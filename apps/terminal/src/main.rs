@@ -1558,6 +1558,135 @@ fn reading_text_display(
     }
     Text::from(lines)
 }
+
+fn analytics_report_rows(
+    data: &[story_analysis::SceneAnalysisInput],
+    target_words: Option<u64>,
+    actual_words: u32,
+    drafted_scenes: usize,
+) -> Vec<String> {
+    let heatmap = story_analysis::character_heatmap(data);
+    let interactions = story_analysis::character_interactions(data);
+    let gaps = story_analysis::subplot_gaps(data, 3);
+    let chronology = story_analysis::chronology_ambiguities(data);
+    let scenes_by_id = data
+        .iter()
+        .map(|scene| (scene.scene_id.as_str(), scene.title.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let character_names = data
+        .iter()
+        .flat_map(|scene| {
+            scene
+                .characters
+                .iter()
+                .map(|character| (character.id.as_str(), character.name.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let plotline_names = data
+        .iter()
+        .flat_map(|scene| {
+            scene
+                .plotlines
+                .iter()
+                .map(|plotline| (plotline.id.as_str(), plotline.name.as_str()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = vec![
+        format!("{} scenes", data.len()),
+        format!("{actual_words} actual words"),
+        format!("{drafted_scenes} drafted or complete scenes"),
+        format!("{} characters", character_names.len()),
+        format!("{} plotlines", plotline_names.len()),
+        format!("{} co-appearance pairs", interactions.len()),
+        format!("{} subplot gaps of 3+ scenes", gaps.len()),
+        format!("{} uncertain chronology pairs", chronology.len()),
+        "Character appearance heatmap · P=POV · M=major · m=minor · o=off-camera · ?=mentioned"
+            .into(),
+    ];
+    rows.extend(heatmap.into_iter().map(|row| {
+        let participants = row
+            .participants
+            .iter()
+            .map(|(_, name, role)| {
+                let marker = match role {
+                    story_core::ParticipationRole::Pov => "P",
+                    story_core::ParticipationRole::Major => "M",
+                    story_core::ParticipationRole::Minor => "m",
+                    story_core::ParticipationRole::OffCamera => "o",
+                    story_core::ParticipationRole::Mentioned => "?",
+                };
+                format!("{name}:{marker}")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("Heatmap · {} │ {participants}", row.scene_title)
+    }));
+    rows.push("Character interactions · shared scene count".into());
+    rows.extend(interactions.into_iter().map(|pair| {
+        format!(
+            "Interaction · {} ↔ {} · {} scenes",
+            character_names
+                .get(pair.first_character.as_str())
+                .copied()
+                .unwrap_or(&pair.first_character),
+            character_names
+                .get(pair.second_character.as_str())
+                .copied()
+                .unwrap_or(&pair.second_character),
+            pair.shared_scenes
+        )
+    }));
+    rows.push("Subplot gaps · manuscript order".into());
+    rows.extend(gaps.into_iter().map(|gap| {
+        format!(
+            "Gap · {} · {} → {} · {} intervening scenes",
+            gap.plotline_name,
+            scenes_by_id
+                .get(gap.from_scene_id.as_str())
+                .copied()
+                .unwrap_or(&gap.from_scene_id),
+            scenes_by_id
+                .get(gap.to_scene_id.as_str())
+                .copied()
+                .unwrap_or(&gap.to_scene_id),
+            gap.intervening_scenes
+        )
+    }));
+    rows.push("Chronology · possible overlaps or indeterminate intervals".into());
+    rows.extend(chronology.into_iter().map(|finding| {
+        format!(
+            "Chronology · {} ↔ {} · uncertain",
+            scenes_by_id
+                .get(finding.first_scene_id.as_str())
+                .copied()
+                .unwrap_or(&finding.first_scene_id),
+            scenes_by_id
+                .get(finding.second_scene_id.as_str())
+                .copied()
+                .unwrap_or(&finding.second_scene_id)
+        )
+    }));
+    if let Some(target_words) = target_words {
+        let budget = story_analysis::preview_budget_redistribution(target_words, data);
+        rows.push(format!(
+            "Budget preview · target {} · fixed {} · remaining {} · preview only",
+            budget.target_words, budget.fixed_words, budget.unallocated_words
+        ));
+        rows.extend(
+            budget
+                .suggested_scene_targets
+                .into_iter()
+                .map(|(id, words)| {
+                    format!(
+                        "Budget suggestion · {} · {words} words",
+                        scenes_by_id.get(id.as_str()).copied().unwrap_or(&id)
+                    )
+                }),
+        );
+    }
+    rows
+}
+
 fn workspace_items(s: &AppState) -> Vec<String> {
     match s.workspace {
         Workspace::Dashboard => vec![
@@ -1670,56 +1799,8 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 .filter(|x| matches!(x.2, SceneStatus::DraftComplete | SceneStatus::Complete))
                 .count();
             let data = s.app.analytics_dataset().unwrap_or_default();
-            let heatmap = story_analysis::character_heatmap(&data);
-            let interactions = story_analysis::character_interactions(&data);
-            let gaps = story_analysis::subplot_gaps(&data, 3);
-            let budget = s
-                .app
-                .get_project()
-                .ok()
-                .and_then(|p| p.target_words)
-                .map(|target| story_analysis::preview_budget_redistribution(target, &data));
-            let mut report = vec![
-                format!("{} scenes", s.scenes.len()),
-                format!("{total} actual words"),
-                format!("{draft} drafted or complete scenes"),
-                format!(
-                    "{} characters",
-                    s.app.list_characters().map(|x| x.len()).unwrap_or(0)
-                ),
-                format!(
-                    "{} plotlines",
-                    s.app.list_plotlines().map(|x| x.len()).unwrap_or(0)
-                ),
-                format!("{} co-appearance pairs", interactions.len()),
-                format!("{} subplot gaps of 3+ scenes", gaps.len()),
-            ];
-            if let Some(budget) = budget {
-                report.push(format!(
-                    "Budget preview: {} target words; {} allocated; {} remaining",
-                    budget.target_words, budget.fixed_words, budget.unallocated_words
-                ));
-            }
-            report.extend(heatmap.into_iter().take(20).map(|row| {
-                format!(
-                    "{} │ {}",
-                    row.scene_title,
-                    row.participants
-                        .iter()
-                        .map(|(_id, name, role)| format!(
-                            "{}:{}",
-                            name,
-                            if *role == story_core::ParticipationRole::Pov {
-                                "POV"
-                            } else {
-                                "in"
-                            }
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                )
-            }));
-            report
+            let target = s.app.get_project().ok().and_then(|p| p.target_words);
+            analytics_report_rows(&data, target, total, draft)
         }
         Workspace::Research => s
             .app
@@ -2721,6 +2802,65 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert_eq!(rendered_text, text);
+    }
+
+    #[test]
+    fn analytics_workspace_rows_include_full_read_only_analysis() {
+        let scenes = (0..5)
+            .map(|index| story_analysis::SceneAnalysisInput {
+                scene_id: format!("scene-{index}"),
+                title: format!("Scene {index}"),
+                chapter_id: None,
+                actual_words: 100,
+                target_words: None,
+                start_time: story_core::StoryTime::unknown(),
+                end_time: story_core::StoryTime::unknown(),
+                characters: if index == 0 {
+                    vec![
+                        story_analysis::CharacterOnScene {
+                            id: "mara".into(),
+                            name: "Mara".into(),
+                            role: story_core::ParticipationRole::Pov,
+                        },
+                        story_analysis::CharacterOnScene {
+                            id: "orin".into(),
+                            name: "Orin".into(),
+                            role: story_core::ParticipationRole::Major,
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                },
+                plotlines: if index == 0 || index == 4 {
+                    vec![story_analysis::PlotlineOnScene {
+                        id: "rebellion".into(),
+                        name: "Rebellion".into(),
+                    }]
+                } else {
+                    Vec::new()
+                },
+            })
+            .collect::<Vec<_>>();
+        let rows = analytics_report_rows(&scenes, Some(2_000), 500, 2);
+        assert!(rows.iter().any(|row| row == "Heatmap · Scene 4 │ "));
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Interaction · Mara ↔ Orin · 1 scenes"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row
+                    .contains("Gap · Rebellion · Scene 0 → Scene 4 · 3 intervening scenes"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Chronology · Scene 0 ↔ Scene 1 · uncertain"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Budget suggestion · Scene 4 · 400 words"))
+        );
+        assert!(scenes.iter().all(|scene| scene.target_words.is_none()));
     }
 
     #[test]
