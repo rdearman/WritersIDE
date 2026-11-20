@@ -10,6 +10,8 @@ story-reading = { path = "../../crates/story-reading" }
 story-app = { path = "../../crates/story-app" }
 story-storage = { path = "../../crates/story-storage" }
 story-analysis = { path = "../../crates/story-analysis" }
+toml.workspace = true
+serde.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 

@@ -1,4 +1,5 @@
-use std::{env, io, time::Duration};
+use serde::Deserialize;
+use std::{collections::BTreeMap, env, fs, io, path::Path, time::Duration};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -91,6 +92,48 @@ struct AppState {
     reading_offset: u64,
     reading_focus: bool,
     reading_selection_start: Option<u64>,
+    function_bindings: Vec<(u8, Workspace)>,
+}
+
+#[derive(Deserialize)]
+struct KeymapFile {
+    bindings: BTreeMap<String, String>,
+}
+
+fn default_bindings() -> Vec<(u8, Workspace)> {
+    Workspace::ALL
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, workspace)| ((index + 1) as u8, workspace))
+        .collect()
+}
+
+fn load_bindings(project: &Path) -> Result<Vec<(u8, Workspace)>, Box<dyn std::error::Error>> {
+    let path = project.join(".writers-ide/keybindings.toml");
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(default_bindings()),
+        Err(error) => return Err(error.into()),
+    };
+    let config: KeymapFile = toml::from_str(&text)?;
+    let mut result = default_bindings();
+    for (key, name) in config.bindings {
+        let number: u8 = key
+            .strip_prefix('F')
+            .ok_or("keymap keys must use F1 through F14")?
+            .parse()?;
+        if !(1..=14).contains(&number) {
+            return Err(format!("unsupported function key {key}").into());
+        }
+        let workspace = Workspace::ALL
+            .iter()
+            .copied()
+            .find(|w| w.title().eq_ignore_ascii_case(&name))
+            .ok_or_else(|| format!("unknown workspace in keymap: {name}"))?;
+        result[(number - 1) as usize] = (number, workspace);
+    }
+    Ok(result)
 }
 impl AppState {
     fn refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -462,7 +505,7 @@ impl AppState {
             self.workspace = Workspace::Search;
             self.message = format!("{} matching scenes", self.scenes.len());
         } else if cmd == "help" {
-            self.message="F1-F12 workspaces; F13 Reading; F14 Revisions; arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
+            self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
             self.message = "Commands: open UUID | workspace NAME | query UUID | process | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | help".into();
         }
@@ -593,7 +636,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = env::args()
         .nth(1)
         .ok_or("usage: writers-ide-tui <project-path>")?;
-    let app = WriterApp::open_project(path)?;
+    let project_path = std::path::PathBuf::from(path);
+    let function_bindings = load_bindings(&project_path)?;
+    let app = WriterApp::open_project(&project_path)?;
     let mut state = AppState {
         app,
         workspace: Workspace::Dashboard,
@@ -616,6 +661,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reading_offset: 0,
         reading_focus: false,
         reading_selection_start: None,
+        function_bindings,
     };
     state.refresh()?;
     let mut terminal = setup()?;
@@ -1163,7 +1209,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     match k.code {
-        KeyCode::F(n) if (1..=14).contains(&n)=>s.switch(Workspace::ALL[(n-1)as usize]),
+        KeyCode::F(n) if (1..=14).contains(&n)=>{if let Some((_, workspace))=s.function_bindings.get((n-1)as usize){s.switch(*workspace);}},
         KeyCode::Char(':')=>{s.mode=Some(':');s.prompt.clear();},
         KeyCode::Char('/')=>{s.mode=Some('/');s.prompt.clear();},
         KeyCode::Char('?')=>s.message="F1 Dashboard · F2 Outline · F3 Cards · F4 Editor · F5 Plot Grid · F6 Characters · F7 Story Bible · F8 Timeline · F9 Analytics · F10 Research · F11 Issues · F12 Search · F13 Reading · F14 Revisions. : commands; / search; Ctrl-S save.".into(),
@@ -1181,6 +1227,25 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_keymap_overrides_function_key_workspace_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            load_bindings(dir.path()).unwrap()[0].1,
+            Workspace::Dashboard
+        );
+        fs::create_dir_all(dir.path().join(".writers-ide")).unwrap();
+        fs::write(
+            dir.path().join(".writers-ide/keybindings.toml"),
+            "[bindings]\nF1 = \"Analytics\"\nF4 = \"Reading\"\n",
+        )
+        .unwrap();
+        let bindings = load_bindings(dir.path()).unwrap();
+        assert_eq!(bindings[0], (1, Workspace::Analytics));
+        assert_eq!(bindings[3], (4, Workspace::Reading));
+        assert_eq!(bindings[1].1, Workspace::Outline);
+    }
     use crossterm::event::KeyModifiers;
 
     #[test]
@@ -1218,6 +1283,7 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            function_bindings: default_bindings(),
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -1257,6 +1323,7 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            function_bindings: default_bindings(),
         };
         assert!(
             !handle(
