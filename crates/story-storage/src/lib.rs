@@ -15,6 +15,7 @@ const MIGRATION_2: &str = include_str!("../migrations/0002_links_queries.sql");
 const MIGRATION_3: &str = include_str!("../migrations/0003_reading.sql");
 const MIGRATION_4: &str = include_str!("../migrations/0004_snapshots.sql");
 const MIGRATION_5: &str = include_str!("../migrations/0005_project_search.sql");
+const MIGRATION_6: &str = include_str!("../migrations/0006_search_custom_fields.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -306,7 +307,7 @@ impl ProjectStore {
         )?;
         let conn = Connection::open(root.join("story.db"))?;
         configure(&conn)?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\nCOMMIT;", now(),now(),now(),now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\n{MIGRATION_6}\nINSERT INTO schema_migrations(version,applied_at) VALUES(6,'{}');\nCOMMIT;", now(),now(),now(),now(),now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now])?;
         Ok(Self {
@@ -338,7 +339,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 5 {
+        if version > 6 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -359,6 +360,10 @@ impl ProjectStore {
         }
         if current_version == 4 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\nCOMMIT;", now()))?;
+            current_version = 5;
+        }
+        if current_version == 5 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_6}\nINSERT INTO schema_migrations(version,applied_at) VALUES(6,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -3664,13 +3669,63 @@ mod tests {
         let hits = store.search_project("North", 20).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].entity_kind, "character");
-        store.rebuild_project_search_index().unwrap();
+        let field = FieldId::new();
+        store
+            .define_custom_field(&CustomFieldDefinition {
+                id: field,
+                name: "World secret".into(),
+                field_type: FieldType::Text,
+                required: false,
+                default_value: None,
+                enum_values: Vec::new(),
+                reference_kind: None,
+            })
+            .unwrap();
+        store
+            .set_custom_field(scene, field, &FieldValue::Text("glassmoon".into()))
+            .unwrap();
         assert_eq!(
-            store.search_project("floorboards", 20).unwrap()[0].entity_id,
+            store.search_project("glassmoon", 10).unwrap()[0].entity_id,
             scene.to_string()
         );
+        let (_, text_hash) = store.load_text(scene).unwrap();
+        store
+            .save_text(
+                scene,
+                Some(&text_hash),
+                "A silver key waits. The moon is bright.",
+            )
+            .unwrap();
+        assert_eq!(
+            store.search_project("glassmoon", 10).unwrap()[0].entity_id,
+            scene.to_string()
+        );
+        store
+            .set_custom_field(scene, field, &FieldValue::Text("redmoon".into()))
+            .unwrap();
+        assert!(store.search_project("glassmoon", 10).unwrap().is_empty());
+        assert_eq!(
+            store.search_project("redmoon", 10).unwrap()[0].entity_id,
+            scene.to_string()
+        );
+        store
+            .conn
+            .execute(
+                "DELETE FROM custom_field_value WHERE scene_id=?1 AND field_id=?2",
+                params![scene.to_string(), field.to_string()],
+            )
+            .unwrap();
+        assert!(store.search_project("redmoon", 10).unwrap().is_empty());
+        store.rebuild_project_search_index().unwrap();
+        assert!(
+            store
+                .search_project("silver", 20)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.entity_id == scene.to_string())
+        );
         assert!(store.search_project("   ", 20).unwrap().is_empty());
-        assert!(store.search_project("floorboards", 0).unwrap().is_empty());
+        assert!(store.search_project("silver", 0).unwrap().is_empty());
     }
 
     #[test]
@@ -3757,7 +3812,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TABLE project_search_fts; DROP TABLE project_search_content; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TABLE project_search_fts; DROP TABLE project_search_content; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -3767,7 +3822,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
