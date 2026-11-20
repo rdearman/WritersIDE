@@ -275,6 +275,25 @@ impl AppState {
                 .count() as u32;
             let id = self.app.create_chapter(None, title.trim(), position)?;
             self.message = format!("Created chapter {id}");
+        } else if let Some(name) = cmd.strip_prefix("character ") {
+            let id = self.app.create_character(name.trim())?;
+            self.switch(Workspace::Characters);
+            self.message = format!("Created character {id}");
+        } else if let Some(name) = cmd.strip_prefix("plotline ") {
+            let id = self.app.create_plotline(name.trim())?;
+            self.switch(Workspace::PlotGrid);
+            self.message = format!("Created plotline {id}");
+        } else if let Some(title) = cmd.strip_prefix("issue ") {
+            let id = self.app.create_issue(title.trim())?;
+            self.switch(Workspace::Issues);
+            self.message = format!("Created issue {id}");
+        } else if let Some(rest) = cmd.strip_prefix("research ") {
+            let (title, body) = rest.split_once('|').unwrap_or((rest, ""));
+            let id =
+                self.app
+                    .create_research_item(title.trim(), body.trim(), "note", None, None)?;
+            self.switch(Workspace::Research);
+            self.message = format!("Created research note {id}");
         } else if let Some(rest) = cmd.strip_prefix("subchapter ") {
             let (parent, title) = rest
                 .split_once(' ')
@@ -787,7 +806,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | plotline NAME | issue TITLE | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -1929,6 +1948,35 @@ mod tests {
         state.prompt = format!("backlinks scene {second}");
         state.command().unwrap();
         assert!(state.message.contains(&first.to_string()));
+        state.mode = Some(':');
+        state.prompt = "character Mara".into();
+        state.command().unwrap();
+        assert_eq!(state.workspace, Workspace::Characters);
+        assert_eq!(state.app.list_characters().unwrap()[0].name, "Mara");
+        state.mode = Some(':');
+        state.prompt = "plotline Political intrigue".into();
+        state.command().unwrap();
+        assert_eq!(state.workspace, Workspace::PlotGrid);
+        assert_eq!(
+            state.app.list_plotlines().unwrap()[0].name,
+            "Political intrigue"
+        );
+        state.mode = Some(':');
+        state.prompt = "issue Clarify the timeline".into();
+        state.command().unwrap();
+        assert_eq!(state.workspace, Workspace::Issues);
+        assert_eq!(
+            state.app.list_issues().unwrap()[0].title,
+            "Clarify the timeline"
+        );
+        state.mode = Some(':');
+        state.prompt = "research City history | Founding records".into();
+        state.command().unwrap();
+        assert_eq!(state.workspace, Workspace::Research);
+        assert_eq!(
+            state.app.list_research_items().unwrap()[0].title,
+            "City history"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ Writer's IDE is an early Rust implementation of the scene-centred novel planning
 
 The current workspace contains a reusable story core, SQLite and manuscript storage, application services, a synthetic import inventory/mapping interface, a CLI and a full-screen terminal prototype. Real Scrivener/Ranperen adapters are not present.
 
-The current implementation adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked scene inclusion, live saved scene queries, FTS5 scene search, a full-screen terminal shell, reference reading and annotations, snapshot revision history, read-only narrative analytics, optional local Ollama assistance, and an incremental processing pipeline. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.16](docs/engineering-design-v0.16.md).
+The current implementation adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked scene inclusion, live saved scene queries, FTS5 scene search, a full-screen terminal shell, reference reading and annotations, snapshot revision history, read-only narrative analytics, optional local Ollama assistance, and an incremental processing pipeline. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.17](docs/engineering-design-v0.17.md).
 
 ## Build and verify
 
@@ -45,7 +45,9 @@ The terminal command palette can run `extract scene|reading <UUID> <model> [endp
 
 Saved scene queries can be created and listed in the terminal command palette with `query-save <name> status=idea` and `query-list`; `query <uuid>` opens current results in the Search workspace. The CLI provides `query-save`, `query-list`, and `query-run`.
 
-The terminal outline supports `section <title>`, `chapter <title>`, `subchapter <section-uuid> <title>`, `scene <chapter-uuid> <title>`, `move <scene-uuid> <chapter-uuid> <position>`, `rename <scene-uuid> <title>`, and `scene-status <scene-uuid> <status>`.
+The terminal outline supports `section <title>`, `chapter <title>`, `subchapter <section-uuid> <title>`, `scene <chapter-uuid> <title>`, `move <scene-uuid> <chapter-uuid> <position>`, `rename <scene-uuid> <title>`, and `scene-status <scene-uuid> <status>`. The command palette also creates basic entity records with `character <name>`, `plotline <name>`, `issue <title>`, and `research <title> | <body>`.
+
+The manuscript editor accepts shifted/uppercase input, Shift+Arrow selection, and internal clipboard operations with Ctrl-C/Ctrl-X/Ctrl-V. Horizontal arrows cross line boundaries. Clipboard contents are local to the running application.
 
 The terminal command palette also accepts `link <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]`, `outgoing <kind> <uuid>`, `backlinks <kind> <uuid>`, `broken-links`, and `transclude <scene-uuid>`. CLI `outgoing` lists links from an entity.
 
