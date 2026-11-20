@@ -1307,13 +1307,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             })
             .collect(),
         Workspace::Editor => Vec::new(),
-        Workspace::Characters => s
-            .app
-            .list_characters()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|c| format!("{}   {} scene appearances", c.name, c.scene_count))
-            .collect(),
+        Workspace::Characters => character_matrix_rows(s),
         Workspace::PlotGrid => plot_grid_rows(s),
         Workspace::StoryBible => {
             let mut rows = Vec::new();
@@ -1505,6 +1499,52 @@ fn plot_grid_rows(s: &AppState) -> Vec<String> {
             .collect::<Vec<_>>()
             .join("   ");
         rows.push(format!("{chapter} / {} | {cells}", scene.title));
+    }
+    rows
+}
+
+fn character_matrix_rows(s: &AppState) -> Vec<String> {
+    let data = match s.app.analytics_dataset() {
+        Ok(data) => data,
+        Err(_) => return vec!["Unable to load character data".into()],
+    };
+    let mut characters = BTreeMap::<String, String>::new();
+    for scene in &data {
+        for person in &scene.characters {
+            characters.insert(person.id.clone(), person.name.clone());
+        }
+    }
+    if characters.is_empty() {
+        return vec!["No character participation recorded".into()];
+    }
+    let characters = characters.into_iter().collect::<Vec<_>>();
+    let mut rows = vec![format!(
+        "Scene / Character | {}",
+        characters
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    )];
+    for scene in data {
+        let by_id = scene
+            .characters
+            .iter()
+            .map(|p| (p.id.as_str(), p.role))
+            .collect::<BTreeMap<_, _>>();
+        let cells = characters
+            .iter()
+            .map(|(id, _)| match by_id.get(id.as_str()) {
+                Some(story_core::ParticipationRole::Pov) => "P",
+                Some(story_core::ParticipationRole::Major) => "●",
+                Some(story_core::ParticipationRole::Minor) => "○",
+                Some(story_core::ParticipationRole::OffCamera) => "o",
+                Some(story_core::ParticipationRole::Mentioned) => "m",
+                None => "·",
+            })
+            .collect::<Vec<_>>()
+            .join("   ");
+        rows.push(format!("{} | {cells}", scene.title));
     }
     rows
 }
@@ -1996,6 +2036,18 @@ mod tests {
         state.command().unwrap();
         assert_eq!(state.workspace, Workspace::Characters);
         assert_eq!(state.app.list_characters().unwrap()[0].name, "Mara");
+        let character_id = state.app.list_characters().unwrap()[0].id;
+        state
+            .app
+            .link_character(first, character_id, story_core::ParticipationRole::Pov)
+            .unwrap();
+        let character_matrix = character_matrix_rows(&state);
+        assert!(character_matrix[0].contains("Mara"));
+        assert!(
+            character_matrix
+                .iter()
+                .any(|row| row.contains("First") && row.contains('P'))
+        );
         state.mode = Some(':');
         state.prompt = "plotline Political intrigue".into();
         state.command().unwrap();
