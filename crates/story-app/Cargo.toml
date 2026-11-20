@@ -1,0 +1,13 @@
+[package]
+name = "story-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+story-core = { path = "../story-core" }
+story-storage = { path = "../story-storage" }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

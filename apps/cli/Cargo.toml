@@ -1,0 +1,10 @@
+[package]
+name = "writers-ide"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+story-core = { path = "../../crates/story-core" }
+story-app = { path = "../../crates/story-app" }
+story-storage = { path = "../../crates/story-storage" }
