@@ -1,5 +1,10 @@
 use serde::Deserialize;
-use std::{collections::BTreeMap, env, fs, io, path::Path, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fs, io,
+    path::Path,
+    time::Duration,
+};
 
 use crossterm::{
     event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
@@ -94,6 +99,7 @@ struct AppState {
     reading_selection_start: Option<u64>,
     function_bindings: Vec<(u8, Workspace)>,
     search_hits: Vec<story_storage::ProjectSearchHit>,
+    query_view: Option<story_core::QueryId>,
     editor_selection: Option<(usize, usize)>,
     clipboard: String,
 }
@@ -193,7 +199,7 @@ impl AppState {
                         .iter()
                         .position(|scene| scene.0 == id)
                         .ok_or("search scene no longer exists")?;
-                    return self.open_selected();
+                    return self.open_scene(id);
                 }
                 "reading" => {
                     let id = story_core::ReadingId(hit.entity_id.parse()?);
@@ -246,23 +252,45 @@ impl AppState {
                 kind => return Err(format!("unsupported search entity kind: {kind}").into()),
             }
         }
-        if let Some(id) = self.active_scene() {
-            if self.dirty && self.editing_scene != Some(id) {
-                self.message =
-                    "Unsaved text is open. Save with Ctrl-S before opening another scene.".into();
+        if self.workspace == Workspace::Search
+            && let Some(query_id) = self.query_view
+        {
+            let matches = self.app.run_scene_query(query_id)?;
+            if matches.is_empty() {
+                self.selected = 0;
+                self.message = "Saved query has no matching scenes".into();
                 return Ok(());
             }
-            let (text, hash) = self.app.load_scene_text(id)?;
-            self.editor = text.lines().map(str::to_owned).collect();
-            if self.editor.is_empty() {
-                self.editor.push(String::new());
-            }
-            self.cursor = (0, 0);
-            self.saved_hash = hash;
-            self.editing_scene = Some(id);
-            self.dirty = false;
-            self.workspace = Workspace::Editor;
+            self.selected = self.selected.min(matches.len() - 1);
+            let id = matches[self.selected];
+            self.selected = self
+                .scenes
+                .iter()
+                .position(|scene| scene.0 == id)
+                .ok_or("query scene no longer exists")?;
+            return self.open_scene(id);
         }
+        if let Some(id) = self.active_scene() {
+            self.open_scene(id)?;
+        }
+        Ok(())
+    }
+    fn open_scene(&mut self, id: SceneId) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty && self.editing_scene != Some(id) {
+            self.message =
+                "Unsaved text is open. Save with Ctrl-S before opening another scene.".into();
+            return Ok(());
+        }
+        let (text, hash) = self.app.load_scene_text(id)?;
+        self.editor = text.lines().map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        self.cursor = (0, 0);
+        self.saved_hash = hash;
+        self.editing_scene = Some(id);
+        self.dirty = false;
+        self.workspace = Workspace::Editor;
         Ok(())
     }
     fn save(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -320,6 +348,8 @@ impl AppState {
                 .filter_map(|id| self.app.get_scene(id).ok())
                 .map(|r| (r.scene.id, r.scene.title, r.scene.status, r.actual_words))
                 .collect();
+            self.query_view = None;
+            self.search_hits.clear();
             self.selected = 0;
             self.workspace = Workspace::Search;
             self.message = format!("{} search results", self.scenes.len());
@@ -889,6 +919,11 @@ impl AppState {
                 .map(|query| format!("{} {}", query.id, query.name))
                 .collect::<Vec<_>>()
                 .join(" · ");
+        } else if cmd == "query-clear" {
+            self.query_view = None;
+            self.search_hits.clear();
+            self.selected = 0;
+            self.message = "Saved query view cleared".into();
         } else if let Some(rest) = cmd.strip_prefix("link ") {
             let mut parts = rest.splitn(6, ' ');
             let source_kind = parts.next().ok_or("missing source kind")?;
@@ -1022,26 +1057,40 @@ impl AppState {
             self.message = format!("Saved query {} ({})", query.name, query.id);
         } else if let Some(rest) = cmd.strip_prefix("query ") {
             let id = story_core::QueryId(rest.parse()?);
-            let found = self.app.run_scene_query(id)?;
+            let saved_queries = self.app.list_saved_queries()?;
+            let query = saved_queries
+                .iter()
+                .find(|query| query.id == id)
+                .ok_or("saved query does not exist")?;
+            let query_name = query.name.clone();
             self.scenes = self
                 .app
                 .list_scenes(false)?
                 .into_iter()
-                .filter(|s| found.contains(&s.scene.id))
-                .map(|r| (r.scene.id, r.scene.title, r.scene.status, r.actual_words))
+                .map(|row| {
+                    (
+                        row.scene.id,
+                        row.scene.title,
+                        row.scene.status,
+                        row.actual_words,
+                    )
+                })
                 .collect();
+            self.query_view = Some(id);
+            self.search_hits.clear();
             self.selected = 0;
             self.workspace = Workspace::Search;
-            self.message = format!("{} matching scenes", self.scenes.len());
+            self.message = format!("{query_name} · dynamic collection");
         } else if let Some(terms) = cmd.strip_prefix("search-all ") {
             self.search_hits = self.app.search_project(terms, 200)?;
+            self.query_view = None;
             self.selected = 0;
             self.switch(Workspace::Search);
             self.message = format!("{} project-wide matches", self.search_hits.len());
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -1275,6 +1324,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reading_selection_start: None,
         function_bindings,
         search_hits: Vec::new(),
+        query_view: None,
         editor_selection: None,
         clipboard: String::new(),
     };
@@ -1913,6 +1963,21 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             .iter()
             .map(|hit| format!("{} · {} · {}", hit.entity_kind, hit.title, hit.excerpt))
             .collect(),
+        Workspace::Search if let Some(query) = s.query_view => {
+            let matches = s
+                .app
+                .run_scene_query(query)
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            s.scenes
+                .iter()
+                .filter(|scene| matches.contains(&scene.0))
+                .map(|(_, title, status, words)| {
+                    format!("{title}   {}   {words} words", status.as_str())
+                })
+                .collect()
+        }
         Workspace::Search => s
             .scenes
             .iter()
@@ -2444,6 +2509,7 @@ mod tests {
             reading_selection_start: None,
             function_bindings: default_bindings(),
             search_hits: Vec::new(),
+            query_view: None,
             editor_selection: Some((0, 2)),
             clipboard: String::new(),
         };
@@ -2497,6 +2563,7 @@ mod tests {
             reading_selection_start: None,
             function_bindings: default_bindings(),
             search_hits: Vec::new(),
+            query_view: None,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -2542,6 +2609,7 @@ mod tests {
             reading_selection_start: None,
             function_bindings: default_bindings(),
             search_hits: Vec::new(),
+            query_view: None,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -2599,6 +2667,7 @@ mod tests {
             reading_selection_start: None,
             function_bindings: default_bindings(),
             search_hits: Vec::new(),
+            query_view: None,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -2765,6 +2834,7 @@ mod tests {
             reading_selection_start: None,
             function_bindings: default_bindings(),
             search_hits: Vec::new(),
+            query_view: None,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -2822,6 +2892,7 @@ mod tests {
             reading_selection_start: None,
             function_bindings: default_bindings(),
             search_hits: Vec::new(),
+            query_view: None,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -2901,6 +2972,7 @@ mod tests {
             reading_selection_start: None,
             function_bindings: default_bindings(),
             search_hits: Vec::new(),
+            query_view: None,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -3147,6 +3219,93 @@ mod tests {
     }
 
     #[test]
+    fn saved_query_is_a_dynamic_virtual_collection_and_opens_by_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let matching = app.create_scene(chapter, "Matching", 1).unwrap();
+        let query = story_core::SavedSceneQuery {
+            id: story_core::QueryId::new(),
+            name: "Drafting scenes".into(),
+            description: String::new(),
+            filters: vec![story_core::SceneQueryFilter::Status(SceneStatus::Drafting)],
+        };
+        app.save_scene_query(&query).unwrap();
+        let scenes = app
+            .list_scenes(false)
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.scene.id,
+                    row.scene.title,
+                    row.scene.status,
+                    row.actual_words,
+                )
+            })
+            .collect::<Vec<_>>();
+        let mut state = AppState {
+            app,
+            workspace: Workspace::Search,
+            scenes: scenes.into_iter().take(1).collect(),
+            selected: 0,
+            editor: vec![String::new()],
+            editing_scene: None,
+            cursor: (0, 0),
+            saved_hash: String::new(),
+            dirty: false,
+            mode: None,
+            prompt: String::new(),
+            message: String::new(),
+            history: vec![Workspace::Search],
+            history_index: 0,
+            width: 80,
+            scroll: 0,
+            reading_document: None,
+            reading_text: String::new(),
+            reading_offset: 0,
+            reading_focus: false,
+            reading_selection_start: None,
+            function_bindings: default_bindings(),
+            search_hits: Vec::new(),
+            query_view: None,
+            editor_selection: None,
+            clipboard: String::new(),
+        };
+        state.mode = Some(':');
+        state.prompt = format!("query {}", query.id);
+        state.command().unwrap();
+        assert_eq!(state.query_view, Some(query.id));
+        assert!(workspace_items(&state).is_empty());
+        let mut scene = state.app.get_scene(matching).unwrap().scene;
+        scene.status = SceneStatus::Drafting;
+        state.app.update_scene_metadata(&scene).unwrap();
+        let rows = workspace_items(&state);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].starts_with("Matching"));
+        assert_eq!(state.scenes.len(), 2);
+        assert_eq!(state.scenes[0].0, first);
+        assert_eq!(state.scenes[1].0, matching);
+        state.selected = 10;
+        state.open_selected().unwrap();
+        assert_eq!(state.editing_scene, Some(matching));
+        assert_eq!(state.workspace, Workspace::Editor);
+        let mut scene = state.app.get_scene(matching).unwrap().scene;
+        scene.status = SceneStatus::Idea;
+        state.app.update_scene_metadata(&scene).unwrap();
+        state.workspace = Workspace::Search;
+        state.open_selected().unwrap();
+        assert_eq!(state.message, "Saved query has no matching scenes");
+        assert_eq!(state.scenes.len(), 2);
+        state.mode = Some(':');
+        state.prompt = "query-clear".into();
+        state.command().unwrap();
+        assert_eq!(state.query_view, None);
+        assert_eq!(workspace_items(&state).len(), 2);
+    }
+
+    #[test]
     fn outline_commands_create_move_rename_and_preserve_scene_content() {
         let dir = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
@@ -3174,6 +3333,7 @@ mod tests {
             reading_selection_start: None,
             function_bindings: default_bindings(),
             search_hits: Vec::new(),
+            query_view: None,
             editor_selection: None,
             clipboard: String::new(),
         };
