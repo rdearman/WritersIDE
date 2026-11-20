@@ -2674,6 +2674,56 @@ mod tests {
     }
 
     #[test]
+    fn reading_render_styles_notes_and_ignores_stale_annotations() {
+        let text = "highlight this; annotate that";
+        let make = |kind: &str, state: &str, start: u64, end: u64, quote: &str| {
+            story_storage::ReadingAnnotationRecord {
+                id: story_core::AnnotationId::new(),
+                document_id: story_core::ReadingId::new(),
+                kind: kind.into(),
+                start_byte: start,
+                end_byte: end,
+                quote: quote.into(),
+                body: String::new(),
+                state: state.into(),
+            }
+        };
+        let annotations = [
+            make("highlight", "current", 0, 14, "highlight this"),
+            make("note", "current", 16, 29, "annotate that"),
+            make("highlight", "needs_review", 0, 14, "highlight this"),
+        ];
+        let rendered = reading_text_display(text, &annotations);
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| {
+                    span.content == "highlight this" && span.style.bg == Some(Color::Yellow)
+                })
+        );
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| {
+                    span.content == "annotate that"
+                        && span.style.fg == Some(Color::Cyan)
+                        && span.style.add_modifier.contains(Modifier::UNDERLINED)
+                })
+        );
+        let rendered_text = rendered
+            .lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(rendered_text, text);
+    }
+
+    #[test]
     fn outline_commands_create_move_rename_and_preserve_scene_content() {
         let dir = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
