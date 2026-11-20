@@ -257,13 +257,98 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        "extract" => {
+            let path = std::path::PathBuf::from(args.next().ok_or("missing project path")?);
+            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let model = args.next().ok_or("missing Ollama model name")?;
+            let endpoint = args
+                .next()
+                .unwrap_or_else(|| "http://localhost:11434".into());
+            let app = WriterApp::open_project(&path)?;
+            let (source, _) = app.load_scene_text(scene)?;
+            let output = story_ollama::OllamaClient::new(&endpoint, &model)?.extract(&source)?;
+            let proposal = story_ollama::attach_provenance(
+                "scene",
+                &scene.to_string(),
+                &source,
+                &model,
+                output,
+            );
+            let folder = path.join(".writers-ide").join("proposals");
+            std::fs::create_dir_all(&folder)?;
+            let target = folder.join(format!(
+                "scene-{scene}-{}-{}.json",
+                &proposal.source_fingerprint[..16],
+                QueryId::new()
+            ));
+            std::fs::write(&target, serde_json::to_vec_pretty(&proposal)?)?;
+            println!(
+                "Saved provisional, unapproved extraction to {}",
+                target.display()
+            );
+        }
+        "study" => {
+            let path = args.next().ok_or("missing project path")?;
+            let source_kind = args.next().ok_or("missing source kind: scene|reading")?;
+            let source_id = args.next().ok_or("missing source UUID")?;
+            let model = args.next().ok_or("missing Ollama model name")?;
+            let options = args.collect::<Vec<_>>();
+            let endpoint = options
+                .iter()
+                .find(|arg| !arg.starts_with("--"))
+                .map(String::as_str)
+                .unwrap_or("http://localhost:11434");
+            let include_questions = options.iter().any(|arg| arg == "--questions");
+            let app = WriterApp::open_project(path)?;
+            let source = match source_kind.as_str() {
+                "scene" => app.load_scene_text(SceneId(source_id.parse()?))?.0,
+                "reading" => {
+                    app.get_reading_document(story_core::ReadingId(source_id.parse()?))?
+                        .extracted_text
+                }
+                _ => return Err("source kind must be scene or reading".into()),
+            };
+            let guide = story_ollama::OllamaClient::new(endpoint, &model)?
+                .study_guide(&source, include_questions)?;
+            println!(
+                "Summary\n{}\n\nExplanation\n{}",
+                guide.summary, guide.explanation
+            );
+            for question in guide.questions {
+                println!("\nQuestion: {question}");
+            }
+        }
+        "approve-extraction" => {
+            let file = std::path::PathBuf::from(args.next().ok_or("missing proposal JSON path")?);
+            let mut proposal: story_ollama::ProvisionalExtraction =
+                serde_json::from_slice(&std::fs::read(&file)?)?;
+            for claim in &mut proposal.claims {
+                claim.approved = true;
+            }
+            let bytes = serde_json::to_vec_pretty(&proposal)?;
+            let temp = file.with_extension(format!("{}.tmp", QueryId::new()));
+            use std::io::Write;
+            let mut out = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            out.write_all(&bytes)?;
+            out.sync_all()?;
+            std::fs::rename(&temp, &file)?;
+            if let Some(parent) = file.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            println!(
+                "Marked proposal approved. This records review only; it does not create canonical story facts."
+            );
+        }
         _ => usage(),
     }
     Ok(())
 }
 fn usage() {
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
+        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide extract <path> <scene-uuid> <ollama-model> [http://localhost:11434]\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
     );
 }
 fn parse_status(value: &str) -> Result<story_core::SceneStatus, Box<dyn std::error::Error>> {
