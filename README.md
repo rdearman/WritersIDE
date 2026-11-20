@@ -4,7 +4,7 @@ Writer's IDE is an early Rust implementation of the scene-centred novel planning
 
 The current workspace contains a reusable story core, SQLite and manuscript storage, application services, a synthetic import inventory/mapping interface, a CLI and a full-screen terminal prototype. Real Scrivener/Ranperen adapters are not present.
 
-The current implementation adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked scene inclusion, live saved scene queries, project-wide FTS5 search, a full-screen terminal shell, reference reading and annotations, snapshot revision history, read-only narrative analytics, optional local Ollama assistance, and an incremental processing pipeline. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.24](docs/engineering-design-v0.24.md).
+The current implementation adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked scene inclusion, live saved scene queries, project-wide FTS5 search, a full-screen terminal shell, reference reading and annotations, snapshot revision history, read-only narrative analytics, optional local Ollama assistance, and an incremental processing pipeline. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.25](docs/engineering-design-v0.25.md).
 
 ## Build and verify
 
@@ -58,6 +58,8 @@ The manuscript editor accepts shifted/uppercase input, Shift+Arrow selection, an
 The terminal command palette also accepts `link <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]`, `outgoing <kind> <uuid>`, `backlinks <kind> <uuid>`, `broken-links`, and `transclude <scene-uuid>`. CLI `outgoing` lists links from an entity.
 
 After scene text changes, passage anchors are automatically relocated only when the quote and context identify one unambiguous location. Use `:anchors` to inspect anchor status and `:anchor-move <anchor-uuid> <start-byte> <end-byte>` to resolve an ambiguous or broken anchor manually. The CLI supports `anchors <project> <scene-uuid>` and `anchor-move <project> <anchor-uuid> <start-byte> <end-byte>`.
+
+In the Reading workspace, `:annotations` and `:bookmarks` show zero-based indices. Use `:annotation-jump <index>` or `:bookmark-jump <index>` to return to a stored passage without changing the source document.
 
 Reading references expose their story links with `reading-links`; `reading-follow <index>` navigates to the linked scene or switches to the character, plotline, or research workspace.
 

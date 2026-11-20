@@ -790,7 +790,8 @@ impl AppState {
                 .app
                 .list_reading_annotations(id)?
                 .into_iter()
-                .map(|a| format!("{} [{}] {}", a.kind, a.state, a.quote))
+                .enumerate()
+                .map(|(index, a)| format!("{index}: {} [{}] {}", a.kind, a.state, a.quote))
                 .collect::<Vec<_>>()
                 .join(" · ");
         } else if cmd == "bookmarks" {
@@ -801,9 +802,36 @@ impl AppState {
                 .app
                 .list_reading_bookmarks(id)?
                 .into_iter()
-                .map(|b| format!("{} @{} [{}]", b.title, b.offset_byte, b.state))
+                .enumerate()
+                .map(|(index, b)| format!("{index}: {} @{} [{}]", b.title, b.offset_byte, b.state))
                 .collect::<Vec<_>>()
                 .join(" · ");
+        } else if let Some(rest) = cmd.strip_prefix("annotation-jump ") {
+            let id = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            let index: usize = rest.parse()?;
+            let annotation = self
+                .app
+                .list_reading_annotations(id)?
+                .get(index)
+                .cloned()
+                .ok_or("annotation index is out of range")?;
+            self.jump_reading(annotation.start_byte)?;
+            self.message = format!("Jumped to annotation {index}: {}", annotation.quote);
+        } else if let Some(rest) = cmd.strip_prefix("bookmark-jump ") {
+            let id = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            let index: usize = rest.parse()?;
+            let bookmark = self
+                .app
+                .list_reading_bookmarks(id)?
+                .get(index)
+                .cloned()
+                .ok_or("bookmark index is out of range")?;
+            self.jump_reading(bookmark.offset_byte)?;
+            self.message = format!("Jumped to bookmark {index}: {}", bookmark.title);
         } else if cmd == "terms" {
             let id = self
                 .reading_document
@@ -816,14 +844,7 @@ impl AppState {
                 .collect::<Vec<_>>()
                 .join(" · ");
         } else if let Some(rest) = cmd.strip_prefix("jump ") {
-            self.reading_offset = rest.parse()?;
-            let offset = usize::try_from(self.reading_offset)?;
-            let prefix = self
-                .reading_text
-                .get(..offset)
-                .ok_or("reading position is outside the text or splits a UTF-8 character")?;
-            self.scroll = prefix.matches('\n').count();
-            self.reading_focus = true;
+            self.jump_reading(rest.parse()?)?;
         } else if let Some(rest) = cmd.strip_prefix("open ") {
             if let Some(i) = self.scenes.iter().position(|s| s.0.to_string() == rest) {
                 self.selected = i;
@@ -998,8 +1019,20 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
+        Ok(())
+    }
+    fn jump_reading(&mut self, offset: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let byte = usize::try_from(offset)?;
+        let prefix = self
+            .reading_text
+            .get(..byte)
+            .ok_or("reading position is outside the text or splits a UTF-8 character")?;
+        self.reading_offset = offset;
+        self.scroll = prefix.matches('\n').count();
+        self.reading_focus = true;
+        self.switch(Workspace::Reading);
         Ok(())
     }
     fn insert(&mut self, ch: char) {
@@ -2465,10 +2498,30 @@ mod tests {
         let mut app = WriterApp::create_project(&project, "Novel").unwrap();
         let character = app.create_character("Mara").unwrap();
         let source = dir.path().join("reference.txt");
-        fs::write(&source, "Mara is the protagonist.").unwrap();
+        fs::write(
+            &source,
+            "Mara is the protagonist.\nA second reference passage.",
+        )
+        .unwrap();
         let imported = story_reading::import_reference(&source).unwrap();
         let reading = app
             .import_reading_document(&imported, "reference.txt")
+            .unwrap();
+        let passage_offset = imported.extracted_text.find("second reference").unwrap() as u64;
+        app.create_reading_annotation(
+            reading,
+            &story_core::ReadingAnnotationDraft {
+                kind: "highlight".into(),
+                start_byte: passage_offset,
+                end_byte: passage_offset + "second reference".len() as u64,
+                quote: "second reference".into(),
+                body: String::new(),
+                prefix_context: "A ".into(),
+                suffix_context: " passage.".into(),
+            },
+        )
+        .unwrap();
+        app.create_reading_bookmark(reading, "Second passage", passage_offset)
             .unwrap();
         app.link_reading_entity(
             reading,
@@ -2495,7 +2548,7 @@ mod tests {
             width: 80,
             scroll: 0,
             reading_document: Some(reading),
-            reading_text: imported.extracted_text,
+            reading_text: imported.extracted_text.clone(),
             reading_offset: 0,
             reading_focus: true,
             reading_selection_start: None,
@@ -2513,6 +2566,26 @@ mod tests {
         state.command().unwrap();
         assert_eq!(state.workspace, Workspace::Characters);
         assert_eq!(state.selected, 0);
+        state.reading_document = Some(reading);
+        state.reading_text = imported.extracted_text;
+        state.mode = Some(':');
+        state.prompt = "annotations".into();
+        state.command().unwrap();
+        assert!(state.message.contains("0: highlight"));
+        state.mode = Some(':');
+        state.prompt = "annotation-jump 0".into();
+        state.command().unwrap();
+        assert_eq!(state.reading_offset, passage_offset);
+        assert_eq!(state.scroll, 1);
+        state.mode = Some(':');
+        state.prompt = "bookmarks".into();
+        state.command().unwrap();
+        assert!(state.message.contains("0: Second passage"));
+        state.mode = Some(':');
+        state.prompt = "bookmark-jump 0".into();
+        state.command().unwrap();
+        assert_eq!(state.reading_offset, passage_offset);
+        assert_eq!(state.workspace, Workspace::Reading);
     }
 
     #[test]
