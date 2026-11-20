@@ -11,3 +11,4 @@ story-storage = { path = "../../crates/story-storage" }
 story-analysis = { path = "../../crates/story-analysis" }
 story-ollama = { path = "../../crates/story-ollama" }
 serde_json.workspace = true
+story-pipeline = { path = "../../crates/story-pipeline" }

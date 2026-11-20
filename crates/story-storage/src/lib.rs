@@ -216,6 +216,9 @@ pub enum ConflictResolution {
 }
 
 impl ProjectStore {
+    pub fn project_root(&self) -> &Path {
+        &self.root
+    }
     pub fn create(root: impl AsRef<Path>, title: &str) -> Result<Self> {
         let project = Project {
             id: ProjectId::new(),

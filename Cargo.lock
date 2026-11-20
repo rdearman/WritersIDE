@@ -1378,6 +1378,7 @@ version = "0.1.0"
 dependencies = [
  "story-analysis",
  "story-core",
+ "story-pipeline",
  "story-reading",
  "story-storage",
  "tempfile",
@@ -1410,6 +1411,19 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "thiserror",
+]
+
+[[package]]
+name = "story-pipeline"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "story-analysis",
+ "story-core",
+ "tempfile",
  "thiserror",
 ]
 
@@ -2040,6 +2054,7 @@ dependencies = [
  "story-app",
  "story-core",
  "story-ollama",
+ "story-pipeline",
  "story-storage",
 ]
 

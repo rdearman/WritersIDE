@@ -205,7 +205,14 @@ impl AppState {
             self.message = format!("{} search results", self.scenes.len());
             return Ok(());
         }
-        if let Some(rest) = cmd.strip_prefix("read-import ") {
+        if cmd == "process" {
+            let reports = self.app.run_processing()?;
+            self.message = reports
+                .into_iter()
+                .map(|report| format!("{:?}:{:?}", report.stage, report.status))
+                .collect::<Vec<_>>()
+                .join(" · ");
+        } else if let Some(rest) = cmd.strip_prefix("read-import ") {
             let path = std::path::Path::new(rest);
             let source = story_reading::import_reference(path)?;
             let id = self.app.import_reading_document(&source, rest)?;
@@ -457,7 +464,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F12 workspaces; F13 Reading; F14 Revisions; arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: open UUID | workspace NAME | query UUID | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | help".into();
+            self.message = "Commands: open UUID | workspace NAME | query UUID | process | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | help".into();
         }
         Ok(())
     }

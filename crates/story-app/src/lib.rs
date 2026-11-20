@@ -11,6 +11,8 @@ pub enum AppError {
     Storage(#[from] StorageError),
     #[error("invalid domain input: {0}")]
     Domain(String),
+    #[error(transparent)]
+    Pipeline(#[from] story_pipeline::PipelineError),
 }
 pub type Result<T> = std::result::Result<T, AppError>;
 
@@ -106,6 +108,48 @@ impl WriterApp {
             });
         }
         Ok(result)
+    }
+    pub fn processing_input(&self) -> Result<story_pipeline::PipelineInput> {
+        let project = self.get_project()?;
+        let analytics = self.analytics_dataset()?;
+        let mut scenes = Vec::new();
+        let mut snapshots = 0usize;
+        for row in self.store.list_scenes(false)? {
+            let (text, _) = self.store.load_text(row.scene.id)?;
+            let linked = analytics
+                .iter()
+                .find(|data| data.scene_id == row.scene.id.to_string());
+            let characters = linked
+                .map(|d| d.characters.iter().map(|c| c.name.clone()).collect())
+                .unwrap_or_default();
+            let plotlines = linked
+                .map(|d| d.plotlines.iter().map(|p| p.name.clone()).collect())
+                .unwrap_or_default();
+            snapshots += self.store.list_snapshots(row.scene.id)?.len();
+            scenes.push(story_pipeline::PipelineScene {
+                id: row.scene.id.to_string(),
+                title: row.scene.title,
+                text,
+                target_words: row.scene.target_words,
+                characters,
+                plotlines,
+                start: row.scene.start_time,
+                end: row.scene.end_time,
+            });
+        }
+        Ok(story_pipeline::PipelineInput {
+            title: project.title,
+            target_words: project.target_words,
+            scenes,
+            revision_summary: format!(
+                "{} scenes; {snapshots} stored snapshots",
+                self.store.list_scenes(false)?.len()
+            ),
+        })
+    }
+    pub fn run_processing(&self) -> Result<Vec<story_pipeline::StageReport>> {
+        let input = self.processing_input()?;
+        Ok(story_pipeline::PipelineRunner::new(self.store.project_root()).run(&input)?)
     }
     pub fn create_snapshot(&mut self, scene: SceneId, label: &str) -> Result<SnapshotId> {
         Ok(self.store.create_snapshot(scene, label)?)
@@ -443,6 +487,24 @@ mod tests {
         assert_eq!(
             app.load_scene_text(scene).unwrap().0,
             "The gate opened. Mara stepped through."
+        );
+        let pipeline = app.processing_input().unwrap();
+        assert_eq!(pipeline.scenes[0].id, scene.to_string());
+        assert_eq!(
+            pipeline.scenes[0].text,
+            "The gate opened. Mara stepped through."
+        );
+        assert!(
+            app.run_processing()
+                .unwrap()
+                .iter()
+                .all(|stage| stage.status == story_pipeline::StageStatus::Complete)
+        );
+        assert!(
+            app.run_processing()
+                .unwrap()
+                .iter()
+                .all(|stage| stage.status == story_pipeline::StageStatus::Cached)
         );
     }
 

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/story-core", "crates/story-storage", "crates/story-app", "crates/story-import", "crates/story-reading", "crates/story-analysis", "crates/story-ollama", "apps/cli", "apps/terminal"]
+members = ["crates/story-core", "crates/story-storage", "crates/story-app", "crates/story-import", "crates/story-reading", "crates/story-analysis", "crates/story-ollama", "crates/story-pipeline", "apps/cli", "apps/terminal"]
 
 [workspace.package]
 edition = "2024"
