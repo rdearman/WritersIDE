@@ -31,9 +31,10 @@ enum Workspace {
     Issues,
     Search,
     Reading,
+    Revisions,
 }
 impl Workspace {
-    const ALL: [Self; 13] = [
+    const ALL: [Self; 14] = [
         Self::Dashboard,
         Self::Outline,
         Self::Cards,
@@ -47,6 +48,7 @@ impl Workspace {
         Self::Issues,
         Self::Search,
         Self::Reading,
+        Self::Revisions,
     ];
     fn title(self) -> &'static str {
         match self {
@@ -63,6 +65,7 @@ impl Workspace {
             Self::Issues => "Issues",
             Self::Search => "Search",
             Self::Reading => "Reading",
+            Self::Revisions => "Revisions",
         }
     }
 }
@@ -296,6 +299,92 @@ impl AppState {
             self.app
                 .link_reading_entity(doc, None, parse_entity(kind, id)?, "references")?;
             self.message = "Reference entity linked".into();
+        } else if let Some(label) = cmd.strip_prefix("snapshot ") {
+            let scene = self
+                .editing_scene
+                .or(self.active_scene())
+                .ok_or("select a scene first")?;
+            let id = self.app.create_snapshot(scene, label)?;
+            self.message = format!("Snapshot created: {id}");
+        } else if cmd == "history" {
+            let scene = self
+                .editing_scene
+                .or(self.active_scene())
+                .ok_or("select a scene first")?;
+            self.message = self
+                .app
+                .list_snapshots(scene)?
+                .into_iter()
+                .map(|s| format!("{} {} {}", s.id, s.created_at, s.label))
+                .collect::<Vec<_>>()
+                .join(" · ");
+        } else if let Some(rest) = cmd.strip_prefix("diff ") {
+            let scene = self
+                .editing_scene
+                .or(self.active_scene())
+                .ok_or("select a scene first")?;
+            let id = story_core::SnapshotId(rest.parse()?);
+            self.message = self
+                .app
+                .diff_snapshot(scene, id)?
+                .into_iter()
+                .filter(|line| line.kind != story_storage::SnapshotLineKind::Equal)
+                .map(|line| {
+                    format!(
+                        "{} {}",
+                        match line.kind {
+                            story_storage::SnapshotLineKind::Added => '+',
+                            story_storage::SnapshotLineKind::Removed => '-',
+                            story_storage::SnapshotLineKind::Equal => ' ',
+                        },
+                        line.text.trim_end()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("restore ") {
+            let scene = self
+                .editing_scene
+                .or(self.active_scene())
+                .ok_or("select a scene first")?;
+            let id = story_core::SnapshotId(rest.parse()?);
+            let (_, hash) = self.app.load_scene_text(scene)?;
+            let new = self.app.restore_snapshot(scene, id, &hash)?;
+            self.saved_hash = new;
+            self.dirty = false;
+            self.message = "Snapshot restored; prior text was snapshotted".into();
+        } else if let Some(rest) = cmd.strip_prefix("restore-lines ") {
+            let (id,ranges)=rest.split_once(' ').ok_or("use restore-lines <snapshot> <current-start>:<current-end> <snapshot-start>:<snapshot-end>")?;
+            let mut parts = ranges.split_whitespace();
+            let (cs, ce) = parts
+                .next()
+                .ok_or("missing current range")?
+                .split_once(':')
+                .ok_or("range must be start:end")?;
+            let (ss, se) = parts
+                .next()
+                .ok_or("missing snapshot range")?
+                .split_once(':')
+                .ok_or("range must be start:end")?;
+            let scene = self
+                .editing_scene
+                .or(self.active_scene())
+                .ok_or("select a scene first")?;
+            let id = story_core::SnapshotId(id.parse()?);
+            let (_, hash) = self.app.load_scene_text(scene)?;
+            self.saved_hash = self.app.restore_snapshot_lines(
+                scene,
+                id,
+                &hash,
+                story_core::SnapshotRestoreSelection {
+                    current_start: cs.parse()?,
+                    current_end: ce.parse()?,
+                    snapshot_start: ss.parse()?,
+                    snapshot_end: se.parse()?,
+                },
+            )?;
+            self.dirty = false;
+            self.message = "Selected lines restored; prior text was snapshotted".into();
         } else if cmd == "annotations" {
             let id = self
                 .reading_document
@@ -366,7 +455,7 @@ impl AppState {
             self.workspace = Workspace::Search;
             self.message = format!("{} matching scenes", self.scenes.len());
         } else if cmd == "help" {
-            self.message="F1-F12 workspaces; F13 Reading; arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
+            self.message="F1-F12 workspaces; F13 Reading; F14 Revisions; arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
             self.message = "Commands: open UUID | workspace NAME | query UUID | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | help".into();
         }
@@ -586,7 +675,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             format!(" {project}  |  {}  |  {dirty} ", s.workspace.title()),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw("F1-F12 workspaces  ? help  : command  / search  Ctrl-S save  q quit"),
+        Span::raw("F1-F14 workspaces  ? help  : command  / search  Ctrl-S save  q quit"),
     ]))
     .block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(head, rows[0]);
@@ -859,6 +948,18 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             .into_iter()
             .map(|r| format!("{}   {}", r.title, r.media_type))
             .collect(),
+        Workspace::Revisions => s
+            .active_scene()
+            .and_then(|scene| s.app.list_snapshots(scene).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|snapshot| {
+                format!(
+                    "{}  {}  {}",
+                    snapshot.id, snapshot.created_at, snapshot.label
+                )
+            })
+            .collect(),
     }
 }
 fn parse_entity(kind: &str, id: &str) -> Result<story_core::EntityRef, Box<dyn std::error::Error>> {
@@ -1017,14 +1118,15 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     match k.code {
-        KeyCode::F(n) if (1..=13).contains(&n)=>s.switch(Workspace::ALL[(n-1)as usize]),
+        KeyCode::F(n) if (1..=14).contains(&n)=>s.switch(Workspace::ALL[(n-1)as usize]),
         KeyCode::Char(':')=>{s.mode=Some(':');s.prompt.clear();},
         KeyCode::Char('/')=>{s.mode=Some('/');s.prompt.clear();},
-        KeyCode::Char('?')=>s.message="F1 Dashboard · F2 Outline · F3 Cards · F4 Editor · F5 Plot Grid · F6 Characters · F7 Story Bible · F8 Timeline · F9 Analytics · F10 Research · F11 Issues · F12 Search · F13 Reading. : commands; / search; Ctrl-S save.".into(),
+        KeyCode::Char('?')=>s.message="F1 Dashboard · F2 Outline · F3 Cards · F4 Editor · F5 Plot Grid · F6 Characters · F7 Story Bible · F8 Timeline · F9 Analytics · F10 Research · F11 Issues · F12 Search · F13 Reading · F14 Revisions. : commands; / search; Ctrl-S save.".into(),
         KeyCode::Tab=>{let i=Workspace::ALL.iter().position(|x|*x==s.workspace).unwrap_or(0);s.switch(Workspace::ALL[(i+1)%Workspace::ALL.len()]);},
         KeyCode::BackTab=>{let i=Workspace::ALL.iter().position(|x|*x==s.workspace).unwrap_or(0);s.switch(Workspace::ALL[(i+Workspace::ALL.len()-1)%Workspace::ALL.len()]);},
         KeyCode::Up|KeyCode::Char('k')=>s.selected=s.selected.saturating_sub(1),
         KeyCode::Down|KeyCode::Char('j')=>{if !s.scenes.is_empty(){s.selected=(s.selected+1).min(s.scenes.len()-1);}},
+        KeyCode::Enter if s.workspace==Workspace::Revisions=>{let scene=s.active_scene().ok_or("select a scene first")?;let snapshots=s.app.list_snapshots(scene)?;if let Some(snapshot)=snapshots.get(s.selected){let diff=s.app.diff_snapshot(scene,snapshot.id)?;s.message=diff.into_iter().map(|line|format!("{}{}",match line.kind{story_storage::SnapshotLineKind::Equal=>' ',story_storage::SnapshotLineKind::Added=>'+',story_storage::SnapshotLineKind::Removed=>'-'},line.text.trim_end())).collect::<Vec<_>>().join(" | ");}},
         KeyCode::Enter=>s.open_selected()?,
         _=>{}
     }

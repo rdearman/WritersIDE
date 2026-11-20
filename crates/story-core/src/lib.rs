@@ -47,6 +47,15 @@ id_type!(ReadingId);
 id_type!(AnnotationId);
 id_type!(BookmarkId);
 id_type!(ReadingTermId);
+id_type!(SnapshotId);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotRestoreSelection {
+    pub current_start: usize,
+    pub current_end: usize,
+    pub snapshot_start: usize,
+    pub snapshot_end: usize,
+}
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReadingAnnotationDraft {

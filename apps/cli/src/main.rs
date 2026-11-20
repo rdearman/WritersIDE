@@ -2,6 +2,7 @@ use std::{env, process::ExitCode};
 use story_app::WriterApp;
 use story_core::{
     EntityRef, LinkId, LinkKind, NodeId, QueryId, SavedSceneQuery, SceneId, SceneQueryFilter,
+    SnapshotId,
 };
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -182,13 +183,51 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}\t{}", link.link_id, link.reason);
             }
         }
+        "snapshot" => {
+            let path = args.next().ok_or("missing project path")?;
+            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let label = args.collect::<Vec<_>>().join(" ");
+            let mut app = WriterApp::open_project(path)?;
+            println!("{}", app.create_snapshot(scene, &label)?);
+        }
+        "history" => {
+            let path = args.next().ok_or("missing project path")?;
+            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let app = WriterApp::open_project(path)?;
+            for item in app.list_snapshots(scene)? {
+                println!("{}\t{}\t{}", item.id, item.created_at, item.label);
+            }
+        }
+        "diff" => {
+            let path = args.next().ok_or("missing project path")?;
+            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let snapshot = SnapshotId(args.next().ok_or("missing snapshot UUID")?.parse()?);
+            let app = WriterApp::open_project(path)?;
+            for line in app.diff_snapshot(scene, snapshot)? {
+                let prefix = match line.kind {
+                    story_storage::SnapshotLineKind::Equal => ' ',
+                    story_storage::SnapshotLineKind::Added => '+',
+                    story_storage::SnapshotLineKind::Removed => '-',
+                };
+                print!("{prefix}{}", line.text);
+            }
+        }
+        "restore" => {
+            let path = args.next().ok_or("missing project path")?;
+            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let snapshot = SnapshotId(args.next().ok_or("missing snapshot UUID")?.parse()?);
+            let mut app = WriterApp::open_project(path)?;
+            let (_, hash) = app.load_scene_text(scene)?;
+            app.restore_snapshot(scene, snapshot, &hash)?;
+            println!("Restored; current text was snapshotted first.");
+        }
         _ => usage(),
     }
     Ok(())
 }
 fn usage() {
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
+        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
     );
 }
 fn parse_status(value: &str) -> Result<story_core::SceneStatus, Box<dyn std::error::Error>> {

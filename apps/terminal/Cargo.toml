@@ -8,6 +8,7 @@ license.workspace = true
 story-core = { path = "../../crates/story-core" }
 story-reading = { path = "../../crates/story-reading" }
 story-app = { path = "../../crates/story-app" }
+story-storage = { path = "../../crates/story-storage" }
 ratatui.workspace = true
 crossterm.workspace = true
 

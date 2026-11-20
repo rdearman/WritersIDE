@@ -69,6 +69,46 @@ impl WriterApp {
     pub fn list_scenes(&self, include_archived: bool) -> Result<Vec<SceneRecord>> {
         Ok(self.store.list_scenes(include_archived)?)
     }
+    pub fn create_snapshot(&mut self, scene: SceneId, label: &str) -> Result<SnapshotId> {
+        Ok(self.store.create_snapshot(scene, label)?)
+    }
+    pub fn list_snapshots(&self, scene: SceneId) -> Result<Vec<story_storage::SnapshotRecord>> {
+        Ok(self.store.list_snapshots(scene)?)
+    }
+    pub fn load_snapshot(
+        &self,
+        snapshot: SnapshotId,
+    ) -> Result<(story_storage::SnapshotRecord, String)> {
+        Ok(self.store.load_snapshot(snapshot)?)
+    }
+    pub fn diff_snapshot(
+        &self,
+        scene: SceneId,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<story_storage::SnapshotDiffLine>> {
+        Ok(self.store.diff_snapshot(scene, snapshot)?)
+    }
+    pub fn restore_snapshot(
+        &mut self,
+        scene: SceneId,
+        snapshot: SnapshotId,
+        expected_hash: &str,
+    ) -> Result<String> {
+        Ok(self
+            .store
+            .restore_snapshot(scene, snapshot, expected_hash)?)
+    }
+    pub fn restore_snapshot_lines(
+        &mut self,
+        scene: SceneId,
+        snapshot: SnapshotId,
+        expected_hash: &str,
+        selection: SnapshotRestoreSelection,
+    ) -> Result<String> {
+        Ok(self
+            .store
+            .restore_snapshot_lines(scene, snapshot, expected_hash, selection)?)
+    }
     pub fn update_scene_metadata(&mut self, scene: &Scene) -> Result<()> {
         Ok(self.store.update_scene(scene)?)
     }

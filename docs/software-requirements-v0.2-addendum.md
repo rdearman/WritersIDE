@@ -19,7 +19,7 @@ This addendum extends SRS v0.1 without replacing its scene-centred, local-first 
 | TUI-001 | Full-screen keyboard-first Ratatui/Crossterm workspaces include all SRS workspaces, help, bindings, palette, history, split panes and conflict state. | Existing + strengthened | Terminal application | Partial: shell, navigation and scene editor work; keymap customization and full workspace operations remain |
 | READ-001 | Read text/Markdown/EPUB references with persistent highlights, annotations, checkpoints and indexes without modifying source files. | New | Reading workspace | Implemented foundation; real EPUB fixture validation and richer rendering remain |
 | LLM-001 | Optional local Ollama extraction is provisional, passage-linked, provenance-bearing and never silently promotes facts or edits prose. | Existing + strengthened | Optional integration | Deferred |
-| REV-001 | Snapshots, diffs, selective restore and history preserve durable journal behavior and Git compatibility. | Strengthened | Storage/revision UI | Deferred |
+| REV-001 | Snapshots, diffs, selective restore and history preserve durable journal behavior and Git compatibility. | Strengthened | Storage/revision UI | Implemented foundation: verified snapshots, line diffs, range restore through the journal, CLI and TUI history view; visual hunk selection remains |
 | PIPE-001 | Dependency-aware processing runs compilation, analyses, diagnostics, export and reports with visible failures and practical invalidation. | New | Processing service | Deferred |
 | ANA-001 | Character heatmaps/interactions, subplot gaps, budget previews and uncertainty-aware chronology reports are read-only projections. | Existing + strengthened | Analysis/TUI | Deferred |
 

@@ -13,6 +13,7 @@ use uuid::Uuid;
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_links_queries.sql");
 const MIGRATION_3: &str = include_str!("../migrations/0003_reading.sql");
+const MIGRATION_4: &str = include_str!("../migrations/0004_snapshots.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -147,6 +148,25 @@ pub struct ReadingTermRecord {
     pub aliases: String,
     pub description: String,
 }
+#[derive(Clone, Debug)]
+pub struct SnapshotRecord {
+    pub id: SnapshotId,
+    pub scene_id: SceneId,
+    pub label: String,
+    pub sha256: String,
+    pub created_at: String,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SnapshotLineKind {
+    Equal,
+    Added,
+    Removed,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotDiffLine {
+    pub kind: SnapshotLineKind,
+    pub text: String,
+}
 type CustomDefaultRow = (
     String,
     String,
@@ -244,7 +264,7 @@ impl ProjectStore {
         )?;
         let conn = Connection::open(root.join("story.db"))?;
         configure(&conn)?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\nCOMMIT;", now(),now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\nCOMMIT;", now(),now(),now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now])?;
         Ok(Self {
@@ -276,7 +296,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 3 {
+        if version > 4 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -289,6 +309,10 @@ impl ProjectStore {
         }
         if current_version == 2 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\nCOMMIT;", now()))?;
+            current_version = 3;
+        }
+        if current_version == 3 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -750,6 +774,155 @@ impl ProjectStore {
                 self.get_scene(id)
             })
             .collect()
+    }
+    pub fn create_snapshot(&mut self, scene: SceneId, label: &str) -> Result<SnapshotId> {
+        let (text, hash) = self.load_text(scene)?;
+        let id = SnapshotId::new();
+        let relative = format!(".writers-ide/snapshots/{scene}/{id}.md");
+        let target = self.safe_path(Path::new(&relative))?;
+        fs::create_dir_all(
+            target
+                .parent()
+                .ok_or_else(|| StorageError::Invalid("snapshot has no parent directory".into()))?,
+        )?;
+        atomic_write(&target, text.as_bytes())?;
+        let result=self.conn.execute("INSERT INTO scene_snapshot(id,scene_id,label,relative_path,sha256,byte_length,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![id.to_string(),scene.to_string(),label,relative,hash,text.len() as i64,now()]);
+        if let Err(error) = result {
+            let _ = fs::remove_file(target);
+            return Err(error.into());
+        }
+        Ok(id)
+    }
+    pub fn list_snapshots(&self, scene: SceneId) -> Result<Vec<SnapshotRecord>> {
+        let mut q=self.conn.prepare("SELECT id,label,sha256,created_at FROM scene_snapshot WHERE scene_id=?1 ORDER BY created_at DESC,id DESC")?;
+        let rows = q.query_map([scene.to_string()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, label, sha256, created_at) = row?;
+            Ok::<SnapshotRecord, rusqlite::Error>(SnapshotRecord {
+                id: SnapshotId(Uuid::parse_str(&id).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                scene_id: scene,
+                label,
+                sha256,
+                created_at,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
+    pub fn load_snapshot(&self, id: SnapshotId) -> Result<(SnapshotRecord, String)> {
+        let row:(String,String,String,String,String)=self.conn.query_row("SELECT scene_id,label,relative_path,sha256,created_at FROM scene_snapshot WHERE id=?1",[id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?))).optional()?.ok_or_else(||StorageError::NotFound(id.to_string()))?;
+        let scene =
+            SceneId(Uuid::parse_str(&row.0).map_err(|e| StorageError::Invalid(e.to_string()))?);
+        let text = fs::read_to_string(self.safe_path(Path::new(&row.2))?)?;
+        if hash_bytes(text.as_bytes()) != row.3 {
+            return Err(StorageError::Conflict(format!(
+                "snapshot {id} was modified externally"
+            )));
+        }
+        Ok((
+            SnapshotRecord {
+                id,
+                scene_id: scene,
+                label: row.1,
+                sha256: row.3,
+                created_at: row.4,
+            },
+            text,
+        ))
+    }
+    pub fn diff_snapshot(
+        &self,
+        scene: SceneId,
+        snapshot: SnapshotId,
+    ) -> Result<Vec<SnapshotDiffLine>> {
+        let (record, old) = self.load_snapshot(snapshot)?;
+        if record.scene_id != scene {
+            return Err(StorageError::Invalid(
+                "snapshot belongs to a different scene".into(),
+            ));
+        }
+        let (current, _) = self.load_text(scene)?;
+        Ok(line_diff(&old, &current))
+    }
+    pub fn restore_snapshot(
+        &mut self,
+        scene: SceneId,
+        snapshot: SnapshotId,
+        expected_hash: &str,
+    ) -> Result<String> {
+        let (record, text) = self.load_snapshot(snapshot)?;
+        if record.scene_id != scene {
+            return Err(StorageError::Invalid(
+                "snapshot belongs to a different scene".into(),
+            ));
+        }
+        self.create_snapshot(scene, &format!("Before restore: {}", record.label))?;
+        self.save_text(scene, Some(expected_hash), &text)
+    }
+    pub fn restore_snapshot_lines(
+        &mut self,
+        scene: SceneId,
+        snapshot: SnapshotId,
+        expected_hash: &str,
+        selection: SnapshotRestoreSelection,
+    ) -> Result<String> {
+        let SnapshotRestoreSelection {
+            current_start,
+            current_end,
+            snapshot_start,
+            snapshot_end,
+        } = selection;
+        let (record, old) = self.load_snapshot(snapshot)?;
+        if record.scene_id != scene {
+            return Err(StorageError::Invalid(
+                "snapshot belongs to a different scene".into(),
+            ));
+        }
+        let (current, hash) = self.load_text(scene)?;
+        if hash != expected_hash {
+            return Err(StorageError::Conflict(
+                "scene changed before selective restore".into(),
+            ));
+        }
+        let current_lines: Vec<&str> = current.split_inclusive('\n').collect();
+        let old_lines: Vec<&str> = old.split_inclusive('\n').collect();
+        if current_start > current_end
+            || current_end > current_lines.len()
+            || snapshot_start > snapshot_end
+            || snapshot_end > old_lines.len()
+        {
+            return Err(StorageError::Invalid(
+                "snapshot restore line range is out of bounds".into(),
+            ));
+        }
+        let mut merged = String::new();
+        for line in &current_lines[..current_start] {
+            merged.push_str(line);
+        }
+        for line in &old_lines[snapshot_start..snapshot_end] {
+            merged.push_str(line);
+        }
+        for line in &current_lines[current_end..] {
+            merged.push_str(line);
+        }
+        self.create_snapshot(
+            scene,
+            &format!("Before selective restore: {}", record.label),
+        )?;
+        self.save_text(scene, Some(expected_hash), &merged)
     }
     pub fn update_scene(&mut self, scene: &Scene) -> Result<()> {
         StoryTime::new(
@@ -2573,6 +2746,74 @@ fn unique_occurrence(text: &str, quote: &str) -> Option<(usize, usize)> {
         Some((start, start + matched.len()))
     }
 }
+fn line_diff(old: &str, new: &str) -> Vec<SnapshotDiffLine> {
+    let a: Vec<&str> = old.split_inclusive('\n').collect();
+    let b: Vec<&str> = new.split_inclusive('\n').collect();
+    let cells = (a.len() + 1).saturating_mul(b.len() + 1);
+    if cells > 4_000_000 {
+        let mut out = Vec::new();
+        let mut prefix = 0;
+        while prefix < a.len().min(b.len()) && a[prefix] == b[prefix] {
+            out.push(SnapshotDiffLine {
+                kind: SnapshotLineKind::Equal,
+                text: a[prefix].into(),
+            });
+            prefix += 1;
+        }
+        for line in &a[prefix..] {
+            out.push(SnapshotDiffLine {
+                kind: SnapshotLineKind::Removed,
+                text: (*line).into(),
+            });
+        }
+        for line in &b[prefix..] {
+            out.push(SnapshotDiffLine {
+                kind: SnapshotLineKind::Added,
+                text: (*line).into(),
+            });
+        }
+        return out;
+    }
+    let width = b.len() + 1;
+    let mut lcs = vec![0u32; cells];
+    for i in (0..a.len()).rev() {
+        for j in (0..b.len()).rev() {
+            let at = i * width + j;
+            lcs[at] = if a[i] == b[j] {
+                lcs[(i + 1) * width + j + 1] + 1
+            } else {
+                lcs[(i + 1) * width + j].max(lcs[i * width + j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0, 0);
+    let mut result = Vec::new();
+    while i < a.len() || j < b.len() {
+        if i < a.len() && j < b.len() && a[i] == b[j] {
+            result.push(SnapshotDiffLine {
+                kind: SnapshotLineKind::Equal,
+                text: a[i].into(),
+            });
+            i += 1;
+            j += 1;
+        } else if i < a.len()
+            && (j == b.len() || lcs[(i + 1) * width + j] >= lcs[i * width + j + 1])
+        {
+            result.push(SnapshotDiffLine {
+                kind: SnapshotLineKind::Removed,
+                text: a[i].into(),
+            });
+            i += 1;
+        } else {
+            result.push(SnapshotDiffLine {
+                kind: SnapshotLineKind::Added,
+                text: b[j].into(),
+            });
+            j += 1;
+        }
+    }
+    result
+}
 fn hash_file(p: &Path) -> Result<String> {
     let mut f = File::open(p)?;
     let mut h = Sha256::new();
@@ -3010,7 +3251,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TRIGGER reading_entity_target_insert; DROP TRIGGER reading_fts_insert; DROP TRIGGER reading_fts_update; DROP TRIGGER reading_fts_delete; DROP TABLE reading_entity_link; DROP TABLE reading_term; DROP TABLE reading_checkpoint; DROP TABLE reading_bookmark; DROP TABLE reading_annotation; DROP TABLE reading_fts; DROP TABLE reading_document; DROP TRIGGER scene_fts_insert; DROP TRIGGER scene_fts_update; DROP TRIGGER scene_fts_delete; DROP TABLE story_link; DROP TABLE passage_anchor; DROP TABLE saved_query_filter; DROP TABLE saved_query; DROP TABLE scene_issue; DROP TABLE story_issue; DROP TABLE scene_fts; DROP TABLE scene_search_content; DROP TABLE research_item; DELETE FROM schema_migrations WHERE version>1;").unwrap();
+        conn.execute_batch("DROP TABLE scene_snapshot; DROP TRIGGER reading_entity_target_insert; DROP TRIGGER reading_fts_insert; DROP TRIGGER reading_fts_update; DROP TRIGGER reading_fts_delete; DROP TABLE reading_entity_link; DROP TABLE reading_term; DROP TABLE reading_checkpoint; DROP TABLE reading_bookmark; DROP TABLE reading_annotation; DROP TABLE reading_fts; DROP TABLE reading_document; DROP TRIGGER scene_fts_insert; DROP TRIGGER scene_fts_update; DROP TRIGGER scene_fts_delete; DROP TABLE story_link; DROP TABLE passage_anchor; DROP TABLE saved_query_filter; DROP TABLE saved_query; DROP TABLE scene_issue; DROP TABLE story_issue; DROP TABLE scene_fts; DROP TABLE scene_search_content; DROP TABLE research_item; DELETE FROM schema_migrations WHERE version>1;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -3020,7 +3261,57 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 3);
+        assert_eq!(version, 4);
+    }
+
+    #[test]
+    fn snapshots_diff_selective_restore_and_full_restore_round_trip() {
+        let d = tempdir().unwrap();
+        let mut st = ProjectStore::create(d.path().join("N"), "Novel").unwrap();
+        let chapter = st.create_node(None, NodeKind::Chapter, "Ch", 0).unwrap();
+        let scene = st.create_scene(chapter, 0, "Scene").unwrap();
+        let (_, hash) = st.load_text(scene).unwrap();
+        st.save_text(scene, Some(&hash), "Opening\nOld middle\nEnding\n")
+            .unwrap();
+        let snapshot = st.create_snapshot(scene, "First draft").unwrap();
+        let (_, hash) = st.load_text(scene).unwrap();
+        st.save_text(scene, Some(&hash), "Opening\nNew middle\nEnding\n")
+            .unwrap();
+        let diff = st.diff_snapshot(scene, snapshot).unwrap();
+        assert!(
+            diff.iter()
+                .any(|line| line.kind == SnapshotLineKind::Removed && line.text == "Old middle\n")
+        );
+        assert!(
+            diff.iter()
+                .any(|line| line.kind == SnapshotLineKind::Added && line.text == "New middle\n")
+        );
+        let (_, hash) = st.load_text(scene).unwrap();
+        st.restore_snapshot_lines(
+            scene,
+            snapshot,
+            &hash,
+            SnapshotRestoreSelection {
+                current_start: 1,
+                current_end: 2,
+                snapshot_start: 1,
+                snapshot_end: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            st.load_text(scene).unwrap().0,
+            "Opening\nOld middle\nEnding\n"
+        );
+        let (_, hash) = st.load_text(scene).unwrap();
+        st.save_text(scene, Some(&hash), "A later edit\n").unwrap();
+        let (_, hash) = st.load_text(scene).unwrap();
+        st.restore_snapshot(scene, snapshot, &hash).unwrap();
+        assert_eq!(
+            st.load_text(scene).unwrap().0,
+            "Opening\nOld middle\nEnding\n"
+        );
+        assert!(st.list_snapshots(scene).unwrap().len() >= 3);
     }
     #[test]
     fn create_reopen_relocate_and_save_scene() {
