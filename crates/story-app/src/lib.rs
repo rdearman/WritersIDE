@@ -477,6 +477,16 @@ impl WriterApp {
     pub fn search_scenes(&self, terms: &str) -> Result<Vec<SceneId>> {
         Ok(self.store.search_scenes(terms)?)
     }
+    pub fn search_project(
+        &self,
+        terms: &str,
+        limit: u32,
+    ) -> Result<Vec<story_storage::ProjectSearchHit>> {
+        Ok(self.store.search_project(terms, limit)?)
+    }
+    pub fn rebuild_project_search_index(&mut self) -> Result<()> {
+        Ok(self.store.rebuild_project_search_index()?)
+    }
     pub fn define_custom_field(&mut self, def: &CustomFieldDefinition) -> Result<()> {
         Ok(self.store.define_custom_field(def)?)
     }

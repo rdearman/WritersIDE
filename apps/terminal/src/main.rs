@@ -93,6 +93,7 @@ struct AppState {
     reading_focus: bool,
     reading_selection_start: Option<u64>,
     function_bindings: Vec<(u8, Workspace)>,
+    search_hits: Vec<story_storage::ProjectSearchHit>,
     editor_selection: Option<(usize, usize)>,
     clipboard: String,
 }
@@ -171,6 +172,74 @@ impl AppState {
         Ok(())
     }
     fn open_selected(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace == Workspace::Search && !self.search_hits.is_empty() {
+            let hit = self
+                .search_hits
+                .get(self.selected)
+                .cloned()
+                .ok_or("search selection is out of range")?;
+            self.search_hits.clear();
+            match hit.entity_kind.as_str() {
+                "scene" => {
+                    let id = SceneId(hit.entity_id.parse()?);
+                    self.selected = self
+                        .scenes
+                        .iter()
+                        .position(|scene| scene.0 == id)
+                        .ok_or("search scene no longer exists")?;
+                    return self.open_selected();
+                }
+                "reading" => {
+                    let id = story_core::ReadingId(hit.entity_id.parse()?);
+                    let docs = self.app.list_reading_documents()?;
+                    self.selected = docs
+                        .iter()
+                        .position(|doc| doc.id == id)
+                        .ok_or("search reference no longer exists")?;
+                    self.switch(Workspace::Reading);
+                    return self.open_reading_selected();
+                }
+                "character" => {
+                    let id = story_core::CharacterId(hit.entity_id.parse()?);
+                    self.selected = self
+                        .app
+                        .list_characters()?
+                        .iter()
+                        .position(|x| x.id == id)
+                        .ok_or("search character no longer exists")?;
+                    self.switch(Workspace::Characters);
+                    return Ok(());
+                }
+                "plotline" => {
+                    let id = story_core::PlotlineId(hit.entity_id.parse()?);
+                    self.selected = self
+                        .app
+                        .list_plotlines()?
+                        .iter()
+                        .position(|x| x.id == id)
+                        .ok_or("search plotline no longer exists")?;
+                    self.switch(Workspace::PlotGrid);
+                    return Ok(());
+                }
+                "research" => {
+                    let id = story_core::ResearchId(hit.entity_id.parse()?);
+                    self.selected = self
+                        .app
+                        .list_research_items()?
+                        .iter()
+                        .position(|x| x.id == id)
+                        .ok_or("search research item no longer exists")?;
+                    self.switch(Workspace::Research);
+                    return Ok(());
+                }
+                "event" | "location" | "issue" => {
+                    self.switch(Workspace::StoryBible);
+                    self.message = format!("Selected {}: {}", hit.entity_kind, hit.title);
+                    return Ok(());
+                }
+                kind => return Err(format!("unsupported search entity kind: {kind}").into()),
+            }
+        }
         if let Some(id) = self.active_scene() {
             if self.dirty && self.editing_scene != Some(id) {
                 self.message =
@@ -827,10 +896,15 @@ impl AppState {
             self.selected = 0;
             self.workspace = Workspace::Search;
             self.message = format!("{} matching scenes", self.scenes.len());
+        } else if let Some(terms) = cmd.strip_prefix("search-all ") {
+            self.search_hits = self.app.search_project(terms, 200)?;
+            self.selected = 0;
+            self.switch(Workspace::Search);
+            self.message = format!("{} project-wide matches", self.search_hits.len());
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | plotline NAME | issue TITLE | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | plotline NAME | issue TITLE | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -1051,6 +1125,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reading_focus: false,
         reading_selection_start: None,
         function_bindings,
+        search_hits: Vec::new(),
         editor_selection: None,
         clipboard: String::new(),
     };
@@ -1323,7 +1398,19 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 })
                 .collect()
         }
-        Workspace::Cards | Workspace::Search => s
+        Workspace::Cards => s
+            .scenes
+            .iter()
+            .map(|(_, title, status, words)| {
+                format!("{title}   {}   {words} words", status.as_str())
+            })
+            .collect(),
+        Workspace::Search if !s.search_hits.is_empty() => s
+            .search_hits
+            .iter()
+            .map(|hit| format!("{} · {} · {}", hit.entity_kind, hit.title, hit.excerpt))
+            .collect(),
+        Workspace::Search => s
             .scenes
             .iter()
             .map(|(_, title, status, words)| {
@@ -1870,6 +1957,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            search_hits: Vec::new(),
             editor_selection: Some((0, 2)),
             clipboard: String::new(),
         };
@@ -1922,6 +2010,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            search_hits: Vec::new(),
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -1966,6 +2055,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            search_hits: Vec::new(),
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -2022,6 +2112,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            search_hits: Vec::new(),
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -2115,6 +2206,19 @@ mod tests {
             state.app.list_research_items().unwrap()[0].title,
             "City history"
         );
+        state.mode = Some(':');
+        state.prompt = "search-all founding records".into();
+        state.command().unwrap();
+        assert_eq!(state.workspace, Workspace::Search);
+        assert_eq!(state.search_hits.len(), 1);
+        assert!(workspace_items(&state)[0].contains("City history"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Research);
+        assert!(state.search_hits.is_empty());
     }
 
     #[test]
@@ -2143,6 +2247,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            search_hits: Vec::new(),
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -2199,6 +2304,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            search_hits: Vec::new(),
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -2257,6 +2363,7 @@ mod tests {
             reading_focus: true,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            search_hits: Vec::new(),
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -2298,6 +2405,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            search_hits: Vec::new(),
             editor_selection: None,
             clipboard: String::new(),
         };

@@ -106,6 +106,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{scene}");
             }
         }
+        "search-all" => {
+            let path = args.next().ok_or("missing project path")?;
+            let terms = args.collect::<Vec<_>>().join(" ");
+            let app = WriterApp::open_project(path)?;
+            for hit in app.search_project(&terms, 100)? {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    hit.entity_kind, hit.entity_id, hit.title, hit.excerpt
+                );
+            }
+        }
+        "rebuild-search" => {
+            let path = args.next().ok_or("missing project path")?;
+            let mut app = WriterApp::open_project(path)?;
+            app.rebuild_project_search_index()?;
+            println!("Project search index rebuilt.");
+        }
         "query-save" => {
             let path = args.next().ok_or("missing project path")?;
             let name = args.next().ok_or("missing query name")?;
@@ -407,6 +424,7 @@ fn usage() {
     eprintln!(
         "writers-ide anchors <path> <scene-uuid>\nwriters-ide anchor-move <path> <anchor-uuid> <start-byte> <end-byte>"
     );
+    eprintln!("writers-ide search-all <path> <terms>\nwriters-ide rebuild-search <path>");
 }
 fn parse_status(value: &str) -> Result<story_core::SceneStatus, Box<dyn std::error::Error>> {
     use story_core::SceneStatus::*;

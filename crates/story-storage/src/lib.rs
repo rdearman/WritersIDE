@@ -14,6 +14,7 @@ const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_links_queries.sql");
 const MIGRATION_3: &str = include_str!("../migrations/0003_reading.sql");
 const MIGRATION_4: &str = include_str!("../migrations/0004_snapshots.sql");
+const MIGRATION_5: &str = include_str!("../migrations/0005_project_search.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -89,6 +90,13 @@ pub struct PassageAnchorRecord {
     pub quote: String,
     pub state: String,
     pub source_hash: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectSearchHit {
+    pub entity_kind: String,
+    pub entity_id: String,
+    pub title: String,
+    pub excerpt: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscludedPassage {
@@ -298,7 +306,7 @@ impl ProjectStore {
         )?;
         let conn = Connection::open(root.join("story.db"))?;
         configure(&conn)?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\nCOMMIT;", now(),now(),now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\nCOMMIT;", now(),now(),now(),now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now])?;
         Ok(Self {
@@ -330,7 +338,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 4 {
+        if version > 5 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -347,6 +355,10 @@ impl ProjectStore {
         }
         if current_version == 3 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\nCOMMIT;", now()))?;
+            current_version = 4;
+        }
+        if current_version == 4 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -2656,6 +2668,30 @@ impl ProjectStore {
             })
             .collect()
     }
+    pub fn search_project(&self, terms: &str, limit: u32) -> Result<Vec<ProjectSearchHit>> {
+        if terms.trim().is_empty() || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut query = self.conn.prepare("SELECT entity_kind,entity_id,title,snippet(project_search_fts,3,'[',']','…',12) FROM project_search_fts WHERE project_search_fts MATCH ?1 ORDER BY bm25(project_search_fts),entity_kind,entity_id LIMIT ?2")?;
+        Ok(query
+            .query_map(params![terms, limit], |row| {
+                Ok(ProjectSearchHit {
+                    entity_kind: row.get(0)?,
+                    entity_id: row.get(1)?,
+                    title: row.get(2)?,
+                    excerpt: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+    pub fn rebuild_project_search_index(&mut self) -> Result<()> {
+        self.conn.execute("DELETE FROM project_search_fts", [])?;
+        self.conn.execute(
+            "INSERT INTO project_search_fts(rowid,entity_kind,entity_id,title,content) SELECT row_id,entity_kind,entity_id,title,content FROM project_search_content",
+            [],
+        )?;
+        Ok(())
+    }
     fn rebuild_scene_index(&mut self) -> Result<()> {
         let ids: Vec<String> = {
             let mut q = self
@@ -3581,6 +3617,63 @@ mod tests {
     }
 
     #[test]
+    fn project_search_indexes_entities_and_updates_incrementally() {
+        let d = tempdir().unwrap();
+        let mut store = ProjectStore::create(d.path().join("SearchNovel"), "Search").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Scene").unwrap();
+        let (_, hash) = store.load_text(scene).unwrap();
+        store
+            .save_text(
+                scene,
+                Some(&hash),
+                "A silver key waits beneath the floorboards.",
+            )
+            .unwrap();
+        let character = CharacterId::new();
+        store.add_character(character, "Mara Venn").unwrap();
+        let research = store
+            .create_research_item(
+                "Archive notes",
+                "silver key provenance",
+                "text/plain",
+                None,
+                None,
+            )
+            .unwrap();
+
+        let hits = store.search_project("silver", 20).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(
+            hits.iter()
+                .any(|hit| hit.entity_kind == "scene" && hit.entity_id == scene.to_string())
+        );
+        assert!(
+            hits.iter()
+                .any(|hit| hit.entity_kind == "research" && hit.entity_id == research.to_string())
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE character SET name='Mara North' WHERE id=?1",
+                [character.to_string()],
+            )
+            .unwrap();
+        let hits = store.search_project("North", 20).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entity_kind, "character");
+        store.rebuild_project_search_index().unwrap();
+        assert_eq!(
+            store.search_project("floorboards", 20).unwrap()[0].entity_id,
+            scene.to_string()
+        );
+        assert!(store.search_project("   ", 20).unwrap().is_empty());
+        assert!(store.search_project("floorboards", 0).unwrap().is_empty());
+    }
+
+    #[test]
     fn reading_copy_annotations_search_and_reanchoring_are_persistent() {
         let d = tempdir().unwrap();
         let project = d.path().join("Novel");
@@ -3653,7 +3746,7 @@ mod tests {
     }
 
     #[test]
-    fn version_one_projects_migrate_and_rebuild_text_index() {
+    fn version_four_projects_migrate_and_build_project_search_index() {
         let d = tempdir().unwrap();
         let project = d.path().join("N");
         let mut st = ProjectStore::create(&project, "Novel").unwrap();
@@ -3664,7 +3757,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TABLE scene_snapshot; DROP TRIGGER reading_entity_target_insert; DROP TRIGGER reading_fts_insert; DROP TRIGGER reading_fts_update; DROP TRIGGER reading_fts_delete; DROP TABLE reading_entity_link; DROP TABLE reading_term; DROP TABLE reading_checkpoint; DROP TABLE reading_bookmark; DROP TABLE reading_annotation; DROP TABLE reading_fts; DROP TABLE reading_document; DROP TRIGGER scene_fts_insert; DROP TRIGGER scene_fts_update; DROP TRIGGER scene_fts_delete; DROP TABLE story_link; DROP TABLE passage_anchor; DROP TABLE saved_query_filter; DROP TABLE saved_query; DROP TABLE scene_issue; DROP TABLE story_issue; DROP TABLE scene_fts; DROP TABLE scene_search_content; DROP TABLE research_item; DELETE FROM schema_migrations WHERE version>1;").unwrap();
+        conn.execute_batch("DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TABLE project_search_fts; DROP TABLE project_search_content; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -3674,7 +3767,9 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
+        let hits = st.search_project("obsidian", 10).unwrap();
+        assert_eq!(hits[0].entity_id, scene.to_string());
     }
 
     #[test]
