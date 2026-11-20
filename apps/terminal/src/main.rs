@@ -10,7 +10,7 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
@@ -93,6 +93,8 @@ struct AppState {
     reading_focus: bool,
     reading_selection_start: Option<u64>,
     function_bindings: Vec<(u8, Workspace)>,
+    editor_selection: Option<(usize, usize)>,
+    clipboard: String,
 }
 
 #[derive(Deserialize)]
@@ -790,6 +792,7 @@ impl AppState {
         Ok(())
     }
     fn insert(&mut self, ch: char) {
+        self.delete_selection();
         let (row, col) = self.cursor;
         let line = &mut self.editor[row];
         let byte = line
@@ -802,6 +805,9 @@ impl AppState {
         self.dirty = true;
     }
     fn backspace(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let (row, col) = self.cursor;
         if col > 0 {
             let line = &mut self.editor[row];
@@ -827,6 +833,9 @@ impl AppState {
         }
     }
     fn delete_forward(&mut self) {
+        if self.delete_selection() {
+            return;
+        }
         let (row, col) = self.cursor;
         let count = self.editor[row].chars().count();
         if col < count {
@@ -850,6 +859,7 @@ impl AppState {
         }
     }
     fn paste_text(&mut self, text: &str) {
+        self.delete_selection();
         for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
             if ch == '\n' {
                 self.enter()
@@ -859,6 +869,7 @@ impl AppState {
         }
     }
     fn enter(&mut self) {
+        self.delete_selection();
         let (row, col) = self.cursor;
         let line = &mut self.editor[row];
         let byte = line
@@ -870,6 +881,63 @@ impl AppState {
         self.editor.insert(row + 1, tail);
         self.cursor = (row + 1, 0);
         self.dirty = true;
+    }
+    fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
+        let anchor = self.editor_selection?;
+        if anchor == self.cursor {
+            return None;
+        }
+        Some(if anchor < self.cursor {
+            (anchor, self.cursor)
+        } else {
+            (self.cursor, anchor)
+        })
+    }
+    fn selected_text(&self) -> Option<String> {
+        let ((start_row, start_col), (end_row, end_col)) = self.selection_bounds()?;
+        if start_row == end_row {
+            return Some(
+                self.editor[start_row]
+                    .chars()
+                    .skip(start_col)
+                    .take(end_col - start_col)
+                    .collect(),
+            );
+        }
+        let mut lines = Vec::new();
+        lines.push(
+            self.editor[start_row]
+                .chars()
+                .skip(start_col)
+                .collect::<String>(),
+        );
+        lines.extend(self.editor[start_row + 1..end_row].iter().cloned());
+        lines.push(self.editor[end_row].chars().take(end_col).collect());
+        Some(lines.join("\n"))
+    }
+    fn delete_selection(&mut self) -> bool {
+        let Some(((start_row, start_col), (end_row, end_col))) = self.selection_bounds() else {
+            return false;
+        };
+        let prefix: String = self.editor[start_row].chars().take(start_col).collect();
+        let suffix: String = self.editor[end_row].chars().skip(end_col).collect();
+        self.editor[start_row] = format!("{prefix}{suffix}");
+        if end_row > start_row {
+            self.editor.drain(start_row + 1..=end_row);
+        }
+        self.cursor = (start_row, start_col);
+        self.editor_selection = None;
+        self.dirty = true;
+        true
+    }
+    fn move_cursor(&mut self, row: usize, col: usize, selecting: bool) {
+        if selecting {
+            self.editor_selection.get_or_insert(self.cursor);
+        } else {
+            self.editor_selection = None;
+        }
+        let row = row.min(self.editor.len().saturating_sub(1));
+        self.cursor = (row, col.min(self.editor[row].chars().count()));
     }
     fn create_reading_selection(
         &mut self,
@@ -940,6 +1008,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reading_focus: false,
         reading_selection_start: None,
         function_bindings,
+        editor_selection: None,
+        clipboard: String::new(),
     };
     state.refresh()?;
     let mut terminal = setup()?;
@@ -1033,20 +1103,32 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         .block(Block::default().title("Scenes").borders(Borders::ALL));
         let mut state = ListState::default().with_selected(Some(s.selected));
         f.render_stateful_widget(list, body[0], &mut state);
+        let selection = s.selection_bounds();
         let content = s
             .editor
             .iter()
             .enumerate()
             .skip(s.scroll)
-            .map(|(i, line)| {
-                if i == s.cursor.0 {
-                    format!("> {line}")
-                } else {
-                    format!("  {line}")
+            .map(|(row, line)| {
+                let prefix = if row == s.cursor.0 { "> " } else { "  " };
+                let mut spans = vec![Span::raw(prefix)];
+                for (col, ch) in line.chars().enumerate() {
+                    let selected = selection.is_some_and(|((sr, sc), (er, ec))| {
+                        (row > sr || (row == sr && col >= sc))
+                            && (row < er || (row == er && col < ec))
+                    });
+                    if selected {
+                        spans.push(Span::styled(
+                            ch.to_string(),
+                            Style::default().fg(Color::White).bg(Color::Blue),
+                        ));
+                    } else {
+                        spans.push(Span::raw(ch.to_string()));
+                    }
                 }
+                Line::from(spans)
             })
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect::<Vec<_>>();
         let editor = Paragraph::new(content).wrap(Wrap { trim: false }).block(
             Block::default()
                 .title(format!("Editor — {}", s.selected_scene()))
@@ -1507,12 +1589,38 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(true);
     }
     if s.workspace == Workspace::Editor {
+        if k.modifiers.contains(KeyModifiers::CONTROL) {
+            match k.code {
+                KeyCode::Char('c') => {
+                    if let Some(text) = s.selected_text() {
+                        s.clipboard = text;
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('x') => {
+                    if let Some(text) = s.selected_text() {
+                        s.clipboard = text;
+                        s.delete_selection();
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('v') => {
+                    let text = s.clipboard.clone();
+                    s.paste_text(&text);
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+        let selecting = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
             KeyCode::Enter => s.enter(),
             KeyCode::Backspace => s.backspace(),
             KeyCode::Delete => s.delete_forward(),
-            KeyCode::Home => s.cursor.1 = 0,
-            KeyCode::End => s.cursor.1 = s.editor[s.cursor.0].chars().count(),
+            KeyCode::Home => s.move_cursor(s.cursor.0, 0, selecting),
+            KeyCode::End => {
+                s.move_cursor(s.cursor.0, s.editor[s.cursor.0].chars().count(), selecting)
+            }
             KeyCode::Char('w') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 let row = s.cursor.0;
                 while s.cursor.1 > 0
@@ -1532,12 +1640,20 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     s.backspace();
                 }
             }
-            KeyCode::Left => s.cursor.1 = s.cursor.1.saturating_sub(1),
-            KeyCode::Right => {
-                s.cursor.1 = (s.cursor.1 + 1).min(s.editor[s.cursor.0].chars().count())
+            KeyCode::Left => s.move_cursor(s.cursor.0, s.cursor.1.saturating_sub(1), selecting),
+            KeyCode::Right => s.move_cursor(
+                s.cursor.0,
+                (s.cursor.1 + 1).min(s.editor[s.cursor.0].chars().count()),
+                selecting,
+            ),
+            KeyCode::Up => {
+                let row = s.cursor.0.saturating_sub(1);
+                s.move_cursor(row, s.cursor.1, selecting);
             }
-            KeyCode::Up => s.cursor.0 = s.cursor.0.saturating_sub(1),
-            KeyCode::Down => s.cursor.0 = (s.cursor.0 + 1).min(s.editor.len() - 1),
+            KeyCode::Down => {
+                let row = (s.cursor.0 + 1).min(s.editor.len() - 1);
+                s.move_cursor(row, s.cursor.1, selecting);
+            }
             KeyCode::Char(c) if k.modifiers.is_empty() => s.insert(c),
             KeyCode::Esc => s.switch(Workspace::Outline),
             _ => {}
@@ -1592,6 +1708,102 @@ mod tests {
     use crossterm::event::KeyModifiers;
 
     #[test]
+    fn editor_selection_copy_cut_and_paste_preserve_multiline_text() {
+        let mut state = AppState {
+            app: WriterApp::create_project(tempfile::tempdir().unwrap().path().join("N"), "N")
+                .unwrap(),
+            workspace: Workspace::Editor,
+            scenes: Vec::new(),
+            selected: 0,
+            editor: vec!["alpha".into(), "beta".into()],
+            editing_scene: None,
+            cursor: (1, 2),
+            saved_hash: String::new(),
+            dirty: false,
+            mode: None,
+            prompt: String::new(),
+            message: String::new(),
+            history: vec![Workspace::Editor],
+            history_index: 0,
+            width: 80,
+            scroll: 0,
+            reading_document: None,
+            reading_text: String::new(),
+            reading_offset: 0,
+            reading_focus: false,
+            reading_selection_start: None,
+            function_bindings: default_bindings(),
+            editor_selection: Some((0, 2)),
+            clipboard: String::new(),
+        };
+        assert_eq!(state.selected_text().as_deref(), Some("pha\nbe"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.clipboard, "pha\nbe");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.editor, vec!["alta"]);
+        assert_eq!(state.cursor, (0, 2));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.editor, vec!["alpha", "beta"]);
+        assert!(state.dirty);
+    }
+
+    #[test]
+    fn editor_shift_arrows_extend_and_plain_arrows_clear_selection() {
+        let mut state = AppState {
+            app: WriterApp::create_project(tempfile::tempdir().unwrap().path().join("N"), "N")
+                .unwrap(),
+            workspace: Workspace::Editor,
+            scenes: Vec::new(),
+            selected: 0,
+            editor: vec!["hello".into()],
+            editing_scene: None,
+            cursor: (0, 1),
+            saved_hash: String::new(),
+            dirty: false,
+            mode: None,
+            prompt: String::new(),
+            message: String::new(),
+            history: vec![Workspace::Editor],
+            history_index: 0,
+            width: 80,
+            scroll: 0,
+            reading_document: None,
+            reading_text: String::new(),
+            reading_offset: 0,
+            reading_focus: false,
+            reading_selection_start: None,
+            function_bindings: default_bindings(),
+            editor_selection: None,
+            clipboard: String::new(),
+        };
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        assert_eq!(state.selected_text().as_deref(), Some("e"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor_selection, None);
+        assert_eq!(state.cursor, (0, 3));
+    }
+
+    #[test]
     fn editor_keeps_dirty_scene_identity_and_refuses_silent_switch() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
@@ -1627,6 +1839,8 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            editor_selection: None,
+            clipboard: String::new(),
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -1686,6 +1900,8 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            editor_selection: None,
+            clipboard: String::new(),
         };
         assert!(
             !handle(
@@ -1740,6 +1956,8 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            editor_selection: None,
+            clipboard: String::new(),
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -1796,6 +2014,8 @@ mod tests {
             reading_focus: true,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            editor_selection: None,
+            clipboard: String::new(),
         };
         state.mode = Some(':');
         state.prompt = "reading-links".into();
@@ -1835,6 +2055,8 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            editor_selection: None,
+            clipboard: String::new(),
         };
         let execute = |state: &mut AppState, command: String| {
             state.mode = Some(':');
