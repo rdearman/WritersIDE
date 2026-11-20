@@ -11,7 +11,7 @@ use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use story_app::WriterApp;
@@ -1411,7 +1411,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             .constraints([Constraint::Min(1), Constraint::Length(3)])
             .split(body[1]);
         f.render_widget(
-            Paragraph::new(text)
+            Paragraph::new(reading_text_display(&text, &notes))
                 .scroll((s.scroll as u16, 0))
                 .wrap(Wrap { trim: false })
                 .block(
@@ -1485,6 +1485,78 @@ fn pane_direction(width: usize) -> Direction {
     } else {
         Direction::Horizontal
     }
+}
+fn reading_text_display(
+    text: &str,
+    annotations: &[story_storage::ReadingAnnotationRecord],
+) -> Text<'static> {
+    let mut byte_styles = vec![0u8; text.len()];
+    for annotation in annotations
+        .iter()
+        .filter(|annotation| annotation.state == "current")
+    {
+        let Ok(start) = usize::try_from(annotation.start_byte) else {
+            continue;
+        };
+        let Ok(end) = usize::try_from(annotation.end_byte) else {
+            continue;
+        };
+        if start >= end
+            || end > text.len()
+            || !text.is_char_boundary(start)
+            || !text.is_char_boundary(end)
+        {
+            continue;
+        }
+        let style = if annotation.kind == "highlight" { 1 } else { 2 };
+        for byte in &mut byte_styles[start..end] {
+            if *byte == 0 || style == 1 {
+                *byte = style;
+            }
+        }
+    }
+    let style_for = |kind| match kind {
+        1 => Style::default().fg(Color::Black).bg(Color::Yellow),
+        2 => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::UNDERLINED),
+        _ => Style::default(),
+    };
+    let mut lines = Vec::new();
+    let mut line_start = 0usize;
+    for chunk in text.split_inclusive('\n') {
+        let line = chunk.strip_suffix('\n').unwrap_or(chunk);
+        let mut spans = Vec::new();
+        let mut segment_start = 0usize;
+        let mut current_style = line
+            .chars()
+            .next()
+            .map(|_| byte_styles[line_start])
+            .unwrap_or(0);
+        for (offset, _) in line.char_indices() {
+            let kind = byte_styles[line_start + offset];
+            if kind != current_style {
+                spans.push(Span::styled(
+                    line[segment_start..offset].to_owned(),
+                    style_for(current_style),
+                ));
+                segment_start = offset;
+                current_style = kind;
+            }
+        }
+        if !line.is_empty() {
+            spans.push(Span::styled(
+                line[segment_start..].to_owned(),
+                style_for(current_style),
+            ));
+        }
+        lines.push(Line::from(spans));
+        line_start += chunk.len();
+    }
+    if text.is_empty() {
+        lines.push(Line::from(""));
+    }
+    Text::from(lines)
 }
 fn workspace_items(s: &AppState) -> Vec<String> {
     match s.workspace {
@@ -2577,6 +2649,19 @@ mod tests {
         state.command().unwrap();
         assert_eq!(state.reading_offset, passage_offset);
         assert_eq!(state.scroll, 1);
+        let rendered = reading_text_display(
+            &state.reading_text,
+            &state.app.list_reading_annotations(reading).unwrap(),
+        );
+        assert!(
+            rendered
+                .lines
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| {
+                    span.content == "second reference" && span.style.bg == Some(Color::Yellow)
+                })
+        );
         state.mode = Some(':');
         state.prompt = "bookmarks".into();
         state.command().unwrap();
