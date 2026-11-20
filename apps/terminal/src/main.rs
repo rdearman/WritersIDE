@@ -255,6 +255,82 @@ impl AppState {
                 .map(|report| format!("{:?}:{:?}", report.stage, report.status))
                 .collect::<Vec<_>>()
                 .join(" · ");
+        } else if let Some(title) = cmd.strip_prefix("section ") {
+            let position = self
+                .app
+                .list_structural_nodes()?
+                .iter()
+                .filter(|node| node.parent_id.is_none())
+                .count() as u32;
+            let id = self.app.create_section(title.trim(), position)?;
+            self.message = format!("Created section {id}");
+        } else if let Some(title) = cmd.strip_prefix("chapter ") {
+            let position = self
+                .app
+                .list_structural_nodes()?
+                .iter()
+                .filter(|node| node.parent_id.is_none())
+                .count() as u32;
+            let id = self.app.create_chapter(None, title.trim(), position)?;
+            self.message = format!("Created chapter {id}");
+        } else if let Some(rest) = cmd.strip_prefix("subchapter ") {
+            let (parent, title) = rest
+                .split_once(' ')
+                .ok_or("use subchapter <section-uuid> <title>")?;
+            let parent = story_core::NodeId(parent.parse()?);
+            let position = self
+                .app
+                .list_structural_nodes()?
+                .iter()
+                .filter(|node| node.parent_id == Some(parent))
+                .count() as u32;
+            let id = self
+                .app
+                .create_chapter(Some(parent), title.trim(), position)?;
+            self.message = format!("Created chapter {id}");
+        } else if let Some(rest) = cmd.strip_prefix("scene ") {
+            let (chapter, title) = rest
+                .split_once(' ')
+                .ok_or("use scene <chapter-uuid> <title>")?;
+            let chapter = story_core::NodeId(chapter.parse()?);
+            let position = self
+                .app
+                .list_scenes(false)?
+                .iter()
+                .filter(|scene| scene.chapter_id == Some(chapter))
+                .count() as u32;
+            let id = self.app.create_scene(chapter, title.trim(), position)?;
+            self.refresh()?;
+            self.message = format!("Created scene {id}");
+        } else if let Some(rest) = cmd.strip_prefix("move ") {
+            let mut parts = rest.split_whitespace();
+            let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let chapter = story_core::NodeId(parts.next().ok_or("missing chapter UUID")?.parse()?);
+            let position = parts
+                .next()
+                .ok_or("missing destination position")?
+                .parse()?;
+            self.app.move_scene(scene, chapter, position)?;
+            self.refresh()?;
+            self.message = format!("Moved scene {scene}");
+        } else if let Some(rest) = cmd.strip_prefix("rename ") {
+            let (id, title) = rest
+                .split_once(' ')
+                .ok_or("use rename <scene-uuid> <title>")?;
+            let mut scene = self.app.get_scene(SceneId(id.parse()?))?.scene;
+            scene.title = title.trim().into();
+            self.app.update_scene_metadata(&scene)?;
+            self.refresh()?;
+            self.message = format!("Renamed scene {}", scene.id);
+        } else if let Some(rest) = cmd.strip_prefix("scene-status ") {
+            let (id, status) = rest
+                .split_once(' ')
+                .ok_or("use scene-status <scene-uuid> <status>")?;
+            let mut scene = self.app.get_scene(SceneId(id.parse()?))?.scene;
+            scene.status = parse_terminal_status(status.trim())?;
+            self.app.update_scene_metadata(&scene)?;
+            self.refresh()?;
+            self.message = format!("Updated status for {}", scene.id);
         } else if let Some(rest) = cmd.strip_prefix("extract ") {
             let mut args = rest.split_whitespace();
             let source_kind = args
@@ -709,7 +785,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -1096,7 +1172,33 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             ),
             format!("{} words", s.scenes.iter().map(|x| x.3).sum::<u32>()),
         ],
-        Workspace::Outline | Workspace::Cards | Workspace::Search => s
+        Workspace::Outline => {
+            let chapters = s
+                .app
+                .list_structural_nodes()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|node| (node.id, node.title))
+                .collect::<BTreeMap<_, _>>();
+            s.app
+                .list_scenes(false)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|scene| {
+                    let chapter = scene
+                        .chapter_id
+                        .and_then(|id| chapters.get(&id).cloned())
+                        .unwrap_or_else(|| "Unplaced".into());
+                    format!(
+                        "{chapter} / {}   {}   {} words",
+                        scene.scene.title,
+                        scene.scene.status.as_str(),
+                        scene.actual_words
+                    )
+                })
+                .collect()
+        }
+        Workspace::Cards | Workspace::Search => s
             .scenes
             .iter()
             .map(|(_, title, status, words)| {
@@ -1704,5 +1806,92 @@ mod tests {
         state.command().unwrap();
         assert_eq!(state.workspace, Workspace::Characters);
         assert_eq!(state.selected, 0);
+    }
+
+    #[test]
+    fn outline_commands_create_move_rename_and_preserve_scene_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState {
+            app,
+            workspace: Workspace::Outline,
+            scenes: Vec::new(),
+            selected: 0,
+            editor: vec![String::new()],
+            editing_scene: None,
+            cursor: (0, 0),
+            saved_hash: String::new(),
+            dirty: false,
+            mode: None,
+            prompt: String::new(),
+            message: String::new(),
+            history: vec![Workspace::Outline],
+            history_index: 0,
+            width: 80,
+            scroll: 0,
+            reading_document: None,
+            reading_text: String::new(),
+            reading_offset: 0,
+            reading_focus: false,
+            reading_selection_start: None,
+            function_bindings: default_bindings(),
+        };
+        let execute = |state: &mut AppState, command: String| {
+            state.mode = Some(':');
+            state.prompt = command;
+            state.command().unwrap();
+        };
+        execute(&mut state, "section Act I".into());
+        let section = state
+            .app
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|node| node.kind == "section")
+            .unwrap()
+            .id;
+        execute(&mut state, format!("subchapter {section} Chapter One"));
+        let chapter_one = state
+            .app
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|node| node.title == "Chapter One")
+            .unwrap()
+            .id;
+        execute(&mut state, format!("scene {chapter_one} Opening"));
+        let scene = state.app.list_scenes(false).unwrap()[0].scene.id;
+        let (_, hash) = state.app.load_scene_text(scene).unwrap();
+        state
+            .app
+            .save_scene_text(scene, Some(&hash), "The story begins.")
+            .unwrap();
+        let character = state.app.create_character("Mara").unwrap();
+        state
+            .app
+            .link_character(scene, character, story_core::ParticipationRole::Pov)
+            .unwrap();
+        execute(&mut state, format!("subchapter {section} Chapter Two"));
+        let chapter_two = state
+            .app
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|node| node.title == "Chapter Two")
+            .unwrap()
+            .id;
+        execute(&mut state, format!("move {scene} {chapter_two} 0"));
+        execute(&mut state, format!("rename {scene} Arrival"));
+        let result = state.app.get_scene(scene).unwrap();
+        assert_eq!(result.scene.title, "Arrival");
+        assert_eq!(result.chapter_id, Some(chapter_two));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "The story begins."
+        );
+        assert_eq!(
+            state.app.analytics_dataset().unwrap()[0].characters[0].id,
+            character.to_string()
+        );
     }
 }

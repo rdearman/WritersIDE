@@ -1,10 +1,10 @@
 # Writer's IDE
 
-Writer's IDE is an early Rust implementation of the scene-centred novel planning and writing environment described in the supplied SRS v0.1 and [active engineering design](docs/engineering-design-v0.15.md).
+Writer's IDE is an early Rust implementation of the scene-centred novel planning and writing environment described in the supplied SRS v0.1 and [active engineering design](docs/engineering-design-v0.16.md).
 
 The current workspace contains a reusable story core, SQLite and manuscript storage, application services, a synthetic import inventory/mapping interface, a CLI and a full-screen terminal prototype. Real Scrivener/Ranperen adapters are not present.
 
-The current implementation adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked scene inclusion, live saved scene queries, FTS5 scene search, a full-screen terminal shell, reference reading and annotations, snapshot revision history, read-only narrative analytics, optional local Ollama assistance, and an incremental processing pipeline. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.15](docs/engineering-design-v0.15.md).
+The current implementation adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked scene inclusion, live saved scene queries, FTS5 scene search, a full-screen terminal shell, reference reading and annotations, snapshot revision history, read-only narrative analytics, optional local Ollama assistance, and an incremental processing pipeline. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.16](docs/engineering-design-v0.16.md).
 
 ## Build and verify
 
@@ -44,6 +44,8 @@ Terminal function-key targets can be overridden in `.writers-ide/keybindings.tom
 The terminal command palette can run `extract scene|reading <UUID> <model> [endpoint]` to save an unapproved evidence-linked proposal. The optional Ollama client only accepts localhost HTTP endpoints; the model request runs only after the author invokes it.
 
 Saved scene queries can be created and listed in the terminal command palette with `query-save <name> status=idea` and `query-list`; `query <uuid>` opens current results in the Search workspace. The CLI provides `query-save`, `query-list`, and `query-run`.
+
+The terminal outline supports `section <title>`, `chapter <title>`, `subchapter <section-uuid> <title>`, `scene <chapter-uuid> <title>`, `move <scene-uuid> <chapter-uuid> <position>`, `rename <scene-uuid> <title>`, and `scene-status <scene-uuid> <status>`.
 
 The terminal command palette also accepts `link <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]`, `outgoing <kind> <uuid>`, `backlinks <kind> <uuid>`, `broken-links`, and `transclude <scene-uuid>`. CLI `outgoing` lists links from an entity.
 

@@ -62,6 +62,14 @@ pub struct SceneRecord {
     pub content_hash: String,
 }
 #[derive(Clone, Debug)]
+pub struct StructuralNodeSummary {
+    pub id: NodeId,
+    pub parent_id: Option<NodeId>,
+    pub kind: String,
+    pub title: String,
+    pub position: u32,
+}
+#[derive(Clone, Debug)]
 pub struct RecoveryConflict {
     pub transaction_id: String,
     pub scene_id: String,
@@ -538,6 +546,39 @@ impl ProjectStore {
         let now = now();
         self.conn.execute("INSERT INTO structural_node(id,parent_id,kind,title,position,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?6)",params![id.to_string(),parent.map(|x|x.to_string()),kind.as_str(),title,i64::from(position),now])?;
         Ok(id)
+    }
+    pub fn list_structural_nodes(&self) -> Result<Vec<StructuralNodeSummary>> {
+        let mut stmt = self.conn.prepare("SELECT id,parent_id,kind,title,position FROM structural_node ORDER BY parent_id,position,id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, u32>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, parent, kind, title, position) = row?;
+            let uuid = |value: String| {
+                Uuid::parse_str(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            };
+            Ok(StructuralNodeSummary {
+                id: NodeId(uuid(id)?),
+                parent_id: parent.map(uuid).transpose()?.map(NodeId),
+                kind,
+                title,
+                position,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+        .map_err(StorageError::from)
     }
     pub fn move_node(
         &mut self,

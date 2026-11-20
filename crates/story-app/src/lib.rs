@@ -65,6 +65,9 @@ impl WriterApp {
     pub fn create_scene(&mut self, chapter: NodeId, title: &str, position: u32) -> Result<SceneId> {
         Ok(self.store.create_scene(chapter, position, title)?)
     }
+    pub fn list_structural_nodes(&self) -> Result<Vec<story_storage::StructuralNodeSummary>> {
+        Ok(self.store.list_structural_nodes()?)
+    }
     pub fn get_scene(&self, id: SceneId) -> Result<SceneRecord> {
         Ok(self.store.get_scene(id)?)
     }
