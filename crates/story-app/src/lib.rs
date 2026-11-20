@@ -306,6 +306,20 @@ impl WriterApp {
             .store
             .create_anchor(scene, start, end, quote, prefix, suffix)?)
     }
+    pub fn list_passage_anchors(
+        &self,
+        scene: SceneId,
+    ) -> Result<Vec<story_storage::PassageAnchorRecord>> {
+        Ok(self.store.list_scene_anchors(scene)?)
+    }
+    pub fn reanchor_passage(
+        &mut self,
+        anchor: story_core::AnchorId,
+        start: u64,
+        end: u64,
+    ) -> Result<()> {
+        Ok(self.store.reanchor_passage(anchor, start, end)?)
+    }
     pub fn create_story_link(&mut self, link: &StoryLink) -> Result<()> {
         Ok(self.store.create_story_link(link)?)
     }

@@ -10,7 +10,7 @@ This addendum extends SRS v0.1 without replacing its scene-centred, local-first 
 | ID | Requirement | Relationship to SRS v0.1 | Allocation | Current state |
 |---|---|---|---|---|
 | HYP-001 | Typed links use stable entity IDs across scenes, characters, plotlines and research; backlinks resolve after title/placement changes. | New | Domain/storage/API/CLI/TUI | Implemented with outgoing/backlink CLI and terminal commands; stable IDs survive rename/move |
-| HYP-002 | Passage anchors retain stable IDs, selected text, byte range, surrounding context and source hash. | Strengthened | Domain/storage; re-anchoring follows editor integration | Initial anchor creation implemented; edit re-anchoring deferred |
+| HYP-002 | Passage anchors retain stable IDs, selected text, byte range, surrounding context and source hash. | Strengthened | Domain/storage; editor integration | Implemented: save/recovery revalidates exact quote and context; unique matches move automatically; missing/ambiguous quotes are flagged; author can inspect and explicitly reattach through application, CLI, or TUI |
 | HYP-003 | Broken endpoints and anchors are reportable; invalid endpoints are rejected at write time. | New | Storage/diagnostics | Implemented for persisted links |
 | HYP-004 | Include/transclude links are navigable references, do not copy canonical prose, and cannot form cycles. | New | Domain/storage/reader/compiler | Cycle guard and terminal transclusion preview implemented; compile option remains deferred |
 | QRY-001 | Named typed scene queries combine status, character, plotline, chronology and unresolved-issue filters. | Strengthened | Domain/storage/CLI/TUI | Save, list, and dynamic run exposed in CLI and terminal command palette |

@@ -747,6 +747,30 @@ impl AppState {
                 .map(|broken| format!("{} {}", broken.link_id, broken.reason))
                 .collect::<Vec<_>>()
                 .join(" · ");
+        } else if cmd == "anchors" {
+            let scene = self
+                .editing_scene
+                .or(self.active_scene())
+                .ok_or("select a scene first")?;
+            self.message = self
+                .app
+                .list_passage_anchors(scene)?
+                .into_iter()
+                .map(|a| {
+                    format!(
+                        "{} {}..{} [{}] {}",
+                        a.id, a.start_byte, a.end_byte, a.state, a.quote
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+        } else if let Some(rest) = cmd.strip_prefix("anchor-move ") {
+            let mut parts = rest.split_whitespace();
+            let anchor = story_core::AnchorId(parts.next().ok_or("missing anchor UUID")?.parse()?);
+            let start = parts.next().ok_or("missing start byte")?.parse()?;
+            let end = parts.next().ok_or("missing end byte")?.parse()?;
+            self.app.reanchor_passage(anchor, start, end)?;
+            self.message = format!("Reattached passage anchor {anchor}");
         } else if let Some(rest) = cmd.strip_prefix("transclude ") {
             let scene = SceneId(rest.parse()?);
             self.message = self
@@ -806,7 +830,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | plotline NAME | issue TITLE | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | plotline NAME | issue TITLE | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }

@@ -81,6 +81,16 @@ pub struct BrokenLink {
     pub reason: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PassageAnchorRecord {
+    pub id: AnchorId,
+    pub scene_id: SceneId,
+    pub start_byte: u64,
+    pub end_byte: u64,
+    pub quote: String,
+    pub state: String,
+    pub source_hash: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscludedPassage {
     pub scene_id: SceneId,
     pub text: String,
@@ -1305,6 +1315,9 @@ impl ProjectStore {
                 [&txid],
             )?;
             update_scene_index(&tx, id, text)?;
+            if new_hash != current {
+                revalidate_scene_anchors(&tx, id, text, &new_hash)?;
+            }
             tx.commit()?;
         }
         if fail == Some(SaveFailpoint::AfterMetadataCommit)
@@ -1600,6 +1613,7 @@ impl ProjectStore {
             params![sid, new, len, generation],
         )?;
         update_scene_index(&tx, scene, &text)?;
+        revalidate_scene_anchors(&tx, scene, &text, new)?;
         tx.execute(
             "UPDATE write_journal SET state='db_committed' WHERE tx_id=?1",
             [txid],
@@ -1626,6 +1640,7 @@ impl ProjectStore {
             params![sid, hash, len, generation],
         )?;
         update_scene_index(&tx, scene, &text)?;
+        revalidate_scene_anchors(&tx, scene, &text, hash)?;
         tx.execute("DELETE FROM write_journal WHERE tx_id=?1", [txid])?;
         tx.execute(
             "UPDATE write_conflict SET resolved=1,decision=0 WHERE tx_id=?1",
@@ -1899,7 +1914,8 @@ impl ProjectStore {
             .map_err(|_| StorageError::Invalid("anchor offset overflow".into()))?;
         let end = usize::try_from(end_byte)
             .map_err(|_| StorageError::Invalid("anchor offset overflow".into()))?;
-        if start > end
+        if quote.is_empty()
+            || start > end
             || end > text.len()
             || !text.is_char_boundary(start)
             || !text.is_char_boundary(end)
@@ -1912,6 +1928,63 @@ impl ProjectStore {
         let id = AnchorId::new();
         self.conn.execute("INSERT INTO passage_anchor(id,scene_id,start_byte,end_byte,quote,prefix_context,suffix_context,source_sha256,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)", params![id.to_string(),scene.to_string(),start_byte,end_byte,quote,prefix,suffix,hash,now()])?;
         Ok(id)
+    }
+    pub fn list_scene_anchors(&self, scene: SceneId) -> Result<Vec<PassageAnchorRecord>> {
+        let mut query = self.conn.prepare("SELECT id,start_byte,end_byte,quote,state,source_sha256 FROM passage_anchor WHERE scene_id=?1 ORDER BY start_byte,id")?;
+        Ok(query
+            .query_map([scene.to_string()], |row| {
+                let id: String = row.get(0)?;
+                Ok(PassageAnchorRecord {
+                    id: AnchorId(Uuid::parse_str(&id).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?),
+                    scene_id: scene,
+                    start_byte: row.get(1)?,
+                    end_byte: row.get(2)?,
+                    quote: row.get(3)?,
+                    state: row.get(4)?,
+                    source_hash: row.get(5)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+    pub fn reanchor_passage(
+        &mut self,
+        anchor: AnchorId,
+        start_byte: u64,
+        end_byte: u64,
+    ) -> Result<()> {
+        let scene_text: (String, String) = self.conn.query_row(
+            "SELECT c.relative_path,c.sha256 FROM passage_anchor a JOIN scene_content c ON c.scene_id=a.scene_id WHERE a.id=?1",
+            [anchor.to_string()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?.ok_or_else(|| StorageError::NotFound(anchor.to_string()))?;
+        let text = fs::read_to_string(self.safe_path(Path::new(&scene_text.0))?)?;
+        let start = usize::try_from(start_byte)
+            .map_err(|_| StorageError::Invalid("anchor offset overflow".into()))?;
+        let end = usize::try_from(end_byte)
+            .map_err(|_| StorageError::Invalid("anchor offset overflow".into()))?;
+        let quote: String = self.conn.query_row(
+            "SELECT quote FROM passage_anchor WHERE id=?1",
+            [anchor.to_string()],
+            |row| row.get(0),
+        )?;
+        if start >= end
+            || end > text.len()
+            || !text.is_char_boundary(start)
+            || !text.is_char_boundary(end)
+            || text.get(start..end) != Some(quote.as_str())
+        {
+            return Err(StorageError::Invalid(
+                "reanchor range must select the anchor's exact UTF-8 passage".into(),
+            ));
+        }
+        self.conn.execute("UPDATE passage_anchor SET start_byte=?2,end_byte=?3,source_sha256=?4,state='current',updated_at=?5 WHERE id=?1", params![anchor.to_string(),start_byte,end_byte,scene_text.1,now()])?;
+        Ok(())
     }
     pub fn create_story_link(&mut self, link: &StoryLink) -> Result<()> {
         if link.source_anchor.is_some() && !matches!(link.source, EntityRef::Scene(_)) {
@@ -2863,6 +2936,81 @@ fn read_story_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoryLink> {
     })
 }
 
+fn revalidate_scene_anchors(
+    conn: &Connection,
+    scene: SceneId,
+    text: &str,
+    new_hash: &str,
+) -> Result<()> {
+    let anchors = {
+        let mut query = conn.prepare("SELECT id,quote,prefix_context,suffix_context FROM passage_anchor WHERE scene_id=?1 AND source_sha256<>?2 ORDER BY id")?;
+        query
+            .query_map(params![scene.to_string(), new_hash], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for (id, quote, prefix, suffix) in anchors {
+        let occurrences = text
+            .match_indices(&quote)
+            .map(|(start, matched)| (start, start + matched.len()))
+            .collect::<Vec<_>>();
+        let selected = if occurrences.len() == 1 {
+            Some(occurrences[0])
+        } else if occurrences.len() > 1 {
+            let scores = occurrences
+                .iter()
+                .map(|(start, end)| {
+                    let before = &text[..*start];
+                    let after = &text[*end..];
+                    let prefix_score = common_suffix_chars(before, &prefix);
+                    let suffix_score = common_prefix_chars(after, &suffix);
+                    prefix_score + suffix_score
+                })
+                .collect::<Vec<_>>();
+            let best = scores.iter().copied().max().unwrap_or(0);
+            (best > 0 && scores.iter().filter(|score| **score == best).count() == 1)
+                .then(|| occurrences[scores.iter().position(|score| *score == best).unwrap()])
+        } else {
+            None
+        };
+        if let Some((start, end)) = selected {
+            conn.execute("UPDATE passage_anchor SET start_byte=?2,end_byte=?3,source_sha256=?4,state='current',updated_at=?5 WHERE id=?1", params![id,start as u64,end as u64,new_hash,now()])?;
+        } else {
+            let state = if occurrences.is_empty() {
+                "broken"
+            } else {
+                "needs_review"
+            };
+            conn.execute(
+                "UPDATE passage_anchor SET source_sha256=?2,state=?3,updated_at=?4 WHERE id=?1",
+                params![id, new_hash, state, now()],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn common_suffix_chars(left: &str, right: &str) -> usize {
+    left.chars()
+        .rev()
+        .zip(right.chars().rev())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
+fn common_prefix_chars(left: &str, right: &str) -> usize {
+    left.chars()
+        .zip(right.chars())
+        .take_while(|(a, b)| a == b)
+        .count()
+}
+
 fn update_scene_index(conn: &Connection, scene: SceneId, text: &str) -> Result<()> {
     let (title, synopsis): (String, String) = conn.query_row(
         "SELECT title,synopsis FROM scene WHERE id=?1",
@@ -3288,6 +3436,98 @@ mod tests {
         );
         let bad: rusqlite::Result<usize> = st.conn.execute("INSERT INTO story_link(id,source_kind,source_id,target_kind,target_id,link_kind,created_at) VALUES('x','scene',?1,'scene','missing','related','now')", [a.to_string()]);
         assert!(bad.is_err());
+    }
+
+    #[test]
+    fn passage_anchors_revalidate_unique_matches_and_flag_ambiguous_or_missing_text() {
+        let d = tempdir().unwrap();
+        let mut store = ProjectStore::create(d.path().join("AnchorNovel"), "Anchors").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Scene").unwrap();
+        let target = store.create_scene(chapter, 1, "Target").unwrap();
+        let (text, hash) = store.load_text(scene).unwrap();
+        let new_hash = store
+            .save_text(scene, Some(&hash), "Before QUOTE after")
+            .unwrap();
+        let anchor = store
+            .create_anchor(scene, 7, 12, "QUOTE", "Before ", " after")
+            .unwrap();
+        let linked = StoryLink {
+            id: LinkId::new(),
+            source: EntityRef::Scene(scene),
+            source_anchor: Some(anchor),
+            target: EntityRef::Scene(target),
+            target_anchor: None,
+            kind: LinkKind::Cites,
+            label: "anchored reference".into(),
+        };
+        store.create_story_link(&linked).unwrap();
+
+        let moved = "A preface. Before QUOTE after";
+        let moved_hash = store.save_text(scene, Some(&new_hash), moved).unwrap();
+        let record = &store.list_scene_anchors(scene).unwrap()[0];
+        assert_eq!(record.id, anchor);
+        assert_eq!(record.state, "current");
+        assert_eq!(record.start_byte, moved.find("QUOTE").unwrap() as u64);
+        assert_eq!(record.source_hash, moved_hash);
+        assert_eq!(
+            store.outgoing_links(EntityRef::Scene(scene)).unwrap()[0].source_anchor,
+            Some(anchor)
+        );
+
+        let repeated = "Before QUOTE after; Before QUOTE after";
+        let repeated_hash = store.save_text(scene, Some(&moved_hash), repeated).unwrap();
+        let record = store.list_scene_anchors(scene).unwrap().remove(0);
+        assert_eq!(record.state, "needs_review");
+        assert_eq!(record.source_hash, repeated_hash);
+        let second = repeated.rfind("QUOTE").unwrap() as u64;
+        store.reanchor_passage(anchor, second, second + 5).unwrap();
+        let record = store.list_scene_anchors(scene).unwrap().remove(0);
+        assert_eq!(record.state, "current");
+        assert_eq!(record.start_byte, second);
+
+        let final_hash = store
+            .save_text(scene, Some(&repeated_hash), "The passage was removed.")
+            .unwrap();
+        let record = store.list_scene_anchors(scene).unwrap().remove(0);
+        assert_eq!(record.state, "broken");
+        assert_eq!(record.source_hash, final_hash);
+        assert!(store.reanchor_passage(anchor, 0, 5).is_err());
+        let _ = text;
+    }
+
+    #[test]
+    fn anchor_revalidation_is_consistent_when_save_recovers_after_file_replacement() {
+        let d = tempdir().unwrap();
+        let mut store = ProjectStore::create(d.path().join("RecoveryNovel"), "Recovery").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Scene").unwrap();
+        let (_, hash) = store.load_text(scene).unwrap();
+        let first = "One anchor.";
+        let hash = store.save_text(scene, Some(&hash), first).unwrap();
+        let anchor = store
+            .create_anchor(scene, 4, 10, "anchor", "One ", ".")
+            .unwrap();
+        assert!(
+            store
+                .save_text_inner(
+                    scene,
+                    Some(&hash),
+                    "Prefix. One anchor.",
+                    Some(SaveFailpoint::AfterRename)
+                )
+                .is_err()
+        );
+        store.recover_pending_writes().unwrap();
+        let record = store.list_scene_anchors(scene).unwrap().remove(0);
+        assert_eq!(record.id, anchor);
+        assert_eq!(record.state, "current");
+        assert_eq!(record.start_byte, 12);
+        assert_eq!(store.load_text(scene).unwrap().0, "Prefix. One anchor.");
     }
 
     #[test]
