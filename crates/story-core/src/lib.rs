@@ -43,6 +43,21 @@ id_type!(LinkId);
 id_type!(AnchorId);
 id_type!(QueryId);
 id_type!(IssueId);
+id_type!(ReadingId);
+id_type!(AnnotationId);
+id_type!(BookmarkId);
+id_type!(ReadingTermId);
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ReadingAnnotationDraft {
+    pub kind: String,
+    pub start_byte: u64,
+    pub end_byte: u64,
+    pub quote: String,
+    pub body: String,
+    pub prefix_context: String,
+    pub suffix_context: String,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EntityRef {

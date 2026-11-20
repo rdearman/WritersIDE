@@ -168,6 +168,94 @@ impl WriterApp {
     pub fn list_events(&self) -> Result<Vec<story_storage::EventSummary>> {
         Ok(self.store.list_events()?)
     }
+    pub fn import_reading_document(
+        &mut self,
+        document: &story_reading::ReferenceDocument,
+        source: &str,
+    ) -> Result<ReadingId> {
+        Ok(self.store.import_reading_document(document, source)?)
+    }
+    pub fn get_reading_document(
+        &self,
+        id: ReadingId,
+    ) -> Result<story_storage::ReadingDocumentRecord> {
+        Ok(self.store.get_reading_document(id)?)
+    }
+    pub fn list_reading_documents(&self) -> Result<Vec<story_storage::ReadingDocumentRecord>> {
+        Ok(self.store.list_reading_documents()?)
+    }
+    pub fn reload_reading_document(
+        &mut self,
+        id: ReadingId,
+        document: &story_reading::ReferenceDocument,
+    ) -> Result<()> {
+        Ok(self.store.reload_reading_document(id, document)?)
+    }
+    pub fn search_reading(&self, terms: &str) -> Result<Vec<(ReadingId, String, String)>> {
+        Ok(self.store.search_reading(terms)?)
+    }
+    pub fn create_reading_annotation(
+        &mut self,
+        id: ReadingId,
+        draft: &ReadingAnnotationDraft,
+    ) -> Result<AnnotationId> {
+        Ok(self.store.create_reading_annotation(id, draft)?)
+    }
+    pub fn list_reading_annotations(
+        &self,
+        id: ReadingId,
+    ) -> Result<Vec<story_storage::ReadingAnnotationRecord>> {
+        Ok(self.store.list_reading_annotations(id)?)
+    }
+    pub fn create_reading_bookmark(
+        &mut self,
+        id: ReadingId,
+        title: &str,
+        offset: u64,
+    ) -> Result<BookmarkId> {
+        Ok(self.store.create_reading_bookmark(id, title, offset)?)
+    }
+    pub fn list_reading_bookmarks(
+        &self,
+        id: ReadingId,
+    ) -> Result<Vec<story_storage::ReadingBookmarkRecord>> {
+        Ok(self.store.list_reading_bookmarks(id)?)
+    }
+    pub fn set_reading_checkpoint(&mut self, id: ReadingId, progress: u64) -> Result<()> {
+        Ok(self.store.set_reading_checkpoint(id, progress)?)
+    }
+    pub fn reading_checkpoint(&self, id: ReadingId) -> Result<Option<u64>> {
+        Ok(self.store.reading_checkpoint(id)?)
+    }
+    pub fn create_reading_term(
+        &mut self,
+        id: ReadingId,
+        kind: &str,
+        name: &str,
+        aliases: &str,
+        description: &str,
+    ) -> Result<ReadingTermId> {
+        Ok(self
+            .store
+            .create_reading_term(id, kind, name, aliases, description)?)
+    }
+    pub fn list_reading_terms(
+        &self,
+        id: ReadingId,
+    ) -> Result<Vec<story_storage::ReadingTermRecord>> {
+        Ok(self.store.list_reading_terms(id)?)
+    }
+    pub fn link_reading_entity(
+        &mut self,
+        doc: ReadingId,
+        annotation: Option<AnnotationId>,
+        target: EntityRef,
+        relation: &str,
+    ) -> Result<()> {
+        Ok(self
+            .store
+            .link_reading_entity(doc, annotation, target, relation)?)
+    }
     pub fn backlinks(&self, target: EntityRef) -> Result<Vec<StoryLink>> {
         Ok(self.store.backlinks(target)?)
     }

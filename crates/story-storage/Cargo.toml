@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 story-core = { path = "../story-core" }
+story-reading = { path = "../story-reading" }
 uuid.workspace = true
 serde.workspace = true
 toml.workspace = true

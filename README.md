@@ -2,9 +2,9 @@
 
 Writer's IDE is an early Rust implementation of the scene-centred novel planning and writing environment described in the supplied SRS v0.1 and [engineering design](docs/engineering-design-v0.2.md).
 
-The current workspace contains a reusable story core, SQLite and manuscript storage, application services, a synthetic import inventory/mapping interface, and a small CLI. It does not yet include the terminal editor or real Scrivener/Ranperen adapters.
+The current workspace contains a reusable story core, SQLite and manuscript storage, application services, a synthetic import inventory/mapping interface, a CLI and a full-screen terminal prototype. Real Scrivener/Ranperen adapters are not present.
 
-The current link/query slice adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked scene inclusion, live saved scene queries, and FTS5 scene search. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.3](docs/engineering-design-v0.3.md). The full-screen terminal application and reading workspace remain planned implementation slices.
+The current link/query slice adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked scene inclusion, live saved scene queries, and FTS5 scene search. The terminal prototype includes scene editing and a reference-reading workspace for text, Markdown and EPUB, with independent annotations and indexes. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.4](docs/engineering-design-v0.4.md).
 
 ## Build and verify
 
@@ -35,7 +35,7 @@ writers-ide backlinks <path> <entity-kind> <entity-id>
 writers-ide broken-links <path>
 ```
 
-The current terminal prototype is launched with `cargo run -p writers-ide-terminal -- <project-path>`. It uses a full-screen Ratatui/Crossterm alternate screen; F1–F12 switch workspaces, `/` searches, `:` opens the command palette, Enter opens the selected scene, and Ctrl-S saves manuscript text.
+The current terminal prototype is launched with `cargo run -p writers-ide-terminal -- <project-path>`. It uses a full-screen Ratatui/Crossterm alternate screen; F1–F13 switch workspaces, `/` searches, `:` opens the command palette, Enter opens the selected scene or reference, and Ctrl-S saves manuscript text. The Reading workspace accepts `:read-import <path>`, passage selection with `v` then `a` (highlight) or `n` (annotate), `b` for a bookmark, `c` for a checkpoint, and `l` to focus the reading pane.
 
 Each project is a directory containing one `story.db`, `project.toml`, portable Markdown files under `manuscript/`, and application recovery data under `.writers-ide/recovery/`. Close the project before copying it manually; use `backup` for a consistent application-managed copy.
 

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
 const MIGRATION_2: &str = include_str!("../migrations/0002_links_queries.sql");
+const MIGRATION_3: &str = include_str!("../migrations/0003_reading.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -109,6 +110,43 @@ pub struct IssueSummary {
     pub status: String,
     pub scene_count: u32,
 }
+#[derive(Clone, Debug)]
+pub struct ReadingDocumentRecord {
+    pub id: ReadingId,
+    pub title: String,
+    pub media_type: String,
+    pub relative_path: String,
+    pub source_identifier: String,
+    pub source_sha256: String,
+    pub extracted_text: String,
+}
+#[derive(Clone, Debug)]
+pub struct ReadingAnnotationRecord {
+    pub id: AnnotationId,
+    pub document_id: ReadingId,
+    pub kind: String,
+    pub start_byte: u64,
+    pub end_byte: u64,
+    pub quote: String,
+    pub body: String,
+    pub state: String,
+}
+#[derive(Clone, Debug)]
+pub struct ReadingBookmarkRecord {
+    pub id: BookmarkId,
+    pub document_id: ReadingId,
+    pub title: String,
+    pub offset_byte: u64,
+    pub state: String,
+}
+#[derive(Clone, Debug)]
+pub struct ReadingTermRecord {
+    pub id: ReadingTermId,
+    pub kind: String,
+    pub name: String,
+    pub aliases: String,
+    pub description: String,
+}
 type CustomDefaultRow = (
     String,
     String,
@@ -186,6 +224,7 @@ impl ProjectStore {
             "templates",
             "exports",
             ".writers-ide/recovery",
+            "research/readings",
         ] {
             fs::create_dir_all(root.join(d))?;
         }
@@ -205,7 +244,7 @@ impl ProjectStore {
         )?;
         let conn = Connection::open(root.join("story.db"))?;
         configure(&conn)?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\nCOMMIT;", now(),now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now])?;
         Ok(Self {
@@ -237,14 +276,19 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 2 {
+        if version > 3 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
             return Err(StorageError::UnsupportedSchema(version));
         }
-        if version == 1 {
+        let mut current_version = version;
+        if current_version == 1 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\nCOMMIT;", now()))?;
+            current_version = 2;
+        }
+        if current_version == 2 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -259,6 +303,7 @@ impl ProjectStore {
             root: root.to_path_buf(),
             conn,
         };
+        fs::create_dir_all(this.root.join("research/readings"))?;
         let _ = this.recover_pending_writes()?;
         if migrated {
             this.rebuild_scene_index()?;
@@ -1740,6 +1785,365 @@ impl ProjectStore {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StorageError::from)
     }
+    pub fn import_reading_document(
+        &mut self,
+        document: &story_reading::ReferenceDocument,
+        source_identifier: &str,
+    ) -> Result<ReadingId> {
+        let expected = format!("{:x}", Sha256::digest(&document.source_bytes));
+        if expected != document.sha256 {
+            return Err(StorageError::Invalid(
+                "reading source fingerprint does not match bytes".into(),
+            ));
+        }
+        let id = ReadingId::new();
+        let ext = match document.media_type.as_str() {
+            "text/plain" => "txt",
+            "text/markdown" => "md",
+            "application/epub+zip" => "epub",
+            _ => {
+                return Err(StorageError::Invalid(
+                    "unsupported reading media type".into(),
+                ));
+            }
+        };
+        let relative = format!("research/readings/{}-{expected}.{ext}", id);
+        let target = self.safe_path(Path::new(&relative))?;
+        atomic_write(&target, &document.source_bytes)?;
+        let stamp = now();
+        let result=self.conn.execute("INSERT INTO reading_document(id,title,media_type,relative_path,source_identifier,source_sha256,extracted_text,imported_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)",params![id.to_string(),document.title,document.media_type,relative,source_identifier,expected,document.extracted_text,stamp]);
+        if let Err(error) = result {
+            let _ = fs::remove_file(&target);
+            return Err(error.into());
+        }
+        Ok(id)
+    }
+    pub fn get_reading_document(&self, id: ReadingId) -> Result<ReadingDocumentRecord> {
+        let row:(String,String,String,String,String,String)=self.conn.query_row("SELECT title,media_type,relative_path,source_identifier,source_sha256,extracted_text FROM reading_document WHERE id=?1",[id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?.ok_or_else(||StorageError::NotFound(id.to_string()))?;
+        let source = fs::read(self.safe_path(Path::new(&row.2))?)?;
+        if format!("{:x}", Sha256::digest(&source)) != row.4 {
+            return Err(StorageError::Conflict(format!(
+                "reading source {id} was modified externally"
+            )));
+        }
+        Ok(ReadingDocumentRecord {
+            id,
+            title: row.0,
+            media_type: row.1,
+            relative_path: row.2,
+            source_identifier: row.3,
+            source_sha256: row.4,
+            extracted_text: row.5,
+        })
+    }
+    pub fn list_reading_documents(&self) -> Result<Vec<ReadingDocumentRecord>> {
+        let ids: Vec<String> = {
+            let mut q = self
+                .conn
+                .prepare("SELECT id FROM reading_document ORDER BY title COLLATE NOCASE,id")?;
+            q.query_map([], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        ids.into_iter()
+            .map(|id| {
+                let id = ReadingId(
+                    Uuid::parse_str(&id).map_err(|e| StorageError::Invalid(e.to_string()))?,
+                );
+                self.get_reading_document(id)
+            })
+            .collect()
+    }
+    pub fn reload_reading_document(
+        &mut self,
+        id: ReadingId,
+        document: &story_reading::ReferenceDocument,
+    ) -> Result<()> {
+        let expected = format!("{:x}", Sha256::digest(&document.source_bytes));
+        if expected != document.sha256 {
+            return Err(StorageError::Invalid(
+                "reading source fingerprint does not match bytes".into(),
+            ));
+        }
+        let existing = self.get_reading_document(id)?;
+        let ext = match document.media_type.as_str() {
+            "text/plain" => "txt",
+            "text/markdown" => "md",
+            "application/epub+zip" => "epub",
+            _ => {
+                return Err(StorageError::Invalid(
+                    "unsupported reading media type".into(),
+                ));
+            }
+        };
+        let relative = format!("research/readings/{}-{expected}.{ext}", id);
+        let target = self.safe_path(Path::new(&relative))?;
+        if existing.source_sha256 != expected {
+            atomic_write(&target, &document.source_bytes)?;
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE reading_document SET title=?2,media_type=?3,relative_path=?4,source_sha256=?5,extracted_text=?6,updated_at=?7 WHERE id=?1",params![id.to_string(),document.title,document.media_type,relative,expected,document.extracted_text,now()])?;
+        if existing.source_sha256 != expected {
+            let annotations: Vec<(String, String)> = {
+                let mut q =
+                    tx.prepare("SELECT id,quote FROM reading_annotation WHERE document_id=?1")?;
+                q.query_map([id.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<std::result::Result<_, _>>()?
+            };
+            for (annotation, quote) in annotations {
+                let found = unique_occurrence(&document.extracted_text, &quote);
+                if let Some((start, end)) = found {
+                    tx.execute("UPDATE reading_annotation SET start_byte=?2,end_byte=?3,source_sha256=?4,state='current',updated_at=?5 WHERE id=?1",params![annotation,start,end,expected,now()])?;
+                } else {
+                    tx.execute("UPDATE reading_annotation SET source_sha256=?2,state='needs_review',updated_at=?3 WHERE id=?1",params![annotation,expected,now()])?;
+                }
+            }
+            let bookmarks: Vec<(String, String)> = {
+                let mut q =
+                    tx.prepare("SELECT id,quote FROM reading_bookmark WHERE document_id=?1")?;
+                q.query_map([id.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .collect::<std::result::Result<_, _>>()?
+            };
+            for (bookmark, quote) in bookmarks {
+                if let Some((start, _)) = unique_occurrence(&document.extracted_text, &quote) {
+                    tx.execute("UPDATE reading_bookmark SET offset_byte=?2,source_sha256=?3,state='current' WHERE id=?1",params![bookmark,start,expected])?;
+                } else {
+                    tx.execute("UPDATE reading_bookmark SET source_sha256=?2,state='needs_review' WHERE id=?1",params![bookmark,expected])?;
+                }
+            }
+            tx.execute("UPDATE reading_checkpoint SET state='needs_review',source_sha256=?2,updated_at=?3 WHERE document_id=?1",params![id.to_string(),expected,now()])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn search_reading(&self, terms: &str) -> Result<Vec<(ReadingId, String, String)>> {
+        if terms.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut q=self.conn.prepare("SELECT document_id,title,snippet(reading_fts,2,'[',']','…',12) FROM reading_fts WHERE reading_fts MATCH ?1 ORDER BY bm25(reading_fts),title")?;
+        let rows = q.query_map([terms], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, title, snippet) = row?;
+            Ok::<(ReadingId, String, String), rusqlite::Error>((
+                ReadingId(Uuid::parse_str(&id).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                title,
+                snippet,
+            ))
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
+    pub fn create_reading_annotation(
+        &mut self,
+        id: ReadingId,
+        draft: &ReadingAnnotationDraft,
+    ) -> Result<AnnotationId> {
+        let kind = draft.kind.as_str();
+        let start = draft.start_byte;
+        let end = draft.end_byte;
+        let quote = draft.quote.as_str();
+        let body = draft.body.as_str();
+        let prefix = draft.prefix_context.as_str();
+        let suffix = draft.suffix_context.as_str();
+        if !matches!(kind, "highlight" | "note") {
+            return Err(StorageError::Invalid(
+                "annotation kind must be highlight or note".into(),
+            ));
+        }
+        let doc = self.get_reading_document(id)?;
+        let a = usize::try_from(start)
+            .map_err(|_| StorageError::Invalid("annotation offset overflow".into()))?;
+        let b = usize::try_from(end)
+            .map_err(|_| StorageError::Invalid("annotation offset overflow".into()))?;
+        if a > b
+            || b > doc.extracted_text.len()
+            || !doc.extracted_text.is_char_boundary(a)
+            || !doc.extracted_text.is_char_boundary(b)
+            || doc.extracted_text.get(a..b) != Some(quote)
+        {
+            return Err(StorageError::Invalid(
+                "annotation range must select its quoted UTF-8 passage".into(),
+            ));
+        }
+        let aid = AnnotationId::new();
+        self.conn.execute("INSERT INTO reading_annotation(id,document_id,annotation_kind,start_byte,end_byte,quote,prefix_context,suffix_context,source_sha256,body,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?11)",params![aid.to_string(),id.to_string(),kind,start,end,quote,prefix,suffix,doc.source_sha256,body,now()])?;
+        Ok(aid)
+    }
+    pub fn list_reading_annotations(&self, id: ReadingId) -> Result<Vec<ReadingAnnotationRecord>> {
+        let mut q=self.conn.prepare("SELECT id,annotation_kind,start_byte,end_byte,quote,body,state FROM reading_annotation WHERE document_id=?1 ORDER BY start_byte,id")?;
+        let rows = q.query_map([id.to_string()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, u64>(2)?,
+                r.get::<_, u64>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (aid, kind, start_byte, end_byte, quote, body, state) = row?;
+            Ok::<ReadingAnnotationRecord, rusqlite::Error>(ReadingAnnotationRecord {
+                id: AnnotationId(Uuid::parse_str(&aid).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                document_id: id,
+                kind,
+                start_byte,
+                end_byte,
+                quote,
+                body,
+                state,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
+    pub fn create_reading_bookmark(
+        &mut self,
+        id: ReadingId,
+        title: &str,
+        offset: u64,
+    ) -> Result<BookmarkId> {
+        let doc = self.get_reading_document(id)?;
+        let pos = usize::try_from(offset)
+            .map_err(|_| StorageError::Invalid("bookmark offset overflow".into()))?;
+        if pos > doc.extracted_text.len() || !doc.extracted_text.is_char_boundary(pos) {
+            return Err(StorageError::Invalid(
+                "bookmark must use a valid UTF-8 text offset".into(),
+            ));
+        }
+        let quote = doc
+            .extracted_text
+            .get(pos..)
+            .unwrap_or("")
+            .chars()
+            .take(80)
+            .collect::<String>();
+        let bid = BookmarkId::new();
+        self.conn.execute("INSERT INTO reading_bookmark(id,document_id,title,offset_byte,quote,source_sha256,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![bid.to_string(),id.to_string(),title,offset,quote,doc.source_sha256,now()])?;
+        Ok(bid)
+    }
+    pub fn list_reading_bookmarks(&self, id: ReadingId) -> Result<Vec<ReadingBookmarkRecord>> {
+        let mut q=self.conn.prepare("SELECT id,title,offset_byte,state FROM reading_bookmark WHERE document_id=?1 ORDER BY created_at,id")?;
+        let rows = q.query_map([id.to_string()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, u64>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (bookmark, title, offset_byte, state) = row?;
+            Ok::<ReadingBookmarkRecord, rusqlite::Error>(ReadingBookmarkRecord {
+                id: BookmarkId(Uuid::parse_str(&bookmark).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                document_id: id,
+                title,
+                offset_byte,
+                state,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
+    pub fn set_reading_checkpoint(&mut self, id: ReadingId, progress: u64) -> Result<()> {
+        let doc = self.get_reading_document(id)?;
+        let offset = usize::try_from(progress)
+            .map_err(|_| StorageError::Invalid("reading checkpoint overflow".into()))?;
+        if offset > doc.extracted_text.len() || !doc.extracted_text.is_char_boundary(offset) {
+            return Err(StorageError::Invalid(
+                "checkpoint must be a valid UTF-8 byte position".into(),
+            ));
+        }
+        self.conn.execute("INSERT INTO reading_checkpoint(document_id,progress_byte,source_sha256,updated_at) VALUES(?1,?2,?3,?4) ON CONFLICT(document_id) DO UPDATE SET progress_byte=excluded.progress_byte,source_sha256=excluded.source_sha256,state='current',updated_at=excluded.updated_at",params![id.to_string(),progress,doc.source_sha256,now()])?;
+        Ok(())
+    }
+    pub fn reading_checkpoint(&self, id: ReadingId) -> Result<Option<u64>> {
+        Ok(self.conn.query_row("SELECT progress_byte FROM reading_checkpoint WHERE document_id=?1 AND state='current'",[id.to_string()],|r|r.get(0)).optional()?)
+    }
+    pub fn create_reading_term(
+        &mut self,
+        id: ReadingId,
+        kind: &str,
+        name: &str,
+        aliases: &str,
+        description: &str,
+    ) -> Result<ReadingTermId> {
+        if !matches!(kind, "character" | "species" | "term") {
+            return Err(StorageError::Invalid(
+                "reading term kind must be character, species or term".into(),
+            ));
+        }
+        let tid = ReadingTermId::new();
+        self.conn.execute("INSERT INTO reading_term(id,document_id,term_kind,name,aliases,description) VALUES(?1,?2,?3,?4,?5,?6)",params![tid.to_string(),id.to_string(),kind,name,aliases,description])?;
+        Ok(tid)
+    }
+    pub fn list_reading_terms(&self, id: ReadingId) -> Result<Vec<ReadingTermRecord>> {
+        let mut q=self.conn.prepare("SELECT id,term_kind,name,aliases,description FROM reading_term WHERE document_id=?1 ORDER BY term_kind,name COLLATE NOCASE")?;
+        let rows = q.query_map([id.to_string()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (term, kind, name, aliases, description) = row?;
+            Ok::<ReadingTermRecord, rusqlite::Error>(ReadingTermRecord {
+                id: ReadingTermId(Uuid::parse_str(&term).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                kind,
+                name,
+                aliases,
+                description,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
+    pub fn link_reading_entity(
+        &mut self,
+        document: ReadingId,
+        annotation: Option<AnnotationId>,
+        target: EntityRef,
+        relation: &str,
+    ) -> Result<()> {
+        let id = LinkId::new();
+        self.conn.execute("INSERT INTO reading_entity_link(id,document_id,annotation_id,target_kind,target_id,relation) VALUES(?1,?2,?3,?4,?5,?6)",params![id.to_string(),document.to_string(),annotation.map(|a|a.to_string()),target.kind(),target.id(),relation])?;
+        Ok(())
+    }
     pub fn outgoing_links(&self, source: EntityRef) -> Result<Vec<StoryLink>> {
         let mut q = self.conn.prepare("SELECT id,source_kind,source_id,source_anchor_id,target_kind,target_id,target_anchor_id,link_kind,label FROM story_link WHERE source_kind=?1 AND source_id=?2 ORDER BY created_at,id")?;
         let rows = q.query_map(params![source.kind(), source.id()], read_story_link)?;
@@ -2157,6 +2561,18 @@ fn now() -> String {
 fn hash_bytes(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
 }
+fn unique_occurrence(text: &str, quote: &str) -> Option<(usize, usize)> {
+    if quote.is_empty() {
+        return None;
+    }
+    let mut found = text.match_indices(quote).take(2);
+    let (start, matched) = found.next()?;
+    if found.next().is_some() {
+        None
+    } else {
+        Some((start, start + matched.len()))
+    }
+}
 fn hash_file(p: &Path) -> Result<String> {
     let mut f = File::open(p)?;
     let mut h = Sha256::new();
@@ -2525,6 +2941,64 @@ mod tests {
     }
 
     #[test]
+    fn reading_copy_annotations_search_and_reanchoring_are_persistent() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("Novel");
+        let original = d.path().join("reference.txt");
+        fs::write(&original, "Mara finds a silver key.").unwrap();
+        let parsed = story_reading::import_reference(&original).unwrap();
+        let mut store = ProjectStore::create(&project, "Novel").unwrap();
+        let reading = store
+            .import_reading_document(&parsed, original.to_str().unwrap())
+            .unwrap();
+        assert_eq!(fs::read(&original).unwrap(), parsed.source_bytes);
+        let at = parsed.extracted_text.find("silver key").unwrap() as u64;
+        let annotation = store
+            .create_reading_annotation(
+                reading,
+                &ReadingAnnotationDraft {
+                    kind: "highlight".into(),
+                    start_byte: at,
+                    end_byte: at + 10,
+                    quote: "silver key".into(),
+                    body: "important clue".into(),
+                    prefix_context: "a ".into(),
+                    suffix_context: ".".into(),
+                },
+            )
+            .unwrap();
+        store.create_reading_bookmark(reading, "Key", 0).unwrap();
+        store.set_reading_checkpoint(reading, 6).unwrap();
+        store
+            .create_reading_term(reading, "character", "Mara", "M. Aran", "Protagonist")
+            .unwrap();
+        assert_eq!(store.search_reading("silver").unwrap().len(), 1);
+        let changed = d.path().join("updated.txt");
+        fs::write(&changed, "Earlier text. Mara finds a silver key.").unwrap();
+        let update = story_reading::import_reference(&changed).unwrap();
+        store.reload_reading_document(reading, &update).unwrap();
+        let annotations = store.list_reading_annotations(reading).unwrap();
+        assert_eq!(annotations[0].id, annotation);
+        assert_eq!(annotations[0].state, "current");
+        assert_eq!(
+            annotations[0].start_byte,
+            update.extracted_text.find("silver key").unwrap() as u64
+        );
+        assert_eq!(
+            store.list_reading_bookmarks(reading).unwrap()[0].state,
+            "current"
+        );
+        assert_eq!(store.list_reading_terms(reading).unwrap()[0].name, "Mara");
+        assert_eq!(store.reading_checkpoint(reading).unwrap(), None);
+        drop(store);
+        let store = ProjectStore::open(&project).unwrap();
+        assert_eq!(
+            store.get_reading_document(reading).unwrap().extracted_text,
+            update.extracted_text
+        );
+    }
+
+    #[test]
     fn version_one_projects_migrate_and_rebuild_text_index() {
         let d = tempdir().unwrap();
         let project = d.path().join("N");
@@ -2536,7 +3010,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TRIGGER scene_fts_insert; DROP TRIGGER scene_fts_update; DROP TRIGGER scene_fts_delete; DROP TABLE story_link; DROP TABLE passage_anchor; DROP TABLE saved_query_filter; DROP TABLE saved_query; DROP TABLE scene_issue; DROP TABLE story_issue; DROP TABLE scene_fts; DROP TABLE scene_search_content; DROP TABLE research_item; DELETE FROM schema_migrations WHERE version=2;").unwrap();
+        conn.execute_batch("DROP TRIGGER reading_entity_target_insert; DROP TRIGGER reading_fts_insert; DROP TRIGGER reading_fts_update; DROP TRIGGER reading_fts_delete; DROP TABLE reading_entity_link; DROP TABLE reading_term; DROP TABLE reading_checkpoint; DROP TABLE reading_bookmark; DROP TABLE reading_annotation; DROP TABLE reading_fts; DROP TABLE reading_document; DROP TRIGGER scene_fts_insert; DROP TRIGGER scene_fts_update; DROP TRIGGER scene_fts_delete; DROP TABLE story_link; DROP TABLE passage_anchor; DROP TABLE saved_query_filter; DROP TABLE saved_query; DROP TABLE scene_issue; DROP TABLE story_issue; DROP TABLE scene_fts; DROP TABLE scene_search_content; DROP TABLE research_item; DELETE FROM schema_migrations WHERE version>1;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -2546,7 +3020,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
     #[test]
     fn create_reopen_relocate_and_save_scene() {

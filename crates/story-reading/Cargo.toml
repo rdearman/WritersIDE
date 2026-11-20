@@ -1,0 +1,13 @@
+[package]
+name = "story-reading"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2.workspace = true
+thiserror.workspace = true
+epub = "1.2.4"
+
+[dev-dependencies]
+tempfile.workspace = true

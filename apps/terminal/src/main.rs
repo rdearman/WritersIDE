@@ -30,9 +30,10 @@ enum Workspace {
     Research,
     Issues,
     Search,
+    Reading,
 }
 impl Workspace {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::Dashboard,
         Self::Outline,
         Self::Cards,
@@ -45,6 +46,7 @@ impl Workspace {
         Self::Research,
         Self::Issues,
         Self::Search,
+        Self::Reading,
     ];
     fn title(self) -> &'static str {
         match self {
@@ -60,6 +62,7 @@ impl Workspace {
             Self::Research => "Research",
             Self::Issues => "Issues",
             Self::Search => "Search",
+            Self::Reading => "Reading",
         }
     }
 }
@@ -80,6 +83,11 @@ struct AppState {
     history_index: usize,
     width: usize,
     scroll: usize,
+    reading_document: Option<story_core::ReadingId>,
+    reading_text: String,
+    reading_offset: u64,
+    reading_focus: bool,
+    reading_selection_start: Option<u64>,
 }
 impl AppState {
     fn refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -96,6 +104,23 @@ impl AppState {
     }
     fn active_scene(&self) -> Option<SceneId> {
         self.scenes.get(self.selected).map(|x| x.0)
+    }
+    fn open_reading_selected(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let docs = self.app.list_reading_documents()?;
+        if let Some(doc) = docs.get(self.selected) {
+            self.reading_document = Some(doc.id);
+            self.reading_text = doc.extracted_text.clone();
+            self.reading_offset = self.app.reading_checkpoint(doc.id)?.unwrap_or(0);
+            let offset = usize::try_from(self.reading_offset)?;
+            self.scroll = self
+                .reading_text
+                .get(..offset)
+                .ok_or("stored reading checkpoint no longer matches document")?
+                .matches('\n')
+                .count();
+            self.message = format!("{} · {}", doc.title, doc.media_type);
+        }
+        Ok(())
     }
     fn open_selected(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(id) = self.active_scene() {
@@ -151,7 +176,20 @@ impl AppState {
         let cmd = self.prompt.trim().to_owned();
         self.prompt.clear();
         let mode = self.mode.take();
+        if mode == Some('n') {
+            self.create_reading_selection("note", &cmd)?;
+            return Ok(());
+        }
         if mode == Some('/') {
+            if self.workspace == Workspace::Reading {
+                let matches = self.app.search_reading(&cmd)?;
+                self.message = matches
+                    .into_iter()
+                    .map(|(_, title, snippet)| format!("{title}: {snippet}"))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                return Ok(());
+            }
             self.scenes = self
                 .app
                 .search_scenes(&cmd)?
@@ -164,7 +202,143 @@ impl AppState {
             self.message = format!("{} search results", self.scenes.len());
             return Ok(());
         }
-        if let Some(rest) = cmd.strip_prefix("open ") {
+        if let Some(rest) = cmd.strip_prefix("read-import ") {
+            let path = std::path::Path::new(rest);
+            let source = story_reading::import_reference(path)?;
+            let id = self.app.import_reading_document(&source, rest)?;
+            self.workspace = Workspace::Reading;
+            let docs = self.app.list_reading_documents()?;
+            self.selected = docs.iter().position(|d| d.id == id).unwrap_or(0);
+            self.open_reading_selected()?;
+            self.message = format!("Imported reference {}", source.title);
+        } else if let Some(rest) = cmd.strip_prefix("read ") {
+            let id = story_core::ReadingId(rest.parse()?);
+            let doc = self.app.get_reading_document(id)?;
+            self.reading_document = Some(id);
+            self.reading_text = doc.extracted_text;
+            self.reading_offset = 0;
+            self.workspace = Workspace::Reading;
+        } else if let Some(rest) = cmd.strip_prefix("highlight ") {
+            let (range, quote) = rest
+                .split_once(' ')
+                .ok_or("use highlight <start>:<end> <quoted text>")?;
+            let (start, end) = range.split_once(':').ok_or("range must be start:end")?;
+            let id = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            self.app.create_reading_annotation(
+                id,
+                &story_core::ReadingAnnotationDraft {
+                    kind: "highlight".into(),
+                    start_byte: start.parse()?,
+                    end_byte: end.parse()?,
+                    quote: quote.into(),
+                    body: String::new(),
+                    prefix_context: String::new(),
+                    suffix_context: String::new(),
+                },
+            )?;
+            self.message = "Highlight saved".into();
+        } else if let Some(rest) = cmd.strip_prefix("note ") {
+            let (selection, body) = rest
+                .split_once('|')
+                .ok_or("use note <start>:<end> <quote> | <annotation>")?;
+            let (range, quote) = selection
+                .trim()
+                .split_once(' ')
+                .ok_or("missing quoted passage")?;
+            let (start, end) = range.split_once(':').ok_or("range must be start:end")?;
+            let id = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            self.app.create_reading_annotation(
+                id,
+                &story_core::ReadingAnnotationDraft {
+                    kind: "note".into(),
+                    start_byte: start.parse()?,
+                    end_byte: end.parse()?,
+                    quote: quote.into(),
+                    body: body.trim().into(),
+                    prefix_context: String::new(),
+                    suffix_context: String::new(),
+                },
+            )?;
+            self.message = "Annotation saved".into();
+        } else if let Some(title) = cmd.strip_prefix("bookmark ") {
+            let id = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            self.app
+                .create_reading_bookmark(id, title, self.reading_offset)?;
+            self.message = "Bookmark saved".into();
+        } else if cmd == "checkpoint" {
+            let id = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            self.app.set_reading_checkpoint(id, self.reading_offset)?;
+            self.message = "Reading checkpoint saved".into();
+        } else if let Some(rest) = cmd.strip_prefix("term ") {
+            let (kind, name) = rest
+                .split_once(' ')
+                .ok_or("use term <character|species|term> <name>")?;
+            let id = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            self.app.create_reading_term(id, kind, name, "", "")?;
+            self.message = "Index entry saved".into();
+        } else if let Some(rest) = cmd.strip_prefix("entity-link ") {
+            let (kind, id) = rest
+                .split_once(' ')
+                .ok_or("use entity-link <scene|character|plotline|research> <UUID>")?;
+            let doc = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            self.app
+                .link_reading_entity(doc, None, parse_entity(kind, id)?, "references")?;
+            self.message = "Reference entity linked".into();
+        } else if cmd == "annotations" {
+            let id = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            self.message = self
+                .app
+                .list_reading_annotations(id)?
+                .into_iter()
+                .map(|a| format!("{} [{}] {}", a.kind, a.state, a.quote))
+                .collect::<Vec<_>>()
+                .join(" · ");
+        } else if cmd == "bookmarks" {
+            let id = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            self.message = self
+                .app
+                .list_reading_bookmarks(id)?
+                .into_iter()
+                .map(|b| format!("{} @{} [{}]", b.title, b.offset_byte, b.state))
+                .collect::<Vec<_>>()
+                .join(" · ");
+        } else if cmd == "terms" {
+            let id = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            self.message = self
+                .app
+                .list_reading_terms(id)?
+                .into_iter()
+                .map(|t| format!("{}: {} {}", t.kind, t.name, t.aliases))
+                .collect::<Vec<_>>()
+                .join(" · ");
+        } else if let Some(rest) = cmd.strip_prefix("jump ") {
+            self.reading_offset = rest.parse()?;
+            let offset = usize::try_from(self.reading_offset)?;
+            let prefix = self
+                .reading_text
+                .get(..offset)
+                .ok_or("reading position is outside the text or splits a UTF-8 character")?;
+            self.scroll = prefix.matches('\n').count();
+            self.reading_focus = true;
+        } else if let Some(rest) = cmd.strip_prefix("open ") {
             if let Some(i) = self.scenes.iter().position(|s| s.0.to_string() == rest) {
                 self.selected = i;
                 self.open_selected()?;
@@ -192,9 +366,9 @@ impl AppState {
             self.workspace = Workspace::Search;
             self.message = format!("{} matching scenes", self.scenes.len());
         } else if cmd == "help" {
-            self.message="F1-F12 switch workspaces; arrows select; Enter opens; : commands; / search; Ctrl-S saves; q quits".into();
+            self.message="F1-F12 workspaces; F13 Reading; arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: open UUID | workspace NAME | query UUID | help".into();
+            self.message = "Commands: open UUID | workspace NAME | query UUID | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | help".into();
         }
         Ok(())
     }
@@ -235,6 +409,38 @@ impl AppState {
             self.dirty = true;
         }
     }
+    fn delete_forward(&mut self) {
+        let (row, col) = self.cursor;
+        let count = self.editor[row].chars().count();
+        if col < count {
+            let line = &mut self.editor[row];
+            let start = line
+                .char_indices()
+                .nth(col)
+                .map(|(b, _)| b)
+                .unwrap_or(line.len());
+            let end = line
+                .char_indices()
+                .nth(col + 1)
+                .map(|(b, _)| b)
+                .unwrap_or(line.len());
+            line.replace_range(start..end, "");
+            self.dirty = true;
+        } else if row + 1 < self.editor.len() {
+            let tail = self.editor.remove(row + 1);
+            self.editor[row].push_str(&tail);
+            self.dirty = true;
+        }
+    }
+    fn paste_text(&mut self, text: &str) {
+        for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
+            if ch == '\n' {
+                self.enter()
+            } else {
+                self.insert(ch)
+            }
+        }
+    }
     fn enter(&mut self) {
         let (row, col) = self.cursor;
         let line = &mut self.editor[row];
@@ -247,6 +453,43 @@ impl AppState {
         self.editor.insert(row + 1, tail);
         self.cursor = (row + 1, 0);
         self.dirty = true;
+    }
+    fn create_reading_selection(
+        &mut self,
+        kind: &str,
+        body: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let id = self
+            .reading_document
+            .ok_or("open a reading document first")?;
+        let start = self
+            .reading_selection_start
+            .ok_or("press v at the passage start first")?;
+        let a = start.min(self.reading_offset) as usize;
+        let b = start.max(self.reading_offset) as usize;
+        if a == b {
+            return Err("move the reading cursor to select a non-empty passage".into());
+        }
+        let quote = self
+            .reading_text
+            .get(a..b)
+            .ok_or("selection does not align with UTF-8 text boundaries")?
+            .to_owned();
+        self.app.create_reading_annotation(
+            id,
+            &story_core::ReadingAnnotationDraft {
+                kind: kind.into(),
+                start_byte: a as u64,
+                end_byte: b as u64,
+                quote,
+                body: body.into(),
+                prefix_context: String::new(),
+                suffix_context: String::new(),
+            },
+        )?;
+        self.reading_selection_start = None;
+        self.message = format!("{kind} saved for selected passage");
+        Ok(())
     }
 }
 
@@ -272,6 +515,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         history_index: 0,
         width: 80,
         scroll: 0,
+        reading_document: None,
+        reading_text: String::new(),
+        reading_offset: 0,
+        reading_focus: false,
+        reading_selection_start: None,
     };
     state.refresh()?;
     let mut terminal = setup()?;
@@ -285,7 +533,8 @@ fn setup() -> Result<Terminal<CrosstermBackend<io::Stdout>>, io::Error> {
     execute!(
         out,
         EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::EnableBracketedPaste
     )?;
     Terminal::new(CrosstermBackend::new(out))
 }
@@ -294,7 +543,8 @@ fn restore(t: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), io::Err
     execute!(
         t.backend_mut(),
         LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
+        crossterm::event::DisableMouseCapture,
+        crossterm::event::DisableBracketedPaste
     )?;
     t.show_cursor()
 }
@@ -304,11 +554,12 @@ fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     loop {
         t.draw(|f| draw(f, s))?;
-        if event::poll(Duration::from_millis(200))?
-            && let Event::Key(k) = event::read()?
-            && handle(s, k)?
-        {
-            break;
+        if event::poll(Duration::from_millis(200))? {
+            match event::read()? {
+                Event::Key(k) if handle(s, k)? => break,
+                Event::Paste(text) if s.workspace == Workspace::Editor => s.paste_text(&text),
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -382,6 +633,57 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 .borders(Borders::ALL),
         );
         f.render_widget(editor, body[1]);
+    } else if s.workspace == Workspace::Reading {
+        let items = workspace_items(s)
+            .into_iter()
+            .map(ListItem::new)
+            .collect::<Vec<_>>();
+        let mut list_state =
+            ListState::default().with_selected(Some(s.selected.min(items.len().saturating_sub(1))));
+        f.render_stateful_widget(
+            List::new(items).highlight_symbol("▸ ").block(
+                Block::default()
+                    .title("Reference Library · h/l changes pane")
+                    .borders(Borders::ALL),
+            ),
+            body[0],
+            &mut list_state,
+        );
+        let text = if s.reading_text.is_empty() {
+            "Choose a reference and press Enter. :read-import PATH imports a read-only copy."
+                .to_owned()
+        } else {
+            s.reading_text.clone()
+        };
+        let notes = s
+            .reading_document
+            .and_then(|id| s.app.list_reading_annotations(id).ok())
+            .unwrap_or_default();
+        let content_area = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(body[1]);
+        f.render_widget(
+            Paragraph::new(text)
+                .scroll((s.scroll as u16, 0))
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title("Reading material · source remains unchanged")
+                        .borders(Borders::ALL),
+                ),
+            content_area[0],
+        );
+        let annotation_text = notes
+            .iter()
+            .map(|a| format!("{}: {} [{}]", a.kind, a.quote, a.state))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        f.render_widget(
+            Paragraph::new(annotation_text)
+                .block(Block::default().title("Annotations").borders(Borders::ALL)),
+            content_area[1],
+        );
     } else {
         let items = workspace_items(s)
             .into_iter()
@@ -550,7 +852,23 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             .into_iter()
             .map(|i| format!("[{}] {}   ({} scenes)", i.status, i.title, i.scene_count))
             .collect(),
+        Workspace::Reading => s
+            .app
+            .list_reading_documents()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| format!("{}   {}", r.title, r.media_type))
+            .collect(),
     }
+}
+fn parse_entity(kind: &str, id: &str) -> Result<story_core::EntityRef, Box<dyn std::error::Error>> {
+    Ok(match kind {
+        "scene" => story_core::EntityRef::Scene(SceneId(id.parse()?)),
+        "character" => story_core::EntityRef::Character(story_core::CharacterId(id.parse()?)),
+        "plotline" => story_core::EntityRef::Plotline(story_core::PlotlineId(id.parse()?)),
+        "research" => story_core::EntityRef::Research(story_core::ResearchId(id.parse()?)),
+        _ => return Err(format!("unknown entity kind: {kind}").into()),
+    })
 }
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
     if s.mode.is_some() {
@@ -565,6 +883,73 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
             KeyCode::Char(c) if k.modifiers.is_empty() => s.prompt.push(c),
             _ => {}
+        }
+        return Ok(false);
+    }
+    if s.workspace == Workspace::Reading {
+        match k.code {
+            KeyCode::Char('h') => s.reading_focus = false,
+            KeyCode::Char('l') => s.reading_focus = true,
+            KeyCode::Up | KeyCode::Char('k') if s.reading_focus => {
+                s.scroll = s.scroll.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') if s.reading_focus => {
+                s.scroll = s.scroll.saturating_add(1)
+            }
+            KeyCode::PageUp if s.reading_focus => s.scroll = s.scroll.saturating_sub(20),
+            KeyCode::PageDown if s.reading_focus => s.scroll = s.scroll.saturating_add(20),
+            KeyCode::Up | KeyCode::Char('k') => s.selected = s.selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => {
+                let n = s.app.list_reading_documents()?.len();
+                if n > 0 {
+                    s.selected = (s.selected + 1).min(n - 1);
+                }
+            }
+            KeyCode::Enter if !s.reading_focus => s.open_reading_selected()?,
+            KeyCode::Enter if s.reading_focus => {
+                if let Some(id) = s.reading_document {
+                    s.app.set_reading_checkpoint(id, s.reading_offset)?;
+                    s.message = "Checkpoint saved".into();
+                }
+            }
+            KeyCode::Char('v') if s.reading_focus => {
+                s.reading_selection_start = Some(s.reading_offset);
+                s.message = format!("Selection start marked at byte {}", s.reading_offset);
+            }
+            KeyCode::Char('a') if s.reading_focus => {
+                if let Err(error) = s.create_reading_selection("highlight", "") {
+                    s.message = error.to_string();
+                }
+            }
+            KeyCode::Char('n') if s.reading_focus => {
+                s.mode = Some('n');
+                s.prompt.clear();
+            }
+            KeyCode::Char('b') if s.reading_focus => {
+                if let Some(id) = s.reading_document {
+                    s.app.create_reading_bookmark(
+                        id,
+                        &format!("At byte {}", s.reading_offset),
+                        s.reading_offset,
+                    )?;
+                    s.message = "Bookmark saved".into();
+                }
+            }
+            KeyCode::Char('c') if s.reading_focus => {
+                if let Some(id) = s.reading_document {
+                    s.app.set_reading_checkpoint(id, s.reading_offset)?;
+                    s.message = "Reading checkpoint saved".into();
+                }
+            }
+            _ => {}
+        }
+        if s.reading_focus {
+            s.reading_offset = s
+                .reading_text
+                .split_inclusive('\n')
+                .take(s.scroll)
+                .map(str::len)
+                .sum::<usize>() as u64;
         }
         return Ok(false);
     }
@@ -597,6 +982,28 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         match k.code {
             KeyCode::Enter => s.enter(),
             KeyCode::Backspace => s.backspace(),
+            KeyCode::Delete => s.delete_forward(),
+            KeyCode::Home => s.cursor.1 = 0,
+            KeyCode::End => s.cursor.1 = s.editor[s.cursor.0].chars().count(),
+            KeyCode::Char('w') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                let row = s.cursor.0;
+                while s.cursor.1 > 0
+                    && s.editor[row]
+                        .chars()
+                        .nth(s.cursor.1 - 1)
+                        .is_some_and(char::is_whitespace)
+                {
+                    s.backspace();
+                }
+                while s.cursor.1 > 0
+                    && s.editor[row]
+                        .chars()
+                        .nth(s.cursor.1 - 1)
+                        .is_some_and(|c| !c.is_whitespace())
+                {
+                    s.backspace();
+                }
+            }
             KeyCode::Left => s.cursor.1 = s.cursor.1.saturating_sub(1),
             KeyCode::Right => {
                 s.cursor.1 = (s.cursor.1 + 1).min(s.editor[s.cursor.0].chars().count())
@@ -610,10 +1017,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     match k.code {
-        KeyCode::F(n) if (1..=12).contains(&n)=>s.switch(Workspace::ALL[(n-1)as usize]),
+        KeyCode::F(n) if (1..=13).contains(&n)=>s.switch(Workspace::ALL[(n-1)as usize]),
         KeyCode::Char(':')=>{s.mode=Some(':');s.prompt.clear();},
         KeyCode::Char('/')=>{s.mode=Some('/');s.prompt.clear();},
-        KeyCode::Char('?')=>s.message="F1 Dashboard · F2 Outline · F3 Cards · F4 Editor · F5 Plot Grid · F6 Characters · F7 Story Bible · F8 Timeline · F9 Analytics · F10 Research · F11 Issues · F12 Search. : commands; / search; Ctrl-S save.".into(),
+        KeyCode::Char('?')=>s.message="F1 Dashboard · F2 Outline · F3 Cards · F4 Editor · F5 Plot Grid · F6 Characters · F7 Story Bible · F8 Timeline · F9 Analytics · F10 Research · F11 Issues · F12 Search · F13 Reading. : commands; / search; Ctrl-S save.".into(),
         KeyCode::Tab=>{let i=Workspace::ALL.iter().position(|x|*x==s.workspace).unwrap_or(0);s.switch(Workspace::ALL[(i+1)%Workspace::ALL.len()]);},
         KeyCode::BackTab=>{let i=Workspace::ALL.iter().position(|x|*x==s.workspace).unwrap_or(0);s.switch(Workspace::ALL[(i+Workspace::ALL.len()-1)%Workspace::ALL.len()]);},
         KeyCode::Up|KeyCode::Char('k')=>s.selected=s.selected.saturating_sub(1),
@@ -659,6 +1066,11 @@ mod tests {
             history_index: 0,
             width: 80,
             scroll: 0,
+            reading_document: None,
+            reading_text: String::new(),
+            reading_offset: 0,
+            reading_focus: false,
+            reading_selection_start: None,
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -693,6 +1105,11 @@ mod tests {
             history_index: 0,
             width: 80,
             scroll: 0,
+            reading_document: None,
+            reading_text: String::new(),
+            reading_offset: 0,
+            reading_focus: false,
+            reading_selection_start: None,
         };
         assert!(
             !handle(
