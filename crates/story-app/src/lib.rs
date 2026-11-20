@@ -285,6 +285,9 @@ impl WriterApp {
     ) -> Result<()> {
         Ok(self.store.set_scene_plotlines(scene, links, policy)?)
     }
+    pub fn scene_plotline_links(&self, scene: SceneId) -> Result<Vec<ScenePlotline>> {
+        Ok(self.store.scene_plotline_links(scene)?)
+    }
     pub fn add_event(&mut self, title: &str, source_time: &str) -> Result<EventId> {
         let id = EventId::new();
         self.store.add_event(id, title, source_time)?;
@@ -292,6 +295,9 @@ impl WriterApp {
     }
     pub fn link_event(&mut self, scene: SceneId, event: EventId, kind: &str) -> Result<()> {
         Ok(self.store.link_event(scene, event, kind)?)
+    }
+    pub fn scene_event_links(&self, scene: SceneId) -> Result<Vec<(EventId, String)>> {
+        Ok(self.store.scene_event_links(scene)?)
     }
     pub fn create_passage_anchor(
         &mut self,

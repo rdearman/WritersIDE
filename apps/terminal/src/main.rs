@@ -348,6 +348,76 @@ impl AppState {
             let id = self.app.create_character(name.trim())?;
             self.switch(Workspace::Characters);
             self.message = format!("Created character {id}");
+        } else if let Some(rest) = cmd.strip_prefix("character-link ") {
+            let mut parts = rest.split_whitespace();
+            let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let character =
+                story_core::CharacterId(parts.next().ok_or("missing character UUID")?.parse()?);
+            let role = parse_participation_role(parts.next().ok_or("missing participation role")?)?;
+            self.app.link_character(scene, character, role)?;
+            self.message = format!("Linked character {character} to scene {scene} as {role:?}");
+        } else if let Some(rest) = cmd.strip_prefix("plotline-link ") {
+            let mut parts = rest.split_whitespace();
+            let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let plotline =
+                story_core::PlotlineId(parts.next().ok_or("missing plotline UUID")?.parse()?);
+            let policy = match parts.next().ok_or("specify overlap or equal attribution")? {
+                "overlap" => story_core::WordAttributionPolicy::Overlap,
+                "equal" => story_core::WordAttributionPolicy::EqualShare,
+                value => return Err(format!("unknown word attribution policy: {value}").into()),
+            };
+            let role = parts.next().unwrap_or("advances").to_owned();
+            let mut links = self.app.scene_plotline_links(scene)?;
+            if links.iter().any(|link| link.plotline_id == plotline) {
+                return Err("scene already belongs to that plotline".into());
+            }
+            links.push(story_core::ScenePlotline {
+                plotline_id: plotline,
+                role,
+                share_basis_points: None,
+            });
+            self.app.set_scene_plotlines(scene, &links, policy)?;
+            self.message = format!("Linked plotline {plotline} to scene {scene}");
+        } else if let Some(rest) = cmd.strip_prefix("plotline-shares ") {
+            let mut parts = rest.split_whitespace();
+            let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let links = parts
+                .map(|allocation| {
+                    let (id, share) = allocation
+                        .split_once('=')
+                        .ok_or("allocations use PLOTLINE-UUID=BASIS-POINTS")?;
+                    Ok(story_core::ScenePlotline {
+                        plotline_id: story_core::PlotlineId(id.parse()?),
+                        role: "advances".into(),
+                        share_basis_points: Some(share.parse()?),
+                    })
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            self.app.set_scene_plotlines(
+                scene,
+                &links,
+                story_core::WordAttributionPolicy::AuthorShares,
+            )?;
+            self.message = format!("Saved author-defined plotline shares for scene {scene}");
+        } else if let Some(rest) = cmd.strip_prefix("scene-field ") {
+            let (identity, value) = rest
+                .split_once('|')
+                .ok_or("use scene-field <scene-uuid> <synopsis|purpose|goal|outcome> | <text>")?;
+            let mut parts = identity.split_whitespace();
+            let id = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let field = parts.next().ok_or("missing scene field")?;
+            let mut scene = self.app.get_scene(id)?.scene;
+            let target = match field {
+                "synopsis" => &mut scene.synopsis,
+                "purpose" => &mut scene.purpose,
+                "goal" => &mut scene.goal,
+                "outcome" => &mut scene.outcome,
+                _ => return Err(format!("unsupported core scene field: {field}").into()),
+            };
+            *target = value.trim().to_owned();
+            self.app.update_scene_metadata(&scene)?;
+            self.refresh()?;
+            self.message = format!("Updated {field} for scene {id}");
         } else if let Some(name) = cmd.strip_prefix("plotline ") {
             let id = self.app.create_plotline(name.trim())?;
             self.switch(Workspace::PlotGrid);
@@ -356,6 +426,24 @@ impl AppState {
             let id = self.app.create_issue(title.trim())?;
             self.switch(Workspace::Issues);
             self.message = format!("Created issue {id}");
+        } else if let Some(rest) = cmd.strip_prefix("issue-link ") {
+            let mut parts = rest.split_whitespace();
+            let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let issue = story_core::IssueId(parts.next().ok_or("missing issue UUID")?.parse()?);
+            self.app.link_issue(scene, issue)?;
+            self.message = format!("Linked issue {issue} to scene {scene}");
+        } else if let Some(rest) = cmd.strip_prefix("event ") {
+            let (title, source_time) = rest.split_once('|').unwrap_or((rest, ""));
+            let id = self.app.add_event(title.trim(), source_time.trim())?;
+            self.switch(Workspace::StoryBible);
+            self.message = format!("Created story event {id}");
+        } else if let Some(rest) = cmd.strip_prefix("event-link ") {
+            let mut parts = rest.split_whitespace();
+            let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let event = story_core::EventId(parts.next().ok_or("missing event UUID")?.parse()?);
+            let kind = parts.next().unwrap_or("depicts");
+            self.app.link_event(scene, event, kind)?;
+            self.message = format!("Linked event {event} to scene {scene}");
         } else if let Some(rest) = cmd.strip_prefix("research ") {
             let (title, body) = rest.split_once('|').unwrap_or((rest, ""));
             let id =
@@ -904,7 +992,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | plotline NAME | issue TITLE | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | event TITLE | TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -1681,6 +1769,18 @@ fn parse_terminal_status(value: &str) -> Result<SceneStatus, Box<dyn std::error:
         _ => return Err(format!("unknown scene status: {value}").into()),
     })
 }
+fn parse_participation_role(
+    value: &str,
+) -> Result<story_core::ParticipationRole, Box<dyn std::error::Error>> {
+    Ok(match value {
+        "pov" => story_core::ParticipationRole::Pov,
+        "major" => story_core::ParticipationRole::Major,
+        "minor" => story_core::ParticipationRole::Minor,
+        "off_camera" => story_core::ParticipationRole::OffCamera,
+        "mentioned" => story_core::ParticipationRole::Mentioned,
+        _ => return Err(format!("unknown participation role: {value}").into()),
+    })
+}
 fn parse_terminal_link_kind(
     value: &str,
 ) -> Result<story_core::LinkKind, Box<dyn std::error::Error>> {
@@ -2152,10 +2252,9 @@ mod tests {
         assert_eq!(state.workspace, Workspace::Characters);
         assert_eq!(state.app.list_characters().unwrap()[0].name, "Mara");
         let character_id = state.app.list_characters().unwrap()[0].id;
-        state
-            .app
-            .link_character(first, character_id, story_core::ParticipationRole::Pov)
-            .unwrap();
+        state.mode = Some(':');
+        state.prompt = format!("character-link {first} {character_id} pov");
+        state.command().unwrap();
         let character_matrix = character_matrix_rows(&state);
         assert!(character_matrix[0].contains("Mara"));
         assert!(
@@ -2172,23 +2271,21 @@ mod tests {
             "Political intrigue"
         );
         let plot_id = state.app.list_plotlines().unwrap()[0].id;
-        state
-            .app
-            .set_scene_plotlines(
-                first,
-                &[story_core::ScenePlotline {
-                    plotline_id: plot_id,
-                    role: "advances".into(),
-                    share_basis_points: None,
-                }],
-                story_core::WordAttributionPolicy::Overlap,
-            )
-            .unwrap();
+        state.mode = Some(':');
+        state.prompt = format!("plotline-link {first} {plot_id} overlap advances");
+        state.command().unwrap();
         let grid = plot_grid_rows(&state);
         assert!(grid[0].contains("Political intrigue"));
         assert!(
             grid.iter()
                 .any(|row| row.contains("First") && row.contains('●'))
+        );
+        state.mode = Some(':');
+        state.prompt = format!("plotline-shares {first} {plot_id}=10000");
+        state.command().unwrap();
+        assert_eq!(
+            state.app.scene_plotline_links(first).unwrap()[0].share_basis_points,
+            Some(10000)
         );
         state.mode = Some(':');
         state.prompt = "issue Clarify the timeline".into();
@@ -2197,6 +2294,36 @@ mod tests {
         assert_eq!(
             state.app.list_issues().unwrap()[0].title,
             "Clarify the timeline"
+        );
+        let issue_id = state.app.list_issues().unwrap()[0].id;
+        state.mode = Some(':');
+        state.prompt = format!("issue-link {first} {issue_id}");
+        state.command().unwrap();
+        state.mode = Some(':');
+        state.prompt = format!("scene-field {first} purpose | Reveal the betrayal");
+        state.command().unwrap();
+        assert_eq!(
+            state.app.get_scene(first).unwrap().scene.purpose,
+            "Reveal the betrayal"
+        );
+        state.mode = Some(':');
+        state.prompt = "event Bridge collapses | Day 2, 09:00".into();
+        state.command().unwrap();
+        let event_id = story_core::EventId(
+            state
+                .message
+                .split_whitespace()
+                .last()
+                .unwrap()
+                .parse()
+                .unwrap(),
+        );
+        state.mode = Some(':');
+        state.prompt = format!("event-link {first} {event_id} causes");
+        state.command().unwrap();
+        assert_eq!(
+            state.app.scene_event_links(first).unwrap(),
+            vec![(event_id, "causes".into())]
         );
         state.mode = Some(':');
         state.prompt = "research City history | Founding records".into();

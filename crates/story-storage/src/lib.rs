@@ -1790,6 +1790,26 @@ impl ProjectStore {
         tx.commit()?;
         Ok(())
     }
+    pub fn scene_plotline_links(&self, scene: SceneId) -> Result<Vec<ScenePlotline>> {
+        let mut query = self.conn.prepare("SELECT plotline_id,role,share_basis_points FROM scene_plotline WHERE scene_id=?1 ORDER BY plotline_id")?;
+        query
+            .query_map([scene.to_string()], |row| {
+                let id: String = row.get(0)?;
+                Ok(ScenePlotline {
+                    plotline_id: PlotlineId(Uuid::parse_str(&id).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?),
+                    role: row.get(1)?,
+                    share_basis_points: row.get(2)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
     pub fn record_import_run(
         &mut self,
         id: ImportRunId,
@@ -1916,6 +1936,25 @@ impl ProjectStore {
             params![scene.to_string(), event.to_string(), kind],
         )?;
         Ok(())
+    }
+    pub fn scene_event_links(&self, scene: SceneId) -> Result<Vec<(EventId, String)>> {
+        let mut query = self.conn.prepare("SELECT event_id,relationship_kind FROM scene_event WHERE scene_id=?1 ORDER BY event_id,relationship_kind")?;
+        query
+            .query_map([scene.to_string()], |row| {
+                let id: String = row.get(0)?;
+                Ok((
+                    EventId(Uuid::parse_str(&id).map_err(|e| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?),
+                    row.get(1)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
     }
     pub fn create_anchor(
         &mut self,
