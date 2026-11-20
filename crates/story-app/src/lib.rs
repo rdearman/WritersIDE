@@ -347,6 +347,9 @@ impl WriterApp {
     pub fn create_issue(&mut self, title: &str) -> Result<IssueId> {
         Ok(self.store.create_issue(title)?)
     }
+    pub fn set_issue_status(&mut self, issue: IssueId, status: &str) -> Result<()> {
+        Ok(self.store.set_issue_status(issue, status)?)
+    }
     pub fn link_issue(&mut self, scene: SceneId, issue: IssueId) -> Result<()> {
         Ok(self.store.link_issue(scene, issue)?)
     }

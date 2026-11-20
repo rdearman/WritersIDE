@@ -2104,6 +2104,24 @@ impl ProjectStore {
         )?;
         Ok(id)
     }
+    pub fn set_issue_status(&mut self, issue: IssueId, status: &str) -> Result<()> {
+        if !matches!(
+            status,
+            "open" | "in_progress" | "resolved" | "deferred" | "closed"
+        ) {
+            return Err(StorageError::Invalid(format!(
+                "invalid issue status: {status}"
+            )));
+        }
+        let changed = self.conn.execute(
+            "UPDATE story_issue SET status=?2,updated_at=?3 WHERE id=?1",
+            params![issue.to_string(), status, now()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(issue.to_string()));
+        }
+        Ok(())
+    }
     pub fn link_issue(&mut self, scene: SceneId, issue: IssueId) -> Result<()> {
         self.conn.execute(
             "INSERT INTO scene_issue(scene_id,issue_id) VALUES(?1,?2)",

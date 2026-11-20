@@ -432,6 +432,12 @@ impl AppState {
             let issue = story_core::IssueId(parts.next().ok_or("missing issue UUID")?.parse()?);
             self.app.link_issue(scene, issue)?;
             self.message = format!("Linked issue {issue} to scene {scene}");
+        } else if let Some(rest) = cmd.strip_prefix("issue-status ") {
+            let mut parts = rest.split_whitespace();
+            let issue = story_core::IssueId(parts.next().ok_or("missing issue UUID")?.parse()?);
+            let status = parts.next().ok_or("missing issue status")?;
+            self.app.set_issue_status(issue, status)?;
+            self.message = format!("Updated issue {issue} to {status}");
         } else if let Some(rest) = cmd.strip_prefix("event ") {
             let (title, source_time) = rest.split_once('|').unwrap_or((rest, ""));
             let id = self.app.add_event(title.trim(), source_time.trim())?;
@@ -992,7 +998,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | event TITLE | TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -2299,6 +2305,10 @@ mod tests {
         state.mode = Some(':');
         state.prompt = format!("issue-link {first} {issue_id}");
         state.command().unwrap();
+        state.mode = Some(':');
+        state.prompt = format!("issue-status {issue_id} in_progress");
+        state.command().unwrap();
+        assert_eq!(state.app.list_issues().unwrap()[0].status, "in_progress");
         state.mode = Some(':');
         state.prompt = format!("scene-field {first} purpose | Reveal the betrayal");
         state.command().unwrap();

@@ -98,6 +98,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut app = WriterApp::open_project(path)?;
             println!("{}", app.create_plotline(&name)?);
         }
+        "issue-status" => {
+            let path = args.next().ok_or("missing project path")?;
+            let issue = story_core::IssueId(args.next().ok_or("missing issue UUID")?.parse()?);
+            let status = args.next().ok_or("missing issue status")?;
+            let mut app = WriterApp::open_project(path)?;
+            app.set_issue_status(issue, &status)?;
+            println!("Updated issue {issue} to {status}");
+        }
         "search" => {
             let path = args.next().ok_or("missing project path")?;
             let terms = args.collect::<Vec<_>>().join(" ");
