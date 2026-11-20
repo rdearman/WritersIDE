@@ -517,6 +517,7 @@ fn parse_entity(kind: &str, id: &str) -> Result<EntityRef, Box<dyn std::error::E
         "character" => EntityRef::Character(story_core::CharacterId(id.parse()?)),
         "plotline" => EntityRef::Plotline(story_core::PlotlineId(id.parse()?)),
         "research" => EntityRef::Research(story_core::ResearchId(id.parse()?)),
+        "reading" => EntityRef::Reading(story_core::ReadingId(id.parse()?)),
         _ => return Err(format!("unknown entity kind: {kind}").into()),
     })
 }

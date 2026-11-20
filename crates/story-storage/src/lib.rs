@@ -18,6 +18,7 @@ const MIGRATION_5: &str = include_str!("../migrations/0005_project_search.sql");
 const MIGRATION_6: &str = include_str!("../migrations/0006_search_custom_fields.sql");
 const MIGRATION_7: &str = include_str!("../migrations/0007_approved_knowledge.sql");
 const MIGRATION_8: &str = include_str!("../migrations/0008_document_inclusion.sql");
+const MIGRATION_9: &str = include_str!("../migrations/0009_reading_document_links.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -334,7 +335,7 @@ impl ProjectStore {
         )?;
         let conn = Connection::open(root.join("story.db"))?;
         configure(&conn)?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\n{MIGRATION_6}\nINSERT INTO schema_migrations(version,applied_at) VALUES(6,'{}');\n{MIGRATION_7}\nINSERT INTO schema_migrations(version,applied_at) VALUES(7,'{}');\n{MIGRATION_8}\nINSERT INTO schema_migrations(version,applied_at) VALUES(8,'{}');\nCOMMIT;", now(),now(),now(),now(),now(),now(),now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\n{MIGRATION_6}\nINSERT INTO schema_migrations(version,applied_at) VALUES(6,'{}');\n{MIGRATION_7}\nINSERT INTO schema_migrations(version,applied_at) VALUES(7,'{}');\n{MIGRATION_8}\nINSERT INTO schema_migrations(version,applied_at) VALUES(8,'{}');\n{MIGRATION_9}\nINSERT INTO schema_migrations(version,applied_at) VALUES(9,'{}');\nCOMMIT;", now(),now(),now(),now(),now(),now(),now(),now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now])?;
         Ok(Self {
@@ -366,7 +367,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 8 {
+        if version > 9 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -399,6 +400,10 @@ impl ProjectStore {
         }
         if current_version == 7 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_8}\nINSERT INTO schema_migrations(version,applied_at) VALUES(8,'{}');\nCOMMIT;", now()))?;
+            current_version = 8;
+        }
+        if current_version == 8 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_9}\nINSERT INTO schema_migrations(version,applied_at) VALUES(9,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -2113,11 +2118,16 @@ impl ProjectStore {
     }
     pub fn create_story_link(&mut self, link: &StoryLink) -> Result<()> {
         if matches!(link.kind, LinkKind::Includes | LinkKind::Transcludes)
-            && (!matches!(link.source, EntityRef::Scene(_) | EntityRef::Research(_))
-                || !matches!(link.target, EntityRef::Scene(_) | EntityRef::Research(_)))
+            && (!matches!(
+                link.source,
+                EntityRef::Scene(_) | EntityRef::Research(_) | EntityRef::Reading(_)
+            ) || !matches!(
+                link.target,
+                EntityRef::Scene(_) | EntityRef::Research(_) | EntityRef::Reading(_)
+            ))
         {
             return Err(StorageError::Invalid(
-                "inclusion links require scene or research document endpoints".into(),
+                "inclusion links require document endpoints".into(),
             ));
         }
         if link.source_anchor.is_some() && !matches!(link.source, EntityRef::Scene(_)) {
@@ -2261,6 +2271,7 @@ impl ProjectStore {
             let text = match entity {
                 EntityRef::Scene(scene) => store.load_text(scene)?.0,
                 EntityRef::Research(research) => store.load_research_text(research)?,
+                EntityRef::Reading(reading) => store.get_reading_document(reading)?.extracted_text,
                 _ => {
                     return Err(StorageError::Invalid(
                         "inclusion target is not a text document".into(),
@@ -2284,6 +2295,7 @@ impl ProjectStore {
                 let entity = match kind.as_str() {
                     "scene" => EntityRef::Scene(SceneId(uuid)),
                     "research" => EntityRef::Research(ResearchId(uuid)),
+                    "reading" => EntityRef::Reading(ReadingId(uuid)),
                     _ => {
                         return Err(StorageError::Invalid(format!(
                             "unsupported inclusion document kind: {kind}"
@@ -2716,7 +2728,34 @@ impl ProjectStore {
             .map_err(StorageError::from)
     }
     pub fn broken_links(&self) -> Result<Vec<BrokenLink>> {
-        let mut q = self.conn.prepare("SELECT l.id,CASE WHEN (l.source_kind='scene' AND NOT EXISTS(SELECT 1 FROM scene WHERE id=l.source_id)) OR (l.source_kind='character' AND NOT EXISTS(SELECT 1 FROM character WHERE id=l.source_id)) OR (l.source_kind='plotline' AND NOT EXISTS(SELECT 1 FROM plotline WHERE id=l.source_id)) OR (l.source_kind='research' AND NOT EXISTS(SELECT 1 FROM research_item WHERE id=l.source_id)) THEN 'missing source' WHEN (l.target_kind='scene' AND NOT EXISTS(SELECT 1 FROM scene WHERE id=l.target_id)) OR (l.target_kind='character' AND NOT EXISTS(SELECT 1 FROM character WHERE id=l.target_id)) OR (l.target_kind='plotline' AND NOT EXISTS(SELECT 1 FROM plotline WHERE id=l.target_id)) OR (l.target_kind='research' AND NOT EXISTS(SELECT 1 FROM research_item WHERE id=l.target_id)) THEN 'missing target' ELSE 'missing passage anchor' END FROM story_link l WHERE (l.source_kind='scene' AND NOT EXISTS(SELECT 1 FROM scene WHERE id=l.source_id)) OR (l.source_kind='character' AND NOT EXISTS(SELECT 1 FROM character WHERE id=l.source_id)) OR (l.source_kind='plotline' AND NOT EXISTS(SELECT 1 FROM plotline WHERE id=l.source_id)) OR (l.source_kind='research' AND NOT EXISTS(SELECT 1 FROM research_item WHERE id=l.source_id)) OR (l.target_kind='scene' AND NOT EXISTS(SELECT 1 FROM scene WHERE id=l.target_id)) OR (l.target_kind='character' AND NOT EXISTS(SELECT 1 FROM character WHERE id=l.target_id)) OR (l.target_kind='plotline' AND NOT EXISTS(SELECT 1 FROM plotline WHERE id=l.target_id)) OR (l.target_kind='research' AND NOT EXISTS(SELECT 1 FROM research_item WHERE id=l.target_id)) OR (l.source_anchor_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM passage_anchor WHERE id=l.source_anchor_id)) OR (l.target_anchor_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM passage_anchor WHERE id=l.target_anchor_id)) ORDER BY l.id")?;
+        let mut q = self.conn.prepare(
+            "SELECT l.id,
+             CASE WHEN (l.source_kind='scene' AND NOT EXISTS(SELECT 1 FROM scene WHERE id=l.source_id))
+                    OR (l.source_kind='character' AND NOT EXISTS(SELECT 1 FROM character WHERE id=l.source_id))
+                    OR (l.source_kind='plotline' AND NOT EXISTS(SELECT 1 FROM plotline WHERE id=l.source_id))
+                    OR (l.source_kind='research' AND NOT EXISTS(SELECT 1 FROM research_item WHERE id=l.source_id))
+                    OR (l.source_kind='reading' AND NOT EXISTS(SELECT 1 FROM reading_document WHERE id=l.source_id)) THEN 'missing source'
+                  WHEN (l.target_kind='scene' AND NOT EXISTS(SELECT 1 FROM scene WHERE id=l.target_id))
+                    OR (l.target_kind='character' AND NOT EXISTS(SELECT 1 FROM character WHERE id=l.target_id))
+                    OR (l.target_kind='plotline' AND NOT EXISTS(SELECT 1 FROM plotline WHERE id=l.target_id))
+                    OR (l.target_kind='research' AND NOT EXISTS(SELECT 1 FROM research_item WHERE id=l.target_id))
+                    OR (l.target_kind='reading' AND NOT EXISTS(SELECT 1 FROM reading_document WHERE id=l.target_id)) THEN 'missing target'
+                  ELSE 'missing passage anchor' END
+             FROM story_link l
+             WHERE (l.source_kind='scene' AND NOT EXISTS(SELECT 1 FROM scene WHERE id=l.source_id))
+                OR (l.source_kind='character' AND NOT EXISTS(SELECT 1 FROM character WHERE id=l.source_id))
+                OR (l.source_kind='plotline' AND NOT EXISTS(SELECT 1 FROM plotline WHERE id=l.source_id))
+                OR (l.source_kind='research' AND NOT EXISTS(SELECT 1 FROM research_item WHERE id=l.source_id))
+                OR (l.source_kind='reading' AND NOT EXISTS(SELECT 1 FROM reading_document WHERE id=l.source_id))
+                OR (l.target_kind='scene' AND NOT EXISTS(SELECT 1 FROM scene WHERE id=l.target_id))
+                OR (l.target_kind='character' AND NOT EXISTS(SELECT 1 FROM character WHERE id=l.target_id))
+                OR (l.target_kind='plotline' AND NOT EXISTS(SELECT 1 FROM plotline WHERE id=l.target_id))
+                OR (l.target_kind='research' AND NOT EXISTS(SELECT 1 FROM research_item WHERE id=l.target_id))
+                OR (l.target_kind='reading' AND NOT EXISTS(SELECT 1 FROM reading_document WHERE id=l.target_id))
+                OR (l.source_anchor_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM passage_anchor WHERE id=l.source_anchor_id))
+                OR (l.target_anchor_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM passage_anchor WHERE id=l.target_anchor_id))
+             ORDER BY l.id",
+        )?;
         let rows = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         rows.map(|row| {
             let (id, reason) = row?;
@@ -3197,6 +3236,7 @@ fn read_story_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoryLink> {
             "character" => Ok(EntityRef::Character(CharacterId(id))),
             "plotline" => Ok(EntityRef::Plotline(PlotlineId(id))),
             "research" => Ok(EntityRef::Research(ResearchId(id))),
+            "reading" => Ok(EntityRef::Reading(ReadingId(id))),
             _ => Err(rusqlite::Error::InvalidQuery),
         }
     };
@@ -3700,12 +3740,57 @@ mod tests {
             label: "document excerpt".into(),
         })
         .unwrap();
+        let source_bytes = b"A field guide to obsidian doors.".to_vec();
+        let reading_doc = story_reading::ReferenceDocument {
+            title: "Field Guide".into(),
+            media_type: "text/plain".into(),
+            sha256: format!("{:x}", Sha256::digest(&source_bytes)),
+            extracted_text: "A field guide to obsidian doors.".into(),
+            source_bytes,
+        };
+        let reading_id = st
+            .import_reading_document(&reading_doc, "fixture:field-guide")
+            .unwrap();
+        st.create_story_link(&StoryLink {
+            id: LinkId::new(),
+            source: EntityRef::Scene(a),
+            source_anchor: None,
+            target: EntityRef::Reading(reading_id),
+            target_anchor: None,
+            kind: LinkKind::Transcludes,
+            label: "reference text".into(),
+        })
+        .unwrap();
         let expanded = st.expand_scene_transclusions(b).unwrap();
-        assert_eq!(expanded.len(), 3);
-        assert_eq!(expanded[2].source, EntityRef::Research(research));
+        assert_eq!(expanded.len(), 4);
+        let research_passage = expanded
+            .iter()
+            .find(|passage| passage.source == EntityRef::Research(research))
+            .unwrap();
         assert_eq!(
-            expanded[2].text,
+            research_passage.text,
             "A brass compass points toward the buried city."
+        );
+        let reading_passage = expanded
+            .iter()
+            .find(|passage| passage.source == EntityRef::Reading(reading_id))
+            .unwrap();
+        assert_eq!(reading_passage.text, reading_doc.extracted_text);
+        assert_eq!(
+            st.backlinks(EntityRef::Reading(reading_id)).unwrap().len(),
+            1
+        );
+        assert!(
+            st.create_story_link(&StoryLink {
+                id: LinkId::new(),
+                source: EntityRef::Reading(reading_id),
+                source_anchor: None,
+                target: EntityRef::Scene(b),
+                target_anchor: None,
+                kind: LinkKind::Includes,
+                label: String::new(),
+            })
+            .is_err()
         );
         assert!(
             st.create_story_link(&StoryLink {
@@ -3737,6 +3822,16 @@ mod tests {
         };
         assert!(st.create_story_link(&reverse).is_err());
         assert!(st.broken_links().unwrap().is_empty());
+        let imported_reading = st.get_reading_document(reading_id).unwrap();
+        fs::write(
+            st.root.join(&imported_reading.relative_path),
+            "externally changed source",
+        )
+        .unwrap();
+        assert!(matches!(
+            st.expand_document_inclusions(EntityRef::Scene(b)),
+            Err(StorageError::Conflict(_))
+        ));
         st.move_scene(b, other_chapter, 0).unwrap();
         let renamed = Scene {
             title: "Renamed B".into(),
@@ -4146,9 +4241,103 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 8);
+        assert_eq!(version, 9);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
+    }
+
+    #[test]
+    fn version_eight_story_links_migrate_to_reading_document_endpoints() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("N");
+        let mut store = ProjectStore::create(&project, "Novel").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let first = store.create_scene(chapter, 0, "First").unwrap();
+        let second = store.create_scene(chapter, 1, "Second").unwrap();
+        let old_link = StoryLink {
+            id: LinkId::new(),
+            source: EntityRef::Scene(first),
+            source_anchor: None,
+            target: EntityRef::Scene(second),
+            target_anchor: None,
+            kind: LinkKind::Related,
+            label: "preserve me".into(),
+        };
+        store.create_story_link(&old_link).unwrap();
+        drop(store);
+
+        let conn = Connection::open(project.join("story.db")).unwrap();
+        conn.execute_batch(
+            "DROP TRIGGER story_link_source_exists_insert;
+             DROP TRIGGER story_link_source_exists_update;
+             DROP TRIGGER story_link_no_transclusion_cycle;
+             DROP TRIGGER story_link_inclusion_documents_insert;
+             DROP TRIGGER story_link_inclusion_documents_update;
+             DROP INDEX story_link_source;
+             DROP INDEX story_link_target;
+             CREATE TABLE story_link_v8(
+               id TEXT PRIMARY KEY,
+               source_kind TEXT NOT NULL CHECK(source_kind IN('scene','character','plotline','research')),
+               source_id TEXT NOT NULL,
+               source_anchor_id TEXT,
+               target_kind TEXT NOT NULL CHECK(target_kind IN('scene','character','plotline','research')),
+               target_id TEXT NOT NULL,
+               target_anchor_id TEXT,
+               link_kind TEXT NOT NULL CHECK(link_kind IN('related','cites','transcludes','includes','navigates')),
+               label TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL,
+               CHECK(source_kind<>target_kind OR source_id<>target_id OR link_kind NOT IN('transcludes','includes'))
+             );
+             INSERT INTO story_link_v8 SELECT * FROM story_link;
+             DROP TABLE story_link;
+             ALTER TABLE story_link_v8 RENAME TO story_link;
+             CREATE INDEX story_link_source ON story_link(source_kind,source_id);
+             CREATE INDEX story_link_target ON story_link(target_kind,target_id);
+             CREATE TRIGGER story_link_source_exists_insert BEFORE INSERT ON story_link BEGIN SELECT 1; END;
+             CREATE TRIGGER story_link_source_exists_update BEFORE UPDATE ON story_link BEGIN SELECT 1; END;
+             CREATE TRIGGER story_link_no_transclusion_cycle BEFORE INSERT ON story_link BEGIN SELECT 1; END;
+             CREATE TRIGGER story_link_inclusion_documents_insert BEFORE INSERT ON story_link BEGIN SELECT 1; END;
+             CREATE TRIGGER story_link_inclusion_documents_update BEFORE UPDATE ON story_link BEGIN SELECT 1; END;
+             DELETE FROM schema_migrations WHERE version=9;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut migrated = ProjectStore::open(&project).unwrap();
+        assert_eq!(
+            migrated.outgoing_links(EntityRef::Scene(first)).unwrap(),
+            vec![old_link]
+        );
+        let bytes = b"Reference included from a scene.".to_vec();
+        let reading = story_reading::ReferenceDocument {
+            title: "Reference".into(),
+            media_type: "text/plain".into(),
+            extracted_text: String::from_utf8(bytes.clone()).unwrap(),
+            sha256: format!("{:x}", Sha256::digest(&bytes)),
+            source_bytes: bytes,
+        };
+        let reading_id = migrated
+            .import_reading_document(&reading, "fixture:migration")
+            .unwrap();
+        migrated
+            .create_story_link(&StoryLink {
+                id: LinkId::new(),
+                source: EntityRef::Scene(first),
+                source_anchor: None,
+                target: EntityRef::Reading(reading_id),
+                target_anchor: None,
+                kind: LinkKind::Includes,
+                label: String::new(),
+            })
+            .unwrap();
+        assert!(
+            migrated
+                .expand_document_inclusions(EntityRef::Scene(first))
+                .unwrap()
+                .iter()
+                .any(|passage| passage.source == EntityRef::Reading(reading_id))
+        );
     }
 
     #[test]

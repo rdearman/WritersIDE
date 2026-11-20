@@ -12,7 +12,7 @@ This addendum extends SRS v0.1 without replacing its scene-centred, local-first 
 | HYP-001 | Typed links use stable entity IDs across scenes, characters, plotlines and research; backlinks resolve after title/placement changes. | New | Domain/storage/API/CLI/TUI | Implemented with outgoing/backlink CLI and terminal commands; stable IDs survive rename/move |
 | HYP-002 | Passage anchors retain stable IDs, selected text, byte range, surrounding context and source hash. | Strengthened | Domain/storage; editor integration | Implemented: save/recovery revalidates exact quote and context; unique matches move automatically; missing/ambiguous quotes are flagged; author can inspect and explicitly reattach through application, CLI, or TUI |
 | HYP-003 | Broken endpoints and anchors are reportable; invalid endpoints are rejected at write time. | New | Storage/diagnostics | Implemented for persisted links |
-| HYP-004 | Include/transclude links are navigable references, do not copy canonical prose, and cannot form cycles. | New | Domain/storage/reader/compiler | Stable-ID inclusion of scene Markdown and research-document bodies, cross-document cycle guards, terminal scene preview, and opt-in derived compilation implemented; imported Reading-workspace documents are not yet inclusion targets |
+| HYP-004 | Include/transclude links are navigable references, do not copy canonical prose, and cannot form cycles. | New | Domain/storage/reader/compiler | Stable-ID inclusion of scene Markdown, research-document bodies, and imported Reading-document text; source hashes are checked before expansion, cross-document cycles are rejected, and derived compilation preserves canonical text |
 | QRY-001 | Named typed scene queries combine status, character, plotline, chronology and unresolved-issue filters. | Strengthened | Domain/storage/CLI/TUI | Save, list, and dynamic run exposed in CLI and terminal as a live virtual collection; current metadata changes refresh results without changing manuscript order |
 | QRY-002 | Query results refresh from current story data and never change manuscript order. | New | Application/analytics | Implemented and tested at storage and terminal view boundaries; terminal preserves the full scene cache and maps navigation by stable scene ID |
 | IDX-001 | Full-text and relationship indexes support search while preserving stable passage references. | Strengthened | Storage/search/CLI/TUI | Implemented project-wide rebuildable FTS5 index across scenes, custom scene fields, characters, locations, plotlines, events, research notes, issues and reading documents; typed hits navigate from terminal; richer query syntax remains |
@@ -82,6 +82,10 @@ Project-wide search and reading links now navigate characters, locations, plotli
 ### Transclusion-aware compilation milestone
 
 The incremental processing pipeline now supports opt-in scene transclusion expansion. CLI `process <project> --expand-transclusions` and terminal `:process-expand` generate a derived compile artifact while leaving canonical manuscript files untouched. The compile cache fingerprints the selected mode. Integration tests verify expansion and unchanged source text.
+
+### Imported Reading-document inclusion milestone
+
+Typed story links now accept Reading document IDs as document endpoints. Migration 0009 preserves existing links while adding Reading IDs to the endpoint constraints and source-existence checks. Compilation resolves extracted text only after verifying the imported source fingerprint, then includes it in the derived view without editing source bytes or annotation records. Storage and app tests cover stable backlinks, scene-to-reference inclusion, cycle checks across document types, and source-safe compiled output.
 
 
 ### Issue #8 command registry and shortcut foundation

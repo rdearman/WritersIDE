@@ -1174,6 +1174,16 @@ impl AppState {
                     self.switch(Workspace::Research);
                     self.message = format!("Opened linked research item {}", id);
                 }
+                story_core::EntityRef::Reading(id) => {
+                    self.selected = self
+                        .app
+                        .list_reading_documents()?
+                        .iter()
+                        .position(|document| document.id == id)
+                        .ok_or("linked reading document no longer exists")?;
+                    self.switch(Workspace::Reading);
+                    self.open_reading_selected()?;
+                }
             }
         } else if let Some(label) = cmd.strip_prefix("snapshot ") {
             let scene = self
@@ -2647,6 +2657,7 @@ fn parse_entity(kind: &str, id: &str) -> Result<story_core::EntityRef, Box<dyn s
         "character" => story_core::EntityRef::Character(story_core::CharacterId(id.parse()?)),
         "plotline" => story_core::EntityRef::Plotline(story_core::PlotlineId(id.parse()?)),
         "research" => story_core::EntityRef::Research(story_core::ResearchId(id.parse()?)),
+        "reading" => story_core::EntityRef::Reading(story_core::ReadingId(id.parse()?)),
         _ => return Err(format!("unknown entity kind: {kind}").into()),
     })
 }

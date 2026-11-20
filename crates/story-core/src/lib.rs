@@ -75,6 +75,7 @@ pub enum EntityRef {
     Character(CharacterId),
     Plotline(PlotlineId),
     Research(ResearchId),
+    Reading(ReadingId),
 }
 impl EntityRef {
     pub fn kind(self) -> &'static str {
@@ -83,6 +84,7 @@ impl EntityRef {
             Self::Character(_) => "character",
             Self::Plotline(_) => "plotline",
             Self::Research(_) => "research",
+            Self::Reading(_) => "reading",
         }
     }
     pub fn id(self) -> String {
@@ -91,6 +93,7 @@ impl EntityRef {
             Self::Character(id) => id.to_string(),
             Self::Plotline(id) => id.to_string(),
             Self::Research(id) => id.to_string(),
+            Self::Reading(id) => id.to_string(),
         }
     }
 }

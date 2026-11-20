@@ -831,6 +831,27 @@ mod tests {
             label: "appendix excerpt".into(),
         })
         .unwrap();
+        let source_bytes = b"Reference body is read-only.".to_vec();
+        let reference = story_reading::ReferenceDocument {
+            title: "Imported reference".into(),
+            media_type: "text/plain".into(),
+            sha256: format!("{:x}", Sha256::digest(&source_bytes)),
+            extracted_text: "Reference body is read-only.".into(),
+            source_bytes,
+        };
+        let reading = app
+            .import_reading_document(&reference, "fixture:read-only")
+            .unwrap();
+        app.create_story_link(&StoryLink {
+            id: LinkId::new(),
+            source: EntityRef::Scene(target),
+            source_anchor: None,
+            target: EntityRef::Reading(reading),
+            target_anchor: None,
+            kind: LinkKind::Includes,
+            label: "quoted source".into(),
+        })
+        .unwrap();
 
         app.run_processing().unwrap();
         let ordinary = fs::read_to_string(project_path.join("exports/compiled.md")).unwrap();
@@ -840,9 +861,14 @@ mod tests {
         assert!(reports[0].message.contains("inclusions expanded"));
         let expanded = fs::read_to_string(project_path.join("exports/compiled.md")).unwrap();
         assert_eq!(expanded.matches("Included passage.").count(), 2);
-        assert!(expanded.contains(
-            "Source passage.\n\n---\n\nIncluded passage.\n\n---\n\nDocument body included in the compilation."
-        ));
+        assert!(expanded.contains("Source passage.\n\n---\n\nIncluded passage."));
+        assert!(expanded.contains("Document body included in the compilation."));
+        assert!(expanded.contains("Reference body is read-only."));
+        let reading_record = app.get_reading_document(reading).unwrap();
+        assert_eq!(
+            fs::read(project_path.join(reading_record.relative_path)).unwrap(),
+            reference.source_bytes
+        );
         assert_eq!(app.load_scene_text(source).unwrap().0, "Source passage.");
         assert_eq!(app.load_scene_text(target).unwrap().0, "Included passage.");
     }
