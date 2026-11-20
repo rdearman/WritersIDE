@@ -124,6 +124,7 @@ enum CommandAction {
     Help,
     Process { expand_transclusions: bool },
     ProcessSelected { expand_transclusions: bool },
+    LegacyPalette,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -134,6 +135,7 @@ struct CommandSpec {
     category: &'static str,
     mnemonic: Option<char>,
     palette_aliases: &'static [&'static str],
+    palette_prefix: Option<&'static str>,
     takes_arguments: bool,
     action: CommandAction,
 }
@@ -164,6 +166,7 @@ fn command_registry() -> Vec<CommandSpec> {
             category: "View",
             mnemonic: None,
             palette_aliases: &[],
+            palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::Workspace(workspace),
         })
@@ -176,6 +179,7 @@ fn command_registry() -> Vec<CommandSpec> {
             category: "Menu",
             mnemonic: Some('m'),
             palette_aliases: &[],
+            palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::OpenMainMenu,
         },
@@ -186,6 +190,7 @@ fn command_registry() -> Vec<CommandSpec> {
             category: "File",
             mnemonic: Some('s'),
             palette_aliases: &["save"],
+            palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::Save,
         },
@@ -196,6 +201,7 @@ fn command_registry() -> Vec<CommandSpec> {
             category: "Help",
             mnemonic: Some('h'),
             palette_aliases: &["help"],
+            palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::Help,
         },
@@ -206,6 +212,7 @@ fn command_registry() -> Vec<CommandSpec> {
             category: "Compile",
             mnemonic: Some('c'),
             palette_aliases: &["process", "compile"],
+            palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::Process {
                 expand_transclusions: false,
@@ -218,6 +225,7 @@ fn command_registry() -> Vec<CommandSpec> {
             category: "Compile",
             mnemonic: None,
             palette_aliases: &["process-expand", "compile-expand"],
+            palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::Process {
                 expand_transclusions: true,
@@ -230,6 +238,7 @@ fn command_registry() -> Vec<CommandSpec> {
             category: "Compile",
             mnemonic: None,
             palette_aliases: &["process-only"],
+            palette_prefix: None,
             takes_arguments: true,
             action: CommandAction::ProcessSelected {
                 expand_transclusions: false,
@@ -242,13 +251,501 @@ fn command_registry() -> Vec<CommandSpec> {
             category: "Compile",
             mnemonic: None,
             palette_aliases: &["process-expand-only"],
+            palette_prefix: None,
             takes_arguments: true,
             action: CommandAction::ProcessSelected {
                 expand_transclusions: true,
             },
         },
     ]);
+    commands.extend([
+        legacy_command(
+            "scene.create",
+            "New Scene",
+            "Create a scene in a chapter",
+            "Scene",
+            "scene",
+            true,
+        ),
+        legacy_command(
+            "scene.move",
+            "Move Scene",
+            "Move a scene to a chapter and position",
+            "Scene",
+            "move",
+            true,
+        ),
+        legacy_command(
+            "scene.rename",
+            "Rename Scene",
+            "Rename a scene without changing its identity",
+            "Scene",
+            "rename",
+            true,
+        ),
+        legacy_command(
+            "scene.status",
+            "Set Scene Status",
+            "Change a scene's drafting status",
+            "Scene",
+            "scene-status",
+            true,
+        ),
+        legacy_command(
+            "scene.field",
+            "Edit Scene Planning Field",
+            "Edit a scene synopsis or purpose field",
+            "Scene",
+            "scene-field",
+            true,
+        ),
+        legacy_command(
+            "scene.subchapter",
+            "New Chapter in Section",
+            "Create a chapter under a section",
+            "Scene",
+            "subchapter",
+            true,
+        ),
+        legacy_command(
+            "structure.section",
+            "New Section",
+            "Create a top-level section",
+            "Scene",
+            "section",
+            true,
+        ),
+        legacy_command(
+            "structure.chapter",
+            "New Chapter",
+            "Create a top-level chapter",
+            "Scene",
+            "chapter",
+            true,
+        ),
+        legacy_command(
+            "character.create",
+            "New Character",
+            "Create a character record",
+            "Plot",
+            "character",
+            true,
+        ),
+        legacy_command(
+            "character.link",
+            "Link Character to Scene",
+            "Record character participation in a scene",
+            "Plot",
+            "character-link",
+            true,
+        ),
+        legacy_command(
+            "location.create",
+            "New Location",
+            "Create a location record",
+            "Plot",
+            "location",
+            true,
+        ),
+        legacy_command(
+            "plotline.create",
+            "New Plotline",
+            "Create a plotline",
+            "Plot",
+            "plotline",
+            true,
+        ),
+        legacy_command(
+            "plotline.link",
+            "Link Plotline to Scene",
+            "Assign a plotline and attribution policy",
+            "Plot",
+            "plotline-link",
+            true,
+        ),
+        legacy_command(
+            "plotline.shares",
+            "Set Plotline Word Shares",
+            "Set complete basis-point allocations",
+            "Plot",
+            "plotline-shares",
+            true,
+        ),
+        legacy_command(
+            "event.create",
+            "New Story Event",
+            "Create a story event",
+            "Plot",
+            "event",
+            true,
+        ),
+        legacy_command(
+            "event.create-timed",
+            "New Timed Story Event",
+            "Create an event with start and end intervals",
+            "Plot",
+            "event-time",
+            true,
+        ),
+        legacy_command(
+            "event.link",
+            "Link Event to Scene",
+            "Associate a story event with a scene",
+            "Plot",
+            "event-link",
+            true,
+        ),
+        legacy_command(
+            "issue.create",
+            "New Writing Issue",
+            "Create an issue",
+            "Tools",
+            "issue",
+            true,
+        ),
+        legacy_command(
+            "issue.link",
+            "Link Issue to Scene",
+            "Associate an issue with a scene",
+            "Tools",
+            "issue-link",
+            true,
+        ),
+        legacy_command(
+            "issue.status",
+            "Change Issue Status",
+            "Update an issue's workflow status",
+            "Tools",
+            "issue-status",
+            true,
+        ),
+        legacy_command(
+            "research.create",
+            "New Research Note",
+            "Create a research note",
+            "Tools",
+            "research",
+            true,
+        ),
+        legacy_command(
+            "research.import",
+            "Import Reading Document",
+            "Import a text, Markdown, or EPUB reference",
+            "Tools",
+            "read-import",
+            true,
+        ),
+        legacy_command(
+            "research.open",
+            "Open Reading Document",
+            "Open a reference by stable ID",
+            "Tools",
+            "read",
+            true,
+        ),
+        legacy_command(
+            "research.highlight",
+            "Add Reading Highlight",
+            "Anchor a highlight to a reference passage",
+            "Tools",
+            "highlight",
+            true,
+        ),
+        legacy_command(
+            "research.annotation",
+            "Add Reading Note",
+            "Anchor an annotation to a reference passage",
+            "Tools",
+            "note",
+            true,
+        ),
+        legacy_command(
+            "research.bookmark",
+            "Add Reading Bookmark",
+            "Bookmark the current reading position",
+            "Tools",
+            "bookmark",
+            true,
+        ),
+        legacy_command(
+            "research.term",
+            "Add Reading Term",
+            "Add a character, species, or term index entry",
+            "Tools",
+            "term",
+            true,
+        ),
+        legacy_command(
+            "research.entity-link",
+            "Link Reference to Story Entity",
+            "Link a reading source to a story entity",
+            "Tools",
+            "entity-link",
+            true,
+        ),
+        legacy_command(
+            "research.follow-link",
+            "Follow Reading Link",
+            "Navigate to a linked story entity",
+            "Tools",
+            "reading-follow",
+            true,
+        ),
+        legacy_command(
+            "search.project",
+            "Search Project",
+            "Search all indexed project content",
+            "View",
+            "search-all",
+            true,
+        ),
+        legacy_command(
+            "search.saved-query",
+            "Run Saved Query",
+            "Open a saved dynamic scene collection",
+            "View",
+            "query",
+            true,
+        ),
+        legacy_command(
+            "search.save-query",
+            "Save Scene Query",
+            "Save structured scene filters",
+            "View",
+            "query-save",
+            true,
+        ),
+        legacy_command(
+            "search.list-queries",
+            "List Saved Queries",
+            "List saved structured queries",
+            "View",
+            "query-list",
+            false,
+        ),
+        legacy_command(
+            "search.clear-query",
+            "Clear Query View",
+            "Leave the current virtual collection",
+            "View",
+            "query-clear",
+            false,
+        ),
+        legacy_command(
+            "link.create",
+            "Create Story Link",
+            "Create a typed link between stable entities",
+            "Edit",
+            "link",
+            true,
+        ),
+        legacy_command(
+            "link.outgoing",
+            "Show Outgoing Links",
+            "List outgoing links from an entity",
+            "Edit",
+            "outgoing",
+            true,
+        ),
+        legacy_command(
+            "link.backlinks",
+            "Show Backlinks",
+            "List links that target an entity",
+            "Edit",
+            "backlinks",
+            true,
+        ),
+        legacy_command(
+            "link.broken",
+            "Find Broken Links",
+            "Report links with missing entities or anchors",
+            "Tools",
+            "broken-links",
+            false,
+        ),
+        legacy_command(
+            "anchor.list",
+            "List Passage Anchors",
+            "Inspect anchors in the selected scene",
+            "Edit",
+            "anchors",
+            false,
+        ),
+        legacy_command(
+            "anchor.move",
+            "Reattach Passage Anchor",
+            "Explicitly reattach an anchor to selected bytes",
+            "Edit",
+            "anchor-move",
+            true,
+        ),
+        legacy_command(
+            "compile.preview-inclusions",
+            "Preview Document Inclusions",
+            "Preview a derived scene inclusion view",
+            "Compile",
+            "transclude",
+            true,
+        ),
+        legacy_command(
+            "revision.snapshot",
+            "Create Snapshot",
+            "Create a labelled scene snapshot",
+            "File",
+            "snapshot",
+            true,
+        ),
+        legacy_command(
+            "revision.history",
+            "Show Revision History",
+            "List snapshots for a scene",
+            "File",
+            "history",
+            false,
+        ),
+        legacy_command(
+            "revision.diff",
+            "Compare Snapshot",
+            "Compare current text to a snapshot",
+            "File",
+            "diff",
+            true,
+        ),
+        legacy_command(
+            "revision.restore",
+            "Restore Snapshot Range",
+            "Restore selected snapshot text",
+            "File",
+            "restore",
+            true,
+        ),
+        legacy_command(
+            "revision.restore-lines",
+            "Restore Selected Snapshot Lines",
+            "Restore a line range from a snapshot through the durable save journal",
+            "File",
+            "restore-lines",
+            true,
+        ),
+        legacy_command(
+            "extract.propose",
+            "Extract Story Candidates",
+            "Create provisional Ollama candidates",
+            "Tools",
+            "extract",
+            true,
+        ),
+        legacy_command(
+            "extract.approve",
+            "Approve Candidate",
+            "Approve a candidate after evidence validation",
+            "Tools",
+            "approve",
+            true,
+        ),
+        legacy_command(
+            "extract.knowledge",
+            "List Approved Knowledge",
+            "Show evidence-linked approved claims",
+            "Story Bible",
+            "knowledge",
+            false,
+        ),
+        legacy_command(
+            "reading.jump",
+            "Jump to Reading Offset",
+            "Navigate to a source byte position",
+            "Tools",
+            "jump",
+            true,
+        ),
+        legacy_command(
+            "reading.list-bookmarks",
+            "List Reading Bookmarks",
+            "List bookmarks in the current document",
+            "Tools",
+            "bookmarks",
+            false,
+        ),
+        legacy_command(
+            "reading.list-annotations",
+            "List Reading Annotations",
+            "List annotations in the current document",
+            "Tools",
+            "annotations",
+            false,
+        ),
+        legacy_command(
+            "reading.annotation-jump",
+            "Jump to Annotation",
+            "Navigate to a saved annotation anchor",
+            "Tools",
+            "annotation-jump",
+            true,
+        ),
+        legacy_command(
+            "reading.bookmark-jump",
+            "Jump to Bookmark",
+            "Navigate to a saved bookmark anchor",
+            "Tools",
+            "bookmark-jump",
+            true,
+        ),
+        legacy_command(
+            "reading.list-terms",
+            "List Reading Terms",
+            "List the current document's terminology index",
+            "Tools",
+            "terms",
+            false,
+        ),
+        legacy_command(
+            "reading.links",
+            "List Reading Links",
+            "List entity links from the current document",
+            "Tools",
+            "reading-links",
+            false,
+        ),
+        legacy_command(
+            "workspace.open",
+            "Open Workspace",
+            "Switch to a named workspace",
+            "View",
+            "workspace",
+            true,
+        ),
+        legacy_command(
+            "scene.open",
+            "Open Scene",
+            "Open a scene by stable ID",
+            "View",
+            "open",
+            true,
+        ),
+    ]);
     commands
+}
+
+fn legacy_command(
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    category: &'static str,
+    alias: &'static str,
+    takes_arguments: bool,
+) -> CommandSpec {
+    CommandSpec {
+        id,
+        label,
+        description,
+        category,
+        mnemonic: None,
+        palette_aliases: &[],
+        palette_prefix: Some(alias),
+        takes_arguments,
+        action: CommandAction::LegacyPalette,
+    }
 }
 
 fn command_by_id(id: &str) -> Option<CommandSpec> {
@@ -265,8 +762,13 @@ fn command_for_workspace(workspace: Workspace) -> Option<CommandSpec> {
 
 fn command_palette_invocation(text: &str) -> Option<(CommandSpec, Option<&str>)> {
     for command in command_registry() {
-        for alias in command.palette_aliases {
-            if text == *alias {
+        for alias in command
+            .palette_aliases
+            .iter()
+            .copied()
+            .chain(command.palette_prefix)
+        {
+            if text == alias {
                 return Some((command, None));
             }
             if command.takes_arguments
@@ -647,6 +1149,11 @@ impl AppState {
                     .collect::<Vec<_>>()
                     .join(" · ");
             }
+            CommandAction::LegacyPalette => {
+                self.execute_legacy_palette_command(
+                    arguments.ok_or("legacy palette action requires its command text")?,
+                )?;
+            }
         }
         Ok(())
     }
@@ -683,8 +1190,22 @@ impl AppState {
             return Ok(());
         }
         if let Some((spec, arguments)) = command_palette_invocation(&cmd) {
-            self.dispatch_registered_with_args(spec.action, arguments)?;
-        } else if let Some(title) = cmd.strip_prefix("section ") {
+            let dispatch_arguments = if spec.action == CommandAction::LegacyPalette {
+                Some(cmd.as_str())
+            } else {
+                arguments
+            };
+            self.dispatch_registered_with_args(spec.action, dispatch_arguments)?;
+        } else {
+            self.execute_legacy_palette_command(&cmd)?;
+        }
+        Ok(())
+    }
+    fn execute_legacy_palette_command(
+        &mut self,
+        cmd: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(title) = cmd.strip_prefix("section ") {
             let position = self
                 .app
                 .list_structural_nodes()?
@@ -2953,7 +3474,9 @@ mod tests {
             command
                 .palette_aliases
                 .iter()
-                .all(|alias| aliases.insert(*alias))
+                .copied()
+                .chain(command.palette_prefix)
+                .all(|alias| aliases.insert(alias))
         }));
         let compile = command_by_id("compile.run").unwrap();
         assert_eq!(compile.label, "Compile");
@@ -2977,6 +3500,16 @@ mod tests {
         );
         assert_eq!(arguments, Some("export,continuity"));
         assert!(command_palette_invocation("compile extra-arguments").is_none());
+        let (move_scene, move_args) = command_palette_invocation(
+            "move 00000000-0000-0000-0000-000000000001 00000000-0000-0000-0000-000000000002 0",
+        )
+        .unwrap();
+        assert_eq!(move_scene.id, "scene.move");
+        assert_eq!(move_scene.action, CommandAction::LegacyPalette);
+        assert_eq!(
+            move_args,
+            Some("00000000-0000-0000-0000-000000000001 00000000-0000-0000-0000-000000000002 0")
+        );
     }
 
     #[test]
