@@ -134,7 +134,7 @@ impl WriterApp {
             let expanded_text = if expand_transclusions {
                 Some(
                     self.store
-                        .expand_scene_transclusions(row.scene.id)?
+                        .expand_document_inclusions(EntityRef::Scene(row.scene.id))?
                         .into_iter()
                         .map(|passage| passage.text)
                         .collect::<Vec<_>>()
@@ -649,7 +649,13 @@ impl WriterApp {
         &self,
         scene: SceneId,
     ) -> Result<Vec<story_storage::TranscludedPassage>> {
-        Ok(self.store.expand_scene_transclusions(scene)?)
+        self.expand_document_inclusions(EntityRef::Scene(scene))
+    }
+    pub fn expand_document_inclusions(
+        &self,
+        root: EntityRef,
+    ) -> Result<Vec<story_storage::TranscludedPassage>> {
+        Ok(self.store.expand_document_inclusions(root)?)
     }
     pub fn broken_links(&self) -> Result<Vec<story_storage::BrokenLink>> {
         Ok(self.store.broken_links()?)
@@ -806,6 +812,25 @@ mod tests {
             label: String::new(),
         })
         .unwrap();
+        let research = app
+            .create_research_item(
+                "Background document",
+                "Document body included in the compilation.",
+                "text/markdown",
+                None,
+                None,
+            )
+            .unwrap();
+        app.create_story_link(&StoryLink {
+            id: LinkId::new(),
+            source: EntityRef::Scene(target),
+            source_anchor: None,
+            target: EntityRef::Research(research),
+            target_anchor: None,
+            kind: LinkKind::Includes,
+            label: "appendix excerpt".into(),
+        })
+        .unwrap();
 
         app.run_processing().unwrap();
         let ordinary = fs::read_to_string(project_path.join("exports/compiled.md")).unwrap();
@@ -815,7 +840,9 @@ mod tests {
         assert!(reports[0].message.contains("inclusions expanded"));
         let expanded = fs::read_to_string(project_path.join("exports/compiled.md")).unwrap();
         assert_eq!(expanded.matches("Included passage.").count(), 2);
-        assert!(expanded.contains("Source passage.\n\n---\n\nIncluded passage."));
+        assert!(expanded.contains(
+            "Source passage.\n\n---\n\nIncluded passage.\n\n---\n\nDocument body included in the compilation."
+        ));
         assert_eq!(app.load_scene_text(source).unwrap().0, "Source passage.");
         assert_eq!(app.load_scene_text(target).unwrap().0, "Included passage.");
     }

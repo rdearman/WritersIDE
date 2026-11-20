@@ -17,6 +17,7 @@ const MIGRATION_4: &str = include_str!("../migrations/0004_snapshots.sql");
 const MIGRATION_5: &str = include_str!("../migrations/0005_project_search.sql");
 const MIGRATION_6: &str = include_str!("../migrations/0006_search_custom_fields.sql");
 const MIGRATION_7: &str = include_str!("../migrations/0007_approved_knowledge.sql");
+const MIGRATION_8: &str = include_str!("../migrations/0008_document_inclusion.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -120,7 +121,7 @@ pub struct ApprovedKnowledgeClaim {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscludedPassage {
-    pub scene_id: SceneId,
+    pub source: EntityRef,
     pub text: String,
     pub depth: usize,
 }
@@ -333,7 +334,7 @@ impl ProjectStore {
         )?;
         let conn = Connection::open(root.join("story.db"))?;
         configure(&conn)?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\n{MIGRATION_6}\nINSERT INTO schema_migrations(version,applied_at) VALUES(6,'{}');\n{MIGRATION_7}\nINSERT INTO schema_migrations(version,applied_at) VALUES(7,'{}');\nCOMMIT;", now(),now(),now(),now(),now(),now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\n{MIGRATION_6}\nINSERT INTO schema_migrations(version,applied_at) VALUES(6,'{}');\n{MIGRATION_7}\nINSERT INTO schema_migrations(version,applied_at) VALUES(7,'{}');\n{MIGRATION_8}\nINSERT INTO schema_migrations(version,applied_at) VALUES(8,'{}');\nCOMMIT;", now(),now(),now(),now(),now(),now(),now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now])?;
         Ok(Self {
@@ -365,7 +366,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 7 {
+        if version > 8 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -394,6 +395,10 @@ impl ProjectStore {
         }
         if current_version == 6 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_7}\nINSERT INTO schema_migrations(version,applied_at) VALUES(7,'{}');\nCOMMIT;", now()))?;
+            current_version = 7;
+        }
+        if current_version == 7 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_8}\nINSERT INTO schema_migrations(version,applied_at) VALUES(8,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -2107,6 +2112,14 @@ impl ProjectStore {
         Ok(())
     }
     pub fn create_story_link(&mut self, link: &StoryLink) -> Result<()> {
+        if matches!(link.kind, LinkKind::Includes | LinkKind::Transcludes)
+            && (!matches!(link.source, EntityRef::Scene(_) | EntityRef::Research(_))
+                || !matches!(link.target, EntityRef::Scene(_) | EntityRef::Research(_)))
+        {
+            return Err(StorageError::Invalid(
+                "inclusion links require scene or research document endpoints".into(),
+            ));
+        }
         if link.source_anchor.is_some() && !matches!(link.source, EntityRef::Scene(_)) {
             return Err(StorageError::Invalid(
                 "passage anchors can only belong to scenes".into(),
@@ -2131,6 +2144,16 @@ impl ProjectStore {
         let id = ResearchId::new();
         self.conn.execute("INSERT INTO research_item(id,title,body,media_type,source_path,source_sha256,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",params![id.to_string(),title,body,media_type,source_path,source_sha256,now()])?;
         Ok(id)
+    }
+    pub fn load_research_text(&self, id: ResearchId) -> Result<String> {
+        self.conn
+            .query_row(
+                "SELECT body FROM research_item WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(id.to_string()))
     }
     pub fn list_research_items(&self) -> Result<Vec<ResearchSummary>> {
         let mut q=self.conn.prepare("SELECT id,title,media_type,source_path FROM research_item ORDER BY title COLLATE NOCASE,id")?;
@@ -2221,35 +2244,55 @@ impl ProjectStore {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
     }
-    pub fn expand_scene_transclusions(&self, root: SceneId) -> Result<Vec<TranscludedPassage>> {
+    pub fn expand_document_inclusions(&self, root: EntityRef) -> Result<Vec<TranscludedPassage>> {
         fn visit(
             store: &ProjectStore,
-            scene: SceneId,
+            entity: EntityRef,
             depth: usize,
-            seen: &mut std::collections::BTreeSet<SceneId>,
+            seen: &mut std::collections::BTreeSet<(String, String)>,
             output: &mut Vec<TranscludedPassage>,
         ) -> Result<()> {
-            if !seen.insert(scene) {
+            let key = (entity.kind().to_owned(), entity.id());
+            if !seen.insert(key.clone()) {
                 return Err(StorageError::Invalid(
                     "transclusion cycle encountered during rendering".into(),
                 ));
             }
+            let text = match entity {
+                EntityRef::Scene(scene) => store.load_text(scene)?.0,
+                EntityRef::Research(research) => store.load_research_text(research)?,
+                _ => {
+                    return Err(StorageError::Invalid(
+                        "inclusion target is not a text document".into(),
+                    ));
+                }
+            };
             output.push(TranscludedPassage {
-                scene_id: scene,
-                text: store.load_text(scene)?.0,
+                source: entity,
+                text,
                 depth,
             });
-            let mut q=store.conn.prepare("SELECT target_id FROM story_link WHERE source_kind='scene' AND source_id=?1 AND target_kind='scene' AND link_kind IN('transcludes','includes') ORDER BY created_at,id")?;
+            let mut q=store.conn.prepare("SELECT target_kind,target_id FROM story_link WHERE source_kind=?1 AND source_id=?2 AND link_kind IN('transcludes','includes') ORDER BY created_at,id")?;
             let targets = q
-                .query_map([scene.to_string()], |r| r.get::<_, String>(0))?
+                .query_map(params![entity.kind(), entity.id()], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            for target in targets {
-                let id = SceneId(
-                    Uuid::parse_str(&target).map_err(|e| StorageError::Invalid(e.to_string()))?,
-                );
-                visit(store, id, depth + 1, seen, output)?;
+            for (kind, target) in targets {
+                let uuid =
+                    Uuid::parse_str(&target).map_err(|e| StorageError::Invalid(e.to_string()))?;
+                let entity = match kind.as_str() {
+                    "scene" => EntityRef::Scene(SceneId(uuid)),
+                    "research" => EntityRef::Research(ResearchId(uuid)),
+                    _ => {
+                        return Err(StorageError::Invalid(format!(
+                            "unsupported inclusion document kind: {kind}"
+                        )));
+                    }
+                };
+                visit(store, entity, depth + 1, seen, output)?;
             }
-            seen.remove(&scene);
+            seen.remove(&key);
             Ok(())
         }
         let mut result = Vec::new();
@@ -2261,6 +2304,9 @@ impl ProjectStore {
             &mut result,
         )?;
         Ok(result)
+    }
+    pub fn expand_scene_transclusions(&self, root: SceneId) -> Result<Vec<TranscludedPassage>> {
+        self.expand_document_inclusions(EntityRef::Scene(root))
     }
     pub fn backlinks(&self, target: EntityRef) -> Result<Vec<StoryLink>> {
         let mut q = self.conn.prepare("SELECT id,source_kind,source_id,source_anchor_id,target_kind,target_id,target_anchor_id,link_kind,label FROM story_link WHERE target_kind=?1 AND target_id=?2 ORDER BY created_at,id")?;
@@ -3631,10 +3677,55 @@ mod tests {
             st.expand_scene_transclusions(b)
                 .unwrap()
                 .iter()
-                .map(|p| p.scene_id)
+                .map(|p| p.source)
                 .collect::<Vec<_>>(),
-            vec![b, a]
+            vec![EntityRef::Scene(b), EntityRef::Scene(a)]
         );
+        let research = st
+            .create_research_item(
+                "Research excerpt",
+                "A brass compass points toward the buried city.",
+                "text/markdown",
+                None,
+                None,
+            )
+            .unwrap();
+        st.create_story_link(&StoryLink {
+            id: LinkId::new(),
+            source: EntityRef::Scene(a),
+            source_anchor: None,
+            target: EntityRef::Research(research),
+            target_anchor: None,
+            kind: LinkKind::Includes,
+            label: "document excerpt".into(),
+        })
+        .unwrap();
+        let expanded = st.expand_scene_transclusions(b).unwrap();
+        assert_eq!(expanded.len(), 3);
+        assert_eq!(expanded[2].source, EntityRef::Research(research));
+        assert_eq!(
+            expanded[2].text,
+            "A brass compass points toward the buried city."
+        );
+        assert!(
+            st.create_story_link(&StoryLink {
+                id: LinkId::new(),
+                source: EntityRef::Research(research),
+                source_anchor: None,
+                target: EntityRef::Scene(b),
+                target_anchor: None,
+                kind: LinkKind::Includes,
+                label: String::new(),
+            })
+            .is_err()
+        );
+        let character = CharacterId::new();
+        st.add_character(character, "Not a document").unwrap();
+        let sql_link = LinkId::new();
+        assert!(st.conn.execute(
+            "INSERT INTO story_link(id,source_kind,source_id,target_kind,target_id,link_kind,label,created_at) VALUES(?1,'scene',?2,'character',?3,'includes','',?4)",
+            params![sql_link.to_string(), a.to_string(), character.to_string(), now()]
+        ).is_err());
         let reverse = StoryLink {
             id: LinkId::new(),
             source: EntityRef::Scene(a),
@@ -3653,8 +3744,6 @@ mod tests {
         };
         st.update_scene(&renamed).unwrap();
         assert_eq!(st.backlinks(EntityRef::Scene(b)).unwrap()[0].id, link.id);
-        let character = CharacterId::new();
-        st.add_character(character, "Soon deleted").unwrap();
         let dangling = StoryLink {
             id: LinkId::new(),
             source: EntityRef::Scene(a),
@@ -4047,7 +4136,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -4057,7 +4146,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
