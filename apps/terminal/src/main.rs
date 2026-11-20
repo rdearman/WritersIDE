@@ -3315,7 +3315,9 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('s') {
-        s.save()?;
+        if let Some(command) = command_by_id("file.save") {
+            s.dispatch_registered(command.action)?;
+        }
         return Ok(false);
     }
     if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Left {
@@ -3423,16 +3425,68 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     match k.code {
-        KeyCode::F(n) if (1..=14).contains(&n)=>{if let Some((_, workspace))=s.function_bindings.iter().find(|(number,_)|*number==n)&& let Some(spec)=command_for_workspace(*workspace){s.dispatch_registered(spec.action)?;}},
-        KeyCode::Char(':')=>{s.mode=Some(':');s.prompt.clear();},
-        KeyCode::Char('/')=>{s.mode=Some('/');s.prompt.clear();},
-        KeyCode::Char('?')=>s.message="F1-F9, F11-F14 workspaces · Ctrl+/ or F10 main menu · : command palette · / search · Ctrl-S save.".into(),
-        KeyCode::Tab=>{let i=Workspace::ALL.iter().position(|x|*x==s.workspace).unwrap_or(0);s.switch(Workspace::ALL[(i+1)%Workspace::ALL.len()]);},
-        KeyCode::BackTab=>{let i=Workspace::ALL.iter().position(|x|*x==s.workspace).unwrap_or(0);s.switch(Workspace::ALL[(i+Workspace::ALL.len()-1)%Workspace::ALL.len()]);},
-        KeyCode::Up|KeyCode::Char('k')=>s.selected=s.selected.saturating_sub(1),
-        KeyCode::Down|KeyCode::Char('j')=>{s.selected=next_list_selection(s.selected,workspace_items(s).len());},
-        KeyCode::Enter if s.workspace==Workspace::Revisions=>{let scene=s.active_scene().ok_or("select a scene first")?;let snapshots=s.app.list_snapshots(scene)?;if let Some(snapshot)=snapshots.get(s.selected){let diff=s.app.diff_snapshot(scene,snapshot.id)?;s.message=diff.into_iter().map(|line|format!("{}{}",match line.kind{story_storage::SnapshotLineKind::Equal=>' ',story_storage::SnapshotLineKind::Added=>'+',story_storage::SnapshotLineKind::Removed=>'-'},line.text.trim_end())).collect::<Vec<_>>().join(" | ");}},
-        KeyCode::Enter if s.workspace==Workspace::Timeline=>{
+        KeyCode::F(n) if (1..=14).contains(&n) => {
+            if let Some((_, workspace)) =
+                s.function_bindings.iter().find(|(number, _)| *number == n)
+                && let Some(spec) = command_for_workspace(*workspace)
+            {
+                s.dispatch_registered(spec.action)?;
+            }
+        }
+        KeyCode::Char(':') => {
+            s.mode = Some(':');
+            s.prompt.clear();
+        }
+        KeyCode::Char('/') => {
+            s.mode = Some('/');
+            s.prompt.clear();
+        }
+        KeyCode::Char('?') => {
+            if let Some(command) = command_by_id("help.context") {
+                s.dispatch_registered(command.action)?;
+            }
+        }
+        KeyCode::Tab => {
+            let i = Workspace::ALL
+                .iter()
+                .position(|x| *x == s.workspace)
+                .unwrap_or(0);
+            s.switch(Workspace::ALL[(i + 1) % Workspace::ALL.len()]);
+        }
+        KeyCode::BackTab => {
+            let i = Workspace::ALL
+                .iter()
+                .position(|x| *x == s.workspace)
+                .unwrap_or(0);
+            s.switch(Workspace::ALL[(i + Workspace::ALL.len() - 1) % Workspace::ALL.len()]);
+        }
+        KeyCode::Up | KeyCode::Char('k') => s.selected = s.selected.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            s.selected = next_list_selection(s.selected, workspace_items(s).len());
+        }
+        KeyCode::Enter if s.workspace == Workspace::Revisions => {
+            let scene = s.active_scene().ok_or("select a scene first")?;
+            let snapshots = s.app.list_snapshots(scene)?;
+            if let Some(snapshot) = snapshots.get(s.selected) {
+                let diff = s.app.diff_snapshot(scene, snapshot.id)?;
+                s.message = diff
+                    .into_iter()
+                    .map(|line| {
+                        format!(
+                            "{}{}",
+                            match line.kind {
+                                story_storage::SnapshotLineKind::Equal => ' ',
+                                story_storage::SnapshotLineKind::Added => '+',
+                                story_storage::SnapshotLineKind::Removed => '-',
+                            },
+                            line.text.trim_end()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+            }
+        }
+        KeyCode::Enter if s.workspace == Workspace::Timeline => {
             let timeline = timeline_items(&s.app);
             let item = timeline
                 .get(s.selected)
@@ -3440,19 +3494,30 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 .ok_or("timeline selection is out of range")?;
             match item {
                 TimelineItem::Scene(scene) => {
-                    s.selected=s.scenes.iter().position(|row|row.0==scene.scene.id).ok_or("timeline scene no longer exists")?;
+                    s.selected = s
+                        .scenes
+                        .iter()
+                        .position(|row| row.0 == scene.scene.id)
+                        .ok_or("timeline scene no longer exists")?;
                     s.open_selected()?;
                 }
                 TimelineItem::Event(event) => {
-                    let event_index = s.app.list_events()?.iter().position(|row|row.id==event.id).ok_or("timeline event no longer exists")?;
-                    s.selected = s.app.list_characters()?.len() + s.app.list_plotlines()?.len() + event_index;
+                    let event_index = s
+                        .app
+                        .list_events()?
+                        .iter()
+                        .position(|row| row.id == event.id)
+                        .ok_or("timeline event no longer exists")?;
+                    s.selected = s.app.list_characters()?.len()
+                        + s.app.list_plotlines()?.len()
+                        + event_index;
                     s.switch(Workspace::StoryBible);
                     s.message = format!("Selected story event {}", event.title);
                 }
             }
-        },
-        KeyCode::Enter=>s.open_selected()?,
-        _=>{}
+        }
+        KeyCode::Enter => s.open_selected()?,
+        _ => {}
     }
     Ok(false)
 }
