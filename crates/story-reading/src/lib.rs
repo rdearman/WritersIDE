@@ -159,6 +159,27 @@ fn html_text(html: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn minimal_epub(path: &Path) {
+        let file = fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let stored =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("mimetype", stored).unwrap();
+        zip.write_all(b"application/epub+zip").unwrap();
+        let compressed =
+            zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("META-INF/container.xml", compressed)
+            .unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles></container>"#).unwrap();
+        zip.start_file("OEBPS/content.opf", compressed).unwrap();
+        zip.write_all(br#"<?xml version="1.0"?><package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="uid"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:identifier id="uid">fixture</dc:identifier><dc:title>Fixture Reader</dc:title><dc:language>en</dc:language></metadata><manifest><item id="chapter" href="chapter.xhtml" media-type="application/xhtml+xml"/></manifest><spine><itemref idref="chapter"/></spine></package>"#).unwrap();
+        zip.start_file("OEBPS/chapter.xhtml", compressed).unwrap();
+        zip.write_all(b"<html><body><p>Elinor &amp; Tomas entered.</p></body></html>")
+            .unwrap();
+        zip.finish().unwrap();
+    }
     #[test]
     fn html_reader_strips_markup_and_decodes_common_entities() {
         assert_eq!(
@@ -174,6 +195,18 @@ mod tests {
         let before = fs::read(&path).unwrap();
         let doc = import_reference(&path).unwrap();
         assert_eq!(doc.extracted_text, "# A heading\n\nText.");
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+
+    #[test]
+    fn synthetic_epub_import_extracts_spine_without_modifying_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fixture.epub");
+        minimal_epub(&path);
+        let before = fs::read(&path).unwrap();
+        let doc = import_reference(&path).unwrap();
+        assert_eq!(doc.title, "Fixture Reader");
+        assert!(doc.extracted_text.contains("Elinor & Tomas entered."));
         assert_eq!(fs::read(path).unwrap(), before);
     }
 }
