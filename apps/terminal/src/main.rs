@@ -133,6 +133,8 @@ struct CommandSpec {
     description: &'static str,
     category: &'static str,
     mnemonic: Option<char>,
+    palette_aliases: &'static [&'static str],
+    takes_arguments: bool,
     action: CommandAction,
 }
 
@@ -161,6 +163,8 @@ fn command_registry() -> Vec<CommandSpec> {
             description: "Switch to this workspace",
             category: "View",
             mnemonic: None,
+            palette_aliases: &[],
+            takes_arguments: false,
             action: CommandAction::Workspace(workspace),
         })
         .collect::<Vec<_>>();
@@ -171,6 +175,8 @@ fn command_registry() -> Vec<CommandSpec> {
             description: "Open the hierarchical command menu",
             category: "Menu",
             mnemonic: Some('m'),
+            palette_aliases: &[],
+            takes_arguments: false,
             action: CommandAction::OpenMainMenu,
         },
         CommandSpec {
@@ -179,6 +185,8 @@ fn command_registry() -> Vec<CommandSpec> {
             description: "Save the current scene using optimistic concurrency",
             category: "File",
             mnemonic: Some('s'),
+            palette_aliases: &["save"],
+            takes_arguments: false,
             action: CommandAction::Save,
         },
         CommandSpec {
@@ -187,6 +195,8 @@ fn command_registry() -> Vec<CommandSpec> {
             description: "Show keyboard and command help",
             category: "Help",
             mnemonic: Some('h'),
+            palette_aliases: &["help"],
+            takes_arguments: false,
             action: CommandAction::Help,
         },
         CommandSpec {
@@ -195,6 +205,8 @@ fn command_registry() -> Vec<CommandSpec> {
             description: "Run the manuscript processing pipeline",
             category: "Compile",
             mnemonic: Some('c'),
+            palette_aliases: &["process", "compile"],
+            takes_arguments: false,
             action: CommandAction::Process {
                 expand_transclusions: false,
             },
@@ -205,6 +217,8 @@ fn command_registry() -> Vec<CommandSpec> {
             description: "Compile a derived view with scene inclusions expanded",
             category: "Compile",
             mnemonic: None,
+            palette_aliases: &["process-expand", "compile-expand"],
+            takes_arguments: false,
             action: CommandAction::Process {
                 expand_transclusions: true,
             },
@@ -215,6 +229,8 @@ fn command_registry() -> Vec<CommandSpec> {
             description: "Run selected processing stages and their dependencies",
             category: "Compile",
             mnemonic: None,
+            palette_aliases: &["process-only"],
+            takes_arguments: true,
             action: CommandAction::ProcessSelected {
                 expand_transclusions: false,
             },
@@ -225,6 +241,8 @@ fn command_registry() -> Vec<CommandSpec> {
             description: "Run selected stages with scene inclusions expanded",
             category: "Compile",
             mnemonic: None,
+            palette_aliases: &["process-expand-only"],
+            takes_arguments: true,
             action: CommandAction::ProcessSelected {
                 expand_transclusions: true,
             },
@@ -245,15 +263,22 @@ fn command_for_workspace(workspace: Workspace) -> Option<CommandSpec> {
         .find(|command| command.action == CommandAction::Workspace(workspace))
 }
 
-fn command_by_palette_text(text: &str) -> Option<CommandSpec> {
-    match text {
-        "process" | "compile" => command_by_id("compile.run"),
-        "process-expand" | "compile-expand" => command_by_id("compile.expand-transclusions"),
-        "process-only" => command_by_id("compile.selected"),
-        "process-expand-only" => command_by_id("compile.selected-expand-transclusions"),
-        "help" => command_by_id("help.context"),
-        _ => None,
+fn command_palette_invocation(text: &str) -> Option<(CommandSpec, Option<&str>)> {
+    for command in command_registry() {
+        for alias in command.palette_aliases {
+            if text == *alias {
+                return Some((command, None));
+            }
+            if command.takes_arguments
+                && let Some(arguments) = text
+                    .strip_prefix(alias)
+                    .and_then(|remaining| remaining.strip_prefix(' '))
+            {
+                return Some((command, Some(arguments)));
+            }
+        }
     }
+    None
 }
 
 fn open_menu_reserved_message() -> &'static str {
@@ -657,28 +682,8 @@ impl AppState {
             self.message = format!("{} search results", self.scenes.len());
             return Ok(());
         }
-        if let Some(spec) = command_by_palette_text(&cmd) {
-            self.dispatch_registered(spec.action)?;
-            return Ok(());
-        }
-        if let Some(rest) = cmd.strip_prefix("process-only ") {
-            let spec = command_by_id("compile.selected").ok_or("missing Compile command")?;
-            self.dispatch_registered_with_args(spec.action, Some(rest))?;
-        } else if let Some(rest) = cmd.strip_prefix("process-expand-only ") {
-            let spec = command_by_id("compile.selected-expand-transclusions")
-                .ok_or("missing Compile command")?;
-            self.dispatch_registered_with_args(spec.action, Some(rest))?;
-        } else if cmd == "process" || cmd == "process-expand" {
-            let reports = if cmd == "process-expand" {
-                self.app.run_processing_with_transclusions()?
-            } else {
-                self.app.run_processing()?
-            };
-            self.message = reports
-                .into_iter()
-                .map(|report| format!("{:?}:{:?}", report.stage, report.status))
-                .collect::<Vec<_>>()
-                .join(" · ");
+        if let Some((spec, arguments)) = command_palette_invocation(&cmd) {
+            self.dispatch_registered_with_args(spec.action, arguments)?;
         } else if let Some(title) = cmd.strip_prefix("section ") {
             let position = self
                 .app
@@ -2932,20 +2937,35 @@ mod tests {
             .map(|command| command.id)
             .collect::<BTreeSet<_>>();
         assert_eq!(ids.len(), registry.len());
+        let mut aliases = BTreeSet::new();
+        assert!(registry.iter().all(|command| {
+            command
+                .palette_aliases
+                .iter()
+                .all(|alias| aliases.insert(*alias))
+        }));
         let compile = command_by_id("compile.run").unwrap();
         assert_eq!(compile.label, "Compile");
         assert_eq!(compile.category, "Compile");
-        assert_eq!(command_by_palette_text("process"), Some(compile));
+        assert_eq!(command_palette_invocation("process").unwrap().0, compile);
         assert_eq!(
             command_by_id("compile.selected").unwrap().category,
             "Compile"
         );
         assert_eq!(
-            command_by_palette_text("process-only").unwrap().action,
+            command_palette_invocation("process-only").unwrap().0.action,
             CommandAction::ProcessSelected {
                 expand_transclusions: false
             }
         );
+        let (selected, arguments) =
+            command_palette_invocation("process-only export,continuity").unwrap();
+        assert_eq!(
+            selected.action,
+            command_by_id("compile.selected").unwrap().action
+        );
+        assert_eq!(arguments, Some("export,continuity"));
+        assert!(command_palette_invocation("compile extra-arguments").is_none());
     }
 
     #[test]

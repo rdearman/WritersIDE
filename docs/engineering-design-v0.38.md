@@ -1,0 +1,132 @@
+# Writer's IDE — Engineering Design v0.38
+
+**Status:** Active implementation design  
+**Baseline:** Engineering Design v0.37
+
+## Terminal outline operations
+
+The command palette now offers structural scene-planning operations: `section <title>`, `chapter <title>`, `subchapter <section-id> <title>`, `scene <chapter-id> <title>`, `move <scene-id> <chapter-id> <position>`, `rename <scene-id> <title>`, and `scene-status <scene-id> <status>`. Creation chooses the next sibling position; movement delegates to the application service's transactional position algorithm. Scene renaming updates typed metadata without changing stable IDs or file paths. The Outline workspace displays chapter titles alongside their scenes.
+
+The terminal regression test creates nested structure, drafts text, links a POV character, moves and renames the scene, then verifies placement, scene identity, relationship, and manuscript content. This makes the TUI useful for actual outlining and rearrangement, while full column/hoist/clone views and metadata forms remain future work.
+
+## Practical manuscript editing and entity creation
+
+The Editor workspace now supports character-indexed text selection, highlighted selection rendering, multiline copy/cut/paste in the application's internal clipboard, and Shift+Arrow selection. Uppercase/shifted text is accepted, and horizontal movement crosses line boundaries. Selection and clipboard state are transient UI state; only resulting manuscript text is persisted, through the existing optimistic durable save path. Conflicts continue to retain the unsaved editor buffer.
+
+The terminal command palette can create a character (`character <name>`), plotline (`plotline <name>`), issue (`issue <title>`), and research note (`research <title> | <body>`), then navigate to the corresponding workspace. These operations use `story-app` services and do not issue domain SQL from the UI. They create initial records only; detailed entity editing forms and OS clipboard integration remain unresolved.
+
+Regression tests cover multiline selection extraction/deletion, clipboard paste, selection extension/collapse, shifted uppercase entry, line-boundary movement, and command-palette creation for character, plotline, issue, and research entities. Offline workspace tests and Clippy pass for this revision.
+
+## Plot Grid matrix
+
+The Plot Grid workspace now derives a read-only matrix from `analytics_dataset`: scenes are rows in manuscript order, plotlines are columns, and a filled marker indicates scene membership. Chapter titles are resolved from structural nodes; unplaced scenes are labelled explicitly. The matrix reads canonical relationships and cannot change them. The app-level regression fixture verifies that an assigned plotline appears in the matching scene row.
+
+The Characters workspace now derives a read-only scene-by-character matrix. Cells distinguish POV (`P`), major (`●`), minor (`○`), off-camera (`o`), mentioned (`m`), and no recorded participation (`·`). It reads application analytics and remains a projection; editing relationships continues through application services. A regression check verifies that a POV link appears with its role marker.
+
+## Passage anchor revalidation
+
+Scene saves revalidate passage anchors inside the same SQLite transaction that commits the manuscript hash and search index, including recovery after an atomic file replacement. A unique exact quote match is reattached automatically. Repeated matches are scored against saved prefix/suffix context and are reattached only if one candidate has a unique non-zero best score. Missing passages become `broken`; ambiguous repeated passages become `needs_review`. The stable anchor UUID is retained in all cases. `anchors` lists a scene's anchor states and `anchor-move <anchor-uuid> <start-byte> <end-byte>` explicitly reattaches an anchor after the author selects the correct passage. The operation validates UTF-8 boundaries and exact quote identity. The CLI provides `anchors` and `anchor-move` equivalents.
+
+Tests cover unique relocation, context ambiguity, removed passages, explicit reattachment, invalid offsets and recovery after rename-before-database-commit. Anchor updates participate in the same transaction as recovered manuscript metadata so the durable journal cannot commit text while leaving anchor state silently current at stale offsets.
+
+## Project-wide full-text index
+
+Migration 0005 adds a rebuildable FTS5 index over a typed `project_search_content` projection. It indexes scene titles, synopsis, purpose, goal, outcome, status and manuscript text; character and location names; plotline names; event titles/descriptions/source time; research titles/bodies; issue titles/status; and imported reading titles/text. SQLite triggers keep the projection and FTS table current. Search returns typed entity kind/ID, title and excerpt, with deterministic ranking ties. `rebuild_project_search_index` recreates the virtual index from its ordinary projection table.
+
+`search-all` is available in the CLI and terminal command palette. Terminal results navigate to their underlying story entity or reading document. Existing scene-only and reference-only search APIs remain available. The storage tests cover initial migration from schema v4, incremental updates for prose and metadata, typed results, empty queries, result limits, and index rebuild.
+
+Migration 0006 adds custom scene-field values to that projection. Text, long text, integer, decimal, boolean, enum, and entity-reference scalar values are searchable. Triggers recompute a scene's indexed projection when a custom value is inserted, updated, or deleted, and when scene prose or core metadata is subsequently updated. Existing custom-field values are included when migrating. Tests verify custom value updates, deletion, and that later manuscript saves preserve the custom metadata in the index.
+
+## Scene planning commands
+
+The terminal command palette now edits core scene purpose fields through `scene-field <scene-uuid> <synopsis|purpose|goal|outcome> | <text>`. `character-link <scene-uuid> <character-uuid> <pov|major|minor|off_camera|mentioned>` creates typed participation. `event <title> | <source-time>` creates story events and `event-link <scene-uuid> <event-uuid> [relationship]` associates them with scenes. Issues can be linked through `issue-link <scene-uuid> <issue-uuid>`.
+
+Plotline assignment uses `plotline-link <scene-uuid> <plotline-uuid> <overlap|equal> [role]`, preserving existing memberships while adding a distinct plotline. `plotline-shares <scene-uuid> <plotline-uuid>=<basis-points>...` submits a complete author-defined allocation set; the existing domain validation requires exactly 10,000 basis points. The terminal doesn't normalize incomplete or excessive allocations. Tests exercise the commands and verify role/relationship/metadata persistence through the application API.
+
+The issue tracker now supports status transitions through `issue-status <issue-uuid> <open|in_progress|resolved|deferred|closed>` in the terminal command palette and CLI. Invalid statuses and missing issue IDs are rejected by the service/storage boundary; updates refresh the indexed issue status. The terminal integration test creates, links, and transitions an issue, then checks its persisted status.
+
+## Reading annotation and bookmark navigation
+
+The Reading command palette lists annotations and bookmarks with stable zero-based indices. `annotation-jump <index>` and `bookmark-jump <index>` navigate to their stored byte offsets without changing the imported source. Navigation validates that offsets are within extracted UTF-8 text and land on a character boundary, then updates the reading pane's scroll position and focus. Annotation/bookmark list output uses the same ordering and indices as jump commands. Integration tests verify listed indices and jumps into a later passage.
+
+## Ollama HTTP contract test
+
+The optional Ollama client now has an offline loopback mock test that binds an ephemeral `127.0.0.1` port and serves one `/api/generate` response. It verifies the real HTTP method/path, model name, `stream=false`, JSON response format, source text in the prompt, and extraction JSON decoding. The test passes under the elevated local-socket permission; ordinary sandbox execution denies TCP bind. No external network request or installed Ollama daemon is needed. Live compatibility with Ollama versions/models remains unverified.
+
+
+## In-place reading annotation rendering
+
+The Reading source pane renders current annotations over the extracted UTF-8 text without changing that text or the imported source file. Highlight annotations use yellow background with black foreground; note annotations use cyan underlining. Stale, broken, or otherwise non-current annotation records are not applied to the passage. Invalid, out-of-range, or non-character-boundary offsets are ignored defensively. Rendering uses stored byte anchors and keeps annotation records separate from source content. The terminal integration test verifies that a saved highlight decorates the expected passage while annotation/bookmark navigation continues to work.
+
+
+## Analytics workspace report
+
+The terminal Analytics workspace now displays all scene rows in the character appearance heatmap, with participation roles distinguished as POV, major, minor, off-camera, and mentioned. It also displays named character interaction pairs and shared-scene counts, subplot gaps with boundary scene titles, uncertain chronology pairs, and per-scene word-budget suggestions. Budget suggestions are explicitly labelled as previews and are generated from a read-only analysis projection; they do not modify scene targets. The report is scrollable as a workspace list. A synthetic regression fixture verifies each report section, includes rows beyond the former 20-row cutoff, and confirms that source scene targets remain unset.
+
+
+## Chronology-aware terminal scene timeline
+
+The Timeline workspace orders scenes by canonical `StoryTime` start values rather than manuscript placement. Exact, approximate, bounded, and unknown values are shown as relative day/time labels using the project's seconds-per-day tick model; bounds remain visible. Unknown values sort after known values. Equal or absent times have deterministic title and UUID tie-breaks. Enter maps the selected chronological scene back to its stable scene ID before opening the editor, so an alternate view cannot accidentally open a different manuscript row. Keyboard list navigation uses the current workspace's visible item count, allowing every expanded Analytics report row to be reached. Tests cover negative ticks, bounded and approximate interval labels, chronological order, unknown-last ordering, and long-list navigation. Story-event timelines and explicit ambiguity grouping remain open extensions.
+
+
+## Event and scene timeline
+
+Timeline records now combine scenes and story events by their canonical nominal start tick, falling back to interval bounds when no nominal value exists and placing unknown intervals last. Scene and event rows display start/end values with explicit approximate or bounded ranges; event rows also retain the original source-time representation for readers. Equal/unknown entries use title and stable ID tie-breaks. The `event-time TITLE | START | END | SOURCE-TIME` command creates a typed event through the application service. Each time accepts `?` for unknown, an integer tick for exact time, `LOWER..UPPER` for bounded time, or `~NOMINAL,LOWER,UPPER` for approximate time. Selection navigates scenes by stable scene ID and events to their Story Bible row. Stored event intervals are loaded as typed `StoryTime` values. The timeline's display order is a navigation aid; uncertain intervals are not asserted as conclusively ordered. Tests verify event interval persistence, mixed scene/event order, relative source labels and parser validation.
+
+
+## Live saved-query virtual collection
+
+The terminal's saved-query view no longer replaces the application-wide scene cache. `query <UUID>` validates the saved query, restores the full manuscript-order scene cache, and displays matching scene references as a virtual Search collection. Each view refresh evaluates the query against current structured data; scene ordering and placements remain unchanged. Enter resolves the selected query result's stable scene ID into the full scene cache before opening the editor. `query-clear` leaves the collection and returns Search to the full scene listing. Full-text search and saved-query views clear one another explicitly. The terminal integration test applies a status change while the query view is open, verifies membership refreshes immediately, confirms the full ordered scene cache remains intact, and checks that Enter opens the matching scene identity.
+
+
+## Story entity selection and search navigation
+
+Project search now routes characters, locations, plotlines, events, and issues into the workspace and row representing that entity. Character, location, plotline, and event indices account for the Story Bible's grouped ordering (characters, locations, plotlines, events). Issue hits select the matching issue row. Reading-document entity links use the same destinations. Enter in Story Bible, Issues, and Research inspects the selected record instead of opening a manuscript scene based on the unrelated shared row index. Creation commands select the newly created character/location/plotline/event/issue/research record. The storage/application layer now exposes location creation and ordered listing, and the terminal `location NAME` command adds locations to the Story Bible. Tests cover all supported project search entity routes, entity inspection without scene misnavigation, and location creation/listing.
+
+
+## Optional transclusion-aware manuscript compilation
+
+The processing service exposes an opt-in compile mode that expands scene-to-scene `Transcludes` and `Includes` links into a derived compilation view. The default `process` behavior remains unchanged. Expansion uses the storage layer's stable-ID graph traversal, which detects cycles and rejects invalid/broken targets; it does not rewrite a scene's canonical Markdown file or its indexed manuscript text. Each included passage is separated by a Markdown horizontal rule. A target scene remains present at its own manuscript placement, so inclusion can intentionally repeat its text in the compiled output.
+
+The expanded view is explicitly selected with `writers-ide process <project> --expand-transclusions` or terminal command `:process-expand`. The expansion mode is included in the compilation fingerprint, preventing reuse of artifacts generated under a different mode. Tests verify normal and expanded output, separator placement, cache behavior, and unchanged canonical scene text. Transclusion expansion currently targets scene passages only; general document inclusion and author-configurable compilation policies remain open.
+
+
+## Hierarchical menu and command registry foundation (Issue #8)
+
+The terminal command registry is the shared source for stable IDs, labels, descriptions, categories, mnemonics, and typed actions for workspace navigation, save, help, and compile commands. Registered actions are dispatched through one application-state dispatcher from keyboard and exact command-palette routes. Existing parameterized command handlers remain in the established command parser and are an incremental migration target; new menu actions must be registered rather than adding a menu-only handler. The registry category uses **Compile**.
+
+Ctrl+/ is reserved as the preferred main-menu invocation when the terminal reports it as `Char('/')` with Control; Ctrl+_ is also accepted for terminal protocols that encode the chord that way. F10 is reserved as the fallback and is no longer assigned to the Research workspace. Research remains reachable by workspace cycling. These chords dispatch to the same registered main-menu action. Until popup rendering is implemented, invoking that action reports that the menu UI is pending and leaves editor text, cursor, selection, dirty state, and undo-relevant content untouched. Plain `/` remains available in manuscript text; outside the editor it continues to invoke search.
+
+The project keymap continues to support function-key workspace overrides, but rejects F10 as a workspace key because it is reserved. Terminal-specific Ctrl+/ reporting cannot be assumed across SSH, tmux, legacy protocols, or emulator configurations; F10 is the reliable fallback. Keymap-configurable command shortcuts, conflict diagnostics, Kitty enhanced keyboard negotiation, hierarchical popup navigation, disabled menu entries, focus restoration, and full registry migration of parameterized commands are deferred to the Issue #8 visual-menu milestone. Tests cover both encoded menu chords, the F10 reservation, registry uniqueness and Compile naming, plain slash insertion, and editor-state preservation.
+
+
+## Evidence-checked approval of extracted knowledge
+
+Migration 0007 adds `approved_knowledge_claim`, a searchable project record for a claim deliberately promoted from a provisional Ollama extraction. The record preserves candidate kind/name/statement, approximate story-time text, source type and stable source ID, SHA-256 fingerprint of the exact extracted text, source byte length, exact evidence quote and byte offsets, model name, and approval timestamp. SQLite source triggers require the scene or reading record to exist; uniqueness prevents repeated promotion of the same claim from the same source revision and evidence span. Search-index triggers add approved claims to project-wide FTS.
+
+`WriterApp::approve_extraction_claim` validates the source kind and UUID, reloads current source text, verifies fingerprint and byte length, and requires the stored evidence range to resolve to the exact nonempty quote before insertion. A changed scene or reference is rejected for review/regeneration. Promotion is idempotent for a matching previously approved record. This operation is the only application path that creates an authoritative knowledge record from a provisional candidate. It does not silently create or mutate characters, events, manuscript text, or other domain entities.
+
+The CLI accepts `approve-extraction <project> <proposal-json-file> <zero-based-claim-index>` and `knowledge <project>`. The terminal palette accepts `approve <proposal-json-path> <claim-index>` and `knowledge`; approved records appear in the Story Bible and are reachable from project search. The explicit approval operation commits the database record first, then atomically marks that one proposal claim approved. If writing the proposal file fails after database commit, rerunning the command resolves to the existing record, avoiding duplicate facts.
+
+Tests cover scene and reading sources, source immutability, stale source rejection, evidence verification, idempotency, persistence after reopen, source existence constraints, FTS indexing and terminal search navigation. Rich proposal review/edit/reject workflows, entity-specific promotion into character/event tables, and fact retraction are not implemented yet.
+
+
+## Selective processing with dependency closure
+
+`PipelineRunner::run_selected(input, requested)` is the selective processing contract. `Stage::ALL` defines deterministic report/order output; each stage's declared dependencies are recursively included in a `BTreeSet` closure. The runner executes that closure in topological order, reuses only fingerprint- and artifact-hash-verified cache entries, marks requested dependents `Skipped` when a dependency fails, and marks excluded stages `NotSelected` with an explicit reason. An empty API selection performs no stages and reports every stage as `NotSelected`. The existing `run` API remains the full-pipeline convenience wrapper.
+
+Stable CLI names are `compile`, `word-count`, `plotline-analysis`, `character-analysis`, `continuity`, `export`, and `revision-report`. Use `writers-ide process <project> --only export` to run Compile and Export, or combine selections such as `--only character-analysis,continuity`. `--expand-transclusions` composes with `--only`. The CLI treats `NotSelected` as an intentional partial run, while `Failed` and dependency `Skipped` indicate incomplete processing. The terminal command palette accepts `process-only <stage,...>` and `process-expand-only <stage,...>`.
+
+Regression tests verify transitive dependency selection, excluded-stage reports, cache reuse, failure propagation, stable stage parsing, CLI argument rejection, and terminal invocation. This adds stage selection without changing stage fingerprints or full-run behavior. Declarative processing profiles, configurable artifact formats, logs, and selective invalidation driven by source entity deltas remain future pipeline work.
+
+## Uncertainty-aware character chronology diagnostics
+
+Continuity processing now delegates same-character interval comparison to `story_analysis::character_chronology_findings`. Pipeline character inputs retain both stable character IDs and display names, so characters with identical names do not create false co-location conflicts. Reports use `definite-overlap`, `possible-overlap`, and `unverified-overlap` classifications with scene IDs and shared character IDs. A definite overlap requires both intervals to be exactly/definitely ordered as intersecting; bounded uncertainty that prevents a conclusion is reported as possible, and any unknown endpoint that prevents a conclusion is unverified. Endpoints that are definitely before or exactly the same as the other scene's start are treated as non-overlapping adjacency. These are candidate chronology findings, not asserted errors.
+
+Analysis tests cover definite overlap, bounded possible overlap, unknown/unverified time, touching boundaries, and different stable IDs for homonymous characters. A pipeline test verifies the emitted classifications and stable character references. Wider location/custody constraints and diagnostic-to-issue workflows remain future work.
+
+## Registry-owned command palette aliases
+
+Each registered terminal command now declares its own palette aliases and whether it accepts an argument string. Palette lookup iterates the registry, rejects ambiguous aliases in tests, and returns a `(CommandSpec, arguments)` invocation. Exact and parameterized Compile commands therefore share the existing central dispatcher; the main palette route no longer carries a separate Compile alias/prefix switch or bypasses the dispatcher for processing. Argument parsing for selected stage names remains in the typed action dispatcher.
+
+This increment does not claim the whole parameterized palette has migrated: structural, entity, reading, link, and extraction commands still use the established parser. They remain an incremental migration task. The registry is the required source for any future menu entry; the visual menu remains deferred. Tests verify alias uniqueness, selected-stage argument routing, and rejection of arguments on no-argument registered commands.
