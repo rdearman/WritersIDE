@@ -112,6 +112,11 @@ pub struct CharacterSummary {
     pub scene_count: u32,
 }
 #[derive(Clone, Debug)]
+pub struct LocationSummary {
+    pub id: LocationId,
+    pub name: String,
+}
+#[derive(Clone, Debug)]
 pub struct PlotlineSummary {
     pub id: PlotlineId,
     pub name: String,
@@ -1700,6 +1705,31 @@ impl ProjectStore {
         })
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
+    }
+    pub fn add_location(&mut self, id: LocationId, name: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO location(id,name) VALUES(?1,?2)",
+            params![id.to_string(), name],
+        )?;
+        Ok(())
+    }
+    pub fn list_locations(&self) -> Result<Vec<LocationSummary>> {
+        let mut query = self
+            .conn
+            .prepare("SELECT id,name FROM location ORDER BY name COLLATE NOCASE,id")?;
+        let rows = query.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (id, name) = row?;
+            Ok(LocationSummary {
+                id: LocationId(Uuid::parse_str(&id).map_err(|error| {
+                    StorageError::Invalid(format!("invalid location UUID: {error}"))
+                })?),
+                name,
+            })
+        })
+        .collect()
     }
     pub fn add_plotline(&mut self, id: PlotlineId, name: &str) -> Result<()> {
         self.conn.execute(

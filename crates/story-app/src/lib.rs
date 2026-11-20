@@ -264,6 +264,11 @@ impl WriterApp {
         self.store.add_character(id, name)?;
         Ok(id)
     }
+    pub fn create_location(&mut self, name: &str) -> Result<LocationId> {
+        let id = LocationId::new();
+        self.store.add_location(id, name)?;
+        Ok(id)
+    }
     pub fn create_plotline(&mut self, name: &str) -> Result<PlotlineId> {
         let id = PlotlineId::new();
         self.store.add_plotline(id, name)?;
@@ -361,6 +366,9 @@ impl WriterApp {
     }
     pub fn list_characters(&self) -> Result<Vec<story_storage::CharacterSummary>> {
         Ok(self.store.list_characters()?)
+    }
+    pub fn list_locations(&self) -> Result<Vec<story_storage::LocationSummary>> {
+        Ok(self.store.list_locations()?)
     }
     pub fn list_plotlines(&self) -> Result<Vec<story_storage::PlotlineSummary>> {
         Ok(self.store.list_plotlines()?)

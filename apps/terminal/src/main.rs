@@ -219,18 +219,33 @@ impl AppState {
                         .iter()
                         .position(|x| x.id == id)
                         .ok_or("search character no longer exists")?;
-                    self.switch(Workspace::Characters);
+                    self.switch(Workspace::StoryBible);
                     return Ok(());
                 }
                 "plotline" => {
                     let id = story_core::PlotlineId(hit.entity_id.parse()?);
-                    self.selected = self
+                    let plotline_index = self
                         .app
                         .list_plotlines()?
                         .iter()
                         .position(|x| x.id == id)
                         .ok_or("search plotline no longer exists")?;
-                    self.switch(Workspace::PlotGrid);
+                    self.selected = self.app.list_characters()?.len()
+                        + self.app.list_locations()?.len()
+                        + plotline_index;
+                    self.switch(Workspace::StoryBible);
+                    return Ok(());
+                }
+                "location" => {
+                    let id = story_core::LocationId(hit.entity_id.parse()?);
+                    let location_index = self
+                        .app
+                        .list_locations()?
+                        .iter()
+                        .position(|location| location.id == id)
+                        .ok_or("search location no longer exists")?;
+                    self.selected = self.app.list_characters()?.len() + location_index;
+                    self.switch(Workspace::StoryBible);
                     return Ok(());
                 }
                 "research" => {
@@ -244,9 +259,30 @@ impl AppState {
                     self.switch(Workspace::Research);
                     return Ok(());
                 }
-                "event" | "location" | "issue" => {
+                "event" => {
+                    let id = story_core::EventId(hit.entity_id.parse()?);
+                    let event_index = self
+                        .app
+                        .list_events()?
+                        .iter()
+                        .position(|event| event.id == id)
+                        .ok_or("search event no longer exists")?;
+                    self.selected = self.app.list_characters()?.len()
+                        + self.app.list_locations()?.len()
+                        + self.app.list_plotlines()?.len()
+                        + event_index;
                     self.switch(Workspace::StoryBible);
-                    self.message = format!("Selected {}: {}", hit.entity_kind, hit.title);
+                    return Ok(());
+                }
+                "issue" => {
+                    let id = story_core::IssueId(hit.entity_id.parse()?);
+                    self.selected = self
+                        .app
+                        .list_issues()?
+                        .iter()
+                        .position(|issue| issue.id == id)
+                        .ok_or("search issue no longer exists")?;
+                    self.switch(Workspace::Issues);
                     return Ok(());
                 }
                 kind => return Err(format!("unsupported search entity kind: {kind}").into()),
@@ -269,6 +305,15 @@ impl AppState {
                 .position(|scene| scene.0 == id)
                 .ok_or("query scene no longer exists")?;
             return self.open_scene(id);
+        }
+        if matches!(
+            self.workspace,
+            Workspace::StoryBible | Workspace::Issues | Workspace::Research
+        ) {
+            if let Some(row) = workspace_items(self).get(self.selected) {
+                self.message = row.clone();
+            }
+            return Ok(());
         }
         if let Some(id) = self.active_scene() {
             self.open_scene(id)?;
@@ -382,8 +427,25 @@ impl AppState {
             self.message = format!("Created chapter {id}");
         } else if let Some(name) = cmd.strip_prefix("character ") {
             let id = self.app.create_character(name.trim())?;
-            self.switch(Workspace::Characters);
+            self.selected = self
+                .app
+                .list_characters()?
+                .iter()
+                .position(|character| character.id == id)
+                .ok_or("created character was not listed")?;
+            self.switch(Workspace::StoryBible);
             self.message = format!("Created character {id}");
+        } else if let Some(name) = cmd.strip_prefix("location ") {
+            let id = self.app.create_location(name.trim())?;
+            self.selected = self.app.list_characters()?.len()
+                + self
+                    .app
+                    .list_locations()?
+                    .iter()
+                    .position(|location| location.id == id)
+                    .ok_or("created location was not listed")?;
+            self.switch(Workspace::StoryBible);
+            self.message = format!("Created location {id}");
         } else if let Some(rest) = cmd.strip_prefix("character-link ") {
             let mut parts = rest.split_whitespace();
             let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
@@ -456,10 +518,24 @@ impl AppState {
             self.message = format!("Updated {field} for scene {id}");
         } else if let Some(name) = cmd.strip_prefix("plotline ") {
             let id = self.app.create_plotline(name.trim())?;
-            self.switch(Workspace::PlotGrid);
+            self.selected = self.app.list_characters()?.len()
+                + self.app.list_locations()?.len()
+                + self
+                    .app
+                    .list_plotlines()?
+                    .iter()
+                    .position(|plotline| plotline.id == id)
+                    .ok_or("created plotline was not listed")?;
+            self.switch(Workspace::StoryBible);
             self.message = format!("Created plotline {id}");
         } else if let Some(title) = cmd.strip_prefix("issue ") {
             let id = self.app.create_issue(title.trim())?;
+            self.selected = self
+                .app
+                .list_issues()?
+                .iter()
+                .position(|issue| issue.id == id)
+                .ok_or("created issue was not listed")?;
             self.switch(Workspace::Issues);
             self.message = format!("Created issue {id}");
         } else if let Some(rest) = cmd.strip_prefix("issue-link ") {
@@ -488,11 +564,29 @@ impl AppState {
                 source_time_text: fields[3].into(),
             };
             self.app.add_story_event(&event)?;
+            self.selected = self.app.list_characters()?.len()
+                + self.app.list_locations()?.len()
+                + self.app.list_plotlines()?.len()
+                + self
+                    .app
+                    .list_events()?
+                    .iter()
+                    .position(|candidate| candidate.id == event.id)
+                    .ok_or("created event was not listed")?;
             self.switch(Workspace::StoryBible);
             self.message = format!("Created timed story event {}", event.id);
         } else if let Some(rest) = cmd.strip_prefix("event ") {
             let (title, source_time) = rest.split_once('|').unwrap_or((rest, ""));
             let id = self.app.add_event(title.trim(), source_time.trim())?;
+            self.selected = self.app.list_characters()?.len()
+                + self.app.list_locations()?.len()
+                + self.app.list_plotlines()?.len()
+                + self
+                    .app
+                    .list_events()?
+                    .iter()
+                    .position(|event| event.id == id)
+                    .ok_or("created event was not listed")?;
             self.switch(Workspace::StoryBible);
             self.message = format!("Created story event {id}");
         } else if let Some(rest) = cmd.strip_prefix("event-link ") {
@@ -507,6 +601,12 @@ impl AppState {
             let id =
                 self.app
                     .create_research_item(title.trim(), body.trim(), "note", None, None)?;
+            self.selected = self
+                .app
+                .list_research_items()?
+                .iter()
+                .position(|item| item.id == id)
+                .ok_or("created research note was not listed")?;
             self.switch(Workspace::Research);
             self.message = format!("Created research note {id}");
         } else if let Some(rest) = cmd.strip_prefix("subchapter ") {
@@ -724,17 +824,20 @@ impl AppState {
                         .iter()
                         .position(|x| x.id == id)
                         .ok_or("linked character no longer exists")?;
-                    self.switch(Workspace::Characters);
+                    self.switch(Workspace::StoryBible);
                     self.message = format!("Opened linked character {}", id);
                 }
                 story_core::EntityRef::Plotline(id) => {
-                    self.selected = self
+                    let plotline_index = self
                         .app
                         .list_plotlines()?
                         .iter()
                         .position(|x| x.id == id)
                         .ok_or("linked plotline no longer exists")?;
-                    self.switch(Workspace::PlotGrid);
+                    self.selected = self.app.list_characters()?.len()
+                        + self.app.list_locations()?.len()
+                        + plotline_index;
+                    self.switch(Workspace::StoryBible);
                     self.message = format!("Opened linked plotline {}", id);
                 }
                 story_core::EntityRef::Research(id) => {
@@ -1090,7 +1193,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -1519,7 +1622,18 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     .borders(Borders::ALL),
             );
         f.render_stateful_widget(list, body[0], &mut state);
-        let detail = if let Some((id, title, status, words)) = s.scenes.get(s.selected) {
+        let detail = if matches!(
+            s.workspace,
+            Workspace::StoryBible | Workspace::Issues | Workspace::Research
+        ) {
+            let selected = workspace_items(s).get(s.selected).cloned();
+            format!(
+                "{}\n\n{}\n\n{}",
+                selected.as_deref().unwrap_or("No record selected"),
+                "Enter inspects this record; relationships use stable entity IDs.",
+                s.message
+            )
+        } else if let Some((id, title, status, words)) = s.scenes.get(s.selected) {
             format!(
                 "Scene: {title}\nID: {id}\nStatus: {}\nWords: {words}\n\nEnter opens the manuscript editor.\n\n{}",
                 status.as_str(),
@@ -1996,6 +2110,13 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                     .unwrap_or_default()
                     .into_iter()
                     .map(|c| format!("Character · {}", c.name)),
+            );
+            rows.extend(
+                s.app
+                    .list_locations()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|location| format!("Location · {}", location.name)),
             );
             rows.extend(
                 s.app
@@ -2704,7 +2825,7 @@ mod tests {
         state.mode = Some(':');
         state.prompt = "character Mara".into();
         state.command().unwrap();
-        assert_eq!(state.workspace, Workspace::Characters);
+        assert_eq!(state.workspace, Workspace::StoryBible);
         assert_eq!(state.app.list_characters().unwrap()[0].name, "Mara");
         let character_id = state.app.list_characters().unwrap()[0].id;
         state.mode = Some(':');
@@ -2718,9 +2839,14 @@ mod tests {
                 .any(|row| row.contains("First") && row.contains('P'))
         );
         state.mode = Some(':');
+        state.prompt = "location Observatory".into();
+        state.command().unwrap();
+        assert_eq!(state.workspace, Workspace::StoryBible);
+        assert!(workspace_items(&state)[state.selected].contains("Observatory"));
+        state.mode = Some(':');
         state.prompt = "plotline Political intrigue".into();
         state.command().unwrap();
-        assert_eq!(state.workspace, Workspace::PlotGrid);
+        assert_eq!(state.workspace, Workspace::StoryBible);
         assert_eq!(
             state.app.list_plotlines().unwrap()[0].name,
             "Political intrigue"
@@ -2983,7 +3109,7 @@ mod tests {
         state.mode = Some(':');
         state.prompt = "reading-follow 0".into();
         state.command().unwrap();
-        assert_eq!(state.workspace, Workspace::Characters);
+        assert_eq!(state.workspace, Workspace::StoryBible);
         assert_eq!(state.selected, 0);
         state.reading_document = Some(reading);
         state.reading_text = imported.extracted_text;
@@ -3303,6 +3429,101 @@ mod tests {
         state.command().unwrap();
         assert_eq!(state.query_view, None);
         assert_eq!(workspace_items(&state).len(), 2);
+    }
+
+    #[test]
+    fn project_search_routes_each_story_entity_to_its_record_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let character = app.create_character("Mara").unwrap();
+        let location = app.create_location("Observatory").unwrap();
+        let plotline = app.create_plotline("Rebellion").unwrap();
+        let event = app.add_event("The signal", "Day 2").unwrap();
+        let issue = app.create_issue("Check the map").unwrap();
+        let mut state = AppState {
+            app,
+            workspace: Workspace::Search,
+            scenes: Vec::new(),
+            selected: 0,
+            editor: vec![String::new()],
+            editing_scene: None,
+            cursor: (0, 0),
+            saved_hash: String::new(),
+            dirty: false,
+            mode: None,
+            prompt: String::new(),
+            message: String::new(),
+            history: vec![Workspace::Search],
+            history_index: 0,
+            width: 80,
+            scroll: 0,
+            reading_document: None,
+            reading_text: String::new(),
+            reading_offset: 0,
+            reading_focus: false,
+            reading_selection_start: None,
+            function_bindings: default_bindings(),
+            search_hits: Vec::new(),
+            query_view: None,
+            editor_selection: None,
+            clipboard: String::new(),
+        };
+        let hit = |kind: &str, id: String, title: &str| story_storage::ProjectSearchHit {
+            entity_kind: kind.into(),
+            entity_id: id,
+            title: title.into(),
+            excerpt: title.into(),
+        };
+        for (kind, id, title, workspace, expected_index) in [
+            (
+                "character",
+                character.to_string(),
+                "Mara",
+                Workspace::StoryBible,
+                0,
+            ),
+            (
+                "location",
+                location.to_string(),
+                "Observatory",
+                Workspace::StoryBible,
+                1,
+            ),
+            (
+                "plotline",
+                plotline.to_string(),
+                "Rebellion",
+                Workspace::StoryBible,
+                2,
+            ),
+            (
+                "event",
+                event.to_string(),
+                "The signal",
+                Workspace::StoryBible,
+                3,
+            ),
+            (
+                "issue",
+                issue.to_string(),
+                "Check the map",
+                Workspace::Issues,
+                0,
+            ),
+        ] {
+            state.workspace = Workspace::Search;
+            state.selected = 0;
+            state.search_hits = vec![hit(kind, id, title)];
+            state.open_selected().unwrap();
+            assert_eq!(state.workspace, workspace);
+            assert_eq!(state.selected, expected_index);
+            let row = workspace_items(&state)[expected_index].clone();
+            assert!(row.contains(title));
+            state.open_selected().unwrap();
+            assert_eq!(state.workspace, workspace);
+            assert_eq!(state.message, row);
+            assert_eq!(state.editing_scene, None);
+        }
     }
 
     #[test]
