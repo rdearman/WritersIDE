@@ -1640,12 +1640,18 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     s.backspace();
                 }
             }
-            KeyCode::Left => s.move_cursor(s.cursor.0, s.cursor.1.saturating_sub(1), selecting),
-            KeyCode::Right => s.move_cursor(
-                s.cursor.0,
-                (s.cursor.1 + 1).min(s.editor[s.cursor.0].chars().count()),
-                selecting,
-            ),
+            KeyCode::Left if s.cursor.1 > 0 => s.move_cursor(s.cursor.0, s.cursor.1 - 1, selecting),
+            KeyCode::Left if s.cursor.0 > 0 => {
+                let row = s.cursor.0 - 1;
+                let col = s.editor[row].chars().count();
+                s.move_cursor(row, col, selecting);
+            }
+            KeyCode::Right if s.cursor.1 < s.editor[s.cursor.0].chars().count() => {
+                s.move_cursor(s.cursor.0, s.cursor.1 + 1, selecting)
+            }
+            KeyCode::Right if s.cursor.0 + 1 < s.editor.len() => {
+                s.move_cursor(s.cursor.0 + 1, 0, selecting);
+            }
             KeyCode::Up => {
                 let row = s.cursor.0.saturating_sub(1);
                 s.move_cursor(row, s.cursor.1, selecting);
@@ -1654,7 +1660,12 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 let row = (s.cursor.0 + 1).min(s.editor.len() - 1);
                 s.move_cursor(row, s.cursor.1, selecting);
             }
-            KeyCode::Char(c) if k.modifiers.is_empty() => s.insert(c),
+            KeyCode::Char(c)
+                if !k.modifiers.contains(KeyModifiers::CONTROL)
+                    && !k.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                s.insert(c)
+            }
             KeyCode::Esc => s.switch(Workspace::Outline),
             _ => {}
         }
@@ -1801,6 +1812,52 @@ mod tests {
         .unwrap();
         assert_eq!(state.editor_selection, None);
         assert_eq!(state.cursor, (0, 3));
+    }
+
+    #[test]
+    fn editor_accepts_shifted_characters_and_moves_between_lines() {
+        let mut state = AppState {
+            app: WriterApp::create_project(tempfile::tempdir().unwrap().path().join("N"), "N")
+                .unwrap(),
+            workspace: Workspace::Editor,
+            scenes: Vec::new(),
+            selected: 0,
+            editor: vec![String::new(), "next".into()],
+            editing_scene: None,
+            cursor: (0, 0),
+            saved_hash: String::new(),
+            dirty: false,
+            mode: None,
+            prompt: String::new(),
+            message: String::new(),
+            history: vec![Workspace::Editor],
+            history_index: 0,
+            width: 80,
+            scroll: 0,
+            reading_document: None,
+            reading_text: String::new(),
+            reading_offset: 0,
+            reading_focus: false,
+            reading_selection_start: None,
+            function_bindings: default_bindings(),
+            editor_selection: None,
+            clipboard: String::new(),
+        };
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        assert_eq!(state.editor[0], "A");
+        state.cursor = (0, 1);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.cursor, (1, 0));
+        handle(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.cursor, (0, 1));
     }
 
     #[test]
