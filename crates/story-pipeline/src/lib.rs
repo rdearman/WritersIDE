@@ -22,6 +22,8 @@ pub struct PipelineScene {
     pub id: String,
     pub title: String,
     pub text: String,
+    /// Resolved inclusion text. This is a derived compilation view; `text` remains canonical.
+    pub expanded_text: Option<String>,
     pub target_words: Option<u64>,
     pub characters: Vec<String>,
     pub plotlines: Vec<String>,
@@ -33,6 +35,7 @@ pub struct PipelineScene {
 pub struct PipelineInput {
     pub title: String,
     pub target_words: Option<u64>,
+    pub expand_transclusions: bool,
     /// Ordered in manuscript order; chronology remains on each scene independently.
     pub scenes: Vec<PipelineScene>,
     pub revision_summary: String,
@@ -147,7 +150,11 @@ impl PipelineRunner {
                     stage,
                     status: StageStatus::Cached,
                     fingerprint: Some(fingerprint),
-                    message: "inputs unchanged; verified cached artifact".into(),
+                    message: if stage == Stage::Compile && input.expand_transclusions {
+                        "inputs unchanged; verified cached artifact with inclusions expanded".into()
+                    } else {
+                        "inputs unchanged; verified cached artifact".into()
+                    },
                 });
                 continue;
             }
@@ -178,7 +185,11 @@ impl PipelineRunner {
                         stage,
                         status: StageStatus::Complete,
                         fingerprint: Some(fingerprint),
-                        message: "completed".into(),
+                        message: if stage == Stage::Compile && input.expand_transclusions {
+                            "completed with scene inclusions expanded".into()
+                        } else {
+                            "completed".into()
+                        },
                     });
                     atomic_write(&self.cache_path, &serde_json::to_vec_pretty(&cache)?)?;
                 }
@@ -218,7 +229,18 @@ fn stage_fingerprint(
         Stage::Compile => input
             .scenes
             .iter()
-            .map(|s| format!("{}\0{}\0{}", s.id, s.title, s.text))
+            .map(|s| {
+                format!(
+                    "{}\0{}\0{}",
+                    s.id,
+                    s.title,
+                    if input.expand_transclusions {
+                        s.expanded_text.as_deref().unwrap_or(&s.text)
+                    } else {
+                        &s.text
+                    }
+                )
+            })
             .collect::<String>(),
         Stage::WordCount | Stage::Export => {
             outputs.get(&Stage::Compile).cloned().unwrap_or_default()
@@ -240,7 +262,9 @@ fn stage_fingerprint(
             .collect(),
         Stage::RevisionReport => input.revision_summary.clone(),
     };
-    let extra = if matches!(stage, Stage::WordCount | Stage::Export) {
+    let extra = if stage == Stage::Compile {
+        format!("expand_transclusions={}", input.expand_transclusions)
+    } else if matches!(stage, Stage::WordCount | Stage::Export) {
         format!("{:?}", input.target_words)
     } else {
         String::new()
@@ -257,7 +281,14 @@ fn render_stage(
         Stage::Compile => Ok(input
             .scenes
             .iter()
-            .map(|scene| format!("## {}\n\n{}\n\n", scene.title, scene.text))
+            .map(|scene| {
+                let body = if input.expand_transclusions {
+                    scene.expanded_text.as_deref().unwrap_or(&scene.text)
+                } else {
+                    &scene.text
+                };
+                format!("## {}\n\n{}\n\n", scene.title, body)
+            })
             .collect()),
         Stage::WordCount => {
             let text = outputs
@@ -417,10 +448,12 @@ mod tests {
         PipelineInput {
             title: "Novel".into(),
             target_words: Some(100),
+            expand_transclusions: false,
             scenes: vec![PipelineScene {
                 id: "scene-1".into(),
                 title: "Opening".into(),
                 text: text.into(),
+                expanded_text: None,
                 target_words: Some(100),
                 characters: vec!["Mara".into()],
                 plotlines: vec!["Main".into()],
@@ -449,6 +482,31 @@ mod tests {
         assert_eq!(changed[2].status, StageStatus::Cached);
         assert_eq!(changed[3].status, StageStatus::Cached);
         assert_eq!(changed[5].status, StageStatus::Complete);
+    }
+
+    #[test]
+    fn transclusion_compilation_uses_derived_text_without_replacing_canonical_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = PipelineRunner::new(dir.path());
+        let mut source = input("Canonical source.");
+        source.expand_transclusions = true;
+        source.scenes[0].expanded_text =
+            Some("Canonical source.\n\n---\n\nIncluded canonical target.".into());
+        runner.run(&source).unwrap();
+        let compiled = fs::read_to_string(dir.path().join("exports/compiled.md")).unwrap();
+        assert!(compiled.contains("Canonical source.\n\n---\n\nIncluded canonical target."));
+        assert!(source.scenes[0].text == "Canonical source.");
+        assert!(
+            runner
+                .run(&source)
+                .unwrap()
+                .iter()
+                .all(|report| report.status == StageStatus::Cached)
+        );
+        source.expand_transclusions = false;
+        runner.run(&source).unwrap();
+        let plain = fs::read_to_string(dir.path().join("exports/compiled.md")).unwrap();
+        assert!(!plain.contains("Included canonical target."));
     }
 
     #[test]

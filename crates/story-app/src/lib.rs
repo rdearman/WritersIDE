@@ -113,12 +113,33 @@ impl WriterApp {
         Ok(result)
     }
     pub fn processing_input(&self) -> Result<story_pipeline::PipelineInput> {
+        self.processing_input_mode(false)
+    }
+    pub fn processing_input_with_transclusions(&self) -> Result<story_pipeline::PipelineInput> {
+        self.processing_input_mode(true)
+    }
+    fn processing_input_mode(
+        &self,
+        expand_transclusions: bool,
+    ) -> Result<story_pipeline::PipelineInput> {
         let project = self.get_project()?;
         let analytics = self.analytics_dataset()?;
         let mut scenes = Vec::new();
         let mut snapshots = 0usize;
         for row in self.store.list_scenes(false)? {
             let (text, _) = self.store.load_text(row.scene.id)?;
+            let expanded_text = if expand_transclusions {
+                Some(
+                    self.store
+                        .expand_scene_transclusions(row.scene.id)?
+                        .into_iter()
+                        .map(|passage| passage.text)
+                        .collect::<Vec<_>>()
+                        .join("\n\n---\n\n"),
+                )
+            } else {
+                None
+            };
             let linked = analytics
                 .iter()
                 .find(|data| data.scene_id == row.scene.id.to_string());
@@ -133,6 +154,7 @@ impl WriterApp {
                 id: row.scene.id.to_string(),
                 title: row.scene.title,
                 text,
+                expanded_text,
                 target_words: row.scene.target_words,
                 characters,
                 plotlines,
@@ -143,6 +165,7 @@ impl WriterApp {
         Ok(story_pipeline::PipelineInput {
             title: project.title,
             target_words: project.target_words,
+            expand_transclusions,
             scenes,
             revision_summary: format!(
                 "{} scenes; {snapshots} stored snapshots",
@@ -152,6 +175,10 @@ impl WriterApp {
     }
     pub fn run_processing(&self) -> Result<Vec<story_pipeline::StageReport>> {
         let input = self.processing_input()?;
+        Ok(story_pipeline::PipelineRunner::new(self.store.project_root()).run(&input)?)
+    }
+    pub fn run_processing_with_transclusions(&self) -> Result<Vec<story_pipeline::StageReport>> {
+        let input = self.processing_input_with_transclusions()?;
         Ok(story_pipeline::PipelineRunner::new(self.store.project_root()).run(&input)?)
     }
     pub fn save_extraction_proposal(
@@ -611,6 +638,44 @@ mod tests {
                 .iter()
                 .all(|stage| stage.status == story_pipeline::StageStatus::Cached)
         );
+    }
+
+    #[test]
+    fn optional_processing_transclusion_expands_a_derived_compile_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let project_path = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project_path, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let source = app.create_scene(chapter, "Source", 0).unwrap();
+        let target = app.create_scene(chapter, "Target", 1).unwrap();
+        let (_, source_hash) = app.load_scene_text(source).unwrap();
+        app.save_scene_text(source, Some(&source_hash), "Source passage.")
+            .unwrap();
+        let (_, target_hash) = app.load_scene_text(target).unwrap();
+        app.save_scene_text(target, Some(&target_hash), "Included passage.")
+            .unwrap();
+        app.create_story_link(&StoryLink {
+            id: LinkId::new(),
+            source: EntityRef::Scene(source),
+            source_anchor: None,
+            target: EntityRef::Scene(target),
+            target_anchor: None,
+            kind: LinkKind::Transcludes,
+            label: String::new(),
+        })
+        .unwrap();
+
+        app.run_processing().unwrap();
+        let ordinary = fs::read_to_string(project_path.join("exports/compiled.md")).unwrap();
+        assert_eq!(ordinary.matches("Included passage.").count(), 1);
+
+        let reports = app.run_processing_with_transclusions().unwrap();
+        assert!(reports[0].message.contains("inclusions expanded"));
+        let expanded = fs::read_to_string(project_path.join("exports/compiled.md")).unwrap();
+        assert_eq!(expanded.matches("Included passage.").count(), 2);
+        assert!(expanded.contains("Source passage.\n\n---\n\nIncluded passage."));
+        assert_eq!(app.load_scene_text(source).unwrap().0, "Source passage.");
+        assert_eq!(app.load_scene_text(target).unwrap().0, "Included passage.");
     }
 
     #[test]

@@ -400,8 +400,12 @@ impl AppState {
             self.message = format!("{} search results", self.scenes.len());
             return Ok(());
         }
-        if cmd == "process" {
-            let reports = self.app.run_processing()?;
+        if cmd == "process" || cmd == "process-expand" {
+            let reports = if cmd == "process-expand" {
+                self.app.run_processing_with_transclusions()?
+            } else {
+                self.app.run_processing()?
+            };
             self.message = reports
                 .into_iter()
                 .map(|report| format!("{:?}:{:?}", report.stage, report.status))
@@ -1193,7 +1197,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | process-expand | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
