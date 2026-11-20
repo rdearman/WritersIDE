@@ -115,12 +115,145 @@ struct KeymapFile {
     bindings: BTreeMap<String, String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandAction {
+    Workspace(Workspace),
+    OpenMainMenu,
+    Save,
+    Help,
+    Process { expand_transclusions: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CommandSpec {
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    category: &'static str,
+    mnemonic: Option<char>,
+    action: CommandAction,
+}
+
+fn command_registry() -> Vec<CommandSpec> {
+    let mut commands = Workspace::ALL
+        .iter()
+        .copied()
+        .map(|workspace| CommandSpec {
+            id: match workspace {
+                Workspace::Dashboard => "view.dashboard",
+                Workspace::Outline => "view.outline",
+                Workspace::Cards => "view.cards",
+                Workspace::Editor => "view.editor",
+                Workspace::PlotGrid => "view.plot-grid",
+                Workspace::Characters => "view.characters",
+                Workspace::StoryBible => "view.story-bible",
+                Workspace::Timeline => "view.timeline",
+                Workspace::Analytics => "view.analytics",
+                Workspace::Research => "view.research",
+                Workspace::Issues => "view.issues",
+                Workspace::Search => "view.search",
+                Workspace::Reading => "view.reading",
+                Workspace::Revisions => "view.revisions",
+            },
+            label: workspace.title(),
+            description: "Switch to this workspace",
+            category: "View",
+            mnemonic: None,
+            action: CommandAction::Workspace(workspace),
+        })
+        .collect::<Vec<_>>();
+    commands.extend([
+        CommandSpec {
+            id: "menu.main",
+            label: "Main Menu",
+            description: "Open the hierarchical command menu",
+            category: "Menu",
+            mnemonic: Some('m'),
+            action: CommandAction::OpenMainMenu,
+        },
+        CommandSpec {
+            id: "file.save",
+            label: "Save Scene",
+            description: "Save the current scene using optimistic concurrency",
+            category: "File",
+            mnemonic: Some('s'),
+            action: CommandAction::Save,
+        },
+        CommandSpec {
+            id: "help.context",
+            label: "Context Help",
+            description: "Show keyboard and command help",
+            category: "Help",
+            mnemonic: Some('h'),
+            action: CommandAction::Help,
+        },
+        CommandSpec {
+            id: "compile.run",
+            label: "Compile",
+            description: "Run the manuscript processing pipeline",
+            category: "Compile",
+            mnemonic: Some('c'),
+            action: CommandAction::Process {
+                expand_transclusions: false,
+            },
+        },
+        CommandSpec {
+            id: "compile.expand-transclusions",
+            label: "Compile with Transclusions",
+            description: "Compile a derived view with scene inclusions expanded",
+            category: "Compile",
+            mnemonic: None,
+            action: CommandAction::Process {
+                expand_transclusions: true,
+            },
+        },
+    ]);
+    commands
+}
+
+fn command_by_id(id: &str) -> Option<CommandSpec> {
+    command_registry()
+        .into_iter()
+        .find(|command| command.id == id)
+}
+
+fn command_for_workspace(workspace: Workspace) -> Option<CommandSpec> {
+    command_registry()
+        .into_iter()
+        .find(|command| command.action == CommandAction::Workspace(workspace))
+}
+
+fn command_by_palette_text(text: &str) -> Option<CommandSpec> {
+    match text {
+        "process" | "compile" => command_by_id("compile.run"),
+        "process-expand" | "compile-expand" => command_by_id("compile.expand-transclusions"),
+        "help" => command_by_id("help.context"),
+        _ => None,
+    }
+}
+
+fn open_menu_reserved_message() -> &'static str {
+    "Hierarchical menu shortcut reserved (Ctrl+/ or F10); use the : command palette until menu rendering lands"
+}
+
+fn is_menu_shortcut(key: KeyEvent) -> bool {
+    key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('/') | KeyCode::Char('_'))
+}
+
 fn default_bindings() -> Vec<(u8, Workspace)> {
     Workspace::ALL
         .iter()
         .copied()
         .enumerate()
-        .map(|(index, workspace)| ((index + 1) as u8, workspace))
+        .filter_map(|(index, workspace)| {
+            if index == 9 {
+                None
+            } else {
+                let function_key = (index + 1) as u8;
+                Some((function_key, workspace))
+            }
+        })
         .collect()
 }
 
@@ -141,12 +274,20 @@ fn load_bindings(project: &Path) -> Result<Vec<(u8, Workspace)>, Box<dyn std::er
         if !(1..=14).contains(&number) {
             return Err(format!("unsupported function key {key}").into());
         }
+        if number == 10 {
+            return Err("F10 is reserved for the hierarchical menu fallback".into());
+        }
         let workspace = Workspace::ALL
             .iter()
             .copied()
             .find(|w| w.title().eq_ignore_ascii_case(&name))
             .ok_or_else(|| format!("unknown workspace in keymap: {name}"))?;
-        result[(number - 1) as usize] = (number, workspace);
+        if let Some(binding) = result.iter_mut().find(|(function, _)| *function == number) {
+            *binding = (number, workspace);
+        } else {
+            result.push((number, workspace));
+            result.sort_by_key(|(function, _)| *function);
+        }
     }
     Ok(result)
 }
@@ -368,6 +509,47 @@ impl AppState {
             .map(|s| s.0.to_string())
             .unwrap_or_else(|| "No scene selected".into())
     }
+    fn dispatch_registered(
+        &mut self,
+        action: CommandAction,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match action {
+            CommandAction::Workspace(workspace) => self.switch(workspace),
+            CommandAction::OpenMainMenu => self.message = open_menu_reserved_message().into(),
+            CommandAction::Save => self.save()?,
+            CommandAction::Help => {
+                self.message = command_registry()
+                    .into_iter()
+                    .map(|command| {
+                        let mnemonic = command
+                            .mnemonic
+                            .map(|key| format!(" [{key}]"))
+                            .unwrap_or_default();
+                        format!(
+                            "{} > {}{} — {}",
+                            command.category, command.label, mnemonic, command.description
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+            }
+            CommandAction::Process {
+                expand_transclusions,
+            } => {
+                let reports = if expand_transclusions {
+                    self.app.run_processing_with_transclusions()?
+                } else {
+                    self.app.run_processing()?
+                };
+                self.message = reports
+                    .into_iter()
+                    .map(|report| format!("{:?}:{:?}", report.stage, report.status))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+            }
+        }
+        Ok(())
+    }
     fn command(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let cmd = self.prompt.trim().to_owned();
         self.prompt.clear();
@@ -398,6 +580,10 @@ impl AppState {
             self.selected = 0;
             self.workspace = Workspace::Search;
             self.message = format!("{} search results", self.scenes.len());
+            return Ok(());
+        }
+        if let Some(spec) = command_by_palette_text(&cmd) {
+            self.dispatch_registered(spec.action)?;
             return Ok(());
         }
         if cmd == "process" || cmd == "process-expand" {
@@ -1195,7 +1381,7 @@ impl AppState {
             self.switch(Workspace::Search);
             self.message = format!("{} project-wide matches", self.search_hits.len());
         } else if cmd == "help" {
-            self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
+            self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
             self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | process-expand | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
@@ -1500,7 +1686,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             format!(" {project}  |  {}  |  {dirty} ", s.workspace.title()),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw("F1-F14 workspaces  ? help  : command  / search  Ctrl-S save  q quit"),
+        Span::raw("F1-F9, F11-F14 workspaces  Ctrl+/ or F10 menu  ? help  : commands  / search  Ctrl-S save  q quit"),
     ]))
     .block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(head, rows[0]);
@@ -2351,6 +2537,18 @@ fn parse_terminal_link_kind(
     })
 }
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if is_menu_shortcut(k) {
+        if let Some(spec) = command_by_id("menu.main") {
+            s.dispatch_registered(spec.action)?;
+        }
+        return Ok(false);
+    }
+    if s.mode.is_none() && k.code == KeyCode::F(10) {
+        if let Some(spec) = command_by_id("menu.main") {
+            s.dispatch_registered(spec.action)?;
+        }
+        return Ok(false);
+    }
     if s.mode.is_some() {
         match k.code {
             KeyCode::Esc => {
@@ -2542,10 +2740,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     match k.code {
-        KeyCode::F(n) if (1..=14).contains(&n)=>{if let Some((_, workspace))=s.function_bindings.get((n-1)as usize){s.switch(*workspace);}},
+        KeyCode::F(n) if (1..=14).contains(&n)=>{if let Some((_, workspace))=s.function_bindings.iter().find(|(number,_)|*number==n)&& let Some(spec)=command_for_workspace(*workspace){s.dispatch_registered(spec.action)?;}},
         KeyCode::Char(':')=>{s.mode=Some(':');s.prompt.clear();},
         KeyCode::Char('/')=>{s.mode=Some('/');s.prompt.clear();},
-        KeyCode::Char('?')=>s.message="F1 Dashboard · F2 Outline · F3 Cards · F4 Editor · F5 Plot Grid · F6 Characters · F7 Story Bible · F8 Timeline · F9 Analytics · F10 Research · F11 Issues · F12 Search · F13 Reading · F14 Revisions. : commands; / search; Ctrl-S save.".into(),
+        KeyCode::Char('?')=>s.message="F1-F9, F11-F14 workspaces · Ctrl+/ or F10 main menu · : command palette · / search · Ctrl-S save.".into(),
         KeyCode::Tab=>{let i=Workspace::ALL.iter().position(|x|*x==s.workspace).unwrap_or(0);s.switch(Workspace::ALL[(i+1)%Workspace::ALL.len()]);},
         KeyCode::BackTab=>{let i=Workspace::ALL.iter().position(|x|*x==s.workspace).unwrap_or(0);s.switch(Workspace::ALL[(i+Workspace::ALL.len()-1)%Workspace::ALL.len()]);},
         KeyCode::Up|KeyCode::Char('k')=>s.selected=s.selected.saturating_sub(1),
@@ -2579,6 +2777,112 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_registry_has_stable_unique_ids_and_compile_taxonomy() {
+        let registry = command_registry();
+        let ids = registry
+            .iter()
+            .map(|command| command.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), registry.len());
+        let compile = command_by_id("compile.run").unwrap();
+        assert_eq!(compile.label, "Compile");
+        assert_eq!(compile.category, "Compile");
+        assert_eq!(command_by_palette_text("process"), Some(compile));
+    }
+
+    #[test]
+    fn menu_shortcuts_are_reserved_without_consuming_plain_slash() {
+        let bindings = default_bindings();
+        assert!(!bindings.iter().any(|(key, _)| *key == 10));
+        assert!(
+            bindings
+                .iter()
+                .any(|(key, workspace)| *key == 9 && *workspace == Workspace::Analytics)
+        );
+        assert!(
+            bindings
+                .iter()
+                .any(|(key, workspace)| *key == 11 && *workspace == Workspace::Issues)
+        );
+        assert!(is_menu_shortcut(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(is_menu_shortcut(KeyEvent::new(
+            KeyCode::Char('_'),
+            KeyModifiers::CONTROL
+        )));
+        assert!(!is_menu_shortcut(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn editor_slash_is_text_and_menu_invocation_preserves_edit_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = AppState {
+            app: WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap(),
+            workspace: Workspace::Editor,
+            scenes: Vec::new(),
+            selected: 0,
+            editor: vec!["text".into()],
+            editing_scene: None,
+            cursor: (0, 4),
+            saved_hash: String::new(),
+            dirty: true,
+            mode: None,
+            prompt: String::new(),
+            message: String::new(),
+            history: vec![Workspace::Editor],
+            history_index: 0,
+            width: 80,
+            scroll: 0,
+            reading_document: None,
+            reading_text: String::new(),
+            reading_offset: 0,
+            reading_focus: false,
+            reading_selection_start: None,
+            function_bindings: default_bindings(),
+            search_hits: Vec::new(),
+            query_view: None,
+            editor_selection: None,
+            clipboard: String::new(),
+        };
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor, vec!["text/".to_owned()]);
+        assert_eq!(state.cursor, (0, 5));
+
+        state.editor_selection = Some((0, 1));
+        let selection = state.editor_selection;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.editor, vec!["text/".to_owned()]);
+        assert_eq!(state.cursor, (0, 5));
+        assert_eq!(state.editor_selection, selection);
+        assert!(state.dirty);
+        assert!(state.message.contains("menu shortcut reserved"));
+
+        state.message.clear();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor, vec!["text/".to_owned()]);
+        assert_eq!(state.cursor, (0, 5));
+        assert_eq!(state.editor_selection, selection);
+        assert!(state.message.contains("menu shortcut reserved"));
+    }
 
     #[test]
     fn project_keymap_overrides_function_key_workspace_targets() {
