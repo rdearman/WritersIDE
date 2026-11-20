@@ -127,6 +127,8 @@ pub struct EventSummary {
     pub id: EventId,
     pub title: String,
     pub nominal_time: Option<i64>,
+    pub start: StoryTime,
+    pub end: StoryTime,
     pub source_time: String,
 }
 #[derive(Clone, Debug)]
@@ -1903,32 +1905,41 @@ impl ProjectStore {
         Ok(())
     }
     pub fn list_events(&self) -> Result<Vec<EventSummary>> {
-        let mut q=self.conn.prepare("SELECT id,title,time_nominal,source_time_text FROM story_event ORDER BY time_nominal IS NULL,time_nominal,id")?;
+        let mut q=self.conn.prepare("SELECT id,title,time_nominal,time_lower,time_upper,time_precision,end_nominal,end_lower,end_upper,end_precision,source_time_text FROM story_event ORDER BY time_nominal IS NULL,time_nominal,id")?;
         let rows = q.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, Option<i64>>(2)?,
-                r.get::<_, String>(3)?,
+                r.get::<_, Option<i64>>(3)?,
+                r.get::<_, Option<i64>>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, Option<i64>>(6)?,
+                r.get::<_, Option<i64>>(7)?,
+                r.get::<_, Option<i64>>(8)?,
+                r.get::<_, String>(9)?,
+                r.get::<_, String>(10)?,
             ))
         })?;
-        rows.map(|row| {
-            let (id, title, nominal_time, source_time) = row?;
-            Ok::<EventSummary, rusqlite::Error>(EventSummary {
-                id: EventId(Uuid::parse_str(&id).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?),
-                title,
-                nominal_time,
-                source_time,
+        let raw = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        raw.into_iter()
+            .map(|row| {
+                let start = read_time(row.2, row.3, row.4, &row.5)?;
+                let end = read_time(row.6, row.7, row.8, &row.9)?;
+                Ok(EventSummary {
+                    id: EventId(
+                        Uuid::parse_str(&row.0).map_err(|e| {
+                            StorageError::Invalid(format!("invalid event UUID: {e}"))
+                        })?,
+                    ),
+                    title: row.1,
+                    nominal_time: start.nominal,
+                    start,
+                    end,
+                    source_time: row.10,
+                })
             })
-        })
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(StorageError::from)
+            .collect()
     }
     pub fn link_event(&mut self, scene: SceneId, event: EventId, kind: &str) -> Result<()> {
         self.conn.execute(

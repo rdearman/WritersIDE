@@ -293,6 +293,9 @@ impl WriterApp {
         self.store.add_event(id, title, source_time)?;
         Ok(id)
     }
+    pub fn add_story_event(&mut self, event: &StoryEvent) -> Result<()> {
+        Ok(self.store.add_story_event(event)?)
+    }
     pub fn link_event(&mut self, scene: SceneId, event: EventId, kind: &str) -> Result<()> {
         Ok(self.store.link_event(scene, event, kind)?)
     }

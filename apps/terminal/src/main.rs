@@ -98,6 +98,12 @@ struct AppState {
     clipboard: String,
 }
 
+#[derive(Clone, Debug)]
+enum TimelineItem {
+    Scene(story_storage::SceneRecord),
+    Event(story_storage::EventSummary),
+}
+
 #[derive(Deserialize)]
 struct KeymapFile {
     bindings: BTreeMap<String, String>,
@@ -438,6 +444,22 @@ impl AppState {
             let status = parts.next().ok_or("missing issue status")?;
             self.app.set_issue_status(issue, status)?;
             self.message = format!("Updated issue {issue} to {status}");
+        } else if let Some(rest) = cmd.strip_prefix("event-time ") {
+            let fields = rest.split('|').map(str::trim).collect::<Vec<_>>();
+            if fields.len() != 4 || fields[0].is_empty() {
+                return Err("use event-time TITLE | START | END | SOURCE-TIME".into());
+            }
+            let event = story_core::StoryEvent {
+                id: story_core::EventId::new(),
+                title: fields[0].into(),
+                description: String::new(),
+                start: parse_story_time_input(fields[1])?,
+                end: parse_story_time_input(fields[2])?,
+                source_time_text: fields[3].into(),
+            };
+            self.app.add_story_event(&event)?;
+            self.switch(Workspace::StoryBible);
+            self.message = format!("Created timed story event {}", event.id);
         } else if let Some(rest) = cmd.strip_prefix("event ") {
             let (title, source_time) = rest.split_once('|').unwrap_or((rest, ""));
             let id = self.app.add_event(title.trim(), source_time.trim())?;
@@ -1019,7 +1041,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -1696,6 +1718,36 @@ fn format_story_tick(tick: i64) -> String {
     format!("D{day} {hour:02}:{minute:02}:{second:02}")
 }
 
+fn parse_story_time_input(
+    value: &str,
+) -> Result<story_core::StoryTime, Box<dyn std::error::Error>> {
+    use story_core::{StoryTime, TimePrecision};
+    if value == "?" {
+        return Ok(StoryTime::unknown());
+    }
+    if let Some(value) = value.strip_prefix('~') {
+        let parts = value.split(',').collect::<Vec<_>>();
+        if parts.len() != 3 {
+            return Err("approximate time syntax is ~NOMINAL,LOWER,UPPER".into());
+        }
+        return Ok(StoryTime::new(
+            Some(parts[0].parse()?),
+            Some(parts[1].parse()?),
+            Some(parts[2].parse()?),
+            TimePrecision::Approximate,
+        )?);
+    }
+    if let Some((lower, upper)) = value.split_once("..") {
+        return Ok(StoryTime::new(
+            None,
+            Some(lower.parse()?),
+            Some(upper.parse()?),
+            TimePrecision::Bounded,
+        )?);
+    }
+    Ok(StoryTime::exact(value.parse()?))
+}
+
 fn format_story_interval(time: story_core::StoryTime) -> String {
     use story_core::TimePrecision;
     match time.precision {
@@ -1749,6 +1801,57 @@ fn timeline_scene_order(app: &WriterApp) -> Vec<story_storage::SceneRecord> {
             .then_with(|| first.scene.id.cmp(&second.scene.id))
     });
     scenes
+}
+
+fn timeline_items(app: &WriterApp) -> Vec<TimelineItem> {
+    let mut items = timeline_scene_order(app)
+        .into_iter()
+        .map(TimelineItem::Scene)
+        .chain(
+            app.list_events()
+                .unwrap_or_default()
+                .into_iter()
+                .map(TimelineItem::Event),
+        )
+        .collect::<Vec<_>>();
+    items.sort_by(|first, second| {
+        let key = |item: &TimelineItem| match item {
+            TimelineItem::Scene(scene) => (
+                scene
+                    .scene
+                    .start_time
+                    .nominal
+                    .or(scene.scene.start_time.lower)
+                    .or(scene.scene.start_time.upper),
+                scene.scene.title.clone(),
+                scene.scene.id.to_string(),
+            ),
+            TimelineItem::Event(event) => (
+                event
+                    .start
+                    .nominal
+                    .or(event.start.lower)
+                    .or(event.start.upper),
+                event.title.clone(),
+                event.id.to_string(),
+            ),
+        };
+        let first_key = key(first);
+        let second_key = key(second);
+        (
+            first_key.0.is_none(),
+            first_key.0.unwrap_or(i64::MAX),
+            first_key.1,
+            first_key.2,
+        )
+            .cmp(&(
+                second_key.0.is_none(),
+                second_key.0.unwrap_or(i64::MAX),
+                second_key.1,
+                second_key.2,
+            ))
+    });
+    items
 }
 
 fn next_list_selection(selected: usize, item_count: usize) -> usize {
@@ -1845,15 +1948,22 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             );
             rows
         }
-        Workspace::Timeline => timeline_scene_order(&s.app)
+        Workspace::Timeline => timeline_items(&s.app)
             .into_iter()
-            .map(|scene| {
-                format!(
-                    "{} → {}  {}",
+            .map(|item| match item {
+                TimelineItem::Scene(scene) => format!(
+                    "Scene · {} → {} · {}",
                     format_story_interval(scene.scene.start_time),
                     format_story_interval(scene.scene.end_time),
                     scene.scene.title
-                )
+                ),
+                TimelineItem::Event(event) => format!(
+                    "Event · {} → {} · {} · {}",
+                    format_story_interval(event.start),
+                    format_story_interval(event.end),
+                    event.title,
+                    event.source_time
+                ),
             })
             .collect(),
         Workspace::Analytics => {
@@ -2252,12 +2362,23 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         KeyCode::Down|KeyCode::Char('j')=>{s.selected=next_list_selection(s.selected,workspace_items(s).len());},
         KeyCode::Enter if s.workspace==Workspace::Revisions=>{let scene=s.active_scene().ok_or("select a scene first")?;let snapshots=s.app.list_snapshots(scene)?;if let Some(snapshot)=snapshots.get(s.selected){let diff=s.app.diff_snapshot(scene,snapshot.id)?;s.message=diff.into_iter().map(|line|format!("{}{}",match line.kind{story_storage::SnapshotLineKind::Equal=>' ',story_storage::SnapshotLineKind::Added=>'+',story_storage::SnapshotLineKind::Removed=>'-'},line.text.trim_end())).collect::<Vec<_>>().join(" | ");}},
         KeyCode::Enter if s.workspace==Workspace::Timeline=>{
-            let timeline = timeline_scene_order(&s.app);
-            let scene = timeline
+            let timeline = timeline_items(&s.app);
+            let item = timeline
                 .get(s.selected)
+                .cloned()
                 .ok_or("timeline selection is out of range")?;
-            s.selected=s.scenes.iter().position(|row|row.0==scene.scene.id).ok_or("timeline scene no longer exists")?;
-            s.open_selected()?;
+            match item {
+                TimelineItem::Scene(scene) => {
+                    s.selected=s.scenes.iter().position(|row|row.0==scene.scene.id).ok_or("timeline scene no longer exists")?;
+                    s.open_selected()?;
+                }
+                TimelineItem::Event(event) => {
+                    let event_index = s.app.list_events()?.iter().position(|row|row.id==event.id).ok_or("timeline event no longer exists")?;
+                    s.selected = s.app.list_characters()?.len() + s.app.list_plotlines()?.len() + event_index;
+                    s.switch(Workspace::StoryBible);
+                    s.message = format!("Selected story event {}", event.title);
+                }
+            }
         },
         KeyCode::Enter=>s.open_selected()?,
         _=>{}
@@ -2950,6 +3071,15 @@ mod tests {
         let mut scene = app.get_scene(earlier).unwrap().scene;
         scene.start_time = story_core::StoryTime::exact(-story_core::STORY_TICKS_PER_DAY);
         app.update_scene_metadata(&scene).unwrap();
+        let event = story_core::StoryEvent {
+            id: story_core::EventId::new(),
+            title: "The signal".into(),
+            description: String::new(),
+            start: story_core::StoryTime::exact(0),
+            end: story_core::StoryTime::exact(30),
+            source_time_text: "first night".into(),
+        };
+        app.add_story_event(&event).unwrap();
         assert_eq!(
             app.get_scene(earlier).unwrap().scene.start_time.nominal,
             Some(-story_core::STORY_TICKS_PER_DAY)
@@ -2958,6 +3088,15 @@ mod tests {
         assert_eq!(ordered[0].scene.id, earlier);
         assert_eq!(ordered[1].scene.id, later);
         assert_eq!(ordered[2].scene.id, unknown);
+        let items = timeline_items(&app);
+        assert!(matches!(&items[0], TimelineItem::Scene(row) if row.scene.id == earlier));
+        assert!(matches!(&items[1], TimelineItem::Event(row) if row.id == event.id));
+        assert!(matches!(&items[2], TimelineItem::Scene(row) if row.scene.id == later));
+        assert!(matches!(&items[3], TimelineItem::Scene(row) if row.scene.id == unknown));
+        let saved_event = app.list_events().unwrap().remove(0);
+        assert_eq!(saved_event.start, event.start);
+        assert_eq!(saved_event.end, event.end);
+        assert_eq!(saved_event.source_time, "first night");
         assert_eq!(format_story_tick(-1), "D-1 23:59:59");
         assert_eq!(
             format_story_interval(story_core::StoryTime::unknown()),
@@ -2982,6 +3121,22 @@ mod tests {
             format_story_interval(approximate),
             "~D0 00:00:10 [D0 00:00:05–D0 00:00:15]"
         );
+        assert_eq!(
+            parse_story_time_input("?").unwrap(),
+            story_core::StoryTime::unknown()
+        );
+        assert_eq!(
+            parse_story_time_input("-7").unwrap(),
+            story_core::StoryTime::exact(-7)
+        );
+        assert_eq!(
+            parse_story_time_input("2..9").unwrap(),
+            story_core::StoryTime::new(None, Some(2), Some(9), story_core::TimePrecision::Bounded)
+                .unwrap()
+        );
+        assert_eq!(parse_story_time_input("~6,2,8").unwrap().nominal, Some(6));
+        assert!(parse_story_time_input("~6,8,2").is_err());
+        assert!(parse_story_time_input("not-a-tick").is_err());
     }
 
     #[test]
