@@ -324,6 +324,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        "knowledge" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            for claim in app.list_approved_knowledge_claims()? {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}:{}..{}\t{}",
+                    claim.id,
+                    claim.kind,
+                    claim.name,
+                    claim.claim,
+                    claim.approximate_story_time.as_deref().unwrap_or("?"),
+                    claim.source_kind,
+                    claim.source_id,
+                    claim.evidence_start_byte,
+                    claim.evidence_end_byte,
+                    claim.evidence_quote
+                );
+            }
+        }
         "process" => {
             let path = args.next().ok_or("missing project path")?;
             let expand_transclusions = match args.next().as_deref() {
@@ -410,12 +429,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "approve-extraction" => {
+            let project = args.next().ok_or("missing project path")?;
             let file = std::path::PathBuf::from(args.next().ok_or("missing proposal JSON path")?);
+            let claim_index: usize = args
+                .next()
+                .ok_or("missing claim index")?
+                .parse()
+                .map_err(|_| "claim index must be a zero-based integer")?;
+            if args.next().is_some() {
+                return Err(
+                    "approve-extraction accepts <project> <proposal-json-file> <claim-index>"
+                        .into(),
+                );
+            }
             let mut proposal: story_ollama::ProvisionalExtraction =
                 serde_json::from_slice(&std::fs::read(&file)?)?;
-            for claim in &mut proposal.claims {
-                claim.approved = true;
-            }
+            proposal
+                .claims
+                .get(claim_index)
+                .ok_or("claim index is out of range")?;
+            let mut app = WriterApp::open_project(project)?;
+            let approved_id = app.approve_extraction_claim(&proposal, claim_index)?;
+            proposal.claims[claim_index].approved = true;
             let bytes = serde_json::to_vec_pretty(&proposal)?;
             let temp = file.with_extension(format!("{}.tmp", QueryId::new()));
             use std::io::Write;
@@ -426,11 +461,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             out.write_all(&bytes)?;
             out.sync_all()?;
             std::fs::rename(&temp, &file)?;
-            if let Some(parent) = file.parent() {
-                std::fs::File::open(parent)?.sync_all()?;
-            }
+            let parent = file
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| std::path::Path::new("."));
+            std::fs::File::open(parent)?.sync_all()?;
             println!(
-                "Marked proposal approved. This records review only; it does not create canonical story facts."
+                "Promoted claim {claim_index} to approved knowledge record {approved_id} with its source evidence."
             );
         }
         _ => usage(),
@@ -439,7 +476,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 fn usage() {
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide approve-extraction <proposal-json-file>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
+        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
     );
     eprintln!(
         "writers-ide anchors <path> <scene-uuid>\nwriters-ide anchor-move <path> <anchor-uuid> <start-byte> <end-byte>"

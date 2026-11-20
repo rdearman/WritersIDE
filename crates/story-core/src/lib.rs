@@ -48,6 +48,7 @@ id_type!(AnnotationId);
 id_type!(BookmarkId);
 id_type!(ReadingTermId);
 id_type!(SnapshotId);
+id_type!(KnowledgeClaimId);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotRestoreSelection {

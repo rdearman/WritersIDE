@@ -1,7 +1,10 @@
+use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use story_core::*;
 use story_storage::{
-    ConflictResolution, ProjectStore, Result as StorageResult, SceneRecord, StorageError,
+    ApprovedKnowledgeClaim, ConflictResolution, ProjectStore, Result as StorageResult, SceneRecord,
+    StorageError,
 };
 use thiserror::Error;
 
@@ -187,6 +190,128 @@ impl WriterApp {
         json: &[u8],
     ) -> Result<std::path::PathBuf> {
         Ok(self.store.save_proposal_file(filename, json)?)
+    }
+    /// Promotes exactly one evidence-anchored provisional claim after revalidating its source.
+    pub fn approve_extraction_claim(
+        &mut self,
+        proposal: &story_ollama::ProvisionalExtraction,
+        claim_index: usize,
+    ) -> Result<KnowledgeClaimId> {
+        let claim = proposal.claims.get(claim_index).ok_or_else(|| {
+            AppError::Domain(format!("claim index {claim_index} is out of range"))
+        })?;
+        let (source_id, source_text) = match proposal.source_kind.as_str() {
+            "scene" => {
+                let id = SceneId(
+                    proposal
+                        .source_id
+                        .parse::<uuid::Uuid>()
+                        .map_err(|error| AppError::Domain(error.to_string()))?,
+                );
+                let (text, fingerprint) = self.load_scene_text(id)?;
+                if fingerprint != proposal.source_fingerprint {
+                    return Err(AppError::Domain(
+                        "proposal source changed since extraction; regenerate or review the evidence".into(),
+                    ));
+                }
+                (id.to_string(), text)
+            }
+            "reading" => {
+                let id = ReadingId(
+                    proposal
+                        .source_id
+                        .parse::<uuid::Uuid>()
+                        .map_err(|error| AppError::Domain(error.to_string()))?,
+                );
+                let reading = self.get_reading_document(id)?;
+                let text = reading.extracted_text;
+                let fingerprint = format!("{:x}", Sha256::digest(text.as_bytes()));
+                if fingerprint != proposal.source_fingerprint {
+                    return Err(AppError::Domain(
+                        "proposal reading source changed since extraction; regenerate or review the evidence".into(),
+                    ));
+                }
+                (id.to_string(), text)
+            }
+            other => {
+                return Err(AppError::Domain(format!(
+                    "unsupported extraction source kind: {other}"
+                )));
+            }
+        };
+        if proposal.source_length_bytes != source_text.len() {
+            return Err(AppError::Domain(
+                "proposal source length no longer matches its source".into(),
+            ));
+        }
+        let start = claim
+            .evidence_start_byte
+            .ok_or_else(|| AppError::Domain("claim has no source evidence offset".into()))?;
+        let end = claim
+            .evidence_end_byte
+            .ok_or_else(|| AppError::Domain("claim has no source evidence end offset".into()))?;
+        let evidence = source_text
+            .get(start..end)
+            .ok_or_else(|| AppError::Domain("claim evidence offsets are invalid".into()))?;
+        if evidence != claim.claim.evidence_quote || evidence.is_empty() {
+            return Err(AppError::Domain(
+                "claim evidence no longer matches its exact source passage".into(),
+            ));
+        }
+        let matches_existing = |existing: &ApprovedKnowledgeClaim| {
+            existing.source_kind == proposal.source_kind
+                && existing.source_id == source_id
+                && existing.source_fingerprint == proposal.source_fingerprint
+                && existing.evidence_start_byte == start
+                && existing.evidence_end_byte == end
+                && existing.kind == claim.claim.kind
+                && existing.name == claim.claim.name
+                && existing.claim == claim.claim.claim
+        };
+        if let Some(existing) = self
+            .store
+            .list_approved_knowledge_claims()?
+            .into_iter()
+            .find(matches_existing)
+        {
+            return Ok(existing.id);
+        }
+        if claim.claim.kind.trim().is_empty()
+            || claim.claim.name.trim().is_empty()
+            || claim.claim.claim.trim().is_empty()
+        {
+            return Err(AppError::Domain(
+                "approved claim kind, name, and statement must be non-empty".into(),
+            ));
+        }
+        let approved_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| AppError::Domain(error.to_string()))?;
+        let record = ApprovedKnowledgeClaim {
+            id: KnowledgeClaimId::new(),
+            kind: claim.claim.kind.clone(),
+            name: claim.claim.name.clone(),
+            claim: claim.claim.claim.clone(),
+            approximate_story_time: claim.claim.approximate_story_time.clone(),
+            source_kind: proposal.source_kind.clone(),
+            source_id,
+            source_fingerprint: proposal.source_fingerprint.clone(),
+            source_length_bytes: proposal.source_length_bytes,
+            evidence_quote: claim.claim.evidence_quote.clone(),
+            evidence_start_byte: start,
+            evidence_end_byte: end,
+            model: proposal.model.clone(),
+            approved_at: format!(
+                "{:010}.{:03}",
+                approved_at.as_secs(),
+                approved_at.subsec_millis()
+            ),
+        };
+        self.store.add_approved_knowledge_claim(&record)?;
+        Ok(record.id)
+    }
+    pub fn list_approved_knowledge_claims(&self) -> Result<Vec<ApprovedKnowledgeClaim>> {
+        Ok(self.store.list_approved_knowledge_claims()?)
     }
     pub fn extract_with_ollama(
         &self,
@@ -715,5 +840,95 @@ mod tests {
         assert_eq!(before, after);
         assert_eq!(data[0].characters[0].name, "Mara");
         assert_eq!(data[0].plotlines[0].name, "A thread");
+    }
+
+    #[test]
+    fn extracted_claims_require_current_exact_evidence_before_authoritative_promotion() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Discovery", 0).unwrap();
+        let source = "Mara knows the ward opens at dawn.";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), source).unwrap();
+        let proposal = story_ollama::attach_provenance(
+            "scene",
+            &scene.to_string(),
+            source,
+            "fixture-model",
+            story_ollama::ExtractionResult {
+                claims: vec![story_ollama::CandidateClaim {
+                    kind: "character_knowledge".into(),
+                    name: "Mara".into(),
+                    claim: "Mara knows the ward opens at dawn.".into(),
+                    evidence_quote: "Mara knows the ward opens at dawn.".into(),
+                    approximate_story_time: Some("day 1 morning".into()),
+                }],
+            },
+        );
+        let mut invalid_evidence = proposal.clone();
+        invalid_evidence.claims[0].evidence_start_byte = Some(1);
+        assert!(app.approve_extraction_claim(&invalid_evidence, 0).is_err());
+        let id = app.approve_extraction_claim(&proposal, 0).unwrap();
+        assert_eq!(app.approve_extraction_claim(&proposal, 0).unwrap(), id);
+        let approved = app.list_approved_knowledge_claims().unwrap();
+        assert_eq!(approved.len(), 1);
+        assert_eq!(approved[0].id, id);
+        assert_eq!(
+            approved[0].evidence_quote,
+            "Mara knows the ward opens at dawn."
+        );
+        assert_eq!(approved[0].source_id, scene.to_string());
+        assert_eq!(approved[0].model, "fixture-model");
+        assert!(
+            app.search_project("character_knowledge dawn", 20)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.entity_kind == "knowledge_claim" && hit.entity_id == id.to_string())
+        );
+
+        let (_, latest_hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&latest_hash), "Mara learned this yesterday.")
+            .unwrap();
+        assert!(app.approve_extraction_claim(&proposal, 0).is_err());
+        assert_eq!(app.list_approved_knowledge_claims().unwrap().len(), 1);
+
+        let reading_path = dir.path().join("reference.txt");
+        std::fs::write(&reading_path, "The bell sounds at noon.").unwrap();
+        let reference = story_reading::import_reference(&reading_path).unwrap();
+        let reading_id = app
+            .import_reading_document(&reference, reading_path.to_str().unwrap())
+            .unwrap();
+        let reading_proposal = story_ollama::attach_provenance(
+            "reading",
+            &reading_id.to_string(),
+            &reference.extracted_text,
+            "fixture-model",
+            story_ollama::ExtractionResult {
+                claims: vec![story_ollama::CandidateClaim {
+                    kind: "event".into(),
+                    name: "Noon bell".into(),
+                    claim: "A bell sounds at noon.".into(),
+                    evidence_quote: "The bell sounds at noon.".into(),
+                    approximate_story_time: Some("noon".into()),
+                }],
+            },
+        );
+        let reading_claim = app.approve_extraction_claim(&reading_proposal, 0).unwrap();
+        assert!(
+            app.list_approved_knowledge_claims()
+                .unwrap()
+                .iter()
+                .any(|record| record.id == reading_claim && record.source_kind == "reading")
+        );
+        assert_eq!(
+            std::fs::read(&reading_path).unwrap(),
+            reference.source_bytes
+        );
+        drop(app);
+        let app = WriterApp::open_project(dir.path().join("Novel")).unwrap();
+        let persisted = app.list_approved_knowledge_claims().unwrap();
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[1].source_kind, "reading");
     }
 }

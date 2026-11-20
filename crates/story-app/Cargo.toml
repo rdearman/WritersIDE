@@ -13,6 +13,7 @@ story-pipeline = { path = "../story-pipeline" }
 story-ollama = { path = "../story-ollama" }
 thiserror.workspace = true
 uuid.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

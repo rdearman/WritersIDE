@@ -1,7 +1,8 @@
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs, io,
+    env, fs,
+    io::{self, Write},
     path::Path,
     time::Duration,
 };
@@ -412,6 +413,22 @@ impl AppState {
                         + self.app.list_locations()?.len()
                         + self.app.list_plotlines()?.len()
                         + event_index;
+                    self.switch(Workspace::StoryBible);
+                    return Ok(());
+                }
+                "knowledge_claim" => {
+                    let id = story_core::KnowledgeClaimId(hit.entity_id.parse()?);
+                    let knowledge_index = self
+                        .app
+                        .list_approved_knowledge_claims()?
+                        .iter()
+                        .position(|claim| claim.id == id)
+                        .ok_or("approved knowledge claim no longer exists")?;
+                    self.selected = self.app.list_characters()?.len()
+                        + self.app.list_locations()?.len()
+                        + self.app.list_plotlines()?.len()
+                        + self.app.list_events()?.len()
+                        + knowledge_index;
                     self.switch(Workspace::StoryBible);
                     return Ok(());
                 }
@@ -877,6 +894,53 @@ impl AppState {
                 .app
                 .save_extraction_proposal(&filename, &serde_json::to_vec_pretty(&proposal)?)?;
             self.message = format!("Saved unapproved extraction: {}", target.display());
+        } else if let Some(rest) = cmd.strip_prefix("approve ") {
+            let (file, index) = rest
+                .rsplit_once(' ')
+                .ok_or("use approve <proposal-json-path> <claim-index>")?;
+            let index: usize = index.parse()?;
+            let file = std::path::PathBuf::from(file);
+            let mut proposal: story_ollama::ProvisionalExtraction =
+                serde_json::from_slice(&fs::read(&file)?)?;
+            proposal
+                .claims
+                .get(index)
+                .ok_or("claim index is out of range")?;
+            let id = self.app.approve_extraction_claim(&proposal, index)?;
+            proposal.claims[index].approved = true;
+            let temp = file.with_extension(format!("{}.tmp", story_core::QueryId::new()));
+            let mut out = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            out.write_all(&serde_json::to_vec_pretty(&proposal)?)?;
+            out.sync_all()?;
+            fs::rename(&temp, &file)?;
+            if let Some(parent) = file.parent() {
+                fs::File::open(parent)?.sync_all()?;
+            }
+            self.workspace = Workspace::StoryBible;
+            self.selected = self.app.list_characters()?.len()
+                + self.app.list_locations()?.len()
+                + self.app.list_plotlines()?.len()
+                + self.app.list_events()?.len()
+                + self
+                    .app
+                    .list_approved_knowledge_claims()?
+                    .iter()
+                    .position(|claim| claim.id == id)
+                    .unwrap_or(0);
+            self.message = format!("Approved claim {index} as evidence-linked knowledge {id}");
+        } else if cmd == "knowledge" {
+            self.workspace = Workspace::StoryBible;
+            self.selected = self.app.list_characters()?.len()
+                + self.app.list_locations()?.len()
+                + self.app.list_plotlines()?.len()
+                + self.app.list_events()?.len();
+            self.message = format!(
+                "{} approved evidence-linked knowledge claims",
+                self.app.list_approved_knowledge_claims()?.len()
+            );
         } else if let Some(rest) = cmd.strip_prefix("read-import ") {
             let path = std::path::Path::new(rest);
             let source = story_reading::import_reference(path)?;
@@ -1383,7 +1447,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | process-expand | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | process-expand | extract scene|reading UUID MODEL | approve PROPOSAL-PATH CLAIM-INDEX | knowledge | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -2321,6 +2385,23 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                     .unwrap_or_default()
                     .into_iter()
                     .map(|e| format!("Event · {} · {}", e.title, e.source_time)),
+            );
+            rows.extend(
+                s.app
+                    .list_approved_knowledge_claims()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|claim| {
+                        format!(
+                            "Approved knowledge · {} · {}: {} · evidence [{}:{} · {}]",
+                            claim.kind,
+                            claim.name,
+                            claim.claim,
+                            claim.source_kind,
+                            claim.source_id,
+                            claim.evidence_quote
+                        )
+                    }),
             );
             rows
         }
@@ -3832,6 +3913,37 @@ mod tests {
             assert_eq!(state.message, row);
             assert_eq!(state.editing_scene, None);
         }
+        let chapter = state.app.create_chapter(None, "One", 0).unwrap();
+        let scene = state.app.create_scene(chapter, "Evidence", 0).unwrap();
+        let source = "Mara carries the silver key.";
+        let (_, hash) = state.app.load_scene_text(scene).unwrap();
+        state
+            .app
+            .save_scene_text(scene, Some(&hash), source)
+            .unwrap();
+        let proposal = story_ollama::attach_provenance(
+            "scene",
+            &scene.to_string(),
+            source,
+            "fixture",
+            story_ollama::ExtractionResult {
+                claims: vec![story_ollama::CandidateClaim {
+                    kind: "object_possession".into(),
+                    name: "silver key".into(),
+                    claim: "Mara carries the key.".into(),
+                    evidence_quote: "Mara carries the silver key.".into(),
+                    approximate_story_time: None,
+                }],
+            },
+        );
+        let knowledge = state.app.approve_extraction_claim(&proposal, 0).unwrap();
+        state.workspace = Workspace::Search;
+        state.selected = 0;
+        state.search_hits = vec![hit("knowledge_claim", knowledge.to_string(), "silver key")];
+        state.open_selected().unwrap();
+        assert_eq!(state.workspace, Workspace::StoryBible);
+        assert_eq!(state.selected, 4);
+        assert!(workspace_items(&state)[4].contains("Mara carries the key"));
     }
 
     #[test]

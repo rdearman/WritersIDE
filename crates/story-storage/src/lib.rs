@@ -16,6 +16,7 @@ const MIGRATION_3: &str = include_str!("../migrations/0003_reading.sql");
 const MIGRATION_4: &str = include_str!("../migrations/0004_snapshots.sql");
 const MIGRATION_5: &str = include_str!("../migrations/0005_project_search.sql");
 const MIGRATION_6: &str = include_str!("../migrations/0006_search_custom_fields.sql");
+const MIGRATION_7: &str = include_str!("../migrations/0007_approved_knowledge.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -98,6 +99,24 @@ pub struct ProjectSearchHit {
     pub entity_id: String,
     pub title: String,
     pub excerpt: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ApprovedKnowledgeClaim {
+    pub id: story_core::KnowledgeClaimId,
+    pub kind: String,
+    pub name: String,
+    pub claim: String,
+    pub approximate_story_time: Option<String>,
+    pub source_kind: String,
+    pub source_id: String,
+    pub source_fingerprint: String,
+    pub source_length_bytes: usize,
+    pub evidence_quote: String,
+    pub evidence_start_byte: usize,
+    pub evidence_end_byte: usize,
+    pub model: String,
+    pub approved_at: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TranscludedPassage {
@@ -314,7 +333,7 @@ impl ProjectStore {
         )?;
         let conn = Connection::open(root.join("story.db"))?;
         configure(&conn)?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\n{MIGRATION_6}\nINSERT INTO schema_migrations(version,applied_at) VALUES(6,'{}');\nCOMMIT;", now(),now(),now(),now(),now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\n{MIGRATION_6}\nINSERT INTO schema_migrations(version,applied_at) VALUES(6,'{}');\n{MIGRATION_7}\nINSERT INTO schema_migrations(version,applied_at) VALUES(7,'{}');\nCOMMIT;", now(),now(),now(),now(),now(),now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now])?;
         Ok(Self {
@@ -346,7 +365,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 6 {
+        if version > 7 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -371,6 +390,10 @@ impl ProjectStore {
         }
         if current_version == 5 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_6}\nINSERT INTO schema_migrations(version,applied_at) VALUES(6,'{}');\nCOMMIT;", now()))?;
+            current_version = 6;
+        }
+        if current_version == 6 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_7}\nINSERT INTO schema_migrations(version,applied_at) VALUES(7,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -2787,6 +2810,84 @@ impl ProjectStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?)
     }
+    pub fn add_approved_knowledge_claim(&mut self, claim: &ApprovedKnowledgeClaim) -> Result<()> {
+        let source_length = i64::try_from(claim.source_length_bytes).map_err(|_| {
+            StorageError::Invalid("source length exceeds SQLite integer range".into())
+        })?;
+        let start = i64::try_from(claim.evidence_start_byte).map_err(|_| {
+            StorageError::Invalid("evidence offset exceeds SQLite integer range".into())
+        })?;
+        let end = i64::try_from(claim.evidence_end_byte).map_err(|_| {
+            StorageError::Invalid("evidence offset exceeds SQLite integer range".into())
+        })?;
+        self.conn.execute(
+            "INSERT INTO approved_knowledge_claim(id,kind,name,claim,approximate_story_time,source_kind,source_id,source_fingerprint,source_length_bytes,evidence_quote,evidence_start_byte,evidence_end_byte,model,approved_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+            params![claim.id.to_string(),claim.kind,claim.name,claim.claim,claim.approximate_story_time,claim.source_kind,claim.source_id,claim.source_fingerprint,source_length,claim.evidence_quote,start,end,claim.model,claim.approved_at],
+        )?;
+        Ok(())
+    }
+    pub fn get_approved_knowledge_claim(
+        &self,
+        id: KnowledgeClaimId,
+    ) -> Result<ApprovedKnowledgeClaim> {
+        self.list_approved_knowledge_claims()?
+            .into_iter()
+            .find(|claim| claim.id == id)
+            .ok_or_else(|| StorageError::NotFound(id.to_string()))
+    }
+    pub fn list_approved_knowledge_claims(&self) -> Result<Vec<ApprovedKnowledgeClaim>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,kind,name,claim,approximate_story_time,source_kind,source_id,source_fingerprint,source_length_bytes,evidence_quote,evidence_start_byte,evidence_end_byte,model,approved_at FROM approved_knowledge_claim ORDER BY approved_at,id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            let parse_id = |value: String| -> rusqlite::Result<KnowledgeClaimId> {
+                Uuid::parse_str(&value)
+                    .map(KnowledgeClaimId)
+                    .map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            0,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })
+            };
+            Ok(ApprovedKnowledgeClaim {
+                id: parse_id(row.get(0)?)?,
+                kind: row.get(1)?,
+                name: row.get(2)?,
+                claim: row.get(3)?,
+                approximate_story_time: row.get(4)?,
+                source_kind: row.get(5)?,
+                source_id: row.get(6)?,
+                source_fingerprint: row.get(7)?,
+                source_length_bytes: usize::try_from(row.get::<_, i64>(8)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+                evidence_quote: row.get(9)?,
+                evidence_start_byte: usize::try_from(row.get::<_, i64>(10)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        10,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+                evidence_end_byte: usize::try_from(row.get::<_, i64>(11)?).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        11,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+                model: row.get(12)?,
+                approved_at: row.get(13)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
     pub fn rebuild_project_search_index(&mut self) -> Result<()> {
         self.conn.execute("DELETE FROM project_search_fts", [])?;
         self.conn.execute(
@@ -3827,6 +3928,42 @@ mod tests {
     }
 
     #[test]
+    fn approved_knowledge_requires_existing_source_and_is_search_indexed() {
+        let dir = tempdir().unwrap();
+        let mut store = ProjectStore::create(dir.path().join("Novel"), "Novel").unwrap();
+        let invalid = store.conn.execute(
+            "INSERT INTO approved_knowledge_claim(id,kind,name,claim,source_kind,source_id,source_fingerprint,source_length_bytes,evidence_quote,evidence_start_byte,evidence_end_byte,model,approved_at) VALUES(?1,'event','Signal','The signal happened','scene',?2,?3,10,'the signal',0,10,'fixture','2026-01-01')",
+            params![KnowledgeClaimId::new().to_string(), Uuid::new_v4().to_string(), "a".repeat(64)],
+        );
+        assert!(
+            invalid
+                .unwrap_err()
+                .to_string()
+                .contains("source scene does not exist")
+        );
+
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "One", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "The Signal").unwrap();
+        let id = KnowledgeClaimId::new();
+        store.conn.execute(
+            "INSERT INTO approved_knowledge_claim(id,kind,name,claim,source_kind,source_id,source_fingerprint,source_length_bytes,evidence_quote,evidence_start_byte,evidence_end_byte,model,approved_at) VALUES(?1,'event','Signal','The signal happened','scene',?2,?3,10,'the signal',0,10,'fixture','2026-01-01')",
+            params![id.to_string(), scene.to_string(), "a".repeat(64)],
+        ).unwrap();
+        let claim = store.get_approved_knowledge_claim(id).unwrap();
+        assert_eq!(claim.source_id, scene.to_string());
+        assert_eq!(claim.evidence_quote, "the signal");
+        assert!(
+            store
+                .search_project("signal happened", 10)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.entity_kind == "knowledge_claim" && hit.entity_id == id.to_string())
+        );
+    }
+
+    #[test]
     fn reading_copy_annotations_search_and_reanchoring_are_persistent() {
         let d = tempdir().unwrap();
         let project = d.path().join("Novel");
@@ -3910,7 +4047,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TABLE project_search_fts; DROP TABLE project_search_content; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -3920,7 +4057,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
