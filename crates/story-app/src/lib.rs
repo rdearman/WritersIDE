@@ -151,6 +151,55 @@ impl WriterApp {
         let input = self.processing_input()?;
         Ok(story_pipeline::PipelineRunner::new(self.store.project_root()).run(&input)?)
     }
+    pub fn save_extraction_proposal(
+        &self,
+        filename: &str,
+        json: &[u8],
+    ) -> Result<std::path::PathBuf> {
+        Ok(self.store.save_proposal_file(filename, json)?)
+    }
+    pub fn extract_with_ollama(
+        &self,
+        source_kind: &str,
+        source_id: &str,
+        model: &str,
+        endpoint: &str,
+    ) -> Result<story_ollama::ProvisionalExtraction> {
+        let source = match source_kind {
+            "scene" => {
+                self.load_scene_text(SceneId(
+                    source_id
+                        .parse::<uuid::Uuid>()
+                        .map_err(|e| AppError::Domain(e.to_string()))?,
+                ))?
+                .0
+            }
+            "reading" => {
+                self.get_reading_document(ReadingId(
+                    source_id
+                        .parse::<uuid::Uuid>()
+                        .map_err(|e| AppError::Domain(e.to_string()))?,
+                ))?
+                .extracted_text
+            }
+            _ => {
+                return Err(AppError::Domain(
+                    "source kind must be scene or reading".into(),
+                ));
+            }
+        };
+        let result = story_ollama::OllamaClient::new(endpoint, model)
+            .map_err(|e| AppError::Domain(e.to_string()))?
+            .extract(&source)
+            .map_err(|e| AppError::Domain(e.to_string()))?;
+        Ok(story_ollama::attach_provenance(
+            source_kind,
+            source_id,
+            &source,
+            model,
+            result,
+        ))
+    }
     pub fn create_snapshot(&mut self, scene: SceneId, label: &str) -> Result<SnapshotId> {
         Ok(self.store.create_snapshot(scene, label)?)
     }

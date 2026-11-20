@@ -345,6 +345,31 @@ impl ProjectStore {
     pub fn root(&self) -> &Path {
         &self.root
     }
+    pub fn save_proposal_file(&self, filename: &str, content: &[u8]) -> Result<PathBuf> {
+        let name = Path::new(filename);
+        if name.components().count() != 1
+            || !matches!(
+                name.components().next(),
+                Some(std::path::Component::Normal(_))
+            )
+            || name.extension().and_then(|x| x.to_str()) != Some("json")
+        {
+            return Err(StorageError::Invalid(
+                "proposal filename must be a simple .json filename".into(),
+            ));
+        }
+        let directory = self.safe_path(Path::new(".writers-ide/proposals"))?;
+        fs::create_dir_all(&directory)?;
+        let relative = Path::new(".writers-ide/proposals").join(name);
+        let target = self.safe_path(&relative)?;
+        if target.exists() {
+            return Err(StorageError::Conflict(
+                "proposal file already exists".into(),
+            ));
+        }
+        atomic_write(&target, content)?;
+        Ok(target)
+    }
     pub fn get_project(&self) -> Result<Project> {
         let row: (String,String,String,String,String,Option<u64>,String,Option<String>) = self.conn.query_row("SELECT id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id FROM project WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
         Ok(Project {
@@ -3877,6 +3902,27 @@ mod tests {
         fs::write(&outside, "external").unwrap();
         symlink(outside, &target).unwrap();
         assert!(s.load_text(sc).is_err());
+    }
+
+    #[test]
+    fn proposal_files_are_project_local_and_never_overwritten() {
+        let d = tempdir().unwrap();
+        let store = ProjectStore::create(d.path().join("Novel"), "Novel").unwrap();
+        let path = store
+            .save_proposal_file("candidate.json", br#"{"approved":false}"#)
+            .unwrap();
+        assert_eq!(fs::read(&path).unwrap(), br#"{"approved":false}"#);
+        assert!(
+            store
+                .save_proposal_file("candidate.json", b"overwrite")
+                .is_err()
+        );
+        assert!(
+            store
+                .save_proposal_file("../escape.json", b"escape")
+                .is_err()
+        );
+        assert!(path.starts_with(store.root()));
     }
     #[test]
     fn journal_recovers_all_committed_crash_windows() {

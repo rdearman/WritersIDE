@@ -301,29 +301,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "extract" => {
             let path = std::path::PathBuf::from(args.next().ok_or("missing project path")?);
-            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let source_kind = args.next().ok_or("missing source kind: scene|reading")?;
+            let source_id = args.next().ok_or("missing source UUID")?;
             let model = args.next().ok_or("missing Ollama model name")?;
             let endpoint = args
                 .next()
                 .unwrap_or_else(|| "http://localhost:11434".into());
             let app = WriterApp::open_project(&path)?;
-            let (source, _) = app.load_scene_text(scene)?;
-            let output = story_ollama::OllamaClient::new(&endpoint, &model)?.extract(&source)?;
-            let proposal = story_ollama::attach_provenance(
-                "scene",
-                &scene.to_string(),
-                &source,
-                &model,
-                output,
-            );
-            let folder = path.join(".writers-ide").join("proposals");
-            std::fs::create_dir_all(&folder)?;
-            let target = folder.join(format!(
-                "scene-{scene}-{}-{}.json",
+            let proposal = app.extract_with_ollama(&source_kind, &source_id, &model, &endpoint)?;
+            let filename = format!(
+                "{source_kind}-{source_id}-{}-{}.json",
                 &proposal.source_fingerprint[..16],
                 QueryId::new()
-            ));
-            std::fs::write(&target, serde_json::to_vec_pretty(&proposal)?)?;
+            );
+            let target =
+                app.save_extraction_proposal(&filename, &serde_json::to_vec_pretty(&proposal)?)?;
             println!(
                 "Saved provisional, unapproved extraction to {}",
                 target.display()
@@ -390,7 +382,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 fn usage() {
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path>\nwriters-ide extract <path> <scene-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide approve-extraction <proposal-json-file>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
+        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path>\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide approve-extraction <proposal-json-file>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
     );
 }
 fn parse_status(value: &str) -> Result<story_core::SceneStatus, Box<dyn std::error::Error>> {

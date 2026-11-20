@@ -255,6 +255,26 @@ impl AppState {
                 .map(|report| format!("{:?}:{:?}", report.stage, report.status))
                 .collect::<Vec<_>>()
                 .join(" · ");
+        } else if let Some(rest) = cmd.strip_prefix("extract ") {
+            let mut args = rest.split_whitespace();
+            let source_kind = args
+                .next()
+                .ok_or("use extract <scene|reading> <UUID> <model> [endpoint]")?;
+            let source_id = args.next().ok_or("missing source UUID")?;
+            let model = args.next().ok_or("missing Ollama model")?;
+            let endpoint = args.next().unwrap_or("http://localhost:11434");
+            let proposal = self
+                .app
+                .extract_with_ollama(source_kind, source_id, model, endpoint)?;
+            let filename = format!(
+                "{source_kind}-{source_id}-{}-{}.json",
+                &proposal.source_fingerprint[..16],
+                story_core::QueryId::new()
+            );
+            let target = self
+                .app
+                .save_extraction_proposal(&filename, &serde_json::to_vec_pretty(&proposal)?)?;
+            self.message = format!("Saved unapproved extraction: {}", target.display());
         } else if let Some(rest) = cmd.strip_prefix("read-import ") {
             let path = std::path::Path::new(rest);
             let source = story_reading::import_reference(path)?;
@@ -622,7 +642,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | transclude SCENE-ID | process | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | help".into();
+            self.message = "Commands: open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | help".into();
         }
         Ok(())
     }

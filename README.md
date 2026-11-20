@@ -1,10 +1,10 @@
 # Writer's IDE
 
-Writer's IDE is an early Rust implementation of the scene-centred novel planning and writing environment described in the supplied SRS v0.1 and [active engineering design](docs/engineering-design-v0.13.md).
+Writer's IDE is an early Rust implementation of the scene-centred novel planning and writing environment described in the supplied SRS v0.1 and [active engineering design](docs/engineering-design-v0.14.md).
 
 The current workspace contains a reusable story core, SQLite and manuscript storage, application services, a synthetic import inventory/mapping interface, a CLI and a full-screen terminal prototype. Real Scrivener/Ranperen adapters are not present.
 
-The current implementation adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked scene inclusion, live saved scene queries, FTS5 scene search, a full-screen terminal shell, reference reading and annotations, snapshot revision history, read-only narrative analytics, optional local Ollama assistance, and an incremental processing pipeline. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.13](docs/engineering-design-v0.13.md).
+The current implementation adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked scene inclusion, live saved scene queries, FTS5 scene search, a full-screen terminal shell, reference reading and annotations, snapshot revision history, read-only narrative analytics, optional local Ollama assistance, and an incremental processing pipeline. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.14](docs/engineering-design-v0.14.md).
 
 ## Build and verify
 
@@ -40,6 +40,8 @@ The current terminal prototype is launched with `cargo run -p writers-ide-termin
 Each project is a directory containing one `story.db`, `project.toml`, portable Markdown files under `manuscript/`, and application recovery data under `.writers-ide/recovery/`. Close the project before copying it manually; use `backup` for a consistent application-managed copy.
 
 Terminal function-key targets can be overridden in `.writers-ide/keybindings.toml`, for example `[bindings]` with `F1 = "Analytics"` and `F4 = "Reading"`; unspecified keys retain their defaults.
+
+The terminal command palette can run `extract scene|reading <UUID> <model> [endpoint]` to save an unapproved evidence-linked proposal. The optional Ollama client only accepts localhost HTTP endpoints; the model request runs only after the author invokes it.
 
 Saved scene queries can be created and listed in the terminal command palette with `query-save <name> status=idea` and `query-list`; `query <uuid>` opens current results in the Search workspace. The CLI provides `query-save`, `query-list`, and `query-run`.
 

@@ -1523,11 +1523,13 @@ version = "0.1.0"
 dependencies = [
  "story-analysis",
  "story-core",
+ "story-ollama",
  "story-pipeline",
  "story-reading",
  "story-storage",
  "tempfile",
  "thiserror",
+ "uuid",
 ]
 
 [[package]]
@@ -2230,9 +2232,11 @@ dependencies = [
  "crossterm",
  "ratatui",
  "serde",
+ "serde_json",
  "story-analysis",
  "story-app",
  "story-core",
+ "story-ollama",
  "story-reading",
  "story-storage",
  "tempfile",
