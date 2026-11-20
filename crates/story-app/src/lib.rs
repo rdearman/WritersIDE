@@ -177,12 +177,21 @@ impl WriterApp {
         })
     }
     pub fn run_processing(&self) -> Result<Vec<story_pipeline::StageReport>> {
-        let input = self.processing_input()?;
-        Ok(story_pipeline::PipelineRunner::new(self.store.project_root()).run(&input)?)
+        self.run_processing_stages(&story_pipeline::Stage::ALL, false)
     }
     pub fn run_processing_with_transclusions(&self) -> Result<Vec<story_pipeline::StageReport>> {
-        let input = self.processing_input_with_transclusions()?;
-        Ok(story_pipeline::PipelineRunner::new(self.store.project_root()).run(&input)?)
+        self.run_processing_stages(&story_pipeline::Stage::ALL, true)
+    }
+    pub fn run_processing_stages(
+        &self,
+        stages: &[story_pipeline::Stage],
+        expand_transclusions: bool,
+    ) -> Result<Vec<story_pipeline::StageReport>> {
+        let input = self.processing_input_mode(expand_transclusions)?;
+        Ok(
+            story_pipeline::PipelineRunner::new(self.store.project_root())
+                .run_selected(&input, stages)?,
+        )
     }
     pub fn save_extraction_proposal(
         &self,

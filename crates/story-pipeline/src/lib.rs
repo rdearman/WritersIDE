@@ -53,6 +53,41 @@ pub enum Stage {
 }
 
 impl Stage {
+    pub const ALL: [Self; 7] = [
+        Self::Compile,
+        Self::WordCount,
+        Self::PlotlineAnalysis,
+        Self::CharacterAnalysis,
+        Self::Continuity,
+        Self::Export,
+        Self::RevisionReport,
+    ];
+
+    pub fn parse_name(name: &str) -> Option<Self> {
+        match name {
+            "compile" => Some(Self::Compile),
+            "word-count" => Some(Self::WordCount),
+            "plotline-analysis" => Some(Self::PlotlineAnalysis),
+            "character-analysis" => Some(Self::CharacterAnalysis),
+            "continuity" => Some(Self::Continuity),
+            "export" => Some(Self::Export),
+            "revision-report" => Some(Self::RevisionReport),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Compile => "compile",
+            Self::WordCount => "word-count",
+            Self::PlotlineAnalysis => "plotline-analysis",
+            Self::CharacterAnalysis => "character-analysis",
+            Self::Continuity => "continuity",
+            Self::Export => "export",
+            Self::RevisionReport => "revision-report",
+        }
+    }
+
     fn dependencies(self) -> &'static [Stage] {
         use Stage::*;
         match self {
@@ -69,6 +104,7 @@ pub enum StageStatus {
     Cached,
     Failed,
     Skipped,
+    NotSelected,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -104,8 +140,18 @@ impl PipelineRunner {
     }
 
     pub fn run(&self, input: &PipelineInput) -> Result<Vec<StageReport>, PipelineError> {
+        self.run_selected(input, &Stage::ALL)
+    }
+
+    /// Runs the requested stages plus their transitive dependencies. Other stages are reported
+    /// as NotSelected, making partial processing explicit to CLI and UI callers.
+    pub fn run_selected(
+        &self,
+        input: &PipelineInput,
+        requested: &[Stage],
+    ) -> Result<Vec<StageReport>, PipelineError> {
+        let selected = dependency_closure(requested);
         fs::create_dir_all(self.cache_path.parent().expect("cache has parent"))?;
-        fs::create_dir_all(self.root.join("exports"))?;
         let mut cache: Cache = match fs::read(&self.cache_path) {
             Ok(bytes) => serde_json::from_slice(&bytes)?,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Cache::default(),
@@ -113,15 +159,16 @@ impl PipelineRunner {
         };
         let mut outputs = BTreeMap::<Stage, String>::new();
         let mut reports = Vec::new();
-        for stage in [
-            Stage::Compile,
-            Stage::WordCount,
-            Stage::PlotlineAnalysis,
-            Stage::CharacterAnalysis,
-            Stage::Continuity,
-            Stage::Export,
-            Stage::RevisionReport,
-        ] {
+        for stage in Stage::ALL {
+            if !selected.contains(&stage) {
+                reports.push(StageReport {
+                    stage,
+                    status: StageStatus::NotSelected,
+                    fingerprint: None,
+                    message: "not requested or required by a requested stage".into(),
+                });
+                continue;
+            }
             if stage
                 .dependencies()
                 .iter()
@@ -203,6 +250,21 @@ impl PipelineRunner {
         }
         Ok(reports)
     }
+}
+
+fn dependency_closure(requested: &[Stage]) -> std::collections::BTreeSet<Stage> {
+    fn include(stage: Stage, selected: &mut std::collections::BTreeSet<Stage>) {
+        if selected.insert(stage) {
+            for dependency in stage.dependencies() {
+                include(*dependency, selected);
+            }
+        }
+    }
+    let mut selected = std::collections::BTreeSet::new();
+    for stage in requested {
+        include(*stage, &mut selected);
+    }
+    selected
 }
 
 fn artifact_path(stage: Stage) -> &'static str {
@@ -527,5 +589,48 @@ mod tests {
         assert_eq!(result[0].status, StageStatus::Failed);
         assert_eq!(result[1].status, StageStatus::Skipped);
         assert!(result[0].message.contains("persist artifact"));
+    }
+
+    #[test]
+    fn selected_stages_run_dependency_closure_and_report_exclusions() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = PipelineRunner::new(dir.path());
+        let selected = runner.run_selected(&input("A."), &[Stage::Export]).unwrap();
+        assert_eq!(selected.len(), Stage::ALL.len());
+        assert_eq!(selected[0].stage, Stage::Compile);
+        assert_eq!(selected[0].status, StageStatus::Complete);
+        assert_eq!(selected[1].status, StageStatus::NotSelected);
+        assert_eq!(selected[2].status, StageStatus::NotSelected);
+        assert_eq!(selected[3].status, StageStatus::NotSelected);
+        assert_eq!(selected[4].status, StageStatus::NotSelected);
+        assert_eq!(selected[5].status, StageStatus::Complete);
+        assert_eq!(selected[6].status, StageStatus::NotSelected);
+
+        let cached = runner.run_selected(&input("A."), &[Stage::Export]).unwrap();
+        assert_eq!(cached[0].status, StageStatus::Cached);
+        assert_eq!(cached[5].status, StageStatus::Cached);
+        assert_eq!(cached[1].status, StageStatus::NotSelected);
+
+        let failed_dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(
+            failed_dir
+                .path()
+                .join(".writers-ide/processing/compiled.md"),
+        )
+        .unwrap();
+        let failed = PipelineRunner::new(failed_dir.path())
+            .run_selected(&input("A."), &[Stage::Export])
+            .unwrap();
+        assert_eq!(failed[0].status, StageStatus::Failed);
+        assert_eq!(failed[5].status, StageStatus::Skipped);
+        assert!(failed[5].message.contains("dependency"));
+    }
+
+    #[test]
+    fn stage_names_are_stable_and_parseable() {
+        for stage in Stage::ALL {
+            assert_eq!(Stage::parse_name(stage.name()), Some(stage));
+        }
+        assert_eq!(Stage::parse_name("unknown"), None);
     }
 }

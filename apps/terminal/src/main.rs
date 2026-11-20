@@ -123,6 +123,7 @@ enum CommandAction {
     Save,
     Help,
     Process { expand_transclusions: bool },
+    ProcessSelected { expand_transclusions: bool },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -208,6 +209,26 @@ fn command_registry() -> Vec<CommandSpec> {
                 expand_transclusions: true,
             },
         },
+        CommandSpec {
+            id: "compile.selected",
+            label: "Compile Selected Stages",
+            description: "Run selected processing stages and their dependencies",
+            category: "Compile",
+            mnemonic: None,
+            action: CommandAction::ProcessSelected {
+                expand_transclusions: false,
+            },
+        },
+        CommandSpec {
+            id: "compile.selected-expand-transclusions",
+            label: "Compile Selected Stages with Transclusions",
+            description: "Run selected stages with scene inclusions expanded",
+            category: "Compile",
+            mnemonic: None,
+            action: CommandAction::ProcessSelected {
+                expand_transclusions: true,
+            },
+        },
     ]);
     commands
 }
@@ -228,6 +249,8 @@ fn command_by_palette_text(text: &str) -> Option<CommandSpec> {
     match text {
         "process" | "compile" => command_by_id("compile.run"),
         "process-expand" | "compile-expand" => command_by_id("compile.expand-transclusions"),
+        "process-only" => command_by_id("compile.selected"),
+        "process-expand-only" => command_by_id("compile.selected-expand-transclusions"),
         "help" => command_by_id("help.context"),
         _ => None,
     }
@@ -240,6 +263,19 @@ fn open_menu_reserved_message() -> &'static str {
 fn is_menu_shortcut(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('/') | KeyCode::Char('_'))
+}
+
+fn parse_processing_stages(names: &str) -> Result<Vec<story_pipeline::Stage>, String> {
+    if names.trim().is_empty() {
+        return Err("provide at least one processing stage".into());
+    }
+    names
+        .split(',')
+        .map(|name| {
+            story_pipeline::Stage::parse_name(name.trim())
+                .ok_or_else(|| format!("unknown processing stage '{name}'"))
+        })
+        .collect()
 }
 
 fn default_bindings() -> Vec<(u8, Workspace)> {
@@ -530,6 +566,13 @@ impl AppState {
         &mut self,
         action: CommandAction,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.dispatch_registered_with_args(action, None)
+    }
+    fn dispatch_registered_with_args(
+        &mut self,
+        action: CommandAction,
+        arguments: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         match action {
             CommandAction::Workspace(workspace) => self.switch(workspace),
             CommandAction::OpenMainMenu => self.message = open_menu_reserved_message().into(),
@@ -558,6 +601,21 @@ impl AppState {
                 } else {
                     self.app.run_processing()?
                 };
+                self.message = reports
+                    .into_iter()
+                    .map(|report| format!("{:?}:{:?}", report.stage, report.status))
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+            }
+            CommandAction::ProcessSelected {
+                expand_transclusions,
+            } => {
+                let stages = parse_processing_stages(
+                    arguments.ok_or("selected Compile command needs stage names")?,
+                )?;
+                let reports = self
+                    .app
+                    .run_processing_stages(&stages, expand_transclusions)?;
                 self.message = reports
                     .into_iter()
                     .map(|report| format!("{:?}:{:?}", report.stage, report.status))
@@ -603,7 +661,14 @@ impl AppState {
             self.dispatch_registered(spec.action)?;
             return Ok(());
         }
-        if cmd == "process" || cmd == "process-expand" {
+        if let Some(rest) = cmd.strip_prefix("process-only ") {
+            let spec = command_by_id("compile.selected").ok_or("missing Compile command")?;
+            self.dispatch_registered_with_args(spec.action, Some(rest))?;
+        } else if let Some(rest) = cmd.strip_prefix("process-expand-only ") {
+            let spec = command_by_id("compile.selected-expand-transclusions")
+                .ok_or("missing Compile command")?;
+            self.dispatch_registered_with_args(spec.action, Some(rest))?;
+        } else if cmd == "process" || cmd == "process-expand" {
             let reports = if cmd == "process-expand" {
                 self.app.run_processing_with_transclusions()?
             } else {
@@ -1447,7 +1512,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | process-expand | extract scene|reading UUID MODEL | approve PROPOSAL-PATH CLAIM-INDEX | knowledge | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | process-expand | process-only STAGE,STAGE | process-expand-only STAGE,STAGE | extract scene|reading UUID MODEL | approve PROPOSAL-PATH CLAIM-INDEX | knowledge | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -2871,6 +2936,16 @@ mod tests {
         assert_eq!(compile.label, "Compile");
         assert_eq!(compile.category, "Compile");
         assert_eq!(command_by_palette_text("process"), Some(compile));
+        assert_eq!(
+            command_by_id("compile.selected").unwrap().category,
+            "Compile"
+        );
+        assert_eq!(
+            command_by_palette_text("process-only").unwrap().action,
+            CommandAction::ProcessSelected {
+                expand_transclusions: false
+            }
+        );
     }
 
     #[test]
@@ -4034,6 +4109,15 @@ mod tests {
         assert_eq!(
             state.app.analytics_dataset().unwrap()[0].characters[0].id,
             character.to_string()
+        );
+        execute(&mut state, "process-only export".into());
+        assert!(state.message.contains("Compile:Complete"));
+        assert!(state.message.contains("Export:Complete"));
+        assert!(state.message.contains("WordCount:NotSelected"));
+        assert!(
+            !dir.path()
+                .join("Novel/.writers-ide/processing/word-count.txt")
+                .exists()
         );
     }
 }

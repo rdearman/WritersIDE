@@ -345,20 +345,34 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "process" => {
             let path = args.next().ok_or("missing project path")?;
-            let expand_transclusions = match args.next().as_deref() {
-                None => false,
-                Some("--expand-transclusions") => true,
-                Some(option) => return Err(format!("unknown process option: {option}").into()),
-            };
-            if args.next().is_some() {
-                return Err("process accepts at most one option: --expand-transclusions".into());
+            let mut expand_transclusions = false;
+            let mut selected = None;
+            while let Some(option) = args.next() {
+                match option.as_str() {
+                    "--expand-transclusions" => expand_transclusions = true,
+                    "--only" => {
+                        let names = args
+                            .next()
+                            .ok_or("--only needs a comma-separated stage list")?;
+                        let stages = names
+                            .split(',')
+                            .map(|name| {
+                                let name = name.trim();
+                                story_pipeline::Stage::parse_name(name)
+                                    .ok_or_else(|| format!("unknown processing stage '{name}'"))
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        if stages.is_empty() {
+                            return Err("--only requires at least one processing stage".into());
+                        }
+                        selected = Some(stages);
+                    }
+                    _ => return Err(format!("unknown process option: {option}").into()),
+                }
             }
             let app = WriterApp::open_project(path)?;
-            let reports = if expand_transclusions {
-                app.run_processing_with_transclusions()?
-            } else {
-                app.run_processing()?
-            };
+            let stages = selected.as_deref().unwrap_or(&story_pipeline::Stage::ALL);
+            let reports = app.run_processing_stages(stages, expand_transclusions)?;
             let incomplete = reports.iter().any(|r| {
                 matches!(
                     r.status,
@@ -476,7 +490,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 fn usage() {
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
+        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
     );
     eprintln!(
         "writers-ide anchors <path> <scene-uuid>\nwriters-ide anchor-move <path> <anchor-uuid> <start-byte> <end-byte>"

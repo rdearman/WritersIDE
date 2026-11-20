@@ -10,6 +10,7 @@ story-reading = { path = "../../crates/story-reading" }
 story-app = { path = "../../crates/story-app" }
 story-storage = { path = "../../crates/story-storage" }
 story-analysis = { path = "../../crates/story-analysis" }
+story-pipeline = { path = "../../crates/story-pipeline" }
 toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
