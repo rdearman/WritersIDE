@@ -169,6 +169,11 @@ pub fn attach_provenance(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread,
+    };
 
     #[test]
     fn claims_keep_source_fingerprint_quote_offsets_and_provisional_state() {
@@ -201,5 +206,60 @@ mod tests {
     fn client_refuses_non_local_service_endpoints() {
         assert!(OllamaClient::new("https://example.com", "model").is_err());
         assert!(OllamaClient::new("http://example.com:11434", "model").is_err());
+    }
+
+    #[test]
+    fn localhost_generate_request_round_trips_json_extraction() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("local test socket permission");
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0u8; 4096];
+            let header_end;
+            loop {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+                if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    header_end = end + 4;
+                    break;
+                }
+            }
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(headers.starts_with("POST /api/generate HTTP/1.1"));
+            let length = headers
+                .lines()
+                .find_map(|line| {
+                    let (key, value) = line.split_once(':')?;
+                    key.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap();
+            while request.len() < header_end + length {
+                let count = stream.read(&mut buffer).unwrap();
+                assert!(count > 0);
+                request.extend_from_slice(&buffer[..count]);
+            }
+            let body: serde_json::Value =
+                serde_json::from_slice(&request[header_end..header_end + length]).unwrap();
+            assert_eq!(body["model"], "test-model");
+            assert_eq!(body["stream"], false);
+            assert_eq!(body["format"], "json");
+            assert!(
+                body["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Mara crossed the bridge.")
+            );
+            let response = r#"{"response":"{\"claims\":[{\"kind\":\"character\",\"name\":\"Mara\",\"claim\":\"Mara crosses the bridge\",\"evidence_quote\":\"Mara crossed the bridge.\",\"approximate_story_time\":null}]}"}"#;
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+        });
+        let client = OllamaClient::new(&format!("http://{address}"), "test-model").unwrap();
+        let result = client.extract("Mara crossed the bridge.").unwrap();
+        assert_eq!(result.claims.len(), 1);
+        assert_eq!(result.claims[0].name, "Mara");
+        assert_eq!(result.claims[0].evidence_quote, "Mara crossed the bridge.");
+        server.join().unwrap();
     }
 }
