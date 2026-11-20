@@ -1314,13 +1314,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             .into_iter()
             .map(|c| format!("{}   {} scene appearances", c.name, c.scene_count))
             .collect(),
-        Workspace::PlotGrid => s
-            .app
-            .list_plotlines()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| format!("{}   {} scene appearances", p.name, p.scene_count))
-            .collect(),
+        Workspace::PlotGrid => plot_grid_rows(s),
         Workspace::StoryBible => {
             let mut rows = Vec::new();
             rows.extend(
@@ -1464,6 +1458,55 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             })
             .collect(),
     }
+}
+
+fn plot_grid_rows(s: &AppState) -> Vec<String> {
+    let data = match s.app.analytics_dataset() {
+        Ok(data) => data,
+        Err(_) => return vec!["Unable to load plot data".into()],
+    };
+    let mut plotlines = BTreeMap::<String, String>::new();
+    for scene in &data {
+        for plot in &scene.plotlines {
+            plotlines.insert(plot.id.to_string(), plot.name.clone());
+        }
+    }
+    let plotlines = plotlines.into_iter().collect::<Vec<_>>();
+    let nodes = s
+        .app
+        .list_structural_nodes()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|n| (n.id.to_string(), n.title))
+        .collect::<BTreeMap<_, _>>();
+    let mut rows = vec![format!(
+        "Scene / Plotline | {}",
+        plotlines
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(" | ")
+    )];
+    for scene in data {
+        let chapter = scene
+            .chapter_id
+            .as_ref()
+            .and_then(|id| nodes.get(id))
+            .map(String::as_str)
+            .unwrap_or("Unplaced");
+        let active = scene
+            .plotlines
+            .iter()
+            .map(|p| p.id.to_string())
+            .collect::<std::collections::BTreeSet<_>>();
+        let cells = plotlines
+            .iter()
+            .map(|(id, _)| if active.contains(id) { "●" } else { "·" })
+            .collect::<Vec<_>>()
+            .join("   ");
+        rows.push(format!("{chapter} / {} | {cells}", scene.title));
+    }
+    rows
 }
 fn parse_entity(kind: &str, id: &str) -> Result<story_core::EntityRef, Box<dyn std::error::Error>> {
     Ok(match kind {
@@ -1960,6 +2003,25 @@ mod tests {
         assert_eq!(
             state.app.list_plotlines().unwrap()[0].name,
             "Political intrigue"
+        );
+        let plot_id = state.app.list_plotlines().unwrap()[0].id;
+        state
+            .app
+            .set_scene_plotlines(
+                first,
+                &[story_core::ScenePlotline {
+                    plotline_id: plot_id,
+                    role: "advances".into(),
+                    share_basis_points: None,
+                }],
+                story_core::WordAttributionPolicy::Overlap,
+            )
+            .unwrap();
+        let grid = plot_grid_rows(&state);
+        assert!(grid[0].contains("Political intrigue"));
+        assert!(
+            grid.iter()
+                .any(|row| row.contains("First") && row.contains('●'))
         );
         state.mode = Some(':');
         state.prompt = "issue Clarify the timeline".into();
