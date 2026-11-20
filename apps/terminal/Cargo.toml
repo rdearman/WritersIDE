@@ -9,6 +9,7 @@ story-core = { path = "../../crates/story-core" }
 story-reading = { path = "../../crates/story-reading" }
 story-app = { path = "../../crates/story-app" }
 story-storage = { path = "../../crates/story-storage" }
+story-analysis = { path = "../../crates/story-analysis" }
 ratatui.workspace = true
 crossterm.workspace = true
 

@@ -8,3 +8,4 @@ license.workspace = true
 story-core = { path = "../../crates/story-core" }
 story-app = { path = "../../crates/story-app" }
 story-storage = { path = "../../crates/story-storage" }
+story-analysis = { path = "../../crates/story-analysis" }

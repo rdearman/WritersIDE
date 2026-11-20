@@ -807,9 +807,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
+name = "story-analysis"
+version = "0.1.0"
+dependencies = [
+ "story-core",
+ "story-storage",
+]
+
+[[package]]
 name = "story-app"
 version = "0.1.0"
 dependencies = [
+ "story-analysis",
  "story-core",
  "story-reading",
  "story-storage",
@@ -1223,6 +1232,7 @@ checksum = "8c3b93199df0ab874cdf0c6a94f0a0dc3423fe41f1cafb62b8bd7b1deb277aef"
 name = "writers-ide"
 version = "0.1.0"
 dependencies = [
+ "story-analysis",
  "story-app",
  "story-core",
  "story-storage",
@@ -1234,6 +1244,7 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "ratatui",
+ "story-analysis",
  "story-app",
  "story-core",
  "story-reading",

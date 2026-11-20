@@ -221,13 +221,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.restore_snapshot(scene, snapshot, &hash)?;
             println!("Restored; current text was snapshotted first.");
         }
+        "analytics" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            let data = app.analytics_dataset()?;
+            let project = app.get_project()?;
+            let words = data.iter().map(|s| u64::from(s.actual_words)).sum::<u64>();
+            println!("{} scenes · {words} words", data.len());
+            for pair in story_analysis::character_interactions(&data) {
+                println!(
+                    "interaction\t{}\t{}\t{} scenes",
+                    pair.first_character, pair.second_character, pair.shared_scenes
+                );
+            }
+            for gap in story_analysis::subplot_gaps(&data, 3) {
+                println!(
+                    "subplot-gap\t{}\t{} scenes\t{} → {}",
+                    gap.plotline_name, gap.intervening_scenes, gap.from_scene_id, gap.to_scene_id
+                );
+            }
+            for finding in story_analysis::chronology_ambiguities(&data) {
+                println!(
+                    "chronology-uncertain\t{}\t{}",
+                    finding.first_scene_id, finding.second_scene_id
+                );
+            }
+            if let Some(target) = project.target_words {
+                let preview = story_analysis::preview_budget_redistribution(target, &data);
+                println!(
+                    "budget-preview\t{} target\t{} fixed\t{} unallocated",
+                    preview.target_words, preview.fixed_words, preview.unallocated_words
+                );
+                for (scene, words) in preview.suggested_scene_targets {
+                    println!("suggested-scene-target\t{scene}\t{words}");
+                }
+            }
+        }
         _ => usage(),
     }
     Ok(())
 }
 fn usage() {
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
+        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
     );
 }
 fn parse_status(value: &str) -> Result<story_core::SceneStatus, Box<dyn std::error::Error>> {

@@ -69,6 +69,44 @@ impl WriterApp {
     pub fn list_scenes(&self, include_archived: bool) -> Result<Vec<SceneRecord>> {
         Ok(self.store.list_scenes(include_archived)?)
     }
+    pub fn analytics_dataset(&self) -> Result<Vec<story_analysis::SceneAnalysisInput>> {
+        let mut result = Vec::new();
+        for row in self.store.list_scenes(false)? {
+            let characters = self
+                .store
+                .scene_character_analytics(row.scene.id)?
+                .into_iter()
+                .map(|(id, name, role)| {
+                    let role = match role.as_str() {
+                        "pov" => ParticipationRole::Pov,
+                        "major" => ParticipationRole::Major,
+                        "minor" => ParticipationRole::Minor,
+                        "off_camera" => ParticipationRole::OffCamera,
+                        _ => ParticipationRole::Mentioned,
+                    };
+                    story_analysis::CharacterOnScene { id, name, role }
+                })
+                .collect();
+            let plotlines = self
+                .store
+                .scene_plotline_analytics(row.scene.id)?
+                .into_iter()
+                .map(|(id, name)| story_analysis::PlotlineOnScene { id, name })
+                .collect();
+            result.push(story_analysis::SceneAnalysisInput {
+                scene_id: row.scene.id.to_string(),
+                title: row.scene.title,
+                chapter_id: row.chapter_id.map(|id| id.to_string()),
+                actual_words: row.actual_words,
+                target_words: row.scene.target_words,
+                start_time: row.scene.start_time,
+                end_time: row.scene.end_time,
+                characters,
+                plotlines,
+            });
+        }
+        Ok(result)
+    }
     pub fn create_snapshot(&mut self, scene: SceneId, label: &str) -> Result<SnapshotId> {
         Ok(self.store.create_snapshot(scene, label)?)
     }
@@ -406,5 +444,44 @@ mod tests {
             app.load_scene_text(scene).unwrap().0,
             "The gate opened. Mara stepped through."
         );
+    }
+
+    #[test]
+    fn analytics_reads_relationships_without_mutating_story_data() {
+        let d = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(d.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "One", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let _second = app.create_scene(chapter, "Second", 1).unwrap();
+        let character = app.create_character("Mara").unwrap();
+        app.link_character(first, character, ParticipationRole::Pov)
+            .unwrap();
+        let plot = app.create_plotline("A thread").unwrap();
+        app.set_scene_plotlines(
+            first,
+            &[ScenePlotline {
+                plotline_id: plot,
+                role: "primary".into(),
+                share_basis_points: None,
+            }],
+            WordAttributionPolicy::Overlap,
+        )
+        .unwrap();
+        let before = app
+            .list_scenes(false)
+            .unwrap()
+            .iter()
+            .map(|s| s.scene.id)
+            .collect::<Vec<_>>();
+        let data = app.analytics_dataset().unwrap();
+        let after = app
+            .list_scenes(false)
+            .unwrap()
+            .iter()
+            .map(|s| s.scene.id)
+            .collect::<Vec<_>>();
+        assert_eq!(before, after);
+        assert_eq!(data[0].characters[0].name, "Mara");
+        assert_eq!(data[0].plotlines[0].name, "A thread");
     }
 }

@@ -1618,6 +1618,23 @@ impl ProjectStore {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
     }
+    pub fn scene_character_analytics(
+        &self,
+        scene: SceneId,
+    ) -> Result<Vec<(String, String, String)>> {
+        let mut q = self.conn.prepare("SELECT c.id,c.name,sc.participation_role FROM scene_character sc JOIN character c ON c.id=sc.character_id WHERE sc.scene_id=?1 ORDER BY c.name COLLATE NOCASE,c.id")?;
+        Ok(q.query_map([scene.to_string()], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?
+        .collect::<std::result::Result<_, _>>()?)
+    }
+    pub fn scene_plotline_analytics(&self, scene: SceneId) -> Result<Vec<(String, String)>> {
+        let mut q = self.conn.prepare("SELECT p.id,p.name FROM scene_plotline sp JOIN plotline p ON p.id=sp.plotline_id WHERE sp.scene_id=?1 ORDER BY p.name COLLATE NOCASE,p.id")?;
+        Ok(
+            q.query_map([scene.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?,
+        )
+    }
     pub fn link_character(
         &mut self,
         scene: SceneId,

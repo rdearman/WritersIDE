@@ -1,0 +1,9 @@
+[package]
+name = "story-analysis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+story-core = { path = "../story-core" }
+story-storage = { path = "../story-storage" }

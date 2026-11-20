@@ -8,6 +8,7 @@ license.workspace = true
 story-core = { path = "../story-core" }
 story-storage = { path = "../story-storage" }
 story-reading = { path = "../story-reading" }
+story-analysis = { path = "../story-analysis" }
 thiserror.workspace = true
 
 [dev-dependencies]

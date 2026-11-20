@@ -906,7 +906,17 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 .iter()
                 .filter(|x| matches!(x.2, SceneStatus::DraftComplete | SceneStatus::Complete))
                 .count();
-            vec![
+            let data = s.app.analytics_dataset().unwrap_or_default();
+            let heatmap = story_analysis::character_heatmap(&data);
+            let interactions = story_analysis::character_interactions(&data);
+            let gaps = story_analysis::subplot_gaps(&data, 3);
+            let budget = s
+                .app
+                .get_project()
+                .ok()
+                .and_then(|p| p.target_words)
+                .map(|target| story_analysis::preview_budget_redistribution(target, &data));
+            let mut report = vec![
                 format!("{} scenes", s.scenes.len()),
                 format!("{total} actual words"),
                 format!("{draft} drafted or complete scenes"),
@@ -918,7 +928,35 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                     "{} plotlines",
                     s.app.list_plotlines().map(|x| x.len()).unwrap_or(0)
                 ),
-            ]
+                format!("{} co-appearance pairs", interactions.len()),
+                format!("{} subplot gaps of 3+ scenes", gaps.len()),
+            ];
+            if let Some(budget) = budget {
+                report.push(format!(
+                    "Budget preview: {} target words; {} allocated; {} remaining",
+                    budget.target_words, budget.fixed_words, budget.unallocated_words
+                ));
+            }
+            report.extend(heatmap.into_iter().take(20).map(|row| {
+                format!(
+                    "{} │ {}",
+                    row.scene_title,
+                    row.participants
+                        .iter()
+                        .map(|(_id, name, role)| format!(
+                            "{}:{}",
+                            name,
+                            if *role == story_core::ParticipationRole::Pov {
+                                "POV"
+                            } else {
+                                "in"
+                            }
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )
+            }));
+            report
         }
         Workspace::Research => s
             .app
