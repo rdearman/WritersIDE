@@ -99,6 +99,10 @@ struct AppState {
     reading_focus: bool,
     reading_selection_start: Option<u64>,
     function_bindings: Vec<(u8, Workspace)>,
+    revision_diff: Option<story_core::SnapshotId>,
+    revision_scene: Option<SceneId>,
+    revision_index: usize,
+    revision_hunk: usize,
     search_hits: Vec<story_storage::ProjectSearchHit>,
     query_view: Option<story_core::QueryId>,
     editor_selection: Option<(usize, usize)>,
@@ -109,6 +113,12 @@ struct AppState {
 enum TimelineItem {
     Scene(story_storage::SceneRecord),
     Event(story_storage::EventSummary),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RevisionHunk {
+    diff_lines: std::ops::Range<usize>,
+    selection: story_core::SnapshotRestoreSelection,
 }
 
 #[derive(Deserialize)]
@@ -122,6 +132,7 @@ enum CommandAction {
     OpenMainMenu,
     Save,
     Help,
+    RestoreRevisionHunk,
     Process { expand_transclusions: bool },
     ProcessSelected { expand_transclusions: bool },
     LegacyPalette,
@@ -204,6 +215,17 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::Help,
+        },
+        CommandSpec {
+            id: "revision.restore-hunk",
+            label: "Restore Selected Revision Hunk",
+            description: "Restore the highlighted snapshot diff hunk",
+            category: "File",
+            mnemonic: Some('r'),
+            palette_aliases: &[],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::RestoreRevisionHunk,
         },
         CommandSpec {
             id: "compile.run",
@@ -1080,6 +1102,12 @@ impl AppState {
             }
             self.history.push(self.workspace);
             self.history_index = self.history.len() - 1;
+            if w == Workspace::Revisions {
+                self.revision_index = 0;
+                self.revision_diff = None;
+                self.revision_scene = None;
+                self.revision_hunk = 0;
+            }
             self.workspace = w;
         }
     }
@@ -1120,6 +1148,7 @@ impl AppState {
                     .collect::<Vec<_>>()
                     .join(" · ");
             }
+            CommandAction::RestoreRevisionHunk => self.restore_selected_revision_hunk()?,
             CommandAction::Process {
                 expand_transclusions,
             } => {
@@ -2249,6 +2278,34 @@ impl AppState {
         self.message = format!("{kind} saved for selected passage");
         Ok(())
     }
+
+    fn restore_selected_revision_hunk(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err("save the current manuscript buffer before restoring a revision".into());
+        }
+        let scene = self.revision_scene.ok_or("open a snapshot diff first")?;
+        let snapshot = self.revision_diff.ok_or("open a snapshot diff first")?;
+        let diff = self.app.diff_snapshot(scene, snapshot)?;
+        let hunk = revision_hunks(&diff)
+            .get(self.revision_hunk)
+            .cloned()
+            .ok_or("the selected snapshot has no changed hunk")?;
+        let (_, expected_hash) = self.app.load_scene_text(scene)?;
+        self.app
+            .restore_snapshot_lines(scene, snapshot, &expected_hash, hunk.selection)?;
+        if self.editing_scene == Some(scene) {
+            let (text, hash) = self.app.load_scene_text(scene)?;
+            self.editor = text.split('\n').map(str::to_owned).collect();
+            self.saved_hash = hash;
+            self.cursor = (0, 0);
+            self.editor_selection = None;
+        }
+        self.revision_diff = None;
+        self.revision_hunk = 0;
+        self.refresh()?;
+        self.message = "Selected revision hunk restored; previous text was snapshotted".into();
+        Ok(())
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -2281,6 +2338,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         reading_focus: false,
         reading_selection_start: None,
         function_bindings,
+        revision_diff: None,
+        revision_scene: None,
+        revision_index: 0,
+        revision_hunk: 0,
         search_hits: Vec::new(),
         query_view: None,
         editor_selection: None,
@@ -2466,8 +2527,13 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             .into_iter()
             .map(ListItem::new)
             .collect::<Vec<_>>();
-        let mut state =
-            ListState::default().with_selected(Some(s.selected.min(items.len().saturating_sub(1))));
+        let list_selection = if s.workspace == Workspace::Revisions {
+            s.revision_index
+        } else {
+            s.selected
+        };
+        let mut state = ListState::default()
+            .with_selected(Some(list_selection.min(items.len().saturating_sub(1))));
         let list = List::new(items)
             .highlight_symbol("▸ ")
             .highlight_style(Style::default().add_modifier(Modifier::BOLD))
@@ -2477,34 +2543,113 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     .borders(Borders::ALL),
             );
         f.render_stateful_widget(list, body[0], &mut state);
-        let detail = if matches!(
-            s.workspace,
-            Workspace::StoryBible | Workspace::Issues | Workspace::Research
-        ) {
-            let selected = workspace_items(s).get(s.selected).cloned();
-            format!(
-                "{}\n\n{}\n\n{}",
-                selected.as_deref().unwrap_or("No record selected"),
-                "Enter inspects this record; relationships use stable entity IDs.",
-                s.message
-            )
-        } else if let Some((id, title, status, words)) = s.scenes.get(s.selected) {
-            format!(
-                "Scene: {title}\nID: {id}\nStatus: {}\nWords: {words}\n\nEnter opens the manuscript editor.\n\n{}",
-                status.as_str(),
-                s.message
-            )
+        if s.workspace == Workspace::Revisions
+            && let Some(snapshot_id) = s.revision_diff
+        {
+            let diff = s
+                .revision_scene
+                .and_then(|scene| s.app.diff_snapshot(scene, snapshot_id).ok());
+            if let Some(diff) = diff {
+                let hunks = revision_hunks(&diff);
+                let selected_hunk = s.revision_hunk.min(hunks.len().saturating_sub(1));
+                let lines = diff
+                    .iter()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        let marker = match line.kind {
+                            story_storage::SnapshotLineKind::Equal => ' ',
+                            story_storage::SnapshotLineKind::Added => '+',
+                            story_storage::SnapshotLineKind::Removed => '-',
+                        };
+                        let in_hunk = hunks
+                            .get(selected_hunk)
+                            .is_some_and(|hunk| hunk.diff_lines.contains(&index));
+                        let style = if in_hunk {
+                            Style::default().fg(Color::Black).bg(Color::Yellow)
+                        } else {
+                            match line.kind {
+                                story_storage::SnapshotLineKind::Equal => Style::default(),
+                                story_storage::SnapshotLineKind::Added => {
+                                    Style::default().fg(Color::Green)
+                                }
+                                story_storage::SnapshotLineKind::Removed => {
+                                    Style::default().fg(Color::Red)
+                                }
+                            }
+                        };
+                        Line::from(Span::styled(
+                            format!("{marker}{}", line.text.trim_end()),
+                            style,
+                        ))
+                    })
+                    .collect::<Vec<_>>();
+                let snapshot_label = s
+                    .revision_scene
+                    .and_then(|scene| {
+                        s.app
+                            .list_snapshots(scene)
+                            .ok()?
+                            .into_iter()
+                            .find(|snapshot| snapshot.id == snapshot_id)
+                            .map(|snapshot| snapshot.label)
+                    })
+                    .unwrap_or_else(|| snapshot_id.to_string());
+                let diff_title = if hunks.is_empty() {
+                    format!("{snapshot_label} · no changes · Esc close")
+                } else {
+                    format!(
+                        "{snapshot_label} · hunk {}/{} · [ ] select · r restore · Esc close",
+                        selected_hunk + 1,
+                        hunks.len()
+                    )
+                };
+                f.render_widget(
+                    Paragraph::new(lines)
+                        .scroll((s.scroll as u16, 0))
+                        .wrap(Wrap { trim: false })
+                        .block(Block::default().title(diff_title).borders(Borders::ALL)),
+                    body[1],
+                );
+            } else {
+                f.render_widget(
+                    Paragraph::new("Unable to load snapshot diff").block(
+                        Block::default()
+                            .title("Revision diff")
+                            .borders(Borders::ALL),
+                    ),
+                    body[1],
+                );
+            }
         } else {
-            format!("{}\n\n{}", s.workspace.title(), s.message)
-        };
-        f.render_widget(
-            Paragraph::new(detail).wrap(Wrap { trim: false }).block(
-                Block::default()
-                    .title("Details / split pane")
-                    .borders(Borders::ALL),
-            ),
-            body[1],
-        );
+            let detail = if matches!(
+                s.workspace,
+                Workspace::StoryBible | Workspace::Issues | Workspace::Research
+            ) {
+                let selected = workspace_items(s).get(s.selected).cloned();
+                format!(
+                    "{}\n\n{}\n\n{}",
+                    selected.as_deref().unwrap_or("No record selected"),
+                    "Enter inspects this record; relationships use stable entity IDs.",
+                    s.message
+                )
+            } else if let Some((id, title, status, words)) = s.scenes.get(s.selected) {
+                format!(
+                    "Scene: {title}\nID: {id}\nStatus: {}\nWords: {words}\n\nEnter opens the manuscript editor.\n\n{}",
+                    status.as_str(),
+                    s.message
+                )
+            } else {
+                format!("{}\n\n{}", s.workspace.title(), s.message)
+            };
+            f.render_widget(
+                Paragraph::new(detail).wrap(Wrap { trim: false }).block(
+                    Block::default()
+                        .title("Details / split pane")
+                        .borders(Borders::ALL),
+                ),
+                body[1],
+            );
+        }
     }
     let footer = if let Some(mode) = s.mode {
         format!(" {mode} {}_", s.prompt)
@@ -2881,6 +3026,54 @@ fn next_list_selection(selected: usize, item_count: usize) -> usize {
     }
 }
 
+fn revision_hunks(diff: &[story_storage::SnapshotDiffLine]) -> Vec<RevisionHunk> {
+    let mut hunks = Vec::new();
+    let (mut snapshot_line, mut current_line, mut index) = (0usize, 0usize, 0usize);
+    while index < diff.len() {
+        if diff[index].kind == story_storage::SnapshotLineKind::Equal {
+            snapshot_line += 1;
+            current_line += 1;
+            index += 1;
+            continue;
+        }
+        let start = index;
+        let snapshot_start = snapshot_line;
+        let current_start = current_line;
+        while index < diff.len() && diff[index].kind != story_storage::SnapshotLineKind::Equal {
+            match diff[index].kind {
+                story_storage::SnapshotLineKind::Equal => unreachable!(),
+                story_storage::SnapshotLineKind::Removed => snapshot_line += 1,
+                story_storage::SnapshotLineKind::Added => current_line += 1,
+            }
+            index += 1;
+        }
+        hunks.push(RevisionHunk {
+            diff_lines: start..index,
+            selection: story_core::SnapshotRestoreSelection {
+                current_start,
+                current_end: current_line,
+                snapshot_start,
+                snapshot_end: snapshot_line,
+            },
+        });
+    }
+    hunks
+}
+
+fn revision_items(s: &AppState) -> Vec<(SceneId, story_storage::SnapshotRecord)> {
+    s.scenes
+        .iter()
+        .flat_map(|(scene, _, _, _)| {
+            s.app
+                .list_snapshots(*scene)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|snapshot| (*scene, snapshot))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 fn workspace_items(s: &AppState) -> Vec<String> {
     match s.workspace {
         Workspace::Dashboard => vec![
@@ -3063,15 +3256,18 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             .into_iter()
             .map(|r| format!("{}   {}", r.title, r.media_type))
             .collect(),
-        Workspace::Revisions => s
-            .active_scene()
-            .and_then(|scene| s.app.list_snapshots(scene).ok())
-            .unwrap_or_default()
+        Workspace::Revisions => revision_items(s)
             .into_iter()
-            .map(|snapshot| {
+            .map(|(scene, snapshot)| {
+                let title = s
+                    .scenes
+                    .iter()
+                    .find(|row| row.0 == scene)
+                    .map(|row| row.1.as_str())
+                    .unwrap_or("Unknown scene");
                 format!(
-                    "{}  {}  {}",
-                    snapshot.id, snapshot.created_at, snapshot.label
+                    "{}  {}  {}  ·  {}",
+                    title, snapshot.id, snapshot.created_at, snapshot.label
                 )
             })
             .collect(),
@@ -3460,30 +3656,57 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 .unwrap_or(0);
             s.switch(Workspace::ALL[(i + Workspace::ALL.len() - 1) % Workspace::ALL.len()]);
         }
+        KeyCode::Esc if s.workspace == Workspace::Revisions && s.revision_diff.is_some() => {
+            s.revision_diff = None;
+            s.revision_scene = None;
+            s.revision_hunk = 0;
+            s.message.clear();
+        }
+        KeyCode::Char('[') if s.workspace == Workspace::Revisions => {
+            s.revision_hunk = s.revision_hunk.saturating_sub(1);
+        }
+        KeyCode::Char(']') if s.workspace == Workspace::Revisions => {
+            if let (Some(scene), Some(snapshot)) = (s.revision_scene, s.revision_diff) {
+                let count = s
+                    .app
+                    .diff_snapshot(scene, snapshot)
+                    .map(|diff| revision_hunks(&diff).len())
+                    .unwrap_or_default();
+                if count > 0 {
+                    s.revision_hunk = (s.revision_hunk + 1).min(count - 1);
+                }
+            }
+        }
+        KeyCode::Char('r') if s.workspace == Workspace::Revisions && s.revision_diff.is_some() => {
+            if let Some(command) = command_by_id("revision.restore-hunk")
+                && let Err(error) = s.dispatch_registered(command.action)
+            {
+                s.message = error.to_string();
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') if s.workspace == Workspace::Revisions => {
+            s.revision_index = s.revision_index.saturating_sub(1);
+            s.revision_diff = None;
+            s.revision_scene = None;
+            s.revision_hunk = 0;
+        }
+        KeyCode::Down | KeyCode::Char('j') if s.workspace == Workspace::Revisions => {
+            s.revision_index = next_list_selection(s.revision_index, workspace_items(s).len());
+            s.revision_diff = None;
+            s.revision_scene = None;
+            s.revision_hunk = 0;
+        }
         KeyCode::Up | KeyCode::Char('k') => s.selected = s.selected.saturating_sub(1),
         KeyCode::Down | KeyCode::Char('j') => {
             s.selected = next_list_selection(s.selected, workspace_items(s).len());
         }
         KeyCode::Enter if s.workspace == Workspace::Revisions => {
-            let scene = s.active_scene().ok_or("select a scene first")?;
-            let snapshots = s.app.list_snapshots(scene)?;
-            if let Some(snapshot) = snapshots.get(s.selected) {
-                let diff = s.app.diff_snapshot(scene, snapshot.id)?;
-                s.message = diff
-                    .into_iter()
-                    .map(|line| {
-                        format!(
-                            "{}{}",
-                            match line.kind {
-                                story_storage::SnapshotLineKind::Equal => ' ',
-                                story_storage::SnapshotLineKind::Added => '+',
-                                story_storage::SnapshotLineKind::Removed => '-',
-                            },
-                            line.text.trim_end()
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" | ");
+            if let Some((scene, snapshot)) = revision_items(s).get(s.revision_index) {
+                s.revision_scene = Some(*scene);
+                s.revision_diff = Some(snapshot.id);
+                s.revision_hunk = 0;
+                s.scroll = 0;
+                s.message = format!("Diff for {}", snapshot.label);
             }
         }
         KeyCode::Enter if s.workspace == Workspace::Timeline => {
@@ -3631,6 +3854,10 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
             editor_selection: None,
@@ -3722,6 +3949,10 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
             editor_selection: Some((0, 2)),
@@ -3776,6 +4007,10 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
             editor_selection: None,
@@ -3822,6 +4057,10 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
             editor_selection: None,
@@ -3880,6 +4119,10 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
             editor_selection: None,
@@ -4052,6 +4295,10 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
             editor_selection: None,
@@ -4110,6 +4357,10 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
             editor_selection: None,
@@ -4126,6 +4377,167 @@ mod tests {
         assert!(state.dirty);
         assert!(state.message.contains("Save conflict/error"));
         assert_eq!(state.editor[0], "A");
+    }
+
+    #[test]
+    fn revisions_workspace_restores_only_the_selected_changed_hunk() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let other_scene = app.create_scene(chapter, "Other scene", 1).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "first\nold\nlast\n")
+            .unwrap();
+        let snapshot = app.create_snapshot(scene, "Old middle").unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "first\nnew\nlast\n")
+            .unwrap();
+        let (_, other_hash) = app.load_scene_text(other_scene).unwrap();
+        app.save_scene_text(other_scene, Some(&other_hash), "other scene text")
+            .unwrap();
+        let other_snapshot = app
+            .create_snapshot(other_scene, "Other scene snapshot")
+            .unwrap();
+        let scenes = app
+            .list_scenes(false)
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.scene.id,
+                    row.scene.title,
+                    row.scene.status,
+                    row.actual_words,
+                )
+            })
+            .collect();
+        let mut state = AppState {
+            app,
+            workspace: Workspace::Revisions,
+            scenes,
+            selected: 1,
+            editor: vec![String::new()],
+            editing_scene: None,
+            cursor: (0, 0),
+            saved_hash: String::new(),
+            dirty: false,
+            mode: None,
+            prompt: String::new(),
+            message: String::new(),
+            history: vec![Workspace::Revisions],
+            history_index: 0,
+            width: 100,
+            scroll: 0,
+            reading_document: None,
+            reading_text: String::new(),
+            reading_offset: 0,
+            reading_focus: false,
+            reading_selection_start: None,
+            function_bindings: default_bindings(),
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
+            search_hits: Vec::new(),
+            query_view: None,
+            editor_selection: None,
+            clipboard: String::new(),
+        };
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.revision_index, 1);
+        assert_eq!(
+            state.selected, 1,
+            "revision browsing must preserve scene selection"
+        );
+        state.revision_index = 0;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.revision_diff, Some(snapshot));
+        assert_eq!(state.revision_scene, Some(scene));
+        let diff = state.app.diff_snapshot(scene, snapshot).unwrap();
+        let hunks = revision_hunks(&diff);
+        assert_eq!(hunks.len(), 1);
+        assert_eq!(hunks[0].selection.current_start, 1);
+        assert_eq!(hunks[0].selection.current_end, 2);
+        assert_eq!(hunks[0].selection.snapshot_start, 1);
+        assert_eq!(hunks[0].selection.snapshot_end, 2);
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "first\nold\nlast\n"
+        );
+        assert_eq!(
+            state.app.load_scene_text(other_scene).unwrap().0,
+            "other scene text"
+        );
+        assert!(state.message.contains("Selected revision hunk restored"));
+        assert!(state.app.list_snapshots(scene).unwrap().len() >= 2);
+        assert!(
+            state
+                .app
+                .list_snapshots(other_scene)
+                .unwrap()
+                .iter()
+                .any(|snapshot| snapshot.id == other_snapshot)
+        );
+    }
+
+    #[test]
+    fn revision_hunks_map_insertions_and_deletions_to_empty_ranges() {
+        let diff = vec![
+            story_storage::SnapshotDiffLine {
+                kind: story_storage::SnapshotLineKind::Equal,
+                text: "a\n".into(),
+            },
+            story_storage::SnapshotDiffLine {
+                kind: story_storage::SnapshotLineKind::Removed,
+                text: "old\n".into(),
+            },
+            story_storage::SnapshotDiffLine {
+                kind: story_storage::SnapshotLineKind::Added,
+                text: "new\n".into(),
+            },
+            story_storage::SnapshotDiffLine {
+                kind: story_storage::SnapshotLineKind::Equal,
+                text: "b\n".into(),
+            },
+            story_storage::SnapshotDiffLine {
+                kind: story_storage::SnapshotLineKind::Removed,
+                text: "deleted\n".into(),
+            },
+            story_storage::SnapshotDiffLine {
+                kind: story_storage::SnapshotLineKind::Equal,
+                text: "c\n".into(),
+            },
+            story_storage::SnapshotDiffLine {
+                kind: story_storage::SnapshotLineKind::Added,
+                text: "inserted\n".into(),
+            },
+        ];
+        let hunks = revision_hunks(&diff);
+        assert_eq!(hunks.len(), 3);
+        assert_eq!(hunks[1].selection.current_start, 3);
+        assert_eq!(hunks[1].selection.current_end, 3);
+        assert_eq!(hunks[1].selection.snapshot_start, 3);
+        assert_eq!(hunks[1].selection.snapshot_end, 4);
+        assert_eq!(hunks[2].selection.current_start, 4);
+        assert_eq!(hunks[2].selection.current_end, 5);
+        assert_eq!(hunks[2].selection.snapshot_start, 5);
+        assert_eq!(hunks[2].selection.snapshot_end, 5);
     }
 
     #[test]
@@ -4190,6 +4602,10 @@ mod tests {
             reading_focus: true,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
             editor_selection: None,
@@ -4487,6 +4903,10 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
             editor_selection: None,
@@ -4556,6 +4976,10 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
             editor_selection: None,
@@ -4677,6 +5101,10 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
             editor_selection: None,
