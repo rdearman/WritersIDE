@@ -116,6 +116,46 @@ impl WriterApp {
     pub fn link_event(&mut self, scene: SceneId, event: EventId, kind: &str) -> Result<()> {
         Ok(self.store.link_event(scene, event, kind)?)
     }
+    pub fn create_passage_anchor(
+        &mut self,
+        scene: SceneId,
+        start: u64,
+        end: u64,
+        quote: &str,
+        prefix: &str,
+        suffix: &str,
+    ) -> Result<AnchorId> {
+        Ok(self
+            .store
+            .create_anchor(scene, start, end, quote, prefix, suffix)?)
+    }
+    pub fn create_story_link(&mut self, link: &StoryLink) -> Result<()> {
+        Ok(self.store.create_story_link(link)?)
+    }
+    pub fn backlinks(&self, target: EntityRef) -> Result<Vec<StoryLink>> {
+        Ok(self.store.backlinks(target)?)
+    }
+    pub fn outgoing_links(&self, source: EntityRef) -> Result<Vec<StoryLink>> {
+        Ok(self.store.outgoing_links(source)?)
+    }
+    pub fn expand_scene_transclusions(
+        &self,
+        scene: SceneId,
+    ) -> Result<Vec<story_storage::TranscludedPassage>> {
+        Ok(self.store.expand_scene_transclusions(scene)?)
+    }
+    pub fn broken_links(&self) -> Result<Vec<story_storage::BrokenLink>> {
+        Ok(self.store.broken_links()?)
+    }
+    pub fn save_scene_query(&mut self, query: &SavedSceneQuery) -> Result<()> {
+        Ok(self.store.save_scene_query(query)?)
+    }
+    pub fn run_scene_query(&self, query: QueryId) -> Result<Vec<SceneId>> {
+        Ok(self.store.run_scene_query(query)?)
+    }
+    pub fn search_scenes(&self, terms: &str) -> Result<Vec<SceneId>> {
+        Ok(self.store.search_scenes(terms)?)
+    }
     pub fn define_custom_field(&mut self, def: &CustomFieldDefinition) -> Result<()> {
         Ok(self.store.define_custom_field(def)?)
     }

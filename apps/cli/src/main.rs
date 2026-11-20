@@ -1,6 +1,8 @@
 use std::{env, process::ExitCode};
 use story_app::WriterApp;
-use story_core::{NodeId, SceneId};
+use story_core::{
+    EntityRef, LinkId, LinkKind, NodeId, QueryId, SavedSceneQuery, SceneId, SceneQueryFilter,
+};
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
@@ -83,14 +85,144 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.backup_project(destination)?;
             println!("Backup created.");
         }
+        "character" => {
+            let path = args.next().ok_or("missing project path")?;
+            let name = args.next().ok_or("missing character name")?;
+            let mut app = WriterApp::open_project(path)?;
+            println!("{}", app.create_character(&name)?);
+        }
+        "plotline" => {
+            let path = args.next().ok_or("missing project path")?;
+            let name = args.next().ok_or("missing plotline name")?;
+            let mut app = WriterApp::open_project(path)?;
+            println!("{}", app.create_plotline(&name)?);
+        }
+        "search" => {
+            let path = args.next().ok_or("missing project path")?;
+            let terms = args.collect::<Vec<_>>().join(" ");
+            let app = WriterApp::open_project(path)?;
+            for scene in app.search_scenes(&terms)? {
+                println!("{scene}");
+            }
+        }
+        "query-save" => {
+            let path = args.next().ok_or("missing project path")?;
+            let name = args.next().ok_or("missing query name")?;
+            let mut filters = Vec::new();
+            for arg in args {
+                let (key, value) = arg
+                    .split_once('=')
+                    .ok_or("filters must use key=value syntax")?;
+                filters.push(match key {
+                    "status" => SceneQueryFilter::Status(parse_status(value)?),
+                    "character" => {
+                        SceneQueryFilter::Character(story_core::CharacterId(value.parse()?))
+                    }
+                    "plotline" => {
+                        SceneQueryFilter::Plotline(story_core::PlotlineId(value.parse()?))
+                    }
+                    "before" => SceneQueryFilter::TimeBefore(value.parse()?),
+                    "after" => SceneQueryFilter::TimeAfter(value.parse()?),
+                    "issue" if value == "unresolved" => SceneQueryFilter::UnresolvedIssue,
+                    _ => return Err(format!("unsupported query filter: {arg}").into()),
+                });
+            }
+            let query = SavedSceneQuery {
+                id: QueryId::new(),
+                name,
+                description: String::new(),
+                filters,
+            };
+            let mut app = WriterApp::open_project(path)?;
+            app.save_scene_query(&query)?;
+            println!("{}", query.id);
+        }
+        "query-run" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = args.next().ok_or("missing query id")?.parse()?;
+            let app = WriterApp::open_project(path)?;
+            for scene in app.run_scene_query(QueryId(id))? {
+                println!("{scene}");
+            }
+        }
+        "link" => {
+            let path = args.next().ok_or("missing project path")?;
+            let source_kind = args.next().ok_or("missing source kind")?;
+            let source_id = args.next().ok_or("missing source id")?;
+            let target_kind = args.next().ok_or("missing target kind")?;
+            let target_id = args.next().ok_or("missing target id")?;
+            let link_kind = args.next().ok_or("missing link kind")?;
+            let label = args.collect::<Vec<_>>().join(" ");
+            let link = story_core::StoryLink {
+                id: LinkId::new(),
+                source: parse_entity(&source_kind, &source_id)?,
+                source_anchor: None,
+                target: parse_entity(&target_kind, &target_id)?,
+                target_anchor: None,
+                kind: parse_link_kind(&link_kind)?,
+                label,
+            };
+            let mut app = WriterApp::open_project(path)?;
+            app.create_story_link(&link)?;
+            println!("{}", link.id);
+        }
+        "backlinks" => {
+            let path = args.next().ok_or("missing project path")?;
+            let kind = args.next().ok_or("missing entity kind")?;
+            let id = args.next().ok_or("missing entity id")?;
+            let app = WriterApp::open_project(path)?;
+            for link in app.backlinks(parse_entity(&kind, &id)?)? {
+                println!("{}\t{}\t{}", link.id, link.kind.as_str(), link.label);
+            }
+        }
+        "broken-links" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            for link in app.broken_links()? {
+                println!("{}\t{}", link.link_id, link.reason);
+            }
+        }
         _ => usage(),
     }
     Ok(())
 }
 fn usage() {
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
+        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
     );
+}
+fn parse_status(value: &str) -> Result<story_core::SceneStatus, Box<dyn std::error::Error>> {
+    use story_core::SceneStatus::*;
+    Ok(match value {
+        "idea" => Idea,
+        "outlined" => Outlined,
+        "ready_to_draft" => ReadyToDraft,
+        "drafting" => Drafting,
+        "draft_complete" => DraftComplete,
+        "revising" => Revising,
+        "complete" => Complete,
+        "archived" => Archived,
+        _ => return Err(format!("unknown scene status: {value}").into()),
+    })
+}
+fn parse_entity(kind: &str, id: &str) -> Result<EntityRef, Box<dyn std::error::Error>> {
+    Ok(match kind {
+        "scene" => EntityRef::Scene(SceneId(id.parse()?)),
+        "character" => EntityRef::Character(story_core::CharacterId(id.parse()?)),
+        "plotline" => EntityRef::Plotline(story_core::PlotlineId(id.parse()?)),
+        "research" => EntityRef::Research(story_core::ResearchId(id.parse()?)),
+        _ => return Err(format!("unknown entity kind: {kind}").into()),
+    })
+}
+fn parse_link_kind(kind: &str) -> Result<LinkKind, Box<dyn std::error::Error>> {
+    Ok(match kind {
+        "related" => LinkKind::Related,
+        "cites" => LinkKind::Cites,
+        "transcludes" => LinkKind::Transcludes,
+        "includes" => LinkKind::Includes,
+        "navigates" => LinkKind::Navigates,
+        _ => return Err(format!("unknown link kind: {kind}").into()),
+    })
 }
 fn main() -> ExitCode {
     match run() {

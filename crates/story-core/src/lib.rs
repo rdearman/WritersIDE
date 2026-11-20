@@ -38,6 +38,97 @@ id_type!(FieldId);
 id_type!(ImportRunId);
 id_type!(SourceItemId);
 id_type!(ProvenanceId);
+id_type!(ResearchId);
+id_type!(LinkId);
+id_type!(AnchorId);
+id_type!(QueryId);
+id_type!(IssueId);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EntityRef {
+    Scene(SceneId),
+    Character(CharacterId),
+    Plotline(PlotlineId),
+    Research(ResearchId),
+}
+impl EntityRef {
+    pub fn kind(self) -> &'static str {
+        match self {
+            Self::Scene(_) => "scene",
+            Self::Character(_) => "character",
+            Self::Plotline(_) => "plotline",
+            Self::Research(_) => "research",
+        }
+    }
+    pub fn id(self) -> String {
+        match self {
+            Self::Scene(id) => id.to_string(),
+            Self::Character(id) => id.to_string(),
+            Self::Plotline(id) => id.to_string(),
+            Self::Research(id) => id.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LinkKind {
+    Related,
+    Cites,
+    Transcludes,
+    Includes,
+    Navigates,
+}
+impl LinkKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Related => "related",
+            Self::Cites => "cites",
+            Self::Transcludes => "transcludes",
+            Self::Includes => "includes",
+            Self::Navigates => "navigates",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PassageAnchor {
+    pub id: AnchorId,
+    pub scene_id: SceneId,
+    pub start_byte: u64,
+    pub end_byte: u64,
+    pub quote: String,
+    pub prefix_context: String,
+    pub suffix_context: String,
+    pub source_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoryLink {
+    pub id: LinkId,
+    pub source: EntityRef,
+    pub source_anchor: Option<AnchorId>,
+    pub target: EntityRef,
+    pub target_anchor: Option<AnchorId>,
+    pub kind: LinkKind,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum SceneQueryFilter {
+    Status(SceneStatus),
+    Character(CharacterId),
+    Plotline(PlotlineId),
+    TimeBefore(i64),
+    TimeAfter(i64),
+    UnresolvedIssue,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct SavedSceneQuery {
+    pub id: QueryId,
+    pub name: String,
+    pub description: String,
+    pub filters: Vec<SceneQueryFilter>,
+}
 
 #[derive(Debug, Error)]
 pub enum DomainError {

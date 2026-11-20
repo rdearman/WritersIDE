@@ -11,6 +11,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 const MIGRATION_1: &str = include_str!("../migrations/0001_initial.sql");
+const MIGRATION_2: &str = include_str!("../migrations/0002_links_queries.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -63,6 +64,17 @@ pub struct RecoveryConflict {
     pub transaction_id: String,
     pub scene_id: String,
     pub recovery_path: PathBuf,
+}
+#[derive(Clone, Debug)]
+pub struct BrokenLink {
+    pub link_id: LinkId,
+    pub reason: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TranscludedPassage {
+    pub scene_id: SceneId,
+    pub text: String,
+    pub depth: usize,
 }
 type CustomDefaultRow = (
     String,
@@ -160,7 +172,7 @@ impl ProjectStore {
         )?;
         let conn = Connection::open(root.join("story.db"))?;
         configure(&conn)?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\nCOMMIT;"))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now])?;
         Ok(Self {
@@ -191,8 +203,15 @@ impl ProjectStore {
             )
             .optional()?
             .unwrap_or(0);
-        if version > 1 {
+        let migrated = version == 1;
+        if version > 2 {
             return Err(StorageError::UnsupportedSchema(version));
+        }
+        if version < 1 {
+            return Err(StorageError::UnsupportedSchema(version));
+        }
+        if version == 1 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -208,6 +227,9 @@ impl ProjectStore {
             conn,
         };
         let _ = this.recover_pending_writes()?;
+        if migrated {
+            this.rebuild_scene_index()?;
+        }
         Ok(this)
     }
     pub fn root(&self) -> &Path {
@@ -933,6 +955,7 @@ impl ProjectStore {
                 "UPDATE write_journal SET state='db_committed' WHERE tx_id=?1",
                 [&txid],
             )?;
+            update_scene_index(&tx, id, text)?;
             tx.commit()?;
         }
         if fail == Some(SaveFailpoint::AfterMetadataCommit)
@@ -1217,6 +1240,9 @@ impl ProjectStore {
         len: i64,
         generation: i64,
     ) -> Result<()> {
+        let scene =
+            SceneId(Uuid::parse_str(sid).map_err(|e| StorageError::Invalid(e.to_string()))?);
+        let text = fs::read_to_string(self.safe_path(&self.content_path(scene)?)?)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1224,6 +1250,7 @@ impl ProjectStore {
             "UPDATE scene_content SET sha256=?2,byte_length=?3,generation=?4 WHERE scene_id=?1",
             params![sid, new, len, generation],
         )?;
+        update_scene_index(&tx, scene, &text)?;
         tx.execute(
             "UPDATE write_journal SET state='db_committed' WHERE tx_id=?1",
             [txid],
@@ -1239,6 +1266,9 @@ impl ProjectStore {
         len: i64,
         generation: i64,
     ) -> Result<()> {
+        let scene =
+            SceneId(Uuid::parse_str(sid).map_err(|e| StorageError::Invalid(e.to_string()))?);
+        let text = fs::read_to_string(self.safe_path(&self.content_path(scene)?)?)?;
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1246,6 +1276,7 @@ impl ProjectStore {
             "UPDATE scene_content SET sha256=?2,byte_length=?3,generation=?4 WHERE scene_id=?1",
             params![sid, hash, len, generation],
         )?;
+        update_scene_index(&tx, scene, &text)?;
         tx.execute("DELETE FROM write_journal WHERE tx_id=?1", [txid])?;
         tx.execute(
             "UPDATE write_conflict SET resolved=1,decision=0 WHERE tx_id=?1",
@@ -1406,6 +1437,231 @@ impl ProjectStore {
             "INSERT INTO scene_event(scene_id,event_id,relationship_kind) VALUES(?1,?2,?3)",
             params![scene.to_string(), event.to_string(), kind],
         )?;
+        Ok(())
+    }
+    pub fn create_anchor(
+        &mut self,
+        scene: SceneId,
+        start_byte: u64,
+        end_byte: u64,
+        quote: &str,
+        prefix: &str,
+        suffix: &str,
+    ) -> Result<AnchorId> {
+        let (text, hash) = self.load_text(scene)?;
+        let start = usize::try_from(start_byte)
+            .map_err(|_| StorageError::Invalid("anchor offset overflow".into()))?;
+        let end = usize::try_from(end_byte)
+            .map_err(|_| StorageError::Invalid("anchor offset overflow".into()))?;
+        if start > end
+            || end > text.len()
+            || !text.is_char_boundary(start)
+            || !text.is_char_boundary(end)
+            || text.get(start..end) != Some(quote)
+        {
+            return Err(StorageError::Invalid(
+                "anchor offsets must select the supplied UTF-8 passage".into(),
+            ));
+        }
+        let id = AnchorId::new();
+        self.conn.execute("INSERT INTO passage_anchor(id,scene_id,start_byte,end_byte,quote,prefix_context,suffix_context,source_sha256,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)", params![id.to_string(),scene.to_string(),start_byte,end_byte,quote,prefix,suffix,hash,now()])?;
+        Ok(id)
+    }
+    pub fn create_story_link(&mut self, link: &StoryLink) -> Result<()> {
+        if link.source_anchor.is_some() && !matches!(link.source, EntityRef::Scene(_)) {
+            return Err(StorageError::Invalid(
+                "passage anchors can only belong to scenes".into(),
+            ));
+        }
+        if link.target_anchor.is_some() && !matches!(link.target, EntityRef::Scene(_)) {
+            return Err(StorageError::Invalid(
+                "passage anchors can only belong to scenes".into(),
+            ));
+        }
+        self.conn.execute("INSERT INTO story_link(id,source_kind,source_id,source_anchor_id,target_kind,target_id,target_anchor_id,link_kind,label,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![link.id.to_string(),link.source.kind(),link.source.id(),link.source_anchor.map(|x|x.to_string()),link.target.kind(),link.target.id(),link.target_anchor.map(|x|x.to_string()),link.kind.as_str(),link.label,now()])?;
+        Ok(())
+    }
+    pub fn create_research_item(
+        &mut self,
+        title: &str,
+        body: &str,
+        media_type: &str,
+        source_path: Option<&str>,
+        source_sha256: Option<&str>,
+    ) -> Result<ResearchId> {
+        let id = ResearchId::new();
+        self.conn.execute("INSERT INTO research_item(id,title,body,media_type,source_path,source_sha256,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",params![id.to_string(),title,body,media_type,source_path,source_sha256,now()])?;
+        Ok(id)
+    }
+    pub fn expand_scene_transclusions(&self, root: SceneId) -> Result<Vec<TranscludedPassage>> {
+        fn visit(
+            store: &ProjectStore,
+            scene: SceneId,
+            depth: usize,
+            seen: &mut std::collections::BTreeSet<SceneId>,
+            output: &mut Vec<TranscludedPassage>,
+        ) -> Result<()> {
+            if !seen.insert(scene) {
+                return Err(StorageError::Invalid(
+                    "transclusion cycle encountered during rendering".into(),
+                ));
+            }
+            output.push(TranscludedPassage {
+                scene_id: scene,
+                text: store.load_text(scene)?.0,
+                depth,
+            });
+            let mut q=store.conn.prepare("SELECT target_id FROM story_link WHERE source_kind='scene' AND source_id=?1 AND target_kind='scene' AND link_kind IN('transcludes','includes') ORDER BY created_at,id")?;
+            let targets = q
+                .query_map([scene.to_string()], |r| r.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for target in targets {
+                let id = SceneId(
+                    Uuid::parse_str(&target).map_err(|e| StorageError::Invalid(e.to_string()))?,
+                );
+                visit(store, id, depth + 1, seen, output)?;
+            }
+            seen.remove(&scene);
+            Ok(())
+        }
+        let mut result = Vec::new();
+        visit(
+            self,
+            root,
+            0,
+            &mut std::collections::BTreeSet::new(),
+            &mut result,
+        )?;
+        Ok(result)
+    }
+    pub fn backlinks(&self, target: EntityRef) -> Result<Vec<StoryLink>> {
+        let mut q = self.conn.prepare("SELECT id,source_kind,source_id,source_anchor_id,target_kind,target_id,target_anchor_id,link_kind,label FROM story_link WHERE target_kind=?1 AND target_id=?2 ORDER BY created_at,id")?;
+        let rows = q.query_map(params![target.kind(), target.id()], read_story_link)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+    pub fn outgoing_links(&self, source: EntityRef) -> Result<Vec<StoryLink>> {
+        let mut q = self.conn.prepare("SELECT id,source_kind,source_id,source_anchor_id,target_kind,target_id,target_anchor_id,link_kind,label FROM story_link WHERE source_kind=?1 AND source_id=?2 ORDER BY created_at,id")?;
+        let rows = q.query_map(params![source.kind(), source.id()], read_story_link)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+    pub fn broken_links(&self) -> Result<Vec<BrokenLink>> {
+        let mut q = self.conn.prepare("SELECT l.id,CASE WHEN (l.source_kind='scene' AND NOT EXISTS(SELECT 1 FROM scene WHERE id=l.source_id)) OR (l.source_kind='character' AND NOT EXISTS(SELECT 1 FROM character WHERE id=l.source_id)) OR (l.source_kind='plotline' AND NOT EXISTS(SELECT 1 FROM plotline WHERE id=l.source_id)) OR (l.source_kind='research' AND NOT EXISTS(SELECT 1 FROM research_item WHERE id=l.source_id)) THEN 'missing source' WHEN (l.target_kind='scene' AND NOT EXISTS(SELECT 1 FROM scene WHERE id=l.target_id)) OR (l.target_kind='character' AND NOT EXISTS(SELECT 1 FROM character WHERE id=l.target_id)) OR (l.target_kind='plotline' AND NOT EXISTS(SELECT 1 FROM plotline WHERE id=l.target_id)) OR (l.target_kind='research' AND NOT EXISTS(SELECT 1 FROM research_item WHERE id=l.target_id)) THEN 'missing target' ELSE 'missing passage anchor' END FROM story_link l WHERE (l.source_kind='scene' AND NOT EXISTS(SELECT 1 FROM scene WHERE id=l.source_id)) OR (l.source_kind='character' AND NOT EXISTS(SELECT 1 FROM character WHERE id=l.source_id)) OR (l.source_kind='plotline' AND NOT EXISTS(SELECT 1 FROM plotline WHERE id=l.source_id)) OR (l.source_kind='research' AND NOT EXISTS(SELECT 1 FROM research_item WHERE id=l.source_id)) OR (l.target_kind='scene' AND NOT EXISTS(SELECT 1 FROM scene WHERE id=l.target_id)) OR (l.target_kind='character' AND NOT EXISTS(SELECT 1 FROM character WHERE id=l.target_id)) OR (l.target_kind='plotline' AND NOT EXISTS(SELECT 1 FROM plotline WHERE id=l.target_id)) OR (l.target_kind='research' AND NOT EXISTS(SELECT 1 FROM research_item WHERE id=l.target_id)) OR (l.source_anchor_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM passage_anchor WHERE id=l.source_anchor_id)) OR (l.target_anchor_id IS NOT NULL AND NOT EXISTS(SELECT 1 FROM passage_anchor WHERE id=l.target_anchor_id)) ORDER BY l.id")?;
+        let rows = q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        rows.map(|row| {
+            let (id, reason) = row?;
+            Ok::<BrokenLink, rusqlite::Error>(BrokenLink {
+                link_id: LinkId(Uuid::parse_str(&id).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                reason,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
+    pub fn save_scene_query(&mut self, query: &SavedSceneQuery) -> Result<()> {
+        if query.name.trim().is_empty() {
+            return Err(StorageError::Invalid(
+                "saved query name cannot be empty".into(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("INSERT INTO saved_query(id,name,description,created_at,updated_at) VALUES(?1,?2,?3,?4,?4) ON CONFLICT(id) DO UPDATE SET name=excluded.name,description=excluded.description,updated_at=excluded.updated_at",params![query.id.to_string(),query.name,query.description,now()])?;
+        tx.execute(
+            "DELETE FROM saved_query_filter WHERE query_id=?1",
+            [query.id.to_string()],
+        )?;
+        for (index, filter) in query.filters.iter().enumerate() {
+            let (kind, value) = match filter {
+                SceneQueryFilter::Status(status) => ("status", status.as_str().to_owned()),
+                SceneQueryFilter::Character(id) => ("character", id.to_string()),
+                SceneQueryFilter::Plotline(id) => ("plotline", id.to_string()),
+                SceneQueryFilter::TimeBefore(tick) => ("time_before", tick.to_string()),
+                SceneQueryFilter::TimeAfter(tick) => ("time_after", tick.to_string()),
+                SceneQueryFilter::UnresolvedIssue => ("unresolved_issue", "1".into()),
+            };
+            tx.execute("INSERT INTO saved_query_filter(query_id,ordinal,filter_kind,value) VALUES(?1,?2,?3,?4)",params![query.id.to_string(),index as i64,kind,value])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn run_scene_query(&self, query: QueryId) -> Result<Vec<SceneId>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT filter_kind,value FROM saved_query_filter WHERE query_id=?1 ORDER BY ordinal",
+        )?;
+        let filters = stmt
+            .query_map([query.to_string()], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut sql = String::from(
+            "WITH RECURSIVE node_order(id,path) AS (SELECT id,printf('%010d/',position) FROM structural_node WHERE parent_id IS NULL UNION ALL SELECT n.id,o.path||printf('%010d/',n.position) FROM structural_node n JOIN node_order o ON n.parent_id=o.id) SELECT s.id FROM scene s LEFT JOIN scene_placement p ON p.scene_id=s.id LEFT JOIN node_order n ON n.id=p.chapter_id WHERE s.archived=0",
+        );
+        let mut values: Vec<String> = Vec::new();
+        for (kind, value) in filters {
+            match kind.as_str() {
+                "status" => { sql.push_str(" AND s.status=?"); values.push(value); }
+                "character" => { sql.push_str(" AND EXISTS(SELECT 1 FROM scene_character sc WHERE sc.scene_id=s.id AND sc.character_id=?)"); values.push(value); }
+                "plotline" => { sql.push_str(" AND EXISTS(SELECT 1 FROM scene_plotline sp WHERE sp.scene_id=s.id AND sp.plotline_id=?)"); values.push(value); }
+                "time_before" => { sql.push_str(" AND s.start_nominal IS NOT NULL AND s.start_nominal<?"); values.push(value); }
+                "time_after" => { sql.push_str(" AND s.start_nominal IS NOT NULL AND s.start_nominal>?"); values.push(value); }
+                "unresolved_issue" => sql.push_str(" AND EXISTS(SELECT 1 FROM scene_issue si JOIN story_issue i ON i.id=si.issue_id WHERE si.scene_id=s.id AND i.status IN('open','in_progress'))"),
+                _ => return Err(StorageError::Invalid(format!("unknown saved query filter: {kind}"))),
+            }
+        }
+        sql.push_str(" ORDER BY n.path,p.position,s.id");
+        let mut q = self.conn.prepare(&sql)?;
+        let refs: Vec<&dyn rusqlite::ToSql> =
+            values.iter().map(|v| v as &dyn rusqlite::ToSql).collect();
+        let ids = q
+            .query_map(refs.as_slice(), |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                Uuid::parse_str(&id)
+                    .map(SceneId)
+                    .map_err(|e| StorageError::Invalid(e.to_string()))
+            })
+            .collect()
+    }
+    pub fn search_scenes(&self, terms: &str) -> Result<Vec<SceneId>> {
+        if terms.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut q=self.conn.prepare("SELECT scene_id FROM scene_fts WHERE scene_fts MATCH ?1 ORDER BY bm25(scene_fts),scene_id")?;
+        let ids = q
+            .query_map([terms], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                Uuid::parse_str(&id)
+                    .map(SceneId)
+                    .map_err(|e| StorageError::Invalid(e.to_string()))
+            })
+            .collect()
+    }
+    fn rebuild_scene_index(&mut self) -> Result<()> {
+        let ids: Vec<String> = {
+            let mut q = self
+                .conn
+                .prepare("SELECT scene_id FROM scene_search_content ORDER BY scene_id")?;
+            q.query_map([], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for id in ids {
+            let scene =
+                SceneId(Uuid::parse_str(&id).map_err(|e| StorageError::Invalid(e.to_string()))?);
+            let text = fs::read_to_string(self.safe_path(&self.content_path(scene)?)?)?;
+            update_scene_index(&self.conn, scene, &text)?;
+        }
         Ok(())
     }
     pub fn define_custom_field(&mut self, def: &CustomFieldDefinition) -> Result<()> {
@@ -1623,6 +1879,70 @@ fn configure(c: &Connection) -> Result<()> {
     c.pragma_update(None, "journal_mode", "WAL")?;
     c.pragma_update(None, "synchronous", "FULL")?;
     c.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(())
+}
+
+fn read_story_link(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoryLink> {
+    let id: String = row.get(0)?;
+    let source_kind: String = row.get(1)?;
+    let source_id: String = row.get(2)?;
+    let source_anchor: Option<String> = row.get(3)?;
+    let target_kind: String = row.get(4)?;
+    let target_id: String = row.get(5)?;
+    let target_anchor: Option<String> = row.get(6)?;
+    let kind: String = row.get(7)?;
+    let uuid = |s: String| {
+        Uuid::parse_str(&s).map_err(|e| {
+            rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+        })
+    };
+    let entity = |kind: &str, value: String| -> rusqlite::Result<EntityRef> {
+        let id = uuid(value)?;
+        match kind {
+            "scene" => Ok(EntityRef::Scene(SceneId(id))),
+            "character" => Ok(EntityRef::Character(CharacterId(id))),
+            "plotline" => Ok(EntityRef::Plotline(PlotlineId(id))),
+            "research" => Ok(EntityRef::Research(ResearchId(id))),
+            _ => Err(rusqlite::Error::InvalidQuery),
+        }
+    };
+    let anchor = |value: Option<String>| -> rusqlite::Result<Option<AnchorId>> {
+        value.map(|s| uuid(s).map(AnchorId)).transpose()
+    };
+    let link_kind = match kind.as_str() {
+        "related" => LinkKind::Related,
+        "cites" => LinkKind::Cites,
+        "transcludes" => LinkKind::Transcludes,
+        "includes" => LinkKind::Includes,
+        "navigates" => LinkKind::Navigates,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(StoryLink {
+        id: LinkId(uuid(id)?),
+        source: entity(&source_kind, source_id)?,
+        source_anchor: anchor(source_anchor)?,
+        target: entity(&target_kind, target_id)?,
+        target_anchor: anchor(target_anchor)?,
+        kind: link_kind,
+        label: row.get(8)?,
+    })
+}
+
+fn update_scene_index(conn: &Connection, scene: SceneId, text: &str) -> Result<()> {
+    let (title, synopsis): (String, String) = conn.query_row(
+        "SELECT title,synopsis FROM scene WHERE id=?1",
+        [scene.to_string()],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    conn.execute("INSERT INTO scene_search_content(scene_id,content) VALUES(?1,?2) ON CONFLICT(scene_id) DO UPDATE SET content=excluded.content", params![scene.to_string(), text])?;
+    conn.execute(
+        "DELETE FROM scene_fts WHERE scene_id=?1",
+        [scene.to_string()],
+    )?;
+    conn.execute(
+        "INSERT INTO scene_fts(scene_id,title,synopsis,content) VALUES(?1,?2,?3,?4)",
+        params![scene.to_string(), title, synopsis, text],
+    )?;
     Ok(())
 }
 fn now() -> String {
@@ -1870,6 +2190,165 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     #[test]
+    fn links_anchors_backlinks_and_transclusion_cycles_are_integrity_checked() {
+        let d = tempdir().unwrap();
+        let mut st = ProjectStore::create(d.path().join("N"), "Novel").unwrap();
+        let chapter = st
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let a = st.create_scene(chapter, 0, "A").unwrap();
+        let b = st.create_scene(chapter, 1, "B").unwrap();
+        let other_chapter = st.create_node(None, NodeKind::Chapter, "Later", 1).unwrap();
+        let (_, hash) = st.load_text(a).unwrap();
+        st.save_text(a, Some(&hash), "Mara opened the red door.")
+            .unwrap();
+        let anchor = st.create_anchor(a, 0, 5, "Mara ", "", "opened").unwrap();
+        let link = StoryLink {
+            id: LinkId::new(),
+            source: EntityRef::Scene(a),
+            source_anchor: Some(anchor),
+            target: EntityRef::Scene(b),
+            target_anchor: None,
+            kind: LinkKind::Cites,
+            label: "consequence".into(),
+        };
+        st.create_story_link(&link).unwrap();
+        assert_eq!(st.backlinks(EntityRef::Scene(b)).unwrap()[0].id, link.id);
+        let cycle = StoryLink {
+            id: LinkId::new(),
+            source: EntityRef::Scene(b),
+            source_anchor: None,
+            target: EntityRef::Scene(a),
+            target_anchor: None,
+            kind: LinkKind::Transcludes,
+            label: String::new(),
+        };
+        st.create_story_link(&cycle).unwrap();
+        assert_eq!(
+            st.expand_scene_transclusions(b)
+                .unwrap()
+                .iter()
+                .map(|p| p.scene_id)
+                .collect::<Vec<_>>(),
+            vec![b, a]
+        );
+        let reverse = StoryLink {
+            id: LinkId::new(),
+            source: EntityRef::Scene(a),
+            source_anchor: None,
+            target: EntityRef::Scene(b),
+            target_anchor: None,
+            kind: LinkKind::Includes,
+            label: String::new(),
+        };
+        assert!(st.create_story_link(&reverse).is_err());
+        assert!(st.broken_links().unwrap().is_empty());
+        st.move_scene(b, other_chapter, 0).unwrap();
+        let renamed = Scene {
+            title: "Renamed B".into(),
+            ..st.get_scene(b).unwrap().scene
+        };
+        st.update_scene(&renamed).unwrap();
+        assert_eq!(st.backlinks(EntityRef::Scene(b)).unwrap()[0].id, link.id);
+        let character = CharacterId::new();
+        st.add_character(character, "Soon deleted").unwrap();
+        let dangling = StoryLink {
+            id: LinkId::new(),
+            source: EntityRef::Scene(a),
+            source_anchor: None,
+            target: EntityRef::Character(character),
+            target_anchor: None,
+            kind: LinkKind::Related,
+            label: String::new(),
+        };
+        st.create_story_link(&dangling).unwrap();
+        st.conn
+            .execute("DELETE FROM character WHERE id=?1", [character.to_string()])
+            .unwrap();
+        assert!(
+            st.broken_links()
+                .unwrap()
+                .iter()
+                .any(|broken| broken.link_id == dangling.id)
+        );
+        let bad: rusqlite::Result<usize> = st.conn.execute("INSERT INTO story_link(id,source_kind,source_id,target_kind,target_id,link_kind,created_at) VALUES('x','scene',?1,'scene','missing','related','now')", [a.to_string()]);
+        assert!(bad.is_err());
+    }
+
+    #[test]
+    fn saved_queries_refresh_and_preserve_manuscript_order() {
+        let d = tempdir().unwrap();
+        let mut st = ProjectStore::create(d.path().join("N"), "Novel").unwrap();
+        let chapter = st
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let first = st.create_scene(chapter, 0, "First").unwrap();
+        let second = st.create_scene(chapter, 1, "Second").unwrap();
+        let character = CharacterId::new();
+        st.add_character(character, "Mara").unwrap();
+        st.link_character(second, character, ParticipationRole::Pov)
+            .unwrap();
+        let query = SavedSceneQuery {
+            id: QueryId::new(),
+            name: "Mara scenes".into(),
+            description: String::new(),
+            filters: vec![SceneQueryFilter::Character(character)],
+        };
+        st.save_scene_query(&query).unwrap();
+        assert_eq!(st.run_scene_query(query.id).unwrap(), vec![second]);
+        st.link_character(first, character, ParticipationRole::Minor)
+            .unwrap();
+        assert_eq!(st.run_scene_query(query.id).unwrap(), vec![first, second]);
+        let order = query_scene_ids(&st.conn, &chapter.to_string()).unwrap();
+        assert_eq!(order, vec![first.to_string(), second.to_string()]);
+    }
+
+    #[test]
+    fn full_text_search_tracks_scenes_and_metadata() {
+        let d = tempdir().unwrap();
+        let mut st = ProjectStore::create(d.path().join("N"), "Novel").unwrap();
+        let chapter = st
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = st.create_scene(chapter, 0, "The Brass Key").unwrap();
+        let (_, hash) = st.load_text(scene).unwrap();
+        st.save_text(scene, Some(&hash), "Mara discovers the brass key.")
+            .unwrap();
+        assert_eq!(st.search_scenes("brass").unwrap(), vec![scene]);
+        st.update_scene(&Scene {
+            title: "Moonlit Door".into(),
+            ..st.get_scene(scene).unwrap().scene
+        })
+        .unwrap();
+        assert_eq!(st.search_scenes("moonlit").unwrap(), vec![scene]);
+        assert!(st.search_scenes("brass").unwrap().contains(&scene));
+    }
+
+    #[test]
+    fn version_one_projects_migrate_and_rebuild_text_index() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("N");
+        let mut st = ProjectStore::create(&project, "Novel").unwrap();
+        let chapter = st.create_node(None, NodeKind::Chapter, "Ch", 0).unwrap();
+        let scene = st.create_scene(chapter, 0, "Old title").unwrap();
+        let (_, hash) = st.load_text(scene).unwrap();
+        st.save_text(scene, Some(&hash), "An obsidian compass points north.")
+            .unwrap();
+        drop(st);
+        let conn = Connection::open(project.join("story.db")).unwrap();
+        conn.execute_batch("DROP TRIGGER scene_fts_insert; DROP TRIGGER scene_fts_update; DROP TRIGGER scene_fts_delete; DROP TABLE story_link; DROP TABLE passage_anchor; DROP TABLE saved_query_filter; DROP TABLE saved_query; DROP TABLE scene_issue; DROP TABLE story_issue; DROP TABLE scene_fts; DROP TABLE scene_search_content; DROP TABLE research_item; DELETE FROM schema_migrations WHERE version=2;").unwrap();
+        drop(conn);
+        let st = ProjectStore::open(&project).unwrap();
+        assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
+        let version: i64 = st
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 2);
+    }
+    #[test]
     fn create_reopen_relocate_and_save_scene() {
         let d = tempdir().unwrap();
         let p = d.path().join("N");
@@ -1970,7 +2449,10 @@ mod tests {
         let p = d.path().join("N");
         let s = ProjectStore::create(&p, "N").unwrap();
         s.conn
-            .execute("UPDATE schema_migrations SET version=99", [])
+            .execute(
+                "UPDATE schema_migrations SET version=99 WHERE version=2",
+                [],
+            )
             .unwrap();
         drop(s);
         assert!(matches!(

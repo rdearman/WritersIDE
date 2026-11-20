@@ -4,6 +4,8 @@ Writer's IDE is an early Rust implementation of the scene-centred novel planning
 
 The current workspace contains a reusable story core, SQLite and manuscript storage, application services, a synthetic import inventory/mapping interface, and a small CLI. It does not yet include the terminal editor or real Scrivener/Ranperen adapters.
 
+The current link/query slice adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked scene inclusion, live saved scene queries, and FTS5 scene search. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.3](docs/engineering-design-v0.3.md). The full-screen terminal application and reading workspace remain planned implementation slices.
+
 ## Build and verify
 
 ```sh
@@ -25,6 +27,12 @@ writers-ide show <path> <scene-uuid>
 writers-ide write <path> <scene-uuid> <text>
 writers-ide resolve <path> <transaction-uuid> external|prepared
 writers-ide backup <path> <destination>
+writers-ide search <path> <terms>
+writers-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...
+writers-ide query-run <path> <query-uuid>
+writers-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <link-kind> [label]
+writers-ide backlinks <path> <entity-kind> <entity-id>
+writers-ide broken-links <path>
 ```
 
 Each project is a directory containing one `story.db`, `project.toml`, portable Markdown files under `manuscript/`, and application recovery data under `.writers-ide/recovery/`. Close the project before copying it manually; use `backup` for a consistent application-managed copy.
