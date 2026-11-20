@@ -35,6 +35,8 @@ writers-ide backlinks <path> <entity-kind> <entity-id>
 writers-ide broken-links <path>
 ```
 
+The current terminal prototype is launched with `cargo run -p writers-ide-terminal -- <project-path>`. It uses a full-screen Ratatui/Crossterm alternate screen; F1–F12 switch workspaces, `/` searches, `:` opens the command palette, Enter opens the selected scene, and Ctrl-S saves manuscript text.
+
 Each project is a directory containing one `story.db`, `project.toml`, portable Markdown files under `manuscript/`, and application recovery data under `.writers-ide/recovery/`. Close the project before copying it manually; use `backup` for a consistent application-managed copy.
 
 The SRS and engineering design are the product baselines. The SRS was supplied in the project brief and is not yet present as a repository file. No Ranperen spreadsheets or Scrivener fixtures are present, so importer compatibility has not been claimed.

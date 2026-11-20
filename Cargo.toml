@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/story-core", "crates/story-storage", "crates/story-app", "crates/story-import", "apps/cli"]
+members = ["crates/story-core", "crates/story-storage", "crates/story-app", "crates/story-import", "apps/cli", "apps/terminal"]
 
 [workspace.package]
 edition = "2024"
@@ -15,3 +15,5 @@ thiserror = "2.0"
 sha2 = "0.10"
 rusqlite = { version = "0.37", features = ["bundled", "backup"] }
 tempfile = "3.23"
+ratatui = "0.29"
+crossterm = "0.28"

@@ -76,6 +76,39 @@ pub struct TranscludedPassage {
     pub text: String,
     pub depth: usize,
 }
+#[derive(Clone, Debug)]
+pub struct CharacterSummary {
+    pub id: CharacterId,
+    pub name: String,
+    pub scene_count: u32,
+}
+#[derive(Clone, Debug)]
+pub struct PlotlineSummary {
+    pub id: PlotlineId,
+    pub name: String,
+    pub scene_count: u32,
+}
+#[derive(Clone, Debug)]
+pub struct EventSummary {
+    pub id: EventId,
+    pub title: String,
+    pub nominal_time: Option<i64>,
+    pub source_time: String,
+}
+#[derive(Clone, Debug)]
+pub struct ResearchSummary {
+    pub id: ResearchId,
+    pub title: String,
+    pub media_type: String,
+    pub source_path: Option<String>,
+}
+#[derive(Clone, Debug)]
+pub struct IssueSummary {
+    pub id: IssueId,
+    pub title: String,
+    pub status: String,
+    pub scene_count: u32,
+}
 type CustomDefaultRow = (
     String,
     String,
@@ -656,6 +689,22 @@ impl ProjectStore {
             actual_words: actual,
             content_hash: row.21,
         })
+    }
+    pub fn list_scenes(&self, include_archived: bool) -> Result<Vec<SceneRecord>> {
+        let sql = "WITH RECURSIVE node_order(id,path) AS (SELECT id,printf('%010d/',position) FROM structural_node WHERE parent_id IS NULL UNION ALL SELECT n.id,o.path||printf('%010d/',n.position) FROM structural_node n JOIN node_order o ON n.parent_id=o.id) SELECT s.id FROM scene s LEFT JOIN scene_placement p ON p.scene_id=s.id LEFT JOIN node_order n ON n.id=p.chapter_id WHERE (?1=1 OR s.archived=0) ORDER BY n.path,p.position,s.id";
+        let ids: Vec<String> = {
+            let mut q = self.conn.prepare(sql)?;
+            q.query_map([include_archived], |r| r.get(0))?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        ids.into_iter()
+            .map(|id| {
+                let id = SceneId(
+                    Uuid::parse_str(&id).map_err(|e| StorageError::Invalid(e.to_string()))?,
+                );
+                self.get_scene(id)
+            })
+            .collect()
     }
     pub fn update_scene(&mut self, scene: &Scene) -> Result<()> {
         StoryTime::new(
@@ -1292,12 +1341,64 @@ impl ProjectStore {
         )?;
         Ok(())
     }
+    pub fn list_characters(&self) -> Result<Vec<CharacterSummary>> {
+        let mut q=self.conn.prepare("SELECT c.id,c.name,COUNT(DISTINCT sc.scene_id) FROM character c LEFT JOIN scene_character sc ON sc.character_id=c.id GROUP BY c.id,c.name ORDER BY c.name COLLATE NOCASE,c.id")?;
+        let rows = q.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, u32>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, name, scene_count) = row?;
+            Ok::<CharacterSummary, rusqlite::Error>(CharacterSummary {
+                id: CharacterId(Uuid::parse_str(&id).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                name,
+                scene_count,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
     pub fn add_plotline(&mut self, id: PlotlineId, name: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO plotline VALUES(?1,?2)",
             params![id.to_string(), name],
         )?;
         Ok(())
+    }
+    pub fn list_plotlines(&self) -> Result<Vec<PlotlineSummary>> {
+        let mut q=self.conn.prepare("SELECT p.id,p.name,COUNT(DISTINCT sp.scene_id) FROM plotline p LEFT JOIN scene_plotline sp ON sp.plotline_id=p.id GROUP BY p.id,p.name ORDER BY p.name COLLATE NOCASE,p.id")?;
+        let rows = q.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, u32>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, name, scene_count) = row?;
+            Ok::<PlotlineSummary, rusqlite::Error>(PlotlineSummary {
+                id: PlotlineId(Uuid::parse_str(&id).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                name,
+                scene_count,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
     }
     pub fn link_character(
         &mut self,
@@ -1432,6 +1533,34 @@ impl ProjectStore {
         self.conn.execute("INSERT INTO story_event(id,title,description,time_nominal,time_lower,time_upper,time_precision,end_nominal,end_lower,end_upper,end_precision,source_time_text) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![event.id.to_string(),event.title,event.description,event.start.nominal,event.start.lower,event.start.upper,precision(event.start.precision),event.end.nominal,event.end.lower,event.end.upper,precision(event.end.precision),event.source_time_text])?;
         Ok(())
     }
+    pub fn list_events(&self) -> Result<Vec<EventSummary>> {
+        let mut q=self.conn.prepare("SELECT id,title,time_nominal,source_time_text FROM story_event ORDER BY time_nominal IS NULL,time_nominal,id")?;
+        let rows = q.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, Option<i64>>(2)?,
+                r.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, title, nominal_time, source_time) = row?;
+            Ok::<EventSummary, rusqlite::Error>(EventSummary {
+                id: EventId(Uuid::parse_str(&id).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                title,
+                nominal_time,
+                source_time,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
     pub fn link_event(&mut self, scene: SceneId, event: EventId, kind: &str) -> Result<()> {
         self.conn.execute(
             "INSERT INTO scene_event(scene_id,event_id,relationship_kind) VALUES(?1,?2,?3)",
@@ -1492,6 +1621,77 @@ impl ProjectStore {
         let id = ResearchId::new();
         self.conn.execute("INSERT INTO research_item(id,title,body,media_type,source_path,source_sha256,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?7)",params![id.to_string(),title,body,media_type,source_path,source_sha256,now()])?;
         Ok(id)
+    }
+    pub fn list_research_items(&self) -> Result<Vec<ResearchSummary>> {
+        let mut q=self.conn.prepare("SELECT id,title,media_type,source_path FROM research_item ORDER BY title COLLATE NOCASE,id")?;
+        let rows = q.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, title, media_type, source_path) = row?;
+            Ok::<ResearchSummary, rusqlite::Error>(ResearchSummary {
+                id: ResearchId(Uuid::parse_str(&id).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                title,
+                media_type,
+                source_path,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
+    pub fn create_issue(&mut self, title: &str) -> Result<IssueId> {
+        let id = IssueId::new();
+        self.conn.execute(
+            "INSERT INTO story_issue(id,title,created_at,updated_at) VALUES(?1,?2,?3,?3)",
+            params![id.to_string(), title, now()],
+        )?;
+        Ok(id)
+    }
+    pub fn link_issue(&mut self, scene: SceneId, issue: IssueId) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO scene_issue(scene_id,issue_id) VALUES(?1,?2)",
+            params![scene.to_string(), issue.to_string()],
+        )?;
+        Ok(())
+    }
+    pub fn list_issues(&self) -> Result<Vec<IssueSummary>> {
+        let mut q=self.conn.prepare("SELECT i.id,i.title,i.status,COUNT(DISTINCT si.scene_id) FROM story_issue i LEFT JOIN scene_issue si ON si.issue_id=i.id GROUP BY i.id,i.title,i.status ORDER BY CASE i.status WHEN 'open' THEN 0 WHEN 'in_progress' THEN 1 WHEN 'deferred' THEN 2 WHEN 'resolved' THEN 3 ELSE 4 END,i.created_at")?;
+        let rows = q.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, u32>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, title, status, scene_count) = row?;
+            Ok::<IssueSummary, rusqlite::Error>(IssueSummary {
+                id: IssueId(Uuid::parse_str(&id).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                title,
+                status,
+                scene_count,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
     }
     pub fn expand_scene_transclusions(&self, root: SceneId) -> Result<Vec<TranscludedPassage>> {
         fn visit(

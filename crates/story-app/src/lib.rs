@@ -66,6 +66,9 @@ impl WriterApp {
     pub fn get_scene(&self, id: SceneId) -> Result<SceneRecord> {
         Ok(self.store.get_scene(id)?)
     }
+    pub fn list_scenes(&self, include_archived: bool) -> Result<Vec<SceneRecord>> {
+        Ok(self.store.list_scenes(include_archived)?)
+    }
     pub fn update_scene_metadata(&mut self, scene: &Scene) -> Result<()> {
         Ok(self.store.update_scene(scene)?)
     }
@@ -131,6 +134,39 @@ impl WriterApp {
     }
     pub fn create_story_link(&mut self, link: &StoryLink) -> Result<()> {
         Ok(self.store.create_story_link(link)?)
+    }
+    pub fn create_research_item(
+        &mut self,
+        title: &str,
+        body: &str,
+        media_type: &str,
+        source_path: Option<&str>,
+        source_hash: Option<&str>,
+    ) -> Result<ResearchId> {
+        Ok(self
+            .store
+            .create_research_item(title, body, media_type, source_path, source_hash)?)
+    }
+    pub fn list_research_items(&self) -> Result<Vec<story_storage::ResearchSummary>> {
+        Ok(self.store.list_research_items()?)
+    }
+    pub fn create_issue(&mut self, title: &str) -> Result<IssueId> {
+        Ok(self.store.create_issue(title)?)
+    }
+    pub fn link_issue(&mut self, scene: SceneId, issue: IssueId) -> Result<()> {
+        Ok(self.store.link_issue(scene, issue)?)
+    }
+    pub fn list_issues(&self) -> Result<Vec<story_storage::IssueSummary>> {
+        Ok(self.store.list_issues()?)
+    }
+    pub fn list_characters(&self) -> Result<Vec<story_storage::CharacterSummary>> {
+        Ok(self.store.list_characters()?)
+    }
+    pub fn list_plotlines(&self) -> Result<Vec<story_storage::PlotlineSummary>> {
+        Ok(self.store.list_plotlines()?)
+    }
+    pub fn list_events(&self) -> Result<Vec<story_storage::EventSummary>> {
+        Ok(self.store.list_events()?)
     }
     pub fn backlinks(&self, target: EntityRef) -> Result<Vec<StoryLink>> {
         Ok(self.store.backlinks(target)?)
