@@ -491,6 +491,48 @@ impl AppState {
                     .find(|w| w.title().eq_ignore_ascii_case(rest))
                     .ok_or("unknown workspace")?,
             );
+        } else if cmd == "query-list" {
+            self.message = self
+                .app
+                .list_saved_queries()?
+                .into_iter()
+                .map(|query| format!("{} {}", query.id, query.name))
+                .collect::<Vec<_>>()
+                .join(" · ");
+        } else if let Some(rest) = cmd.strip_prefix("query-save ") {
+            let mut parts = rest.split_whitespace();
+            let name = parts
+                .next()
+                .ok_or("use query-save <name> [key=value ...]")?;
+            let mut filters = Vec::new();
+            for filter in parts {
+                let (key, value) = filter
+                    .split_once('=')
+                    .ok_or("query filters use key=value")?;
+                filters.push(match key {
+                    "status" => story_core::SceneQueryFilter::Status(parse_terminal_status(value)?),
+                    "character" => story_core::SceneQueryFilter::Character(
+                        story_core::CharacterId(value.parse()?),
+                    ),
+                    "plotline" => story_core::SceneQueryFilter::Plotline(story_core::PlotlineId(
+                        value.parse()?,
+                    )),
+                    "before" => story_core::SceneQueryFilter::TimeBefore(value.parse()?),
+                    "after" => story_core::SceneQueryFilter::TimeAfter(value.parse()?),
+                    "issue" if value == "unresolved" => {
+                        story_core::SceneQueryFilter::UnresolvedIssue
+                    }
+                    _ => return Err(format!("unsupported query filter: {filter}").into()),
+                });
+            }
+            let query = story_core::SavedSceneQuery {
+                id: story_core::QueryId::new(),
+                name: name.into(),
+                description: String::new(),
+                filters,
+            };
+            self.app.save_scene_query(&query)?;
+            self.message = format!("Saved query {} ({})", query.name, query.id);
         } else if let Some(rest) = cmd.strip_prefix("query ") {
             let id = story_core::QueryId(rest.parse()?);
             let found = self.app.run_scene_query(id)?;
@@ -507,7 +549,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: open UUID | workspace NAME | query UUID | process | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | help".into();
+            self.message = "Commands: open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | process | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | help".into();
         }
         Ok(())
     }
@@ -1069,6 +1111,19 @@ fn parse_entity(kind: &str, id: &str) -> Result<story_core::EntityRef, Box<dyn s
         _ => return Err(format!("unknown entity kind: {kind}").into()),
     })
 }
+fn parse_terminal_status(value: &str) -> Result<SceneStatus, Box<dyn std::error::Error>> {
+    Ok(match value {
+        "idea" => SceneStatus::Idea,
+        "outlined" => SceneStatus::Outlined,
+        "ready_to_draft" => SceneStatus::ReadyToDraft,
+        "drafting" => SceneStatus::Drafting,
+        "draft_complete" => SceneStatus::DraftComplete,
+        "revising" => SceneStatus::Revising,
+        "complete" => SceneStatus::Complete,
+        "archived" => SceneStatus::Archived,
+        _ => return Err(format!("unknown scene status: {value}").into()),
+    })
+}
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
     if s.mode.is_some() {
         match k.code {
@@ -1310,6 +1365,14 @@ mod tests {
         assert_eq!(state.app.load_scene_text(first).unwrap().0, "A");
         assert_eq!(state.app.load_scene_text(second).unwrap().0, "");
         assert!(!state.dirty);
+        state.mode = Some(':');
+        state.prompt = "query-save ideas status=idea".into();
+        state.command().unwrap();
+        assert_eq!(state.app.list_saved_queries().unwrap()[0].name, "ideas");
+        state.mode = Some(':');
+        state.prompt = "query-list".into();
+        state.command().unwrap();
+        assert!(state.message.contains("ideas"));
     }
 
     #[test]

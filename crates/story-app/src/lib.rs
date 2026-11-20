@@ -396,6 +396,9 @@ impl WriterApp {
     pub fn save_scene_query(&mut self, query: &SavedSceneQuery) -> Result<()> {
         Ok(self.store.save_scene_query(query)?)
     }
+    pub fn list_saved_queries(&self) -> Result<Vec<story_storage::SavedQuerySummary>> {
+        Ok(self.store.list_saved_queries()?)
+    }
     pub fn run_scene_query(&self, query: QueryId) -> Result<Vec<SceneId>> {
         Ok(self.store.run_scene_query(query)?)
     }

@@ -91,6 +91,11 @@ pub struct PlotlineSummary {
     pub scene_count: u32,
 }
 #[derive(Clone, Debug)]
+pub struct SavedQuerySummary {
+    pub id: QueryId,
+    pub name: String,
+}
+#[derive(Clone, Debug)]
 pub struct EventSummary {
     pub id: EventId,
     pub title: String,
@@ -2390,6 +2395,29 @@ impl ProjectStore {
         tx.commit()?;
         Ok(())
     }
+    pub fn list_saved_queries(&self) -> Result<Vec<SavedQuerySummary>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id,name FROM saved_query ORDER BY name COLLATE NOCASE,id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (id, name) = row?;
+            Ok(SavedQuerySummary {
+                id: QueryId(Uuid::parse_str(&id).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?),
+                name,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+        .map_err(StorageError::from)
+    }
     pub fn run_scene_query(&self, query: QueryId) -> Result<Vec<SceneId>> {
         let mut stmt = self.conn.prepare(
             "SELECT filter_kind,value FROM saved_query_filter WHERE query_id=?1 ORDER BY ordinal",
@@ -3172,6 +3200,7 @@ mod tests {
             filters: vec![SceneQueryFilter::Character(character)],
         };
         st.save_scene_query(&query).unwrap();
+        assert_eq!(st.list_saved_queries().unwrap()[0].name, "Mara scenes");
         assert_eq!(st.run_scene_query(query.id).unwrap(), vec![second]);
         st.link_character(first, character, ParticipationRole::Minor)
             .unwrap();
