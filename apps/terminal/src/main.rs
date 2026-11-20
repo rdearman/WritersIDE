@@ -732,7 +732,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     ]))
     .block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(head, rows[0]);
-    let body = if s.width < 100 {
+    let body = if pane_direction(s.width) == Direction::Vertical {
         Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
@@ -873,6 +873,13 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         Paragraph::new(footer).block(Block::default().borders(Borders::TOP)),
         rows[2],
     );
+}
+fn pane_direction(width: usize) -> Direction {
+    if width < 100 {
+        Direction::Vertical
+    } else {
+        Direction::Horizontal
+    }
 }
 fn workspace_items(s: &AppState) -> Vec<String> {
     match s.workspace {
@@ -1246,6 +1253,13 @@ mod tests {
         assert_eq!(bindings[3], (4, Workspace::Reading));
         assert_eq!(bindings[1].1, Workspace::Outline);
     }
+
+    #[test]
+    fn narrow_terminal_switches_split_panes_to_stacked_layout() {
+        assert_eq!(pane_direction(80), Direction::Vertical);
+        assert_eq!(pane_direction(99), Direction::Vertical);
+        assert_eq!(pane_direction(100), Direction::Horizontal);
+    }
     use crossterm::event::KeyModifiers;
 
     #[test]
@@ -1333,5 +1347,62 @@ mod tests {
             .unwrap()
         );
         assert_eq!(state.workspace, Workspace::Dashboard);
+    }
+
+    #[test]
+    fn stale_save_keeps_dirty_text_and_exposes_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let scenes = app
+            .list_scenes(false)
+            .unwrap()
+            .into_iter()
+            .map(|row| {
+                (
+                    row.scene.id,
+                    row.scene.title,
+                    row.scene.status,
+                    row.actual_words,
+                )
+            })
+            .collect();
+        let mut state = AppState {
+            app,
+            workspace: Workspace::Outline,
+            scenes,
+            selected: 0,
+            editor: vec![String::new()],
+            editing_scene: None,
+            cursor: (0, 0),
+            saved_hash: String::new(),
+            dirty: false,
+            mode: None,
+            prompt: String::new(),
+            message: String::new(),
+            history: vec![Workspace::Outline],
+            history_index: 0,
+            width: 80,
+            scroll: 0,
+            reading_document: None,
+            reading_text: String::new(),
+            reading_offset: 0,
+            reading_focus: false,
+            reading_selection_start: None,
+            function_bindings: default_bindings(),
+        };
+        state.open_selected().unwrap();
+        state.insert('A');
+        let (_, external_hash) = state.app.load_scene_text(scene).unwrap();
+        state
+            .app
+            .save_scene_text(scene, Some(&external_hash), "Another writer changed this.")
+            .unwrap();
+        state.save().unwrap();
+        assert!(state.dirty);
+        assert!(state.message.contains("Save conflict/error"));
+        assert_eq!(state.editor[0], "A");
     }
 }
