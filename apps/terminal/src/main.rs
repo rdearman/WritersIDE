@@ -1687,6 +1687,78 @@ fn analytics_report_rows(
     rows
 }
 
+fn format_story_tick(tick: i64) -> String {
+    let day = tick.div_euclid(story_core::STORY_TICKS_PER_DAY);
+    let day_seconds = tick.rem_euclid(story_core::STORY_TICKS_PER_DAY);
+    let hour = day_seconds / 3_600;
+    let minute = (day_seconds % 3_600) / 60;
+    let second = day_seconds % 60;
+    format!("D{day} {hour:02}:{minute:02}:{second:02}")
+}
+
+fn format_story_interval(time: story_core::StoryTime) -> String {
+    use story_core::TimePrecision;
+    match time.precision {
+        TimePrecision::Unknown => "unknown".into(),
+        TimePrecision::Exact => time
+            .nominal
+            .map(format_story_tick)
+            .unwrap_or_else(|| "unknown".into()),
+        TimePrecision::Approximate => {
+            let nominal = time.nominal.map(format_story_tick).unwrap_or_default();
+            match (time.lower, time.upper) {
+                (Some(lower), Some(upper)) => format!(
+                    "~{nominal} [{}–{}]",
+                    format_story_tick(lower),
+                    format_story_tick(upper)
+                ),
+                _ => format!("~{nominal}"),
+            }
+        }
+        TimePrecision::Bounded => match (time.lower, time.upper) {
+            (Some(lower), Some(upper)) => format!(
+                "[{}–{}]",
+                format_story_tick(lower),
+                format_story_tick(upper)
+            ),
+            (Some(lower), None) => format!("≥{}", format_story_tick(lower)),
+            (None, Some(upper)) => format!("≤{}", format_story_tick(upper)),
+            (None, None) => "bounded (no limits)".into(),
+        },
+    }
+}
+
+fn timeline_scene_order(app: &WriterApp) -> Vec<story_storage::SceneRecord> {
+    let mut scenes = app.list_scenes(false).unwrap_or_default();
+    scenes.sort_by(|first, second| {
+        let first_tick = first
+            .scene
+            .start_time
+            .nominal
+            .or(first.scene.start_time.lower)
+            .or(first.scene.start_time.upper);
+        let second_tick = second
+            .scene
+            .start_time
+            .nominal
+            .or(second.scene.start_time.lower)
+            .or(second.scene.start_time.upper);
+        (first_tick.is_none(), first_tick.unwrap_or(i64::MAX))
+            .cmp(&(second_tick.is_none(), second_tick.unwrap_or(i64::MAX)))
+            .then_with(|| first.scene.title.cmp(&second.scene.title))
+            .then_with(|| first.scene.id.cmp(&second.scene.id))
+    });
+    scenes
+}
+
+fn next_list_selection(selected: usize, item_count: usize) -> usize {
+    if item_count == 0 {
+        0
+    } else {
+        selected.saturating_add(1).min(item_count - 1)
+    }
+}
+
 fn workspace_items(s: &AppState) -> Vec<String> {
     match s.workspace {
         Workspace::Dashboard => vec![
@@ -1773,20 +1845,13 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             );
             rows
         }
-        Workspace::Timeline => s
-            .app
-            .list_scenes(false)
-            .unwrap_or_default()
+        Workspace::Timeline => timeline_scene_order(&s.app)
             .into_iter()
             .map(|scene| {
                 format!(
-                    "{:>14}  {}",
-                    scene
-                        .scene
-                        .start_time
-                        .nominal
-                        .map(|t| t.to_string())
-                        .unwrap_or_else(|| "unknown".into()),
+                    "{} → {}  {}",
+                    format_story_interval(scene.scene.start_time),
+                    format_story_interval(scene.scene.end_time),
                     scene.scene.title
                 )
             })
@@ -2184,8 +2249,16 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         KeyCode::Tab=>{let i=Workspace::ALL.iter().position(|x|*x==s.workspace).unwrap_or(0);s.switch(Workspace::ALL[(i+1)%Workspace::ALL.len()]);},
         KeyCode::BackTab=>{let i=Workspace::ALL.iter().position(|x|*x==s.workspace).unwrap_or(0);s.switch(Workspace::ALL[(i+Workspace::ALL.len()-1)%Workspace::ALL.len()]);},
         KeyCode::Up|KeyCode::Char('k')=>s.selected=s.selected.saturating_sub(1),
-        KeyCode::Down|KeyCode::Char('j')=>{if !s.scenes.is_empty(){s.selected=(s.selected+1).min(s.scenes.len()-1);}},
+        KeyCode::Down|KeyCode::Char('j')=>{s.selected=next_list_selection(s.selected,workspace_items(s).len());},
         KeyCode::Enter if s.workspace==Workspace::Revisions=>{let scene=s.active_scene().ok_or("select a scene first")?;let snapshots=s.app.list_snapshots(scene)?;if let Some(snapshot)=snapshots.get(s.selected){let diff=s.app.diff_snapshot(scene,snapshot.id)?;s.message=diff.into_iter().map(|line|format!("{}{}",match line.kind{story_storage::SnapshotLineKind::Equal=>' ',story_storage::SnapshotLineKind::Added=>'+',story_storage::SnapshotLineKind::Removed=>'-'},line.text.trim_end())).collect::<Vec<_>>().join(" | ");}},
+        KeyCode::Enter if s.workspace==Workspace::Timeline=>{
+            let timeline = timeline_scene_order(&s.app);
+            let scene = timeline
+                .get(s.selected)
+                .ok_or("timeline selection is out of range")?;
+            s.selected=s.scenes.iter().position(|row|row.0==scene.scene.id).ok_or("timeline scene no longer exists")?;
+            s.open_selected()?;
+        },
         KeyCode::Enter=>s.open_selected()?,
         _=>{}
     }
@@ -2861,6 +2934,61 @@ mod tests {
                 .any(|row| row.contains("Budget suggestion · Scene 4 · 400 words"))
         );
         assert!(scenes.iter().all(|scene| scene.target_words.is_none()));
+    }
+
+    #[test]
+    fn timeline_sorts_by_story_time_and_labels_uncertainty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let later = app.create_scene(chapter, "Later", 0).unwrap();
+        let unknown = app.create_scene(chapter, "Unknown", 1).unwrap();
+        let earlier = app.create_scene(chapter, "Earlier", 2).unwrap();
+        let mut scene = app.get_scene(later).unwrap().scene;
+        scene.start_time = story_core::StoryTime::exact(50);
+        app.update_scene_metadata(&scene).unwrap();
+        let mut scene = app.get_scene(earlier).unwrap().scene;
+        scene.start_time = story_core::StoryTime::exact(-story_core::STORY_TICKS_PER_DAY);
+        app.update_scene_metadata(&scene).unwrap();
+        assert_eq!(
+            app.get_scene(earlier).unwrap().scene.start_time.nominal,
+            Some(-story_core::STORY_TICKS_PER_DAY)
+        );
+        let ordered = timeline_scene_order(&app);
+        assert_eq!(ordered[0].scene.id, earlier);
+        assert_eq!(ordered[1].scene.id, later);
+        assert_eq!(ordered[2].scene.id, unknown);
+        assert_eq!(format_story_tick(-1), "D-1 23:59:59");
+        assert_eq!(
+            format_story_interval(story_core::StoryTime::unknown()),
+            "unknown"
+        );
+        let bounded = story_core::StoryTime::new(
+            Some(10),
+            Some(5),
+            Some(15),
+            story_core::TimePrecision::Bounded,
+        )
+        .unwrap();
+        assert_eq!(format_story_interval(bounded), "[D0 00:00:05–D0 00:00:15]");
+        let approximate = story_core::StoryTime::new(
+            Some(10),
+            Some(5),
+            Some(15),
+            story_core::TimePrecision::Approximate,
+        )
+        .unwrap();
+        assert_eq!(
+            format_story_interval(approximate),
+            "~D0 00:00:10 [D0 00:00:05–D0 00:00:15]"
+        );
+    }
+
+    #[test]
+    fn list_navigation_can_reach_rows_beyond_scene_count() {
+        assert_eq!(next_list_selection(10, 25), 11);
+        assert_eq!(next_list_selection(24, 25), 24);
+        assert_eq!(next_list_selection(3, 0), 0);
     }
 
     #[test]

@@ -21,7 +21,7 @@ This addendum extends SRS v0.1 without replacing its scene-centred, local-first 
 | LLM-001 | Optional local Ollama extraction is provisional, passage-linked, provenance-bearing and never silently promotes facts or edits prose. | Existing + strengthened | Optional integration | Partial: CLI/TUI localhost extraction accepts scene or reading sources, stores hashed quote-anchored proposals and has explicit review flag; offline mock verifies real HTTP request/response contract; canonical promotion and rich proposal management remain, and live Ollama compatibility is unverified |
 | REV-001 | Snapshots, diffs, selective restore and history preserve durable journal behavior and Git compatibility. | Strengthened | Storage/revision UI | Implemented foundation: verified snapshots, line diffs, range restore through the journal, CLI and TUI history view; visual hunk selection remains |
 | PIPE-001 | Dependency-aware processing runs compilation, analyses, diagnostics, export and reports with visible failures and practical invalidation. | New | Processing service | Partial: local compiler, word count, plot/character/chronology analysis, export, revision summary, verified artifact cache and CLI/TUI invocation implemented; richer diagnostics/configuration remain |
-| ANA-001 | Character heatmaps/interactions, subplot gaps, budget previews and uncertainty-aware chronology reports are read-only projections. | Existing + strengthened | Analysis/TUI | Partial: read-only DTOs, full terminal heatmap rows, named co-appearance pairs, boundary-labelled subplot gaps, uncertainty-aware chronology pairs and deterministic per-scene budget previews implemented; graphical heatmaps, richer policy controls and other visualization modes remain |
+| ANA-001 | Character heatmaps/interactions, subplot gaps, budget previews and uncertainty-aware chronology reports are read-only projections. | Existing + strengthened | Analysis/TUI | Partial: read-only DTOs, full terminal heatmap rows, named co-appearance pairs, boundary-labelled subplot gaps, uncertainty-aware chronology pairs and deterministic per-scene budget previews implemented; the scene timeline now orders by story time and labels uncertainty; event timelines, graphical heatmaps, richer policy controls and other visualization modes remain |
 
 ## Domain and storage contracts
 
@@ -55,3 +55,8 @@ The Reading workspace visually marks current highlights (yellow background) and 
 ### Analytics workspace milestone
 
 The terminal Analytics workspace now presents the complete scene heatmap, named character interaction counts, subplot gap locations, uncertain chronology pairs, and budget redistribution suggestions. All output is a read-only projection; budget suggestions are marked as previews and never alter scene targets. A regression test exercises these report sections and verifies no target mutation.
+
+
+### Chronology timeline milestone
+
+The terminal Timeline workspace now orders scenes by story-time values, displays start/end ranges for approximate and bounded values, places unknown dates last, and opens the correct scene through its stable ID. Workspace list navigation now follows the actual visible rows, including expanded analytics reports. Event-level timeline interaction and visual overlap grouping remain incomplete.
