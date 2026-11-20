@@ -499,6 +499,79 @@ impl AppState {
                 .map(|query| format!("{} {}", query.id, query.name))
                 .collect::<Vec<_>>()
                 .join(" · ");
+        } else if let Some(rest) = cmd.strip_prefix("link ") {
+            let mut parts = rest.splitn(6, ' ');
+            let source_kind = parts.next().ok_or("missing source kind")?;
+            let source_id = parts.next().ok_or("missing source UUID")?;
+            let target_kind = parts.next().ok_or("missing target kind")?;
+            let target_id = parts.next().ok_or("missing target UUID")?;
+            let link_kind = parse_terminal_link_kind(parts.next().ok_or("missing link kind")?)?;
+            let label = parts.next().unwrap_or("").trim();
+            self.app.create_story_link(&story_core::StoryLink {
+                id: story_core::LinkId::new(),
+                source: parse_entity(source_kind, source_id)?,
+                source_anchor: None,
+                target: parse_entity(target_kind, target_id)?,
+                target_anchor: None,
+                kind: link_kind,
+                label: label.into(),
+            })?;
+            self.message = "Story link saved".into();
+        } else if let Some(rest) = cmd.strip_prefix("outgoing ") {
+            let (kind, id) = rest
+                .split_once(' ')
+                .ok_or("use outgoing <entity-kind> <UUID>")?;
+            self.message = self
+                .app
+                .outgoing_links(parse_entity(kind, id)?)?
+                .into_iter()
+                .map(|link| {
+                    format!(
+                        "{} {} → {}:{}",
+                        link.kind.as_str(),
+                        link.id,
+                        link.target.kind(),
+                        link.target.id()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+        } else if let Some(rest) = cmd.strip_prefix("backlinks ") {
+            let (kind, id) = rest
+                .split_once(' ')
+                .ok_or("use backlinks <entity-kind> <UUID>")?;
+            self.message = self
+                .app
+                .backlinks(parse_entity(kind, id)?)?
+                .into_iter()
+                .map(|link| {
+                    format!(
+                        "{} {} ← {}:{}",
+                        link.kind.as_str(),
+                        link.id,
+                        link.source.kind(),
+                        link.source.id()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+        } else if cmd == "broken-links" {
+            self.message = self
+                .app
+                .broken_links()?
+                .into_iter()
+                .map(|broken| format!("{} {}", broken.link_id, broken.reason))
+                .collect::<Vec<_>>()
+                .join(" · ");
+        } else if let Some(rest) = cmd.strip_prefix("transclude ") {
+            let scene = SceneId(rest.parse()?);
+            self.message = self
+                .app
+                .expand_scene_transclusions(scene)?
+                .into_iter()
+                .map(|passage| format!("{}{}", "  ".repeat(passage.depth), passage.text))
+                .collect::<Vec<_>>()
+                .join("\n");
         } else if let Some(rest) = cmd.strip_prefix("query-save ") {
             let mut parts = rest.split_whitespace();
             let name = parts
@@ -549,7 +622,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | process | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | help".into();
+            self.message = "Commands: open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | transclude SCENE-ID | process | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | help".into();
         }
         Ok(())
     }
@@ -1124,6 +1197,18 @@ fn parse_terminal_status(value: &str) -> Result<SceneStatus, Box<dyn std::error:
         _ => return Err(format!("unknown scene status: {value}").into()),
     })
 }
+fn parse_terminal_link_kind(
+    value: &str,
+) -> Result<story_core::LinkKind, Box<dyn std::error::Error>> {
+    Ok(match value {
+        "related" => story_core::LinkKind::Related,
+        "cites" => story_core::LinkKind::Cites,
+        "transcludes" => story_core::LinkKind::Transcludes,
+        "includes" => story_core::LinkKind::Includes,
+        "navigates" => story_core::LinkKind::Navigates,
+        _ => return Err(format!("unknown link kind: {value}").into()),
+    })
+}
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
     if s.mode.is_some() {
         match k.code {
@@ -1373,6 +1458,17 @@ mod tests {
         state.prompt = "query-list".into();
         state.command().unwrap();
         assert!(state.message.contains("ideas"));
+        state.mode = Some(':');
+        state.prompt = format!("link scene {first} scene {second} related note");
+        state.command().unwrap();
+        state.mode = Some(':');
+        state.prompt = format!("outgoing scene {first}");
+        state.command().unwrap();
+        assert!(state.message.contains(&second.to_string()));
+        state.mode = Some(':');
+        state.prompt = format!("backlinks scene {second}");
+        state.command().unwrap();
+        assert!(state.message.contains(&first.to_string()));
     }
 
     #[test]

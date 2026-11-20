@@ -9,10 +9,10 @@ This addendum extends SRS v0.1 without replacing its scene-centred, local-first 
 
 | ID | Requirement | Relationship to SRS v0.1 | Allocation | Current state |
 |---|---|---|---|---|
-| HYP-001 | Typed links use stable entity IDs across scenes, characters, plotlines and research; backlinks resolve after title/placement changes. | New | Domain/storage/API | Implemented in migration 0002 and services |
+| HYP-001 | Typed links use stable entity IDs across scenes, characters, plotlines and research; backlinks resolve after title/placement changes. | New | Domain/storage/API/CLI/TUI | Implemented with outgoing/backlink CLI and terminal commands; stable IDs survive rename/move |
 | HYP-002 | Passage anchors retain stable IDs, selected text, byte range, surrounding context and source hash. | Strengthened | Domain/storage; re-anchoring follows editor integration | Initial anchor creation implemented; edit re-anchoring deferred |
 | HYP-003 | Broken endpoints and anchors are reportable; invalid endpoints are rejected at write time. | New | Storage/diagnostics | Implemented for persisted links |
-| HYP-004 | Include/transclude links are navigable references, do not copy canonical prose, and cannot form cycles. | New | Domain/storage/reader/compiler | Cycle guard implemented; rendering/compiler semantics deferred |
+| HYP-004 | Include/transclude links are navigable references, do not copy canonical prose, and cannot form cycles. | New | Domain/storage/reader/compiler | Cycle guard and terminal transclusion preview implemented; compile option remains deferred |
 | QRY-001 | Named typed scene queries combine status, character, plotline, chronology and unresolved-issue filters. | Strengthened | Domain/storage/CLI/TUI | Save, list, and dynamic run exposed in CLI and terminal command palette |
 | QRY-002 | Query results refresh from current story data and never change manuscript order. | New | Application/analytics | Implemented and tested at storage query boundary |
 | IDX-001 | Full-text and relationship indexes support search while preserving stable passage references. | Strengthened | Storage/search | Initial FTS5 table; indexing/search API deferred |
