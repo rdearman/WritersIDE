@@ -154,6 +154,14 @@ pub struct ReadingTermRecord {
     pub description: String,
 }
 #[derive(Clone, Debug)]
+pub struct ReadingEntityLinkRecord {
+    pub id: LinkId,
+    pub annotation_id: Option<AnnotationId>,
+    pub target_kind: String,
+    pub target_id: String,
+    pub relation: String,
+}
+#[derive(Clone, Debug)]
 pub struct SnapshotRecord {
     pub id: SnapshotId,
     pub scene_id: SceneId,
@@ -2367,6 +2375,42 @@ impl ProjectStore {
         self.conn.execute("INSERT INTO reading_entity_link(id,document_id,annotation_id,target_kind,target_id,relation) VALUES(?1,?2,?3,?4,?5,?6)",params![id.to_string(),document.to_string(),annotation.map(|a|a.to_string()),target.kind(),target.id(),relation])?;
         Ok(())
     }
+    pub fn reading_entity_links(
+        &self,
+        document: ReadingId,
+    ) -> Result<Vec<ReadingEntityLinkRecord>> {
+        let mut stmt = self.conn.prepare("SELECT id,annotation_id,target_kind,target_id,relation FROM reading_entity_link WHERE document_id=?1 ORDER BY id")?;
+        let rows = stmt.query_map([document.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, annotation, target_kind, target_id, relation) = row?;
+            let parse = |value: String| {
+                Uuid::parse_str(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            };
+            Ok(ReadingEntityLinkRecord {
+                id: LinkId(parse(id)?),
+                annotation_id: annotation.map(parse).transpose()?.map(AnnotationId),
+                target_kind,
+                target_id,
+                relation,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+        .map_err(StorageError::from)
+    }
     pub fn outgoing_links(&self, source: EntityRef) -> Result<Vec<StoryLink>> {
         let mut q = self.conn.prepare("SELECT id,source_kind,source_id,source_anchor_id,target_kind,target_id,target_anchor_id,link_kind,label FROM story_link WHERE source_kind=?1 AND source_id=?2 ORDER BY created_at,id")?;
         let rows = q.query_map(params![source.kind(), source.id()], read_story_link)?;
@@ -3282,6 +3326,16 @@ mod tests {
                 },
             )
             .unwrap();
+        let character = CharacterId::new();
+        store.add_character(character, "Mara").unwrap();
+        store
+            .link_reading_entity(
+                reading,
+                Some(annotation),
+                EntityRef::Character(character),
+                "identified-as",
+            )
+            .unwrap();
         store.create_reading_bookmark(reading, "Key", 0).unwrap();
         store.set_reading_checkpoint(reading, 6).unwrap();
         store
@@ -3304,6 +3358,10 @@ mod tests {
             "current"
         );
         assert_eq!(store.list_reading_terms(reading).unwrap()[0].name, "Mara");
+        let links = store.reading_entity_links(reading).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].annotation_id, Some(annotation));
+        assert_eq!(links[0].target_id, character.to_string());
         assert_eq!(store.reading_checkpoint(reading).unwrap(), None);
         drop(store);
         let store = ProjectStore::open(&project).unwrap();

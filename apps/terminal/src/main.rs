@@ -369,6 +369,73 @@ impl AppState {
             self.app
                 .link_reading_entity(doc, None, parse_entity(kind, id)?, "references")?;
             self.message = "Reference entity linked".into();
+        } else if cmd == "reading-links" {
+            let doc = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            self.message = self
+                .app
+                .reading_entity_links(doc)?
+                .into_iter()
+                .map(|link| {
+                    format!(
+                        "{} {} → {}:{}",
+                        link.relation, link.id, link.target_kind, link.target_id
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+        } else if let Some(index) = cmd.strip_prefix("reading-follow ") {
+            let doc = self
+                .reading_document
+                .ok_or("open a reading document first")?;
+            let link = self
+                .app
+                .reading_entity_links(doc)?
+                .get(index.parse::<usize>()?)
+                .cloned()
+                .ok_or("reading link index is out of range")?;
+            let entity = parse_entity(&link.target_kind, &link.target_id)?;
+            match entity {
+                story_core::EntityRef::Scene(id) => {
+                    self.selected = self
+                        .scenes
+                        .iter()
+                        .position(|scene| scene.0 == id)
+                        .ok_or("linked scene is not in the current scene list")?;
+                    self.open_selected()?;
+                }
+                story_core::EntityRef::Character(id) => {
+                    self.selected = self
+                        .app
+                        .list_characters()?
+                        .iter()
+                        .position(|x| x.id == id)
+                        .ok_or("linked character no longer exists")?;
+                    self.switch(Workspace::Characters);
+                    self.message = format!("Opened linked character {}", id);
+                }
+                story_core::EntityRef::Plotline(id) => {
+                    self.selected = self
+                        .app
+                        .list_plotlines()?
+                        .iter()
+                        .position(|x| x.id == id)
+                        .ok_or("linked plotline no longer exists")?;
+                    self.switch(Workspace::PlotGrid);
+                    self.message = format!("Opened linked plotline {}", id);
+                }
+                story_core::EntityRef::Research(id) => {
+                    self.selected = self
+                        .app
+                        .list_research_items()?
+                        .iter()
+                        .position(|x| x.id == id)
+                        .ok_or("linked research item no longer exists")?;
+                    self.switch(Workspace::Research);
+                    self.message = format!("Opened linked research item {}", id);
+                }
+            }
         } else if let Some(label) = cmd.strip_prefix("snapshot ") {
             let scene = self
                 .editing_scene
@@ -642,7 +709,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F14 workspaces (override in .writers-ide/keybindings.toml); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | help".into();
+            self.message = "Commands: open UUID | workspace NAME | query UUID | query-list | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | transclude SCENE-ID | process | extract scene|reading UUID MODEL | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -1583,5 +1650,59 @@ mod tests {
         assert!(state.dirty);
         assert!(state.message.contains("Save conflict/error"));
         assert_eq!(state.editor[0], "A");
+    }
+
+    #[test]
+    fn reading_entity_link_can_navigate_to_story_character() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let character = app.create_character("Mara").unwrap();
+        let source = dir.path().join("reference.txt");
+        fs::write(&source, "Mara is the protagonist.").unwrap();
+        let imported = story_reading::import_reference(&source).unwrap();
+        let reading = app
+            .import_reading_document(&imported, "reference.txt")
+            .unwrap();
+        app.link_reading_entity(
+            reading,
+            None,
+            story_core::EntityRef::Character(character),
+            "mentions",
+        )
+        .unwrap();
+        let mut state = AppState {
+            app,
+            workspace: Workspace::Reading,
+            scenes: Vec::new(),
+            selected: 0,
+            editor: vec![String::new()],
+            editing_scene: None,
+            cursor: (0, 0),
+            saved_hash: String::new(),
+            dirty: false,
+            mode: None,
+            prompt: String::new(),
+            message: String::new(),
+            history: vec![Workspace::Reading],
+            history_index: 0,
+            width: 80,
+            scroll: 0,
+            reading_document: Some(reading),
+            reading_text: imported.extracted_text,
+            reading_offset: 0,
+            reading_focus: true,
+            reading_selection_start: None,
+            function_bindings: default_bindings(),
+        };
+        state.mode = Some(':');
+        state.prompt = "reading-links".into();
+        state.command().unwrap();
+        assert!(state.message.contains(&character.to_string()));
+        state.mode = Some(':');
+        state.prompt = "reading-follow 0".into();
+        state.command().unwrap();
+        assert_eq!(state.workspace, Workspace::Characters);
+        assert_eq!(state.selected, 0);
     }
 }

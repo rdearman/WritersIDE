@@ -427,6 +427,12 @@ impl WriterApp {
             .store
             .link_reading_entity(doc, annotation, target, relation)?)
     }
+    pub fn reading_entity_links(
+        &self,
+        document: ReadingId,
+    ) -> Result<Vec<story_storage::ReadingEntityLinkRecord>> {
+        Ok(self.store.reading_entity_links(document)?)
+    }
     pub fn backlinks(&self, target: EntityRef) -> Result<Vec<StoryLink>> {
         Ok(self.store.backlinks(target)?)
     }
