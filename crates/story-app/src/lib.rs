@@ -147,7 +147,15 @@ impl WriterApp {
                 .iter()
                 .find(|data| data.scene_id == row.scene.id.to_string());
             let characters = linked
-                .map(|d| d.characters.iter().map(|c| c.name.clone()).collect())
+                .map(|d| {
+                    d.characters
+                        .iter()
+                        .map(|c| story_pipeline::PipelineCharacter {
+                            id: c.id.clone(),
+                            name: c.name.clone(),
+                        })
+                        .collect()
+                })
                 .unwrap_or_default();
             let plotlines = linked
                 .map(|d| d.plotlines.iter().map(|p| p.name.clone()).collect())

@@ -6,7 +6,9 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
-use story_analysis::{CharacterOnScene, PlotlineOnScene, SceneAnalysisInput};
+use story_analysis::{
+    CharacterChronologyStatus, CharacterOnScene, PlotlineOnScene, SceneAnalysisInput,
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -18,6 +20,12 @@ pub enum PipelineError {
 }
 
 #[derive(Clone, Debug)]
+pub struct PipelineCharacter {
+    pub id: String,
+    pub name: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct PipelineScene {
     pub id: String,
     pub title: String,
@@ -25,7 +33,7 @@ pub struct PipelineScene {
     /// Resolved inclusion text. This is a derived compilation view; `text` remains canonical.
     pub expanded_text: Option<String>,
     pub target_words: Option<u64>,
-    pub characters: Vec<String>,
+    pub characters: Vec<PipelineCharacter>,
     pub plotlines: Vec<String>,
     pub start: story_core::StoryTime,
     pub end: story_core::StoryTime,
@@ -398,7 +406,7 @@ fn render_stage(
             let mut counts = BTreeMap::<String, usize>::new();
             for scene in &input.scenes {
                 for character in &scene.characters {
-                    *counts.entry(character.clone()).or_default() += 1;
+                    *counts.entry(character.name.clone()).or_default() += 1;
                 }
             }
             let mut output = counts
@@ -415,25 +423,18 @@ fn render_stage(
         }
         Stage::Continuity => {
             let mut output = String::new();
-            for (i, first) in input.scenes.iter().enumerate() {
-                for second in input.scenes.iter().skip(i + 1) {
-                    if first
-                        .characters
-                        .iter()
-                        .any(|c| second.characters.contains(c))
-                        && !matches!(
-                            first.end.compare(second.start),
-                            story_core::TimeOrdering::Before
-                        )
-                        && !matches!(
-                            second.end.compare(first.start),
-                            story_core::TimeOrdering::Before
-                        )
-                    {
-                        output
-                            .push_str(&format!("uncertain-overlap\t{}\t{}\n", first.id, second.id));
-                    }
-                }
+            for finding in story_analysis::character_chronology_findings(&analysis_input(input)) {
+                let label = match finding.status {
+                    CharacterChronologyStatus::DefiniteOverlap => "definite-overlap",
+                    CharacterChronologyStatus::PossibleOverlap => "possible-overlap",
+                    CharacterChronologyStatus::Unverified => "unverified-overlap",
+                };
+                output.push_str(&format!(
+                    "{label}\t{}\t{}\t{}\n",
+                    finding.first_scene_id,
+                    finding.second_scene_id,
+                    finding.shared_character_ids.join(",")
+                ));
             }
             Ok(output)
         }
@@ -460,9 +461,9 @@ fn analysis_input(input: &PipelineInput) -> Vec<SceneAnalysisInput> {
             characters: scene
                 .characters
                 .iter()
-                .map(|name| CharacterOnScene {
-                    id: name.clone(),
-                    name: name.clone(),
+                .map(|character| CharacterOnScene {
+                    id: character.id.clone(),
+                    name: character.name.clone(),
                     role: story_core::ParticipationRole::Major,
                 })
                 .collect(),
@@ -517,7 +518,10 @@ mod tests {
                 text: text.into(),
                 expanded_text: None,
                 target_words: Some(100),
-                characters: vec!["Mara".into()],
+                characters: vec![PipelineCharacter {
+                    id: "character-1".into(),
+                    name: "Mara".into(),
+                }],
                 plotlines: vec!["Main".into()],
                 start: StoryTime::unknown(),
                 end: StoryTime::unknown(),
@@ -544,6 +548,36 @@ mod tests {
         assert_eq!(changed[2].status, StageStatus::Cached);
         assert_eq!(changed[3].status, StageStatus::Cached);
         assert_eq!(changed[5].status, StageStatus::Complete);
+    }
+
+    #[test]
+    fn continuity_report_distinguishes_definite_and_unverified_character_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut novel = input("Draft.");
+        let mut second = novel.scenes[0].clone();
+        novel.scenes[0].start = StoryTime::exact(0);
+        novel.scenes[0].end = StoryTime::exact(10);
+        novel.scenes[0].characters[0].id = "character-1".into();
+        second.id = "scene-2".into();
+        second.title = "Second".into();
+        second.start = StoryTime::exact(5);
+        second.end = StoryTime::exact(20);
+        second.characters[0].id = "character-1".into();
+        let mut unknown = second.clone();
+        unknown.id = "scene-3".into();
+        unknown.title = "Unknown time".into();
+        unknown.start = StoryTime::unknown();
+        unknown.end = StoryTime::unknown();
+        novel.scenes.extend([second, unknown]);
+
+        PipelineRunner::new(dir.path())
+            .run_selected(&novel, &[Stage::Continuity])
+            .unwrap();
+        let report =
+            fs::read_to_string(dir.path().join(".writers-ide/processing/continuity.txt")).unwrap();
+        assert!(report.contains("definite-overlap\tscene-1\tscene-2\tcharacter-1"));
+        assert!(report.contains("unverified-overlap\tscene-1\tscene-3\tcharacter-1"));
+        assert!(report.contains("unverified-overlap\tscene-2\tscene-3\tcharacter-1"));
     }
 
     #[test]

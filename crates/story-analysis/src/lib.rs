@@ -60,6 +60,21 @@ pub struct ChronologyFinding {
     pub comparison: TimeOrdering,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CharacterChronologyStatus {
+    DefiniteOverlap,
+    PossibleOverlap,
+    Unverified,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CharacterChronologyFinding {
+    pub first_scene_id: String,
+    pub second_scene_id: String,
+    pub shared_character_ids: Vec<String>,
+    pub status: CharacterChronologyStatus,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BudgetPreview {
     pub target_words: u64,
@@ -187,6 +202,70 @@ pub fn chronology_ambiguities(scenes: &[SceneAnalysisInput]) -> Vec<ChronologyFi
     findings
 }
 
+/// Reports same-character scene intervals that may overlap without treating uncertainty as a
+/// proven conflict. Touching end/start boundaries are considered adjacent, not overlapping.
+pub fn character_chronology_findings(
+    scenes: &[SceneAnalysisInput],
+) -> Vec<CharacterChronologyFinding> {
+    use CharacterChronologyStatus::*;
+    use TimeOrdering::*;
+
+    let mut findings = Vec::new();
+    for (index, first) in scenes.iter().enumerate() {
+        for second in scenes.iter().skip(index + 1) {
+            let first_characters = first
+                .characters
+                .iter()
+                .map(|character| character.id.as_str())
+                .collect::<BTreeSet<_>>();
+            let shared_character_ids = second
+                .characters
+                .iter()
+                .filter(|character| first_characters.contains(character.id.as_str()))
+                .map(|character| character.id.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if shared_character_ids.is_empty() {
+                continue;
+            }
+
+            let first_before_second =
+                matches!(first.end_time.compare(second.start_time), Before | Same);
+            let second_before_first =
+                matches!(second.end_time.compare(first.start_time), Before | Same);
+            if first_before_second || second_before_first {
+                continue;
+            }
+
+            let definite_overlap = matches!(first.start_time.compare(second.end_time), Before)
+                && matches!(second.start_time.compare(first.end_time), Before);
+            let has_unknown_endpoint = [
+                first.start_time,
+                first.end_time,
+                second.start_time,
+                second.end_time,
+            ]
+            .into_iter()
+            .any(|time| time.precision == story_core::TimePrecision::Unknown);
+            let status = if definite_overlap {
+                DefiniteOverlap
+            } else if has_unknown_endpoint {
+                Unverified
+            } else {
+                PossibleOverlap
+            };
+            findings.push(CharacterChronologyFinding {
+                first_scene_id: first.scene_id.clone(),
+                second_scene_id: second.scene_id.clone(),
+                shared_character_ids,
+                status,
+            });
+        }
+    }
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +342,63 @@ mod tests {
         ];
         assert_eq!(subplot_gaps(&scenes, 1)[0].intervening_scenes, 1);
         assert_eq!(chronology_ambiguities(&scenes).len(), 3);
+    }
+
+    #[test]
+    fn same_character_chronology_distinguishes_confirmed_possible_and_unverified_overlap() {
+        let character = |id: &str| CharacterOnScene {
+            id: id.into(),
+            name: "Mara".into(),
+            role: ParticipationRole::Major,
+        };
+        let mut first = scene("first", None, &["Mara"], &[]);
+        first.characters = vec![character("mara-id")];
+        first.start_time = story_core::StoryTime::exact(0);
+        first.end_time = story_core::StoryTime::exact(10);
+        let mut definite = scene("definite", None, &["Mara"], &[]);
+        definite.characters = vec![character("mara-id")];
+        definite.start_time = story_core::StoryTime::exact(5);
+        definite.end_time = story_core::StoryTime::exact(20);
+        let finding = character_chronology_findings(&[first.clone(), definite]).remove(0);
+        assert_eq!(finding.status, CharacterChronologyStatus::DefiniteOverlap);
+        assert_eq!(finding.shared_character_ids, vec!["mara-id"]);
+
+        let mut possible = scene("possible", None, &["Mara"], &[]);
+        possible.characters = vec![character("mara-id")];
+        possible.start_time = story_core::StoryTime::new(
+            None,
+            Some(10),
+            Some(14),
+            story_core::TimePrecision::Bounded,
+        )
+        .unwrap();
+        possible.end_time = story_core::StoryTime::exact(20);
+        let mut uncertain_end = first.clone();
+        uncertain_end.end_time =
+            story_core::StoryTime::new(None, Some(8), Some(12), story_core::TimePrecision::Bounded)
+                .unwrap();
+        assert_eq!(
+            character_chronology_findings(&[uncertain_end, possible])[0].status,
+            CharacterChronologyStatus::PossibleOverlap
+        );
+
+        let mut unknown = scene("unknown", None, &["Mara"], &[]);
+        unknown.characters = vec![character("mara-id")];
+        assert_eq!(
+            character_chronology_findings(&[first.clone(), unknown])[0].status,
+            CharacterChronologyStatus::Unverified
+        );
+
+        let mut adjacent = scene("adjacent", None, &["Mara"], &[]);
+        adjacent.characters = vec![character("mara-id")];
+        adjacent.start_time = story_core::StoryTime::exact(10);
+        adjacent.end_time = story_core::StoryTime::exact(15);
+        assert!(character_chronology_findings(&[first.clone(), adjacent]).is_empty());
+
+        let mut unrelated = scene("unrelated", None, &["Mara"], &[]);
+        unrelated.characters = vec![character("different-id")];
+        unrelated.start_time = story_core::StoryTime::exact(5);
+        unrelated.end_time = story_core::StoryTime::exact(20);
+        assert!(character_chronology_findings(&[first, unrelated]).is_empty());
     }
 }
