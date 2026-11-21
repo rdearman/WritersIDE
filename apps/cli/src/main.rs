@@ -1,8 +1,9 @@
 use sha2::{Digest, Sha256};
 use std::{
     env, fs,
+    io::Write,
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{Command, ExitCode, Stdio},
     thread,
     time::Duration,
 };
@@ -1108,6 +1109,55 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 thread::sleep(Duration::from_millis(poll_ms));
             }
         }
+        "compile-edition" => {
+            let project = PathBuf::from(args.next().ok_or("missing project path")?);
+            let recipe = PathBuf::from(args.next().ok_or("missing edition recipe TOML")?);
+            compile_edition(&project, &recipe)?;
+        }
+        "spellcheck" => {
+            let project = PathBuf::from(args.next().ok_or("missing project path")?);
+            let language = args.next().ok_or("missing Aspell language tag")?;
+            let dictionary = args.next();
+            let findings =
+                spellcheck_project(&project, &language, dictionary.as_deref(), "aspell")?;
+            println!("{}", serde_json::to_string_pretty(&findings)?);
+            if !findings.is_empty() {
+                return Err(
+                    format!("{} scene(s) contain spelling candidates", findings.len()).into(),
+                );
+            }
+        }
+        "watch-edition" => {
+            let project = PathBuf::from(args.next().ok_or("missing project path")?);
+            let recipe = PathBuf::from(args.next().ok_or("missing edition recipe TOML")?);
+            let poll_ms = args
+                .next()
+                .map(|v| v.parse::<u64>())
+                .transpose()?
+                .unwrap_or(1000)
+                .clamp(250, 60_000);
+            let mut previous = String::new();
+            println!("Watching edition recipe; Ctrl-C stops the watcher.");
+            loop {
+                let mut fingerprint = Sha256::new();
+                fingerprint.update(watch_fingerprint(&project)?);
+                let recipe_bytes = fs::read(&recipe)?;
+                fingerprint.update(&recipe_bytes);
+                let recipe_config =
+                    story_document::EditionRecipe::from_toml(std::str::from_utf8(&recipe_bytes)?)?;
+                if let Some(dictionary) = recipe_config.dictionary {
+                    fingerprint.update(fs::read(project.join(dictionary))?);
+                }
+                let current = format!("{:x}", fingerprint.finalize());
+                if current != previous {
+                    previous = current;
+                    if let Err(error) = compile_edition(&project, &recipe) {
+                        eprintln!("Edition compile failed; previous output preserved: {error}");
+                    }
+                }
+                thread::sleep(Duration::from_millis(poll_ms));
+            }
+        }
         "inspect-manuscript" => {
             let source = args
                 .next()
@@ -1415,6 +1465,9 @@ fn usage() {
     eprintln!("writers-ide import-manuscript <source-file> <new-project-directory> [title]");
     eprintln!("writers-ide browse <project> [loopback-port]");
     eprintln!(
+        "writers-ide compile-edition <project> <recipe.toml>\nwriters-ide watch-edition <project> <recipe.toml> [poll-ms]\nwriters-ide spellcheck <project> <language-tag> [project-relative-wordlist]"
+    );
+    eprintln!(
         "writers-ide query-assert-save <project> <query-uuid> <non-empty|empty|at-least:N|at-most:N|exactly:N>...\nwriters-ide query-assert-check <project> <query-uuid>"
     );
     eprintln!(
@@ -1472,6 +1525,185 @@ fn watch_fingerprint(project: &Path) -> Result<String, Box<dyn std::error::Error
         hash.update(fs::read(path)?);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+fn compile_edition(project: &Path, recipe_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    compile_edition_with_aspell(project, recipe_path, "aspell")
+}
+
+fn compile_edition_with_aspell(
+    project: &Path,
+    recipe_path: &Path,
+    aspell: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = fs::read_to_string(recipe_path)?;
+    let recipe = story_document::EditionRecipe::from_toml(&source)?;
+    let output_relative = Path::new(&recipe.output);
+    ensure_project_path_has_no_symlink(project, output_relative)?;
+    let spelling = if recipe.spellcheck {
+        Some(spellcheck_project(
+            project,
+            recipe
+                .language
+                .as_deref()
+                .ok_or("spellcheck language missing")?,
+            recipe.dictionary.as_deref(),
+            aspell,
+        )?)
+    } else {
+        None
+    };
+    let app = WriterApp::open_project(project)?;
+    let artifact = app.compile_artifact_with_design(
+        recipe.format,
+        recipe.expand_transclusions,
+        recipe.design,
+    )?;
+    let output = project.join(output_relative);
+    atomic_write(&output, &artifact.bytes)?;
+    let sidecar = PathBuf::from(format!("{}.source-map.json", output.display()));
+    let map = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "edition": recipe.name,
+        "output_format": recipe.format,
+        "offset_space": "compile-ir-markdown-utf8",
+        "visual_layout_mapping": false,
+        "entries": artifact.source_map,
+    }))?;
+    atomic_write(&sidecar, &map)?;
+    if let Some(findings) = spelling {
+        let report = PathBuf::from(format!("{}.spellcheck.json", output.display()));
+        atomic_write(&report, &serde_json::to_vec_pretty(&findings)?)?;
+        if !findings.is_empty() {
+            eprintln!(
+                "Edition spelling check found candidate words in {} scene(s): {}",
+                findings.len(),
+                report.display()
+            );
+        }
+    }
+    println!(
+        "Compiled edition {} · {} bytes · {}",
+        recipe.name,
+        artifact.bytes.len(),
+        output.display()
+    );
+    Ok(())
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct SpellingFinding {
+    entity_kind: String,
+    entity_id: String,
+    title: String,
+    candidates: std::collections::BTreeMap<String, usize>,
+}
+
+fn spellcheck_project(
+    project: &Path,
+    language: &str,
+    dictionary: Option<&str>,
+    executable: &str,
+) -> Result<Vec<SpellingFinding>, Box<dyn std::error::Error>> {
+    if language.trim().is_empty() {
+        return Err("language tag cannot be empty".into());
+    }
+    let allowed = if let Some(relative) = dictionary {
+        let relative = Path::new(relative);
+        ensure_project_path_has_no_symlink(project, relative)?;
+        let path = project.join(relative);
+        if !fs::symlink_metadata(&path)?.is_file() {
+            return Err("personal dictionary must be a regular file".into());
+        }
+        fs::read_to_string(path)?
+            .lines()
+            .map(|line| line.trim().to_lowercase())
+            .filter(|word| !word.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let app = WriterApp::open_project(project)?;
+    let mut findings = Vec::new();
+    let input = app.processing_input()?;
+    let prose = input
+        .scenes
+        .into_iter()
+        .map(|scene| ("scene".to_owned(), scene.id, scene.title, scene.text))
+        .chain(
+            input
+                .content_units
+                .into_iter()
+                .map(|unit| ("content-unit".to_owned(), unit.id, unit.title, unit.text)),
+        );
+    for (entity_kind, entity_id, title, text) in prose {
+        let mut child = Command::new(executable)
+            .arg(format!("--lang={language}"))
+            .arg("list")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or("Aspell stdin unavailable")?
+            .write_all(text.as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "Aspell failed for {entity_kind} {title}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        let mut candidates = std::collections::BTreeMap::new();
+        for word in String::from_utf8(output.stdout)?
+            .lines()
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+        {
+            let normalized = word.to_lowercase();
+            if !allowed.contains(&normalized) {
+                *candidates.entry(normalized).or_insert(0) += 1;
+            }
+        }
+        if !candidates.is_empty() {
+            findings.push(SpellingFinding {
+                entity_kind,
+                entity_id,
+                title,
+                candidates,
+            });
+        }
+    }
+    Ok(findings)
+}
+
+fn ensure_project_path_has_no_symlink(
+    root: &Path,
+    relative: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err("project output path contains traversal".into());
+        };
+        current.push(name);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "project output path crosses a symlink: {}",
+                    current.display()
+                )
+                .into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
@@ -1547,8 +1779,11 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod watch_tests {
-    use super::watch_fingerprint;
+    use super::{
+        compile_edition, compile_edition_with_aspell, spellcheck_project, watch_fingerprint,
+    };
     use std::fs;
+    use story_app::WriterApp;
     #[test]
     fn watch_fingerprint_tracks_manuscript_and_ignores_generated_exports() {
         let root = tempfile::tempdir().unwrap();
@@ -1566,5 +1801,118 @@ mod watch_tests {
         let with_wal = watch_fingerprint(root.path()).unwrap();
         fs::write(scene, "second").unwrap();
         assert_ne!(with_wal, watch_fingerprint(root.path()).unwrap());
+    }
+
+    #[test]
+    fn edition_recipe_compiles_project_relative_output_and_source_map() {
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Novel");
+        let mut project = WriterApp::create_project(&project_path, "Novel").unwrap();
+        let chapter = project.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = project.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = project.load_scene_text(scene).unwrap();
+        project
+            .save_scene_text(scene, Some(&hash), "The story begins.")
+            .unwrap();
+        drop(project);
+        let recipe_path = root.path().join("edition.toml");
+        fs::write(&recipe_path, "version=1\nname='Reader'\nformat='markdown'\noutput='exports/reader.md'\ndesign='trade-paperback'\nexpand_transclusions=false\n").unwrap();
+        compile_edition(&project_path, &recipe_path).unwrap();
+        assert!(
+            fs::read_to_string(project_path.join("exports/reader.md"))
+                .unwrap()
+                .contains("The story begins.")
+        );
+        assert!(
+            project_path
+                .join("exports/reader.md.source-map.json")
+                .exists()
+        );
+        use std::os::unix::fs::PermissionsExt;
+        fs::create_dir_all(project_path.join("dictionaries")).unwrap();
+        fs::write(project_path.join("dictionaries/en.txt"), "known\n").unwrap();
+        let mock = root.path().join("aspell");
+        fs::write(
+            &mock,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'baad\\nknown\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&mock, fs::Permissions::from_mode(0o755)).unwrap();
+        let checked_recipe = root.path().join("checked.toml");
+        fs::write(&checked_recipe, "version=1\nname='Checked reader'\nformat='markdown'\noutput='exports/checked.md'\nspellcheck=true\nlanguage='en_GB'\ndictionary='dictionaries/en.txt'\n").unwrap();
+        compile_edition_with_aspell(&project_path, &checked_recipe, mock.to_str().unwrap())
+            .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(project_path.join("exports/checked.md.spellcheck.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report[0]["candidates"]["baad"], 1);
+        assert!(report[0]["candidates"].get("known").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edition_output_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Novel");
+        drop(WriterApp::create_project(&project_path, "Novel").unwrap());
+        let outside = root.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(project_path.join("exports")).unwrap();
+        symlink(&outside, project_path.join("exports/link")).unwrap();
+        let recipe = root.path().join("edition.toml");
+        fs::write(
+            &recipe,
+            "version=1\nname='Escape'\nformat='markdown'\noutput='exports/link/out.md'\n",
+        )
+        .unwrap();
+        assert!(compile_edition(&project_path, &recipe).is_err());
+        assert!(!outside.join("out.md").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn spelling_candidates_use_local_dictionary_without_modifying_prose() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Novel");
+        let mut project = WriterApp::create_project(&project_path, "Novel").unwrap();
+        let chapter = project.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = project.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = project.load_scene_text(scene).unwrap();
+        project
+            .save_scene_text(scene, Some(&hash), "The manuscript stays unchanged.")
+            .unwrap();
+        drop(project);
+        fs::create_dir_all(project_path.join("dictionaries")).unwrap();
+        fs::write(project_path.join("dictionaries/en.txt"), "known\n").unwrap();
+        let fake_aspell = root.path().join("aspell-mock");
+        fs::write(
+            &fake_aspell,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'Baad\\nKnown\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_aspell, fs::Permissions::from_mode(0o755)).unwrap();
+        let before = WriterApp::open_project(&project_path)
+            .unwrap()
+            .load_scene_text(scene)
+            .unwrap()
+            .0;
+        let findings = spellcheck_project(
+            &project_path,
+            "en",
+            Some("dictionaries/en.txt"),
+            fake_aspell.to_str().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(findings[0].candidates.get("baad"), Some(&1));
+        assert!(!findings[0].candidates.contains_key("known"));
+        let after = WriterApp::open_project(&project_path)
+            .unwrap()
+            .load_scene_text(scene)
+            .unwrap()
+            .0;
+        assert_eq!(before, after);
     }
 }

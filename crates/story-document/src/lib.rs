@@ -463,6 +463,75 @@ pub enum BookDesign {
     Nonfiction,
 }
 
+/// Portable, project-relative compile edition configuration.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EditionRecipe {
+    pub version: u16,
+    pub name: String,
+    pub format: CompileFormat,
+    /// Destination within the project; absolute paths and parent traversal are forbidden.
+    pub output: String,
+    #[serde(default)]
+    pub design: BookDesign,
+    #[serde(default)]
+    pub expand_transclusions: bool,
+    #[serde(default)]
+    pub spellcheck: bool,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub dictionary: Option<String>,
+}
+
+impl EditionRecipe {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err(format!(
+                "unsupported edition recipe version {}",
+                self.version
+            ));
+        }
+        if self.name.trim().is_empty() {
+            return Err("edition name cannot be empty".into());
+        }
+        validate_project_relative_path(&self.output)?;
+        if self.spellcheck && self.language.as_deref().is_none_or(str::is_empty) {
+            return Err("spellcheck editions require a language tag".into());
+        }
+        if let Some(dictionary) = &self.dictionary {
+            if !self.spellcheck {
+                return Err("edition dictionary is only valid when spellcheck is enabled".into());
+            }
+            validate_project_relative_path(dictionary)?;
+        }
+        Ok(())
+    }
+    pub fn from_toml(source: &str) -> Result<Self, String> {
+        let recipe: Self = toml::from_str(source).map_err(|error| error.to_string())?;
+        recipe.validate()?;
+        Ok(recipe)
+    }
+    pub fn to_toml(&self) -> Result<String, String> {
+        self.validate()?;
+        toml::to_string_pretty(self).map_err(|error| error.to_string())
+    }
+}
+
+fn validate_project_relative_path(value: &str) -> Result<(), String> {
+    let path = Path::new(value);
+    if value.trim().is_empty()
+        || path.is_absolute()
+        || path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!(
+            "edition paths must be non-empty project-relative paths without traversal: {value}"
+        ));
+    }
+    Ok(())
+}
+
 impl BookDesign {
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
@@ -685,6 +754,29 @@ pub fn source_fingerprint(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn edition_recipes_validate_round_trip_and_reject_path_escape() {
+        let recipe = EditionRecipe {
+            version: 1,
+            name: "Reader EPUB".into(),
+            format: CompileFormat::Epub,
+            output: "exports/reader.epub".into(),
+            design: BookDesign::Nonfiction,
+            expand_transclusions: true,
+            spellcheck: false,
+            language: None,
+            dictionary: None,
+        };
+        assert_eq!(
+            EditionRecipe::from_toml(&recipe.to_toml().unwrap()).unwrap(),
+            recipe
+        );
+        let mut invalid = recipe;
+        invalid.output = "../outside.epub".into();
+        assert!(invalid.validate().is_err());
+        invalid.output = "exports/out.epub".into();
+    }
     use std::io::Read;
 
     #[test]

@@ -207,6 +207,6 @@ Issue #5 adds persisted challenge start/deadline/target/mode/results, terminal c
 
 Issue #15 adds read-only character/plotline scene coverage checks exposed through `coverage`, plus persisted saved-query count assertions exposed through `query-assert-save`/`query-assert-check` in CLI and terminal. Coverage authoring UI remains outstanding.
 
-Issue #16 adds `compile-watch`, which recompiles on changes to project metadata, database or manuscript source while preserving the last successful output on failure. Assemblies support alternate editions; edition dictionaries and declarative build recipes remain outstanding.
+Issue #16 adds project-relative edition recipes with `compile-edition`/`watch-edition`, source-map output, symlink/traversal protection, and local Aspell-based spellchecking with optional project word lists. The original `compile-watch` command remains. Assemblies support alternate ordering. Multi-stage pipeline automation and broader dictionary formats remain open; spelling requires an Aspell executable installed locally.
 
 Issue #3 adds an in-editor timer and opt-in Kamikaze inactivity behavior. Kamikaze removes the previous word after ten seconds without typing; Undo restores it. Configuration and richer challenge modes remain open. Phase 5 is a partial implementation milestone, not full closure of the listed issues.

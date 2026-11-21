@@ -1,0 +1,9 @@
+version = 1
+name = "Reader EPUB"
+format = "epub"
+output = "exports/reader.epub"
+design = "nonfiction"
+expand_transclusions = false
+spellcheck = true
+language = "en_GB"
+dictionary = "dictionaries/project-words.txt"
