@@ -711,6 +711,9 @@ pub enum SceneQueryFilter {
     Event(EventId),
     Chapter(String),
     TextContains(String),
+    /// Included scene membership in a named manuscript assembly.
+    Assembly(AssemblyId),
+    IssueStatus(String),
     CustomMetadataEquals {
         field_id: FieldId,
         value: FieldValue,

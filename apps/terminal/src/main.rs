@@ -5351,15 +5351,18 @@ impl AppState {
             let entity_id = parts.next().unwrap_or_default().trim();
             let minimum_scenes = parts
                 .next()
-                .ok_or("use coverage-add ID character|plotline ENTITY-UUID MIN LABEL")?
+                .ok_or("use coverage-add ID character|plotline|pov|location|event ENTITY-UUID MIN LABEL")?
                 .parse::<usize>()?;
             let label = parts.next().unwrap_or_default().trim();
             if id.is_empty()
                 || label.is_empty()
                 || entity_id.is_empty()
-                || !matches!(dimension, "character" | "plotline")
+                || !matches!(
+                    dimension,
+                    "character" | "plotline" | "pov" | "location" | "event"
+                )
             {
-                return Err("coverage requires a unique ID, character|plotline dimension, entity UUID, minimum and label".into());
+                return Err("coverage requires a unique ID, supported dimension, entity UUID, minimum and label".into());
             }
             let root = self.app.project_root();
             let mut config = load_coverage_config(root)?;
@@ -5539,6 +5542,10 @@ impl AppState {
                     "event" => {
                         story_core::SceneQueryFilter::Event(story_core::EventId(value.parse()?))
                     }
+                    "assembly" => story_core::SceneQueryFilter::Assembly(story_core::AssemblyId(
+                        value.parse()?,
+                    )),
+                    "issue-status" => story_core::SceneQueryFilter::IssueStatus(value.into()),
                     "chapter" => story_core::SceneQueryFilter::Chapter(value.into()),
                     "text" => story_core::SceneQueryFilter::TextContains(value.into()),
                     "meta" => {
@@ -8627,6 +8634,9 @@ fn coverage_report_rows(root: &Path, scenes: &[story_analysis::SceneAnalysisInpu
                 dimension: match entry.dimension.as_str() {
                     "character" => story_analysis::CoverageDimension::Character,
                     "plotline" => story_analysis::CoverageDimension::Plotline,
+                    "pov" => story_analysis::CoverageDimension::Pov,
+                    "location" => story_analysis::CoverageDimension::Location,
+                    "event" => story_analysis::CoverageDimension::Event,
                     _ => return Err(format!("unsupported dimension {}", entry.dimension)),
                 },
                 minimum_scenes: entry.minimum_scenes,
@@ -12213,6 +12223,8 @@ mod tests {
                 } else {
                     Vec::new()
                 },
+                locations: Vec::new(),
+                events: Vec::new(),
             })
             .collect::<Vec<_>>();
         let rows = analytics_report_rows(&scenes, Some(2_000), 500, 2);
@@ -12249,6 +12261,8 @@ mod tests {
             end_time: story_core::StoryTime::unknown(),
             characters: vec![],
             plotlines: vec![],
+            locations: vec![],
+            events: vec![],
         };
         let rows = analytics_report_rows(&[scene], Some(200), 50, 0);
         assert!(

@@ -965,6 +965,8 @@ fn analysis_input(input: &PipelineInput) -> Vec<SceneAnalysisInput> {
                     name: name.clone(),
                 })
                 .collect(),
+            locations: Vec::new(),
+            events: Vec::new(),
         })
         .collect()
 }

@@ -252,6 +252,12 @@ pub struct PlotlineOnScene {
     pub name: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoryEntityOnScene {
+    pub id: String,
+    pub name: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct SceneAnalysisInput {
     pub scene_id: String,
@@ -263,6 +269,8 @@ pub struct SceneAnalysisInput {
     pub end_time: story_core::StoryTime,
     pub characters: Vec<CharacterOnScene>,
     pub plotlines: Vec<PlotlineOnScene>,
+    pub locations: Vec<StoryEntityOnScene>,
+    pub events: Vec<StoryEntityOnScene>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -334,6 +342,9 @@ pub struct CoverageRequirement {
 pub enum CoverageDimension {
     Character,
     Plotline,
+    Pov,
+    Location,
+    Event,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -362,6 +373,17 @@ pub fn evaluate_coverage(
                     }),
                     CoverageDimension::Plotline => scene
                         .plotlines
+                        .iter()
+                        .any(|item| item.id == requirement.entity_id),
+                    CoverageDimension::Pov => scene.characters.iter().any(|item| {
+                        item.id == requirement.entity_id && item.role == ParticipationRole::Pov
+                    }),
+                    CoverageDimension::Location => scene
+                        .locations
+                        .iter()
+                        .any(|item| item.id == requirement.entity_id),
+                    CoverageDimension::Event => scene
+                        .events
                         .iter()
                         .any(|item| item.id == requirement.entity_id),
                 })
@@ -510,11 +532,26 @@ mod inspection_tests {
             end_time: story_core::StoryTime::unknown(),
             characters: vec![],
             plotlines: vec![],
+            locations: vec![],
+            events: vec![],
         }];
         scenes[0].characters.push(CharacterOnScene {
             id: "c1".into(),
             name: "Ada".into(),
             role: ParticipationRole::Major,
+        });
+        scenes[0].characters.push(CharacterOnScene {
+            id: "c-pov".into(),
+            name: "POV".into(),
+            role: ParticipationRole::Pov,
+        });
+        scenes[0].locations.push(StoryEntityOnScene {
+            id: "loc".into(),
+            name: "Dock".into(),
+        });
+        scenes[0].events.push(StoryEntityOnScene {
+            id: "event".into(),
+            name: "Signal".into(),
         });
         scenes[0].characters.push(CharacterOnScene {
             id: "c-mentioned".into(),
@@ -539,6 +576,20 @@ mod inspection_tests {
             minimum_scenes: 1,
         };
         assert!(!evaluate_coverage(&scenes, &[mention_only])[0].coverage_met);
+        for (dimension, entity_id) in [
+            (CoverageDimension::Pov, "c-pov"),
+            (CoverageDimension::Location, "loc"),
+            (CoverageDimension::Event, "event"),
+        ] {
+            let requirement = CoverageRequirement {
+                id: entity_id.into(),
+                label: entity_id.into(),
+                entity_id: entity_id.into(),
+                dimension,
+                minimum_scenes: 1,
+            };
+            assert!(evaluate_coverage(&scenes, &[requirement])[0].coverage_met);
+        }
         assert!(evaluate_query_assertion(1, &story_core::QueryAssertion::Exactly(1)).passed);
         assert!(!evaluate_query_assertion(0, &story_core::QueryAssertion::NonEmpty).passed);
     }
@@ -760,6 +811,8 @@ mod tests {
                     name: (*id).into(),
                 })
                 .collect(),
+            locations: vec![],
+            events: vec![],
         }
     }
 

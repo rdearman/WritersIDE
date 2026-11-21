@@ -223,3 +223,5 @@ Character absence is now an explicit scene relationship with notes. Unrecorded p
 Saved queries now include typed scalar custom-metadata equality predicates keyed by field UUID, with validation against the declared field type and enum options. The CLI and terminal accept `meta=FIELD-UUID:VALUE` filters; prefixes distinguish non-text types. Entity-reference-list membership queries are not yet supported.
 
 Events can now have explicit `precedes` and `requires` dependency edges with notes. SQLite rejects self-links and dependency cycles, including direct SQL attempts. Inspection compares the recorded end and start story-time intervals and keeps ambiguous/missing dates UNKNOWN; manuscript disclosure order does not substitute for fictional chronology.
+
+Inspection queries now filter scenes by included membership in a named assembly and by any issue status. Coverage requirements now include POV, location and event, using stable entity relationships; mention-only character records remain excluded from presence coverage. These analytical projections do not reorder or mutate manuscript content.

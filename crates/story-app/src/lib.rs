@@ -162,6 +162,18 @@ impl WriterApp {
     }
     pub fn analytics_dataset(&self) -> Result<Vec<story_analysis::SceneAnalysisInput>> {
         let mut result = Vec::new();
+        let locations = self
+            .store
+            .list_locations()?
+            .into_iter()
+            .map(|item| (item.id.to_string(), item.name))
+            .collect::<std::collections::HashMap<_, _>>();
+        let events = self
+            .store
+            .list_events()?
+            .into_iter()
+            .map(|item| (item.id.to_string(), item.title))
+            .collect::<std::collections::HashMap<_, _>>();
         for row in self.store.list_scenes(false)? {
             let characters = self
                 .store
@@ -184,6 +196,28 @@ impl WriterApp {
                 .into_iter()
                 .map(|(id, name)| story_analysis::PlotlineOnScene { id, name })
                 .collect();
+            let mut location_ids = std::collections::BTreeSet::new();
+            location_ids.extend(row.scene.start_location.map(|id| id.to_string()));
+            location_ids.extend(row.scene.end_location.map(|id| id.to_string()));
+            let locations = location_ids
+                .into_iter()
+                .map(|id| story_analysis::StoryEntityOnScene {
+                    name: locations.get(&id).cloned().unwrap_or_else(|| id.clone()),
+                    id,
+                })
+                .collect();
+            let events = self
+                .store
+                .scene_event_links(row.scene.id)?
+                .into_iter()
+                .map(|(id, _kind)| id.to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .map(|id| story_analysis::StoryEntityOnScene {
+                    name: events.get(&id).cloned().unwrap_or_else(|| id.clone()),
+                    id,
+                })
+                .collect();
             result.push(story_analysis::SceneAnalysisInput {
                 scene_id: row.scene.id.to_string(),
                 title: row.scene.title,
@@ -194,6 +228,8 @@ impl WriterApp {
                 end_time: row.scene.end_time,
                 characters,
                 plotlines,
+                locations,
+                events,
             });
         }
         Ok(result)
@@ -2163,6 +2199,12 @@ mod tests {
             WordAttributionPolicy::Overlap,
         )
         .unwrap();
+        let location = app.create_location("Harbor").unwrap();
+        let mut scene_metadata = app.get_scene(first).unwrap().scene;
+        scene_metadata.start_location = Some(location);
+        app.update_scene_metadata(&scene_metadata).unwrap();
+        let event = app.add_event("The signal", "day 1").unwrap();
+        app.link_event(first, event, "depicts").unwrap();
         let before = app
             .list_scenes(false)
             .unwrap()
@@ -2179,6 +2221,8 @@ mod tests {
         assert_eq!(before, after);
         assert_eq!(data[0].characters[0].name, "Mara");
         assert_eq!(data[0].plotlines[0].name, "A thread");
+        assert_eq!(data[0].locations[0].name, "Harbor");
+        assert_eq!(data[0].events[0].name, "The signal");
     }
 
     #[test]

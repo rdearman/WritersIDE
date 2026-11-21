@@ -739,15 +739,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "coverage" => {
             let path = args.next().ok_or("missing project path")?;
-            let dimension = match args
-                .next()
-                .as_deref()
-                .ok_or("missing character|plotline dimension")?
-            {
-                "character" => story_analysis::CoverageDimension::Character,
-                "plotline" => story_analysis::CoverageDimension::Plotline,
-                _ => return Err("coverage dimension must be character or plotline".into()),
-            };
+            let dimension =
+                match args
+                    .next()
+                    .as_deref()
+                    .ok_or("missing character|plotline|pov|location|event dimension")?
+                {
+                    "character" => story_analysis::CoverageDimension::Character,
+                    "plotline" => story_analysis::CoverageDimension::Plotline,
+                    "pov" => story_analysis::CoverageDimension::Pov,
+                    "location" => story_analysis::CoverageDimension::Location,
+                    "event" => story_analysis::CoverageDimension::Event,
+                    _ => return Err(
+                        "coverage dimension must be character, plotline, pov, location or event"
+                            .into(),
+                    ),
+                };
             let entity_id = args.next().ok_or("missing entity UUID")?;
             let minimum_scenes = args
                 .next()
@@ -1681,6 +1688,9 @@ fn dimension_label(dimension: story_analysis::CoverageDimension) -> &'static str
     match dimension {
         story_analysis::CoverageDimension::Character => "character",
         story_analysis::CoverageDimension::Plotline => "plotline",
+        story_analysis::CoverageDimension::Pov => "pov",
+        story_analysis::CoverageDimension::Location => "location",
+        story_analysis::CoverageDimension::Event => "event",
     }
 }
 
@@ -2093,6 +2103,8 @@ fn parse_scene_query_filter(
         "plotline" => SceneQueryFilter::Plotline(story_core::PlotlineId(value.parse()?)),
         "location" => SceneQueryFilter::Location(story_core::LocationId(value.parse()?)),
         "event" => SceneQueryFilter::Event(story_core::EventId(value.parse()?)),
+        "assembly" => SceneQueryFilter::Assembly(story_core::AssemblyId(value.parse()?)),
+        "issue-status" => SceneQueryFilter::IssueStatus(value.to_owned()),
         "chapter" => SceneQueryFilter::Chapter(value.to_owned()),
         "text" => SceneQueryFilter::TextContains(value.to_owned()),
         "meta" => {
