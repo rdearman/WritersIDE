@@ -116,6 +116,7 @@ struct AppState {
     reading_focus: bool,
     reading_selection_start: Option<u64>,
     function_bindings: Vec<(u8, Workspace)>,
+    command_bindings: CommandBindings,
     revision_diff: Option<story_core::SnapshotId>,
     revision_scene: Option<SceneId>,
     revision_index: usize,
@@ -291,7 +292,10 @@ struct RevisionHunk {
 
 #[derive(Deserialize)]
 struct KeymapFile {
+    #[serde(default)]
     bindings: BTreeMap<String, String>,
+    #[serde(default)]
+    commands: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1944,6 +1948,99 @@ fn load_bindings(project: &Path) -> Result<Vec<(u8, Workspace)>, Box<dyn std::er
     }
     Ok(result)
 }
+
+type CommandBindings = Vec<(KeyEvent, String)>;
+
+fn parse_shortcut(value: &str) -> Result<KeyEvent, Box<dyn std::error::Error>> {
+    let parts = value.split('+').collect::<Vec<_>>();
+    let key = parts.last().copied().ok_or("empty key chord")?;
+    let mut modifiers = KeyModifiers::empty();
+    for modifier in &parts[..parts.len().saturating_sub(1)] {
+        let flag = match modifier.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => KeyModifiers::CONTROL,
+            "alt" => KeyModifiers::ALT,
+            "shift" => KeyModifiers::SHIFT,
+            _ => return Err(format!("unsupported key modifier: {modifier}").into()),
+        };
+        if modifiers.contains(flag) {
+            return Err(format!("duplicate key modifier: {modifier}").into());
+        }
+        modifiers |= flag;
+    }
+    if modifiers.is_empty() {
+        return Err("command shortcuts must include Ctrl, Alt, or Shift".into());
+    }
+    let code = if let Some(number) = key.strip_prefix('F').or_else(|| key.strip_prefix('f')) {
+        let number: u8 = number.parse()?;
+        if !(1..=14).contains(&number) || number == 10 {
+            return Err("function shortcut must be F1–F9 or F11–F14".into());
+        }
+        KeyCode::F(number)
+    } else {
+        let mut chars = key.chars();
+        let Some(character) = chars.next() else {
+            return Err("missing shortcut key".into());
+        };
+        if chars.next().is_some() || !character.is_ascii() {
+            return Err("shortcut key must be one ASCII character or F-key".into());
+        }
+        KeyCode::Char(character.to_ascii_lowercase())
+    };
+    Ok(KeyEvent::new(code, modifiers))
+}
+
+fn is_reserved_command_shortcut(event: KeyEvent) -> bool {
+    let ctrl = KeyModifiers::CONTROL;
+    let exact = |code, modifiers| event.code == code && event.modifiers == modifiers;
+    exact(KeyCode::F(10), KeyModifiers::NONE)
+        || exact(KeyCode::Char('/'), ctrl)
+        || exact(KeyCode::Char('_'), ctrl)
+        || exact(KeyCode::Char('s'), ctrl)
+        || exact(KeyCode::Char('z'), ctrl)
+        || exact(KeyCode::Char('y'), ctrl)
+        || exact(KeyCode::Char('z'), ctrl | KeyModifiers::SHIFT)
+        || exact(KeyCode::Char('g'), ctrl)
+        || exact(KeyCode::Tab, ctrl)
+        || exact(KeyCode::F(3), KeyModifiers::NONE)
+        || exact(KeyCode::F(3), KeyModifiers::SHIFT)
+}
+
+fn same_keycode(left: KeyCode, right: KeyCode) -> bool {
+    match (left, right) {
+        (KeyCode::Char(a), KeyCode::Char(b)) => a.eq_ignore_ascii_case(&b),
+        _ => left == right,
+    }
+}
+
+fn load_command_bindings(project: &Path) -> Result<CommandBindings, Box<dyn std::error::Error>> {
+    let path = project.join(".writers-ide/keybindings.toml");
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let config: KeymapFile = toml::from_str(&text)?;
+    let mut result = Vec::new();
+    for (chord, id) in config.commands {
+        let event = parse_shortcut(&chord)?;
+        if is_reserved_command_shortcut(event) {
+            return Err(format!("{chord} conflicts with a reserved application shortcut").into());
+        }
+        if result.iter().any(|(existing, _): &(KeyEvent, String)| {
+            existing.code == event.code && existing.modifiers == event.modifiers
+        }) {
+            return Err(format!("duplicate command shortcut: {chord}").into());
+        }
+        let command = command_by_id(&id).ok_or_else(|| format!("unknown command ID: {id}"))?;
+        if command.takes_arguments {
+            return Err(
+                format!("command {id} requires arguments and cannot be bound directly").into(),
+            );
+        }
+        result.push((event, id));
+    }
+    Ok(result)
+}
 impl AppState {
     fn new(app: WriterApp, function_bindings: Vec<(u8, Workspace)>) -> Self {
         let draft_notice = list_challenge_drafts(app.project_root())
@@ -2031,6 +2128,7 @@ impl AppState {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings,
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -6980,9 +7078,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: writers-ide-tui <project-path>")?;
     let project_path = std::path::PathBuf::from(path);
     let function_bindings = load_bindings(&project_path)?;
+    let command_bindings = load_command_bindings(&project_path)?;
     let mut app = WriterApp::open_project(&project_path)?;
     app.recover_interrupted_writing_challenges()?;
     let mut state = AppState::new(app, function_bindings);
+    state.command_bindings = command_bindings;
     state.restore_session()?;
     state.refresh()?;
     let mut terminal = setup()?;
@@ -9596,6 +9696,20 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         return Ok(false);
     }
+    if let Some((_, id)) = s
+        .command_bindings
+        .iter()
+        .find(|(event, _)| same_keycode(event.code, k.code) && event.modifiers == k.modifiers)
+    {
+        if let Some(command) = command_by_id(id) {
+            if let Some(reason) = s.command_disabled_reason(command) {
+                s.message = reason.into();
+            } else {
+                s.dispatch_registered(command.action)?;
+            }
+        }
+        return Ok(false);
+    }
     if s.workspace == Workspace::Editor && k.code == KeyCode::F(3) {
         s.navigate_search_match(!k.modifiers.contains(KeyModifiers::SHIFT))?;
         return Ok(false);
@@ -10110,6 +10224,61 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_shortcuts_load_from_registry_and_dispatch_without_replacing_slash_input() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
+        let config = project.project_root().join(".writers-ide/keybindings.toml");
+        fs::write(&config, "[commands]\n\"Ctrl+Alt+A\" = \"view.analytics\"\n").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.command_bindings = load_command_bindings(state.app.project_root()).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(
+                KeyCode::Char('a'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Analytics);
+        state.workspace = Workspace::Editor;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.editor.join("\n").contains('/'));
+    }
+
+    #[test]
+    fn command_shortcuts_reject_duplicates_reserved_keys_unknown_and_argument_commands() {
+        assert!(parse_shortcut("A").is_err());
+        assert!(parse_shortcut("Ctrl+Alt+F10").is_err());
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
+        let config = project.project_root().join(".writers-ide/keybindings.toml");
+        fs::write(&config, "[commands]\n\"Ctrl+/\" = \"view.editor\"\n").unwrap();
+        assert!(load_command_bindings(project.project_root()).is_err());
+        fs::write(
+            &config,
+            "[commands]\n\"Ctrl+Alt+A\" = \"unknown.command\"\n",
+        )
+        .unwrap();
+        assert!(load_command_bindings(project.project_root()).is_err());
+        fs::write(
+            &config,
+            "[commands]\n\"Ctrl+Alt+A\" = \"compile.selected\"\n",
+        )
+        .unwrap();
+        assert!(load_command_bindings(project.project_root()).is_err());
+        fs::write(
+            &config,
+            "[commands]\n\"Ctrl+Alt+A\" = \"view.editor\"\n\"Ctrl+Alt+a\" = \"view.analytics\"\n",
+        )
+        .unwrap();
+        assert!(load_command_bindings(project.project_root()).is_err());
+    }
 
     #[test]
     fn command_registry_has_stable_unique_ids_and_compile_taxonomy() {
@@ -11589,6 +11758,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -12079,6 +12249,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -12171,6 +12342,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -12255,6 +12427,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -12351,6 +12524,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -12597,6 +12771,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -12693,6 +12868,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -12806,6 +12982,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -13037,6 +13214,7 @@ mod tests {
             reading_focus: true,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -13399,6 +13577,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -13506,6 +13685,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -13665,6 +13845,7 @@ mod tests {
             reading_focus: false,
             reading_selection_start: None,
             function_bindings: default_bindings(),
+            command_bindings: Vec::new(),
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
