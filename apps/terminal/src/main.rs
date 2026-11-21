@@ -4503,7 +4503,9 @@ impl AppState {
                     format!(
                         "{} p{} {}{}: {}",
                         item.kind,
-                        item.paragraph_index + 1,
+                        item.paragraph_index
+                            .map(|index| (index + 1).to_string())
+                            .unwrap_or_else(|| "?".into()),
                         item.author.unwrap_or_else(|| "unknown author".into()),
                         item.date
                             .map(|date| format!(" · {date}"))
