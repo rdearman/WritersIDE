@@ -514,6 +514,22 @@ mod multilingual_tests {
     }
 
     #[test]
+    fn multilingual_budget_policies_cover_issue_four_languages_and_hangul_jamo() {
+        use super::{WordCountPolicy, count_words_with_policy};
+        let unicode = WordCountPolicy::UnicodeWords;
+        let script = WordCountPolicy::UnspacedScriptGraphemes;
+        for sentence in ["L'autrice è qui.", "L’autrice est là."] {
+            assert_eq!(count_words_with_policy(sentence, unicode), 3);
+        }
+        assert_eq!(count_words_with_policy("한국어", unicode), 1);
+        assert_eq!(count_words_with_policy("한국어", script), 3);
+        // Decomposed Hangul jamo are counted by extended grapheme cluster,
+        // keeping a composed syllable and its jamo representation consistent.
+        assert_eq!(count_words_with_policy("한글", script), 2);
+        assert_eq!(count_words_with_policy("cafe\u{301}", unicode), 1);
+    }
+
+    #[test]
     fn find_replace_support_normal_extended_and_regex_modes() {
         use super::{FindMode, find_matches, replace_matches};
         let source = "one\ntwo 22";
