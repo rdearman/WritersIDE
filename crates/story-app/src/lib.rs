@@ -851,6 +851,26 @@ impl WriterApp {
     pub fn list_writing_challenges(&self) -> Result<Vec<story_storage::WritingChallengeRecord>> {
         Ok(self.store.list_writing_challenges()?)
     }
+    pub fn start_writing_session(
+        &mut self,
+        scene_id: Option<SceneId>,
+        start_words: u32,
+    ) -> Result<String> {
+        Ok(self.store.start_writing_session(scene_id, start_words)?)
+    }
+    pub fn finish_writing_session(
+        &mut self,
+        id: &str,
+        end_words: u32,
+        abandoned: bool,
+    ) -> Result<()> {
+        Ok(self
+            .store
+            .finish_writing_session(id, end_words, abandoned)?)
+    }
+    pub fn list_writing_sessions(&self) -> Result<Vec<story_storage::WritingSessionRecord>> {
+        Ok(self.store.list_writing_sessions()?)
+    }
     pub fn list_characters(&self) -> Result<Vec<story_storage::CharacterSummary>> {
         Ok(self.store.list_characters()?)
     }

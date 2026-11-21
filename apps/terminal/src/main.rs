@@ -104,6 +104,7 @@ struct AppState {
     typed_characters: u64,
     pasted_characters: u64,
     successful_saves: u64,
+    writing_session: Option<ActiveWritingSession>,
     scroll: usize,
     reading_document: Option<story_core::ReadingId>,
     reading_text: String,
@@ -147,6 +148,13 @@ struct ActiveWritingChallenge {
     mode: String,
     last_activity: Instant,
     kamikaze_idle_seconds: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveWritingSession {
+    id: String,
+    scene_id: Option<SceneId>,
+    initial_words: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -1568,6 +1576,19 @@ impl AppState {
                 format!("Editor tools not loaded: {error}"),
             ),
         };
+        let writing_session = app
+            .list_writing_sessions()
+            .ok()
+            .and_then(|sessions| {
+                sessions
+                    .into_iter()
+                    .find(|session| session.status == "active")
+            })
+            .map(|session| ActiveWritingSession {
+                id: session.id,
+                scene_id: session.scene_id,
+                initial_words: session.start_words,
+            });
         Self {
             app,
             workspace: Workspace::Dashboard,
@@ -1589,10 +1610,11 @@ impl AppState {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
-            writing_stats_enabled: false,
+            writing_stats_enabled: writing_session.is_some(),
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -1771,7 +1793,8 @@ impl AppState {
         };
         self.horizontal_split_ratio = snapshot.horizontal_split_ratio.clamp(20, 80);
         self.vertical_split_ratio = snapshot.vertical_split_ratio.clamp(20, 80);
-        self.writing_stats_enabled = snapshot.writing_stats_enabled;
+        self.writing_stats_enabled =
+            snapshot.writing_stats_enabled && self.writing_session.is_some();
         self.typed_characters = snapshot.typed_characters;
         self.pasted_characters = snapshot.pasted_characters;
         self.successful_saves = snapshot.successful_saves;
@@ -1892,6 +1915,28 @@ impl AppState {
     }
     fn active_scene(&self) -> Option<SceneId> {
         self.scenes.get(self.selected).map(|x| x.0)
+    }
+    fn current_writing_words(
+        &self,
+        scene_id: Option<SceneId>,
+    ) -> Result<u32, Box<dyn std::error::Error>> {
+        if let Some(scene_id) = scene_id {
+            let text = if self.editing_scene == Some(scene_id) {
+                self.editor.join("\n")
+            } else {
+                self.app.load_scene_text(scene_id)?.0
+            };
+            return Ok(story_core::count_words(&text));
+        }
+        let mut total = self.scenes.iter().map(|row| u64::from(row.3)).sum::<u64>();
+        if let Some(scene_id) = self.editing_scene
+            && let Some(row) = self.scenes.iter().find(|row| row.0 == scene_id)
+        {
+            total = total.saturating_sub(u64::from(row.3));
+            total =
+                total.saturating_add(u64::from(story_core::count_words(&self.editor.join("\n"))));
+        }
+        Ok(total.min(u64::from(u32::MAX)) as u32)
     }
     fn scenes_for_scope(
         &self,
@@ -2799,12 +2844,30 @@ impl AppState {
         } else if let Some(value) = cmd.strip_prefix("writing-stats ") {
             match value.trim() {
                 "on" => {
+                    if self.writing_session.is_none() {
+                        let scene_id = self.editing_scene.or_else(|| self.active_scene());
+                        let initial_words = self.current_writing_words(scene_id)?;
+                        let id = self.app.start_writing_session(scene_id, initial_words)?;
+                        self.writing_session = Some(ActiveWritingSession {
+                            id,
+                            scene_id,
+                            initial_words,
+                        });
+                    }
                     self.writing_stats_enabled = true;
-                    self.message = "Local aggregate writing statistics enabled; manuscript text is never logged".into();
+                    self.message =
+                        "Local writing session started; manuscript text is never logged".into();
                 }
                 "off" => {
+                    if let Some(session) = self.writing_session.take() {
+                        let end_words = self
+                            .current_writing_words(session.scene_id)
+                            .unwrap_or(session.initial_words);
+                        self.app
+                            .finish_writing_session(&session.id, end_words, false)?;
+                    }
                     self.writing_stats_enabled = false;
-                    self.message = "Writing statistics disabled".into();
+                    self.message = "Writing statistics disabled; session words recorded".into();
                 }
                 "report" => {
                     self.message = format!(
@@ -6359,6 +6422,9 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             rows.extend(daily_writing_rows(
                 &s.app.list_writing_challenges().unwrap_or_default(),
             ));
+            let sessions = s.app.list_writing_sessions().unwrap_or_default();
+            rows.extend(daily_session_rows(&sessions));
+            rows.extend(scene_writing_rows(&sessions, &data));
             rows.extend(coverage_report_rows(s.app.project_root(), &data));
             rows
         }
@@ -6486,6 +6552,77 @@ fn daily_writing_rows(challenges: &[story_storage::WritingChallengeRecord]) -> V
             let bar = "█".repeat(filled);
             let session_label = if sessions == 1 { "session" } else { "sessions" };
             format!("{date}  {bar}  {words} words · {sessions} {session_label} · {cumulative} cumulative")
+        })
+        .collect()
+}
+
+fn daily_session_rows(sessions: &[story_storage::WritingSessionRecord]) -> Vec<String> {
+    let mut days = BTreeMap::<String, (i64, usize)>::new();
+    for session in sessions {
+        let Some(delta) = session.words_delta else {
+            continue;
+        };
+        let Ok(timestamp) = time::OffsetDateTime::from_unix_timestamp(session.started_at) else {
+            continue;
+        };
+        let date = format!(
+            "{:04}-{:02}-{:02}",
+            timestamp.year(),
+            u8::from(timestamp.month()),
+            timestamp.day()
+        );
+        let entry = days.entry(date).or_default();
+        entry.0 = entry.0.saturating_add(delta);
+        entry.1 += 1;
+    }
+    let maximum = days
+        .values()
+        .map(|entry| entry.0.unsigned_abs())
+        .max()
+        .unwrap_or(0);
+    let mut cumulative = 0i64;
+    days.into_iter()
+        .map(|(date, (delta, count))| {
+            cumulative = cumulative.saturating_add(delta);
+            let filled = delta
+                .unsigned_abs()
+                .saturating_mul(20)
+                .checked_div(maximum)
+                .unwrap_or(0)
+                .min(20) as usize;
+            let sign = if delta < 0 { "−" } else { "" };
+            format!(
+                "Drafting · {date}  {sign}{}  {delta:+} words · {count} sessions · {cumulative:+} cumulative",
+                "█".repeat(filled)
+            )
+        })
+        .collect()
+}
+
+fn scene_writing_rows(
+    sessions: &[story_storage::WritingSessionRecord],
+    scenes: &[story_analysis::SceneAnalysisInput],
+) -> Vec<String> {
+    let titles = scenes
+        .iter()
+        .map(|scene| (scene.scene_id.as_str(), scene.title.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let mut totals = BTreeMap::<String, (i64, usize)>::new();
+    for session in sessions {
+        let (Some(scene_id), Some(delta)) = (session.scene_id, session.words_delta) else {
+            continue;
+        };
+        let entry = totals.entry(scene_id.to_string()).or_default();
+        entry.0 = entry.0.saturating_add(delta);
+        entry.1 += 1;
+    }
+    totals
+        .into_iter()
+        .map(|(id, (delta, count))| {
+            format!(
+                "Scene writing · {} · {delta:+} net words · {count} sessions",
+                titles.get(id.as_str()).copied().unwrap_or("Deleted scene")
+            )
         })
         .collect()
 }
@@ -7576,6 +7713,32 @@ mod tests {
     }
 
     #[test]
+    fn general_writing_session_records_scene_net_words_and_analytics_rows() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut app = project;
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.scenes = vec![(scene, "Scene".into(), SceneStatus::Idea, 0)];
+        state.editor = vec!["one two".into()];
+        state.editing_scene = Some(scene);
+        state
+            .execute_legacy_palette_command("writing-stats on")
+            .unwrap();
+        state.editor = vec!["one two three four".into()];
+        state
+            .execute_legacy_palette_command("writing-stats off")
+            .unwrap();
+        let sessions = state.app.list_writing_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].scene_id, Some(scene));
+        assert_eq!(sessions[0].words_delta, Some(2));
+        assert!(scene_writing_rows(&sessions, &[])[0].contains("+2 net words"));
+        assert!(daily_session_rows(&sessions)[0].contains("+2 words"));
+    }
+
+    #[test]
     fn coverage_rules_are_project_local_persistent_and_read_only() {
         let root = tempfile::tempdir().unwrap();
         let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
@@ -7763,6 +7926,7 @@ mod tests {
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session: None,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -8223,6 +8387,7 @@ mod tests {
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session: None,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -8307,6 +8472,7 @@ mod tests {
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session: None,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -8383,6 +8549,7 @@ mod tests {
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session: None,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -8471,6 +8638,7 @@ mod tests {
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session: None,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -8673,6 +8841,7 @@ mod tests {
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session: None,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -8761,6 +8930,7 @@ mod tests {
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session: None,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -8866,6 +9036,7 @@ mod tests {
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session: None,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -9089,6 +9260,7 @@ mod tests {
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session: None,
             scroll: 0,
             reading_document: Some(reading),
             reading_text: imported.extracted_text.clone(),
@@ -9439,6 +9611,7 @@ mod tests {
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session: None,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -9538,6 +9711,7 @@ mod tests {
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session: None,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -9689,6 +9863,7 @@ mod tests {
             typed_characters: 0,
             pasted_characters: 0,
             successful_saves: 0,
+            writing_session: None,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
