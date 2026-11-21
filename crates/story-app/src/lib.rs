@@ -473,6 +473,57 @@ impl WriterApp {
         self.store.add_character(id, name)?;
         Ok(id)
     }
+    pub fn get_character(&self, id: CharacterId) -> Result<story_core::Character> {
+        Ok(self.store.get_character(id)?)
+    }
+    pub fn update_character(&mut self, character: &story_core::Character) -> Result<()> {
+        Ok(self.store.update_character(character)?)
+    }
+    pub fn set_character_field(&mut self, id: CharacterId, field: &str, value: &str) -> Result<()> {
+        let mut character = self.get_character(id)?;
+        match field {
+            "full_name" => character.full_name = value.into(),
+            "preferred_name" => character.preferred_name = value.into(),
+            "description" => character.description = value.into(),
+            "background" => character.background = value.into(),
+            "goals" => character.goals = value.into(),
+            "motivations" => character.motivations = value.into(),
+            "secrets" => character.secrets = value.into(),
+            "internal_conflict" => character.internal_conflict = value.into(),
+            "external_conflict" => character.external_conflict = value.into(),
+            "status" => character.status = value.into(),
+            _ => {
+                return Err(AppError::Domain(format!(
+                    "unknown character field '{field}'"
+                )));
+            }
+        }
+        self.update_character(&character)
+    }
+    pub fn add_character_alias(&mut self, id: CharacterId, alias: &str) -> Result<()> {
+        let mut character = self.get_character(id)?;
+        if character
+            .aliases
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(alias.trim()))
+        {
+            return Err(AppError::Domain("character alias already exists".into()));
+        }
+        character.aliases.push(alias.into());
+        self.update_character(&character)
+    }
+    pub fn remove_character_alias(&mut self, id: CharacterId, alias: &str) -> Result<()> {
+        let mut character = self.get_character(id)?;
+        let Some(index) = character
+            .aliases
+            .iter()
+            .position(|existing| existing.eq_ignore_ascii_case(alias.trim()))
+        else {
+            return Err(AppError::Domain("character alias does not exist".into()));
+        };
+        character.aliases.remove(index);
+        self.update_character(&character)
+    }
     pub fn create_location(&mut self, name: &str) -> Result<LocationId> {
         let id = LocationId::new();
         self.store.add_location(id, name)?;
@@ -1103,5 +1154,28 @@ mod tests {
 
         proposal.claims[0].approved = true;
         assert!(app.dismiss_extraction_claim(&mut proposal, 0).is_err());
+    }
+
+    #[test]
+    fn character_profile_use_cases_validate_and_persist_fields_and_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let id = app.create_character("Mara Venn").unwrap();
+        app.set_character_field(id, "preferred_name", "Mara")
+            .unwrap();
+        app.set_character_field(id, "goals", "Find the atlas")
+            .unwrap();
+        app.add_character_alias(id, "The Cartographer").unwrap();
+        assert!(app.add_character_alias(id, "the cartographer").is_err());
+        app.remove_character_alias(id, "THE CARTOGRAPHER").unwrap();
+        assert!(app.remove_character_alias(id, "unknown").is_err());
+        assert!(app.set_character_field(id, "unknown", "value").is_err());
+        let character = app.get_character(id).unwrap();
+        assert_eq!(character.preferred_name, "Mara");
+        assert_eq!(character.goals, "Find the atlas");
+        assert!(character.aliases.is_empty());
+        drop(app);
+        let app = WriterApp::open_project(dir.path().join("Novel")).unwrap();
+        assert_eq!(app.get_character(id).unwrap(), character);
     }
 }

@@ -19,6 +19,7 @@ const MIGRATION_6: &str = include_str!("../migrations/0006_search_custom_fields.
 const MIGRATION_7: &str = include_str!("../migrations/0007_approved_knowledge.sql");
 const MIGRATION_8: &str = include_str!("../migrations/0008_document_inclusion.sql");
 const MIGRATION_9: &str = include_str!("../migrations/0009_reading_document_links.sql");
+const MIGRATION_10: &str = include_str!("../migrations/0010_character_profiles.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -336,6 +337,7 @@ impl ProjectStore {
         let conn = Connection::open(root.join("story.db"))?;
         configure(&conn)?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\n{MIGRATION_6}\nINSERT INTO schema_migrations(version,applied_at) VALUES(6,'{}');\n{MIGRATION_7}\nINSERT INTO schema_migrations(version,applied_at) VALUES(7,'{}');\n{MIGRATION_8}\nINSERT INTO schema_migrations(version,applied_at) VALUES(8,'{}');\n{MIGRATION_9}\nINSERT INTO schema_migrations(version,applied_at) VALUES(9,'{}');\nCOMMIT;", now(),now(),now(),now(),now(),now(),now(),now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_10}\nINSERT INTO schema_migrations(version,applied_at) VALUES(10,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now])?;
         Ok(Self {
@@ -367,7 +369,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 9 {
+        if version > 10 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -404,6 +406,10 @@ impl ProjectStore {
         }
         if current_version == 8 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_9}\nINSERT INTO schema_migrations(version,applied_at) VALUES(9,'{}');\nCOMMIT;", now()))?;
+            current_version = 9;
+        }
+        if current_version == 9 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_10}\nINSERT INTO schema_migrations(version,applied_at) VALUES(10,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -1808,14 +1814,91 @@ impl ProjectStore {
         Ok(())
     }
     pub fn add_character(&mut self, id: CharacterId, name: &str) -> Result<()> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(StorageError::Invalid(
+                "character name cannot be empty".into(),
+            ));
+        }
         self.conn.execute(
-            "INSERT INTO character VALUES(?1,?2)",
+            "INSERT INTO character(id,name,preferred_name) VALUES(?1,?2,?2)",
             params![id.to_string(), name],
         )?;
         Ok(())
     }
+    pub fn get_character(&self, id: CharacterId) -> Result<Character> {
+        let mut character = self.conn.query_row(
+            "SELECT name,preferred_name,description,background,goals,motivations,secrets,internal_conflict,external_conflict,status FROM character WHERE id=?1",
+            [id.to_string()],
+            |row| Ok(Character { id, full_name: row.get(0)?, preferred_name: row.get(1)?, aliases: Vec::new(), description: row.get(2)?, background: row.get(3)?, goals: row.get(4)?, motivations: row.get(5)?, secrets: row.get(6)?, internal_conflict: row.get(7)?, external_conflict: row.get(8)?, status: row.get(9)? }),
+        ).optional()?.ok_or_else(|| StorageError::NotFound(format!("character {id}")))?;
+        let mut query = self.conn.prepare(
+            "SELECT alias FROM character_alias WHERE character_id=?1 ORDER BY alias COLLATE NOCASE,alias",
+        )?;
+        character.aliases = query
+            .query_map([id.to_string()], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(character)
+    }
+    pub fn update_character(&mut self, character: &Character) -> Result<()> {
+        if character.full_name.trim().is_empty() {
+            return Err(StorageError::Invalid(
+                "character full name cannot be empty".into(),
+            ));
+        }
+        if character.preferred_name.trim().is_empty() {
+            return Err(StorageError::Invalid(
+                "character preferred name cannot be empty".into(),
+            ));
+        }
+        let mut aliases = character
+            .aliases
+            .iter()
+            .map(|alias| alias.trim().to_owned())
+            .collect::<Vec<_>>();
+        if aliases.iter().any(String::is_empty) {
+            return Err(StorageError::Invalid(
+                "character aliases cannot be empty".into(),
+            ));
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        if aliases
+            .iter()
+            .any(|alias| !unique.insert(alias.to_lowercase()))
+        {
+            return Err(StorageError::Invalid(
+                "character aliases must be unique ignoring case".into(),
+            ));
+        }
+        aliases.sort_by_key(|alias| alias.to_lowercase());
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let updated = tx.execute(
+            "UPDATE character SET name=?2,preferred_name=?3,description=?4,background=?5,goals=?6,motivations=?7,secrets=?8,internal_conflict=?9,external_conflict=?10,status=?11 WHERE id=?1",
+            params![character.id.to_string(), character.full_name.trim(), character.preferred_name.trim(), character.description, character.background, character.goals, character.motivations, character.secrets, character.internal_conflict, character.external_conflict, character.status],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::NotFound(format!(
+                "character {}",
+                character.id
+            )));
+        }
+        tx.execute(
+            "DELETE FROM character_alias WHERE character_id=?1",
+            [character.id.to_string()],
+        )?;
+        for alias in aliases {
+            tx.execute(
+                "INSERT INTO character_alias(character_id,alias) VALUES(?1,?2)",
+                params![character.id.to_string(), alias],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn list_characters(&self) -> Result<Vec<CharacterSummary>> {
-        let mut q=self.conn.prepare("SELECT c.id,c.name,COUNT(DISTINCT sc.scene_id) FROM character c LEFT JOIN scene_character sc ON sc.character_id=c.id GROUP BY c.id,c.name ORDER BY c.name COLLATE NOCASE,c.id")?;
+        let mut q=self.conn.prepare("SELECT c.id,COALESCE(NULLIF(c.preferred_name,''),c.name),COUNT(DISTINCT sc.scene_id) FROM character c LEFT JOIN scene_character sc ON sc.character_id=c.id GROUP BY c.id,c.name,c.preferred_name ORDER BY COALESCE(NULLIF(c.preferred_name,''),c.name) COLLATE NOCASE,c.id")?;
         let rows = q.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -4332,7 +4415,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -4342,7 +4425,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 9);
+        assert_eq!(version, 10);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -4400,7 +4483,18 @@ mod tests {
              CREATE TRIGGER story_link_no_transclusion_cycle BEFORE INSERT ON story_link BEGIN SELECT 1; END;
              CREATE TRIGGER story_link_inclusion_documents_insert BEFORE INSERT ON story_link BEGIN SELECT 1; END;
              CREATE TRIGGER story_link_inclusion_documents_update BEFORE UPDATE ON story_link BEGIN SELECT 1; END;
-             DELETE FROM schema_migrations WHERE version=9;",
+             DROP TRIGGER project_search_character_profile_update;
+             DROP TRIGGER project_search_character_alias_insert;
+             DROP TRIGGER project_search_character_alias_delete;
+             DROP TABLE character_alias;
+             ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict;
+             ALTER TABLE character DROP COLUMN secrets;
+             ALTER TABLE character DROP COLUMN motivations;
+             ALTER TABLE character DROP COLUMN goals;
+             ALTER TABLE character DROP COLUMN background;
+             ALTER TABLE character DROP COLUMN description;
+             ALTER TABLE character DROP COLUMN preferred_name;
+             DELETE FROM schema_migrations WHERE version>=9;",
         )
         .unwrap();
         drop(conn);
@@ -5156,5 +5250,56 @@ mod tests {
             .unwrap(),
             "external edit"
         );
+    }
+
+    #[test]
+    fn character_profiles_and_aliases_migrate_persist_and_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Novel");
+        let mut store = ProjectStore::create(&path, "Novel").unwrap();
+        let id = CharacterId::new();
+        store.add_character(id, "Mara Venn").unwrap();
+        let mut character = store.get_character(id).unwrap();
+        assert_eq!(character.preferred_name, "Mara Venn");
+        character.preferred_name = "Mara".into();
+        character.aliases = vec!["The Cartographer".into(), "M.V.".into()];
+        character.description = "A reluctant mapmaker".into();
+        character.background = "Raised in the flood district".into();
+        character.goals = "Find the missing atlas".into();
+        character.motivations = "Protect her sister".into();
+        character.secrets = "She destroyed the first map".into();
+        character.internal_conflict = "Fear of being known".into();
+        character.external_conflict = "The guild wants the atlas".into();
+        character.status = "missing".into();
+        store.update_character(&character).unwrap();
+        assert!(
+            store
+                .update_character(&Character {
+                    aliases: vec!["same".into(), "SAME".into()],
+                    ..character.clone()
+                })
+                .is_err()
+        );
+        drop(store);
+
+        let store = ProjectStore::open(&path).unwrap();
+        let mut expected = character.clone();
+        expected.aliases.sort_by_key(|alias| alias.to_lowercase());
+        assert_eq!(store.get_character(id).unwrap(), expected);
+        assert!(
+            store
+                .search_project("Cartographer", 10)
+                .unwrap()
+                .iter()
+                .any(|hit| { hit.entity_kind == "character" && hit.entity_id == id.to_string() })
+        );
+        assert!(
+            store
+                .search_project("flood", 10)
+                .unwrap()
+                .iter()
+                .any(|hit| { hit.entity_kind == "character" && hit.entity_id == id.to_string() })
+        );
+        assert_eq!(store.list_characters().unwrap()[0].name, "Mara");
     }
 }

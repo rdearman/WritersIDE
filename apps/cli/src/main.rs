@@ -92,6 +92,52 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut app = WriterApp::open_project(path)?;
             println!("{}", app.create_character(&name)?);
         }
+        "character-profile" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = story_core::CharacterId(args.next().ok_or("missing character UUID")?.parse()?);
+            let app = WriterApp::open_project(path)?;
+            let character = app.get_character(id)?;
+            println!(
+                "ID: {}\nName: {}\nPreferred name: {}\nAliases: {}\nStatus: {}\nDescription: {}\nBackground: {}\nGoals: {}\nMotivations: {}\nSecrets: {}\nInternal conflict: {}\nExternal conflict: {}",
+                character.id,
+                character.full_name,
+                character.preferred_name,
+                character.aliases.join(", "),
+                character.status,
+                character.description,
+                character.background,
+                character.goals,
+                character.motivations,
+                character.secrets,
+                character.internal_conflict,
+                character.external_conflict
+            );
+        }
+        "character-set" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = story_core::CharacterId(args.next().ok_or("missing character UUID")?.parse()?);
+            let field = args.next().ok_or("missing character field")?;
+            let value = args.collect::<Vec<_>>().join(" ");
+            let mut app = WriterApp::open_project(path)?;
+            app.set_character_field(id, &field, &value)?;
+            println!("Updated character {id} field {field}");
+        }
+        "character-alias" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = story_core::CharacterId(args.next().ok_or("missing character UUID")?.parse()?);
+            let alias = args.collect::<Vec<_>>().join(" ");
+            let mut app = WriterApp::open_project(path)?;
+            app.add_character_alias(id, &alias)?;
+            println!("Added alias for character {id}");
+        }
+        "character-un-alias" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = story_core::CharacterId(args.next().ok_or("missing character UUID")?.parse()?);
+            let alias = args.collect::<Vec<_>>().join(" ");
+            let mut app = WriterApp::open_project(path)?;
+            app.remove_character_alias(id, &alias)?;
+            println!("Removed alias from character {id}");
+        }
         "plotline" => {
             let path = args.next().ok_or("missing project path")?;
             let name = args.next().ok_or("missing plotline name")?;
@@ -545,7 +591,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 fn usage() {
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
+        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
     );
     eprintln!(
         "writers-ide anchors <path> <scene-uuid>\nwriters-ide anchor-move <path> <anchor-uuid> <start-byte> <end-byte>"

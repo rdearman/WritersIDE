@@ -432,7 +432,7 @@ pub struct SceneEvent {
     pub event_id: EventId,
     pub relationship_kind: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Character {
     pub id: CharacterId,
     pub full_name: String,
@@ -443,6 +443,8 @@ pub struct Character {
     pub goals: String,
     pub motivations: String,
     pub secrets: String,
+    pub internal_conflict: String,
+    pub external_conflict: String,
     pub status: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]

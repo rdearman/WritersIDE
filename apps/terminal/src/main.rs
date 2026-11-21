@@ -356,6 +356,38 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "character.profile",
+            "Show Character Profile",
+            "Inspect structured character information",
+            "Plot",
+            "character-profile",
+            true,
+        ),
+        legacy_command(
+            "character.set",
+            "Edit Character Field",
+            "Update a structured character profile field",
+            "Plot",
+            "character-set",
+            true,
+        ),
+        legacy_command(
+            "character.alias",
+            "Add Character Alias",
+            "Add a searchable character alias",
+            "Plot",
+            "character-alias",
+            true,
+        ),
+        legacy_command(
+            "character.un-alias",
+            "Remove Character Alias",
+            "Remove an alias from a character profile",
+            "Plot",
+            "character-un-alias",
+            true,
+        ),
+        legacy_command(
             "character.link",
             "Link Character to Scene",
             "Record character participation in a scene",
@@ -1285,6 +1317,46 @@ impl AppState {
                 .ok_or("created character was not listed")?;
             self.switch(Workspace::StoryBible);
             self.message = format!("Created character {id}");
+        } else if let Some(rest) = cmd.strip_prefix("character-profile ") {
+            let id = story_core::CharacterId(rest.trim().parse()?);
+            let character = self.app.get_character(id)?;
+            self.message = format!(
+                "{} ({}) · {} · goals: {} · motivations: {} · aliases: {}",
+                character.full_name,
+                character.preferred_name,
+                character.status,
+                character.goals,
+                character.motivations,
+                character.aliases.join(", ")
+            );
+            self.switch(Workspace::StoryBible);
+        } else if let Some(rest) = cmd.strip_prefix("character-set ") {
+            let (identity, value) = rest
+                .split_once('|')
+                .ok_or("use character-set <character-uuid> <field> | <value>")?;
+            let mut parts = identity.split_whitespace();
+            let id =
+                story_core::CharacterId(parts.next().ok_or("missing character UUID")?.parse()?);
+            let field = parts.next().ok_or("missing character field")?;
+            if parts.next().is_some() {
+                return Err("character-set accepts one field name".into());
+            }
+            self.app.set_character_field(id, field, value.trim())?;
+            self.message = format!("Updated character {id} field {field}");
+        } else if let Some(rest) = cmd.strip_prefix("character-alias ") {
+            let (identity, alias) = rest
+                .split_once('|')
+                .ok_or("use character-alias <character-uuid> | <alias>")?;
+            let id = story_core::CharacterId(identity.trim().parse()?);
+            self.app.add_character_alias(id, alias.trim())?;
+            self.message = format!("Added alias for character {id}");
+        } else if let Some(rest) = cmd.strip_prefix("character-un-alias ") {
+            let (identity, alias) = rest
+                .split_once('|')
+                .ok_or("use character-un-alias <character-uuid> | <alias>")?;
+            let id = story_core::CharacterId(identity.trim().parse()?);
+            self.app.remove_character_alias(id, alias.trim())?;
+            self.message = format!("Removed alias from character {id}");
         } else if let Some(name) = cmd.strip_prefix("location ") {
             let id = self.app.create_location(name.trim())?;
             self.selected = self.app.list_characters()?.len()
@@ -5303,6 +5375,24 @@ mod tests {
             state.prompt = command;
             state.command().unwrap();
         };
+        let character = state.app.create_character("Mara Venn").unwrap();
+        execute(
+            &mut state,
+            format!("character-set {character} preferred_name | Mara"),
+        );
+        execute(
+            &mut state,
+            format!("character-set {character} goals | Find the missing atlas"),
+        );
+        execute(
+            &mut state,
+            format!("character-alias {character} | The Cartographer"),
+        );
+        execute(&mut state, format!("character-profile {character}"));
+        assert!(state.message.contains("Find the missing atlas"));
+        assert!(state.message.contains("The Cartographer"));
+        assert!(state.app.get_character(character).unwrap().preferred_name == "Mara");
+
         execute(&mut state, "section Act I".into());
         let section = state
             .app
