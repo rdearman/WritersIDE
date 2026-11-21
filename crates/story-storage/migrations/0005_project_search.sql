@@ -6,7 +6,7 @@ CREATE TABLE project_search_content(
   content TEXT NOT NULL DEFAULT '',
   UNIQUE(entity_kind,entity_id)
 );
-CREATE VIRTUAL TABLE project_search_fts USING fts5(entity_kind UNINDEXED,entity_id UNINDEXED,title,content,tokenize='unicode61');
+CREATE VIRTUAL TABLE project_search_fts USING fts5(entity_kind UNINDEXED,entity_id UNINDEXED,title,content,tokenize='unicode61 remove_diacritics 1');
 CREATE TRIGGER project_search_content_insert AFTER INSERT ON project_search_content BEGIN
   INSERT INTO project_search_fts(rowid,entity_kind,entity_id,title,content) VALUES(NEW.row_id,NEW.entity_kind,NEW.entity_id,NEW.title,NEW.content);
 END;

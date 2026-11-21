@@ -10779,6 +10779,29 @@ mod tests {
     }
 
     #[test]
+    fn multilingual_fts_is_caseless_accent_insensitive_and_preserves_prose() {
+        let directory = tempdir().unwrap();
+        let mut store = ProjectStore::create(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Café").unwrap();
+        let (_, hash) = store.load_text(scene).unwrap();
+        let source = "Élodie likes café and déjà-vu; 한국어도 씁니다.";
+        store.save_text(scene, Some(&hash), source).unwrap();
+
+        // SQLite FTS5 unicode61 uses its default simple Unicode case folding
+        // and diacritic folding. This affects only the search index, never the
+        // canonical UTF-8 manuscript file.
+        assert_eq!(store.search_scenes("ELODIE").unwrap(), vec![scene]);
+        assert_eq!(store.search_scenes("E\u{301}LODIE").unwrap(), vec![scene]);
+        assert_eq!(store.search_scenes("cafe").unwrap(), vec![scene]);
+        assert_eq!(store.search_scenes("deja").unwrap(), vec![scene]);
+        assert_eq!(store.search_scenes("한국어도").unwrap(), vec![scene]);
+        assert_eq!(store.load_text(scene).unwrap().0, source);
+    }
+
+    #[test]
     fn project_search_indexes_entities_and_updates_incrementally() {
         let d = tempdir().unwrap();
         let mut store = ProjectStore::create(d.path().join("SearchNovel"), "Search").unwrap();

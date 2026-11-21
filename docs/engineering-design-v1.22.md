@@ -320,7 +320,7 @@ A plotted two-dimensional spatial canvas, resizable board cards and board export
 
 ### Multilingual text foundation (Issue #4)
 
-Migration 0017 stores a project language code, defaulting to `en`. Canonical manuscript and editor positions remain UTF-8; terminal cursor columns are now grapheme-cluster indices mapped to byte boundaries through Unicode Segmentation. Word counts use Unicode word boundaries, independent of locale and whitespace. This is a stable baseline, not a claim of fully language-specific tokenization. Language tags are validated and can be set in CLI/TUI; script-specific count policies remain open. Tests cover combining sequences, emoji ZWJ clusters, CJK cursor boundaries, and real insert/delete operations.
+Migration 0017 stores a project language code. New projects inherit the configured global writing-language default (`en-GB` by default), and scenes can override it. Canonical manuscript and editor positions remain UTF-8; terminal cursor columns are grapheme-cluster indices mapped to byte boundaries through Unicode Segmentation. Word counting offers Unicode word boundaries and selected-script grapheme units, including Hangul syllables/Jamo behavior; project and scene policies feed budgets, challenges, analysis and processing. Search indexes use SQLite FTS5 `unicode61 remove_diacritics 1`: Unicode simple case folding and accent-insensitive matching, with no changes to canonical prose. This is a fixed broad-search policy, not locale-sensitive collation (for example Turkish-specific casing); that remains open. Tests cover composed/decomposed accents, apostrophes, Korean, Hangul Jamo, mixed scripts, combining sequences, emoji ZWJ clusters and real insert/delete operations.
 
 ### Search and replace foundation (Issue #12)
 

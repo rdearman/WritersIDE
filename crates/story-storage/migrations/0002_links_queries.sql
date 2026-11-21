@@ -113,7 +113,7 @@ CREATE TABLE scene_issue(
 CREATE INDEX scene_issue_issue ON scene_issue(issue_id,scene_id);
 CREATE TABLE scene_search_content(scene_id TEXT PRIMARY KEY REFERENCES scene(id) ON DELETE CASCADE,content TEXT NOT NULL DEFAULT '');
 INSERT INTO scene_search_content(scene_id,content) SELECT id,'' FROM scene;
-CREATE VIRTUAL TABLE scene_fts USING fts5(scene_id UNINDEXED,title,synopsis,content,tokenize='unicode61');
+CREATE VIRTUAL TABLE scene_fts USING fts5(scene_id UNINDEXED,title,synopsis,content,tokenize='unicode61 remove_diacritics 1');
 INSERT INTO scene_fts(scene_id,title,synopsis,content)
   SELECT s.id,s.title,s.synopsis,'' FROM scene s;
 CREATE TRIGGER scene_fts_insert AFTER INSERT ON scene BEGIN

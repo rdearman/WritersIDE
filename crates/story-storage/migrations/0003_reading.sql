@@ -62,7 +62,7 @@ CREATE TABLE reading_entity_link(
   relation TEXT NOT NULL DEFAULT 'references'
 );
 CREATE INDEX reading_entity_link_target ON reading_entity_link(target_kind,target_id);
-CREATE VIRTUAL TABLE reading_fts USING fts5(document_id UNINDEXED,title,content,tokenize='unicode61');
+CREATE VIRTUAL TABLE reading_fts USING fts5(document_id UNINDEXED,title,content,tokenize='unicode61 remove_diacritics 1');
 INSERT INTO reading_fts(document_id,title,content) SELECT id,title,extracted_text FROM reading_document;
 CREATE TRIGGER reading_fts_insert AFTER INSERT ON reading_document BEGIN
   INSERT INTO reading_fts(document_id,title,content) VALUES(NEW.id,NEW.title,NEW.extracted_text);
