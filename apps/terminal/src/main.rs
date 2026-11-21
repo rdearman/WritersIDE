@@ -6608,15 +6608,29 @@ fn scene_writing_rows(
         .map(|scene| (scene.scene_id.as_str(), scene.title.as_str()))
         .collect::<BTreeMap<_, _>>();
     let mut totals = BTreeMap::<String, (i64, usize)>::new();
+    let mut series = BTreeMap::<(String, String), (i64, usize)>::new();
     for session in sessions {
         let (Some(scene_id), Some(delta)) = (session.scene_id, session.words_delta) else {
             continue;
         };
-        let entry = totals.entry(scene_id.to_string()).or_default();
+        let id = scene_id.to_string();
+        let entry = totals.entry(id.clone()).or_default();
+        entry.0 = entry.0.saturating_add(delta);
+        entry.1 += 1;
+        let Ok(timestamp) = time::OffsetDateTime::from_unix_timestamp(session.started_at) else {
+            continue;
+        };
+        let date = format!(
+            "{:04}-{:02}-{:02}",
+            timestamp.year(),
+            u8::from(timestamp.month()),
+            timestamp.day()
+        );
+        let entry = series.entry((id, date)).or_default();
         entry.0 = entry.0.saturating_add(delta);
         entry.1 += 1;
     }
-    totals
+    let mut rows = totals
         .into_iter()
         .map(|(id, (delta, count))| {
             format!(
@@ -6624,7 +6638,28 @@ fn scene_writing_rows(
                 titles.get(id.as_str()).copied().unwrap_or("Deleted scene")
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let mut maxima = BTreeMap::<String, u64>::new();
+    for ((id, _), (delta, _)) in &series {
+        let maximum = maxima.entry(id.clone()).or_default();
+        *maximum = (*maximum).max(delta.unsigned_abs());
+    }
+    rows.extend(series.into_iter().map(|((id, date), (delta, count))| {
+        let maximum = maxima.get(&id).copied().unwrap_or(0);
+        let filled = delta
+            .unsigned_abs()
+            .saturating_mul(12)
+            .checked_div(maximum)
+            .unwrap_or(0)
+            .min(12) as usize;
+        let sign = if delta < 0 { "−" } else { "" };
+        format!(
+            "Scene history · {} · {date} · {sign}{} {delta:+} words · {count} sessions",
+            titles.get(id.as_str()).copied().unwrap_or("Deleted scene"),
+            "█".repeat(filled)
+        )
+    }));
+    rows
 }
 
 fn coverage_config_path(root: &Path) -> std::path::PathBuf {
@@ -7730,12 +7765,38 @@ mod tests {
         state
             .execute_legacy_palette_command("writing-stats off")
             .unwrap();
+        state
+            .execute_legacy_palette_command("writing-stats on")
+            .unwrap();
+        state.editor = vec!["one two three four five".into()];
+        state
+            .execute_legacy_palette_command("writing-stats off")
+            .unwrap();
         let sessions = state.app.list_writing_sessions().unwrap();
-        assert_eq!(sessions.len(), 1);
-        assert_eq!(sessions[0].scene_id, Some(scene));
-        assert_eq!(sessions[0].words_delta, Some(2));
-        assert!(scene_writing_rows(&sessions, &[])[0].contains("+2 net words"));
-        assert!(daily_session_rows(&sessions)[0].contains("+2 words"));
+        assert_eq!(sessions.len(), 2);
+        assert!(
+            sessions
+                .iter()
+                .all(|session| session.scene_id == Some(scene))
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .map(|session| session.words_delta.unwrap())
+                .sum::<i64>(),
+            3
+        );
+        assert!(scene_writing_rows(&sessions, &[])[0].contains("+3 net words"));
+        assert!(
+            scene_writing_rows(&sessions, &[])
+                .iter()
+                .any(|row| row.contains("Scene history"))
+        );
+        assert!(
+            daily_session_rows(&sessions)
+                .iter()
+                .any(|row| row.contains("cumulative"))
+        );
     }
 
     #[test]
