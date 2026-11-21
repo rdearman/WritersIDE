@@ -114,6 +114,13 @@ impl WriterApp {
     pub fn set_project_language(&mut self, language_code: &str) -> Result<()> {
         Ok(self.store.set_project_language(language_code)?)
     }
+    pub fn set_scene_language(
+        &mut self,
+        scene_id: SceneId,
+        language_code: Option<&str>,
+    ) -> Result<()> {
+        Ok(self.store.set_scene_language(scene_id, language_code)?)
+    }
     pub fn set_project_word_count_policy(&mut self, policy: WordCountPolicy) -> Result<()> {
         Ok(self.store.set_project_word_count_policy(policy)?)
     }

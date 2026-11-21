@@ -154,6 +154,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("{}", app.get_project()?.language_code);
         }
+        "scene-language" => {
+            let path = args.next().ok_or("missing project path")?;
+            let scene = SceneId(args.next().ok_or("missing scene id")?.parse()?);
+            let requested = args.next();
+            let mut app = WriterApp::open_project(path)?;
+            if let Some(tag) = requested.as_deref() {
+                app.set_scene_language(scene, (tag != "inherit").then_some(tag))?;
+            }
+            let project = app.get_project()?;
+            let record = app.get_scene(scene)?;
+            println!("{}", record.scene.effective_language_code(&project));
+        }
         "word-count-policy" => {
             let path = args.next().ok_or("missing project path")?;
             let requested = args.next();
@@ -2147,6 +2159,7 @@ fn usage() {
     );
     eprintln!("writers-ide compile-check <project>");
     eprintln!("writers-ide word-count-policy <project> [unicode-words|script-graphemes]");
+    eprintln!("writers-ide scene-language <project> <scene-uuid> [language-tag|inherit]");
     eprintln!("writers-ide git-auto-snapshot <project> <interval-minutes|off> (1–10080 minutes)");
     eprintln!(
         "writers-ide git-auto-snapshot-check <project> (one-shot; suitable for cron/systemd timers)"

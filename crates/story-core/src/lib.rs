@@ -1170,7 +1170,20 @@ pub struct Project {
 }
 
 pub fn default_language_code() -> String {
-    "en".to_owned()
+    "en-GB".to_owned()
+}
+
+pub fn is_valid_language_tag(language_code: &str) -> bool {
+    let parts = language_code.split('-').collect::<Vec<_>>();
+    !parts.is_empty()
+        && parts[0].len() >= 2
+        && parts[0].len() <= 8
+        && parts[0].bytes().all(|byte| byte.is_ascii_alphabetic())
+        && parts.iter().skip(1).all(|part| {
+            !part.is_empty()
+                && part.len() <= 8
+                && part.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1264,7 +1277,17 @@ pub struct Scene {
     pub pov_character: Option<CharacterId>,
     pub start_location: Option<LocationId>,
     pub end_location: Option<LocationId>,
+    /// Optional BCP 47 language override; `None` inherits the project default.
+    #[serde(default)]
+    pub language_code: Option<String>,
     pub archived: bool,
+}
+impl Scene {
+    pub fn effective_language_code<'a>(&'a self, project: &'a Project) -> &'a str {
+        self.language_code
+            .as_deref()
+            .unwrap_or(&project.language_code)
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScenePlacement {

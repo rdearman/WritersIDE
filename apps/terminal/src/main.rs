@@ -308,7 +308,7 @@ struct SessionSnapshot {
 
 #[derive(Clone, Debug)]
 enum TimelineItem {
-    Scene(story_storage::SceneRecord),
+    Scene(Box<story_storage::SceneRecord>),
     Event(story_storage::EventSummary),
 }
 
@@ -1462,6 +1462,14 @@ fn command_registry() -> Vec<CommandSpec> {
             "Choose Unicode word boundaries or selected unspaced-script grapheme units",
             "Project",
             "project-word-count-policy",
+            true,
+        ),
+        legacy_command(
+            "scene.language",
+            "Set Scene Language",
+            "Override the project language for a scene or restore inheritance",
+            "Scene",
+            "scene-language",
             true,
         ),
         legacy_command(
@@ -6232,6 +6240,25 @@ impl AppState {
                 "Project language set to {}",
                 self.app.get_project()?.language_code
             );
+        } else if let Some(rest) = cmd.strip_prefix("scene-language ") {
+            let (id, language) = rest
+                .split_once(' ')
+                .ok_or("usage: scene-language <scene-uuid> <BCP-47-tag|inherit>")?;
+            let scene = SceneId(id.parse()?);
+            let language = language.trim();
+            self.app
+                .set_scene_language(scene, (language != "inherit").then_some(language))?;
+            let project = self.app.get_project()?;
+            let record = self.app.get_scene(scene)?;
+            self.message = format!(
+                "Scene language: {}{}",
+                record.scene.effective_language_code(&project),
+                if record.scene.language_code.is_some() {
+                    " (override)"
+                } else {
+                    " (inherited)"
+                }
+            );
         } else if let Some(policy) = cmd.strip_prefix("project-word-count-policy ") {
             let policy = story_core::WordCountPolicy::parse(policy.trim())
                 .ok_or("policy must be unicode-words or script-graphemes")?;
@@ -9642,7 +9669,7 @@ fn timeline_scene_order(app: &WriterApp) -> Vec<story_storage::SceneRecord> {
 fn timeline_items(app: &WriterApp) -> Vec<TimelineItem> {
     let mut items = timeline_scene_order(app)
         .into_iter()
-        .map(TimelineItem::Scene)
+        .map(|scene| TimelineItem::Scene(Box::new(scene)))
         .chain(
             app.list_events()
                 .unwrap_or_default()
@@ -12427,6 +12454,27 @@ mod tests {
             story_core::WordCountPolicy::UnspacedScriptGraphemes
         );
         assert!(state.message.contains("script-graphemes"));
+    }
+
+    #[test]
+    fn scene_language_command_sets_override_and_restores_inheritance() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Language"), "Language").unwrap();
+        app.set_project_language("it-IT").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command(&format!("scene-language {scene} fr-FR"))
+            .unwrap();
+        assert!(state.message.contains("fr-FR (override)"));
+        state
+            .execute_legacy_palette_command(&format!("scene-language {scene} inherit"))
+            .unwrap();
+        assert!(state.message.contains("it-IT (inherited)"));
+        let record = state.app.get_scene(scene).unwrap();
+        assert_eq!(record.scene.language_code, None);
+        assert_eq!(state.app.get_project().unwrap().language_code, "it-IT");
     }
 
     #[test]
