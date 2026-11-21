@@ -1620,6 +1620,54 @@ fn command_registry() -> Vec<CommandSpec> {
             false,
         ),
         legacy_command(
+            "window.next",
+            "Next Window",
+            "Focus the next reference buffer",
+            "View",
+            "reference-next",
+            false,
+        ),
+        legacy_command(
+            "window.previous",
+            "Previous Window",
+            "Focus the previous reference buffer",
+            "View",
+            "reference-prev",
+            false,
+        ),
+        legacy_command(
+            "window.close",
+            "Close Reference Window",
+            "Close the selected reference buffer",
+            "View",
+            "reference-close",
+            false,
+        ),
+        legacy_command(
+            "window.return-to-writing",
+            "Return to Writing",
+            "Return focus to the manuscript editor",
+            "View",
+            "reference-return",
+            false,
+        ),
+        legacy_command(
+            "window.maximize",
+            "Maximize Current Window",
+            "Expand the currently focused editor or reference pane",
+            "View",
+            "window-maximize",
+            false,
+        ),
+        legacy_command(
+            "window.restore-layout",
+            "Restore Window Layout",
+            "Restore the prior split layout",
+            "View",
+            "window-restore",
+            false,
+        ),
+        legacy_command(
             "scratchpad.create",
             "Quick Capture",
             "Capture a note without leaving the current scene",
@@ -4459,6 +4507,23 @@ impl AppState {
             }
         }
         self.reference_focused = true;
+    }
+    fn cycle_reference(&mut self, forward: bool) {
+        if self.reference_panes.is_empty() {
+            return;
+        }
+        let keep_reference_focus = self.reference_focused;
+        if keep_reference_focus {
+            self.focus_main_editor();
+        }
+        self.active_reference = if forward {
+            (self.active_reference + 1) % self.reference_panes.len()
+        } else {
+            (self.active_reference + self.reference_panes.len() - 1) % self.reference_panes.len()
+        };
+        if keep_reference_focus {
+            self.toggle_reference_focus();
+        }
     }
     fn follow_active_scene_card(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let scene = self
@@ -8069,23 +8134,31 @@ impl AppState {
             };
             self.message = format!("Reference layout: {}", value.trim());
             self.save_session()?;
+        } else if cmd == "reference-return" {
+            self.focus_main_editor();
+            self.message = "Manuscript editor focused".into();
         } else if cmd == "reference-next" {
-            if self.reference_focused {
-                self.focus_main_editor();
-            }
-            if !self.reference_panes.is_empty() {
-                self.active_reference = (self.active_reference + 1) % self.reference_panes.len();
-            }
+            self.cycle_reference(true);
             self.message = "Next reference buffer".into();
         } else if cmd == "reference-prev" {
-            if self.reference_focused {
-                self.focus_main_editor();
-            }
-            if !self.reference_panes.is_empty() {
-                self.active_reference = (self.active_reference + self.reference_panes.len() - 1)
-                    % self.reference_panes.len();
-            }
+            self.cycle_reference(false);
             self.message = "Previous reference buffer".into();
+        } else if cmd == "window-maximize" {
+            self.editor_focus_mode = true;
+            if self.reference_focused && self.reference_panes_hidden {
+                self.reference_panes_hidden = false;
+            }
+            self.message = if self.reference_focused {
+                "Reference pane maximized · Ctrl-G or window-restore restores layout"
+            } else {
+                "Manuscript pane maximized · Ctrl-G or window-restore restores layout"
+            }
+            .into();
+            self.save_session()?;
+        } else if cmd == "window-restore" {
+            self.editor_focus_mode = false;
+            self.message = "Window layout restored".into();
+            self.save_session()?;
         } else if cmd == "reference-close" {
             if self.reference_focused {
                 self.focus_main_editor();
@@ -10342,7 +10415,36 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             .take(s.scroll)
             .map(|line| line.len() as u64 + 1)
             .sum::<u64>();
-        let (content, editor_title) = if let Some(targets) = &s.pending_replace {
+        let maximized_reference = s.editor_focus_mode
+            && s.reference_focused
+            && !s.reference_panes_hidden
+            && !s.reference_panes.is_empty();
+        let (content, editor_title) = if maximized_reference {
+            let reference = &s.reference_panes[s.active_reference.min(s.reference_panes.len() - 1)];
+            let shared_scene = reference.shared_scene && reference.scene_id == s.editing_scene;
+            let lines = if shared_scene {
+                s.editor.clone()
+            } else {
+                reference.content.lines().map(str::to_owned).collect()
+            };
+            let content = lines
+                .iter()
+                .enumerate()
+                .skip(reference.scroll)
+                .map(|(row, line)| {
+                    let prefix = if shared_scene && row == s.cursor.0 {
+                        "> "
+                    } else {
+                        "  "
+                    };
+                    Line::from(format!("{prefix}{line}"))
+                })
+                .collect();
+            (
+                content,
+                format!("Maximized reference — {}", reference.title),
+            )
+        } else if let Some(targets) = &s.pending_replace {
             let target = targets
                 .get(s.replace_preview_target)
                 .or_else(|| targets.first());
@@ -13765,6 +13867,26 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if s.workspace == Workspace::Editor
+        && !s.reference_panes_hidden
+        && !s.reference_panes.is_empty()
+        && k.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(k.code, KeyCode::PageUp | KeyCode::PageDown)
+    {
+        s.cycle_reference(k.code == KeyCode::PageDown);
+        s.message = if k.code == KeyCode::PageDown {
+            "Next reference window"
+        } else {
+            "Previous reference window"
+        }
+        .into();
+        return Ok(false);
+    }
+    if s.workspace == Workspace::Editor && s.reference_focused && k.code == KeyCode::Esc {
+        s.focus_main_editor();
+        s.message = "Manuscript editor focused".into();
+        return Ok(false);
+    }
+    if s.workspace == Workspace::Editor
         && k.modifiers.contains(KeyModifiers::CONTROL)
         && k.code == KeyCode::Char('g')
     {
@@ -17062,6 +17184,18 @@ mod tests {
         assert!(focused.contains("PROSEVISIBLE"));
         assert!(!focused.contains("REFERENCEHIDDEN"));
         assert!(!focused.contains("F1-F9"));
+
+        state.reference_focused = true;
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let maximized = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(maximized.contains("REFERENCEHIDDEN"));
+        assert!(!maximized.contains("PROSEVISIBLE"));
     }
 
     #[test]
@@ -17097,6 +17231,35 @@ mod tests {
             .execute_legacy_palette_command("reference-toggle")
             .unwrap();
         assert!(!reopened.reference_panes_hidden);
+        reopened
+            .execute_legacy_palette_command("window-maximize")
+            .unwrap();
+        assert!(reopened.editor_focus_mode);
+        reopened
+            .execute_legacy_palette_command("window-restore")
+            .unwrap();
+        assert!(!reopened.editor_focus_mode);
+        reopened.open_reference_buffer(
+            "fixture:two".into(),
+            None,
+            "Second reference".into(),
+            "second reference text".into(),
+        );
+        reopened.active_reference = 0;
+        reopened.reference_focused = true;
+        handle(
+            &mut reopened,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(reopened.active_reference, 1);
+        assert!(reopened.reference_focused);
+        handle(
+            &mut reopened,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!reopened.reference_focused);
         assert_eq!(ReferenceLayout::Stacked.direction(120), Direction::Vertical);
         assert_eq!(
             ReferenceLayout::SideBySide.direction(80),
