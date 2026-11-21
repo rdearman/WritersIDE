@@ -835,6 +835,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "search.query-expression",
+            "Set Nested Query Expression",
+            "Set a JSON AND/OR/NOT expression on a saved query",
+            "View",
+            "query-expression-set",
+            true,
+        ),
+        legacy_command(
             "search.list-queries",
             "List Saved Queries",
             "List saved structured queries",
@@ -4833,6 +4841,18 @@ impl AppState {
             self.selected = 0;
             self.workspace = Workspace::Search;
             self.message = format!("{query_name} · dynamic collection");
+        } else if let Some(rest) = cmd.strip_prefix("query-expression-set ") {
+            let (id, source) = rest
+                .split_once(' ')
+                .ok_or("use query-expression-set QUERY-UUID JSON|clear")?;
+            let id = story_core::QueryId(id.parse()?);
+            if source == "clear" {
+                self.app.set_scene_query_expression(id, None)?;
+            } else {
+                let expression: story_core::QueryExpression = serde_json::from_str(source)?;
+                self.app.set_scene_query_expression(id, Some(&expression))?;
+            }
+            self.message = format!("Updated query expression {id}");
         } else if let Some(terms) = cmd.strip_prefix("search-all ") {
             self.search_hits = self.app.search_project(terms, 200)?;
             self.query_view = None;
@@ -10017,6 +10037,27 @@ mod tests {
             .into_iter()
             .find(|query| query.name == "mixed")
             .unwrap();
+        assert_eq!(state.app.run_scene_query(query.id).unwrap(), vec![first]);
+        let expression = story_core::QueryExpression::All(vec![
+            story_core::QueryExpression::Any(vec![
+                story_core::QueryExpression::Filter(story_core::SceneQueryFilter::Character(
+                    character_id,
+                )),
+                story_core::QueryExpression::Filter(story_core::SceneQueryFilter::Character(
+                    other_character,
+                )),
+            ]),
+            story_core::QueryExpression::Not(Box::new(story_core::QueryExpression::Filter(
+                story_core::SceneQueryFilter::Status(SceneStatus::Complete),
+            ))),
+        ]);
+        state.mode = Some(':');
+        state.prompt = format!(
+            "query-expression-set {} {}",
+            query.id,
+            serde_json::to_string(&expression).unwrap()
+        );
+        state.command().unwrap();
         assert_eq!(state.app.run_scene_query(query.id).unwrap(), vec![first]);
         let grid = plot_grid_rows(&state);
         assert!(grid[0].contains("Political intrigue"));

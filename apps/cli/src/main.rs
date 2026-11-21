@@ -645,6 +645,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{scene}");
             }
         }
+        "query-expression-set" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = QueryId(args.next().ok_or("missing query id")?.parse()?);
+            let source = args.collect::<Vec<_>>().join(" ");
+            let mut app = WriterApp::open_project(path)?;
+            if source == "clear" {
+                app.set_scene_query_expression(id, None)?;
+            } else {
+                let expression: story_core::QueryExpression = serde_json::from_str(&source)?;
+                app.set_scene_query_expression(id, Some(&expression))?;
+            }
+            println!("Updated expression for query {id}");
+        }
         "query-assert" => {
             let path = args.next().ok_or("missing project path")?;
             let id = QueryId(args.next().ok_or("missing query ID")?.parse()?);
@@ -1556,6 +1569,7 @@ fn usage() {
         "writers-ide anchors <path> <scene-uuid>\nwriters-ide anchor-move <path> <anchor-uuid> <start-byte> <end-byte>"
     );
     eprintln!("writers-ide search-all <path> <terms>\nwriters-ide rebuild-search <path>");
+    eprintln!("writers-ide query-expression-set <path> <query-uuid> <JSON|clear>");
     eprintln!(
         "writers-ide create-template <path> <blank-fiction|novel|short-story|blank-nonfiction|nonfiction-book> [title]\nwriters-ide content <path> <chapter|section|front|back> <parent-uuid|-> <title>\nwriters-ide read-content <path> <content-uuid>\nwriters-ide write-content <path> <content-uuid> <text>\nwriters-ide resolve-content <path> <transaction-id> external|prepared\nwriters-ide git-snapshot <path> <label>\nwriters-ide git-history <path>\nwriters-ide git-diff <path> <commit-a> <commit-b> [project-relative-path]\nwriters-ide git-restore-new <source-project> <commit> <new-project-directory>"
     );

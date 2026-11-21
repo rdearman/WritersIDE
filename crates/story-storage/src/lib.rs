@@ -34,6 +34,7 @@ const MIGRATION_19: &str = include_str!("../migrations/0019_query_assertions.sql
 const MIGRATION_20: &str = include_str!("../migrations/0020_writing_sessions.sql");
 const MIGRATION_21: &str = include_str!("../migrations/0021_query_boolean_filters.sql");
 const MIGRATION_22: &str = include_str!("../migrations/0022_challenge_outcomes.sql");
+const MIGRATION_23: &str = include_str!("../migrations/0023_query_expressions.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -83,6 +84,103 @@ type ContentUnitJournalRow = (
     i64,
     String,
 );
+
+fn validate_query_expression(expression: &QueryExpression) -> Result<()> {
+    fn walk(expression: &QueryExpression, depth: usize, nodes: &mut usize) -> Result<()> {
+        *nodes += 1;
+        if depth > 32 || *nodes > 512 {
+            return Err(StorageError::Invalid(
+                "saved query expression exceeds the 32-level/512-node limit".into(),
+            ));
+        }
+        match expression {
+            QueryExpression::Filter(SceneQueryFilter::AnyCharacter(ids)) if ids.is_empty() => Err(
+                StorageError::Invalid("character-any query filter cannot be empty".into()),
+            ),
+            QueryExpression::Filter(SceneQueryFilter::AnyPlotline(ids)) if ids.is_empty() => Err(
+                StorageError::Invalid("plotline-any query filter cannot be empty".into()),
+            ),
+            QueryExpression::All(children) | QueryExpression::Any(children) => {
+                if children.is_empty() {
+                    return Err(StorageError::Invalid(
+                        "saved query AND/OR groups cannot be empty".into(),
+                    ));
+                }
+                for child in children {
+                    walk(child, depth + 1, nodes)?;
+                }
+                Ok(())
+            }
+            QueryExpression::Not(child) => walk(child, depth + 1, nodes),
+            QueryExpression::Filter(_) => Ok(()),
+        }
+    }
+    walk(expression, 1, &mut 0)
+}
+
+fn compile_query_expression(
+    expression: &QueryExpression,
+    values: &mut Vec<String>,
+) -> Result<String> {
+    let combine = |operator: &str,
+                   children: &[QueryExpression],
+                   values: &mut Vec<String>|
+     -> Result<String> {
+        let parts = children
+            .iter()
+            .map(|child| compile_query_expression(child, values))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(format!("({})", parts.join(operator)))
+    };
+    Ok(match expression {
+        QueryExpression::All(children) => combine(" AND ", children, values)?,
+        QueryExpression::Any(children) => combine(" OR ", children, values)?,
+        QueryExpression::Not(child) => {
+            format!("(NOT {})", compile_query_expression(child, values)?)
+        }
+        QueryExpression::Filter(filter) => match filter {
+            SceneQueryFilter::Status(status) => {
+                values.push(status.as_str().to_owned());
+                "s.status=?".into()
+            }
+            SceneQueryFilter::ExcludeStatus(status) => {
+                values.push(status.as_str().to_owned());
+                "s.status<>?".into()
+            }
+            SceneQueryFilter::Character(id) => {
+                values.push(id.to_string());
+                "EXISTS(SELECT 1 FROM scene_character sc WHERE sc.scene_id=s.id AND sc.character_id=?)".into()
+            }
+            SceneQueryFilter::AnyCharacter(ids) => {
+                if ids.is_empty() {
+                    return Err(StorageError::Invalid("character-any query filter cannot be empty".into()));
+                }
+                values.extend(ids.iter().map(ToString::to_string));
+                format!("EXISTS(SELECT 1 FROM scene_character sc WHERE sc.scene_id=s.id AND sc.character_id IN ({}))", vec!["?"; ids.len()].join(","))
+            }
+            SceneQueryFilter::Plotline(id) => {
+                values.push(id.to_string());
+                "EXISTS(SELECT 1 FROM scene_plotline sp WHERE sp.scene_id=s.id AND sp.plotline_id=?)".into()
+            }
+            SceneQueryFilter::AnyPlotline(ids) => {
+                if ids.is_empty() {
+                    return Err(StorageError::Invalid("plotline-any query filter cannot be empty".into()));
+                }
+                values.extend(ids.iter().map(ToString::to_string));
+                format!("EXISTS(SELECT 1 FROM scene_plotline sp WHERE sp.scene_id=s.id AND sp.plotline_id IN ({}))", vec!["?"; ids.len()].join(","))
+            }
+            SceneQueryFilter::TimeBefore(tick) => {
+                values.push(tick.to_string());
+                "s.start_nominal IS NOT NULL AND s.start_nominal<?".into()
+            }
+            SceneQueryFilter::TimeAfter(tick) => {
+                values.push(tick.to_string());
+                "s.start_nominal IS NOT NULL AND s.start_nominal>?".into()
+            }
+            SceneQueryFilter::UnresolvedIssue => "EXISTS(SELECT 1 FROM scene_issue si JOIN story_issue i ON i.id=si.issue_id WHERE si.scene_id=s.id AND i.status IN('open','in_progress'))".into(),
+        },
+    })
+}
 
 #[derive(Serialize, Deserialize)]
 struct ProjectConfig {
@@ -581,7 +679,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_19}\nINSERT INTO schema_migrations(version,applied_at) VALUES(19,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_20}\nINSERT INTO schema_migrations(version,applied_at) VALUES(20,'{}');\nCOMMIT;", now()))?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\nCOMMIT;", now(), now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\nCOMMIT;", now(), now(), now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
@@ -624,7 +722,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 22 {
+        if version > 23 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -713,6 +811,10 @@ impl ProjectStore {
         }
         if current_version == 21 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\nCOMMIT;", now()))?;
+            current_version = 22;
+        }
+        if current_version == 22 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -5502,6 +5604,59 @@ impl ProjectStore {
         tx.commit()?;
         Ok(())
     }
+    pub fn set_scene_query_expression(
+        &mut self,
+        query: QueryId,
+        expression: Option<&QueryExpression>,
+    ) -> Result<()> {
+        if let Some(expression) = expression {
+            validate_query_expression(expression)?;
+        }
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM saved_query WHERE id=?1)",
+            [query.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StorageError::NotFound(query.to_string()));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(expression) = expression {
+            let encoded = serde_json::to_string(expression)
+                .map_err(|error| StorageError::Invalid(error.to_string()))?;
+            tx.execute(
+                "INSERT INTO saved_query_expression(query_id,expression_json,updated_at) VALUES(?1,?2,?3) ON CONFLICT(query_id) DO UPDATE SET expression_json=excluded.expression_json,updated_at=excluded.updated_at",
+                params![query.to_string(), encoded, now()],
+            )?;
+        } else {
+            tx.execute(
+                "DELETE FROM saved_query_expression WHERE query_id=?1",
+                [query.to_string()],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn get_scene_query_expression(&self, query: QueryId) -> Result<Option<QueryExpression>> {
+        let encoded: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT expression_json FROM saved_query_expression WHERE query_id=?1",
+                [query.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        encoded
+            .map(|encoded| {
+                let expression: QueryExpression = serde_json::from_str(&encoded)
+                    .map_err(|error| StorageError::Invalid(error.to_string()))?;
+                validate_query_expression(&expression)?;
+                Ok(expression)
+            })
+            .transpose()
+    }
     pub fn set_query_assertions(
         &mut self,
         query: QueryId,
@@ -5644,6 +5799,11 @@ impl ProjectStore {
                 "unresolved_issue" => sql.push_str(" AND EXISTS(SELECT 1 FROM scene_issue si JOIN story_issue i ON i.id=si.issue_id WHERE si.scene_id=s.id AND i.status IN('open','in_progress'))"),
                 _ => return Err(StorageError::Invalid(format!("unknown saved query filter: {kind}"))),
             }
+        }
+        if let Some(expression) = self.get_scene_query_expression(query)? {
+            let compiled = compile_query_expression(&expression, &mut values)?;
+            sql.push_str(" AND ");
+            sql.push_str(&compiled);
         }
         sql.push_str(" ORDER BY n.path,p.position,s.id");
         let mut q = self.conn.prepare(&sql)?;
@@ -7935,6 +8095,86 @@ mod tests {
     }
 
     #[test]
+    fn nested_saved_query_expressions_are_validated_persistent_and_dynamic() {
+        let directory = tempdir().unwrap();
+        let mut store = ProjectStore::create(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let first = store.create_scene(chapter, 0, "First").unwrap();
+        let second = store.create_scene(chapter, 1, "Second").unwrap();
+        let third = store.create_scene(chapter, 2, "Third").unwrap();
+        let mara = CharacterId::new();
+        let ivo = CharacterId::new();
+        store.add_character(mara, "Mara").unwrap();
+        store.add_character(ivo, "Ivo").unwrap();
+        store
+            .link_character(first, mara, ParticipationRole::Major)
+            .unwrap();
+        store
+            .link_character(second, ivo, ParticipationRole::Major)
+            .unwrap();
+        let query = SavedSceneQuery {
+            id: QueryId::new(),
+            name: "Active scenes for either character".into(),
+            description: String::new(),
+            filters: Vec::new(),
+        };
+        store.save_scene_query(&query).unwrap();
+        let expression = QueryExpression::All(vec![
+            QueryExpression::Any(vec![
+                QueryExpression::Filter(SceneQueryFilter::Character(mara)),
+                QueryExpression::Filter(SceneQueryFilter::Character(ivo)),
+            ]),
+            QueryExpression::Not(Box::new(QueryExpression::Filter(SceneQueryFilter::Status(
+                SceneStatus::Complete,
+            )))),
+        ]);
+        store
+            .set_scene_query_expression(query.id, Some(&expression))
+            .unwrap();
+        assert_eq!(
+            store.get_scene_query_expression(query.id).unwrap(),
+            Some(expression)
+        );
+        assert_eq!(
+            store.run_scene_query(query.id).unwrap(),
+            vec![first, second]
+        );
+        store
+            .conn
+            .execute(
+                "UPDATE scene SET status='complete' WHERE id=?1",
+                [second.to_string()],
+            )
+            .unwrap();
+        assert_eq!(store.run_scene_query(query.id).unwrap(), vec![first]);
+        assert!(
+            store
+                .set_scene_query_expression(query.id, Some(&QueryExpression::All(vec![])))
+                .is_err()
+        );
+        assert!(
+            store
+                .set_scene_query_expression(QueryId::new(), None)
+                .is_err()
+        );
+        drop(store);
+        let reopened = ProjectStore::open(directory.path().join("Novel")).unwrap();
+        assert_eq!(reopened.run_scene_query(query.id).unwrap(), vec![first]);
+        assert!(!reopened.run_scene_query(query.id).unwrap().contains(&third));
+        reopened
+            .conn
+            .query_row(
+                "SELECT version FROM schema_migrations ORDER BY version DESC LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|version| assert_eq!(version, 23))
+            .unwrap();
+    }
+
+    #[test]
     fn full_text_search_tracks_scenes_and_metadata() {
         let d = tempdir().unwrap();
         let mut st = ProjectStore::create(d.path().join("N"), "Novel").unwrap();
@@ -8182,6 +8422,8 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
+        conn.execute_batch("DROP TABLE saved_query_expression")
+            .unwrap();
         conn.execute_batch("DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
@@ -8192,7 +8434,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 22);
+        assert_eq!(version, 23);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -8270,6 +8512,7 @@ mod tests {
              ALTER TABLE character DROP COLUMN description;
              ALTER TABLE character DROP COLUMN preferred_name;
              ALTER TABLE project DROP COLUMN language_code;
+             DROP TABLE saved_query_expression;
              DELETE FROM schema_migrations WHERE version>=9;",
         )
         .unwrap();

@@ -705,6 +705,16 @@ pub enum SceneQueryFilter {
     TimeAfter(i64),
     UnresolvedIssue,
 }
+
+/// A composable, saved-query predicate. Empty `All`/`Any` groups are invalid.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum QueryExpression {
+    Filter(SceneQueryFilter),
+    All(Vec<QueryExpression>),
+    Any(Vec<QueryExpression>),
+    Not(Box<QueryExpression>),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SavedSceneQuery {
     pub id: QueryId,
