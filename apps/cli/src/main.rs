@@ -1316,19 +1316,26 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .transpose()?
                 .unwrap_or(1000)
                 .clamp(250, 60_000);
-            let mut previous = String::new();
+            let mut successful = WatchSuccess::default();
             println!("Watching processing recipe; Ctrl-C stops the watcher.");
             loop {
                 let recipe_config =
                     story_pipeline::ProcessingRecipe::from_toml(&fs::read_to_string(&recipe)?)?;
                 let current = processing_watch_fingerprint(&project, &recipe)?;
-                if current != previous {
+                if successful.needs_run(&current) {
                     if recipe_config.debounce_ms > 0 {
                         thread::sleep(Duration::from_millis(recipe_config.debounce_ms));
                     }
-                    previous = processing_watch_fingerprint(&project, &recipe)?;
-                    if let Err(error) = run_processing_recipe(&project, &recipe) {
-                        eprintln!("Processing run incomplete; inspect stage failures: {error}");
+                    let settled = processing_watch_fingerprint(&project, &recipe)?;
+                    if successful.needs_run(&settled) {
+                        match run_processing_recipe(&project, &recipe) {
+                            Ok(()) => successful.mark_successful(settled),
+                            Err(error) => {
+                                eprintln!(
+                                    "Processing run incomplete; it will retry while inputs remain unchanged: {error}"
+                                );
+                            }
+                        }
                     }
                 }
                 thread::sleep(Duration::from_millis(poll_ms));
@@ -1601,34 +1608,35 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .transpose()?
                 .unwrap_or(1000)
                 .clamp(250, 60_000);
-            let mut previous = String::new();
+            let mut successful = WatchSuccess::default();
             println!("Watching project for changes; Ctrl-C stops the watcher.");
             loop {
                 let fingerprint = watch_fingerprint(&project)?;
-                if fingerprint != previous {
-                    previous = fingerprint;
-                    match WriterApp::open_project(&project)
-                        .and_then(|app| app.compile_artifact(format, false))
-                    {
-                        Ok(artifact) => {
-                            atomic_write(&output, &artifact.bytes)?;
-                            write_compile_auxiliary(&output, &artifact.auxiliary_files)?;
-                            let map = serde_json::to_vec_pretty(
-                                &serde_json::json!({"schema_version":1,"entries":artifact.source_map}),
-                            )?;
-                            atomic_write(
-                                &PathBuf::from(format!("{}.source-map.json", output.display())),
-                                &map,
-                            )?;
-                            println!(
-                                "Compiled {} bytes to {}",
-                                artifact.bytes.len(),
-                                output.display()
-                            );
-                        }
-                        Err(error) => {
-                            eprintln!("Compile failed; previous output preserved: {error}")
-                        }
+                if successful.needs_run(&fingerprint) {
+                    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                        let artifact =
+                            WriterApp::open_project(&project)?.compile_artifact(format, false)?;
+                        atomic_write(&output, &artifact.bytes)?;
+                        write_compile_auxiliary(&output, &artifact.auxiliary_files)?;
+                        let map = serde_json::to_vec_pretty(
+                            &serde_json::json!({"schema_version":1,"entries":artifact.source_map}),
+                        )?;
+                        atomic_write(
+                            &PathBuf::from(format!("{}.source-map.json", output.display())),
+                            &map,
+                        )?;
+                        println!(
+                            "Compiled {} bytes to {}",
+                            artifact.bytes.len(),
+                            output.display()
+                        );
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => successful.mark_successful(fingerprint),
+                        Err(error) => eprintln!(
+                            "Compile failed; previous output preserved; it will retry while inputs remain unchanged: {error}"
+                        ),
                     }
                 }
                 thread::sleep(Duration::from_millis(poll_ms));
@@ -1661,23 +1669,18 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .transpose()?
                 .unwrap_or(1000)
                 .clamp(250, 60_000);
-            let mut previous = String::new();
+            let mut successful = WatchSuccess::default();
             println!("Watching edition recipe; Ctrl-C stops the watcher.");
             loop {
-                let mut fingerprint = Sha256::new();
-                fingerprint.update(watch_fingerprint(&project)?);
-                let recipe_bytes = fs::read(&recipe)?;
-                fingerprint.update(&recipe_bytes);
-                let recipe_config =
-                    story_document::EditionRecipe::from_toml(std::str::from_utf8(&recipe_bytes)?)?;
-                if let Some(dictionary) = recipe_config.dictionary {
-                    fingerprint.update(fs::read(project.join(dictionary))?);
-                }
-                let current = format!("{:x}", fingerprint.finalize());
-                if current != previous {
-                    previous = current;
-                    if let Err(error) = compile_edition(&project, &recipe) {
-                        eprintln!("Edition compile failed; previous output preserved: {error}");
+                let current = edition_watch_fingerprint(&project, &recipe)?;
+                if successful.needs_run(&current) {
+                    match compile_edition(&project, &recipe) {
+                        Ok(()) => successful.mark_successful(current),
+                        Err(error) => {
+                            eprintln!(
+                                "Edition compile failed; previous output preserved; it will retry while inputs remain unchanged: {error}"
+                            );
+                        }
                     }
                 }
                 thread::sleep(Duration::from_millis(poll_ms));
@@ -2204,6 +2207,42 @@ fn watch_fingerprint(project: &Path) -> Result<String, Box<dyn std::error::Error
     Ok(format!("{:x}", hash.finalize()))
 }
 
+fn edition_watch_fingerprint(
+    project: &Path,
+    recipe_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let recipe_bytes = fs::read(recipe_path)?;
+    let recipe = story_document::EditionRecipe::from_toml(std::str::from_utf8(&recipe_bytes)?)?;
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(watch_fingerprint(project)?);
+    fingerprint.update(&recipe_bytes);
+    if let Some(dictionary) = recipe.dictionary {
+        let dictionary = Path::new(&dictionary);
+        ensure_project_path_has_no_symlink(project, dictionary)?;
+        let dictionary_path = project.join(dictionary);
+        if !fs::symlink_metadata(&dictionary_path)?.is_file() {
+            return Err("personal dictionary must be a regular project-local file".into());
+        }
+        fingerprint.update(fs::read(dictionary_path)?);
+    }
+    Ok(format!("{:x}", fingerprint.finalize()))
+}
+
+#[derive(Default)]
+struct WatchSuccess {
+    fingerprint: Option<String>,
+}
+
+impl WatchSuccess {
+    fn needs_run(&self, fingerprint: &str) -> bool {
+        self.fingerprint.as_deref() != Some(fingerprint)
+    }
+
+    fn mark_successful(&mut self, fingerprint: String) {
+        self.fingerprint = Some(fingerprint);
+    }
+}
+
 fn compile_edition(project: &Path, recipe_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     compile_edition_with_aspell(project, recipe_path, "aspell")
 }
@@ -2606,11 +2645,21 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod watch_tests {
     use super::{
-        compile_edition, compile_edition_with_aspell, parse_scene_query_filter,
-        run_processing_recipe, spellcheck_project, watch_fingerprint,
+        WatchSuccess, compile_edition, compile_edition_with_aspell, edition_watch_fingerprint,
+        parse_scene_query_filter, run_processing_recipe, spellcheck_project, watch_fingerprint,
     };
     use std::fs;
     use story_app::WriterApp;
+    #[test]
+    fn watch_fingerprint_is_acknowledged_only_after_success() {
+        let mut watcher = WatchSuccess::default();
+        assert!(watcher.needs_run("inputs-a"));
+        // A failed invocation makes no state transition, so the same input retries.
+        assert!(watcher.needs_run("inputs-a"));
+        watcher.mark_successful("inputs-a".into());
+        assert!(!watcher.needs_run("inputs-a"));
+        assert!(watcher.needs_run("inputs-b"));
+    }
     #[test]
     fn custom_entity_reference_query_filter_parses_stable_identity() {
         let field = uuid::Uuid::new_v4();
@@ -2717,6 +2766,8 @@ mod watch_tests {
         fs::set_permissions(&mock, fs::Permissions::from_mode(0o755)).unwrap();
         let checked_recipe = root.path().join("checked.toml");
         fs::write(&checked_recipe, "version=1\nname='Checked reader'\nformat='markdown'\noutput='exports/checked.md'\nspellcheck=true\nlanguage='en_GB'\ndictionary='dictionaries/en.txt'\n").unwrap();
+        let dictionary_fingerprint =
+            edition_watch_fingerprint(&project_path, &checked_recipe).unwrap();
         compile_edition_with_aspell(&project_path, &checked_recipe, mock.to_str().unwrap())
             .unwrap();
         let report: serde_json::Value = serde_json::from_slice(
@@ -2725,6 +2776,24 @@ mod watch_tests {
         .unwrap();
         assert_eq!(report[0]["candidates"]["baad"], 1);
         assert!(report[0]["candidates"].get("known").is_none());
+        fs::write(
+            project_path.join("dictionaries/en.txt"),
+            "known\nadditional\n",
+        )
+        .unwrap();
+        assert_ne!(
+            dictionary_fingerprint,
+            edition_watch_fingerprint(&project_path, &checked_recipe).unwrap()
+        );
+        let outside_dictionary = root.path().join("outside.txt");
+        fs::write(&outside_dictionary, "outside\n").unwrap();
+        std::os::unix::fs::symlink(
+            &outside_dictionary,
+            project_path.join("dictionaries/linked.txt"),
+        )
+        .unwrap();
+        fs::write(&checked_recipe, "version=1\nname='Checked reader'\nformat='markdown'\noutput='exports/checked.md'\nspellcheck=true\nlanguage='en_GB'\ndictionary='dictionaries/linked.txt'\n").unwrap();
+        assert!(edition_watch_fingerprint(&project_path, &checked_recipe).is_err());
     }
 
     #[test]

@@ -246,3 +246,5 @@ Event dependency assertions (`precedes` and `requires`) can now be added, listed
 
 
 Custom-metadata saved queries now support field existence, escaped text containment, and typed numeric comparisons through stable field IDs. CLI and terminal syntax includes `meta-exists=FIELD`, `meta-text=FIELD:TEXT`, and `meta-number=FIELD:OP:int|decimal:VALUE`; field types and finite numeric operands are checked when saved. Integer comparisons remain exact SQLite integer comparisons; decimal comparisons use the current decimal field storage precision.
+
+Issue #16 watcher reliability: compile, edition, and processing watchers now record an input fingerprint only after the complete run succeeds. Transient compile, spellcheck, export, or pipeline failures are retried on subsequent polls even when inputs have not changed. Edition watcher fingerprints include local dictionary contents and validate the dictionary as a regular, non-symlink project file before reading it.
