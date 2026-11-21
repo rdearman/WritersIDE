@@ -100,6 +100,7 @@ enum OutlineRow {
         collapsed: bool,
     },
     Scene(SceneId),
+    ContentUnit(story_core::ContentUnitId),
 }
 
 struct AppState {
@@ -109,6 +110,7 @@ struct AppState {
     selected: usize,
     editor: Vec<String>,
     editing_scene: Option<SceneId>,
+    editing_content_unit: Option<story_core::ContentUnitId>,
     cursor: (usize, usize),
     narrowed_passage: Option<(usize, usize)>,
     saved_hash: String,
@@ -318,6 +320,8 @@ struct SessionSnapshot {
     workspace: String,
     selected_scene: Option<String>,
     editing_scene: Option<String>,
+    #[serde(default)]
+    editing_content_unit: Option<String>,
     cursor: (usize, usize),
     scroll: usize,
     selected: usize,
@@ -2062,6 +2066,8 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.text-expansion-set", "Set Text Expansion", "Add a literal abbreviation and replacement to the project dictionary", "Insert", "text-expansion-set", true),
         legacy_command("edit.text-expansion", "Text Expansion Settings", "Enable, disable, or list project text expansions", "Insert", "text-expansion", true),
         legacy_command("edit.text-expand", "Expand Abbreviation", "Expand the abbreviation immediately before the editor cursor", "Insert", "text-expand", false),
+        legacy_command("document.new-content-unit", "Create Direct Prose Unit", "Add chapter or section prose without creating scenes", "Insert", "content-new", true),
+        legacy_command("document.open-content-unit", "Open Direct Prose Unit", "Open a chapter or section prose document by stable ID", "Insert", "content-open", true),
         legacy_command("edit.preferences", "Editor Preferences", "Set project-local line endings and indentation without rewriting until save", "Edit", "editor-preferences", true),
         legacy_command("edit.bookmark-save", "Save Passage Bookmark", "Save a named stable-ID bookmark for the current passage", "Navigate", "manuscript-bookmark-save", true),
         legacy_command("edit.bookmark-list", "List Passage Bookmarks", "List saved manuscript passage bookmarks", "Navigate", "manuscript-bookmark-list", false),
@@ -3132,6 +3138,7 @@ impl AppState {
             selected: 0,
             editor: vec![String::new()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (0, 0),
             narrowed_passage: None,
             saved_hash: String::new(),
@@ -3424,6 +3431,7 @@ impl AppState {
             workspace: self.workspace.title().to_owned(),
             selected_scene: self.active_scene().map(|id| id.to_string()),
             editing_scene: self.editing_scene.map(|id| id.to_string()),
+            editing_content_unit: self.editing_content_unit.map(|id| id.to_string()),
             cursor: if self.reference_focused {
                 self.active_reference_pane()
                     .filter(|pane| pane.shared_scene)
@@ -3586,6 +3594,24 @@ impl AppState {
             } else {
                 stale_reference = true;
                 self.editing_scene = None;
+            }
+        }
+        if let Some(content_id) = snapshot
+            .editing_content_unit
+            .as_deref()
+            .and_then(|value| value.parse::<uuid::Uuid>().ok())
+            .map(story_core::ContentUnitId)
+        {
+            if self.app.get_content_unit(content_id).is_ok() {
+                self.open_content_unit(content_id)?;
+                self.cursor.0 = snapshot.cursor.0.min(self.editor.len().saturating_sub(1));
+                self.cursor.1 = snapshot
+                    .cursor
+                    .1
+                    .min(grapheme_count(&self.editor[self.cursor.0]));
+            } else {
+                stale_reference = true;
+                self.editing_content_unit = None;
             }
         }
         if self.editing_scene.is_some()
@@ -5115,6 +5141,7 @@ impl AppState {
                         .ok_or("outline scene no longer exists")?;
                     return self.open_scene(id);
                 }
+                Some(OutlineRow::ContentUnit(id)) => return self.open_content_unit(id),
                 None => return Ok(()),
             }
         }
@@ -5329,7 +5356,7 @@ impl AppState {
         Ok(())
     }
     fn open_scene(&mut self, id: SceneId) -> Result<(), Box<dyn std::error::Error>> {
-        if self.dirty && self.editing_scene != Some(id) {
+        if self.dirty && (self.editing_scene != Some(id) || self.editing_content_unit.is_some()) {
             self.message =
                 "Unsaved text is open. Save with Ctrl-S before opening another scene.".into();
             return Ok(());
@@ -5348,6 +5375,7 @@ impl AppState {
         self.cursor = (0, 0);
         self.saved_hash = hash;
         self.editing_scene = Some(id);
+        self.editing_content_unit = None;
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.editor_selection = None;
@@ -5378,6 +5406,34 @@ impl AppState {
         }
         Ok(())
     }
+    fn open_content_unit(
+        &mut self,
+        id: story_core::ContentUnitId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty && self.editing_content_unit != Some(id) {
+            self.message =
+                "Unsaved text is open. Save with Ctrl-S before opening another document.".into();
+            return Ok(());
+        }
+        let (text, hash) = self.app.load_content_unit_text(id)?;
+        self.editor = text.split('\n').map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        self.cursor = (0, 0);
+        self.saved_hash = hash;
+        self.editing_scene = None;
+        self.editing_content_unit = Some(id);
+        self.assembly_draft = None;
+        self.narrowed_passage = None;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.editor_selection = None;
+        self.dirty = false;
+        self.workspace = Workspace::Editor;
+        self.message = format!("{} · direct prose", self.app.get_content_unit(id)?.title);
+        Ok(())
+    }
     fn open_assembly_draft(
         &mut self,
         id: story_core::AssemblyDraftId,
@@ -5397,6 +5453,7 @@ impl AppState {
         self.cursor = (0, 0);
         self.scroll = 0;
         self.editing_scene = None;
+        self.editing_content_unit = None;
         self.assembly_draft = Some(id);
         self.dirty = false;
         self.workspace = Workspace::Editor;
@@ -5464,6 +5521,28 @@ impl AppState {
                     self.message = "Saved".into();
                 }
                 Err(e) => self.message = format!("Save conflict/error: {e}"),
+            }
+        }
+        if let Some(id) = self.editing_content_unit {
+            let canonical_text = self.editor.join("\n");
+            let text = if self.editor_preferences.line_ending == "crlf" {
+                canonical_text.replace('\n', "\r\n")
+            } else {
+                canonical_text
+            };
+            match self
+                .app
+                .save_content_unit_text(id, Some(&self.saved_hash), &text)
+            {
+                Ok(hash) => {
+                    self.saved_hash = hash;
+                    self.dirty = false;
+                    if self.writing_stats_enabled {
+                        self.successful_saves = self.successful_saves.saturating_add(1);
+                    }
+                    self.message = "Saved direct prose".into();
+                }
+                Err(error) => self.message = format!("Save conflict/error: {error}"),
             }
         }
         Ok(())
@@ -5593,7 +5672,9 @@ impl AppState {
     fn command_disabled_reason(&self, spec: CommandSpec) -> Option<&'static str> {
         match spec.action {
             CommandAction::Save
-                if self.editing_scene.is_none() && self.assembly_draft.is_none() =>
+                if self.editing_scene.is_none()
+                    && self.editing_content_unit.is_none()
+                    && self.assembly_draft.is_none() =>
             {
                 Some("Open a scene or assembly draft first")
             }
@@ -5829,6 +5910,35 @@ impl AppState {
         &mut self,
         cmd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(arguments) = cmd.strip_prefix("content-open ") {
+            let id = story_core::ContentUnitId(arguments.trim().parse()?);
+            return self.open_content_unit(id);
+        }
+        if let Some(arguments) = cmd.strip_prefix("content-new ") {
+            let (kind, remainder) = arguments
+                .split_once(' ')
+                .ok_or("use content-new <chapter|section|front|back> <parent-uuid|-> <title>")?;
+            let (parent, title) = remainder
+                .split_once(' ')
+                .ok_or("content-new requires a parent and title")?;
+            let kind = match kind {
+                "chapter" => story_core::ContentUnitKind::ChapterBody,
+                "section" => story_core::ContentUnitKind::SectionBody,
+                "front" => story_core::ContentUnitKind::FrontMatter,
+                "back" => story_core::ContentUnitKind::BackMatter,
+                _ => return Err("content kind must be chapter, section, front, or back".into()),
+            };
+            let parent = if parent == "-" {
+                None
+            } else {
+                Some(story_core::NodeId(parent.parse()?))
+            };
+            let id = self
+                .app
+                .create_content_unit(kind, title.trim(), parent, 0, None)?;
+            self.refresh()?;
+            return self.open_content_unit(id);
+        }
         if cmd == "series-open" {
             self.scrivener_import = None;
             self.series_reference_view = false;
@@ -12975,6 +13085,7 @@ fn outline_rows(s: &AppState) -> Vec<OutlineRow> {
         .into_iter()
         .filter(|scene| visible_ids.contains(&scene.scene.id))
         .collect::<Vec<_>>();
+    let content_units = s.app.list_content_units(false).unwrap_or_default();
     let is_hoisted = scenes.len() < all_scene_count;
     let mut rows = Vec::new();
     for chapter in nodes.iter().filter(|node| node.kind == "chapter") {
@@ -13003,12 +13114,27 @@ fn outline_rows(s: &AppState) -> Vec<OutlineRow> {
         });
         if !s.collapsed_outline_nodes.contains(&chapter.id) {
             rows.extend(
+                content_units
+                    .iter()
+                    .filter(|unit| {
+                        unit.kind == story_core::ContentUnitKind::ChapterBody
+                            && unit.parent_id == Some(chapter.id)
+                    })
+                    .map(|unit| OutlineRow::ContentUnit(unit.id)),
+            );
+            rows.extend(
                 children
                     .into_iter()
                     .map(|scene| OutlineRow::Scene(scene.scene.id)),
             );
         }
     }
+    rows.extend(
+        content_units
+            .iter()
+            .filter(|unit| unit.parent_id.is_none())
+            .map(|unit| OutlineRow::ContentUnit(unit.id)),
+    );
     rows.extend(
         scenes
             .iter()
@@ -13153,6 +13279,17 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                             scene.1,
                             scene.2.as_str(),
                             scene.3
+                        )
+                    },
+                ),
+                OutlineRow::ContentUnit(id) => s.app.get_content_unit(id).map_or_else(
+                    |_| format!("  <missing content unit {id}>"),
+                    |unit| {
+                        format!(
+                            "  {} · {} · {} words",
+                            unit.title,
+                            unit.kind.as_str(),
+                            unit.actual_words
                         )
                     },
                 ),
@@ -15358,6 +15495,56 @@ mod tests {
     }
 
     #[test]
+    fn direct_chapter_prose_uses_the_shared_editor_and_journaled_save() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project_with_type(
+            root.path().join("Book"),
+            "Book",
+            story_core::BookType::Nonfiction,
+        )
+        .unwrap();
+        let chapter = app.create_chapter(None, "Chapter 1", 0).unwrap();
+        let unit = app
+            .create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "Chapter prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| *row == OutlineRow::ContentUnit(unit))
+            .unwrap();
+        state.open_selected().unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        for ch in "Argument with evidence.".chars() {
+            state.insert(ch);
+        }
+        assert!(state.dirty);
+        state.save().unwrap();
+        assert!(!state.dirty);
+        assert_eq!(
+            state.app.load_content_unit_text(unit).unwrap().0,
+            "Argument with evidence."
+        );
+        state.save_session().unwrap();
+        drop(state);
+        let reopened = WriterApp::open_project(root.path().join("Book")).unwrap();
+        let mut reopened_state = AppState::new(reopened, default_bindings());
+        reopened_state.restore_session().unwrap();
+        assert_eq!(reopened_state.editing_content_unit, Some(unit));
+        assert_eq!(
+            reopened_state.app.load_content_unit_text(unit).unwrap().0,
+            "Argument with evidence."
+        );
+        assert!(reopened_state.app.list_scenes(false).unwrap().is_empty());
+    }
+
+    #[test]
     fn series_menu_commands_create_select_and_open_a_new_book() {
         let root = tempfile::tempdir().unwrap();
         let initial = WriterApp::create_project(root.path().join("Initial"), "Initial").unwrap();
@@ -17269,6 +17456,7 @@ mod tests {
             selected: 1,
             editor: vec!["text".into()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (0, 4),
             narrowed_passage: None,
             saved_hash: String::new(),
@@ -17434,7 +17622,9 @@ mod tests {
                 "edit.snippet-insert",
                 "edit.text-expansion-set",
                 "edit.text-expansion",
-                "edit.text-expand"
+                "edit.text-expand",
+                "document.new-content-unit",
+                "document.open-content-unit"
             ]
         );
         handle(
@@ -19386,6 +19576,7 @@ mod tests {
             selected: 0,
             editor: vec!["alpha".into(), "beta".into()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (1, 2),
             narrowed_passage: None,
             saved_hash: String::new(),
@@ -19497,6 +19688,7 @@ mod tests {
             selected: 0,
             editor: vec!["hello".into()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (0, 1),
             narrowed_passage: None,
             saved_hash: String::new(),
@@ -19600,6 +19792,7 @@ mod tests {
             selected: 0,
             editor: vec![String::new(), "next".into()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (0, 0),
             narrowed_passage: None,
             saved_hash: String::new(),
@@ -19715,6 +19908,7 @@ mod tests {
             selected: 1,
             editor: vec![String::new()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (0, 0),
             narrowed_passage: None,
             saved_hash: String::new(),
@@ -19980,6 +20174,7 @@ mod tests {
             selected: 0,
             editor: vec![String::new()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (0, 0),
             narrowed_passage: None,
             saved_hash: String::new(),
@@ -20095,6 +20290,7 @@ mod tests {
             selected: 1,
             editor: vec![String::new()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (0, 0),
             narrowed_passage: None,
             saved_hash: String::new(),
@@ -20227,6 +20423,7 @@ mod tests {
             selected: 1,
             editor: vec![String::new()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (0, 0),
             narrowed_passage: None,
             saved_hash: String::new(),
@@ -20477,6 +20674,7 @@ mod tests {
             selected: 0,
             editor: vec![String::new()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (0, 0),
             narrowed_passage: None,
             saved_hash: String::new(),
@@ -20858,6 +21056,7 @@ mod tests {
             selected: 0,
             editor: vec![String::new()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (0, 0),
             narrowed_passage: None,
             saved_hash: String::new(),
@@ -20984,6 +21183,7 @@ mod tests {
             selected: 0,
             editor: vec![String::new()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (0, 0),
             narrowed_passage: None,
             saved_hash: String::new(),
@@ -21162,6 +21362,7 @@ mod tests {
             selected: 0,
             editor: vec![String::new()],
             editing_scene: None,
+            editing_content_unit: None,
             cursor: (0, 0),
             narrowed_passage: None,
             saved_hash: String::new(),

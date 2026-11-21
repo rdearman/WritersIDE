@@ -311,22 +311,116 @@ impl WriterApp {
         title: &str,
         template: BuiltinTemplate,
     ) -> Result<Self> {
+        Self::create_project_from_definition(path, title, &template.definition())
+    }
+    /// Create a project from a validated declarative template in a sibling
+    /// staging directory, then publish it with one directory rename.
+    pub fn create_project_from_definition(
+        path: impl AsRef<Path>,
+        title: &str,
+        template: &ProjectTemplate,
+    ) -> Result<Self> {
+        template.validate().map_err(AppError::Domain)?;
+        let path = path.as_ref();
+        if path.exists() {
+            return Err(AppError::Domain(
+                "project destination already exists".into(),
+            ));
+        }
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        fs::create_dir_all(parent)
+            .map_err(|error| AppError::Domain(format!("create project parent: {error}")))?;
+        let staging_root = tempfile::tempdir_in(parent).map_err(|error| {
+            AppError::Domain(format!("create project staging directory: {error}"))
+        })?;
+        let staged = staging_root.path().join("project");
         let project = Project {
             id: ProjectId::new(),
             title: title.into(),
             author: String::new(),
             genre: String::new(),
             synopsis: String::new(),
-            book_type: template.book_type(),
-            template_id: Some(template.id().into()),
-            target_words: None,
+            book_type: template.book_type,
+            template_id: Some(template.id.clone()),
+            target_words: template.target_words,
             story_epoch_label: "Day 0".into(),
             story_calendar_id: None,
             language_code: Self::user_preferences()?.default_writing_language,
             word_count_policy: WordCountPolicy::default(),
         };
-        Self::create_project_with_metadata(path, &project)
+        let mut app = Self::create_project_with_metadata(&staged, &project)?;
+        let mut node_ids = std::collections::BTreeMap::new();
+        let mut pending = template.nodes.clone();
+        while !pending.is_empty() {
+            let before = pending.len();
+            let mut next = Vec::new();
+            for node in pending {
+                let parent = node
+                    .parent_key
+                    .as_deref()
+                    .and_then(|key| node_ids.get(key).copied());
+                if node.parent_key.is_some() && parent.is_none() {
+                    next.push(node);
+                    continue;
+                }
+                let id =
+                    app.create_structural_node(parent, node.kind, &node.title, node.position)?;
+                node_ids.insert(node.key, id);
+            }
+            if next.len() == before {
+                return Err(AppError::Domain(
+                    "template structural nodes cannot be ordered".into(),
+                ));
+            }
+            pending = next;
+        }
+        for unit in &template.content_units {
+            let parent = unit
+                .parent_key
+                .as_deref()
+                .and_then(|key| node_ids.get(key).copied());
+            app.create_content_unit(
+                unit.kind,
+                &unit.title,
+                parent,
+                unit.position,
+                unit.target_words,
+            )?;
+        }
+        for scene in &template.scenes {
+            let chapter = node_ids.get(&scene.chapter_key).copied().ok_or_else(|| {
+                AppError::Domain(format!(
+                    "template scene chapter {} is missing",
+                    scene.chapter_key
+                ))
+            })?;
+            let id = app.create_scene(chapter, &scene.title, scene.position)?;
+            if let Some(words) = scene.target_words {
+                let mut metadata = app.get_scene(id)?.scene;
+                metadata.target_words = Some(words);
+                app.update_scene_metadata(&metadata)?;
+            }
+        }
+        app.validate_project()?;
+        drop(app);
+        fs::rename(&staged, path)
+            .map_err(|error| AppError::Domain(format!("publish created project: {error}")))?;
+        Self::open_project(path)
     }
+
+    pub fn create_structural_node(
+        &mut self,
+        parent: Option<NodeId>,
+        kind: NodeKind,
+        title: &str,
+        position: u32,
+    ) -> Result<NodeId> {
+        Ok(self.store.create_node(parent, kind, title, position)?)
+    }
+
     pub fn create_project_with_metadata(path: impl AsRef<Path>, project: &Project) -> Result<Self> {
         Ok(Self {
             store: ProjectStore::create_for(path, project)?,
@@ -3015,6 +3109,51 @@ mod tests {
         let path = app.export_emacs_tags().unwrap();
         assert!(path.ends_with(".writers-ide/tags/TAGS"));
         assert_eq!(fs::read_to_string(path).unwrap(), export.tags_file);
+    }
+
+    #[test]
+    fn declarative_nonfiction_template_creates_direct_prose_and_round_trips() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Reference Book");
+        let template = BuiltinTemplate::NonfictionBook.definition();
+        let mut app =
+            WriterApp::create_project_from_definition(&path, "Reference Book", &template).unwrap();
+        let project = app.get_project().unwrap();
+        assert_eq!(project.book_type, BookType::Nonfiction);
+        assert_eq!(project.template_id.as_deref(), Some("nonfiction-book"));
+        let chapters = app.list_structural_nodes().unwrap();
+        assert_eq!(chapters.len(), 1);
+        let bodies = app.list_content_units(false).unwrap();
+        assert_eq!(bodies.len(), 1);
+        let body = bodies[0].id;
+        let (_, hash) = app.load_content_unit_text(body).unwrap();
+        app.save_content_unit_text(body, Some(&hash), "Direct chapter prose.")
+            .unwrap();
+        drop(app);
+        let reopened = WriterApp::open_project(&path).unwrap();
+        assert_eq!(
+            reopened.load_content_unit_text(body).unwrap().0,
+            "Direct chapter prose."
+        );
+        assert!(reopened.list_scenes(false).unwrap().is_empty());
+        let compiled = reopened
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        let compiled = String::from_utf8(compiled.bytes).unwrap();
+        assert!(compiled.contains("Direct chapter prose."));
+    }
+
+    #[test]
+    fn custom_template_deserialization_rejects_unmapped_keys() {
+        let source = r#"
+schema_version = 1
+template_revision = 1
+id = "custom"
+name = "Custom"
+book_type = "nonfiction"
+unexpected_prose = "must not be silently discarded"
+"#;
+        assert!(toml::from_str::<ProjectTemplate>(source).is_err());
     }
 
     #[test]

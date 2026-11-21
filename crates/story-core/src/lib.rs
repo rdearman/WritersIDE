@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -1481,6 +1481,244 @@ impl BuiltinTemplate {
     pub fn parse(id: &str) -> Option<Self> {
         Self::all().into_iter().find(|template| template.id() == id)
     }
+
+    pub fn definition(self) -> ProjectTemplate {
+        let mut template = ProjectTemplate {
+            schema_version: 1,
+            template_revision: 1,
+            id: self.id().into(),
+            name: match self {
+                Self::BlankFiction => "Blank Fiction",
+                Self::Novel => "Novel",
+                Self::ShortStory => "Short Story",
+                Self::BlankNonfiction => "Blank Non-fiction",
+                Self::NonfictionBook => "Non-fiction Book",
+            }
+            .into(),
+            book_type: self.book_type(),
+            target_words: None,
+            nodes: Vec::new(),
+            content_units: Vec::new(),
+            scenes: Vec::new(),
+        };
+        match self {
+            Self::BlankFiction | Self::BlankNonfiction => {}
+            Self::Novel => template.nodes.push(ProjectTemplateNode {
+                key: "chapter-1".into(),
+                parent_key: None,
+                kind: NodeKind::Chapter,
+                title: "Chapter 1".into(),
+                position: 0,
+            }),
+            Self::ShortStory => template.nodes.push(ProjectTemplateNode {
+                key: "chapter-1".into(),
+                parent_key: None,
+                kind: NodeKind::Chapter,
+                title: "Story".into(),
+                position: 0,
+            }),
+            Self::NonfictionBook => {
+                template.nodes.push(ProjectTemplateNode {
+                    key: "chapter-1".into(),
+                    parent_key: None,
+                    kind: NodeKind::Chapter,
+                    title: "Chapter 1".into(),
+                    position: 0,
+                });
+                template.content_units.push(ProjectTemplateContentUnit {
+                    key: "chapter-1-body".into(),
+                    parent_key: Some("chapter-1".into()),
+                    kind: ContentUnitKind::ChapterBody,
+                    title: "Chapter 1 prose".into(),
+                    position: 0,
+                    target_words: None,
+                });
+            }
+        }
+        template
+    }
+}
+
+/// A versioned, declarative project starter. It contains structure and empty
+/// content-unit definitions only; manuscript prose and project secrets are
+/// never copied into a new project.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectTemplate {
+    pub schema_version: u16,
+    pub template_revision: u32,
+    pub id: String,
+    pub name: String,
+    pub book_type: BookType,
+    #[serde(default)]
+    pub target_words: Option<u64>,
+    #[serde(default)]
+    pub nodes: Vec<ProjectTemplateNode>,
+    #[serde(default)]
+    pub content_units: Vec<ProjectTemplateContentUnit>,
+    #[serde(default)]
+    pub scenes: Vec<ProjectTemplateScene>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectTemplateNode {
+    pub key: String,
+    #[serde(default)]
+    pub parent_key: Option<String>,
+    pub kind: NodeKind,
+    pub title: String,
+    pub position: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectTemplateContentUnit {
+    pub key: String,
+    #[serde(default)]
+    pub parent_key: Option<String>,
+    pub kind: ContentUnitKind,
+    pub title: String,
+    pub position: u32,
+    #[serde(default)]
+    pub target_words: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectTemplateScene {
+    pub key: String,
+    pub chapter_key: String,
+    pub title: String,
+    pub position: u32,
+    #[serde(default)]
+    pub target_words: Option<u64>,
+}
+
+impl ProjectTemplate {
+    pub fn validate(&self) -> Result<(), String> {
+        const MAX_TEMPLATE_ITEMS: usize = 4096;
+        let valid_key = |key: &str| {
+            !key.is_empty()
+                && key.len() <= 80
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+        };
+        if self.schema_version != 1 || self.template_revision == 0 {
+            return Err("unsupported project-template schema or revision".into());
+        }
+        if !valid_key(&self.id) || self.name.trim().is_empty() {
+            return Err("project-template ID and name are required".into());
+        }
+        let total = self.nodes.len() + self.content_units.len() + self.scenes.len();
+        if total > MAX_TEMPLATE_ITEMS {
+            return Err("project template exceeds the 4096-item limit".into());
+        }
+        let mut keys = BTreeSet::new();
+        for item in &self.nodes {
+            if !valid_key(&item.key)
+                || item.title.trim().is_empty()
+                || !keys.insert(item.key.as_str())
+            {
+                return Err(
+                    "project-template node keys and titles must be valid and unique".into(),
+                );
+            }
+        }
+        for item in &self.content_units {
+            if !valid_key(&item.key)
+                || item.title.trim().is_empty()
+                || !keys.insert(item.key.as_str())
+            {
+                return Err(
+                    "project-template content keys and titles must be valid and unique".into(),
+                );
+            }
+        }
+        for item in &self.scenes {
+            if !valid_key(&item.key)
+                || item.title.trim().is_empty()
+                || !keys.insert(item.key.as_str())
+            {
+                return Err(
+                    "project-template scene keys and titles must be valid and unique".into(),
+                );
+            }
+        }
+        let nodes = self
+            .nodes
+            .iter()
+            .map(|node| (node.key.as_str(), node))
+            .collect::<BTreeMap<_, _>>();
+        for item in &self.nodes {
+            if let Some(parent_key) = item.parent_key.as_deref() {
+                let parent = nodes
+                    .get(parent_key)
+                    .ok_or_else(|| format!("template parent {parent_key} is missing"))?;
+                if parent.kind == NodeKind::Chapter {
+                    return Err("template chapters cannot contain structural children".into());
+                }
+            }
+        }
+        for item in &self.nodes {
+            let mut visited = BTreeSet::new();
+            let mut cursor = Some(item.key.as_str());
+            while let Some(key) = cursor {
+                if !visited.insert(key) {
+                    return Err("project-template structure contains a cycle".into());
+                }
+                cursor = nodes.get(key).and_then(|node| node.parent_key.as_deref());
+            }
+        }
+        let mut positions: BTreeSet<(Option<&str>, u32)> = BTreeSet::new();
+        for item in &self.nodes {
+            if !positions.insert((item.parent_key.as_deref(), item.position)) {
+                return Err("project-template sibling node positions must be unique".into());
+            }
+        }
+        let mut content_positions: BTreeSet<(Option<&str>, String, u32)> = BTreeSet::new();
+        for item in &self.content_units {
+            match (item.kind, item.parent_key.as_deref()) {
+                (ContentUnitKind::ChapterBody, Some(key))
+                    if nodes
+                        .get(key)
+                        .is_some_and(|node| node.kind == NodeKind::Chapter) => {}
+                (ContentUnitKind::SectionBody, Some(key))
+                    if nodes
+                        .get(key)
+                        .is_some_and(|node| node.kind == NodeKind::Section) => {}
+                (ContentUnitKind::FrontMatter | ContentUnitKind::BackMatter, None) => {}
+                _ => return Err("template content-unit kind and parent do not match".into()),
+            }
+            // Front matter and back matter are distinct root collections and
+            // may each start at position zero.
+            let root_kind = if item.parent_key.is_none() {
+                format!("root:{:?}", item.kind)
+            } else {
+                "children".to_owned()
+            };
+            if !content_positions.insert((item.parent_key.as_deref(), root_kind, item.position)) {
+                return Err("project-template content positions must be unique per parent".into());
+            }
+        }
+        let mut scene_positions: BTreeSet<(&str, u32)> = BTreeSet::new();
+        for item in &self.scenes {
+            if !nodes
+                .get(item.chapter_key.as_str())
+                .is_some_and(|node| node.kind == NodeKind::Chapter)
+            {
+                return Err(format!(
+                    "scene {} must reference a template chapter",
+                    item.key
+                ));
+            }
+            if !scene_positions.insert((item.chapter_key.as_str(), item.position)) {
+                return Err("project-template scene positions must be unique per chapter".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1976,5 +2214,46 @@ mod tests {
             d.validate(&FieldValue::DateTime("tomorrow".into()))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn templates_allow_separate_front_and_back_matter_positions_and_reject_cycles() {
+        let mut template = BuiltinTemplate::BlankNonfiction.definition();
+        template.content_units = vec![
+            ProjectTemplateContentUnit {
+                key: "front".into(),
+                parent_key: None,
+                kind: ContentUnitKind::FrontMatter,
+                title: "Preface".into(),
+                position: 0,
+                target_words: None,
+            },
+            ProjectTemplateContentUnit {
+                key: "back".into(),
+                parent_key: None,
+                kind: ContentUnitKind::BackMatter,
+                title: "Bibliography".into(),
+                position: 0,
+                target_words: None,
+            },
+        ];
+        assert!(template.validate().is_ok());
+        template.nodes = vec![
+            ProjectTemplateNode {
+                key: "one".into(),
+                parent_key: Some("two".into()),
+                kind: NodeKind::Section,
+                title: "One".into(),
+                position: 0,
+            },
+            ProjectTemplateNode {
+                key: "two".into(),
+                parent_key: Some("one".into()),
+                kind: NodeKind::Section,
+                title: "Two".into(),
+                position: 0,
+            },
+        ];
+        assert!(template.validate().unwrap_err().contains("cycle"));
     }
 }
