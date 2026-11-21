@@ -4489,7 +4489,25 @@ impl AppState {
                 .unwrap_or(0);
             self.message = "Full outline restored".into();
         } else if cmd == "proofread" || cmd.starts_with("proofread ") {
-            let scope = cmd.strip_prefix("proofread ").unwrap_or("current");
+            let mut scope = "current";
+            let mut severities = None;
+            for argument in cmd.split_whitespace().skip(1) {
+                if let Some(filter) = argument.strip_prefix("severity=") {
+                    let values = filter.split(',').collect::<std::collections::BTreeSet<_>>();
+                    if values.is_empty()
+                        || values
+                            .iter()
+                            .any(|value| !matches!(*value, "error" | "warning" | "information"))
+                    {
+                        return Err(
+                            "severity filter must contain error, warning, or information".into(),
+                        );
+                    }
+                    severities = Some(values);
+                } else {
+                    scope = argument;
+                }
+            }
             let target = self
                 .editing_scene
                 .or(self.active_scene())
@@ -4507,6 +4525,12 @@ impl AppState {
             for record in records {
                 let (text, _) = self.app.load_scene_text(record.scene.id)?;
                 for finding in self.app.proofread_text(&text)? {
+                    if severities
+                        .as_ref()
+                        .is_some_and(|values| !values.contains(finding.severity.as_str()))
+                    {
+                        continue;
+                    }
                     rows.push(format!(
                         "{} {}..{} {} {} · {}",
                         record.scene.title,

@@ -879,6 +879,22 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "proofread" => {
             let path = args.next().ok_or("missing project path")?;
             let scope = args.next().unwrap_or_else(|| "all".into());
+            let severities = args.next().map(|value| {
+                value
+                    .strip_prefix("severity=")
+                    .unwrap_or(&value)
+                    .split(',')
+                    .map(str::to_owned)
+                    .collect::<std::collections::BTreeSet<_>>()
+            });
+            if let Some(values) = &severities
+                && (values.is_empty()
+                    || values.iter().any(|value| {
+                        !matches!(value.as_str(), "error" | "warning" | "information")
+                    }))
+            {
+                return Err("severity filter must contain error, warning, or information".into());
+            }
             let app = WriterApp::open_project(path)?;
             for scene in app
                 .list_scenes(false)?
@@ -887,6 +903,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             {
                 let (text, _) = app.load_scene_text(scene.scene.id)?;
                 for finding in app.proofread_text(&text)? {
+                    if severities
+                        .as_ref()
+                        .is_some_and(|values| !values.contains(&finding.severity))
+                    {
+                        continue;
+                    }
                     println!(
                         "{}\t{}\t{}..{}\t{}\t{}: {}",
                         scene.scene.id,

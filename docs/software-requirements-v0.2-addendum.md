@@ -189,7 +189,7 @@ The browser now supports chapter/scene creation, scene synopsis/status changes, 
 
 ### Issue #10 — Configurable deterministic diagnostics foundation
 
-Mechanical proofing now loads an optional project-local `.writers-ide/diagnostics.toml` rule set. It supports the existing repeated-word, double-space, and space-before-punctuation checks plus bounded Rust-regex rules; each rule has a stable ID, enabled flag, severity and message. Invalid config and regex patterns fail visibly. CLI `proofread-config` writes a default file without overwriting an existing one; CLI and terminal proofread commands use the project config and return UTF-8 byte ranges. Findings remain advisory and do not modify prose. Broader publishing/continuity rule families, dictionary-backed spelling, rule scoping and severity filtering remain incomplete.
+Mechanical proofing now loads an optional project-local `.writers-ide/diagnostics.toml` rule set. It supports the existing repeated-word, double-space, and space-before-punctuation checks plus bounded Rust-regex rules; each rule has a stable ID, enabled flag, severity and message. Invalid config and regex patterns fail visibly. CLI `proofread-config` writes a default file without overwriting an existing one; CLI and terminal proofread commands use the project config and return UTF-8 byte ranges. Both reports accept a severity filter (`severity=error,warning,information`). Findings remain advisory and do not modify prose. Broader publishing/continuity rule families, dictionary-backed spelling, and rule scoping remain incomplete.
 
 ### Issue #1 — Hypertext and knowledge workflows status
 
