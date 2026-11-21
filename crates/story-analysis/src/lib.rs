@@ -778,6 +778,107 @@ pub fn character_chronology_findings(
     findings
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum LocationRuleFindingStatus {
+    DefiniteConflict,
+    PossibleConflict,
+    Unverified,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocationRuleFinding {
+    pub rule_id: String,
+    pub first_scene_id: String,
+    pub second_scene_id: String,
+    pub shared_character_ids: Vec<String>,
+    pub status: LocationRuleFindingStatus,
+    pub description: String,
+}
+
+/// Applies explicit author-defined incompatible-location rules to scenes with a
+/// shared participant. Missing or unbounded chronology remains unverified.
+pub fn location_incompatibility_findings(
+    scenes: &[SceneAnalysisInput],
+    rules: &[story_core::LocationIncompatibilityRule],
+) -> Vec<LocationRuleFinding> {
+    use LocationRuleFindingStatus::*;
+    use TimeOrdering::*;
+    let mut findings = Vec::new();
+    for rule in rules.iter().filter(|rule| rule.enabled) {
+        let first_location = rule.first_location.to_string();
+        let second_location = rule.second_location.to_string();
+        for (index, first) in scenes.iter().enumerate() {
+            let first_has_a = first.locations.iter().any(|item| item.id == first_location);
+            let first_has_b = first
+                .locations
+                .iter()
+                .any(|item| item.id == second_location);
+            for second in scenes.iter().skip(index + 1) {
+                let second_has_a = second
+                    .locations
+                    .iter()
+                    .any(|item| item.id == first_location);
+                let second_has_b = second
+                    .locations
+                    .iter()
+                    .any(|item| item.id == second_location);
+                if !((first_has_a && second_has_b) || (first_has_b && second_has_a)) {
+                    continue;
+                }
+                let first_chars = first
+                    .characters
+                    .iter()
+                    .filter(|item| item.role != ParticipationRole::Mentioned)
+                    .map(|item| item.id.as_str())
+                    .collect::<BTreeSet<_>>();
+                let shared = second
+                    .characters
+                    .iter()
+                    .filter(|item| item.role != ParticipationRole::Mentioned)
+                    .filter(|item| first_chars.contains(item.id.as_str()))
+                    .map(|item| item.id.clone())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if shared.is_empty() {
+                    continue;
+                }
+                if matches!(first.end_time.compare(second.start_time), Before | Same)
+                    || matches!(second.end_time.compare(first.start_time), Before | Same)
+                {
+                    continue;
+                }
+                let bounded = [
+                    first.start_time,
+                    first.end_time,
+                    second.start_time,
+                    second.end_time,
+                ]
+                .into_iter()
+                .all(|time| time.lower.is_some() && time.upper.is_some());
+                let definite = matches!(first.start_time.compare(second.end_time), Before)
+                    && matches!(second.start_time.compare(first.end_time), Before);
+                let status = if definite {
+                    DefiniteConflict
+                } else if bounded {
+                    PossibleConflict
+                } else {
+                    Unverified
+                };
+                findings.push(LocationRuleFinding {
+                    rule_id: rule.id.to_string(),
+                    first_scene_id: first.scene_id.clone(),
+                    second_scene_id: second.scene_id.clone(),
+                    shared_character_ids: shared,
+                    status,
+                    description: rule.description.clone(),
+                });
+            }
+        }
+    }
+    findings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -914,5 +1015,78 @@ mod tests {
         unrelated.start_time = story_core::StoryTime::exact(5);
         unrelated.end_time = story_core::StoryTime::exact(20);
         assert!(character_chronology_findings(&[first, unrelated]).is_empty());
+    }
+
+    #[test]
+    fn location_incompatibility_rules_report_definite_possible_and_unknown_cases() {
+        let location_a = story_core::LocationId::new();
+        let location_b = story_core::LocationId::new();
+        let rule = story_core::LocationIncompatibilityRule {
+            id: story_core::ContinuityRuleId::new(),
+            first_location: location_a,
+            second_location: location_b,
+            description: "The sealed room and the bridge are too far apart".into(),
+            enabled: true,
+        };
+        let mut first = scene("first", None, &["Mara"], &[]);
+        first.locations.push(StoryEntityOnScene {
+            id: location_a.to_string(),
+            name: "Sealed room".into(),
+        });
+        first.start_time = story_core::StoryTime::exact(0);
+        first.end_time = story_core::StoryTime::exact(10);
+        let mut definite = scene("definite", None, &["Mara"], &[]);
+        definite.locations.push(StoryEntityOnScene {
+            id: location_b.to_string(),
+            name: "Bridge".into(),
+        });
+        definite.start_time = story_core::StoryTime::exact(5);
+        definite.end_time = story_core::StoryTime::exact(15);
+        assert_eq!(
+            location_incompatibility_findings(
+                &[first.clone(), definite],
+                std::slice::from_ref(&rule)
+            )[0]
+            .status,
+            LocationRuleFindingStatus::DefiniteConflict
+        );
+
+        let mut possible = scene("possible", None, &["Mara"], &[]);
+        possible.locations.push(StoryEntityOnScene {
+            id: location_b.to_string(),
+            name: "Bridge".into(),
+        });
+        possible.start_time = story_core::StoryTime::new(
+            Some(12),
+            Some(8),
+            Some(14),
+            story_core::TimePrecision::Bounded,
+        )
+        .unwrap();
+        possible.end_time = story_core::StoryTime::exact(20);
+        assert_eq!(
+            location_incompatibility_findings(
+                &[first.clone(), possible],
+                std::slice::from_ref(&rule)
+            )[0]
+            .status,
+            LocationRuleFindingStatus::PossibleConflict
+        );
+
+        let mut unknown = scene("unknown", None, &["Mara"], &[]);
+        unknown.locations.push(StoryEntityOnScene {
+            id: location_b.to_string(),
+            name: "Bridge".into(),
+        });
+        assert_eq!(
+            location_incompatibility_findings(&[first, unknown], std::slice::from_ref(&rule))[0]
+                .status,
+            LocationRuleFindingStatus::Unverified
+        );
+        let disabled = story_core::LocationIncompatibilityRule {
+            enabled: false,
+            ..rule
+        };
+        assert!(location_incompatibility_findings(&[], &[disabled]).is_empty());
     }
 }

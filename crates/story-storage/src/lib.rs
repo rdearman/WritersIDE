@@ -43,6 +43,7 @@ const MIGRATION_28: &str = include_str!("../migrations/0028_assembly_issue_query
 const MIGRATION_29: &str = include_str!("../migrations/0029_entity_ref_query_filters.sql");
 const MIGRATION_30: &str =
     include_str!("../migrations/0030_uncertainty_aware_time_query_filters.sql");
+const MIGRATION_31: &str = include_str!("../migrations/0031_location_incompatibility_rules.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -849,7 +850,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_19}\nINSERT INTO schema_migrations(version,applied_at) VALUES(19,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_20}\nINSERT INTO schema_migrations(version,applied_at) VALUES(20,'{}');\nCOMMIT;", now()))?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\n{MIGRATION_25}\nINSERT INTO schema_migrations(version,applied_at) VALUES(25,'{}');\n{MIGRATION_26}\nINSERT INTO schema_migrations(version,applied_at) VALUES(26,'{}');\n{MIGRATION_27}\nINSERT INTO schema_migrations(version,applied_at) VALUES(27,'{}');\n{MIGRATION_28}\nINSERT INTO schema_migrations(version,applied_at) VALUES(28,'{}');\n{MIGRATION_29}\nINSERT INTO schema_migrations(version,applied_at) VALUES(29,'{}');\n{MIGRATION_30}\nINSERT INTO schema_migrations(version,applied_at) VALUES(30,'{}');\nCOMMIT;", now(), now(), now(), now(), now(), now(), now(), now(), now(), now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\n{MIGRATION_25}\nINSERT INTO schema_migrations(version,applied_at) VALUES(25,'{}');\n{MIGRATION_26}\nINSERT INTO schema_migrations(version,applied_at) VALUES(26,'{}');\n{MIGRATION_27}\nINSERT INTO schema_migrations(version,applied_at) VALUES(27,'{}');\n{MIGRATION_28}\nINSERT INTO schema_migrations(version,applied_at) VALUES(28,'{}');\n{MIGRATION_29}\nINSERT INTO schema_migrations(version,applied_at) VALUES(29,'{}');\n{MIGRATION_30}\nINSERT INTO schema_migrations(version,applied_at) VALUES(30,'{}');\n{MIGRATION_31}\nINSERT INTO schema_migrations(version,applied_at) VALUES(31,'{}');\nCOMMIT;", now(), now(), now(), now(), now(), now(), now(), now(), now(), now(), now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
@@ -892,7 +893,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 30 {
+        if version > 31 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1013,6 +1014,10 @@ impl ProjectStore {
         }
         if current_version == 29 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_30}\nINSERT INTO schema_migrations(version,applied_at) VALUES(30,'{}');\nCOMMIT;", now()))?;
+            current_version = 30;
+        }
+        if current_version == 30 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_31}\nINSERT INTO schema_migrations(version,applied_at) VALUES(31,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -5085,6 +5090,104 @@ impl ProjectStore {
         let rows = query.query_map([include_archived], writing_goal_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StorageError::from)
+    }
+    pub fn add_location_incompatibility_rule(
+        &mut self,
+        rule: &LocationIncompatibilityRule,
+    ) -> Result<()> {
+        if rule.first_location == rule.second_location {
+            return Err(StorageError::Invalid(
+                "an incompatibility rule must name two different locations".into(),
+            ));
+        }
+        let (first, second) = if rule.first_location.to_string() < rule.second_location.to_string()
+        {
+            (rule.first_location, rule.second_location)
+        } else {
+            (rule.second_location, rule.first_location)
+        };
+        self.conn.execute(
+            "INSERT INTO location_incompatibility_rule(id,first_location_id,second_location_id,description,enabled,created_at) VALUES(?1,?2,?3,?4,?5,?6)",
+            params![rule.id.to_string(), first.to_string(), second.to_string(), rule.description, rule.enabled, now()],
+        )?;
+        Ok(())
+    }
+    pub fn list_location_incompatibility_rules(&self) -> Result<Vec<LocationIncompatibilityRule>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,first_location_id,second_location_id,description,enabled FROM location_incompatibility_rule ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, first, second, description, enabled) = row?;
+            Ok::<LocationIncompatibilityRule, rusqlite::Error>(LocationIncompatibilityRule {
+                id: ContinuityRuleId(Uuid::parse_str(&id).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?),
+                first_location: LocationId(Uuid::parse_str(&first).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?),
+                second_location: LocationId(Uuid::parse_str(&second).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?),
+                description,
+                enabled,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
+    pub fn update_location_incompatibility_rule(
+        &mut self,
+        rule: &LocationIncompatibilityRule,
+    ) -> Result<()> {
+        if rule.first_location == rule.second_location {
+            return Err(StorageError::Invalid(
+                "an incompatibility rule must name two different locations".into(),
+            ));
+        }
+        let (first, second) = if rule.first_location.to_string() < rule.second_location.to_string()
+        {
+            (rule.first_location, rule.second_location)
+        } else {
+            (rule.second_location, rule.first_location)
+        };
+        if self.conn.execute(
+            "UPDATE location_incompatibility_rule SET first_location_id=?2,second_location_id=?3,description=?4,enabled=?5 WHERE id=?1",
+            params![rule.id.to_string(), first.to_string(), second.to_string(), rule.description, rule.enabled],
+        )? == 0 {
+            return Err(StorageError::NotFound(rule.id.to_string()));
+        }
+        Ok(())
+    }
+    pub fn remove_location_incompatibility_rule(&mut self, id: ContinuityRuleId) -> Result<()> {
+        if self.conn.execute(
+            "DELETE FROM location_incompatibility_rule WHERE id=?1",
+            [id.to_string()],
+        )? == 0
+        {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
     pub fn record_writing_goal_event(&mut self, event: &NewWritingGoalEvent) -> Result<String> {
         if !matches!(
@@ -9617,6 +9720,48 @@ mod tests {
     }
 
     #[test]
+    fn location_incompatibility_rules_persist_and_reject_invalid_sql() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Location Rules");
+        let mut store = ProjectStore::create(&project, "Location Rules").unwrap();
+        let left = LocationId::new();
+        let right = LocationId::new();
+        store.add_location(left, "The bridge").unwrap();
+        store.add_location(right, "The sealed room").unwrap();
+        let rule = LocationIncompatibilityRule {
+            id: ContinuityRuleId::new(),
+            first_location: left,
+            second_location: right,
+            description: "cannot be occupied simultaneously".into(),
+            enabled: true,
+        };
+        store.add_location_incompatibility_rule(&rule).unwrap();
+        assert_eq!(
+            store.list_location_incompatibility_rules().unwrap().len(),
+            1
+        );
+        assert!(store.add_location_incompatibility_rule(&rule).is_err());
+        let bad_id = ContinuityRuleId::new();
+        assert!(store.conn.execute(
+            "INSERT INTO location_incompatibility_rule(id,first_location_id,second_location_id,description,enabled,created_at) VALUES(?1,?2,?2,'self',1,'now')",
+            params![bad_id.to_string(), left.to_string()]
+        ).is_err());
+        assert!(store.conn.execute(
+            "INSERT INTO location_incompatibility_rule(id,first_location_id,second_location_id,description,enabled,created_at) VALUES(?1,?2,?3,'missing',1,'now')",
+            params![bad_id.to_string(), left.to_string(), Uuid::new_v4().to_string()]
+        ).is_err());
+        store.remove_location_incompatibility_rule(rule.id).unwrap();
+        drop(store);
+        assert!(
+            ProjectStore::open(project)
+                .unwrap()
+                .list_location_incompatibility_rules()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn query_filters_cover_assembly_membership_and_all_issue_states() {
         let directory = tempdir().unwrap();
         let mut store = ProjectStore::create(directory.path().join("Queries"), "Queries").unwrap();
@@ -9821,7 +9966,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 30))
+            .map(|version| assert_eq!(version, 31))
             .unwrap();
     }
 
@@ -10075,7 +10220,7 @@ mod tests {
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch("DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
-        conn.execute_batch("DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -10085,7 +10230,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 30);
+        assert_eq!(version, 31);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -10164,6 +10309,7 @@ mod tests {
              ALTER TABLE character DROP COLUMN preferred_name;
              ALTER TABLE project DROP COLUMN language_code;
              DROP TABLE saved_query_expression;
+             DROP TABLE location_incompatibility_rule;
              DELETE FROM schema_migrations WHERE version>=9;",
         )
         .unwrap();

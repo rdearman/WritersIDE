@@ -947,6 +947,11 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("search.query-assert-save", "Save Query Assertions", "Persist count assertions for a saved query", "View", "query-assert-save", true),
         legacy_command("search.query-assert-check", "Check Query Assertions", "Evaluate saved count assertions against refreshed results", "View", "query-assert-check", true),
         legacy_command("analysis.coverage-add", "Add Coverage Rule", "Add a project-local character or plotline appearance requirement", "Plot", "coverage-add", true),
+        legacy_command("analysis.location-rule-add", "Add Location Conflict Rule", "Record two locations that cannot overlap in time", "Plot", "location-rule-add", true),
+        legacy_command("analysis.location-rule-list", "List Location Conflict Rules", "Show author-defined location incompatibilities", "Plot", "location-rule-list", false),
+        legacy_command("analysis.location-rule-update", "Update Location Conflict Rule", "Enable, disable or rename a location incompatibility", "Plot", "location-rule-update", true),
+        legacy_command("analysis.location-rule-check", "Check Location Conflict Rules", "Inspect scenes against location rules", "Plot", "location-rule-check", false),
+        legacy_command("analysis.location-rule-remove", "Remove Location Conflict Rule", "Delete an author-defined location rule", "Plot", "location-rule-remove", true),
         legacy_command("analysis.coverage-check", "Check Coverage Rules", "Evaluate saved coverage requirements without changing story data", "Plot", "coverage-check", false),
         legacy_command("analysis.coverage-list", "List Coverage Rules", "List project-local coverage requirements", "Plot", "coverage-list", false),
         legacy_command("analysis.coverage-remove", "Remove Coverage Rule", "Remove a coverage requirement by ID", "Plot", "coverage-remove", true),
@@ -5372,6 +5377,102 @@ impl AppState {
                 .map(|fact| format!("{} {} · {}", fact.source_kind, fact.source_id, fact.detail))
                 .collect::<Vec<_>>()
                 .join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("location-rule-add ") {
+            let mut parts = rest.splitn(3, ' ');
+            let first_location = story_core::LocationId(
+                parts
+                    .next()
+                    .ok_or("use location-rule-add LOCATION-A LOCATION-B DESCRIPTION")?
+                    .parse()?,
+            );
+            let second_location = story_core::LocationId(
+                parts
+                    .next()
+                    .ok_or("use location-rule-add LOCATION-A LOCATION-B DESCRIPTION")?
+                    .parse()?,
+            );
+            let description = parts.next().unwrap_or_default().trim();
+            if description.is_empty() {
+                return Err("location rule description cannot be empty".into());
+            }
+            let rule = story_core::LocationIncompatibilityRule {
+                id: story_core::ContinuityRuleId::new(),
+                first_location,
+                second_location,
+                description: description.into(),
+                enabled: true,
+            };
+            self.app.add_location_incompatibility_rule(&rule)?;
+            self.message = format!("Added location conflict rule {}", rule.id);
+        } else if cmd == "location-rule-list" {
+            self.message = self
+                .app
+                .list_location_incompatibility_rules()?
+                .iter()
+                .map(|rule| {
+                    format!(
+                        "{} {} ↔ {} · {}{}",
+                        rule.id,
+                        rule.first_location,
+                        rule.second_location,
+                        rule.description,
+                        if rule.enabled { "" } else { " (disabled)" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("location-rule-update ") {
+            let mut parts = rest.splitn(3, ' ');
+            let id = story_core::ContinuityRuleId(
+                parts
+                    .next()
+                    .ok_or("use location-rule-update RULE-UUID enabled|disabled DESCRIPTION")?
+                    .parse()?,
+            );
+            let enabled = match parts.next().ok_or("missing enabled|disabled")? {
+                "enabled" => true,
+                "disabled" => false,
+                _ => return Err("rule state must be enabled or disabled".into()),
+            };
+            let description = parts.next().unwrap_or_default().trim();
+            let mut rule = self
+                .app
+                .list_location_incompatibility_rules()?
+                .into_iter()
+                .find(|rule| rule.id == id)
+                .ok_or("unknown location rule")?;
+            rule.enabled = enabled;
+            rule.description = description.into();
+            self.app.update_location_incompatibility_rule(&rule)?;
+            self.message = format!("Updated location rule {id}");
+        } else if let Some(id) = cmd.strip_prefix("location-rule-remove ") {
+            let id = story_core::ContinuityRuleId(id.trim().parse()?);
+            self.app.remove_location_incompatibility_rule(id)?;
+            self.message = format!("Removed location rule {id}");
+        } else if cmd == "location-rule-check" {
+            self.message = self
+                .app
+                .inspect_location_incompatibilities()?
+                .iter()
+                .map(|finding| {
+                    let status = match finding.status {
+                        story_analysis::LocationRuleFindingStatus::DefiniteConflict => "CONFLICT",
+                        story_analysis::LocationRuleFindingStatus::PossibleConflict => "POSSIBLE",
+                        story_analysis::LocationRuleFindingStatus::Unverified => "UNVERIFIED",
+                    };
+                    format!(
+                        "{status} {} {} ↔ {} · {}",
+                        finding.rule_id,
+                        finding.first_scene_id,
+                        finding.second_scene_id,
+                        finding.description
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if self.message.is_empty() {
+                self.message = "No location-rule findings".into();
+            }
         } else if let Some(rest) = cmd.strip_prefix("coverage-add ") {
             let mut parts = rest.splitn(5, ' ');
             let id = parts.next().unwrap_or_default().trim();
@@ -5787,7 +5888,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -10488,6 +10589,58 @@ mod tests {
                 .requirements
                 .len(),
             0
+        );
+    }
+
+    #[test]
+    fn terminal_manages_and_checks_persistent_location_rules() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        let first = state.app.create_location("Bridge").unwrap();
+        let second = state.app.create_location("Vault").unwrap();
+        state
+            .execute_legacy_palette_command(&format!(
+                "location-rule-add {first} {second} impossible together"
+            ))
+            .unwrap();
+        assert!(state.message.contains("Added location conflict rule"));
+        let rule = state
+            .app
+            .list_location_incompatibility_rules()
+            .unwrap()
+            .remove(0);
+        state
+            .execute_legacy_palette_command("location-rule-list")
+            .unwrap();
+        assert!(state.message.contains("impossible together"));
+        state
+            .execute_legacy_palette_command(&format!(
+                "location-rule-update {} disabled inactive rule",
+                rule.id
+            ))
+            .unwrap();
+        assert!(state.message.contains("Updated location rule"));
+        assert!(!state.app.list_location_incompatibility_rules().unwrap()[0].enabled);
+        state
+            .execute_legacy_palette_command(&format!(
+                "location-rule-update {} enabled impossible together",
+                rule.id
+            ))
+            .unwrap();
+        state
+            .execute_legacy_palette_command("location-rule-check")
+            .unwrap();
+        assert!(state.message.contains("No location-rule findings"));
+        state
+            .execute_legacy_palette_command(&format!("location-rule-remove {}", rule.id))
+            .unwrap();
+        assert!(
+            state
+                .app
+                .list_location_incompatibility_rules()
+                .unwrap()
+                .is_empty()
         );
     }
 

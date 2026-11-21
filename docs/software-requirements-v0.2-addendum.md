@@ -233,3 +233,5 @@ Entity-reference-list custom fields can now participate in saved scene queries t
 Chronology queries now offer explicit definitely/possibly before/after predicates over bounded scene start-time intervals. They use interval bounds, retain strict cutoff semantics, and exclude unknown or insufficiently bounded times rather than guessing. The original nominal-time filters remain for compatibility.
 
 Saved-query results can be explained with stable scene and related-entity evidence, including current text hash, characters, plotlines, events, locations, issues and custom metadata references. The CLI `query-explain` and terminal `query-evidence` commands require the scene to remain a current match. This report presents structured model facts and does not infer which prose words matched a full-text predicate.
+
+Authors can now persist enabled/disabled incompatibility rules for location pairs. The continuity inspector compares scenes sharing a character and reports definite overlap, possible overlap, or unverified timing separately. The rules are project-local and can be managed and evaluated through CLI and terminal commands.

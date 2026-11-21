@@ -849,6 +849,32 @@ impl WriterApp {
             })
             .map_err(Into::into)
     }
+    pub fn add_location_incompatibility_rule(
+        &mut self,
+        rule: &LocationIncompatibilityRule,
+    ) -> Result<()> {
+        Ok(self.store.add_location_incompatibility_rule(rule)?)
+    }
+    pub fn list_location_incompatibility_rules(&self) -> Result<Vec<LocationIncompatibilityRule>> {
+        Ok(self.store.list_location_incompatibility_rules()?)
+    }
+    pub fn update_location_incompatibility_rule(
+        &mut self,
+        rule: &LocationIncompatibilityRule,
+    ) -> Result<()> {
+        Ok(self.store.update_location_incompatibility_rule(rule)?)
+    }
+    pub fn remove_location_incompatibility_rule(&mut self, id: ContinuityRuleId) -> Result<()> {
+        Ok(self.store.remove_location_incompatibility_rule(id)?)
+    }
+    pub fn inspect_location_incompatibilities(
+        &self,
+    ) -> Result<Vec<story_analysis::LocationRuleFinding>> {
+        Ok(story_analysis::location_incompatibility_findings(
+            &self.analytics_dataset()?,
+            &self.store.list_location_incompatibility_rules()?,
+        ))
+    }
     pub fn create_passage_anchor(
         &mut self,
         scene: SceneId,
@@ -2230,6 +2256,62 @@ mod tests {
         assert_eq!(data[0].plotlines[0].name, "A thread");
         assert_eq!(data[0].locations[0].name, "Harbor");
         assert_eq!(data[0].events[0].name, "The signal");
+    }
+
+    #[test]
+    fn location_incompatibility_rules_are_persisted_and_evaluated_read_only() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "One", 0).unwrap();
+        let first = app.create_scene(chapter, "At the bridge", 0).unwrap();
+        let second = app.create_scene(chapter, "In the vault", 1).unwrap();
+        let character = app.create_character("Mara").unwrap();
+        app.link_character(first, character, ParticipationRole::Major)
+            .unwrap();
+        app.link_character(second, character, ParticipationRole::Major)
+            .unwrap();
+        let bridge = app.create_location("Bridge").unwrap();
+        let vault = app.create_location("Vault").unwrap();
+        for (scene_id, location, start, end) in [(first, bridge, 0, 10), (second, vault, 5, 15)] {
+            let mut scene = app.get_scene(scene_id).unwrap().scene;
+            scene.start_location = Some(location);
+            scene.start_time = StoryTime::exact(start);
+            scene.end_time = StoryTime::exact(end);
+            app.update_scene_metadata(&scene).unwrap();
+        }
+        let rule = LocationIncompatibilityRule {
+            id: ContinuityRuleId::new(),
+            first_location: bridge,
+            second_location: vault,
+            description: "Mara cannot be at both locations at once".into(),
+            enabled: true,
+        };
+        app.add_location_incompatibility_rule(&rule).unwrap();
+        assert_eq!(
+            app.inspect_location_incompatibilities().unwrap()[0].status,
+            story_analysis::LocationRuleFindingStatus::DefiniteConflict
+        );
+        let mut disabled = rule.clone();
+        disabled.enabled = false;
+        app.update_location_incompatibility_rule(&disabled).unwrap();
+        assert!(app.inspect_location_incompatibilities().unwrap().is_empty());
+        app.update_location_incompatibility_rule(&rule).unwrap();
+        drop(app);
+        let reopened = WriterApp::open_project(project).unwrap();
+        let reopened_rules = reopened.list_location_incompatibility_rules().unwrap();
+        assert_eq!(reopened_rules.len(), 1);
+        assert_eq!(reopened_rules[0].id, rule.id);
+        assert!(
+            (reopened_rules[0].first_location == bridge
+                && reopened_rules[0].second_location == vault)
+                || (reopened_rules[0].first_location == vault
+                    && reopened_rules[0].second_location == bridge)
+        );
+        assert_eq!(
+            reopened.inspect_location_incompatibilities().unwrap().len(),
+            1
+        );
     }
 
     #[test]

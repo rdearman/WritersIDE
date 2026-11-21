@@ -478,6 +478,7 @@ id_type!(AssemblyId);
 id_type!(AssemblyItemId);
 id_type!(PlanningBoardId);
 id_type!(PlanningBoardItemId);
+id_type!(ContinuityRuleId);
 id_type!(PlanningBoardConnectorId);
 id_type!(AssemblyDraftId);
 id_type!(StoryBibleTemplateId);
@@ -1203,6 +1204,14 @@ pub struct StoryEventDependency {
     pub successor: EventId,
     pub kind: String,
     pub notes: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocationIncompatibilityRule {
+    pub id: ContinuityRuleId,
+    pub first_location: LocationId,
+    pub second_location: LocationId,
+    pub description: String,
+    pub enabled: bool,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WordAttributionPolicy {
