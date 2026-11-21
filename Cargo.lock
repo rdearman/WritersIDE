@@ -2352,6 +2352,7 @@ dependencies = [
  "story-app",
  "story-core",
  "story-document",
+ "story-import",
  "story-ollama",
  "story-pipeline",
  "story-reading",

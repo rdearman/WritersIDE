@@ -613,6 +613,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "review.resolve",
+            "Resolve Editorial Conflicts",
+            "Apply explicit base, local, or reviewed choices to each overlapping hunk",
+            "Edit",
+            "review-resolve",
+            true,
+        ),
+        legacy_command(
             "review.docx",
             "Accept or Reject DOCX Revisions",
             "Choose a tracked-changes view and three-way merge it into a scene",
@@ -4181,10 +4189,42 @@ impl AppState {
                 "Editorial merge applied through the manuscript write journal".into()
             } else {
                 format!(
-                    "{} overlapping review conflict(s); manuscript left unchanged",
-                    result.conflicts.len()
+                    "{} overlapping review conflict(s); manuscript unchanged. Inspect JSON: {}",
+                    result.conflicts.len(),
+                    serde_json::to_string(&result.conflicts)?
                 )
             };
+        } else if let Some(arguments) = cmd.strip_prefix("review-resolve ") {
+            let mut parts = arguments.split_whitespace();
+            let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let base_path = parts.next().ok_or("missing base manuscript file")?;
+            let reviewed_path = parts.next().ok_or("missing reviewed manuscript file")?;
+            let raw_choices = parts
+                .next()
+                .ok_or("missing comma-separated conflict choices")?;
+            let choices = raw_choices
+                .split(',')
+                .map(|choice| match choice {
+                    "base" => Ok(story_import::MergeConflictChoice::Base),
+                    "local" => Ok(story_import::MergeConflictChoice::Local),
+                    "external" => Ok(story_import::MergeConflictChoice::External),
+                    _ => Err("choices must be base, local, or external"),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let base = fs::read_to_string(base_path)?;
+            let reviewed = fs::read_to_string(reviewed_path)?;
+            let merged = self
+                .app
+                .resolve_review_text(scene, &base, &reviewed, &choices)?;
+            if self.editing_scene == Some(scene) {
+                self.editor = merged.lines().map(str::to_owned).collect();
+                self.dirty = false;
+                self.cursor = (0, 0);
+            }
+            self.message = format!(
+                "Resolved {} conflict(s) and saved through the manuscript write journal",
+                choices.len()
+            );
         } else if let Some(path) = cmd.strip_prefix("review-inspect ") {
             self.message = self
                 .app
@@ -11270,7 +11310,6 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "One local.\nTwo.\nThree reviewed.\n"
         );
-
         fs::write(&review_file, "One external.\nTwo.\nThree.\n").unwrap();
         state.mode = Some(':');
         state.prompt = format!(
@@ -11283,6 +11322,17 @@ mod tests {
         assert_eq!(
             state.app.load_scene_text(scene).unwrap().0,
             "One local.\nTwo.\nThree reviewed.\n"
+        );
+        state.mode = Some(':');
+        state.prompt = format!(
+            "review-resolve {scene} {} {} external",
+            base_file.display(),
+            review_file.display()
+        );
+        state.command().unwrap();
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "One external.\nTwo.\nThree reviewed.\n"
         );
     }
 

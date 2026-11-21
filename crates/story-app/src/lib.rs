@@ -1225,6 +1225,19 @@ impl WriterApp {
         }
         Ok(result)
     }
+    pub fn resolve_review_text(
+        &mut self,
+        scene: SceneId,
+        base: &str,
+        reviewed_text: &str,
+        choices: &[story_import::MergeConflictChoice],
+    ) -> Result<String> {
+        let (current, expected_hash) = self.load_scene_text(scene)?;
+        let merged = story_import::resolve_three_way_merge(base, &current, reviewed_text, choices)
+            .map_err(AppError::Domain)?;
+        self.save_scene_text(scene, Some(&expected_hash), &merged)?;
+        Ok(merged)
+    }
     pub fn merge_docx_review(
         &mut self,
         scene: SceneId,
@@ -2163,6 +2176,15 @@ mod tests {
             app.load_scene_text(scene).unwrap().0,
             "One.\nTwo local.\nThree external.\n"
         );
+        let resolved = app
+            .resolve_review_text(
+                scene,
+                base,
+                "One.\nTwo reviewed.\nThree.\n",
+                &[story_import::MergeConflictChoice::External],
+            )
+            .unwrap();
+        assert_eq!(resolved, "One.\nTwo reviewed.\nThree.\n");
     }
 
     #[test]

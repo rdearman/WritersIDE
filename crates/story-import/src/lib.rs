@@ -96,6 +96,14 @@ pub struct ThreeWayMerge {
     pub conflicts: Vec<MergeConflict>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MergeConflictChoice {
+    Base,
+    Local,
+    External,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DocxReviewItem {
     pub kind: String,
@@ -337,6 +345,82 @@ pub fn three_way_merge(base: &str, local: &str, external: &str) -> ThreeWayMerge
         merged_text: Some(output.concat()),
         conflicts,
     }
+}
+
+/// Resolves each reported overlapping range in order while retaining automatic
+/// disjoint edits from both versions. `choices` must cover every conflict.
+pub fn resolve_three_way_merge(
+    base: &str,
+    local: &str,
+    external: &str,
+    choices: &[MergeConflictChoice],
+) -> Result<String, String> {
+    let result = three_way_merge(base, local, external);
+    if result.conflicts.is_empty() {
+        if !choices.is_empty() {
+            return Err("merge has no conflicts but resolution choices were provided".into());
+        }
+        return result
+            .merged_text
+            .ok_or_else(|| "automatic merge did not produce text".to_owned());
+    }
+    if choices.len() != result.conflicts.len() {
+        return Err(format!(
+            "expected {} conflict choices, received {}",
+            result.conflicts.len(),
+            choices.len()
+        ));
+    }
+    let base_lines = base.split_inclusive('\n').collect::<Vec<_>>();
+    let local_lines = local.split_inclusive('\n').collect::<Vec<_>>();
+    let external_lines = external.split_inclusive('\n').collect::<Vec<_>>();
+    let edits = line_edits(&base_lines, &local_lines)
+        .into_iter()
+        .chain(line_edits(&base_lines, &external_lines))
+        .collect::<Vec<_>>();
+    let mut operations: Vec<(usize, usize, Vec<&str>)> = Vec::new();
+    for edit in edits {
+        let in_conflict = result.conflicts.iter().any(|conflict| {
+            if conflict.base_start_line == conflict.base_end_line {
+                edit.start <= conflict.base_start_line && edit.end >= conflict.base_start_line
+            } else if edit.start == edit.end {
+                edit.start >= conflict.base_start_line && edit.start <= conflict.base_end_line
+            } else {
+                edit.start < conflict.base_end_line && edit.end > conflict.base_start_line
+            }
+        });
+        if !in_conflict {
+            let operation = (edit.start, edit.end, edit.replacement);
+            if !operations.contains(&operation) {
+                operations.push(operation);
+            }
+        }
+    }
+    for (conflict, choice) in result.conflicts.iter().zip(choices) {
+        let replacement = match choice {
+            MergeConflictChoice::Base => conflict.base.as_str(),
+            MergeConflictChoice::Local => conflict.local.as_str(),
+            MergeConflictChoice::External => conflict.external.as_str(),
+        };
+        operations.push((
+            conflict.base_start_line,
+            conflict.base_end_line,
+            replacement.split_inclusive('\n').collect(),
+        ));
+    }
+    operations.sort_by_key(|(start, end, _)| (*start, *end));
+    let mut output = String::new();
+    let mut cursor = 0;
+    for (start, end, replacement) in operations {
+        if start < cursor || end > base_lines.len() {
+            return Err("merge conflict ranges overlap ambiguously".into());
+        }
+        output.push_str(&base_lines[cursor..start].concat());
+        output.push_str(&replacement.concat());
+        cursor = end;
+    }
+    output.push_str(&base_lines[cursor..].concat());
+    Ok(output)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1171,6 +1255,32 @@ mod tests {
         assert_eq!(conflict.conflicts[0].base, "One.\n");
         assert_eq!(conflict.conflicts[0].local, "One local.\n");
         assert_eq!(conflict.conflicts[0].external, "One external.\n");
+    }
+
+    #[test]
+    fn conflict_resolution_preserves_disjoint_changes_and_requires_one_choice_per_hunk() {
+        let base = "One.\nTwo.\nThree.\nFour.\nFive.\nSix.\nSeven.\nEight.\n";
+        let local = "One local.\nTwo.\nThree.\nFour.\nFive.\nSix.\nSeven.\nEight local.\n";
+        let external = "One external.\nTwo.\nThree.\nFour.\nFive external.\nSix.\nSeven.\nEight.\n";
+        let conflicts = three_way_merge(base, local, external).conflicts;
+        assert_eq!(conflicts.len(), 1);
+        assert!(resolve_three_way_merge(base, local, external, &[]).is_err());
+        let merged =
+            resolve_three_way_merge(base, local, external, &[MergeConflictChoice::External])
+                .unwrap();
+        assert_eq!(
+            merged,
+            "One external.\nTwo.\nThree.\nFour.\nFive external.\nSix.\nSeven.\nEight local.\n"
+        );
+        assert!(
+            resolve_three_way_merge(
+                base,
+                local,
+                external,
+                &[MergeConflictChoice::Base, MergeConflictChoice::Local]
+            )
+            .is_err()
+        );
     }
 
     #[test]

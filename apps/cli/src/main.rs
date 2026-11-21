@@ -1673,6 +1673,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("overlapping editorial changes require author resolution".into());
             }
         }
+        "review-resolve" => {
+            let project = args.next().ok_or("missing project path")?;
+            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let base = fs::read_to_string(args.next().ok_or("missing base manuscript file")?)?;
+            let reviewed =
+                fs::read_to_string(args.next().ok_or("missing reviewed manuscript file")?)?;
+            let choices = parse_merge_choices(
+                &args
+                    .next()
+                    .ok_or("missing comma-separated conflict choices")?,
+            )?;
+            let mut app = WriterApp::open_project(project)?;
+            app.resolve_review_text(scene, &base, &reviewed, &choices)?;
+            println!(
+                "Editorial conflicts resolved and saved through the manuscript write journal."
+            );
+        }
         "review-docx" => {
             let project = args.next().ok_or("missing project path")?;
             let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
@@ -1931,12 +1948,29 @@ fn scene_matches_scope(scene: &story_storage::SceneRecord, scope: &str) -> bool 
         scene.scene.id.to_string() == scope
     }
 }
+fn parse_merge_choices(
+    value: &str,
+) -> Result<Vec<story_import::MergeConflictChoice>, Box<dyn std::error::Error>> {
+    value
+        .split(',')
+        .map(|choice| match choice {
+            "base" => Ok(story_import::MergeConflictChoice::Base),
+            "local" => Ok(story_import::MergeConflictChoice::Local),
+            "external" => Ok(story_import::MergeConflictChoice::External),
+            _ => Err(format!("invalid merge choice {choice}; use base, local, or external").into()),
+        })
+        .collect()
+}
+
 fn usage() {
     eprintln!(
         "writers-ide compile <project> <markdown|latex|html|epub|docx|pdf> [output] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"
     );
     eprintln!("writers-ide compile-check <project>");
     eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");
+    eprintln!(
+        "writers-ide review-resolve <project> <scene-uuid> <base-file> <reviewed-file> <base|local|external,...>"
+    );
     eprintln!("writers-ide import-manuscript <source-file> <new-project-directory> [title]");
     eprintln!("writers-ide browse <project> [loopback-port]");
     eprintln!(
