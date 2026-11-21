@@ -453,6 +453,107 @@ impl ProjectStore {
         atomic_write(&target, content)?;
         Ok(target)
     }
+    pub fn list_proposal_files(&self) -> Result<Vec<PathBuf>> {
+        let directory = self.safe_path(Path::new(".writers-ide/proposals"))?;
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let mut paths = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let metadata = fs::symlink_metadata(entry.path())?;
+            if metadata.file_type().is_symlink() {
+                return Err(StorageError::Invalid(
+                    "proposal directory cannot contain symlinks".into(),
+                ));
+            }
+            if metadata.is_file()
+                && entry.path().extension().and_then(|x| x.to_str()) == Some("json")
+            {
+                paths.push(entry.path());
+            }
+        }
+        paths.sort();
+        Ok(paths)
+    }
+    pub fn load_proposal_file(&self, path: &Path) -> Result<Vec<u8>> {
+        let relative = self.proposal_relative_path(path)?;
+        let target = self.safe_path(&relative)?;
+        let metadata = fs::symlink_metadata(&target)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(StorageError::Invalid(
+                "proposal must be a regular project file".into(),
+            ));
+        }
+        Ok(fs::read(target)?)
+    }
+    pub fn update_proposal_file(
+        &self,
+        path: &Path,
+        expected_fingerprint: &str,
+        content: &[u8],
+    ) -> Result<()> {
+        let relative = self.proposal_relative_path(path)?;
+        let target = self.safe_path(&relative)?;
+        let metadata = fs::symlink_metadata(&target)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(StorageError::Invalid(
+                "proposal must be a regular project file".into(),
+            ));
+        }
+        let current = fs::read(&target)?;
+        if hash_bytes(&current) != expected_fingerprint {
+            return Err(StorageError::Conflict(
+                "proposal changed since it was opened; reload before updating".into(),
+            ));
+        }
+        let temp = target.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        write_synced(&temp, content)?;
+        fs::rename(&temp, &target)?;
+        sync_dir(
+            target
+                .parent()
+                .ok_or_else(|| StorageError::Invalid("proposal has no parent directory".into()))?,
+        )?;
+        Ok(())
+    }
+    fn proposal_relative_path(&self, path: &Path) -> Result<PathBuf> {
+        let relative = if path.is_absolute() {
+            let root = fs::canonicalize(&self.root)?;
+            let canonical_path = fs::canonicalize(path)?;
+            canonical_path
+                .strip_prefix(&root)
+                .map_err(|_| StorageError::Invalid("proposal is outside the project".into()))?
+                .to_path_buf()
+        } else {
+            if path.starts_with(Path::new(".writers-ide/proposals")) {
+                path.to_path_buf()
+            } else if self.root.is_relative() && path.starts_with(&self.root) {
+                path.strip_prefix(&self.root)
+                    .map_err(|_| {
+                        StorageError::Invalid("proposal path is outside the project".into())
+                    })?
+                    .to_path_buf()
+            } else if path.components().count() == 1 {
+                Path::new(".writers-ide/proposals").join(path)
+            } else {
+                path.to_path_buf()
+            }
+        };
+        let components = relative.components().collect::<Vec<_>>();
+        if components.len() != 3
+            || components[0] != std::path::Component::Normal(".writers-ide".as_ref())
+            || components[1] != std::path::Component::Normal("proposals".as_ref())
+            || !matches!(components[2], std::path::Component::Normal(_))
+            || relative.extension().and_then(|x| x.to_str()) != Some("json")
+        {
+            return Err(StorageError::Invalid(
+                "proposal path must identify a project-local .writers-ide/proposals/*.json file"
+                    .into(),
+            ));
+        }
+        Ok(relative)
+    }
     pub fn get_project(&self) -> Result<Project> {
         let row: (String,String,String,String,String,Option<u64>,String,Option<String>) = self.conn.query_row("SELECT id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id FROM project WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
         Ok(Project {
@@ -4925,6 +5026,37 @@ mod tests {
                 .is_err()
         );
         assert!(path.starts_with(store.root()));
+    }
+
+    #[test]
+    fn proposal_updates_are_project_local_atomic_and_optimistic() {
+        let d = tempdir().unwrap();
+        let store = ProjectStore::create(d.path().join("Novel"), "Novel").unwrap();
+        assert!(store.list_proposal_files().unwrap().is_empty());
+        let path = store
+            .save_proposal_file("candidate.json", br#"{"claim":"candidate"}"#)
+            .unwrap();
+        let original = store.load_proposal_file(&path).unwrap();
+        let fingerprint = hash_bytes(&original);
+        assert_eq!(store.list_proposal_files().unwrap(), vec![path.clone()]);
+        store
+            .update_proposal_file(&path, &fingerprint, br#"{"dismissed":true}"#)
+            .unwrap();
+        assert_eq!(
+            store.load_proposal_file(&path).unwrap(),
+            br#"{"dismissed":true}"#
+        );
+        assert!(
+            store
+                .update_proposal_file(&path, &fingerprint, b"stale")
+                .is_err()
+        );
+        assert!(store.load_proposal_file(d.path()).is_err());
+        assert!(
+            store
+                .update_proposal_file(&d.path().join("outside.json"), "", b"unsafe")
+                .is_err()
+        );
     }
     #[test]
     fn journal_recovers_all_committed_crash_windows() {

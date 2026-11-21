@@ -127,6 +127,9 @@ pub struct AnchoredClaim {
     pub evidence_end_byte: Option<usize>,
     /// Always false at extraction time; promotion requires an explicit author operation.
     pub approved: bool,
+    /// Dismissed claims remain in the provenance record but are excluded from review queues.
+    #[serde(default)]
+    pub dismissed: bool,
 }
 
 pub fn attach_provenance(
@@ -153,6 +156,7 @@ pub fn attach_provenance(
                 evidence_start_byte: span.map(|s| s.0),
                 evidence_end_byte: span.map(|s| s.1),
                 approved: false,
+                dismissed: false,
             }
         })
         .collect();
@@ -199,7 +203,16 @@ mod tests {
             "Mara entered"
         );
         assert!(!claim.approved);
+        assert!(!claim.dismissed);
         assert_eq!(proposals.source_length_bytes, text.len());
+
+        let mut legacy_json = serde_json::to_value(&proposals).unwrap();
+        legacy_json["claims"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("dismissed");
+        let legacy: ProvisionalExtraction = serde_json::from_value(legacy_json).unwrap();
+        assert!(!legacy.claims[0].dismissed);
     }
 
     #[test]

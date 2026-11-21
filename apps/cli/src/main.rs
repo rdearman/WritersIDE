@@ -456,33 +456,88 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         .into(),
                 );
             }
+            let mut app = WriterApp::open_project(project)?;
+            let (original, fingerprint) = app.load_extraction_proposal_file(&file)?;
             let mut proposal: story_ollama::ProvisionalExtraction =
-                serde_json::from_slice(&std::fs::read(&file)?)?;
+                serde_json::from_slice(&original)?;
             proposal
                 .claims
                 .get(claim_index)
                 .ok_or("claim index is out of range")?;
-            let mut app = WriterApp::open_project(project)?;
             let approved_id = app.approve_extraction_claim(&proposal, claim_index)?;
             proposal.claims[claim_index].approved = true;
-            let bytes = serde_json::to_vec_pretty(&proposal)?;
-            let temp = file.with_extension(format!("{}.tmp", QueryId::new()));
-            use std::io::Write;
-            let mut out = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            out.write_all(&bytes)?;
-            out.sync_all()?;
-            std::fs::rename(&temp, &file)?;
-            let parent = file
-                .parent()
-                .filter(|path| !path.as_os_str().is_empty())
-                .unwrap_or_else(|| std::path::Path::new("."));
-            std::fs::File::open(parent)?.sync_all()?;
+            app.update_extraction_proposal_file(
+                &file,
+                &fingerprint,
+                &serde_json::to_vec_pretty(&proposal)?,
+            )?;
             println!(
                 "Promoted claim {claim_index} to approved knowledge record {approved_id} with its source evidence."
             );
+        }
+        "dismiss-extraction" => {
+            let project = args.next().ok_or("missing project path")?;
+            let file = std::path::PathBuf::from(args.next().ok_or("missing proposal JSON path")?);
+            let claim_index: usize = args
+                .next()
+                .ok_or("missing claim index")?
+                .parse()
+                .map_err(|_| "claim index must be a zero-based integer")?;
+            if args.next().is_some() {
+                return Err(
+                    "dismiss-extraction accepts <project> <proposal-json-file> <claim-index>"
+                        .into(),
+                );
+            }
+            let app = WriterApp::open_project(project)?;
+            let (original, fingerprint) = app.load_extraction_proposal_file(&file)?;
+            let mut proposal: story_ollama::ProvisionalExtraction =
+                serde_json::from_slice(&original)?;
+            app.dismiss_extraction_claim(&mut proposal, claim_index)?;
+            app.update_extraction_proposal_file(
+                &file,
+                &fingerprint,
+                &serde_json::to_vec_pretty(&proposal)?,
+            )?;
+            println!("Dismissed provisional claim {claim_index}; source evidence was retained.");
+        }
+        "proposals" => {
+            let project = args.next().ok_or("missing project path")?;
+            if args.next().is_some() {
+                return Err("proposals accepts <project>".into());
+            }
+            let app = WriterApp::open_project(project)?;
+            let files = app.list_extraction_proposal_files()?;
+            if files.is_empty() {
+                println!("No extraction proposals.");
+            }
+            for file in files {
+                let (bytes, _) = app.load_extraction_proposal_file(&file)?;
+                let proposal: story_ollama::ProvisionalExtraction = serde_json::from_slice(&bytes)?;
+                println!(
+                    "{} · {} {} · model {}",
+                    file.file_name().unwrap_or_default().to_string_lossy(),
+                    proposal.source_kind,
+                    proposal.source_id,
+                    proposal.model
+                );
+                for (index, claim) in proposal.claims.iter().enumerate() {
+                    let status = if claim.approved {
+                        "approved"
+                    } else if claim.dismissed {
+                        "dismissed"
+                    } else {
+                        "provisional"
+                    };
+                    println!(
+                        "  [{index}] {status}: {} · {} — {} | evidence: {}",
+                        claim.claim.kind,
+                        claim.claim.name,
+                        claim.claim.claim,
+                        claim.claim.evidence_quote
+                    );
+                }
+            }
         }
         _ => usage(),
     }
@@ -490,7 +545,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 fn usage() {
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
+        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>"
     );
     eprintln!(
         "writers-ide anchors <path> <scene-uuid>\nwriters-ide anchor-move <path> <anchor-uuid> <start-byte> <end-byte>"

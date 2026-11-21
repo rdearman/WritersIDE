@@ -1,8 +1,7 @@
 use serde::Deserialize;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
-    io::{self, Write},
+    env, fs, io,
     path::Path,
     time::Duration,
 };
@@ -105,6 +104,9 @@ struct AppState {
     revision_hunk: usize,
     search_hits: Vec<story_storage::ProjectSearchHit>,
     query_view: Option<story_core::QueryId>,
+    proposal_review_active: bool,
+    proposal_review_rows: Vec<String>,
+    proposal_review_index: usize,
     editor_selection: Option<(usize, usize)>,
     clipboard: String,
 }
@@ -666,6 +668,22 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "extract.dismiss",
+            "Dismiss Candidate",
+            "Dismiss a provisional claim while retaining its evidence",
+            "Tools",
+            "dismiss",
+            true,
+        ),
+        legacy_command(
+            "extract.review",
+            "Review Candidate Proposals",
+            "List provisional, approved, and dismissed candidate claims",
+            "Tools",
+            "proposals",
+            false,
+        ),
+        legacy_command(
             "extract.knowledge",
             "List Approved Knowledge",
             "Show evidence-linked approved claims",
@@ -1108,6 +1126,11 @@ impl AppState {
                 self.revision_scene = None;
                 self.revision_hunk = 0;
             }
+            if w == Workspace::Research {
+                self.proposal_review_active = false;
+                self.proposal_review_rows.clear();
+                self.proposal_review_index = 0;
+            }
             self.workspace = w;
         }
     }
@@ -1520,24 +1543,22 @@ impl AppState {
                 .ok_or("use approve <proposal-json-path> <claim-index>")?;
             let index: usize = index.parse()?;
             let file = std::path::PathBuf::from(file);
+            let (original, fingerprint) = self.app.load_extraction_proposal_file(&file)?;
             let mut proposal: story_ollama::ProvisionalExtraction =
-                serde_json::from_slice(&fs::read(&file)?)?;
+                serde_json::from_slice(&original)?;
             proposal
                 .claims
                 .get(index)
                 .ok_or("claim index is out of range")?;
             let id = self.app.approve_extraction_claim(&proposal, index)?;
             proposal.claims[index].approved = true;
-            let temp = file.with_extension(format!("{}.tmp", story_core::QueryId::new()));
-            let mut out = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)?;
-            out.write_all(&serde_json::to_vec_pretty(&proposal)?)?;
-            out.sync_all()?;
-            fs::rename(&temp, &file)?;
-            if let Some(parent) = file.parent() {
-                fs::File::open(parent)?.sync_all()?;
+            self.app.update_extraction_proposal_file(
+                &file,
+                &fingerprint,
+                &serde_json::to_vec_pretty(&proposal)?,
+            )?;
+            if self.proposal_review_active {
+                self.proposal_review_rows = load_proposal_review_rows(&self.app)?;
             }
             self.workspace = Workspace::StoryBible;
             self.selected = self.app.list_characters()?.len()
@@ -1551,6 +1572,35 @@ impl AppState {
                     .position(|claim| claim.id == id)
                     .unwrap_or(0);
             self.message = format!("Approved claim {index} as evidence-linked knowledge {id}");
+        } else if let Some(rest) = cmd.strip_prefix("dismiss ") {
+            let (file, index) = rest
+                .rsplit_once(' ')
+                .ok_or("use dismiss <proposal-json-path> <claim-index>")?;
+            let index: usize = index.parse()?;
+            let file = std::path::PathBuf::from(file);
+            let (original, fingerprint) = self.app.load_extraction_proposal_file(&file)?;
+            let mut proposal: story_ollama::ProvisionalExtraction =
+                serde_json::from_slice(&original)?;
+            self.app.dismiss_extraction_claim(&mut proposal, index)?;
+            self.app.update_extraction_proposal_file(
+                &file,
+                &fingerprint,
+                &serde_json::to_vec_pretty(&proposal)?,
+            )?;
+            if self.proposal_review_active {
+                self.proposal_review_rows = load_proposal_review_rows(&self.app)?;
+            }
+            self.message = format!("Dismissed provisional claim {index}; evidence retained");
+        } else if cmd == "proposals" {
+            self.switch(Workspace::Research);
+            self.proposal_review_rows = load_proposal_review_rows(&self.app)?;
+            self.proposal_review_active = true;
+            self.proposal_review_index = 0;
+            self.message = if self.proposal_review_rows.is_empty() {
+                "No extraction proposals".into()
+            } else {
+                "Provisional extraction review; evidence and status are shown per claim".into()
+            };
         } else if cmd == "knowledge" {
             self.workspace = Workspace::StoryBible;
             self.selected = self.app.list_characters()?.len()
@@ -2077,7 +2127,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | process-expand | process-only STAGE,STAGE | process-expand-only STAGE,STAGE | extract scene|reading UUID MODEL | approve PROPOSAL-PATH CLAIM-INDEX | knowledge | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | process-expand | process-only STAGE,STAGE | process-expand-only STAGE,STAGE | extract scene|reading UUID MODEL | proposals | approve PROPOSAL-PATH CLAIM-INDEX | dismiss PROPOSAL-PATH CLAIM-INDEX | knowledge | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -2344,6 +2394,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         revision_hunk: 0,
         search_hits: Vec::new(),
         query_view: None,
+        proposal_review_active: false,
+        proposal_review_rows: Vec::new(),
+        proposal_review_index: 0,
         editor_selection: None,
         clipboard: String::new(),
     };
@@ -2529,6 +2582,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             .collect::<Vec<_>>();
         let list_selection = if s.workspace == Workspace::Revisions {
             s.revision_index
+        } else if s.workspace == Workspace::Research && s.proposal_review_active {
+            s.proposal_review_index
         } else {
             s.selected
         };
@@ -2621,7 +2676,17 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 );
             }
         } else {
-            let detail = if matches!(
+            let detail = if s.workspace == Workspace::Research && s.proposal_review_active {
+                format!(
+                    "{}\n\n{}\n\n{}",
+                    workspace_items(s)
+                        .get(s.proposal_review_index)
+                        .map(String::as_str)
+                        .unwrap_or("No proposal claim selected"),
+                    "Use :approve PROPOSAL-PATH CLAIM-INDEX or :dismiss PROPOSAL-PATH CLAIM-INDEX to record a decision.",
+                    s.message
+                )
+            } else if matches!(
                 s.workspace,
                 Workspace::StoryBible | Workspace::Issues | Workspace::Research
             ) {
@@ -3074,6 +3139,34 @@ fn revision_items(s: &AppState) -> Vec<(SceneId, story_storage::SnapshotRecord)>
         .collect()
 }
 
+fn load_proposal_review_rows(app: &WriterApp) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut rows = Vec::new();
+    for file in app.list_extraction_proposal_files()? {
+        let (bytes, _) = app.load_extraction_proposal_file(&file)?;
+        let proposal: story_ollama::ProvisionalExtraction = serde_json::from_slice(&bytes)?;
+        rows.push(format!(
+            "{} · {} {}",
+            file.display(),
+            proposal.source_kind,
+            proposal.source_id
+        ));
+        for (index, claim) in proposal.claims.iter().enumerate() {
+            let status = if claim.approved {
+                "approved"
+            } else if claim.dismissed {
+                "dismissed"
+            } else {
+                "provisional"
+            };
+            rows.push(format!(
+                "  [{index}] {status}: {} · {} — {}; evidence: {}",
+                claim.claim.kind, claim.claim.name, claim.claim.claim, claim.claim.evidence_quote
+            ));
+        }
+    }
+    Ok(rows)
+}
+
 fn workspace_items(s: &AppState) -> Vec<String> {
     match s.workspace {
         Workspace::Dashboard => vec![
@@ -3228,6 +3321,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             let target = s.app.get_project().ok().and_then(|p| p.target_words);
             analytics_report_rows(&data, target, total, draft)
         }
+        Workspace::Research if s.proposal_review_active => s.proposal_review_rows.clone(),
         Workspace::Research => s
             .app
             .list_research_items()
@@ -3656,6 +3750,18 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 .unwrap_or(0);
             s.switch(Workspace::ALL[(i + Workspace::ALL.len() - 1) % Workspace::ALL.len()]);
         }
+        KeyCode::Up | KeyCode::Char('k')
+            if s.workspace == Workspace::Research && s.proposal_review_active =>
+        {
+            s.proposal_review_index = s.proposal_review_index.saturating_sub(1);
+        }
+        KeyCode::Down | KeyCode::Char('j')
+            if s.workspace == Workspace::Research && s.proposal_review_active =>
+        {
+            s.proposal_review_index =
+                next_list_selection(s.proposal_review_index, workspace_items(s).len());
+        }
+        KeyCode::Enter if s.workspace == Workspace::Research && s.proposal_review_active => {}
         KeyCode::Esc if s.workspace == Workspace::Revisions && s.revision_diff.is_some() => {
             s.revision_diff = None;
             s.revision_scene = None;
@@ -3752,6 +3858,14 @@ mod tests {
     #[test]
     fn command_registry_has_stable_unique_ids_and_compile_taxonomy() {
         let registry = command_registry();
+        assert_eq!(
+            command_by_id("extract.dismiss").unwrap().palette_prefix,
+            Some("dismiss")
+        );
+        assert_eq!(
+            command_by_id("extract.review").unwrap().palette_prefix,
+            Some("proposals")
+        );
         let ids = registry
             .iter()
             .map(|command| command.id)
@@ -3798,6 +3912,13 @@ mod tests {
             move_args,
             Some("00000000-0000-0000-0000-000000000001 00000000-0000-0000-0000-000000000002 0")
         );
+        assert_eq!(
+            command_palette_invocation("proposals").unwrap().0.id,
+            "extract.review"
+        );
+        let (dismiss, dismiss_args) = command_palette_invocation("dismiss review.json 2").unwrap();
+        assert_eq!(dismiss.id, "extract.dismiss");
+        assert_eq!(dismiss_args, Some("review.json 2"));
     }
 
     #[test]
@@ -3860,6 +3981,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -3955,6 +4079,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
             editor_selection: Some((0, 2)),
             clipboard: String::new(),
         };
@@ -4013,6 +4140,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -4063,6 +4193,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -4125,6 +4258,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -4301,6 +4437,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -4363,6 +4502,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -4442,6 +4584,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -4541,6 +4686,37 @@ mod tests {
     }
 
     #[test]
+    fn proposal_review_rows_show_provisional_status_and_source_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Discovery", 0).unwrap();
+        let source = "Mara found the silver key.";
+        let proposal = story_ollama::attach_provenance(
+            "scene",
+            &scene.to_string(),
+            source,
+            "fixture-model",
+            story_ollama::ExtractionResult {
+                claims: vec![story_ollama::CandidateClaim {
+                    kind: "object".into(),
+                    name: "Silver key".into(),
+                    claim: "Mara found the key.".into(),
+                    evidence_quote: source.into(),
+                    approximate_story_time: None,
+                }],
+            },
+        );
+        app.save_extraction_proposal("review.json", &serde_json::to_vec(&proposal).unwrap())
+            .unwrap();
+        let rows = load_proposal_review_rows(&app).unwrap();
+        assert!(rows[0].contains("review.json"));
+        assert!(rows.iter().any(|row| row.contains("provisional")));
+        assert!(rows.iter().any(|row| row.contains(source)));
+    }
+
+    #[test]
     fn reading_entity_link_can_navigate_to_story_character() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("Novel");
@@ -4608,6 +4784,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -4909,6 +5088,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -4982,6 +5164,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
         };
@@ -5107,6 +5292,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
         };

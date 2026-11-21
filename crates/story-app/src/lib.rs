@@ -208,6 +208,41 @@ impl WriterApp {
     ) -> Result<std::path::PathBuf> {
         Ok(self.store.save_proposal_file(filename, json)?)
     }
+    pub fn list_extraction_proposal_files(&self) -> Result<Vec<std::path::PathBuf>> {
+        Ok(self.store.list_proposal_files()?)
+    }
+    pub fn load_extraction_proposal_file(&self, path: &Path) -> Result<(Vec<u8>, String)> {
+        let bytes = self.store.load_proposal_file(path)?;
+        let fingerprint = format!("{:x}", Sha256::digest(&bytes));
+        Ok((bytes, fingerprint))
+    }
+    pub fn update_extraction_proposal_file(
+        &self,
+        path: &Path,
+        expected_fingerprint: &str,
+        json: &[u8],
+    ) -> Result<()> {
+        Ok(self
+            .store
+            .update_proposal_file(path, expected_fingerprint, json)?)
+    }
+    pub fn dismiss_extraction_claim(
+        &self,
+        proposal: &mut story_ollama::ProvisionalExtraction,
+        claim_index: usize,
+    ) -> Result<()> {
+        let claim = proposal.claims.get_mut(claim_index).ok_or_else(|| {
+            AppError::Domain(format!("claim index {claim_index} is out of range"))
+        })?;
+        if claim.approved {
+            return Err(AppError::Domain(
+                "an approved claim cannot be dismissed; retract it through knowledge management"
+                    .into(),
+            ));
+        }
+        claim.dismissed = true;
+        Ok(())
+    }
     /// Promotes exactly one evidence-anchored provisional claim after revalidating its source.
     pub fn approve_extraction_claim(
         &mut self,
@@ -217,6 +252,11 @@ impl WriterApp {
         let claim = proposal.claims.get(claim_index).ok_or_else(|| {
             AppError::Domain(format!("claim index {claim_index} is out of range"))
         })?;
+        if claim.dismissed {
+            return Err(AppError::Domain(
+                "dismissed extraction claims cannot be approved".into(),
+            ));
+        }
         let (source_id, source_text) = match proposal.source_kind.as_str() {
             "scene" => {
                 let id = SceneId(
@@ -1000,5 +1040,68 @@ mod tests {
         let persisted = app.list_approved_knowledge_claims().unwrap();
         assert_eq!(persisted.len(), 2);
         assert_eq!(persisted[1].source_kind, "reading");
+    }
+
+    #[test]
+    fn provisional_claims_can_be_reviewed_and_dismissed_without_losing_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Discovery", 0).unwrap();
+        let source = "Mara found the silver key.";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), source).unwrap();
+        let mut proposal = story_ollama::attach_provenance(
+            "scene",
+            &scene.to_string(),
+            source,
+            "fixture-model",
+            story_ollama::ExtractionResult {
+                claims: vec![story_ollama::CandidateClaim {
+                    kind: "object".into(),
+                    name: "Silver key".into(),
+                    claim: "Mara found the key.".into(),
+                    evidence_quote: "Mara found the silver key.".into(),
+                    approximate_story_time: None,
+                }],
+            },
+        );
+        let filename = "review.json";
+        let path = app
+            .save_extraction_proposal(filename, &serde_json::to_vec(&proposal).unwrap())
+            .unwrap();
+        let (original, fingerprint) = app.load_extraction_proposal_file(&path).unwrap();
+        let review: story_ollama::ProvisionalExtraction =
+            serde_json::from_slice(&original).unwrap();
+        assert!(!review.claims[0].approved);
+        assert!(!review.claims[0].dismissed);
+        assert!(review.claims[0].evidence_start_byte.is_some());
+
+        app.dismiss_extraction_claim(&mut proposal, 0).unwrap();
+        assert!(proposal.claims[0].dismissed);
+        app.update_extraction_proposal_file(
+            &path,
+            &fingerprint,
+            &serde_json::to_vec(&proposal).unwrap(),
+        )
+        .unwrap();
+        let (updated, _) = app.load_extraction_proposal_file(&path).unwrap();
+        let persisted: story_ollama::ProvisionalExtraction =
+            serde_json::from_slice(&updated).unwrap();
+        assert!(persisted.claims[0].dismissed);
+        assert_eq!(
+            persisted.claims[0].claim.evidence_quote,
+            "Mara found the silver key."
+        );
+        assert_eq!(app.load_scene_text(scene).unwrap().0, source);
+        assert!(app.approve_extraction_claim(&persisted, 0).is_err());
+        assert!(
+            app.list_extraction_proposal_files()
+                .unwrap()
+                .contains(&path)
+        );
+
+        proposal.claims[0].approved = true;
+        assert!(app.dismiss_extraction_claim(&mut proposal, 0).is_err());
     }
 }
