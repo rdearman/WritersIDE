@@ -578,6 +578,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None => println!("Automatic Git snapshots disabled."),
             }
         }
+        "git-auto-snapshot-check" => {
+            let path = PathBuf::from(args.next().ok_or("missing project path")?);
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64;
+            match run_auto_snapshot_check(&path, now)? {
+                Some(commit) => println!("Automatic project snapshot created: {commit}"),
+                None => println!("Automatic snapshot not due or project unchanged."),
+            }
+        }
         "git-history" => {
             let path = args.next().ok_or("missing project path")?;
             let app = WriterApp::open_project(path)?;
@@ -2074,6 +2084,9 @@ fn usage() {
     );
     eprintln!("writers-ide compile-check <project>");
     eprintln!("writers-ide git-auto-snapshot <project> <interval-minutes|off> (1–10080 minutes)");
+    eprintln!(
+        "writers-ide git-auto-snapshot-check <project> (one-shot; suitable for cron/systemd timers)"
+    );
     eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");
     eprintln!(
         "writers-ide event-time-set <project> <event-uuid> <start-tick|?|~nominal,lower,upper|lower..upper> <end-tick|?|~nominal,lower,upper|lower..upper> [source-time-text]"
@@ -2162,6 +2175,14 @@ fn run_processing_recipe(
         return Err("processing recipe incomplete; inspect failed/skipped stages".into());
     }
     Ok(())
+}
+
+fn run_auto_snapshot_check(
+    project: &Path,
+    now_unix: i64,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut app = WriterApp::open_project(project)?;
+    Ok(app.git_auto_snapshot_if_due(now_unix)?)
 }
 
 fn processing_watch_fingerprint(
@@ -2646,7 +2667,8 @@ fn main() -> ExitCode {
 mod watch_tests {
     use super::{
         WatchSuccess, compile_edition, compile_edition_with_aspell, edition_watch_fingerprint,
-        parse_scene_query_filter, run_processing_recipe, spellcheck_project, watch_fingerprint,
+        parse_scene_query_filter, run_auto_snapshot_check, run_processing_recipe,
+        spellcheck_project, watch_fingerprint,
     };
     use std::fs;
     use story_app::WriterApp;
@@ -2659,6 +2681,48 @@ mod watch_tests {
         watcher.mark_successful("inputs-a".into());
         assert!(!watcher.needs_run("inputs-a"));
         assert!(watcher.needs_run("inputs-b"));
+    }
+    #[test]
+    fn one_shot_git_snapshot_check_supports_external_schedulers() {
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Novel");
+        let mut project = WriterApp::create_project(&project_path, "Novel").unwrap();
+        project.set_git_auto_snapshot_interval(Some(1)).unwrap();
+        let chapter = project.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = project.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = project.load_scene_text(scene).unwrap();
+        project
+            .save_scene_text(scene, Some(&hash), "First version.")
+            .unwrap();
+        drop(project);
+
+        assert!(
+            run_auto_snapshot_check(&project_path, 1_000)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            run_auto_snapshot_check(&project_path, 1_059)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            run_auto_snapshot_check(&project_path, 1_060)
+                .unwrap()
+                .is_none()
+        );
+
+        let mut project = WriterApp::open_project(&project_path).unwrap();
+        let (_, hash) = project.load_scene_text(scene).unwrap();
+        project
+            .save_scene_text(scene, Some(&hash), "Revised version.")
+            .unwrap();
+        drop(project);
+        assert!(
+            run_auto_snapshot_check(&project_path, 1_120)
+                .unwrap()
+                .is_some()
+        );
     }
     #[test]
     fn custom_entity_reference_query_filter_parses_stable_identity() {
