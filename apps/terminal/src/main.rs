@@ -146,6 +146,7 @@ struct ActiveWritingChallenge {
     deadline: Instant,
     mode: String,
     last_activity: Instant,
+    kamikaze_idle_seconds: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -267,6 +268,26 @@ struct CoverageConfigEntry {
     entity_id: String,
     dimension: String,
     minimum_scenes: usize,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ChallengeConfig {
+    version: u16,
+    #[serde(default = "default_kamikaze_idle_seconds")]
+    kamikaze_idle_seconds: u64,
+}
+
+fn default_kamikaze_idle_seconds() -> u64 {
+    10
+}
+
+impl Default for ChallengeConfig {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            kamikaze_idle_seconds: default_kamikaze_idle_seconds(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1246,6 +1267,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.cursor-clear", "Clear Multi-cursors", "Return to the primary editor cursor", "Edit", "cursor-clear", false),
         legacy_command("challenge.start", "Start Writing Challenge", "Start a timed word target; opt-in Kamikaze mode reacts to inactivity", "Tools", "challenge-start", true),
         legacy_command("challenge.finish", "Finish Writing Challenge", "Record words written and finish the active timed challenge", "Tools", "challenge-finish", false),
+        legacy_command("challenge.idle", "Set Kamikaze Idle Threshold", "Set the project-local inactivity threshold for Kamikaze mode", "Tools", "challenge-idle", true),
         legacy_command(
             "story-template-list",
             "List Story Bible Templates",
@@ -2547,6 +2569,7 @@ impl AppState {
                 return Err("mode must be steady or kamikaze".into());
             }
             let id = self.app.start_writing_challenge(target, seconds, mode)?;
+            let challenge_config = load_challenge_config(self.app.project_root())?;
             let initial_words = story_core::count_words(&self.editor.join("\n"));
             let now = Instant::now();
             self.active_challenge = Some(ActiveWritingChallenge {
@@ -2556,16 +2579,31 @@ impl AppState {
                 deadline: now + Duration::from_secs(u64::from(seconds)),
                 mode: mode.into(),
                 last_activity: now,
+                kamikaze_idle_seconds: challenge_config.kamikaze_idle_seconds,
             });
             self.message = if mode == "kamikaze" {
                 format!(
-                    "Kamikaze challenge armed: {target} words; one word is removed after 10 seconds without typing. Undo remains available."
+                    "Kamikaze challenge armed: {target} words; one word is removed after {} seconds without typing. Undo remains available.",
+                    challenge_config.kamikaze_idle_seconds
                 )
             } else {
                 format!("Timed challenge: {target} words in {seconds} seconds")
             };
         } else if cmd == "challenge-finish" {
             self.finish_active_challenge(false)?;
+        } else if let Some(value) = cmd.strip_prefix("challenge-idle ") {
+            let seconds = value.trim().parse::<u64>()?;
+            if !(1..=3600).contains(&seconds) {
+                return Err("Kamikaze idle threshold must be between 1 and 3600 seconds".into());
+            }
+            save_challenge_config(
+                self.app.project_root(),
+                &ChallengeConfig {
+                    version: 1,
+                    kamikaze_idle_seconds: seconds,
+                },
+            )?;
+            self.message = format!("Saved Kamikaze idle threshold: {seconds} seconds");
         } else if let Some(rest) = cmd.strip_prefix("snippet ") {
             let (name, body) = rest.split_once(' ').ok_or("use snippet NAME TEXT")?;
             self.snippets.insert(name.to_owned(), body.to_owned());
@@ -4446,7 +4484,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [steady|kamikaze] | challenge-finish | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [steady|kamikaze] | challenge-finish | challenge-idle SECONDS | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -4561,7 +4599,8 @@ impl AppState {
             return Ok(false);
         }
         if challenge.mode != "kamikaze"
-            || now.duration_since(challenge.last_activity) < Duration::from_secs(10)
+            || now.duration_since(challenge.last_activity)
+                < Duration::from_secs(challenge.kamikaze_idle_seconds)
         {
             return Ok(false);
         }
@@ -6504,6 +6543,43 @@ fn save_coverage_config(
     Ok(())
 }
 
+fn challenge_config_path(root: &Path) -> std::path::PathBuf {
+    root.join(".writers-ide/challenge.toml")
+}
+
+fn load_challenge_config(root: &Path) -> Result<ChallengeConfig, Box<dyn std::error::Error>> {
+    match fs::read_to_string(challenge_config_path(root)) {
+        Ok(source) => {
+            let config: ChallengeConfig = toml::from_str(&source)?;
+            if config.version != 1 || !(1..=3600).contains(&config.kamikaze_idle_seconds) {
+                return Err("invalid challenge configuration version or idle threshold".into());
+            }
+            Ok(config)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ChallengeConfig::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_challenge_config(
+    root: &Path,
+    config: &ChallengeConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if config.version != 1 || !(1..=3600).contains(&config.kamikaze_idle_seconds) {
+        return Err("invalid challenge configuration version or idle threshold".into());
+    }
+    let directory = root.join(".writers-ide");
+    fs::create_dir_all(&directory)?;
+    let bytes = toml::to_string_pretty(config)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    use std::io::Write;
+    temporary.write_all(bytes.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(challenge_config_path(root))?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
 fn coverage_report_rows(root: &Path, scenes: &[story_analysis::SceneAnalysisInput]) -> Vec<String> {
     let config = match load_coverage_config(root) {
         Ok(config) => config,
@@ -7317,12 +7393,20 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
         let mut state = AppState::new(app, default_bindings());
+        state.prompt = "challenge-idle 2".into();
+        state.command().unwrap();
+        assert_eq!(
+            load_challenge_config(state.app.project_root())
+                .unwrap()
+                .kamikaze_idle_seconds,
+            2
+        );
         state.editor = vec!["one two".into()];
         state.cursor = (0, 7);
         state.prompt = "challenge-start 10 60 kamikaze".into();
         state.command().unwrap();
         state.active_challenge.as_mut().unwrap().last_activity =
-            Instant::now() - Duration::from_secs(11);
+            Instant::now() - Duration::from_secs(3);
         assert!(state.tick_challenge().unwrap());
         assert_eq!(state.editor[0], "one ");
         state.undo_edit();

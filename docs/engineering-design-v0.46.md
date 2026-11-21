@@ -244,6 +244,6 @@ CLI `compile-watch <project> <format> <output> [poll-ms]` fingerprints project m
 
 ### Issue #3 — Timed drafting status
 
-The terminal supports timed word-target sessions with steady mode and an explicit Kamikaze option. The countdown is visible in the footer; expiry records the word delta. Kamikaze deletes the previous word after ten seconds without typed input, supports Undo, and never runs unless selected when starting the session. The mode is stored durably. Configuration of inactivity threshold and richer challenge modes remains open.
+The terminal supports timed word-target sessions with steady mode and an explicit Kamikaze option. The countdown is visible in the footer; expiry records the word delta. Kamikaze deletes the previous word after the project-configured inactivity period, supports Undo, and never runs unless selected when starting the session. `challenge-idle SECONDS` stores a 1–3600 second threshold in `.writers-ide/challenge.toml`; new sessions capture the current value, so later settings changes do not silently alter an active challenge. Richer challenge modes remain open.
 
 Phase 5 has not completed every feature in the issue roadmap. General-session/per-scene writing history, graphical coverage editing, broader dictionary formats/management, processing watch debounce and richer recipes remain deferred. The shipped APIs and schema are foundations, not substitutes for those remaining acceptance criteria.
