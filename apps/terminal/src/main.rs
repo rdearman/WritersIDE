@@ -2472,6 +2472,18 @@ impl AppState {
                         let content = self.app.load_research_text(id).ok()?;
                         Some((None, row.title, content))
                     }),
+                "character" => source_id
+                    .parse::<uuid::Uuid>()
+                    .ok()
+                    .map(story_core::CharacterId)
+                    .and_then(|id| {
+                        let character = self.app.get_character(id).ok()?;
+                        Some((
+                            None,
+                            character.preferred_name.clone(),
+                            format_character_reference(&character),
+                        ))
+                    }),
                 _ => None,
             };
             if let Some((scene_id, title, content)) = loaded {
@@ -5573,6 +5585,21 @@ impl AppState {
                 self.active_reference + 1,
                 self.reference_panes.len()
             );
+        } else if let Some(id) = cmd.strip_prefix("reference-character ") {
+            let id = story_core::CharacterId(id.parse()?);
+            let character = self.app.get_character(id)?;
+            self.open_reference_buffer(
+                format!("character:{id}"),
+                None,
+                character.preferred_name.clone(),
+                format_character_reference(&character),
+            );
+            self.reference_focused = false;
+            self.message = format!(
+                "Character reference opened in buffer {} of {}",
+                self.active_reference + 1,
+                self.reference_panes.len()
+            );
         } else if cmd == "reference-next" {
             if !self.reference_panes.is_empty() {
                 self.active_reference = (self.active_reference + 1) % self.reference_panes.len();
@@ -7904,6 +7931,31 @@ fn format_conflict_review(
         output.push('\n');
     }
     output
+}
+
+fn format_character_reference(character: &story_core::Character) -> String {
+    let mut lines = vec![format!("# {}", character.full_name)];
+    if character.preferred_name != character.full_name {
+        lines.push(format!("Preferred name: {}", character.preferred_name));
+    }
+    if !character.aliases.is_empty() {
+        lines.push(format!("Aliases: {}", character.aliases.join(", ")));
+    }
+    for (label, value) in [
+        ("Status", character.status.as_str()),
+        ("Description", character.description.as_str()),
+        ("Background", character.background.as_str()),
+        ("Goals", character.goals.as_str()),
+        ("Motivations", character.motivations.as_str()),
+        ("Secrets", character.secrets.as_str()),
+        ("Internal conflict", character.internal_conflict.as_str()),
+        ("External conflict", character.external_conflict.as_str()),
+    ] {
+        if !value.trim().is_empty() {
+            lines.push(format!("\n## {label}\n{value}"));
+        }
+    }
+    lines.join("\n")
 }
 
 fn format_planning_board_markdown(
@@ -12305,6 +12357,7 @@ mod tests {
                 None,
             )
             .unwrap();
+        let character = app.create_character("Mira Vale").unwrap();
         for (scene, prose) in [
             (first, "Main prose"),
             (second, "Reference A text"),
@@ -12339,23 +12392,36 @@ mod tests {
             state.active_reference_pane().unwrap().scene_id,
             Some(second)
         );
-        assert_eq!(state.reference_panes.len(), 3);
+        execute(&mut state, format!("reference-character {character}"));
+        assert!(
+            state
+                .active_reference_pane()
+                .unwrap()
+                .content
+                .contains("Mira Vale")
+        );
+        execute(&mut state, "reference-next".into());
+        assert_eq!(
+            state.active_reference_pane().unwrap().scene_id,
+            Some(second)
+        );
+        assert_eq!(state.reference_panes.len(), 4);
         state.save_session().unwrap();
         let saved: SessionSnapshot =
             serde_json::from_slice(&fs::read(state.session_path()).unwrap()).unwrap();
-        assert_eq!(saved.reference_sources.len(), 3);
+        assert_eq!(saved.reference_sources.len(), 4);
         let mut restored = AppState::new(
             WriterApp::open_project(&project).unwrap(),
             default_bindings(),
         );
         restored.restore_session().unwrap();
-        assert_eq!(restored.reference_panes.len(), 3);
+        assert_eq!(restored.reference_panes.len(), 4);
         assert_eq!(
             restored.active_reference_pane().unwrap().scene_id,
             Some(second)
         );
         execute(&mut restored, "reference-close".into());
-        assert_eq!(restored.reference_panes.len(), 2);
+        assert_eq!(restored.reference_panes.len(), 3);
         assert_eq!(
             restored.active_reference_pane().unwrap().scene_id,
             Some(third)
@@ -12363,6 +12429,10 @@ mod tests {
         assert!(restored.reference_panes.iter().any(|pane| {
             pane.source_key == format!("research:{research}")
                 && pane.content == "The city follows a lunar calendar."
+        }));
+        assert!(restored.reference_panes.iter().any(|pane| {
+            pane.source_key == format!("character:{character}")
+                && pane.content.contains("Mira Vale")
         }));
     }
 
