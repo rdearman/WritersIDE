@@ -7338,8 +7338,8 @@ fn scene_writing_rows(
         .iter()
         .map(|scene| (scene.scene_id.as_str(), scene.title.as_str()))
         .collect::<BTreeMap<_, _>>();
-    let mut totals = BTreeMap::<String, (i64, usize)>::new();
-    let mut series = BTreeMap::<(String, String), (i64, usize)>::new();
+    let mut totals = BTreeMap::<String, (i64, usize, i64, i64)>::new();
+    let mut series = BTreeMap::<(String, String), (i64, usize, i64)>::new();
     for session in sessions {
         let (Some(scene_id), Some(delta)) = (session.scene_id, session.words_delta) else {
             continue;
@@ -7348,6 +7348,14 @@ fn scene_writing_rows(
         let entry = totals.entry(id.clone()).or_default();
         entry.0 = entry.0.saturating_add(delta);
         entry.1 += 1;
+        let elapsed = session
+            .ended_at
+            .map(|ended| ended.saturating_sub(session.started_at).max(0))
+            .unwrap_or(0);
+        entry.2 = entry.2.saturating_add(elapsed);
+        if session.status == "completed" {
+            entry.3 = entry.3.saturating_add(delta);
+        }
         let Ok(timestamp) = time::OffsetDateTime::from_unix_timestamp(session.started_at) else {
             continue;
         };
@@ -7360,22 +7368,29 @@ fn scene_writing_rows(
         let entry = series.entry((id, date)).or_default();
         entry.0 = entry.0.saturating_add(delta);
         entry.1 += 1;
+        entry.2 = entry.2.saturating_add(elapsed);
     }
     let mut rows = totals
         .into_iter()
-        .map(|(id, (delta, count))| {
+        .map(|(id, (delta, count, seconds, completed_delta))| {
+            let productivity = if seconds > 0 {
+                completed_delta.saturating_mul(3_600) / seconds
+            } else {
+                0
+            };
             format!(
-                "Scene writing · {} · {delta:+} net words · {count} sessions",
-                titles.get(id.as_str()).copied().unwrap_or("Deleted scene")
+                "Scene writing · {} · {delta:+} net words · {count} sessions · {} focused time · {productivity} completed words/hour",
+                titles.get(id.as_str()).copied().unwrap_or("Deleted scene"),
+                display_duration(seconds)
             )
         })
         .collect::<Vec<_>>();
     let mut maxima = BTreeMap::<String, u64>::new();
-    for ((id, _), (delta, _)) in &series {
+    for ((id, _), (delta, _, _)) in &series {
         let maximum = maxima.entry(id.clone()).or_default();
         *maximum = (*maximum).max(delta.unsigned_abs());
     }
-    rows.extend(series.into_iter().map(|((id, date), (delta, count))| {
+    rows.extend(series.into_iter().map(|((id, date), (delta, count, seconds))| {
         let maximum = maxima.get(&id).copied().unwrap_or(0);
         let filled = delta
             .unsigned_abs()
@@ -7385,12 +7400,22 @@ fn scene_writing_rows(
             .min(12) as usize;
         let sign = if delta < 0 { "−" } else { "" };
         format!(
-            "Scene history · {} · {date} · {sign}{} {delta:+} words · {count} sessions",
+            "Scene history · {} · {date} · {sign}{} {delta:+} words · {count} sessions · {} focused",
             titles.get(id.as_str()).copied().unwrap_or("Deleted scene"),
-            "█".repeat(filled)
+            "█".repeat(filled),
+            display_duration(seconds)
         )
     }));
     rows
+}
+
+fn display_duration(seconds: i64) -> String {
+    let minutes = seconds.max(0) / 60;
+    if minutes < 60 {
+        format!("{minutes}m")
+    } else {
+        format!("{}h {}m", minutes / 60, minutes % 60)
+    }
 }
 
 fn coverage_config_path(root: &Path) -> std::path::PathBuf {
@@ -9031,6 +9056,26 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("cumulative"))
         );
+    }
+
+    #[test]
+    fn scene_writing_analytics_report_focused_time_and_completed_productivity() {
+        let scene = story_core::SceneId::new();
+        let session = story_storage::WritingSessionRecord {
+            id: "timed-scene-session".into(),
+            started_at: 1_000,
+            ended_at: Some(4_600),
+            scene_id: Some(scene),
+            start_words: 100,
+            end_words: Some(160),
+            words_delta: Some(60),
+            status: "completed".into(),
+        };
+        let rows = scene_writing_rows(&[session], &[]);
+        assert!(rows.iter().any(|row| {
+            row.contains("60 completed words/hour") && row.contains("1h 0m focused time")
+        }));
+        assert!(rows.iter().any(|row| row.contains("1h 0m focused")));
     }
 
     #[test]
