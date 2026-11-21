@@ -27,6 +27,8 @@ use story_app::WriterApp;
 use story_core::{SceneId, SceneStatus};
 use unicode_segmentation::UnicodeSegmentation;
 
+type SceneRow = (SceneId, String, SceneStatus, u32);
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Workspace {
     Dashboard,
@@ -252,6 +254,8 @@ struct SessionSnapshot {
     selected: usize,
     #[serde(default)]
     narrowed_chapter: Option<String>,
+    #[serde(default)]
+    narrowed_node: Option<String>,
     reading_document: Option<String>,
     reading_offset: u64,
     #[serde(default)]
@@ -1963,6 +1967,87 @@ fn default_bindings() -> Vec<(u8, Workspace)> {
         .collect()
 }
 
+fn scenes_in_structural_subtree(
+    app: &WriterApp,
+    root: story_core::NodeId,
+) -> Result<Vec<SceneRow>, Box<dyn std::error::Error>> {
+    let nodes = app.list_structural_nodes()?;
+    if !nodes.iter().any(|node| node.id == root) {
+        return Err("structural node does not exist".into());
+    }
+    let scenes = app.list_scenes(false)?;
+    let mut chapter_ids = BTreeSet::new();
+    for node in nodes.iter().filter(|node| node.kind == "chapter") {
+        let mut current = Some(node.id);
+        while let Some(id) = current {
+            if id == root {
+                chapter_ids.insert(node.id);
+                break;
+            }
+            current = nodes
+                .iter()
+                .find(|candidate| candidate.id == id)
+                .and_then(|candidate| candidate.parent_id);
+        }
+    }
+    Ok(scenes
+        .into_iter()
+        .filter(|scene| scene.chapter_id.is_some_and(|id| chapter_ids.contains(&id)))
+        .map(|record| {
+            (
+                record.scene.id,
+                record.scene.title,
+                record.scene.status,
+                record.actual_words,
+            )
+        })
+        .collect())
+}
+
+fn infer_narrowed_node(
+    visible: &[(SceneId, String, SceneStatus, u32)],
+    all: &[story_storage::SceneRecord],
+    app: &WriterApp,
+) -> Result<Option<story_core::NodeId>, Box<dyn std::error::Error>> {
+    if visible.is_empty() || visible.len() >= all.len() {
+        return Ok(None);
+    }
+    let visible_ids = visible.iter().map(|scene| scene.0).collect::<BTreeSet<_>>();
+    let visible_chapters = all
+        .iter()
+        .filter(|scene| visible_ids.contains(&scene.scene.id))
+        .filter_map(|scene| scene.chapter_id)
+        .collect::<BTreeSet<_>>();
+    if visible_chapters.is_empty() {
+        return Ok(None);
+    }
+    let nodes = app.list_structural_nodes()?;
+    let mut ancestors = Vec::new();
+    let mut current = Some(*visible_chapters.iter().next().unwrap());
+    while let Some(id) = current {
+        ancestors.push(id);
+        current = nodes
+            .iter()
+            .find(|node| node.id == id)
+            .and_then(|node| node.parent_id);
+    }
+    Ok(ancestors.into_iter().find(|ancestor| {
+        visible_chapters.iter().all(|chapter| {
+            let mut current = Some(*chapter);
+            while let Some(id) = current {
+                if id == *ancestor {
+                    return true;
+                }
+                current = nodes
+                    .iter()
+                    .find(|node| node.id == id)
+                    .and_then(|node| node.parent_id);
+            }
+            false
+        })
+    }))
+}
+
 fn infer_narrowed_chapter(
     visible: &[(SceneId, String, SceneStatus, u32)],
     all: &[story_storage::SceneRecord],
@@ -2447,8 +2532,11 @@ impl AppState {
         let path = self.session_path();
         let parent = path.parent().ok_or("session file has no parent")?;
         fs::create_dir_all(parent)?;
-        let narrowed_chapter = infer_narrowed_chapter(&self.scenes, &self.app.list_scenes(false)?)
-            .map(|chapter| chapter.to_string());
+        let all_scenes = self.app.list_scenes(false)?;
+        let narrowed_chapter =
+            infer_narrowed_chapter(&self.scenes, &all_scenes).map(|chapter| chapter.to_string());
+        let narrowed_node =
+            infer_narrowed_node(&self.scenes, &all_scenes, &self.app)?.map(|node| node.to_string());
         let snapshot = SessionSnapshot {
             workspace: self.workspace.title().to_owned(),
             selected_scene: self.active_scene().map(|id| id.to_string()),
@@ -2457,6 +2545,7 @@ impl AppState {
             scroll: self.scroll,
             selected: self.selected,
             narrowed_chapter,
+            narrowed_node,
             reading_document: self.reading_document.map(|id| id.to_string()),
             reading_offset: self.reading_offset,
             editor_focus_mode: self.editor_focus_mode,
@@ -2520,28 +2609,34 @@ impl AppState {
         };
         self.refresh()?;
         let mut stale_reference = false;
-        if let Some(chapter) = snapshot
-            .narrowed_chapter
+        if let Some(node) = snapshot
+            .narrowed_node
             .as_deref()
+            .or(snapshot.narrowed_chapter.as_deref())
             .and_then(|value| value.parse::<uuid::Uuid>().ok())
             .map(story_core::NodeId)
         {
             let all = self.app.list_scenes(false)?;
-            if all.iter().any(|scene| scene.chapter_id == Some(chapter)) {
-                self.scenes = all
-                    .into_iter()
-                    .filter(|scene| scene.chapter_id == Some(chapter))
-                    .map(|record| {
-                        (
-                            record.scene.id,
-                            record.scene.title,
-                            record.scene.status,
-                            record.actual_words,
-                        )
-                    })
-                    .collect();
-            } else {
-                stale_reference = true;
+            match scenes_in_structural_subtree(&self.app, node) {
+                Ok(visible) if !visible.is_empty() => {
+                    let ids = visible
+                        .into_iter()
+                        .map(|scene| scene.0)
+                        .collect::<BTreeSet<_>>();
+                    self.scenes = all
+                        .into_iter()
+                        .filter(|scene| ids.contains(&scene.scene.id))
+                        .map(|record| {
+                            (
+                                record.scene.id,
+                                record.scene.title,
+                                record.scene.status,
+                                record.actual_words,
+                            )
+                        })
+                        .collect();
+                }
+                _ => stale_reference = true,
             }
         }
         self.selected = snapshot.selected.min(self.scenes.len().saturating_sub(1));
@@ -6074,28 +6169,18 @@ impl AppState {
                 "Reference buffer closed"
             }
             .into();
-        } else if let Some(chapter) = cmd.strip_prefix("narrow ") {
-            let chapter = story_core::NodeId(chapter.parse()?);
-            self.scenes = self
-                .app
-                .list_scenes(false)?
-                .into_iter()
-                .filter(|record| record.chapter_id == Some(chapter))
-                .map(|record| {
-                    (
-                        record.scene.id,
-                        record.scene.title,
-                        record.scene.status,
-                        record.actual_words,
-                    )
-                })
-                .collect();
+        } else if let Some(node) = cmd
+            .strip_prefix("narrow ")
+            .or_else(|| cmd.strip_prefix("hoist "))
+        {
+            let node = story_core::NodeId(node.parse()?);
+            self.scenes = scenes_in_structural_subtree(&self.app, node)?;
             self.selected = self
                 .editing_scene
                 .and_then(|id| self.scenes.iter().position(|scene| scene.0 == id))
                 .unwrap_or(0);
             self.message =
-                format!("Outline narrowed to chapter {chapter} · :widen restores all scenes");
+                format!("Outline hoisted to structural node {node} · :widen restores all scenes");
         } else if cmd == "widen" {
             self.scenes = self
                 .app
@@ -13086,6 +13171,42 @@ mod tests {
         );
         assert!(!state.dirty);
         assert_ne!(saved, state.editor.join("\n"));
+    }
+
+    #[test]
+    fn outline_hoist_includes_descendant_chapters_and_restores_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Hoist"), "Hoist").unwrap();
+        let section = app.create_section("Part One", 0).unwrap();
+        let first_chapter = app.create_chapter(Some(section), "Chapter One", 0).unwrap();
+        let second_chapter = app.create_chapter(Some(section), "Chapter Two", 1).unwrap();
+        let other_chapter = app.create_chapter(None, "Outside", 1).unwrap();
+        let first = app.create_scene(first_chapter, "First", 0).unwrap();
+        let second = app.create_scene(second_chapter, "Second", 0).unwrap();
+        let outside = app.create_scene(other_chapter, "Outside scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command(&format!("hoist {section}"))
+            .unwrap();
+        assert_eq!(
+            state.scenes.iter().map(|scene| scene.0).collect::<Vec<_>>(),
+            [first, second]
+        );
+        state.save_session().unwrap();
+        let mut reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        assert_eq!(
+            reopened
+                .scenes
+                .iter()
+                .map(|scene| scene.0)
+                .collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert!(!reopened.scenes.iter().any(|scene| scene.0 == outside));
     }
 
     #[test]
