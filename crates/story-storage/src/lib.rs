@@ -1,4 +1,6 @@
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, backup::Backup, params};
+use rusqlite::{
+    Connection, OptionalExtension, TransactionBehavior, backup::Backup, params, types::ValueRef,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -20,6 +22,8 @@ const MIGRATION_7: &str = include_str!("../migrations/0007_approved_knowledge.sq
 const MIGRATION_8: &str = include_str!("../migrations/0008_document_inclusion.sql");
 const MIGRATION_9: &str = include_str!("../migrations/0009_reading_document_links.sql");
 const MIGRATION_10: &str = include_str!("../migrations/0010_character_profiles.sql");
+const MIGRATION_11: &str = include_str!("../migrations/0011_book_types_content_units.sql");
+const MIGRATION_12: &str = include_str!("../migrations/0012_project_template.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -43,6 +47,30 @@ pub enum StorageError {
     RecoveryConflict(String),
 }
 pub type Result<T> = std::result::Result<T, StorageError>;
+type ProjectRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<u64>,
+    String,
+    Option<String>,
+    String,
+    Option<String>,
+);
+type ContentUnitJournalRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    String,
+    i64,
+    i64,
+    String,
+);
 
 #[derive(Serialize, Deserialize)]
 struct ProjectConfig {
@@ -51,6 +79,10 @@ struct ProjectConfig {
     author: String,
     genre: String,
     synopsis: String,
+    #[serde(default)]
+    book_type: BookType,
+    #[serde(default)]
+    template_id: Option<String>,
     target_words: Option<u64>,
     story_epoch_label: String,
     story_calendar_id: Option<String>,
@@ -74,6 +106,24 @@ pub struct StructuralNodeSummary {
     pub kind: String,
     pub title: String,
     pub position: u32,
+}
+#[derive(Clone, Debug)]
+pub struct ContentUnitRecord {
+    pub id: ContentUnitId,
+    pub kind: ContentUnitKind,
+    pub title: String,
+    pub parent_id: Option<NodeId>,
+    pub position: u32,
+    pub target_words: Option<u64>,
+    pub actual_words: u32,
+    pub content_hash: String,
+    pub archived: bool,
+}
+#[derive(Clone, Debug)]
+pub struct ContentUnitRecoveryConflict {
+    pub transaction_id: String,
+    pub content_unit_id: ContentUnitId,
+    pub recovery_path: PathBuf,
 }
 #[derive(Clone, Debug)]
 pub struct RecoveryConflict {
@@ -295,6 +345,8 @@ impl ProjectStore {
             author: String::new(),
             genre: String::new(),
             synopsis: String::new(),
+            book_type: BookType::Fiction,
+            template_id: None,
             target_words: None,
             story_epoch_label: "Day 0".into(),
             story_calendar_id: None,
@@ -326,6 +378,8 @@ impl ProjectStore {
             author: project.author.clone(),
             genre: project.genre.clone(),
             synopsis: project.synopsis.clone(),
+            book_type: project.book_type,
+            template_id: project.template_id.clone(),
             target_words: project.target_words,
             story_epoch_label: project.story_epoch_label.clone(),
             story_calendar_id: project.story_calendar_id.clone(),
@@ -338,8 +392,10 @@ impl ProjectStore {
         configure(&conn)?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_1}\n{MIGRATION_2}\nINSERT INTO schema_migrations(version,applied_at) VALUES(2,'{}');\n{MIGRATION_3}\nINSERT INTO schema_migrations(version,applied_at) VALUES(3,'{}');\n{MIGRATION_4}\nINSERT INTO schema_migrations(version,applied_at) VALUES(4,'{}');\n{MIGRATION_5}\nINSERT INTO schema_migrations(version,applied_at) VALUES(5,'{}');\n{MIGRATION_6}\nINSERT INTO schema_migrations(version,applied_at) VALUES(6,'{}');\n{MIGRATION_7}\nINSERT INTO schema_migrations(version,applied_at) VALUES(7,'{}');\n{MIGRATION_8}\nINSERT INTO schema_migrations(version,applied_at) VALUES(8,'{}');\n{MIGRATION_9}\nINSERT INTO schema_migrations(version,applied_at) VALUES(9,'{}');\nCOMMIT;", now(),now(),now(),now(),now(),now(),now(),now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_10}\nINSERT INTO schema_migrations(version,applied_at) VALUES(10,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_11}\nINSERT INTO schema_migrations(version,applied_at) VALUES(11,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_12}\nINSERT INTO schema_migrations(version,applied_at) VALUES(12,'{}');\nCOMMIT;", now()))?;
         let now = now();
-        conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now])?;
+        conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id])?;
         Ok(Self {
             root: root.to_path_buf(),
             conn,
@@ -359,6 +415,17 @@ impl ProjectStore {
         let cfg: ProjectConfig =
             toml::from_str(&config_text).map_err(|e| StorageError::Config(e.to_string()))?;
         let conn = Connection::open(root.join("story.db"))?;
+        let initial_id: String = conn
+            .query_row("SELECT id FROM project WHERE singleton=1", [], |row| {
+                row.get(0)
+            })
+            .map_err(|_| StorageError::Config("database has no project identity".into()))?;
+        if cfg.id.to_string() != initial_id {
+            return Err(StorageError::IdentityMismatch {
+                config: cfg.id.to_string(),
+                database: initial_id,
+            });
+        }
         configure(&conn)?;
         let version: i64 = conn
             .query_row(
@@ -369,7 +436,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 10 {
+        if version > 12 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -410,10 +477,41 @@ impl ProjectStore {
         }
         if current_version == 9 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_10}\nINSERT INTO schema_migrations(version,applied_at) VALUES(10,'{}');\nCOMMIT;", now()))?;
+            current_version = 10;
+        }
+        if current_version == 10 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_11}\nINSERT INTO schema_migrations(version,applied_at) VALUES(11,'{}');\nCOMMIT;", now()))?;
+            current_version = 11;
+        }
+        if current_version == 11 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_12}\nINSERT INTO schema_migrations(version,applied_at) VALUES(12,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
             .map_err(|_| StorageError::Config("database has no project identity".into()))?;
+        let db_book_type: String = conn.query_row(
+            "SELECT book_type FROM project WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if BookType::parse(&db_book_type) != Some(cfg.book_type) {
+            return Err(StorageError::Config(format!(
+                "project book type mismatch: config {}, database {}",
+                cfg.book_type.as_str(),
+                db_book_type
+            )));
+        }
+        let db_template_id: Option<String> = conn.query_row(
+            "SELECT template_id FROM project WHERE singleton=1",
+            [],
+            |row| row.get(0),
+        )?;
+        if cfg.template_id != db_template_id {
+            return Err(StorageError::Config(format!(
+                "project template mismatch: config {:?}, database {:?}",
+                cfg.template_id, db_template_id
+            )));
+        }
         if cfg.id.to_string() != dbid {
             return Err(StorageError::IdentityMismatch {
                 config: cfg.id.to_string(),
@@ -425,7 +523,12 @@ impl ProjectStore {
             conn,
         };
         fs::create_dir_all(this.root.join("research/readings"))?;
-        let _ = this.recover_pending_writes()?;
+        let _ = this
+            .recover_pending_writes()
+            .map_err(|e| StorageError::Config(format!("scene write recovery failed: {e}")))?;
+        let _ = this.recover_pending_content_unit_writes().map_err(|e| {
+            StorageError::Config(format!("content-unit write recovery failed: {e}"))
+        })?;
         if migrated {
             this.rebuild_scene_index()?;
         }
@@ -561,7 +664,7 @@ impl ProjectStore {
         Ok(relative)
     }
     pub fn get_project(&self) -> Result<Project> {
-        let row: (String,String,String,String,String,Option<u64>,String,Option<String>) = self.conn.query_row("SELECT id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id FROM project WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?)))?;
+        let row: ProjectRow = self.conn.query_row("SELECT id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,book_type,template_id FROM project WHERE singleton=1",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?,r.get(8)?,r.get(9)?)))?;
         Ok(Project {
             id: ProjectId(
                 Uuid::parse_str(&row.0).map_err(|e| StorageError::Config(e.to_string()))?,
@@ -570,6 +673,10 @@ impl ProjectStore {
             author: row.2,
             genre: row.3,
             synopsis: row.4,
+            book_type: BookType::parse(&row.8).ok_or_else(|| {
+                StorageError::Config(format!("invalid project book type {}", row.8))
+            })?,
+            template_id: row.9,
             target_words: row.5,
             story_epoch_label: row.6,
             story_calendar_id: row.7,
@@ -640,6 +747,51 @@ impl ProjectStore {
         sync_dir(parent)?;
         Ok(())
     }
+    /// Exports and consumes a single consistent project revision while SQLite's writer barrier
+    /// prevents journaled file replacements from crossing the snapshot boundary.
+    pub fn with_git_snapshot_barrier<T>(
+        &mut self,
+        action: impl FnOnce(&Path) -> std::result::Result<T, String>,
+    ) -> Result<T> {
+        for attempt in 0..3 {
+            let conflicts = self.recover_pending_writes()?;
+            let content_conflicts = self.recover_pending_content_unit_writes()?;
+            if !conflicts.is_empty()
+                || !content_conflicts.is_empty()
+                || self.pending_conflicts()? > 0
+                || self.pending_content_unit_conflicts()? > 0
+            {
+                return Err(StorageError::RecoveryConflict(
+                    "resolve pending manuscript conflicts before creating a Git snapshot".into(),
+                ));
+            }
+            let root = self.root.clone();
+            let transaction = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let pending:i64=transaction.query_row("SELECT (SELECT count(*) FROM write_journal)+(SELECT count(*) FROM content_unit_write_journal)",[],|row|row.get(0))?;
+            if pending > 0 {
+                transaction.rollback()?;
+                if attempt == 2 {
+                    return Err(StorageError::RecoveryConflict(
+                        "manuscript writes remain pending at the snapshot barrier".into(),
+                    ));
+                }
+                continue;
+            }
+            let dump = deterministic_sql_dump(&transaction)?;
+            validate_sql_dump(&dump)?;
+            let snapshot = root.join("snapshots/database.sql");
+            fs::create_dir_all(snapshot.parent().unwrap())?;
+            atomic_write(&snapshot, dump.as_bytes())?;
+            let result = action(&root).map_err(StorageError::Invalid)?;
+            transaction.commit()?;
+            return Ok(result);
+        }
+        Err(StorageError::RecoveryConflict(
+            "could not establish a stable project snapshot".into(),
+        ))
+    }
     pub fn validate(&self) -> Result<()> {
         self.conn.execute_batch("PRAGMA foreign_key_check")?;
         let bad: i64 =
@@ -665,7 +817,7 @@ impl ProjectStore {
             q.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
                 .collect::<std::result::Result<_, _>>()?
         };
-        let expected_paths: std::collections::HashSet<String> =
+        let mut expected_paths: std::collections::HashSet<String> =
             files.iter().map(|(_, path, _)| path.clone()).collect();
         for (id, rel, length) in files {
             let path = self.safe_path(Path::new(&rel))?;
@@ -680,6 +832,27 @@ impl ProjectStore {
             if bytes.len() as u64 != length || hash_bytes(&bytes) != expected {
                 return Err(StorageError::Conflict(format!(
                     "manuscript integrity mismatch for scene {id}"
+                )));
+            }
+        }
+        let content_files: Vec<(String, String, u64, String)> = {
+            let mut q = self
+                .conn
+                .prepare("SELECT id,relative_path,byte_length,sha256 FROM content_unit")?;
+            q.query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<std::result::Result<_, _>>()?
+        };
+        for (id, relative, length, expected_hash) in content_files {
+            expected_paths.insert(relative.clone());
+            let path = self.safe_path(Path::new(&relative))?;
+            let bytes = fs::read(&path).map_err(|error| {
+                StorageError::Conflict(format!("missing/unreadable content unit {id}: {error}"))
+            })?;
+            if bytes.len() as u64 != length || hash_bytes(&bytes) != expected_hash {
+                return Err(StorageError::Conflict(format!(
+                    "content unit integrity mismatch for {id}"
                 )));
             }
         }
@@ -971,6 +1144,210 @@ impl ProjectStore {
         }
         tx.commit()?;
         Ok(id)
+    }
+    pub fn create_content_unit(
+        &mut self,
+        kind: ContentUnitKind,
+        title: &str,
+        parent: Option<NodeId>,
+        position: u32,
+        target_words: Option<u64>,
+    ) -> Result<ContentUnitId> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(StorageError::Invalid(
+                "content unit title cannot be empty".into(),
+            ));
+        }
+        match (kind, parent) {
+            (ContentUnitKind::ChapterBody, Some(parent)) => {
+                let destination: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT kind FROM structural_node WHERE id=?1",
+                        [parent.to_string()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if destination.as_deref() != Some("chapter") {
+                    return Err(StorageError::Invalid(
+                        "chapter body must belong to an existing chapter".into(),
+                    ));
+                }
+            }
+            (ContentUnitKind::SectionBody, Some(parent)) => {
+                let destination: Option<String> = self
+                    .conn
+                    .query_row(
+                        "SELECT kind FROM structural_node WHERE id=?1",
+                        [parent.to_string()],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if destination.as_deref() != Some("section") {
+                    return Err(StorageError::Invalid(
+                        "section body must belong to an existing section".into(),
+                    ));
+                }
+            }
+            (ContentUnitKind::FrontMatter | ContentUnitKind::BackMatter, None) => {}
+            _ => {
+                return Err(StorageError::Invalid(
+                    "content unit kind and parent do not match".into(),
+                ));
+            }
+        }
+        let parent_value = parent.map(|id| id.to_string());
+        let kind_value = kind.as_str();
+        let sibling_count: u32 = if parent.is_some() {
+            self.conn.query_row(
+                "SELECT count(*) FROM content_unit WHERE parent_node_id=?1",
+                [parent_value.as_deref()],
+                |row| row.get(0),
+            )?
+        } else {
+            self.conn.query_row(
+                "SELECT count(*) FROM content_unit WHERE parent_node_id IS NULL AND kind=?1",
+                [kind_value],
+                |row| row.get(0),
+            )?
+        };
+        if position > sibling_count {
+            return Err(StorageError::Invalid(
+                "content unit position beyond sibling count".into(),
+            ));
+        }
+        let id = ContentUnitId::new();
+        let relative = PathBuf::from(format!("manuscript/content-{}.md", id));
+        let path = self.safe_path(&relative)?;
+        let bytes = b"";
+        write_synced(&path, bytes)?;
+        sync_dir(path.parent().ok_or_else(|| {
+            StorageError::Invalid("content unit has no parent directory".into())
+        })?)?;
+        let now = now();
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let base: i64 = if let Some(parent) = parent_value.as_deref() {
+            transaction.query_row(
+                "SELECT COALESCE(MAX(position),-1)+1 FROM content_unit WHERE parent_node_id=?1",
+                [parent],
+                |row| row.get(0),
+            )?
+        } else {
+            transaction.query_row(
+                "SELECT COALESCE(MAX(position),-1)+1 FROM content_unit WHERE parent_node_id IS NULL AND kind=?1",
+                [kind_value],
+                |row| row.get(0),
+            )?
+        };
+        if parent.is_some() {
+            transaction.execute(
+                "UPDATE content_unit SET position=position+?2 WHERE parent_node_id=?1",
+                params![parent_value.as_deref(), base + i64::from(sibling_count) + 2],
+            )?;
+            let old: Vec<String> = {
+                let mut query = transaction.prepare(
+                    "SELECT id FROM content_unit WHERE parent_node_id=?1 ORDER BY position,id",
+                )?;
+                query
+                    .query_map([parent_value.as_deref()], |row| row.get(0))?
+                    .collect::<std::result::Result<_, _>>()?
+            };
+            for (index, sibling) in old.iter().enumerate() {
+                let new_position = index + usize::from(index >= position as usize);
+                transaction.execute(
+                    "UPDATE content_unit SET position=?2 WHERE id=?1",
+                    params![sibling, new_position as i64],
+                )?;
+            }
+        } else {
+            transaction.execute(
+                "UPDATE content_unit SET position=position+?2 WHERE parent_node_id IS NULL AND kind=?1",
+                params![kind_value, base + i64::from(sibling_count) + 2],
+            )?;
+            let old: Vec<String> = {
+                let mut query = transaction.prepare("SELECT id FROM content_unit WHERE parent_node_id IS NULL AND kind=?1 ORDER BY position,id")?;
+                query
+                    .query_map([kind_value], |row| row.get(0))?
+                    .collect::<std::result::Result<_, _>>()?
+            };
+            for (index, sibling) in old.iter().enumerate() {
+                let new_position = index + usize::from(index >= position as usize);
+                transaction.execute(
+                    "UPDATE content_unit SET position=?2 WHERE id=?1",
+                    params![sibling, new_position as i64],
+                )?;
+            }
+        }
+        transaction.execute(
+            "INSERT INTO content_unit(id,kind,title,parent_node_id,position,target_words,relative_path,sha256,byte_length,word_count,generation,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,0,0,0,?9,?9)",
+            params![id.to_string(), kind_value, title, parent_value, position, target_words, relative.to_string_lossy(), hash_bytes(bytes), now],
+        )?;
+        transaction.execute(
+            "INSERT INTO content_unit_search_content(content_unit_id,content) VALUES(?1,'')",
+            [id.to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(id)
+    }
+    pub fn get_content_unit(&self, id: ContentUnitId) -> Result<ContentUnitRecord> {
+        let row = self.conn.query_row(
+            "SELECT kind,title,parent_node_id,position,target_words,word_count,sha256,archived FROM content_unit WHERE id=?1",
+            [id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, Option<String>>(2)?,row.get::<_, u32>(3)?,row.get::<_, Option<u64>>(4)?,row.get::<_, u32>(5)?,row.get::<_, String>(6)?,row.get::<_, bool>(7)?)),
+        ).optional()?.ok_or_else(|| StorageError::NotFound(format!("content unit {id}")))?;
+        let parent_id = row
+            .2
+            .map(|value| {
+                Uuid::parse_str(&value)
+                    .map(NodeId)
+                    .map_err(|e| StorageError::Invalid(e.to_string()))
+            })
+            .transpose()?;
+        let kind = ContentUnitKind::parse(&row.0)
+            .ok_or_else(|| StorageError::Invalid(format!("unknown content unit kind {}", row.0)))?;
+        Ok(ContentUnitRecord {
+            id,
+            kind,
+            title: row.1,
+            parent_id,
+            position: row.3,
+            target_words: row.4,
+            actual_words: row.5,
+            content_hash: row.6,
+            archived: row.7,
+        })
+    }
+    pub fn list_content_units(&self, include_archived: bool) -> Result<Vec<ContentUnitRecord>> {
+        let mut query = self.conn.prepare("SELECT id FROM content_unit WHERE (?1 OR archived=0) ORDER BY CASE kind WHEN 'front_matter' THEN 0 WHEN 'section_body' THEN 1 WHEN 'chapter_body' THEN 2 ELSE 3 END,parent_node_id,position,id")?;
+        let ids = query
+            .query_map([include_archived], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .map(|id| {
+                let id = ContentUnitId(
+                    Uuid::parse_str(&id).map_err(|e| StorageError::Invalid(e.to_string()))?,
+                );
+                self.get_content_unit(id)
+            })
+            .collect()
+    }
+    pub fn rename_content_unit(&mut self, id: ContentUnitId, title: &str) -> Result<()> {
+        if title.trim().is_empty() {
+            return Err(StorageError::Invalid(
+                "content unit title cannot be empty".into(),
+            ));
+        }
+        let updated = self.conn.execute(
+            "UPDATE content_unit SET title=?2,updated_at=?3 WHERE id=?1",
+            params![id.to_string(), title.trim(), now()],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::NotFound(format!("content unit {id}")));
+        }
+        Ok(())
     }
     pub fn get_scene(&self, id: SceneId) -> Result<SceneRecord> {
         let row=self.conn.query_row("SELECT s.title,s.synopsis,s.status,s.target_words,s.purpose,s.goal,s.outcome,s.start_nominal,s.start_lower,s.start_upper,s.start_precision,s.end_nominal,s.end_lower,s.end_upper,s.end_precision,s.pov_character_id,s.start_location_id,s.end_location_id,s.archived,p.chapter_id,p.position,c.sha256,c.byte_length FROM scene s LEFT JOIN scene_placement p ON p.scene_id=s.id JOIN scene_content c ON c.scene_id=s.id WHERE s.id=?1",[id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<u64>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,Option<i64>>(7)?,r.get::<_,Option<i64>>(8)?,r.get::<_,Option<i64>>(9)?,r.get::<_,String>(10)?,r.get::<_,Option<i64>>(11)?,r.get::<_,Option<i64>>(12)?,r.get::<_,Option<i64>>(13)?,r.get::<_,String>(14)?,r.get::<_,Option<String>>(15)?,r.get::<_,Option<String>>(16)?,r.get::<_,Option<String>>(17)?,r.get::<_,bool>(18)?,r.get::<_,Option<String>>(19)?,r.get::<_,Option<u32>>(20)?,r.get::<_,String>(21)?,r.get::<_,u64>(22)?))).map_err(|_|StorageError::NotFound(id.to_string()))?;
@@ -1360,6 +1737,398 @@ impl ProjectStore {
             hash,
         ))
     }
+    fn content_unit_path(&self, id: ContentUnitId) -> Result<PathBuf> {
+        let relative: String = self
+            .conn
+            .query_row(
+                "SELECT relative_path FROM content_unit WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(format!("content unit {id}")))?;
+        Ok(PathBuf::from(relative))
+    }
+    pub fn load_content_unit_text(&self, id: ContentUnitId) -> Result<(String, String)> {
+        let relative = self.content_unit_path(id)?;
+        let path = self.safe_path(&relative)?;
+        let bytes = fs::read(path)?;
+        let actual = hash_bytes(&bytes);
+        let expected: String = self.conn.query_row(
+            "SELECT sha256 FROM content_unit WHERE id=?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        if actual != expected {
+            return Err(StorageError::Conflict(format!(
+                "external edit detected for content unit {id}; expected {expected}, found {actual}"
+            )));
+        }
+        Ok((
+            String::from_utf8(bytes).map_err(|error| StorageError::Invalid(error.to_string()))?,
+            actual,
+        ))
+    }
+    pub fn save_content_unit_text(
+        &mut self,
+        id: ContentUnitId,
+        expected: Option<&str>,
+        text: &str,
+    ) -> Result<String> {
+        self.save_content_unit_text_inner(id, expected, text, None)
+    }
+    fn save_content_unit_text_inner(
+        &mut self,
+        id: ContentUnitId,
+        expected: Option<&str>,
+        text: &str,
+        fail: Option<ContentUnitSaveFailpoint>,
+    ) -> Result<String> {
+        let relative = self.content_unit_path(id)?;
+        let target = self.safe_path(&relative)?;
+        let current: String = self.conn.query_row(
+            "SELECT sha256 FROM content_unit WHERE id=?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        if expected != Some(current.as_str()) {
+            return Err(StorageError::Conflict(
+                "stale expected content-unit hash".into(),
+            ));
+        }
+        let actual = if target.exists() {
+            hash_file(&target)?
+        } else {
+            String::new()
+        };
+        if actual != current {
+            return Err(StorageError::Conflict(
+                "content unit changed outside Writer's IDE".into(),
+            ));
+        }
+        let bytes = text.as_bytes();
+        let new_hash = hash_bytes(bytes);
+        let txid = Uuid::new_v4().to_string();
+        let temp = target.with_file_name(format!(".content-{id}.{txid}.tmp"));
+        if fail == Some(ContentUnitSaveFailpoint::AfterPartialTemp) {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(&bytes[..bytes.len() / 2])?;
+            file.sync_all()?;
+            sync_dir(target.parent().unwrap())?;
+            return Err(StorageError::Invalid(
+                "injected interruption during content-unit temp write".into(),
+            ));
+        }
+        write_synced(&temp, bytes)?;
+        let candidate_relative = PathBuf::from(".writers-ide/recovery")
+            .join(&txid)
+            .join("candidate.md");
+        let candidate = self.safe_path(&candidate_relative)?;
+        fs::create_dir_all(candidate.parent().unwrap())?;
+        write_synced(&candidate, bytes)?;
+        sync_dir(target.parent().unwrap())?;
+        sync_dir(candidate.parent().unwrap())?;
+        sync_dir(candidate.parent().unwrap().parent().unwrap())?;
+        if fail == Some(ContentUnitSaveFailpoint::AfterTempSync) {
+            return Err(StorageError::Invalid(
+                "injected interruption after content-unit temp sync".into(),
+            ));
+        }
+        let generation: i64 = self.conn.query_row(
+            "SELECT generation+1 FROM content_unit WHERE id=?1",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute("INSERT INTO content_unit_write_journal(tx_id,content_unit_id,target_path,temp_path,candidate_path,old_hash,new_hash,new_length,next_generation,state,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'prepared',?10)",params![txid,id.to_string(),relative.to_string_lossy(),temp.strip_prefix(&self.root).unwrap_or(&temp).to_string_lossy(),candidate_relative.to_string_lossy(),current,new_hash,bytes.len() as i64,generation,now()])?;
+            tx.commit()?;
+        }
+        if fail == Some(ContentUnitSaveFailpoint::AfterIntent)
+            || fail == Some(ContentUnitSaveFailpoint::BeforeRename)
+        {
+            return Err(StorageError::Invalid(
+                "injected interruption after content-unit write intent".into(),
+            ));
+        }
+        if (if target.exists() {
+            hash_file(&target)?
+        } else {
+            String::new()
+        }) != current
+        {
+            let _ = self.recover_pending_content_unit_writes()?;
+            return Err(StorageError::Conflict(
+                "content unit changed while save was prepared; both versions were preserved".into(),
+            ));
+        }
+        fs::rename(&temp, &target)?;
+        sync_dir(target.parent().unwrap())?;
+        if fail == Some(ContentUnitSaveFailpoint::AfterRename) {
+            return Err(StorageError::Invalid(
+                "injected interruption after content-unit replacement".into(),
+            ));
+        }
+        {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute("UPDATE content_unit SET sha256=?2,byte_length=?3,word_count=?4,generation=?5,updated_at=?6 WHERE id=?1",params![id.to_string(),new_hash,bytes.len() as i64,text.split_whitespace().count() as i64,generation,now()])?;
+            tx.execute(
+                "UPDATE content_unit_search_content SET content=?2 WHERE content_unit_id=?1",
+                params![id.to_string(), text],
+            )?;
+            tx.execute(
+                "UPDATE content_unit_write_journal SET state='db_committed' WHERE tx_id=?1",
+                [&txid],
+            )?;
+            tx.commit()?;
+        }
+        if fail == Some(ContentUnitSaveFailpoint::AfterMetadataCommit) {
+            return Err(StorageError::Invalid(
+                "injected interruption after content-unit metadata commit".into(),
+            ));
+        }
+        self.cleanup_content_unit_journal(&txid, &temp, &candidate)?;
+        if fail == Some(ContentUnitSaveFailpoint::AfterJournalCleanup) {
+            return Err(StorageError::Invalid(
+                "injected interruption during content-unit journal cleanup".into(),
+            ));
+        }
+        Ok(new_hash)
+    }
+    fn cleanup_content_unit_journal(
+        &mut self,
+        txid: &str,
+        temp: &Path,
+        candidate: &Path,
+    ) -> Result<()> {
+        if temp.exists() {
+            fs::remove_file(temp)?;
+        }
+        if candidate.exists() {
+            fs::remove_file(candidate)?;
+        }
+        if let Some(parent) = candidate.parent() {
+            sync_dir(parent).map_err(|e| {
+                StorageError::Config(format!(
+                    "sync recovery transaction before removal {}: {e}",
+                    parent.display()
+                ))
+            })?;
+            let _ = fs::remove_dir(parent);
+            if let Some(recovery) = parent.parent() {
+                sync_dir(recovery).map_err(|e| {
+                    StorageError::Config(format!(
+                        "sync recovery directory {}: {e}",
+                        recovery.display()
+                    ))
+                })?;
+            }
+        }
+        if let Some(parent) = temp.parent() {
+            sync_dir(parent).map_err(|e| {
+                StorageError::Config(format!(
+                    "sync manuscript directory {}: {e}",
+                    parent.display()
+                ))
+            })?;
+        }
+        self.conn.execute(
+            "DELETE FROM content_unit_write_journal WHERE tx_id=?1 AND state='db_committed'",
+            [txid],
+        )?;
+        Ok(())
+    }
+    pub fn recover_pending_content_unit_writes(
+        &mut self,
+    ) -> Result<Vec<ContentUnitRecoveryConflict>> {
+        let entries: Vec<ContentUnitJournalRow> = {
+            let mut q = self.conn.prepare("SELECT tx_id,content_unit_id,target_path,temp_path,candidate_path,old_hash,new_hash,new_length,next_generation,state FROM content_unit_write_journal ORDER BY created_at")?;
+            q.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            })?
+            .collect::<std::result::Result<_, _>>()?
+        };
+        let mut conflicts = Vec::new();
+        for (
+            txid,
+            id,
+            target_rel,
+            temp_rel,
+            candidate_rel,
+            old_hash,
+            new_hash,
+            length,
+            generation,
+            state,
+        ) in entries
+        {
+            let target = self.safe_path(Path::new(&target_rel))?;
+            let temp = self.safe_path(Path::new(&temp_rel))?;
+            let candidate = self.safe_path(Path::new(&candidate_rel))?;
+            let target_hash = if target.exists() {
+                Some(hash_file(&target)?)
+            } else {
+                None
+            };
+            let temp_hash = if temp.exists() {
+                Some(hash_file(&temp)?)
+            } else {
+                None
+            };
+            let candidate_hash = if candidate.exists() {
+                Some(hash_file(&candidate)?)
+            } else {
+                None
+            };
+            let existing_conflict: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT tx_id FROM content_unit_write_conflict WHERE tx_id=?1 AND resolved=0",
+                    [&txid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if existing_conflict.is_some() {
+                conflicts.push(ContentUnitRecoveryConflict {
+                    transaction_id: txid.clone(),
+                    content_unit_id: ContentUnitId(
+                        Uuid::parse_str(&id).map_err(|e| StorageError::Invalid(e.to_string()))?,
+                    ),
+                    recovery_path: self.root.join(".writers-ide/recovery").join(&txid),
+                });
+            } else if target_hash.as_deref() == Some(new_hash.as_str()) {
+                self.update_content_unit_recovery(&txid, &id, &new_hash, length, generation)?;
+                self.cleanup_content_unit_journal(&txid, &temp, &candidate)?;
+            } else if target_hash.as_deref() == old_hash.as_deref()
+                && temp_hash.as_deref() == Some(new_hash.as_str())
+            {
+                fs::rename(&temp, &target).map_err(|e| {
+                    StorageError::Config(format!("replace recovered content unit: {e}"))
+                })?;
+                sync_dir(target.parent().unwrap()).map_err(|e| {
+                    StorageError::Config(format!("sync recovered content directory: {e}"))
+                })?;
+                self.update_content_unit_recovery(&txid, &id, &new_hash, length, generation)
+                    .map_err(|e| {
+                        StorageError::Config(format!("update recovered content metadata: {e}"))
+                    })?;
+                self.cleanup_content_unit_journal(&txid, &temp, &candidate)
+                    .map_err(|e| {
+                        StorageError::Config(format!("clean recovered content journal: {e}"))
+                    })?;
+            } else if state == "prepared"
+                && target_hash.as_deref() == old_hash.as_deref()
+                && temp_hash.is_none()
+            {
+                self.cleanup_content_unit_journal(&txid, &temp, &candidate)?;
+            } else {
+                let recovery = self.root.join(".writers-ide/recovery").join(&txid);
+                fs::create_dir_all(&recovery)?;
+                if target.exists() && !recovery.join("external-version.md").exists() {
+                    copy_synced(&target, &recovery.join("external-version.md"))?;
+                }
+                let prepared = if candidate.exists() {
+                    Some(&candidate)
+                } else if temp.exists() {
+                    Some(&temp)
+                } else {
+                    None
+                };
+                if let Some(prepared) = prepared
+                    && !recovery.join("prepared-version.md").exists()
+                {
+                    copy_synced(prepared, &recovery.join("prepared-version.md"))?;
+                }
+                sync_dir(&recovery)?;
+                self.conn.execute("INSERT OR IGNORE INTO content_unit_write_conflict(tx_id,content_unit_id,recovery_path,expected_hash,actual_hash,candidate_hash,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![txid,id,recovery.strip_prefix(&self.root).unwrap().to_string_lossy(),old_hash,target_hash.unwrap_or_default(),candidate_hash.unwrap_or(new_hash),now()])?;
+                conflicts.push(ContentUnitRecoveryConflict {
+                    transaction_id: txid,
+                    content_unit_id: ContentUnitId(
+                        Uuid::parse_str(&id).map_err(|e| StorageError::Invalid(e.to_string()))?,
+                    ),
+                    recovery_path: recovery,
+                });
+            }
+        }
+        Ok(conflicts)
+    }
+    pub fn pending_content_unit_conflicts(&self) -> Result<u32> {
+        Ok(self.conn.query_row(
+            "SELECT count(*) FROM content_unit_write_conflict WHERE resolved=0",
+            [],
+            |row| row.get(0),
+        )?)
+    }
+    pub fn list_content_unit_recovery_conflicts(&self) -> Result<Vec<ContentUnitRecoveryConflict>> {
+        let mut q=self.conn.prepare("SELECT tx_id,content_unit_id,recovery_path FROM content_unit_write_conflict WHERE resolved=0 ORDER BY created_at")?;
+        let rows = q.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (txid, id, path) = row?;
+            Ok(ContentUnitRecoveryConflict {
+                transaction_id: txid,
+                content_unit_id: ContentUnitId(
+                    Uuid::parse_str(&id).map_err(|e| StorageError::Invalid(e.to_string()))?,
+                ),
+                recovery_path: self.safe_path(Path::new(&path))?,
+            })
+        })
+        .collect()
+    }
+    fn update_content_unit_recovery(
+        &mut self,
+        txid: &str,
+        id: &str,
+        hash: &str,
+        length: i64,
+        generation: i64,
+    ) -> Result<()> {
+        let relative: String = self.conn.query_row(
+            "SELECT relative_path FROM content_unit WHERE id=?1",
+            [id],
+            |r| r.get(0),
+        )?;
+        let content = fs::read(self.safe_path(Path::new(&relative))?)?;
+        let content =
+            String::from_utf8(content).map_err(|e| StorageError::Invalid(e.to_string()))?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE content_unit SET sha256=?2,byte_length=?3,word_count=?4,generation=?5,updated_at=?6 WHERE id=?1",params![id,hash,length,content.split_whitespace().count() as i64,generation,now()])?;
+        tx.execute(
+            "UPDATE content_unit_search_content SET content=?2 WHERE content_unit_id=?1",
+            params![id, content],
+        )?;
+        tx.execute(
+            "UPDATE content_unit_write_journal SET state='db_committed' WHERE tx_id=?1",
+            [txid],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
     pub fn save_text(&mut self, id: SceneId, expected: Option<&str>, text: &str) -> Result<String> {
         self.save_text_inner(id, expected, text, None)
     }
@@ -1707,7 +2476,7 @@ impl ProjectStore {
     fn cleanup_orphan_write_files(&self) -> Result<()> {
         let mut active = std::collections::HashSet::new();
         {
-            let mut q=self.conn.prepare("SELECT tx_id FROM write_journal UNION SELECT tx_id FROM write_conflict WHERE resolved=0")?;
+            let mut q=self.conn.prepare("SELECT tx_id FROM write_journal UNION SELECT tx_id FROM write_conflict WHERE resolved=0 UNION SELECT tx_id FROM content_unit_write_journal UNION SELECT tx_id FROM content_unit_write_conflict WHERE resolved=0")?;
             for id in q.query_map([], |r| r.get::<_, String>(0))? {
                 active.insert(id?);
             }
@@ -1746,6 +2515,17 @@ impl ProjectStore {
             if let Some(body) = name.strip_prefix('.').and_then(|s| s.strip_suffix(".tmp"))
                 && let Some((scene, tx)) = body.split_once('.')
                 && Uuid::parse_str(scene).is_ok()
+                && Uuid::parse_str(tx).is_ok()
+                && !active.contains(tx)
+            {
+                fs::remove_file(entry.path())?;
+                changed = true;
+            }
+            if let Some(body) = name
+                .strip_prefix(".content-")
+                .and_then(|s| s.strip_suffix(".tmp"))
+                && let Some((content, tx)) = body.split_once('.')
+                && Uuid::parse_str(content).is_ok()
                 && Uuid::parse_str(tx).is_ok()
                 && !active.contains(tx)
             {
@@ -2187,6 +2967,52 @@ impl ProjectStore {
                 })
             })
             .collect()
+    }
+    pub fn resolve_content_unit_conflict(&mut self, txid: &str, use_prepared: bool) -> Result<()> {
+        let row:Option<(String,String)>=self.conn.query_row("SELECT content_unit_id,recovery_path FROM content_unit_write_conflict WHERE tx_id=?1 AND resolved=0",[txid],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let (id, recovery_rel) = row.ok_or_else(|| StorageError::NotFound(txid.into()))?;
+        let recovery = self.safe_path(Path::new(&recovery_rel))?;
+        let relative = self.content_unit_path(ContentUnitId(
+            Uuid::parse_str(&id).map_err(|e| StorageError::Invalid(e.to_string()))?,
+        ))?;
+        let target = self.safe_path(&relative)?;
+        if use_prepared {
+            let prepared = recovery.join("prepared-version.md");
+            let bytes = fs::read(&prepared).map_err(|e| {
+                StorageError::RecoveryConflict(format!("prepared version is unavailable: {e}"))
+            })?;
+            let temp = target.with_file_name(format!(".resolve-content-{}.tmp", Uuid::new_v4()));
+            write_synced(&temp, &bytes)?;
+            fs::rename(&temp, &target)?;
+            sync_dir(target.parent().unwrap())?;
+        }
+        let bytes = fs::read(&target)?;
+        let hash = hash_bytes(&bytes);
+        let text = String::from_utf8(bytes).map_err(|e| StorageError::Invalid(e.to_string()))?;
+        let generation: i64 = self.conn.query_row(
+            "SELECT generation+1 FROM content_unit WHERE id=?1",
+            [&id],
+            |r| r.get(0),
+        )?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE content_unit SET sha256=?2,byte_length=?3,word_count=?4,generation=?5,updated_at=?6 WHERE id=?1",params![id,hash,text.len() as i64,text.split_whitespace().count() as i64,generation,now()])?;
+        tx.execute(
+            "UPDATE content_unit_search_content SET content=?2 WHERE content_unit_id=?1",
+            params![id, text],
+        )?;
+        tx.execute(
+            "UPDATE content_unit_write_conflict SET resolved=1,decision=?2 WHERE tx_id=?1",
+            params![txid, if use_prepared { 1 } else { 2 }],
+        )?;
+        tx.execute(
+            "DELETE FROM content_unit_write_journal WHERE tx_id=?1",
+            [txid],
+        )?;
+        tx.commit()?;
+        // Retain the recovery directory: it contains both versions for later inspection.
+        Ok(())
     }
     pub fn link_event(&mut self, scene: SceneId, event: EventId, kind: &str) -> Result<()> {
         self.conn.execute(
@@ -3391,6 +4217,17 @@ enum SaveFailpoint {
     AfterJournalCleanup,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ContentUnitSaveFailpoint {
+    AfterPartialTemp,
+    AfterTempSync,
+    AfterIntent,
+    BeforeRename,
+    AfterRename,
+    AfterMetadataCommit,
+    AfterJournalCleanup,
+}
+
 fn configure(c: &Connection) -> Result<()> {
     c.pragma_update(None, "foreign_keys", "ON")?;
     c.pragma_update(None, "journal_mode", "WAL")?;
@@ -3688,6 +4525,152 @@ fn sync_dir(p: &Path) -> Result<()> {
     File::open(p)?.sync_all()?;
     Ok(())
 }
+fn deterministic_sql_dump(conn: &Connection) -> Result<String> {
+    let mut schema = Vec::<(String, String, String)>::new();
+    {
+        let mut query=conn.prepare("SELECT type,name,sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 WHEN 'view' THEN 2 WHEN 'trigger' THEN 3 ELSE 4 END,name")?;
+        for row in query.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let entry = row?;
+            if is_transient_or_fts_shadow(&entry.1) {
+                continue;
+            }
+            schema.push(entry);
+        }
+    }
+    let virtual_tables: std::collections::HashSet<String> = schema
+        .iter()
+        .filter(|(kind, _, sql)| {
+            kind == "table" && sql.to_ascii_uppercase().contains("CREATE VIRTUAL TABLE")
+        })
+        .map(|(_, name, _)| name.clone())
+        .collect();
+    let mut output = String::from(
+        "-- Writer's IDE deterministic metadata snapshot v1\nPRAGMA foreign_keys=OFF;\nBEGIN IMMEDIATE;\n",
+    );
+    for (_, _, sql) in &schema {
+        output.push_str(sql.trim_end());
+        output.push_str(";\n");
+    }
+    for (kind, name, _) in &schema {
+        if kind != "table" || virtual_tables.contains(name) || excluded_snapshot_table(name) {
+            continue;
+        }
+        let table_quote = quote_identifier(name);
+        let mut columns_stmt = conn.prepare(&format!("PRAGMA table_info({table_quote})"))?;
+        let columns: Vec<(String, i64)> = columns_stmt
+            .query_map([], |row| Ok((row.get(1)?, row.get(5)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        if columns.is_empty() {
+            continue;
+        }
+        let names = columns
+            .iter()
+            .map(|(name, _)| quote_identifier(name))
+            .collect::<Vec<_>>();
+        let pk = columns
+            .iter()
+            .filter(|(_, order)| *order > 0)
+            .collect::<Vec<_>>();
+        let order = if pk.is_empty() {
+            names.clone()
+        } else {
+            pk.iter().map(|(name, _)| quote_identifier(name)).collect()
+        };
+        let sql = format!(
+            "SELECT {} FROM {table_quote} ORDER BY {}",
+            names.join(","),
+            order.join(",")
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let count = statement.column_count();
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            let values = (0..count)
+                .map(|index| row.get_ref(index).map(sql_literal))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            output.push_str("INSERT INTO ");
+            output.push_str(&table_quote);
+            output.push_str(" (");
+            output.push_str(&names.join(","));
+            output.push_str(") VALUES (");
+            output.push_str(&values.join(","));
+            output.push_str(");\n");
+        }
+    }
+    output.push_str("COMMIT;\nPRAGMA foreign_keys=ON;\n");
+    Ok(output)
+}
+fn excluded_snapshot_table(name: &str) -> bool {
+    matches!(
+        name,
+        "scene_snapshot"
+            | "write_journal"
+            | "write_conflict"
+            | "content_unit_write_journal"
+            | "content_unit_write_conflict"
+            | "project_search_content"
+            | "scene_search_content"
+            | "content_unit_search_content"
+    )
+}
+fn is_transient_or_fts_shadow(name: &str) -> bool {
+    matches!(
+        name,
+        "write_journal"
+            | "write_conflict"
+            | "content_unit_write_journal"
+            | "content_unit_write_conflict"
+    ) || name.starts_with("sqlite_")
+        || ["scene_fts_", "reading_fts_", "project_search_fts_"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+fn quote_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+fn sql_literal(value: ValueRef<'_>) -> String {
+    match value {
+        ValueRef::Null => "NULL".into(),
+        ValueRef::Integer(value) => value.to_string(),
+        ValueRef::Real(value) => value.to_string(),
+        ValueRef::Text(value) => {
+            format!("'{}'", String::from_utf8_lossy(value).replace('\'', "''"))
+        }
+        ValueRef::Blob(value) => format!(
+            "X'{}'",
+            value
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ),
+    }
+}
+fn validate_sql_dump(sql: &str) -> Result<()> {
+    let conn = Connection::open_in_memory()?;
+    conn.execute_batch(sql)?;
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    if integrity != "ok" {
+        return Err(StorageError::Invalid(format!(
+            "generated SQL snapshot failed integrity_check: {integrity}"
+        )));
+    }
+    let foreign_key_errors: i64 =
+        conn.query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+            row.get(0)
+        })?;
+    if foreign_key_errors != 0 {
+        return Err(StorageError::Invalid(format!(
+            "generated SQL snapshot has {foreign_key_errors} foreign-key violations"
+        )));
+    }
+    Ok(())
+}
 fn word_count(s: &str) -> u32 {
     s.split_whitespace().count().min(u32::MAX as usize) as u32
 }
@@ -3862,6 +4845,240 @@ fn query_ref_ids(conn: &Connection, field: FieldId, value: &str) -> Result<Vec<S
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn chapter_content_units_persist_and_compile_without_scenes() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("Book");
+        let mut st = ProjectStore::create_for(
+            &project,
+            &Project {
+                id: ProjectId::new(),
+                title: "Book".into(),
+                author: String::new(),
+                genre: String::new(),
+                synopsis: String::new(),
+                book_type: BookType::Nonfiction,
+                template_id: None,
+                target_words: None,
+                story_epoch_label: "Day 0".into(),
+                story_calendar_id: None,
+            },
+        )
+        .unwrap();
+        let chapter = st
+            .create_node(None, NodeKind::Chapter, "Chapter 1", 0)
+            .unwrap();
+        let unit = st
+            .create_content_unit(
+                ContentUnitKind::ChapterBody,
+                "Chapter 1",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, hash) = st.load_content_unit_text(unit).unwrap();
+        st.save_content_unit_text(unit, Some(&hash), "A chapter with prose and no scenes.")
+            .unwrap();
+        assert_eq!(st.get_content_unit(unit).unwrap().actual_words, 7);
+        drop(st);
+        let st = ProjectStore::open(&project).unwrap();
+        assert_eq!(st.get_project().unwrap().book_type, BookType::Nonfiction);
+        assert_eq!(
+            st.load_content_unit_text(unit).unwrap().0,
+            "A chapter with prose and no scenes."
+        );
+        st.validate().unwrap();
+    }
+
+    #[test]
+    fn content_unit_constraints_reject_wrong_parent_kind_and_id_collisions_in_sql() {
+        let d = tempdir().unwrap();
+        let mut store = ProjectStore::create(d.path().join("Book"), "Book").unwrap();
+        let section = store
+            .create_node(None, NodeKind::Section, "Part", 0)
+            .unwrap();
+        let chapter = store
+            .create_node(Some(section), NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let _section_body = store
+            .create_content_unit(
+                ContentUnitKind::SectionBody,
+                "Part introduction",
+                Some(section),
+                0,
+                None,
+            )
+            .unwrap();
+        let unit = store
+            .create_content_unit(ContentUnitKind::ChapterBody, "Body", Some(chapter), 0, None)
+            .unwrap();
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE structural_node SET kind='group' WHERE id=?1",
+                    [section.to_string()]
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE content_unit SET kind='section_body' WHERE id=?1",
+                    [unit.to_string()]
+                )
+                .is_err()
+        );
+        let scene = store.create_scene(chapter, 0, "Scene").unwrap();
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE scene SET id=?2 WHERE id=?1",
+                    params![scene.to_string(), unit.to_string()]
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn metadata_sql_snapshot_is_deterministic_consistent_and_replayable() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("Novel");
+        let mut store = ProjectStore::create(&project, "Novel").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "One", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Quoted ' title").unwrap();
+        let (_, hash) = store.load_text(scene).unwrap();
+        store
+            .save_text(scene, Some(&hash), "Élodie said: 'hello'.")
+            .unwrap();
+        let first = store
+            .with_git_snapshot_barrier(|root| {
+                fs::read(root.join("snapshots/database.sql")).map_err(|e| e.to_string())
+            })
+            .unwrap();
+        let second = store
+            .with_git_snapshot_barrier(|root| {
+                fs::read(root.join("snapshots/database.sql")).map_err(|e| e.to_string())
+            })
+            .unwrap();
+        assert_eq!(first, second);
+        let dump = String::from_utf8(first).unwrap();
+        assert!(!dump.contains("CREATE VIRTUAL TABLE \"scene_fts\"_data"));
+        let restored = Connection::open_in_memory().unwrap();
+        restored.execute_batch(&dump).unwrap();
+        let integrity: String = restored
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let title: String = restored
+            .query_row(
+                "SELECT title FROM scene WHERE id=?1",
+                [scene.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Quoted ' title");
+        assert!(
+            restored
+                .query_row("SELECT count(*) FROM write_journal", [], |r| r
+                    .get::<_, i64>(0))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn content_unit_write_journal_recovers_interrupted_replacements() {
+        let failpoints = [
+            ContentUnitSaveFailpoint::AfterPartialTemp,
+            ContentUnitSaveFailpoint::AfterTempSync,
+            ContentUnitSaveFailpoint::AfterIntent,
+            ContentUnitSaveFailpoint::BeforeRename,
+            ContentUnitSaveFailpoint::AfterRename,
+            ContentUnitSaveFailpoint::AfterMetadataCommit,
+        ];
+        for failpoint in failpoints {
+            let d = tempdir().unwrap();
+            let project = d.path().join("Book");
+            let mut st = ProjectStore::create(&project, "Book").unwrap();
+            let chapter = st.create_node(None, NodeKind::Chapter, "Ch", 0).unwrap();
+            let unit = st
+                .create_content_unit(ContentUnitKind::ChapterBody, "Body", Some(chapter), 0, None)
+                .unwrap();
+            let (_, hash) = st.load_content_unit_text(unit).unwrap();
+            assert!(
+                st.save_content_unit_text_inner(
+                    unit,
+                    Some(&hash),
+                    "Prepared prose.",
+                    Some(failpoint)
+                )
+                .is_err()
+            );
+            drop(st);
+            let st = ProjectStore::open(&project)
+                .unwrap_or_else(|error| panic!("reopen after {failpoint:?}: {error}"));
+            let expected = if matches!(
+                failpoint,
+                ContentUnitSaveFailpoint::AfterPartialTemp
+                    | ContentUnitSaveFailpoint::AfterTempSync
+            ) {
+                ""
+            } else {
+                "Prepared prose."
+            };
+            assert_eq!(st.load_content_unit_text(unit).unwrap().0, expected);
+            assert_eq!(st.pending_content_unit_conflicts().unwrap(), 0);
+            st.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn content_unit_recovery_preserves_external_conflicts() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("Book");
+        let mut st = ProjectStore::create(&project, "Book").unwrap();
+        let chapter = st.create_node(None, NodeKind::Chapter, "Ch", 0).unwrap();
+        let unit = st
+            .create_content_unit(ContentUnitKind::ChapterBody, "Body", Some(chapter), 0, None)
+            .unwrap();
+        let (_, hash) = st.load_content_unit_text(unit).unwrap();
+        assert!(
+            st.save_content_unit_text_inner(
+                unit,
+                Some(&hash),
+                "Prepared version",
+                Some(ContentUnitSaveFailpoint::AfterIntent)
+            )
+            .is_err()
+        );
+        let path = st.safe_path(&st.content_unit_path(unit).unwrap()).unwrap();
+        fs::write(&path, "External version").unwrap();
+        drop(st);
+        let mut st = ProjectStore::open(&project).unwrap();
+        assert_eq!(st.pending_content_unit_conflicts().unwrap(), 1);
+        let conflicts = st.list_content_unit_recovery_conflicts().unwrap();
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(fs::read_to_string(path).unwrap(), "External version");
+        assert_eq!(
+            fs::read_to_string(conflicts[0].recovery_path.join("prepared-version.md")).unwrap(),
+            "Prepared version"
+        );
+        st.resolve_content_unit_conflict(&conflicts[0].transaction_id, true)
+            .unwrap();
+        assert_eq!(
+            st.load_content_unit_text(unit).unwrap().0,
+            "Prepared version"
+        );
+        assert_eq!(
+            fs::read_to_string(conflicts[0].recovery_path.join("external-version.md")).unwrap(),
+            "External version"
+        );
+    }
     #[test]
     fn links_anchors_backlinks_and_transclusion_cycles_are_integrity_checked() {
         let d = tempdir().unwrap();
@@ -4415,7 +5632,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -4425,7 +5642,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 10);
+        assert_eq!(version, 12);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -4455,6 +5672,13 @@ mod tests {
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch(
             "DROP TRIGGER story_link_source_exists_insert;
+             DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update;
+             DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update;
+             DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert;
+             DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit;
+             DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal;
+             DROP TABLE content_unit_search_content; DROP TABLE content_unit;
+             ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type;
              DROP TRIGGER story_link_source_exists_update;
              DROP TRIGGER story_link_no_transclusion_cycle;
              DROP TRIGGER story_link_inclusion_documents_insert;
@@ -4706,6 +5930,8 @@ mod tests {
             author: "Author".into(),
             genre: "Fantasy".into(),
             synopsis: "Synopsis".into(),
+            book_type: BookType::Nonfiction,
+            template_id: None,
             target_words: Some(90000),
             story_epoch_label: "Before the Sundering".into(),
             story_calendar_id: Some("twelve-moons".into()),
@@ -4713,6 +5939,7 @@ mod tests {
         let s = ProjectStore::create_for(&p, &project).unwrap();
         let got = s.get_project().unwrap();
         assert_eq!(got.id, project.id);
+        assert_eq!(got.book_type, BookType::Nonfiction);
         assert_eq!(got.target_words, Some(90000));
         assert_eq!(got.story_epoch_label, "Before the Sundering");
         assert_eq!(got.story_calendar_id.as_deref(), Some("twelve-moons"));

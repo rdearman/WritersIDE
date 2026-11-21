@@ -16,6 +16,8 @@ pub enum AppError {
     Domain(String),
     #[error(transparent)]
     Pipeline(#[from] story_pipeline::PipelineError),
+    #[error(transparent)]
+    Git(#[from] story_git::GitError),
 }
 pub type Result<T> = std::result::Result<T, AppError>;
 
@@ -28,6 +30,44 @@ impl WriterApp {
         Ok(Self {
             store: ProjectStore::create(path, title)?,
         })
+    }
+    pub fn create_project_with_type(
+        path: impl AsRef<Path>,
+        title: &str,
+        book_type: BookType,
+    ) -> Result<Self> {
+        let project = Project {
+            id: ProjectId::new(),
+            title: title.into(),
+            author: String::new(),
+            genre: String::new(),
+            synopsis: String::new(),
+            book_type,
+            template_id: None,
+            target_words: None,
+            story_epoch_label: "Day 0".into(),
+            story_calendar_id: None,
+        };
+        Self::create_project_with_metadata(path, &project)
+    }
+    pub fn create_project_from_template(
+        path: impl AsRef<Path>,
+        title: &str,
+        template: BuiltinTemplate,
+    ) -> Result<Self> {
+        let project = Project {
+            id: ProjectId::new(),
+            title: title.into(),
+            author: String::new(),
+            genre: String::new(),
+            synopsis: String::new(),
+            book_type: template.book_type(),
+            template_id: Some(template.id().into()),
+            target_words: None,
+            story_epoch_label: "Day 0".into(),
+            story_calendar_id: None,
+        };
+        Self::create_project_with_metadata(path, &project)
     }
     pub fn create_project_with_metadata(path: impl AsRef<Path>, project: &Project) -> Result<Self> {
         Ok(Self {
@@ -67,6 +107,41 @@ impl WriterApp {
     }
     pub fn create_scene(&mut self, chapter: NodeId, title: &str, position: u32) -> Result<SceneId> {
         Ok(self.store.create_scene(chapter, position, title)?)
+    }
+    pub fn create_content_unit(
+        &mut self,
+        kind: ContentUnitKind,
+        title: &str,
+        parent: Option<NodeId>,
+        position: u32,
+        target_words: Option<u64>,
+    ) -> Result<ContentUnitId> {
+        Ok(self
+            .store
+            .create_content_unit(kind, title, parent, position, target_words)?)
+    }
+    pub fn get_content_unit(&self, id: ContentUnitId) -> Result<story_storage::ContentUnitRecord> {
+        Ok(self.store.get_content_unit(id)?)
+    }
+    pub fn list_content_units(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<story_storage::ContentUnitRecord>> {
+        Ok(self.store.list_content_units(include_archived)?)
+    }
+    pub fn load_content_unit_text(&self, id: ContentUnitId) -> Result<(String, String)> {
+        Ok(self.store.load_content_unit_text(id)?)
+    }
+    pub fn save_content_unit_text(
+        &mut self,
+        id: ContentUnitId,
+        expected: Option<&str>,
+        text: &str,
+    ) -> Result<String> {
+        Ok(self.store.save_content_unit_text(id, expected, text)?)
+    }
+    pub fn rename_content_unit(&mut self, id: ContentUnitId, title: &str) -> Result<()> {
+        Ok(self.store.rename_content_unit(id, title)?)
     }
     pub fn list_structural_nodes(&self) -> Result<Vec<story_storage::StructuralNodeSummary>> {
         Ok(self.store.list_structural_nodes()?)
@@ -143,6 +218,22 @@ impl WriterApp {
             })
             .collect();
         let mut scenes = Vec::new();
+        let mut content_units = Vec::new();
+        for unit in self.store.list_content_units(false)? {
+            let (text, _) = self.store.load_content_unit_text(unit.id)?;
+            content_units.push(story_pipeline::PipelineContentUnit {
+                id: unit.id.to_string(),
+                parent_id: unit.parent_id.map(|id| id.to_string()),
+                kind: match unit.kind {
+                    ContentUnitKind::FrontMatter => story_document::ContentUnitKind::FrontMatter,
+                    ContentUnitKind::SectionBody => story_document::ContentUnitKind::SectionBody,
+                    ContentUnitKind::ChapterBody => story_document::ContentUnitKind::ChapterBody,
+                    ContentUnitKind::BackMatter => story_document::ContentUnitKind::BackMatter,
+                },
+                title: unit.title,
+                text,
+            });
+        }
         let mut snapshots = 0usize;
         for row in self.store.list_scenes(false)? {
             let (text, _) = self.store.load_text(row.scene.id)?;
@@ -208,6 +299,7 @@ impl WriterApp {
             target_words: project.target_words,
             expand_transclusions,
             groups,
+            content_units,
             scenes,
             revision_summary: format!(
                 "{} scenes; {snapshots} stored snapshots",
@@ -845,11 +937,35 @@ impl WriterApp {
     pub fn list_recovery_conflicts(&self) -> Result<Vec<story_storage::RecoveryConflict>> {
         Ok(self.store.list_recovery_conflicts()?)
     }
+    pub fn list_content_unit_recovery_conflicts(
+        &self,
+    ) -> Result<Vec<story_storage::ContentUnitRecoveryConflict>> {
+        Ok(self.store.list_content_unit_recovery_conflicts()?)
+    }
     pub fn backup_project(&mut self, destination: impl AsRef<Path>) -> Result<()> {
         Ok(self.store.backup_to(destination)?)
     }
+    pub fn git_snapshot(&mut self, label: &str) -> Result<Option<String>> {
+        let author = self.get_project()?.author;
+        Ok(self.store.with_git_snapshot_barrier(|root| {
+            story_git::GitHistory::open(root)
+                .and_then(|git| git.snapshot(label, &author))
+                .map_err(|e| e.to_string())
+        })?)
+    }
+    pub fn git_history(&self, limit: usize) -> Result<Vec<story_git::GitCommit>> {
+        Ok(story_git::GitHistory::open(self.store.project_root())?.history(limit)?)
+    }
+    pub fn git_diff(&self, from: &str, to: &str, path: Option<&str>) -> Result<String> {
+        Ok(story_git::GitHistory::open(self.store.project_root())?.diff(from, to, path)?)
+    }
     pub fn resolve_conflict(&mut self, txid: &str, resolution: ConflictResolution) -> Result<()> {
         Ok(self.store.resolve_write_conflict(txid, resolution)?)
+    }
+    pub fn resolve_content_unit_conflict(&mut self, txid: &str, use_prepared: bool) -> Result<()> {
+        Ok(self
+            .store
+            .resolve_content_unit_conflict(txid, use_prepared)?)
     }
 }
 
@@ -908,6 +1024,69 @@ mod tests {
                 .iter()
                 .all(|stage| stage.status == story_pipeline::StageStatus::Cached)
         );
+    }
+
+    #[test]
+    fn nonfiction_chapter_prose_is_a_content_unit_not_a_scene() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Field Guide");
+        let mut app = WriterApp::create_project_from_template(
+            &path,
+            "Field Guide",
+            BuiltinTemplate::BlankNonfiction,
+        )
+        .unwrap();
+        let chapter = app.create_chapter(None, "Introduction", 0).unwrap();
+        let body = app
+            .create_content_unit(
+                ContentUnitKind::ChapterBody,
+                "Introduction",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, hash) = app.load_content_unit_text(body).unwrap();
+        app.save_content_unit_text(body, Some(&hash), "This is direct chapter prose.")
+            .unwrap();
+        assert!(app.list_scenes(false).unwrap().is_empty());
+        assert_eq!(
+            app.get_project().unwrap().template_id.as_deref(),
+            Some("blank-nonfiction")
+        );
+        let input = app.processing_input().unwrap();
+        assert!(input.scenes.is_empty());
+        assert_eq!(input.content_units.len(), 1);
+        assert!(input.content_units[0].text.contains("direct chapter prose"));
+        let (compiled, _) = story_pipeline::compile_ir(&input).render_markdown();
+        assert_eq!(compiled, "This is direct chapter prose.\n\n");
+    }
+
+    #[test]
+    fn git_snapshots_pair_manuscript_and_metadata_and_skip_unchanged_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "First draft.")
+            .unwrap();
+        let first = app.git_snapshot("First draft").unwrap().unwrap();
+        assert!(app.git_snapshot("No changes").unwrap().is_none());
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Revised draft.")
+            .unwrap();
+        let second = app.git_snapshot("Revision").unwrap().unwrap();
+        assert_ne!(first, second);
+        assert_eq!(app.git_history(10).unwrap().len(), 2);
+        assert!(
+            app.git_diff(&first, &second, Some(&format!("manuscript/{scene}.md")))
+                .unwrap()
+                .contains("Revised draft")
+        );
+        assert!(project.join("snapshots/database.sql").exists());
+        assert!(app.git_diff(&first, &second, Some("story.db")).is_err());
     }
 
     #[test]

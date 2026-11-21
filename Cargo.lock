@@ -1547,6 +1547,7 @@ dependencies = [
  "story-analysis",
  "story-core",
  "story-document",
+ "story-git",
  "story-ollama",
  "story-pipeline",
  "story-reading",
@@ -1573,6 +1574,14 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "story-git"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

@@ -49,6 +49,7 @@ id_type!(BookmarkId);
 id_type!(ReadingTermId);
 id_type!(SnapshotId);
 id_type!(KnowledgeClaimId);
+id_type!(ContentUnitId);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotRestoreSelection {
@@ -318,6 +319,36 @@ pub enum NodeKind {
     Chapter,
     Group,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentUnitKind {
+    FrontMatter,
+    SectionBody,
+    ChapterBody,
+    BackMatter,
+}
+
+impl ContentUnitKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FrontMatter => "front_matter",
+            Self::SectionBody => "section_body",
+            Self::ChapterBody => "chapter_body",
+            Self::BackMatter => "back_matter",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "front_matter" => Some(Self::FrontMatter),
+            "section_body" => Some(Self::SectionBody),
+            "chapter_body" => Some(Self::ChapterBody),
+            "back_matter" => Some(Self::BackMatter),
+            _ => None,
+        }
+    }
+}
 impl NodeKind {
     pub fn as_str(self) -> &'static str {
         match self {
@@ -359,9 +390,81 @@ pub struct Project {
     pub author: String,
     pub genre: String,
     pub synopsis: String,
+    #[serde(default)]
+    pub book_type: BookType,
+    #[serde(default)]
+    pub template_id: Option<String>,
     pub target_words: Option<u64>,
     pub story_epoch_label: String,
     pub story_calendar_id: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BuiltinTemplate {
+    BlankFiction,
+    Novel,
+    ShortStory,
+    BlankNonfiction,
+    NonfictionBook,
+}
+
+impl BuiltinTemplate {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::BlankFiction => "blank-fiction",
+            Self::Novel => "novel",
+            Self::ShortStory => "short-story",
+            Self::BlankNonfiction => "blank-nonfiction",
+            Self::NonfictionBook => "nonfiction-book",
+        }
+    }
+    pub fn book_type(self) -> BookType {
+        match self {
+            Self::BlankNonfiction | Self::NonfictionBook => BookType::Nonfiction,
+            _ => BookType::Fiction,
+        }
+    }
+    pub fn all() -> [Self; 5] {
+        [
+            Self::BlankFiction,
+            Self::Novel,
+            Self::ShortStory,
+            Self::BlankNonfiction,
+            Self::NonfictionBook,
+        ]
+    }
+    pub fn parse(id: &str) -> Option<Self> {
+        Self::all().into_iter().find(|template| template.id() == id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BookType {
+    #[default]
+    Fiction,
+    Nonfiction,
+    Custom,
+}
+
+impl BookType {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fiction => "fiction",
+            Self::Nonfiction => "nonfiction",
+            Self::Custom => "custom",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "fiction" => Some(Self::Fiction),
+            "nonfiction" | "non-fiction" => Some(Self::Nonfiction),
+            "custom" => Some(Self::Custom),
+            _ => None,
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StructuralNode {

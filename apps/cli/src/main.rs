@@ -18,6 +18,24 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             drop(WriterApp::create_project(path, &title)?);
             println!("Created project: {title}");
         }
+        "create-kind" => {
+            let path = args.next().ok_or("missing project path")?;
+            let kind = story_core::BookType::parse(&args.next().ok_or("missing book type")?)
+                .ok_or("book type must be fiction, nonfiction, or custom")?;
+            let title = args.next().unwrap_or_else(|| "Untitled Book".into());
+            drop(WriterApp::create_project_with_type(path, &title, kind)?);
+            println!("Created {kind:?} project: {title}");
+        }
+        "create-template" => {
+            let path = args.next().ok_or("missing project path")?;
+            let template_id = args.next().ok_or("missing template ID")?;
+            let template=story_core::BuiltinTemplate::parse(&template_id).ok_or("template must be blank-fiction, novel, short-story, blank-nonfiction, or nonfiction-book")?;
+            let title = args.next().unwrap_or_else(|| "Untitled Book".into());
+            drop(WriterApp::create_project_from_template(
+                path, &title, template,
+            )?);
+            println!("Created {template_id} project: {title}");
+        }
         "inspect" => {
             let path = args.next().ok_or("missing project path")?;
             let app = WriterApp::open_project(path)?;
@@ -26,6 +44,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "Unresolved manuscript conflict {} for scene {} at {}",
                     conflict.transaction_id,
                     conflict.scene_id,
+                    conflict.recovery_path.display()
+                );
+            }
+            for conflict in app.list_content_unit_recovery_conflicts()? {
+                println!(
+                    "Unresolved manuscript conflict {} for content unit {} at {}",
+                    conflict.transaction_id,
+                    conflict.content_unit_id,
                     conflict.recovery_path.display()
                 );
             }
@@ -38,6 +64,47 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut app = WriterApp::open_project(path)?;
             let id = app.create_chapter(None, &title, 0)?;
             println!("{id}");
+        }
+        "content" => {
+            let path = args.next().ok_or("missing project path")?;
+            let kind = match args.next().as_deref().ok_or("missing content kind")? {
+                "chapter" => story_core::ContentUnitKind::ChapterBody,
+                "section" => story_core::ContentUnitKind::SectionBody,
+                "front" => story_core::ContentUnitKind::FrontMatter,
+                "back" => story_core::ContentUnitKind::BackMatter,
+                _ => return Err("content kind must be chapter, section, front, or back".into()),
+            };
+            let parent = args.next().ok_or("missing parent node UUID or -")?;
+            let parent = if parent == "-" {
+                None
+            } else {
+                Some(NodeId(parent.parse()?))
+            };
+            let title = args.next().ok_or("missing content-unit title")?;
+            let mut app = WriterApp::open_project(path)?;
+            println!(
+                "{}",
+                app.create_content_unit(kind, &title, parent, 0, None)?
+            );
+        }
+        "read-content" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id =
+                story_core::ContentUnitId(args.next().ok_or("missing content unit UUID")?.parse()?);
+            let app = WriterApp::open_project(path)?;
+            print!("{}", app.load_content_unit_text(id)?.0);
+        }
+        "write-content" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id =
+                story_core::ContentUnitId(args.next().ok_or("missing content unit UUID")?.parse()?);
+            let text = args.next().ok_or("missing content text")?;
+            let mut app = WriterApp::open_project(path)?;
+            let (_, hash) = app.load_content_unit_text(id)?;
+            println!(
+                "Saved {}",
+                app.save_content_unit_text(id, Some(&hash), &text)?
+            );
         }
         "scene" => {
             let path = args.next().ok_or("missing project path")?;
@@ -79,12 +146,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.resolve_conflict(&txid, resolution)?;
             println!("Conflict resolved.");
         }
+        "resolve-content" => {
+            let path = args.next().ok_or("missing project path")?;
+            let txid = args.next().ok_or("missing transaction ID")?;
+            let choice = args.next().ok_or("missing choice: external|prepared")?;
+            let use_prepared = match choice.as_str() {
+                "prepared" => true,
+                "external" => false,
+                _ => return Err("choice must be external or prepared".into()),
+            };
+            let mut app = WriterApp::open_project(path)?;
+            app.resolve_content_unit_conflict(&txid, use_prepared)?;
+            println!("Content conflict resolved; recovery versions retained.");
+        }
         "backup" => {
             let path = args.next().ok_or("missing project path")?;
             let destination = args.next().ok_or("missing backup destination")?;
             let mut app = WriterApp::open_project(path)?;
             app.backup_project(destination)?;
             println!("Backup created.");
+        }
+        "git-snapshot" => {
+            let path = args.next().ok_or("missing project path")?;
+            let label = args.next().ok_or("missing snapshot label")?;
+            let mut app = WriterApp::open_project(path)?;
+            match app.git_snapshot(&label)? {
+                Some(commit) => println!("Snapshot {commit}"),
+                None => println!("No changes; snapshot not created."),
+            }
+        }
+        "git-history" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            for commit in app.git_history(100)? {
+                println!("{}\t{}\t{}", commit.id, commit.date, commit.subject);
+            }
+        }
+        "git-diff" => {
+            let path = args.next().ok_or("missing project path")?;
+            let from = args.next().ok_or("missing first commit")?;
+            let to = args.next().ok_or("missing second commit")?;
+            let file = args.next();
+            let app = WriterApp::open_project(path)?;
+            print!("{}", app.git_diff(&from, &to, file.as_deref())?);
         }
         "character" => {
             let path = args.next().ok_or("missing project path")?;
@@ -591,12 +695,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 fn usage() {
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
+        "writers-ide create <path> [title]\nwriters-ide create-kind <path> <fiction|nonfiction|custom> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
     );
     eprintln!(
         "writers-ide anchors <path> <scene-uuid>\nwriters-ide anchor-move <path> <anchor-uuid> <start-byte> <end-byte>"
     );
     eprintln!("writers-ide search-all <path> <terms>\nwriters-ide rebuild-search <path>");
+    eprintln!(
+        "writers-ide create-template <path> <blank-fiction|novel|short-story|blank-nonfiction|nonfiction-book> [title]\nwriters-ide content <path> <chapter|section|front|back> <parent-uuid|-> <title>\nwriters-ide read-content <path> <content-uuid>\nwriters-ide write-content <path> <content-uuid> <text>\nwriters-ide resolve-content <path> <transaction-id> external|prepared\nwriters-ide git-snapshot <path> <label>\nwriters-ide git-history <path>\nwriters-ide git-diff <path> <commit-a> <commit-b> [project-relative-path]"
+    );
 }
 fn parse_status(value: &str) -> Result<story_core::SceneStatus, Box<dyn std::error::Error>> {
     use story_core::SceneStatus::*;

@@ -51,6 +51,15 @@ pub struct PipelineGroup {
 }
 
 #[derive(Clone, Debug)]
+pub struct PipelineContentUnit {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub kind: story_document::ContentUnitKind,
+    pub title: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct PipelinePassage {
     pub source_entity_id: String,
     pub text: String,
@@ -62,6 +71,7 @@ pub struct PipelineInput {
     pub target_words: Option<u64>,
     pub expand_transclusions: bool,
     pub groups: Vec<PipelineGroup>,
+    pub content_units: Vec<PipelineContentUnit>,
     /// Ordered in manuscript order; chronology remains on each scene independently.
     pub scenes: Vec<PipelineScene>,
     pub revision_summary: String,
@@ -460,6 +470,7 @@ pub fn compile_ir(input: &PipelineInput) -> story_document::CompileIr {
             title: group.title.clone(),
         });
     }
+    let mut scenes = Vec::new();
     for scene in &input.scenes {
         let segments = if input.expand_transclusions {
             scene
@@ -491,7 +502,7 @@ pub fn compile_ir(input: &PipelineInput) -> story_document::CompileIr {
                 scene.text.clone(),
             )]
         };
-        ir.push(story_document::CompileUnit {
+        scenes.push(story_document::CompileUnit {
             id: scene.id.clone(),
             parent_id: scene.chapter_id.clone(),
             kind: story_document::ContentUnitKind::Scene,
@@ -499,7 +510,93 @@ pub fn compile_ir(input: &PipelineInput) -> story_document::CompileIr {
             segments,
         });
     }
+    let mut used_scenes = std::collections::BTreeSet::new();
+    let mut used_content = std::collections::BTreeSet::new();
+    for content in input
+        .content_units
+        .iter()
+        .filter(|unit| unit.kind == story_document::ContentUnitKind::FrontMatter)
+    {
+        push_content(&mut ir, content);
+        used_content.insert(content.id.clone());
+    }
+    fn emit_group(
+        id: &str,
+        input: &PipelineInput,
+        scenes: &[story_document::CompileUnit],
+        ir: &mut story_document::CompileIr,
+        used_scenes: &mut std::collections::BTreeSet<String>,
+        used_content: &mut std::collections::BTreeSet<String>,
+    ) {
+        for content in input
+            .content_units
+            .iter()
+            .filter(|unit| unit.parent_id.as_deref() == Some(id))
+        {
+            push_content(ir, content);
+            used_content.insert(content.id.clone());
+        }
+        for scene in scenes
+            .iter()
+            .filter(|scene| scene.parent_id.as_deref() == Some(id))
+        {
+            ir.push(scene.clone());
+            used_scenes.insert(scene.id.clone());
+        }
+        for group in input
+            .groups
+            .iter()
+            .filter(|group| group.parent_id.as_deref() == Some(id))
+        {
+            emit_group(&group.id, input, scenes, ir, used_scenes, used_content);
+        }
+    }
+    for group in input
+        .groups
+        .iter()
+        .filter(|group| group.parent_id.is_none())
+    {
+        emit_group(
+            &group.id,
+            input,
+            &scenes,
+            &mut ir,
+            &mut used_scenes,
+            &mut used_content,
+        );
+    }
+    for scene in &scenes {
+        if !used_scenes.contains(&scene.id) {
+            ir.push(scene.clone());
+        }
+    }
+    for content in input
+        .content_units
+        .iter()
+        .filter(|unit| unit.kind == story_document::ContentUnitKind::BackMatter)
+    {
+        push_content(&mut ir, content);
+        used_content.insert(content.id.clone());
+    }
+    for content in &input.content_units {
+        if !used_content.contains(&content.id) {
+            push_content(&mut ir, content);
+        }
+    }
     ir
+}
+
+fn push_content(ir: &mut story_document::CompileIr, content: &PipelineContentUnit) {
+    ir.push(story_document::CompileUnit {
+        id: content.id.clone(),
+        parent_id: content.parent_id.clone(),
+        kind: content.kind,
+        title: content.title.clone(),
+        segments: vec![story_document::CompileSegment::new(
+            content.id.clone(),
+            content.text.clone(),
+        )],
+    });
 }
 
 fn analysis_input(input: &PipelineInput) -> Vec<SceneAnalysisInput> {
@@ -574,6 +671,7 @@ mod tests {
                 kind: story_document::StructuralKind::Chapter,
                 title: "Opening".into(),
             }],
+            content_units: vec![],
             scenes: vec![PipelineScene {
                 id: "scene-1".into(),
                 chapter_id: Some("chapter-1".into()),
@@ -612,6 +710,24 @@ mod tests {
         assert_eq!(changed[2].status, StageStatus::Cached);
         assert_eq!(changed[3].status, StageStatus::Cached);
         assert_eq!(changed[5].status, StageStatus::Complete);
+    }
+
+    #[test]
+    fn chapter_level_prose_compiles_without_a_fake_scene_and_before_scene_units() {
+        let mut novel = input("Scene prose.");
+        novel.content_units.push(PipelineContentUnit {
+            id: "chapter-body".into(),
+            parent_id: Some("chapter-1".into()),
+            kind: story_document::ContentUnitKind::ChapterBody,
+            title: "Chapter".into(),
+            text: "Chapter-level introduction.".into(),
+        });
+        let (compiled, _) = compile_ir(&novel).render_markdown();
+        assert!(compiled.starts_with("Chapter-level introduction.\n\n## Opening\n\nScene prose."));
+        let mut nonfiction = novel;
+        nonfiction.scenes.clear();
+        let (compiled, _) = compile_ir(&nonfiction).render_markdown();
+        assert_eq!(compiled, "Chapter-level introduction.\n\n");
     }
 
     #[test]

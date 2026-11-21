@@ -12,6 +12,7 @@ story-analysis = { path = "../story-analysis" }
 story-pipeline = { path = "../story-pipeline" }
 story-document = { path = "../story-document" }
 story-ollama = { path = "../story-ollama" }
+story-git = { path = "../story-git" }
 thiserror.workspace = true
 uuid.workspace = true
 sha2.workspace = true

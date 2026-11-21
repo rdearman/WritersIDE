@@ -323,9 +323,14 @@ impl CompileIr {
         let mut output = String::new();
         let mut source_map = Vec::new();
         for unit in &self.units {
-            output.push_str("## ");
-            output.push_str(&unit.title);
-            output.push_str("\n\n");
+            if matches!(
+                unit.kind,
+                ContentUnitKind::Scene | ContentUnitKind::FrontMatter | ContentUnitKind::BackMatter
+            ) {
+                output.push_str("## ");
+                output.push_str(&unit.title);
+                output.push_str("\n\n");
+            }
             for (index, segment) in unit.segments.iter().enumerate() {
                 if index > 0 {
                     output.push_str("\n\n---\n\n");

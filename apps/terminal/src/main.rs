@@ -14,10 +14,10 @@ use crossterm::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 use story_app::WriterApp;
 use story_core::{SceneId, SceneStatus};
@@ -109,7 +109,18 @@ struct AppState {
     proposal_review_index: usize,
     editor_selection: Option<(usize, usize)>,
     clipboard: String,
+    menu: Option<MenuState>,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MenuState {
+    top: usize,
+    selected: usize,
+}
+
+const MENU_CATEGORIES: [&str; 9] = [
+    "File", "Edit", "Insert", "Scene", "Plot", "View", "Compile", "Tools", "Help",
+];
 
 #[derive(Clone, Debug)]
 enum TimelineItem {
@@ -287,7 +298,7 @@ fn command_registry() -> Vec<CommandSpec> {
             "scene.create",
             "New Scene",
             "Create a scene in a chapter",
-            "Scene",
+            "Insert",
             "scene",
             true,
         ),
@@ -303,7 +314,7 @@ fn command_registry() -> Vec<CommandSpec> {
             "scene.rename",
             "Rename Scene",
             "Rename a scene without changing its identity",
-            "Scene",
+            "Edit",
             "rename",
             true,
         ),
@@ -311,7 +322,7 @@ fn command_registry() -> Vec<CommandSpec> {
             "scene.status",
             "Set Scene Status",
             "Change a scene's drafting status",
-            "Scene",
+            "Edit",
             "scene-status",
             true,
         ),
@@ -319,7 +330,7 @@ fn command_registry() -> Vec<CommandSpec> {
             "scene.field",
             "Edit Scene Planning Field",
             "Edit a scene synopsis or purpose field",
-            "Scene",
+            "Edit",
             "scene-field",
             true,
         ),
@@ -327,7 +338,7 @@ fn command_registry() -> Vec<CommandSpec> {
             "scene.subchapter",
             "New Chapter in Section",
             "Create a chapter under a section",
-            "Scene",
+            "Insert",
             "subchapter",
             true,
         ),
@@ -335,7 +346,7 @@ fn command_registry() -> Vec<CommandSpec> {
             "structure.section",
             "New Section",
             "Create a top-level section",
-            "Scene",
+            "Insert",
             "section",
             true,
         ),
@@ -343,7 +354,7 @@ fn command_registry() -> Vec<CommandSpec> {
             "structure.chapter",
             "New Chapter",
             "Create a top-level chapter",
-            "Scene",
+            "Insert",
             "chapter",
             true,
         ),
@@ -684,6 +695,30 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "git.snapshot",
+            "Create Project Snapshot",
+            "Commit consistent prose and SQL metadata to local Git history",
+            "File",
+            "git-snapshot",
+            true,
+        ),
+        legacy_command(
+            "git.history",
+            "Show Project History",
+            "List local project snapshots",
+            "File",
+            "git-history",
+            false,
+        ),
+        legacy_command(
+            "git.diff",
+            "Compare Project Snapshots",
+            "Compare two local project snapshots",
+            "File",
+            "git-diff",
+            true,
+        ),
+        legacy_command(
             "extract.propose",
             "Extract Story Candidates",
             "Create provisional Ollama candidates",
@@ -855,8 +890,18 @@ fn command_palette_invocation(text: &str) -> Option<(CommandSpec, Option<&str>)>
     None
 }
 
-fn open_menu_reserved_message() -> &'static str {
-    "Hierarchical menu shortcut reserved (Ctrl+/ or F10); use the : command palette until menu rendering lands"
+fn menu_category(category: &str) -> &'static str {
+    match category {
+        "File" => "File",
+        "Edit" => "Edit",
+        "Insert" => "Insert",
+        "Scene" => "Scene",
+        "Plot" => "Plot",
+        "View" => "View",
+        "Compile" => "Compile",
+        "Help" => "Help",
+        _ => "Tools",
+    }
 }
 
 fn is_menu_shortcut(key: KeyEvent) -> bool {
@@ -1172,6 +1217,140 @@ impl AppState {
             .map(|s| s.0.to_string())
             .unwrap_or_else(|| "No scene selected".into())
     }
+    fn toggle_menu(&mut self) {
+        if self.menu.take().is_some() {
+            self.message = "Menu closed; editor focus restored".into();
+        } else {
+            self.menu = Some(MenuState {
+                top: 0,
+                selected: 0,
+            });
+            self.message = "Main menu · arrows navigate · Enter selects · Esc closes".into();
+        }
+    }
+    fn menu_commands(&self) -> Vec<CommandSpec> {
+        let Some(menu) = self.menu else {
+            return Vec::new();
+        };
+        let top = MENU_CATEGORIES[menu.top.min(MENU_CATEGORIES.len() - 1)];
+        command_registry()
+            .into_iter()
+            .filter(|spec| spec.id != "menu.main" && menu_category(spec.category) == top)
+            .collect()
+    }
+    fn command_disabled_reason(&self, spec: CommandSpec) -> Option<&'static str> {
+        match spec.action {
+            CommandAction::Save if self.editing_scene.is_none() => Some("Open a scene first"),
+            CommandAction::RestoreRevisionHunk if self.revision_diff.is_none() => {
+                Some("Open a revision diff first")
+            }
+            CommandAction::RestoreRevisionHunk if self.dirty => {
+                Some("Save the manuscript buffer first")
+            }
+            _ => None,
+        }
+    }
+    fn handle_menu_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn std::error::Error>> {
+        let mut menu = self.menu.ok_or("menu is closed")?;
+        match key.code {
+            KeyCode::Esc => {
+                self.menu = None;
+                self.message = "Menu closed; editor focus restored".into();
+                return Ok(());
+            }
+            KeyCode::Left => {
+                menu.top = (menu.top + MENU_CATEGORIES.len() - 1) % MENU_CATEGORIES.len();
+                menu.selected = 0;
+                self.menu = Some(menu);
+                return Ok(());
+            }
+            KeyCode::Right => {
+                menu.top = (menu.top + 1) % MENU_CATEGORIES.len();
+                menu.selected = 0;
+                self.menu = Some(menu);
+                return Ok(());
+            }
+            KeyCode::Up => {
+                let count = self.menu_commands().len();
+                if count > 0 {
+                    menu.selected = (menu.selected + count - 1) % count;
+                }
+            }
+            KeyCode::Down => {
+                let count = self.menu_commands().len();
+                if count > 0 {
+                    menu.selected = (menu.selected + 1) % count;
+                }
+            }
+            KeyCode::Enter => {
+                let commands = self.menu_commands();
+                if let Some(spec) = commands.get(menu.selected).copied() {
+                    if let Some(reason) = self.command_disabled_reason(spec) {
+                        self.message = format!("{} unavailable: {reason}", spec.label);
+                        return Ok(());
+                    }
+                    if spec.takes_arguments {
+                        let prefix = spec
+                            .palette_prefix
+                            .ok_or("menu command has no command-palette route")?;
+                        self.menu = None;
+                        self.mode = Some(':');
+                        self.prompt = format!("{prefix} ");
+                        self.message = spec.description.into();
+                        return Ok(());
+                    }
+                    self.menu = None;
+                    self.dispatch_registered(spec.action)?;
+                    return Ok(());
+                }
+                return Ok(());
+            }
+            KeyCode::Char(ch) => {
+                if let Some(index) = MENU_CATEGORIES.iter().position(|category| {
+                    category
+                        .chars()
+                        .next()
+                        .is_some_and(|first| first.eq_ignore_ascii_case(&ch))
+                }) {
+                    menu.top = index;
+                    menu.selected = 0;
+                    self.menu = Some(menu);
+                    return Ok(());
+                } else if let Some((index, spec)) =
+                    self.menu_commands().iter().enumerate().find(|(_, spec)| {
+                        spec.mnemonic
+                            .is_some_and(|mnemonic| mnemonic.eq_ignore_ascii_case(&ch))
+                    })
+                {
+                    menu.selected = index;
+                    if let Some(reason) = self.command_disabled_reason(*spec) {
+                        self.message = format!("{} unavailable: {reason}", spec.label);
+                        self.menu = Some(menu);
+                        return Ok(());
+                    }
+                    if spec.takes_arguments {
+                        let prefix = spec
+                            .palette_prefix
+                            .ok_or("menu command has no command-palette route")?;
+                        self.menu = None;
+                        self.mode = Some(':');
+                        self.prompt = format!("{prefix} ");
+                        self.message = spec.description.into();
+                        return Ok(());
+                    }
+                    self.menu = None;
+                    self.dispatch_registered(spec.action)?;
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+        menu.selected = menu
+            .selected
+            .min(self.menu_commands().len().saturating_sub(1));
+        self.menu = Some(menu);
+        Ok(())
+    }
     fn dispatch_registered(
         &mut self,
         action: CommandAction,
@@ -1185,7 +1364,7 @@ impl AppState {
     ) -> Result<(), Box<dyn std::error::Error>> {
         match action {
             CommandAction::Workspace(workspace) => self.switch(workspace),
-            CommandAction::OpenMainMenu => self.message = open_menu_reserved_message().into(),
+            CommandAction::OpenMainMenu => self.toggle_menu(),
             CommandAction::Save => self.save()?,
             CommandAction::Help => {
                 self.message = command_registry()
@@ -1857,6 +2036,39 @@ impl AppState {
                     self.open_reading_selected()?;
                 }
             }
+        } else if let Some(label) = cmd.strip_prefix("git-snapshot ") {
+            if self.dirty {
+                self.save()?;
+            }
+            self.message = match self.app.git_snapshot(label)? {
+                Some(commit) => format!("Project snapshot created: {commit}"),
+                None => "No project changes; snapshot not created".into(),
+            };
+        } else if cmd == "git-history" {
+            self.message = self
+                .app
+                .git_history(20)?
+                .into_iter()
+                .map(|commit| {
+                    format!(
+                        "{} {} {}",
+                        &commit.id[..commit.id.len().min(10)],
+                        commit.date,
+                        commit.subject
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
+        } else if let Some(args) = cmd.strip_prefix("git-diff ") {
+            let mut parts = args.splitn(3, ' ');
+            let from = parts
+                .next()
+                .ok_or("use git-diff <commit-a> <commit-b> [path]")?;
+            let to = parts
+                .next()
+                .ok_or("use git-diff <commit-a> <commit-b> [path]")?;
+            let diff = self.app.git_diff(from, to, parts.next())?;
+            self.message = diff.lines().take(12).collect::<Vec<_>>().join(" · ");
         } else if let Some(label) = cmd.strip_prefix("snapshot ") {
             let scene = self
                 .editing_scene
@@ -2471,6 +2683,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         proposal_review_index: 0,
         editor_selection: None,
         clipboard: String::new(),
+        menu: None,
     };
     state.refresh()?;
     let mut terminal = setup()?;
@@ -2800,6 +3013,97 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     f.render_widget(
         Paragraph::new(footer).block(Block::default().borders(Borders::TOP)),
         rows[2],
+    );
+    if s.menu.is_some() {
+        draw_menu_overlay(f, s);
+    }
+}
+
+fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let area = f.area();
+    let width = area.width.clamp(40, 86);
+    let height = area.height.clamp(8, 24);
+    let popup = Rect {
+        x: area.x + (area.width - width) / 2,
+        y: area.y + (area.height - height) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Main Menu · Ctrl+/ or F10 · Esc close ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(18), Constraint::Min(10)])
+        .split(inner);
+    let menu = s.menu.unwrap_or(MenuState {
+        top: 0,
+        selected: 0,
+    });
+    let roots = MENU_CATEGORIES
+        .iter()
+        .enumerate()
+        .map(|(i, name)| {
+            ListItem::new(format!(
+                "{}{}",
+                if i == menu.top { "▸ " } else { "  " },
+                name
+            ))
+        })
+        .collect::<Vec<_>>();
+    f.render_stateful_widget(
+        List::new(roots)
+            .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+            .block(Block::default().title("Menu").borders(Borders::RIGHT)),
+        panes[0],
+        &mut ListState::default().with_selected(Some(menu.top)),
+    );
+    let commands = s.menu_commands();
+    let items = if commands.is_empty() {
+        vec![ListItem::new("No commands available yet").style(Style::default().fg(Color::DarkGray))]
+    } else {
+        commands
+            .iter()
+            .map(|spec| {
+                let disabled = s.command_disabled_reason(*spec);
+                let mark = spec
+                    .mnemonic
+                    .map(|key| format!(" [{key}]"))
+                    .unwrap_or_default();
+                let args = if spec.takes_arguments { " …" } else { "" };
+                let label = if let Some(reason) = disabled {
+                    format!("{}{}{} — unavailable: {}", spec.label, mark, args, reason)
+                } else {
+                    format!("{}{}{} — {}", spec.label, mark, args, spec.description)
+                };
+                ListItem::new(label).style(if disabled.is_some() {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                })
+            })
+            .collect()
+    };
+    let selected = if commands.is_empty() {
+        None
+    } else {
+        Some(menu.selected.min(commands.len() - 1))
+    };
+    f.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
+            .block(
+                Block::default()
+                    .title(MENU_CATEGORIES[menu.top])
+                    .borders(Borders::LEFT),
+            ),
+        panes[1],
+        &mut ListState::default().with_selected(selected),
     );
 }
 fn pane_direction(width: usize) -> Direction {
@@ -3582,13 +3886,21 @@ fn parse_terminal_link_kind(
     })
 }
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if s.menu.is_some() {
+        if is_menu_shortcut(k) || k.code == KeyCode::F(10) {
+            s.toggle_menu();
+        } else {
+            s.handle_menu_key(k)?;
+        }
+        return Ok(false);
+    }
     if is_menu_shortcut(k) {
         if let Some(spec) = command_by_id("menu.main") {
             s.dispatch_registered(spec.action)?;
         }
         return Ok(false);
     }
-    if s.mode.is_none() && k.code == KeyCode::F(10) {
+    if k.code == KeyCode::F(10) {
         if let Some(spec) = command_by_id("menu.main") {
             s.dispatch_registered(spec.action)?;
         }
@@ -3961,6 +4273,17 @@ mod tests {
             "Compile"
         );
         assert_eq!(
+            command_palette_invocation("git-history").unwrap().0.id,
+            "git.history"
+        );
+        assert_eq!(
+            command_palette_invocation("git-snapshot Before edits")
+                .unwrap()
+                .0
+                .id,
+            "git.snapshot"
+        );
+        assert_eq!(
             command_palette_invocation("process-only").unwrap().0.action,
             CommandAction::ProcessSelected {
                 expand_transclusions: false
@@ -4058,6 +4381,7 @@ mod tests {
             proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
+            menu: None,
         };
         handle(
             &mut state,
@@ -4078,9 +4402,26 @@ mod tests {
         assert_eq!(state.cursor, (0, 5));
         assert_eq!(state.editor_selection, selection);
         assert!(state.dirty);
-        assert!(state.message.contains("menu shortcut reserved"));
+        assert!(state.menu.is_some());
+        assert_eq!(
+            state.command_disabled_reason(command_by_id("file.save").unwrap()),
+            Some("Open a scene first")
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.menu.unwrap().top, 1);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.menu.unwrap().top, 2);
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.menu.is_none());
 
-        state.message.clear();
         handle(
             &mut state,
             KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
@@ -4089,7 +4430,52 @@ mod tests {
         assert_eq!(state.editor, vec!["text/".to_owned()]);
         assert_eq!(state.cursor, (0, 5));
         assert_eq!(state.editor_selection, selection);
-        assert!(state.message.contains("menu shortcut reserved"));
+        assert!(state.menu.is_some());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.menu.unwrap().top, 5);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.menu.is_none());
+        assert_eq!(state.workspace, Workspace::Dashboard);
+        assert_eq!(state.editor, vec!["text/".to_owned()]);
+        assert_eq!(state.cursor, (0, 5));
+
+        state.toggle_menu();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(MENU_CATEGORIES[state.menu.unwrap().top], "Insert");
+        let ids = state
+            .menu_commands()
+            .into_iter()
+            .map(|command| command.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            [
+                "scene.create",
+                "scene.subchapter",
+                "structure.section",
+                "structure.chapter"
+            ]
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.menu.is_none());
+        assert_eq!(state.mode, Some(':'));
+        assert_eq!(state.prompt, "scene ");
     }
 
     #[test]
@@ -4156,6 +4542,7 @@ mod tests {
             proposal_review_index: 0,
             editor_selection: Some((0, 2)),
             clipboard: String::new(),
+            menu: None,
         };
         assert_eq!(state.selected_text().as_deref(), Some("pha\nbe"));
         handle(
@@ -4217,6 +4604,7 @@ mod tests {
             proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
+            menu: None,
         };
         handle(
             &mut state,
@@ -4270,6 +4658,7 @@ mod tests {
             proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
+            menu: None,
         };
         handle(
             &mut state,
@@ -4335,6 +4724,7 @@ mod tests {
             proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
+            menu: None,
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -4514,6 +4904,7 @@ mod tests {
             proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
+            menu: None,
         };
         assert!(
             !handle(
@@ -4579,6 +4970,7 @@ mod tests {
             proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
+            menu: None,
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -4661,6 +5053,7 @@ mod tests {
             proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
+            menu: None,
         };
         handle(
             &mut state,
@@ -4861,6 +5254,7 @@ mod tests {
             proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
+            menu: None,
         };
         state.mode = Some(':');
         state.prompt = "reading-links".into();
@@ -5165,6 +5559,7 @@ mod tests {
             proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
+            menu: None,
         };
         state.mode = Some(':');
         state.prompt = format!("query {}", query.id);
@@ -5241,6 +5636,7 @@ mod tests {
             proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
+            menu: None,
         };
         let hit = |kind: &str, id: String, title: &str| story_storage::ProjectSearchHit {
             entity_kind: kind.into(),
@@ -5369,6 +5765,7 @@ mod tests {
             proposal_review_index: 0,
             editor_selection: None,
             clipboard: String::new(),
+            menu: None,
         };
         let execute = |state: &mut AppState, command: String| {
             state.mode = Some(':');
