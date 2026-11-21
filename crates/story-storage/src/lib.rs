@@ -2605,6 +2605,11 @@ impl ProjectStore {
             .ok_or_else(|| StorageError::NotFound(format!("content unit {id}")))?;
         Ok(PathBuf::from(relative))
     }
+    pub fn content_unit_content_relative_path(&self, id: ContentUnitId) -> Result<PathBuf> {
+        let relative = self.content_unit_path(id)?;
+        self.safe_path(&relative)?;
+        Ok(relative)
+    }
     pub fn load_content_unit_text(&self, id: ContentUnitId) -> Result<(String, String)> {
         let relative = self.content_unit_path(id)?;
         let path = self.safe_path(&relative)?;
@@ -8504,10 +8509,20 @@ fn deterministic_sql_dump(conn: &Connection) -> Result<String> {
         output.push_str(sql.trim_end());
         output.push_str(";\n");
     }
-    for (kind, name, _) in &schema {
-        if kind != "table" || virtual_tables.contains(name) || excluded_snapshot_table(name) {
-            continue;
-        }
+    let mut data_tables = schema
+        .iter()
+        .filter(|(kind, name, _)| {
+            kind == "table" && !virtual_tables.contains(name) && !excluded_snapshot_table(name)
+        })
+        .collect::<Vec<_>>();
+    // Some integrity triggers validate parent kinds even while foreign keys are
+    // disabled in the portable dump. Insert those parents before dependent data.
+    data_tables.sort_by_key(|(_, name, _)| match name.as_str() {
+        "structural_node" => (0, name.as_str()),
+        "content_unit" => (1, name.as_str()),
+        _ => (2, name.as_str()),
+    });
+    for (_, name, _) in data_tables {
         let table_quote = quote_identifier(name);
         let mut columns_stmt = conn.prepare(&format!("PRAGMA table_info({table_quote})"))?;
         let columns: Vec<(String, i64)> = columns_stmt

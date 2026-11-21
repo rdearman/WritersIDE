@@ -647,6 +647,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.restore_scene_from_git(&commit, scene)?;
             println!("Scene prose restored from {commit}; previous project state snapshotted.");
         }
+        "git-restore-content" => {
+            let path = args.next().ok_or("missing project path")?;
+            let commit = args.next().ok_or("missing commit identifier")?;
+            let content_unit =
+                story_core::ContentUnitId(args.next().ok_or("missing content-unit UUID")?.parse()?);
+            let mut app = WriterApp::open_project(path)?;
+            app.restore_content_unit_from_git(&commit, content_unit)?;
+            println!(
+                "Content-unit prose restored from {commit}; previous project state snapshotted."
+            );
+        }
         "character" => {
             let path = args.next().ok_or("missing project path")?;
             let name = args.next().ok_or("missing character name")?;
@@ -2120,7 +2131,7 @@ fn usage() {
         "writers-ide git-search-history <path> <literal-text> [project-relative-path]\nwriters-ide git-blame <path> <project-relative-file> <first-line> <last-line>"
     );
     eprintln!(
-        "writers-ide create-template <path> <blank-fiction|novel|short-story|blank-nonfiction|nonfiction-book> [title]\nwriters-ide content <path> <chapter|section|front|back> <parent-uuid|-> <title>\nwriters-ide read-content <path> <content-uuid>\nwriters-ide write-content <path> <content-uuid> <text>\nwriters-ide resolve-content <path> <transaction-id> external|prepared\nwriters-ide git-snapshot <path> <label>\nwriters-ide git-history <path>\nwriters-ide git-diff <path> <commit-a> <commit-b> [project-relative-path]\nwriters-ide git-restore-new <source-project> <commit> <new-project-directory>\nwriters-ide git-restore-scene <project> <commit> <scene-uuid>"
+        "writers-ide create-template <path> <blank-fiction|novel|short-story|blank-nonfiction|nonfiction-book> [title]\nwriters-ide content <path> <chapter|section|front|back> <parent-uuid|-> <title>\nwriters-ide read-content <path> <content-uuid>\nwriters-ide write-content <path> <content-uuid> <text>\nwriters-ide resolve-content <path> <transaction-id> external|prepared\nwriters-ide git-snapshot <path> <label>\nwriters-ide git-history <path>\nwriters-ide git-diff <path> <commit-a> <commit-b> [project-relative-path]\nwriters-ide git-restore-new <source-project> <commit> <new-project-directory>\nwriters-ide git-restore-scene <project> <commit> <scene-uuid>\nwriters-ide git-restore-content <project> <commit> <content-unit-uuid>"
     );
     eprintln!(
         "writers-ide scratchpad-create <path> <title> [body]\nwriters-ide scratchpad-list <path>\nwriters-ide scratchpad-promote <path> <note-uuid> <scene|character|location|object|research> <entity-uuid>\nwriters-ide mentions <path> <scene-uuid>\nwriters-ide mention-confirm <path> <mention-uuid> <character|location|object> <entity-uuid>\nwriters-ide mention-dismiss <path> <mention-uuid>\nwriters-ide object-create <path> <name> [description]\nwriters-ide assembly-draft-create <path> <assembly-uuid>\nwriters-ide assembly-draft-list <path>\nwriters-ide assembly-draft-set <path> <draft-uuid> <scene-uuid> <text.md>\nwriters-ide assembly-draft-commit <path> <draft-uuid>\nwriters-ide board-create <path> <title>\nwriters-ide board-add-scene <path> <board-uuid> <scene-uuid> <x> <y> [note]\nwriters-ide board-list <path> <board-uuid>\nwriters-ide board-resize <path> <item-uuid> <width> <height>\nwriters-ide board-export <path> <board-uuid> (Markdown to stdout)\nwriters-ide backup-archive <project-path> <archive.zip>\nwriters-ide restore-archive <archive.zip> <new-project-directory>"

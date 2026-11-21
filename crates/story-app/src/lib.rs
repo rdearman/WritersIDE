@@ -1896,6 +1896,33 @@ impl WriterApp {
         self.git_snapshot(&format!("Before restoring scene {title} from {commit}"))?;
         self.save_scene_text(scene, Some(&expected_hash), &historical)
     }
+    /// Restore one chapter/front/section content unit from a local Git commit
+    /// through its optimistic write journal after snapshotting current state.
+    pub fn restore_content_unit_from_git(
+        &mut self,
+        commit: &str,
+        content_unit: ContentUnitId,
+    ) -> Result<String> {
+        let relative_path = self
+            .store
+            .content_unit_content_relative_path(content_unit)?;
+        let relative_path = relative_path
+            .to_str()
+            .ok_or_else(|| AppError::Domain("content-unit path is not UTF-8".into()))?;
+        let historical = story_git::GitHistory::open(self.store.project_root())?
+            .read_file_at(commit, relative_path)?;
+        let historical = String::from_utf8(historical)
+            .map_err(|_| AppError::Domain("historical content-unit text is not UTF-8".into()))?;
+        let (current, expected_hash) = self.load_content_unit_text(content_unit)?;
+        if current == historical {
+            return Ok(expected_hash);
+        }
+        let title = self.get_content_unit(content_unit)?.title;
+        self.git_snapshot(&format!(
+            "Before restoring content unit {title} from {commit}"
+        ))?;
+        self.save_content_unit_text(content_unit, Some(&expected_hash), &historical)
+    }
     pub fn git_history(&self, limit: usize) -> Result<Vec<story_git::GitCommit>> {
         Ok(story_git::GitHistory::open(self.store.project_root())?.history(limit)?)
     }
@@ -2148,6 +2175,45 @@ mod tests {
             .contains("Current revision.")
         );
         assert!(app.restore_scene_from_git("not-a-commit", scene).is_err());
+    }
+
+    #[test]
+    fn git_restores_one_nonfiction_content_unit_through_its_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Book");
+        let mut app =
+            WriterApp::create_project_with_type(&project, "Field Guide", BookType::Nonfiction)
+                .unwrap();
+        let chapter = app.create_chapter(None, "Introduction", 0).unwrap();
+        let body = app
+            .create_content_unit(
+                ContentUnitKind::ChapterBody,
+                "Introduction prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, hash) = app.load_content_unit_text(body).unwrap();
+        app.save_content_unit_text(body, Some(&hash), "Original chapter text.")
+            .unwrap();
+        let original = app.git_snapshot("Original chapter body").unwrap().unwrap();
+        let (_, hash) = app.load_content_unit_text(body).unwrap();
+        app.save_content_unit_text(body, Some(&hash), "Current chapter revision.")
+            .unwrap();
+
+        app.restore_content_unit_from_git(&original, body).unwrap();
+        assert_eq!(
+            app.load_content_unit_text(body).unwrap().0,
+            "Original chapter text."
+        );
+        let history = app.git_history(10).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(history[0].subject.contains("Before restoring content unit"));
+        assert!(
+            app.restore_content_unit_from_git("not-a-commit", body)
+                .is_err()
+        );
     }
 
     #[test]
