@@ -1686,6 +1686,7 @@ dependencies = [
  "serde_json",
  "story-app",
  "story-core",
+ "story-ollama",
  "story-storage",
  "tempfile",
  "uuid",
