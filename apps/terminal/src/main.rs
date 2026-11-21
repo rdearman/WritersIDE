@@ -3315,9 +3315,25 @@ impl AppState {
                 );
             } else {
                 self.macro_preview = None;
+                let snapshot = if needs_preview {
+                    if self.dirty {
+                        self.save()?;
+                        if self.dirty {
+                            return Err("repeated destructive macro cancelled because the manuscript could not be saved safely".into());
+                        }
+                    }
+                    self.app
+                        .git_snapshot(&format!("Before repeated macro {name}"))?
+                } else {
+                    None
+                };
                 self.apply_edit_macro(&repeated)?;
-                self.message =
-                    format!("Applied saved macro {name} × {repetitions} (undo available)");
+                self.message = format!(
+                    "Applied saved macro {name} × {repetitions} (undo available){}",
+                    snapshot
+                        .map(|_| " · pre-change project snapshot created")
+                        .unwrap_or("")
+                );
             }
         } else if let Some(value) = cmd.strip_prefix("text-expansion-set ") {
             let (abbreviation, replacement) = value
@@ -9352,9 +9368,13 @@ mod tests {
     #[test]
     fn destructive_repeated_macros_preview_then_apply_as_one_undoable_edit() {
         let root = tempfile::tempdir().unwrap();
-        let project = WriterApp::create_project(root.path().join("Macro"), "Macro").unwrap();
+        let mut project = WriterApp::create_project(root.path().join("Macro"), "Macro").unwrap();
+        let chapter = project.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = project.create_scene(chapter, "Scene", 0).unwrap();
         let mut state = AppState::new(project, default_bindings());
+        state.open_scene(scene).unwrap();
         state.editor = vec!["word".into()];
+        state.dirty = true;
         state
             .macros
             .insert("trim".into(), vec![story_core::EditMacroOp::Backspace]);
@@ -9365,6 +9385,14 @@ mod tests {
         state.prompt = "macro-run trim 2".into();
         state.command().unwrap();
         assert_eq!(state.editor, ["wo"]);
+        assert!(
+            state
+                .app
+                .git_history(5)
+                .unwrap()
+                .iter()
+                .any(|commit| { commit.subject == "Before repeated macro trim" })
+        );
         state.undo_edit();
         assert_eq!(state.editor, ["word"]);
         assert_eq!(
