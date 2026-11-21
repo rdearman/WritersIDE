@@ -131,6 +131,7 @@ struct AppState {
     registers: BTreeMap<String, String>,
     macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
     recording_macro: Option<(String, Vec<story_core::EditMacroOp>)>,
+    text_expansion: TextExpansionConfig,
     extra_cursors: Vec<(usize, usize)>,
     active_challenge: Option<ActiveWritingChallenge>,
     menu: Option<MenuState>,
@@ -292,6 +293,29 @@ struct EditorToolsFile {
     registers: BTreeMap<String, String>,
     #[serde(default)]
     macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TextExpansionFile {
+    text_expansion: TextExpansionConfig,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct TextExpansionConfig {
+    enabled: bool,
+    triggers: Vec<String>,
+    mappings: BTreeMap<String, String>,
+}
+
+impl Default for TextExpansionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            triggers: vec!["space".into(), "enter".into()],
+            mappings: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -1363,6 +1387,9 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.macro-run", "Run Named Edit Macro", "Apply a saved macro to the selection or current line", "Edit", "macro-run", true),
         legacy_command("edit.macro-record", "Record Edit Macro", "Record editor insertions, deletions, cursor movement, and selection changes", "Edit", "macro-record", true),
         legacy_command("edit.macro-stop", "Stop Macro Recording", "Save the currently recorded edit macro", "Edit", "macro-stop", false),
+        legacy_command("edit.text-expansion-set", "Set Text Expansion", "Add a literal abbreviation and replacement to the project dictionary", "Insert", "text-expansion-set", true),
+        legacy_command("edit.text-expansion", "Text Expansion Settings", "Enable, disable, or list project text expansions", "Insert", "text-expansion", true),
+        legacy_command("edit.text-expand", "Expand Abbreviation", "Expand the abbreviation immediately before the editor cursor", "Insert", "text-expand", false),
         legacy_command("edit.cursor-add", "Add Multi-cursor", "Add an editing cursor at grapheme row and column", "Edit", "cursor-add", true),
         legacy_command("edit.cursor-clear", "Clear Multi-cursors", "Return to the primary editor cursor", "Edit", "cursor-clear", false),
         legacy_command("challenge.start", "Start Writing Challenge", "Start a timed word target; opt-in Kamikaze mode reacts to inactivity", "Tools", "challenge-start", true),
@@ -1549,6 +1576,56 @@ fn load_editor_tools(root: &Path) -> Result<EditorToolsFile, Box<dyn std::error:
     Ok(tools)
 }
 
+fn load_text_expansion(root: &Path) -> Result<TextExpansionConfig, Box<dyn std::error::Error>> {
+    let path = root.join(".writers-ide/text-expansion.toml");
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let config: TextExpansionFile = toml::from_str(&text)?;
+            if config
+                .text_expansion
+                .triggers
+                .iter()
+                .any(|trigger| !matches!(trigger.as_str(), "space" | "enter" | "tab"))
+            {
+                return Err("text expansion triggers must be space or enter".into());
+            }
+            if config
+                .text_expansion
+                .mappings
+                .iter()
+                .any(|(key, _)| key.is_empty() || key.chars().any(char::is_whitespace))
+            {
+                return Err(
+                    "text expansion abbreviations must be non-empty and contain no whitespace"
+                        .into(),
+                );
+            }
+            Ok(config.text_expansion)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(TextExpansionConfig::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_text_expansion(
+    root: &Path,
+    config: &TextExpansionConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = root.join(".writers-ide");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join("text-expansion.toml");
+    let text = toml::to_string_pretty(&TextExpansionFile {
+        text_expansion: config.clone(),
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    use std::io::Write;
+    temporary.write_all(text.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path)?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
 fn parse_macro_recipe(
     recipe: &str,
 ) -> Result<Vec<story_core::EditMacroOp>, Box<dyn std::error::Error>> {
@@ -1675,6 +1752,13 @@ impl AppState {
                 format!("Editor tools not loaded: {error}"),
             ),
         };
+        let (text_expansion, expansion_error) = match load_text_expansion(app.project_root()) {
+            Ok(config) => (config, String::new()),
+            Err(error) => (
+                TextExpansionConfig::default(),
+                format!("Text expansions not loaded: {error}"),
+            ),
+        };
         let writing_session = app
             .list_writing_sessions()
             .ok()
@@ -1700,7 +1784,13 @@ impl AppState {
             dirty: false,
             mode: None,
             prompt: String::new(),
-            message: draft_notice.unwrap_or(tools_error),
+            message: draft_notice.unwrap_or({
+                if tools_error.is_empty() {
+                    expansion_error
+                } else {
+                    tools_error
+                }
+            }),
             history: vec![Workspace::Dashboard],
             history_index: 0,
             width: 80,
@@ -1740,6 +1830,7 @@ impl AppState {
             registers: tools.registers,
             macros: tools.macros,
             recording_macro: None,
+            text_expansion,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -3053,6 +3144,63 @@ impl AppState {
                 .clone();
             self.apply_edit_macro(&operations)?;
             self.message = format!("Applied saved macro {} (undo available)", name.trim());
+        } else if let Some(value) = cmd.strip_prefix("text-expansion-set ") {
+            let (abbreviation, replacement) = value
+                .split_once("=>")
+                .ok_or("use text-expansion-set ABBREVIATION => REPLACEMENT")?;
+            let abbreviation = abbreviation.trim();
+            if abbreviation.is_empty() || abbreviation.chars().any(char::is_whitespace) {
+                return Err("abbreviation must be non-empty and contain no whitespace".into());
+            }
+            self.text_expansion
+                .mappings
+                .insert(abbreviation.to_owned(), replacement.trim().to_owned());
+            save_text_expansion(self.app.project_root(), &self.text_expansion)?;
+            self.message = format!("Saved text expansion {abbreviation}");
+        } else if let Some(abbreviation) = cmd.strip_prefix("text-expansion-remove ") {
+            if self
+                .text_expansion
+                .mappings
+                .remove(abbreviation.trim())
+                .is_none()
+            {
+                return Err("unknown text expansion".into());
+            }
+            save_text_expansion(self.app.project_root(), &self.text_expansion)?;
+            self.message = format!("Removed text expansion {}", abbreviation.trim());
+        } else if let Some(value) = cmd.strip_prefix("text-expansion ") {
+            match value.trim() {
+                "on" | "off" => {
+                    self.text_expansion.enabled = value.trim() == "on";
+                    save_text_expansion(self.app.project_root(), &self.text_expansion)?;
+                    self.message = format!(
+                        "Text expansion {}",
+                        if self.text_expansion.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                }
+                "list" => {
+                    self.message = self
+                        .text_expansion
+                        .mappings
+                        .iter()
+                        .map(|(abbreviation, replacement)| {
+                            format!("{abbreviation} → {replacement}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                }
+                _ => return Err("use text-expansion on|off|list".into()),
+            }
+        } else if cmd == "text-expand" {
+            if self.expand_text_before_cursor("", true) {
+                self.message = "Expanded abbreviation (undo available)".into();
+            } else {
+                self.message = "No matching abbreviation before the cursor".into();
+            }
         } else if let Some(rest) = cmd.strip_prefix("macro ") {
             let operations = parse_macro_recipe(rest)?;
             self.apply_edit_macro(&operations)?;
@@ -4931,7 +5079,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -5020,7 +5168,7 @@ impl AppState {
         self.push_undo();
         let (updated, selection) =
             story_core::run_edit_macro(&self.editor.join("\n"), selection, operations)?;
-        self.editor = updated.lines().map(str::to_owned).collect();
+        self.editor = updated.split('\n').map(str::to_owned).collect();
         if self.editor.is_empty() {
             self.editor.push(String::new());
         }
@@ -5062,6 +5210,9 @@ impl AppState {
             self.typed_characters = self.typed_characters.saturating_add(1);
         }
         self.insert_text_char(ch);
+        if matches!(ch, ' ' | '\t') {
+            self.expand_text_before_cursor(&ch.to_string(), false);
+        }
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
         }
@@ -5152,6 +5303,63 @@ impl AppState {
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
         }
+    }
+    fn expand_text_before_cursor(&mut self, delimiter: &str, record_undo: bool) -> bool {
+        if !self.text_expansion.enabled || !self.extra_cursors.is_empty() {
+            return false;
+        }
+        let original = self.editor.join("\n");
+        let cursor = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+        let before_cursor = &original[..cursor];
+        let trigger_bytes = delimiter.len();
+        if trigger_bytes > before_cursor.len()
+            || !before_cursor.ends_with(delimiter)
+            || (!delimiter.is_empty()
+                && !self.text_expansion.triggers.iter().any(|trigger| {
+                    (trigger == "space" && delimiter == " ")
+                        || (trigger == "enter" && delimiter == "\n")
+                        || (trigger == "tab" && delimiter == "\t")
+                }))
+        {
+            return false;
+        }
+        let token_end = cursor - trigger_bytes;
+        let candidates = self
+            .text_expansion
+            .mappings
+            .iter()
+            .filter(|(abbreviation, _)| original[..token_end].ends_with(abbreviation.as_str()))
+            .collect::<Vec<_>>();
+        let Some((abbreviation, replacement)) = candidates
+            .into_iter()
+            .max_by_key(|(abbreviation, _)| abbreviation.len())
+            .map(|(abbreviation, replacement)| (abbreviation.clone(), replacement.clone()))
+        else {
+            return false;
+        };
+        let start = token_end - abbreviation.len();
+        if start > 0 {
+            let previous = original[..start].chars().next_back();
+            if previous.is_some_and(|ch| ch.is_alphanumeric() || ch == '_') {
+                return false;
+            }
+        }
+        if record_undo {
+            self.push_undo();
+        }
+        let mut updated = original;
+        updated.replace_range(start..token_end, &replacement);
+        self.editor = updated.split('\n').map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        if let Some((row, column)) =
+            editor_position_from_byte(&updated, cursor - abbreviation.len() + replacement.len())
+        {
+            self.cursor = (row, column);
+        }
+        self.dirty = true;
+        true
     }
     fn insert_text_at_cursor(&mut self, insertion: &str) -> Result<(), Box<dyn std::error::Error>> {
         let original = self.editor.join("\n");
@@ -5281,7 +5489,7 @@ impl AppState {
         }
         for ch in normalized.chars() {
             if ch == '\n' {
-                self.enter()
+                self.split_line()
             } else {
                 self.insert_text_char(ch)
             }
@@ -5292,6 +5500,13 @@ impl AppState {
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
         }
+        self.split_line();
+        self.expand_text_before_cursor("\n", false);
+        if let Some(challenge) = &mut self.active_challenge {
+            challenge.last_activity = Instant::now();
+        }
+    }
+    fn split_line(&mut self) {
         self.delete_selection();
         let (row, col) = self.cursor;
         let line = &mut self.editor[row];
@@ -5300,9 +5515,6 @@ impl AppState {
         self.editor.insert(row + 1, tail);
         self.cursor = (row + 1, 0);
         self.dirty = true;
-        if let Some(challenge) = &mut self.active_challenge {
-            challenge.last_activity = Instant::now();
-        }
     }
     fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
         let anchor = self.editor_selection?;
@@ -8092,7 +8304,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         let mutating = matches!(
             k.code,
-            KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete
+            KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete | KeyCode::Tab
         ) || (matches!(k.code, KeyCode::Char(_))
             && (!k.modifiers.contains(KeyModifiers::CONTROL)
                 && !k.modifiers.contains(KeyModifiers::ALT)
@@ -8127,6 +8339,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         let selecting = k.modifiers.contains(KeyModifiers::SHIFT);
         match k.code {
+            KeyCode::Tab => s.insert('\t'),
             KeyCode::Enter => s.enter(),
             KeyCode::Backspace => s.backspace(),
             KeyCode::Delete => s.delete_forward(),
@@ -8835,6 +9048,64 @@ mod tests {
     }
 
     #[test]
+    fn text_expansion_is_configurable_undoable_contextual_and_not_applied_to_paste() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Text Expansion"), "Text Expansion")
+            .unwrap();
+        let mut config = TextExpansionConfig::default();
+        config.triggers.push("tab".into());
+        config
+            .mappings
+            .insert("%DWAP%".into(), "Department of Work and Pensions".into());
+        config.mappings.insert("%D%".into(), "short".into());
+        save_text_expansion(app.project_root(), &config).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+
+        state.editor = vec!["%DWAP%".into()];
+        state.cursor = (0, 6);
+        state.push_undo();
+        state.insert(' ');
+        assert_eq!(state.editor, ["Department of Work and Pensions "]);
+        state.undo_edit();
+        assert_eq!(state.editor, ["%DWAP%"]);
+
+        state.editor = vec!["word%D%".into()];
+        state.cursor = (0, 7);
+        state.push_undo();
+        state.insert(' ');
+        assert_eq!(state.editor, ["word%D% "]);
+
+        state.editor = vec!["%D%".into()];
+        state.cursor = (0, 3);
+        state.paste_text(" ");
+        assert_eq!(state.editor, ["%D% "]);
+
+        state.editor = vec!["%D%".into()];
+        state.cursor = (0, 3);
+        state.push_undo();
+        state.insert('\t');
+        assert_eq!(state.editor, ["short\t"]);
+
+        state.editor = vec!["%D%".into()];
+        state.cursor = (0, 3);
+        assert!(state.expand_text_before_cursor("", true));
+        assert_eq!(state.editor, ["short"]);
+
+        state.editor = vec!["%DWAP%".into()];
+        state.cursor = (0, 6);
+        state.enter();
+        assert_eq!(state.editor, ["Department of Work and Pensions", ""]);
+        let reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        assert_eq!(
+            reopened.text_expansion.mappings["%DWAP%"],
+            "Department of Work and Pensions"
+        );
+    }
+
+    #[test]
     fn recorded_shift_selection_replays_as_a_text_replacement() {
         let root = tempfile::tempdir().unwrap();
         let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
@@ -9366,6 +9637,7 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            text_expansion: TextExpansionConfig::default(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -9457,7 +9729,10 @@ mod tests {
                 "structure.section",
                 "structure.chapter",
                 "edit.snippet-save",
-                "edit.snippet-insert"
+                "edit.snippet-insert",
+                "edit.text-expansion-set",
+                "edit.text-expansion",
+                "edit.text-expand"
             ]
         );
         handle(
@@ -9827,6 +10102,7 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            text_expansion: TextExpansionConfig::default(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -9912,6 +10188,7 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            text_expansion: TextExpansionConfig::default(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -9989,6 +10266,7 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            text_expansion: TextExpansionConfig::default(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10078,6 +10356,7 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            text_expansion: TextExpansionConfig::default(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10317,6 +10596,7 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            text_expansion: TextExpansionConfig::default(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10406,6 +10686,7 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            text_expansion: TextExpansionConfig::default(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10512,6 +10793,7 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            text_expansion: TextExpansionConfig::default(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10736,6 +11018,7 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            text_expansion: TextExpansionConfig::default(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11087,6 +11370,7 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            text_expansion: TextExpansionConfig::default(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11187,6 +11471,7 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            text_expansion: TextExpansionConfig::default(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11339,6 +11624,7 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            text_expansion: TextExpansionConfig::default(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
