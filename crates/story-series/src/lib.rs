@@ -49,6 +49,7 @@ pub struct BookMembership {
     pub format_version: u32,
     pub series_id: SeriesId,
     pub book_id: BookId,
+    pub series_root_relative_path: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -309,6 +310,52 @@ impl SeriesStore {
         Ok(repaired)
     }
 
+    pub fn open_for_book(book_root: impl AsRef<Path>) -> Result<(Self, SeriesBook)> {
+        let book_root = book_root.as_ref();
+        let membership_path = book_root.join(".writers-ide/series-membership.toml");
+        let membership: BookMembership = toml::from_str(&fs::read_to_string(&membership_path)?)
+            .map_err(|error| SeriesError::Config(error.to_string()))?;
+        if membership.format_version != 1 {
+            return Err(SeriesError::UnsupportedSchema(i64::from(
+                membership.format_version,
+            )));
+        }
+        let relative_root = Path::new(&membership.series_root_relative_path);
+        if relative_root.is_absolute()
+            || relative_root
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_) | Component::ParentDir))
+        {
+            return Err(SeriesError::InvalidBookPath(
+                membership.series_root_relative_path,
+            ));
+        }
+        let series_root = book_root.join(relative_root);
+        let series = Self::open(&series_root)?;
+        if series.id() != membership.series_id {
+            return Err(SeriesError::IdentityMismatch {
+                manifest: membership.series_id,
+                database: series.id(),
+            });
+        }
+        let project = story_storage::ProjectStore::open(book_root)
+            .map_err(|error| SeriesError::Config(format!("invalid book project: {error}")))?;
+        let project_id = project
+            .get_project()
+            .map_err(|error| SeriesError::Config(format!("cannot read book project: {error}")))?
+            .id;
+        drop(project);
+        let book = series
+            .list_books()?
+            .into_iter()
+            .find(|book| book.id == membership.book_id && book.project_id == project_id)
+            .ok_or(SeriesError::MembershipConflict)?;
+        if series.relative_book_path(book_root)? != book.relative_path {
+            return Err(SeriesError::MembershipConflict);
+        }
+        Ok((series, book))
+    }
+
     fn relative_book_path(&self, book_path: &Path) -> Result<String> {
         let root = self.root.canonicalize()?;
         let book = book_path.canonicalize()?;
@@ -343,6 +390,11 @@ impl SeriesStore {
             format_version: 1,
             series_id: self.manifest.id,
             book_id: book.id,
+            series_root_relative_path: Path::new(&book.relative_path)
+                .components()
+                .map(|_| "..")
+                .collect::<Vec<_>>()
+                .join("/"),
         };
         if path.exists() {
             let current: BookMembership = toml::from_str(&fs::read_to_string(&path)?)
@@ -421,6 +473,10 @@ mod tests {
         .unwrap();
         assert_eq!(membership.series_id, series_id);
         assert_eq!(membership.book_id, book.id);
+        assert_eq!(membership.series_root_relative_path, "..");
+        let (by_book, current_book) = SeriesStore::open_for_book(&path).unwrap();
+        assert_eq!(by_book.id(), series_id);
+        assert_eq!(current_book.id, book.id);
         assert_eq!(
             series.book_for_project(project_id).unwrap(),
             Some(book.clone())
@@ -438,6 +494,7 @@ mod tests {
                 .join("Book 1/.writers-ide/series-membership.toml")
                 .is_file()
         );
+        assert!(SeriesStore::open_for_book(relocated.join("Book 1")).is_ok());
     }
 
     #[test]
