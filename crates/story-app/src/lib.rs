@@ -775,11 +775,43 @@ impl WriterApp {
     pub fn add_story_event(&mut self, event: &StoryEvent) -> Result<()> {
         Ok(self.store.add_story_event(event)?)
     }
+    pub fn update_story_event(&mut self, event: &StoryEvent) -> Result<()> {
+        Ok(self.store.update_story_event(event)?)
+    }
     pub fn link_event(&mut self, scene: SceneId, event: EventId, kind: &str) -> Result<()> {
         Ok(self.store.link_event(scene, event, kind)?)
     }
     pub fn scene_event_links(&self, scene: SceneId) -> Result<Vec<(EventId, String)>> {
         Ok(self.store.scene_event_links(scene)?)
+    }
+    pub fn add_event_dependency(&mut self, dependency: &StoryEventDependency) -> Result<()> {
+        Ok(self.store.add_event_dependency(dependency)?)
+    }
+    pub fn inspect_event_dependencies(
+        &self,
+    ) -> Result<Vec<(StoryEventDependency, story_analysis::InspectionResult)>> {
+        let events = self.store.list_events()?;
+        self.store
+            .list_event_dependencies()
+            .map(|dependencies| {
+                dependencies
+                    .into_iter()
+                    .map(|dependency| {
+                        let earlier = events
+                            .iter()
+                            .find(|event| event.id == dependency.predecessor);
+                        let later = events.iter().find(|event| event.id == dependency.successor);
+                        let comparison = earlier.zip(later).map(|(a, b)| a.end.compare(b.start));
+                        let result = story_analysis::evaluate_event_precedence(
+                            &dependency.predecessor.to_string(),
+                            &dependency.successor.to_string(),
+                            comparison,
+                        );
+                        (dependency, result)
+                    })
+                    .collect()
+            })
+            .map_err(Into::into)
     }
     pub fn create_passage_anchor(
         &mut self,
@@ -1713,6 +1745,48 @@ fn _storage_result(_: StorageResult<()>) {}
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn event_dependency_review_uses_uncertain_story_intervals() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Events"), "Events").unwrap();
+        let first = EventId::new();
+        let second = EventId::new();
+        app.add_story_event(&StoryEvent {
+            id: first,
+            title: "Message sent".into(),
+            description: String::new(),
+            start: StoryTime::exact(10),
+            end: StoryTime::exact(12),
+            source_time_text: "day 1".into(),
+        })
+        .unwrap();
+        let mut second_event = StoryEvent {
+            id: second,
+            title: "Reply received".into(),
+            description: String::new(),
+            start: StoryTime::new(Some(20), Some(15), Some(25), TimePrecision::Bounded).unwrap(),
+            end: StoryTime::unknown(),
+            source_time_text: "sometime later".into(),
+        };
+        app.add_story_event(&second_event).unwrap();
+        app.add_event_dependency(&StoryEventDependency {
+            predecessor: first,
+            successor: second,
+            kind: "precedes".into(),
+            notes: "Communication order".into(),
+        })
+        .unwrap();
+        let findings = app.inspect_event_dependencies().unwrap();
+        assert_eq!(findings[0].1.status, story_analysis::InspectionStatus::Pass);
+        second_event.start =
+            StoryTime::new(Some(12), Some(11), Some(13), TimePrecision::Bounded).unwrap();
+        app.update_story_event(&second_event).unwrap();
+        assert_eq!(
+            app.inspect_event_dependencies().unwrap()[0].1.status,
+            story_analysis::InspectionStatus::Unknown
+        );
+    }
     #[test]
     fn application_vertical_slice_survives_reopen_and_relocation() {
         let d = tempfile::tempdir().unwrap();

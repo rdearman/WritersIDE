@@ -221,3 +221,5 @@ Saved query expressions support confirmed character presence separately from men
 Character absence is now an explicit scene relationship with notes. Unrecorded participation remains unknown, while an explicit absence query matches only author-entered records. Storage triggers reject simultaneous confirmed participation and explicit absence; mention-only relationships may coexist with absence. Character coverage excludes mention-only records.
 
 Saved queries now include typed scalar custom-metadata equality predicates keyed by field UUID, with validation against the declared field type and enum options. The CLI and terminal accept `meta=FIELD-UUID:VALUE` filters; prefixes distinguish non-text types. Entity-reference-list membership queries are not yet supported.
+
+Events can now have explicit `precedes` and `requires` dependency edges with notes. SQLite rejects self-links and dependency cycles, including direct SQL attempts. Inspection compares the recorded end and start story-time intervals and keeps ambiguous/missing dates UNKNOWN; manuscript disclosure order does not substitute for fictional chronology.

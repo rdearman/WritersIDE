@@ -38,6 +38,7 @@ const MIGRATION_23: &str = include_str!("../migrations/0023_query_expressions.sq
 const MIGRATION_24: &str = include_str!("../migrations/0024_writing_goal_ledger.sql");
 const MIGRATION_25: &str = include_str!("../migrations/0025_inspection_query_filters.sql");
 const MIGRATION_26: &str = include_str!("../migrations/0026_explicit_scene_absence.sql");
+const MIGRATION_27: &str = include_str!("../migrations/0027_event_dependencies.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -798,7 +799,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_19}\nINSERT INTO schema_migrations(version,applied_at) VALUES(19,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_20}\nINSERT INTO schema_migrations(version,applied_at) VALUES(20,'{}');\nCOMMIT;", now()))?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\n{MIGRATION_25}\nINSERT INTO schema_migrations(version,applied_at) VALUES(25,'{}');\n{MIGRATION_26}\nINSERT INTO schema_migrations(version,applied_at) VALUES(26,'{}');\nCOMMIT;", now(), now(), now(), now(), now(), now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\n{MIGRATION_25}\nINSERT INTO schema_migrations(version,applied_at) VALUES(25,'{}');\n{MIGRATION_26}\nINSERT INTO schema_migrations(version,applied_at) VALUES(26,'{}');\n{MIGRATION_27}\nINSERT INTO schema_migrations(version,applied_at) VALUES(27,'{}');\nCOMMIT;", now(), now(), now(), now(), now(), now(), now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
@@ -841,7 +842,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 26 {
+        if version > 27 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -946,6 +947,10 @@ impl ProjectStore {
         }
         if current_version == 25 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_26}\nINSERT INTO schema_migrations(version,applied_at) VALUES(26,'{}');\nCOMMIT;", now()))?;
+            current_version = 26;
+        }
+        if current_version == 26 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_27}\nINSERT INTO schema_migrations(version,applied_at) VALUES(27,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -4586,6 +4591,15 @@ impl ProjectStore {
         self.conn.execute("INSERT INTO story_event(id,title,description,time_nominal,time_lower,time_upper,time_precision,end_nominal,end_lower,end_upper,end_precision,source_time_text) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",params![event.id.to_string(),event.title,event.description,event.start.nominal,event.start.lower,event.start.upper,precision(event.start.precision),event.end.nominal,event.end.lower,event.end.upper,precision(event.end.precision),event.source_time_text])?;
         Ok(())
     }
+    pub fn update_story_event(&mut self, event: &StoryEvent) -> Result<()> {
+        validate_time(event.start)?;
+        validate_time(event.end)?;
+        let changed = self.conn.execute("UPDATE story_event SET title=?2,description=?3,time_nominal=?4,time_lower=?5,time_upper=?6,time_precision=?7,end_nominal=?8,end_lower=?9,end_upper=?10,end_precision=?11,source_time_text=?12 WHERE id=?1", params![event.id.to_string(),event.title,event.description,event.start.nominal,event.start.lower,event.start.upper,precision(event.start.precision),event.end.nominal,event.end.lower,event.end.upper,precision(event.end.precision),event.source_time_text])?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(event.id.to_string()));
+        }
+        Ok(())
+    }
     pub fn list_events(&self) -> Result<Vec<EventSummary>> {
         let mut q=self.conn.prepare("SELECT id,title,time_nominal,time_lower,time_upper,time_precision,end_nominal,end_lower,end_upper,end_precision,source_time_text FROM story_event ORDER BY time_nominal IS NULL,time_nominal,id")?;
         let rows = q.query_map([], |r| {
@@ -4694,6 +4708,48 @@ impl ProjectStore {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StorageError::from)
+    }
+    pub fn add_event_dependency(&mut self, dependency: &StoryEventDependency) -> Result<()> {
+        if !matches!(dependency.kind.as_str(), "precedes" | "requires") {
+            return Err(StorageError::Invalid(
+                "event dependency kind must be precedes or requires".into(),
+            ));
+        }
+        self.conn.execute(
+            "INSERT INTO story_event_dependency(predecessor_event_id,successor_event_id,dependency_kind,notes) VALUES(?1,?2,?3,?4)",
+            params![dependency.predecessor.to_string(), dependency.successor.to_string(), dependency.kind, dependency.notes],
+        )?;
+        Ok(())
+    }
+    pub fn list_event_dependencies(&self) -> Result<Vec<StoryEventDependency>> {
+        let mut query = self.conn.prepare("SELECT predecessor_event_id,successor_event_id,dependency_kind,notes FROM story_event_dependency ORDER BY predecessor_event_id,successor_event_id,dependency_kind")?;
+        query
+            .query_map([], |row| {
+                let predecessor: String = row.get(0)?;
+                let successor: String = row.get(1)?;
+                Ok((
+                    predecessor,
+                    successor,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })?
+            .map(|row| {
+                let (predecessor, successor, kind, notes) = row?;
+                Ok(StoryEventDependency {
+                    predecessor: EventId(
+                        Uuid::parse_str(&predecessor)
+                            .map_err(|error| StorageError::Invalid(error.to_string()))?,
+                    ),
+                    successor: EventId(
+                        Uuid::parse_str(&successor)
+                            .map_err(|error| StorageError::Invalid(error.to_string()))?,
+                    ),
+                    kind,
+                    notes,
+                })
+            })
+            .collect()
     }
     pub fn create_anchor(
         &mut self,
@@ -9340,6 +9396,56 @@ mod tests {
     }
 
     #[test]
+    fn event_prerequisites_are_persistent_and_sql_prevents_cycles() {
+        let directory = tempdir().unwrap();
+        let mut store = ProjectStore::create(directory.path().join("Events"), "Events").unwrap();
+        let first = EventId::new();
+        let second = EventId::new();
+        let third = EventId::new();
+        store.add_event(first, "The message", "day 1").unwrap();
+        store.add_event(second, "The response", "day 2").unwrap();
+        store.add_event(third, "The consequence", "day 3").unwrap();
+        let dependency = StoryEventDependency {
+            predecessor: first,
+            successor: second,
+            kind: "precedes".into(),
+            notes: "The response follows delivery".into(),
+        };
+        store.add_event_dependency(&dependency).unwrap();
+        store
+            .add_event_dependency(&StoryEventDependency {
+                predecessor: second,
+                successor: third,
+                kind: "requires".into(),
+                notes: String::new(),
+            })
+            .unwrap();
+        assert_eq!(store.list_event_dependencies().unwrap().len(), 2);
+        assert!(
+            store
+                .add_event_dependency(&StoryEventDependency {
+                    predecessor: third,
+                    successor: first,
+                    kind: "precedes".into(),
+                    notes: String::new()
+                })
+                .is_err()
+        );
+        assert!(store.conn.execute("INSERT INTO story_event_dependency(predecessor_event_id,successor_event_id,dependency_kind) VALUES(?1,?2,'precedes')", params![third.to_string(), first.to_string()]).is_err());
+        drop(store);
+        let reopened = ProjectStore::open(directory.path().join("Events")).unwrap();
+        let reopened_dependencies = reopened.list_event_dependencies().unwrap();
+        assert_eq!(reopened_dependencies.len(), 2);
+        assert!(reopened_dependencies.contains(&dependency));
+        assert!(reopened_dependencies.contains(&StoryEventDependency {
+            predecessor: second,
+            successor: third,
+            kind: "requires".into(),
+            notes: String::new(),
+        }));
+    }
+
+    #[test]
     fn nested_saved_query_expressions_are_validated_persistent_and_dynamic() {
         let directory = tempdir().unwrap();
         let mut store = ProjectStore::create(directory.path().join("Novel"), "Novel").unwrap();
@@ -9415,7 +9521,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 26))
+            .map(|version| assert_eq!(version, 27))
             .unwrap();
     }
 
@@ -9667,7 +9773,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
+        conn.execute_batch("DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
         conn.execute_batch("DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
@@ -9679,7 +9785,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 26);
+        assert_eq!(version, 27);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -9708,7 +9814,7 @@ mod tests {
 
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch(
-            "DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
+            "DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
              DROP TRIGGER story_link_source_exists_insert;
              DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update;
              DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update;

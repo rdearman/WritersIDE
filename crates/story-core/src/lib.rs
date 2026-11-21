@@ -1172,6 +1172,13 @@ pub struct StoryEvent {
     pub end: StoryTime,
     pub source_time_text: String,
 }
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoryEventDependency {
+    pub predecessor: EventId,
+    pub successor: EventId,
+    pub kind: String,
+    pub notes: String,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum WordAttributionPolicy {
     Overlap,
