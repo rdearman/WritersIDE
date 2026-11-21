@@ -2428,6 +2428,9 @@ impl ProjectStore {
         )?;
         Ok(PathBuf::from(p))
     }
+    pub fn scene_content_relative_path(&self, id: SceneId) -> Result<PathBuf> {
+        self.content_path(id)
+    }
     fn safe_path(&self, rel: &Path) -> Result<PathBuf> {
         let root = fs::canonicalize(&self.root)?;
         let mut path = root.clone();

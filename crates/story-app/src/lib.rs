@@ -1789,6 +1789,25 @@ impl WriterApp {
                 .map_err(|e| e.to_string())
         })?)
     }
+    /// Restore one scene's prose from a local Git commit through the normal
+    /// optimistic write journal. Current project state is snapshotted first.
+    pub fn restore_scene_from_git(&mut self, commit: &str, scene: SceneId) -> Result<String> {
+        let relative_path = self.store.scene_content_relative_path(scene)?;
+        let relative_path = relative_path
+            .to_str()
+            .ok_or_else(|| AppError::Domain("scene manuscript path is not UTF-8".into()))?;
+        let historical = story_git::GitHistory::open(self.store.project_root())?
+            .read_file_at(commit, relative_path)?;
+        let historical = String::from_utf8(historical)
+            .map_err(|_| AppError::Domain("historical scene text is not UTF-8".into()))?;
+        let (current, expected_hash) = self.load_scene_text(scene)?;
+        if current == historical {
+            return Ok(expected_hash);
+        }
+        let title = self.get_scene(scene)?.scene.title;
+        self.git_snapshot(&format!("Before restoring scene {title} from {commit}"))?;
+        self.save_scene_text(scene, Some(&expected_hash), &historical)
+    }
     pub fn git_history(&self, limit: usize) -> Result<Vec<story_git::GitCommit>> {
         Ok(story_git::GitHistory::open(self.store.project_root())?.history(limit)?)
     }
@@ -1986,6 +2005,42 @@ mod tests {
         );
         assert!(project.join("snapshots/database.sql").exists());
         assert!(app.git_diff(&first, &second, Some("story.db")).is_err());
+    }
+
+    #[test]
+    fn git_restores_one_scene_through_journal_and_snapshots_current_prose() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Original version.")
+            .unwrap();
+        let original = app.git_snapshot("Original prose").unwrap().unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Current revision.")
+            .unwrap();
+
+        app.restore_scene_from_git(&original, scene).unwrap();
+        assert_eq!(app.load_scene_text(scene).unwrap().0, "Original version.");
+        let history = app.git_history(10).unwrap();
+        assert_eq!(history.len(), 2);
+        assert!(
+            history[0]
+                .subject
+                .contains("Before restoring scene Opening")
+        );
+        assert!(
+            app.git_diff(
+                &history[1].id,
+                &history[0].id,
+                Some(&format!("manuscript/{scene}.md"))
+            )
+            .unwrap()
+            .contains("Current revision.")
+        );
+        assert!(app.restore_scene_from_git("not-a-commit", scene).is_err());
     }
 
     #[test]

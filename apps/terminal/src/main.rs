@@ -1089,6 +1089,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "git.restore-scene",
+            "Restore Scene from Snapshot",
+            "Restore one scene's historical prose through the journal after snapshotting current state",
+            "File",
+            "git-restore-scene",
+            true,
+        ),
+        legacy_command(
             "extract.propose",
             "Extract Story Candidates",
             "Create provisional Ollama candidates",
@@ -4993,6 +5001,30 @@ impl AppState {
             self.message = format!(
                 "Restored {commit} to {destination} ({} project files); current project unchanged",
                 files.len()
+            );
+        } else if let Some(args) = cmd.strip_prefix("git-restore-scene ") {
+            let mut parts = args.split_whitespace();
+            let commit = parts
+                .next()
+                .ok_or("use git-restore-scene COMMIT SCENE-UUID")?;
+            let scene = story_core::SceneId(
+                parts
+                    .next()
+                    .ok_or("use git-restore-scene COMMIT SCENE-UUID")?
+                    .parse()?,
+            );
+            self.save()?;
+            self.app.restore_scene_from_git(commit, scene)?;
+            if self.editing_scene == Some(scene) {
+                let (text, hash) = self.app.load_scene_text(scene)?;
+                self.editor = text.split('\n').map(str::to_owned).collect();
+                self.saved_hash = hash;
+                self.cursor.0 = self.cursor.0.min(self.editor.len().saturating_sub(1));
+                self.cursor.1 = 0;
+            }
+            self.refresh()?;
+            self.message = format!(
+                "Scene prose restored from {commit}; the prior project state was snapshotted"
             );
         } else if let Some(label) = cmd.strip_prefix("snapshot ") {
             let scene = self
@@ -10796,6 +10828,40 @@ mod tests {
             ))
             .unwrap();
         assert!(state.app.list_event_dependencies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn terminal_restores_one_scene_from_project_history_safely() {
+        let root = tempfile::tempdir().unwrap();
+        let mut project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let chapter = project.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = project.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = project.load_scene_text(scene).unwrap();
+        project
+            .save_scene_text(scene, Some(&hash), "First draft.")
+            .unwrap();
+        let commit = project.git_snapshot("First draft").unwrap().unwrap();
+        let (_, hash) = project.load_scene_text(scene).unwrap();
+        project
+            .save_scene_text(scene, Some(&hash), "Revised draft.")
+            .unwrap();
+        let mut state = AppState::new(project, default_bindings());
+
+        state
+            .execute_legacy_palette_command(&format!("git-restore-scene {commit} {scene}"))
+            .unwrap();
+
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, "First draft.");
+        assert!(
+            state
+                .message
+                .contains("prior project state was snapshotted")
+        );
+        assert!(
+            state.app.git_history(10).unwrap()[0]
+                .subject
+                .contains("Before restoring scene Opening")
+        );
     }
 
     #[test]
