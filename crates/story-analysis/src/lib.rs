@@ -1,6 +1,78 @@
 //! Read-only analytical projections over the canonical story model.
 use std::collections::{BTreeMap, BTreeSet};
 use story_core::{ParticipationRole, TimeOrdering};
+use unicode_segmentation::UnicodeSegmentation;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProofreadingFinding {
+    pub byte_range: std::ops::Range<usize>,
+    pub category: &'static str,
+    pub message: String,
+}
+
+#[cfg(test)]
+mod proofread_tests {
+    use super::proofread;
+
+    #[test]
+    fn mechanical_findings_are_unicode_byte_mapped_and_non_mutating() {
+        let text = "Élodie said said  hello !";
+        let findings = proofread(text);
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.category)
+                .collect::<Vec<_>>(),
+            ["repeated-word", "double-space", "space-before-punctuation"]
+        );
+        for finding in findings {
+            assert!(text.get(finding.byte_range).is_some());
+        }
+        assert_eq!(text, "Élodie said said  hello !");
+    }
+}
+
+/// Deterministic mechanical checks. These are suggestions and never edit manuscript text.
+pub fn proofread(text: &str) -> Vec<ProofreadingFinding> {
+    let mut findings = Vec::new();
+    let words = text.unicode_word_indices().collect::<Vec<_>>();
+    for pair in words.windows(2) {
+        let (a_start, a) = pair[0];
+        let (b_start, b) = pair[1];
+        let between = &text[a_start + a.len()..b_start];
+        if !between.is_empty()
+            && between.chars().all(char::is_whitespace)
+            && a.eq_ignore_ascii_case(b)
+        {
+            findings.push(ProofreadingFinding {
+                byte_range: b_start..b_start + b.len(),
+                category: "repeated-word",
+                message: format!("Repeated word: {b}"),
+            });
+        }
+    }
+    for (offset, _) in text.match_indices("  ") {
+        findings.push(ProofreadingFinding {
+            byte_range: offset..offset + 2,
+            category: "double-space",
+            message: "Repeated spaces".into(),
+        });
+    }
+    let chars = text.char_indices().collect::<Vec<_>>();
+    for pair in chars.windows(2) {
+        let (offset, ch) = pair[0];
+        let (next_offset, next) = pair[1];
+        if ch == ' ' && matches!(next, ',' | '.' | ';' | ':' | '!' | '?') {
+            findings.push(ProofreadingFinding {
+                byte_range: offset..next_offset + next.len_utf8(),
+                category: "space-before-punctuation",
+                message: format!("Remove space before {next}"),
+            });
+        }
+    }
+    findings.sort_by_key(|finding| (finding.byte_range.start, finding.category));
+    findings
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CharacterOnScene {

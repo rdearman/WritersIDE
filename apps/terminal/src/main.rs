@@ -1,9 +1,9 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs, io,
     path::Path,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossterm::{
@@ -21,6 +21,7 @@ use ratatui::{
 };
 use story_app::WriterApp;
 use story_core::{SceneId, SceneStatus};
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Workspace {
@@ -38,9 +39,10 @@ enum Workspace {
     Search,
     Reading,
     Revisions,
+    PlanningBoards,
 }
 impl Workspace {
-    const ALL: [Self; 14] = [
+    const ALL: [Self; 15] = [
         Self::Dashboard,
         Self::Outline,
         Self::Cards,
@@ -55,6 +57,7 @@ impl Workspace {
         Self::Search,
         Self::Reading,
         Self::Revisions,
+        Self::PlanningBoards,
     ];
     fn title(self) -> &'static str {
         match self {
@@ -72,6 +75,7 @@ impl Workspace {
             Self::Search => "Search",
             Self::Reading => "Reading",
             Self::Revisions => "Revisions",
+            Self::PlanningBoards => "Planning Boards",
         }
     }
 }
@@ -91,6 +95,15 @@ struct AppState {
     history: Vec<Workspace>,
     history_index: usize,
     width: usize,
+    editor_focus_mode: bool,
+    horizontal_split_ratio: u16,
+    vertical_split_ratio: u16,
+    assembly_draft: Option<story_core::AssemblyDraftId>,
+    planning_board_id: Option<story_core::PlanningBoardId>,
+    writing_stats_enabled: bool,
+    typed_characters: u64,
+    pasted_characters: u64,
+    successful_saves: u64,
     scroll: usize,
     reading_document: Option<story_core::ReadingId>,
     reading_text: String,
@@ -103,13 +116,35 @@ struct AppState {
     revision_index: usize,
     revision_hunk: usize,
     search_hits: Vec<story_storage::ProjectSearchHit>,
+    search_locations: Vec<(SceneId, usize, usize)>,
+    search_location_index: usize,
     query_view: Option<story_core::QueryId>,
     proposal_review_active: bool,
     proposal_review_rows: Vec<String>,
     proposal_review_index: usize,
     editor_selection: Option<(usize, usize)>,
+    undo_stack: Vec<EditorSnapshot>,
+    redo_stack: Vec<EditorSnapshot>,
     clipboard: String,
     menu: Option<MenuState>,
+    reference_panes: Vec<ReferencePane>,
+    active_reference: usize,
+    reference_focused: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ReferencePane {
+    scene_id: SceneId,
+    title: String,
+    content: String,
+    scroll: usize,
+}
+
+#[derive(Clone, Debug)]
+struct EditorSnapshot {
+    lines: Vec<String>,
+    cursor: (usize, usize),
+    selection: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,6 +156,48 @@ struct MenuState {
 const MENU_CATEGORIES: [&str; 9] = [
     "File", "Edit", "Insert", "Scene", "Plot", "View", "Compile", "Tools", "Help",
 ];
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SessionSnapshot {
+    workspace: String,
+    selected_scene: Option<String>,
+    editing_scene: Option<String>,
+    cursor: (usize, usize),
+    scroll: usize,
+    selected: usize,
+    reading_document: Option<String>,
+    reading_offset: u64,
+    #[serde(default)]
+    editor_focus_mode: bool,
+    #[serde(default = "default_split_ratio")]
+    horizontal_split_ratio: u16,
+    #[serde(default = "default_split_ratio")]
+    vertical_split_ratio: u16,
+    #[serde(default)]
+    assembly_draft: Option<String>,
+    #[serde(default)]
+    planning_board_id: Option<String>,
+    #[serde(default)]
+    writing_stats_enabled: bool,
+    #[serde(default)]
+    typed_characters: u64,
+    #[serde(default)]
+    pasted_characters: u64,
+    #[serde(default)]
+    successful_saves: u64,
+    #[serde(default)]
+    reference_scene: Option<String>,
+    #[serde(default)]
+    reference_scroll: usize,
+    #[serde(default)]
+    reference_scenes: Vec<String>,
+    #[serde(default)]
+    active_reference: usize,
+    #[serde(default)]
+    reference_scrolls: Vec<usize>,
+    #[serde(default)]
+    reference_focused: bool,
+}
 
 #[derive(Clone, Debug)]
 enum TimelineItem {
@@ -184,6 +261,7 @@ fn command_registry() -> Vec<CommandSpec> {
                 Workspace::Search => "view.search",
                 Workspace::Reading => "view.reading",
                 Workspace::Revisions => "view.revisions",
+                Workspace::PlanningBoards => "view.planning-boards",
             },
             label: workspace.title(),
             description: "Switch to this workspace",
@@ -209,8 +287,8 @@ fn command_registry() -> Vec<CommandSpec> {
         },
         CommandSpec {
             id: "file.save",
-            label: "Save Scene",
-            description: "Save the current scene using optimistic concurrency",
+            label: "Save Manuscript Buffer",
+            description: "Save the current scene or resumable multi-scene assembly buffer",
             category: "File",
             mnemonic: Some('s'),
             palette_aliases: &["save"],
@@ -830,6 +908,286 @@ fn command_registry() -> Vec<CommandSpec> {
             "open",
             true,
         ),
+        legacy_command(
+            "scratchpad.create",
+            "Quick Capture",
+            "Capture a note without leaving the current scene",
+            "Tools",
+            "scratchpad",
+            true,
+        ),
+        legacy_command(
+            "scratchpad.list",
+            "Scratchpad Notes",
+            "List active and promoted scratchpad notes",
+            "Tools",
+            "scratchpad-list",
+            false,
+        ),
+        legacy_command(
+            "scratchpad.pin",
+            "Pin Scratchpad Note",
+            "Pin or unpin a quick-capture note",
+            "Tools",
+            "scratchpad-pin",
+            true,
+        ),
+        legacy_command(
+            "scratchpad.promote",
+            "Promote Scratchpad Note",
+            "Link a note to a scene or story-bible entity",
+            "Tools",
+            "scratchpad-promote",
+            true,
+        ),
+        legacy_command(
+            "mention.list",
+            "Scene Mentions",
+            "Inspect candidate story-bible mentions in the current scene",
+            "Scene",
+            "mentions",
+            false,
+        ),
+        legacy_command(
+            "mention.jump",
+            "Jump to Story Mention",
+            "Navigate to a detected passage",
+            "Scene",
+            "mention-jump",
+            true,
+        ),
+        legacy_command(
+            "mention.appearances",
+            "Entity Mention Appearances",
+            "List confirmed mention backlinks",
+            "Plot",
+            "mention-appearances",
+            true,
+        ),
+        legacy_command(
+            "mention.confirm",
+            "Confirm Entity Mention",
+            "Confirm a detected story-bible reference",
+            "Scene",
+            "mention-confirm",
+            true,
+        ),
+        legacy_command(
+            "mention.dismiss",
+            "Dismiss Entity Mention",
+            "Dismiss a false positive mention",
+            "Scene",
+            "mention-dismiss",
+            true,
+        ),
+        legacy_command(
+            "object.create",
+            "New Story Object",
+            "Create an object for mention detection",
+            "Plot",
+            "object",
+            true,
+        ),
+        legacy_command(
+            "comment.create",
+            "Comment on Selection",
+            "Attach a personal note to selected manuscript text",
+            "Edit",
+            "comment",
+            true,
+        ),
+        legacy_command(
+            "comment.list",
+            "Scene Comments",
+            "List personal notes and anchor status",
+            "Edit",
+            "comments",
+            false,
+        ),
+        legacy_command(
+            "comment.state",
+            "Resolve or Reopen Comment",
+            "Change personal comment state",
+            "Edit",
+            "comment-state",
+            true,
+        ),
+        legacy_command(
+            "assembly.create",
+            "Create Manuscript Assembly",
+            "Create an independent edition ordering",
+            "Compile",
+            "assembly",
+            true,
+        ),
+        legacy_command(
+            "assembly.list",
+            "List Manuscript Assemblies",
+            "Inspect alternate manuscript arrangements",
+            "Compile",
+            "assembly-list",
+            false,
+        ),
+        legacy_command(
+            "assembly.edit",
+            "Edit Assembly Scenes",
+            "Open an editable buffer spanning every scene in an assembly",
+            "Edit",
+            "assembly-edit",
+            true,
+        ),
+        legacy_command(
+            "assembly.resume",
+            "Resume Assembly Draft",
+            "Resume a durable multi-scene edit buffer by draft ID",
+            "Edit",
+            "assembly-resume",
+            true,
+        ),
+        legacy_command(
+            "assembly.drafts",
+            "List Assembly Drafts",
+            "Inspect interrupted or pending assembly edits",
+            "Edit",
+            "assembly-drafts",
+            false,
+        ),
+        legacy_command(
+            "assembly.add",
+            "Add Scene to Assembly",
+            "Add a scene without changing canonical placement",
+            "Compile",
+            "assembly-add",
+            true,
+        ),
+        legacy_command(
+            "assembly.move",
+            "Reorder Assembly Item",
+            "Reorder content in an assembly only",
+            "Compile",
+            "assembly-move",
+            true,
+        ),
+        legacy_command(
+            "assembly.include",
+            "Include or Exclude Assembly Item",
+            "Control edition membership",
+            "Compile",
+            "assembly-include",
+            true,
+        ),
+        legacy_command(
+            "assembly.compile",
+            "Compile Assembly",
+            "Render an assembly through Compile IR",
+            "Compile",
+            "assembly-compile",
+            true,
+        ),
+        legacy_command(
+            "board.create",
+            "Create Planning Board",
+            "Create a spatial planning canvas",
+            "Plan",
+            "board",
+            true,
+        ),
+        legacy_command(
+            "board.open",
+            "Open Planning Board",
+            "Open a board to inspect and move its cards",
+            "Plan",
+            "board-open",
+            true,
+        ),
+        legacy_command(
+            "board.back",
+            "Board List",
+            "Return to planning board list",
+            "Plan",
+            "board-back",
+            false,
+        ),
+        legacy_command(
+            "board.list",
+            "List Board Items",
+            "Inspect entities placed on a planning board",
+            "Plan",
+            "board-list",
+            true,
+        ),
+        legacy_command(
+            "board.move",
+            "Move Planning Card",
+            "Change a card's canvas coordinates without affecting story order",
+            "Plan",
+            "board-move",
+            true,
+        ),
+        legacy_command(
+            "board.connect",
+            "Connect Planning Cards",
+            "Add a labeled relationship between cards on one board",
+            "Plan",
+            "board-connect",
+            true,
+        ),
+        legacy_command(
+            "board.add-scene",
+            "Place Scene on Board",
+            "Place a scene without changing manuscript order",
+            "Plan",
+            "board-add-scene",
+            true,
+        ),
+        legacy_command(
+            "board.add",
+            "Add Planning Card",
+            "Place a supported story entity on a planning board",
+            "Plan",
+            "board-add",
+            true,
+        ),
+        legacy_command(
+            "writing.stats",
+            "Writing Statistics",
+            "Opt in to local aggregate counts without recording manuscript text",
+            "Tools",
+            "writing-stats",
+            true,
+        ),
+        legacy_command(
+            "story-template-list",
+            "List Story Bible Templates",
+            "Inspect reusable profile templates",
+            "Story Bible",
+            "story-template-list",
+            false,
+        ),
+        legacy_command(
+            "story-template-import",
+            "Import Story Bible Template",
+            "Add a validated TOML profile template",
+            "Story Bible",
+            "story-template-import",
+            true,
+        ),
+        legacy_command(
+            "story-profile-show",
+            "Show Story Bible Profile",
+            "Inspect typed values for a story entity",
+            "Story Bible",
+            "story-profile-show",
+            true,
+        ),
+        legacy_command(
+            "story-profile-import",
+            "Import Story Bible Profile",
+            "Validate and store a typed profile from JSON",
+            "Story Bible",
+            "story-profile-import",
+            true,
+        ),
     ]);
     commands
 }
@@ -909,6 +1267,35 @@ fn is_menu_shortcut(key: KeyEvent) -> bool {
         && matches!(key.code, KeyCode::Char('/') | KeyCode::Char('_'))
 }
 
+fn editor_position_byte(lines: &[String], row: usize, column: usize) -> usize {
+    let prefix_bytes = lines
+        .iter()
+        .take(row)
+        .map(|line| line.len() + 1)
+        .sum::<usize>();
+    let line = lines.get(row).map(String::as_str).unwrap_or_default();
+    prefix_bytes + grapheme_byte(line, column)
+}
+
+fn grapheme_byte(text: &str, column: usize) -> usize {
+    text.grapheme_indices(true)
+        .nth(column)
+        .map(|(offset, _)| offset)
+        .unwrap_or(text.len())
+}
+
+fn grapheme_count(text: &str) -> usize {
+    text.graphemes(true).count()
+}
+
+fn editor_position_from_byte(text: &str, byte: usize) -> Option<(usize, usize)> {
+    let prefix = text.get(..byte)?;
+    Some((
+        prefix.matches('\n').count(),
+        grapheme_count(prefix.rsplit('\n').next().unwrap_or_default()),
+    ))
+}
+
 fn parse_processing_stages(names: &str) -> Result<Vec<story_pipeline::Stage>, String> {
     if names.trim().is_empty() {
         return Err("provide at least one processing stage".into());
@@ -920,6 +1307,15 @@ fn parse_processing_stages(names: &str) -> Result<Vec<story_pipeline::Stage>, St
                 .ok_or_else(|| format!("unknown processing stage '{name}'"))
         })
         .collect()
+}
+
+fn parse_find_mode(value: &str) -> Result<story_core::FindMode, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "normal" => Ok(story_core::FindMode::Normal),
+        "extended" => Ok(story_core::FindMode::Extended),
+        "regex" => Ok(story_core::FindMode::Regex),
+        _ => Err("search mode must be normal, extended, or regex".into()),
+    }
 }
 
 fn default_bindings() -> Vec<(u8, Workspace)> {
@@ -973,6 +1369,293 @@ fn load_bindings(project: &Path) -> Result<Vec<(u8, Workspace)>, Box<dyn std::er
     Ok(result)
 }
 impl AppState {
+    fn new(app: WriterApp, function_bindings: Vec<(u8, Workspace)>) -> Self {
+        Self {
+            app,
+            workspace: Workspace::Dashboard,
+            scenes: Vec::new(),
+            selected: 0,
+            editor: vec![String::new()],
+            editing_scene: None,
+            cursor: (0, 0),
+            saved_hash: String::new(),
+            dirty: false,
+            mode: None,
+            prompt: String::new(),
+            message: String::new(),
+            history: vec![Workspace::Dashboard],
+            history_index: 0,
+            width: 80,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
+            scroll: 0,
+            reading_document: None,
+            reading_text: String::new(),
+            reading_offset: 0,
+            reading_focus: false,
+            reading_selection_start: None,
+            function_bindings,
+            revision_diff: None,
+            revision_scene: None,
+            revision_index: 0,
+            revision_hunk: 0,
+            search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
+            query_view: None,
+            proposal_review_active: false,
+            proposal_review_rows: Vec::new(),
+            proposal_review_index: 0,
+            editor_selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            clipboard: String::new(),
+            menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
+        }
+    }
+    fn session_path(&self) -> std::path::PathBuf {
+        self.app.project_root().join(".writers-ide/session.json")
+    }
+    fn save_session(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let path = self.session_path();
+        let parent = path.parent().ok_or("session file has no parent")?;
+        fs::create_dir_all(parent)?;
+        let snapshot = SessionSnapshot {
+            workspace: self.workspace.title().to_owned(),
+            selected_scene: self.active_scene().map(|id| id.to_string()),
+            editing_scene: self.editing_scene.map(|id| id.to_string()),
+            cursor: self.cursor,
+            scroll: self.scroll,
+            selected: self.selected,
+            reading_document: self.reading_document.map(|id| id.to_string()),
+            reading_offset: self.reading_offset,
+            editor_focus_mode: self.editor_focus_mode,
+            horizontal_split_ratio: self.horizontal_split_ratio,
+            vertical_split_ratio: self.vertical_split_ratio,
+            assembly_draft: self.assembly_draft.map(|id| id.to_string()),
+            planning_board_id: self.planning_board_id.map(|id| id.to_string()),
+            writing_stats_enabled: self.writing_stats_enabled,
+            typed_characters: self.typed_characters,
+            pasted_characters: self.pasted_characters,
+            successful_saves: self.successful_saves,
+            reference_scene: self
+                .active_reference_pane()
+                .map(|pane| pane.scene_id.to_string()),
+            reference_scroll: self.active_reference_pane().map_or(0, |pane| pane.scroll),
+            reference_scenes: self
+                .reference_panes
+                .iter()
+                .map(|pane| pane.scene_id.to_string())
+                .collect(),
+            reference_scrolls: self
+                .reference_panes
+                .iter()
+                .map(|pane| pane.scroll)
+                .collect(),
+            active_reference: self.active_reference,
+            reference_focused: self.reference_focused,
+        };
+        let bytes = serde_json::to_vec_pretty(&snapshot)?;
+        let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(&bytes)?;
+            file.sync_all()?;
+        }
+        fs::rename(&temp, &path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+    fn restore_session(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let path = self.session_path();
+        let Ok(bytes) = fs::read(&path) else {
+            return Ok(());
+        };
+        let snapshot: SessionSnapshot = match serde_json::from_slice(&bytes) {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.message = format!("Previous session could not be restored: {error}");
+                return Ok(());
+            }
+        };
+        self.refresh()?;
+        self.selected = snapshot.selected.min(self.scenes.len().saturating_sub(1));
+        if let Some(scene_id) = snapshot
+            .selected_scene
+            .as_deref()
+            .and_then(|value| value.parse::<uuid::Uuid>().ok())
+            .map(SceneId)
+            && let Some(index) = self.scenes.iter().position(|scene| scene.0 == scene_id)
+        {
+            self.selected = index;
+        }
+        let mut stale_reference = false;
+        if let Some(scene_id) = snapshot
+            .editing_scene
+            .as_deref()
+            .and_then(|value| value.parse::<uuid::Uuid>().ok())
+            .map(SceneId)
+        {
+            if self.scenes.iter().any(|scene| scene.0 == scene_id) {
+                self.open_scene(scene_id)?;
+                self.cursor.0 = snapshot.cursor.0.min(self.editor.len().saturating_sub(1));
+                self.cursor.1 = snapshot
+                    .cursor
+                    .1
+                    .min(grapheme_count(&self.editor[self.cursor.0]));
+            } else {
+                stale_reference = true;
+                self.editing_scene = None;
+            }
+        }
+        self.scroll = snapshot.scroll;
+        self.editor_focus_mode = snapshot.editor_focus_mode;
+        self.planning_board_id = match snapshot.planning_board_id.as_deref() {
+            Some(value) => match value.parse::<uuid::Uuid>() {
+                Ok(id) => {
+                    let id = story_core::PlanningBoardId(id);
+                    if self
+                        .app
+                        .list_planning_boards()?
+                        .iter()
+                        .any(|board| board.id == id)
+                    {
+                        Some(id)
+                    } else {
+                        stale_reference = true;
+                        None
+                    }
+                }
+                Err(_) => {
+                    stale_reference = true;
+                    None
+                }
+            },
+            None => None,
+        };
+        self.horizontal_split_ratio = snapshot.horizontal_split_ratio.clamp(20, 80);
+        self.vertical_split_ratio = snapshot.vertical_split_ratio.clamp(20, 80);
+        self.writing_stats_enabled = snapshot.writing_stats_enabled;
+        self.typed_characters = snapshot.typed_characters;
+        self.pasted_characters = snapshot.pasted_characters;
+        self.successful_saves = snapshot.successful_saves;
+        let mut saved_references = snapshot.reference_scenes.clone();
+        if let Some(legacy) = snapshot.reference_scene.as_ref()
+            && !saved_references.contains(legacy)
+        {
+            saved_references.push(legacy.clone());
+        }
+        for (index, value) in saved_references.iter().enumerate() {
+            if let Ok(raw_id) = value.parse::<uuid::Uuid>() {
+                let id = SceneId(raw_id);
+                if let Ok(row) = self.app.get_scene(id)
+                    && let Ok((content, _)) = self.app.load_scene_text(id)
+                {
+                    let fallback_scroll = if Some(value) == snapshot.reference_scene.as_ref() {
+                        snapshot.reference_scroll
+                    } else {
+                        0
+                    };
+                    let requested = snapshot
+                        .reference_scrolls
+                        .get(index)
+                        .copied()
+                        .unwrap_or(fallback_scroll);
+                    let scroll = requested.min(content.lines().count().saturating_sub(1));
+                    self.reference_panes.push(ReferencePane {
+                        scene_id: id,
+                        title: row.scene.title,
+                        content,
+                        scroll,
+                    });
+                } else {
+                    stale_reference = true;
+                }
+            } else {
+                stale_reference = true;
+            }
+        }
+        if !self.reference_panes.is_empty() {
+            self.active_reference = snapshot
+                .active_reference
+                .min(self.reference_panes.len() - 1);
+            self.reference_focused = snapshot.reference_focused;
+        }
+        if let Some(id) = snapshot
+            .assembly_draft
+            .as_deref()
+            .and_then(|v| v.parse::<uuid::Uuid>().ok())
+            .map(story_core::AssemblyDraftId)
+        {
+            match self.app.load_assembly_draft(id) {
+                Ok(draft) => {
+                    self.editor = format_assembly_draft(&draft)
+                        .lines()
+                        .map(str::to_owned)
+                        .collect();
+                    if self.editor.is_empty() {
+                        self.editor.push(String::new());
+                    }
+                    self.assembly_draft = Some(id);
+                    self.editing_scene = None;
+                }
+                Err(_) => {
+                    stale_reference = true;
+                    self.assembly_draft = None;
+                }
+            }
+        }
+        if let Some(reading_id) = snapshot
+            .reading_document
+            .as_deref()
+            .and_then(|value| value.parse::<uuid::Uuid>().ok())
+            .map(story_core::ReadingId)
+        {
+            if let Some(document) = self
+                .app
+                .list_reading_documents()?
+                .into_iter()
+                .find(|document| document.id == reading_id)
+            {
+                self.reading_document = Some(reading_id);
+                self.reading_text = document.extracted_text;
+                let requested = usize::try_from(snapshot.reading_offset)?;
+                let safe_offset = self
+                    .reading_text
+                    .floor_char_boundary(requested.min(self.reading_text.len()));
+                self.reading_offset = safe_offset as u64;
+            } else {
+                stale_reference = true;
+                self.reading_document = None;
+                self.reading_text.clear();
+            }
+        }
+        self.workspace = Workspace::ALL
+            .iter()
+            .copied()
+            .find(|workspace| workspace.title().eq_ignore_ascii_case(&snapshot.workspace))
+            .unwrap_or(Workspace::Dashboard);
+        if stale_reference {
+            self.message =
+                "Previous session restored; one removed scene or reading reference was skipped"
+                    .into();
+        }
+        Ok(())
+    }
     fn refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.scenes = self
             .app
@@ -987,6 +1670,75 @@ impl AppState {
     }
     fn active_scene(&self) -> Option<SceneId> {
         self.scenes.get(self.selected).map(|x| x.0)
+    }
+    fn scenes_for_scope(
+        &self,
+        scope: &str,
+    ) -> Result<Vec<story_storage::SceneRecord>, Box<dyn std::error::Error>> {
+        let scenes = self.app.list_scenes(false)?;
+        if scope == "all" {
+            return Ok(scenes);
+        }
+        if let Some(id) = scope.strip_prefix("chapter:") {
+            let chapter = story_core::NodeId(id.parse()?);
+            return Ok(scenes
+                .into_iter()
+                .filter(|record| record.chapter_id == Some(chapter))
+                .collect());
+        }
+        let id = if scope == "current" {
+            self.editing_scene
+                .or(self.active_scene())
+                .ok_or("select a scene first")?
+        } else {
+            SceneId(scope.parse()?)
+        };
+        Ok(scenes
+            .into_iter()
+            .filter(|record| record.scene.id == id)
+            .collect())
+    }
+    fn active_reference_pane(&self) -> Option<&ReferencePane> {
+        self.reference_panes.get(self.active_reference)
+    }
+    fn active_reference_pane_mut(&mut self) -> Option<&mut ReferencePane> {
+        self.reference_panes.get_mut(self.active_reference)
+    }
+    fn navigate_search_match(&mut self, forward: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if self.search_locations.is_empty() {
+            self.message = "No active find results".into();
+            return Ok(());
+        }
+        let index = if forward {
+            (self.search_location_index + 1) % self.search_locations.len()
+        } else {
+            (self.search_location_index + self.search_locations.len() - 1)
+                % self.search_locations.len()
+        };
+        let (scene, start, end) = self.search_locations[index];
+        if self.editing_scene != Some(scene) && self.dirty {
+            self.message =
+                "Save the dirty scene before navigating to a match in another scene".into();
+            return Ok(());
+        }
+        self.search_location_index = index;
+        if self.editing_scene != Some(scene) {
+            self.open_scene(scene)?;
+        }
+        let text = self.editor.join("\n");
+        let (start_row, start_col) = editor_position_from_byte(&text, start)
+            .ok_or("match no longer aligns with manuscript UTF-8")?;
+        let (end_row, end_col) = editor_position_from_byte(&text, end)
+            .ok_or("match no longer aligns with manuscript UTF-8")?;
+        self.editor_selection = Some((start_row, start_col));
+        self.move_cursor(end_row, end_col, true);
+        self.switch(Workspace::Editor);
+        self.message = format!(
+            "Match {}/{}",
+            self.search_location_index + 1,
+            self.search_locations.len()
+        );
+        Ok(())
     }
     fn open_reading_selected(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let docs = self.app.list_reading_documents()?;
@@ -1144,6 +1896,37 @@ impl AppState {
                 .ok_or("query scene no longer exists")?;
             return self.open_scene(id);
         }
+        if self.workspace == Workspace::PlanningBoards {
+            if self.planning_board_id.is_none() {
+                let boards = self.app.list_planning_boards()?;
+                let board = boards
+                    .get(self.selected)
+                    .ok_or("planning board selection is out of range")?;
+                self.planning_board_id = Some(board.id);
+                self.selected = 0;
+                self.message = format!(
+                    "{} · Ctrl+arrows move cards · Esc returns to boards",
+                    board.title
+                );
+            } else {
+                let board = self.planning_board_id.unwrap();
+                let items = self.app.list_planning_board_items(board)?;
+                let item = items
+                    .get(self.selected)
+                    .ok_or("planning board card selection is out of range")?;
+                if item.entity_kind == "scene" {
+                    let id = SceneId(item.entity_id.parse()?);
+                    self.selected = self
+                        .scenes
+                        .iter()
+                        .position(|scene| scene.0 == id)
+                        .ok_or("board scene no longer exists")?;
+                    return self.open_scene(id);
+                }
+                self.message = format!("{} {} · {}", item.entity_kind, item.entity_id, item.note);
+            }
+            return Ok(());
+        }
         if matches!(
             self.workspace,
             Workspace::StoryBible | Workspace::Issues | Workspace::Research
@@ -1165,6 +1948,7 @@ impl AppState {
             return Ok(());
         }
         let (text, hash) = self.app.load_scene_text(id)?;
+        self.app.reindex_scene_mentions(id, &text, &hash)?;
         self.editor = text.lines().map(str::to_owned).collect();
         if self.editor.is_empty() {
             self.editor.push(String::new());
@@ -1172,17 +1956,93 @@ impl AppState {
         self.cursor = (0, 0);
         self.saved_hash = hash;
         self.editing_scene = Some(id);
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.editor_selection = None;
+        self.assembly_draft = None;
         self.dirty = false;
         self.workspace = Workspace::Editor;
+        let mentions = self.app.list_scene_mentions(id)?;
+        let detected = mentions
+            .iter()
+            .filter(|mention| matches!(mention.state.as_str(), "detected" | "ambiguous"))
+            .count();
+        if detected > 0 {
+            self.message =
+                format!("{detected} possible story-bible mention(s) · use :mentions to review");
+        }
+        Ok(())
+    }
+    fn open_assembly_draft(
+        &mut self,
+        id: story_core::AssemblyDraftId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            self.message = "Save the current editor buffer before opening an assembly".into();
+            return Ok(());
+        }
+        let draft = self.app.load_assembly_draft(id)?;
+        self.editor = format_assembly_draft(&draft)
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        self.cursor = (0, 0);
+        self.scroll = 0;
+        self.editing_scene = None;
+        self.assembly_draft = Some(id);
+        self.dirty = false;
+        self.workspace = Workspace::Editor;
+        self.message = format!(
+            "Assembly buffer: {} scene files · scene markers must remain intact",
+            draft.items.len()
+        );
         Ok(())
     }
     fn save(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(draft_id) = self.assembly_draft {
+            let draft = self.app.load_assembly_draft(draft_id)?;
+            match parse_assembly_draft(&draft, &self.editor.join("\n")) {
+                Ok(items) => match self.app.replace_assembly_draft_items(draft_id, &items) {
+                    Ok(()) => match self.app.commit_assembly_draft(draft_id) {
+                        Ok(()) => {
+                            self.assembly_draft = None;
+                            self.dirty = false;
+                            if self.writing_stats_enabled {
+                                self.successful_saves = self.successful_saves.saturating_add(1);
+                            }
+                            self.message =
+                                "Saved all assembly scene files through journaled writes".into();
+                            self.refresh()?;
+                            self.switch(Workspace::Outline);
+                        }
+                        Err(error) => {
+                            self.message =
+                                format!("Assembly save can be resumed; draft retained: {error}")
+                        }
+                    },
+                    Err(error) => {
+                        self.message = format!("Assembly draft was not replaced: {error}")
+                    }
+                },
+                Err(error) => {
+                    self.message =
+                        format!("Assembly markers are invalid; no files changed: {error}")
+                }
+            }
+            return Ok(());
+        }
         if let Some(id) = self.editing_scene {
             let text = self.editor.join("\n");
             match self.app.save_scene_text(id, Some(&self.saved_hash), &text) {
                 Ok(hash) => {
                     self.saved_hash = hash;
                     self.dirty = false;
+                    if self.writing_stats_enabled {
+                        self.successful_saves = self.successful_saves.saturating_add(1);
+                    }
                     self.message = "Saved".into();
                 }
                 Err(e) => self.message = format!("Save conflict/error: {e}"),
@@ -1240,7 +2100,11 @@ impl AppState {
     }
     fn command_disabled_reason(&self, spec: CommandSpec) -> Option<&'static str> {
         match spec.action {
-            CommandAction::Save if self.editing_scene.is_none() => Some("Open a scene first"),
+            CommandAction::Save
+                if self.editing_scene.is_none() && self.assembly_draft.is_none() =>
+            {
+                Some("Open a scene or assembly draft first")
+            }
             CommandAction::RestoreRevisionHunk if self.revision_diff.is_none() => {
                 Some("Open a revision diff first")
             }
@@ -1468,7 +2332,420 @@ impl AppState {
         &mut self,
         cmd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(title) = cmd.strip_prefix("section ") {
+        if cmd == "story-template-list" {
+            self.message = self
+                .app
+                .list_story_bible_templates()?
+                .into_iter()
+                .map(|template| {
+                    format!(
+                        "{} · {} · {} fields · {}",
+                        template.id,
+                        template.entity_kind.as_str(),
+                        template.fields.len(),
+                        template.name
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(file) = cmd.strip_prefix("story-template-import ") {
+            let template: story_core::StoryBibleTemplate =
+                toml::from_str(&fs::read_to_string(file.trim())?)?;
+            self.app.save_story_bible_template(&template)?;
+            self.message = format!("Imported Story Bible template {}", template.id);
+        } else if let Some(rest) = cmd.strip_prefix("story-profile-show ") {
+            let mut parts = rest.split_whitespace();
+            let kind = parse_story_bible_kind(parts.next().ok_or("missing entity kind")?)?;
+            let id = parts.next().ok_or("missing entity UUID")?;
+            let profile = self.app.load_story_bible_profile(kind, id)?;
+            self.message = serde_json::to_string(&profile)?;
+        } else if let Some(file) = cmd.strip_prefix("story-profile-import ") {
+            let profile: story_core::StoryBibleProfile =
+                serde_json::from_slice(&fs::read(file.trim())?)?;
+            self.app.save_story_bible_profile(&profile)?;
+            self.message = format!(
+                "Stored profile for {} {}",
+                profile.entity_kind.as_str(),
+                profile.entity_id
+            );
+        } else if let Some(value) = cmd.strip_prefix("writing-stats ") {
+            match value.trim() {
+                "on" => {
+                    self.writing_stats_enabled = true;
+                    self.message = "Local aggregate writing statistics enabled; manuscript text is never logged".into();
+                }
+                "off" => {
+                    self.writing_stats_enabled = false;
+                    self.message = "Writing statistics disabled".into();
+                }
+                "report" => {
+                    self.message = format!(
+                        "{} · {} typed chars · {} pasted chars · {} saves",
+                        if self.writing_stats_enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        },
+                        self.typed_characters,
+                        self.pasted_characters,
+                        self.successful_saves
+                    );
+                }
+                "reset" => {
+                    self.typed_characters = 0;
+                    self.pasted_characters = 0;
+                    self.successful_saves = 0;
+                    self.message = "Local aggregate writing counts reset".into();
+                }
+                _ => return Err("use writing-stats on|off|report|reset".into()),
+            }
+        } else if let Some(value) = cmd.strip_prefix("assembly-resume ") {
+            let id = story_core::AssemblyDraftId(value.trim().parse()?);
+            self.open_assembly_draft(id)?;
+        } else if cmd == "assembly-drafts" {
+            self.message = self
+                .app
+                .list_assembly_drafts()?
+                .into_iter()
+                .map(|draft| {
+                    format!(
+                        "{} · assembly {} · {} scenes",
+                        draft.id,
+                        draft.assembly_id,
+                        draft.items.len()
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(value) = cmd.strip_prefix("assembly-edit ") {
+            let assembly = story_core::AssemblyId(value.trim().parse()?);
+            let draft = self.app.create_assembly_draft(assembly)?;
+            self.open_assembly_draft(draft.id)?;
+        } else if cmd == "board-back" {
+            self.planning_board_id = None;
+            self.selected = 0;
+            self.message = "Planning board list".into();
+        } else if let Some(value) = cmd.strip_prefix("board-open ") {
+            let id = story_core::PlanningBoardId(value.trim().parse()?);
+            if !self
+                .app
+                .list_planning_boards()?
+                .iter()
+                .any(|board| board.id == id)
+            {
+                return Err("planning board no longer exists".into());
+            }
+            self.planning_board_id = Some(id);
+            self.selected = 0;
+            self.switch(Workspace::PlanningBoards);
+            self.message = format!("Opened planning board {id} · Ctrl+arrows move cards");
+        } else if let Some(title) = cmd.strip_prefix("board ") {
+            let id = self.app.create_planning_board(title.trim())?;
+            self.planning_board_id = Some(id);
+            self.selected = 0;
+            self.switch(Workspace::PlanningBoards);
+            self.message = format!("Created planning board {id}");
+        } else if let Some(rest) = cmd.strip_prefix("board-list ") {
+            let board = story_core::PlanningBoardId(rest.trim().parse()?);
+            self.message = self
+                .app
+                .list_planning_board_items(board)?
+                .into_iter()
+                .map(|item| {
+                    format!(
+                        "{} · {} {} at ({}, {})",
+                        item.id, item.entity_kind, item.entity_id, item.x, item.y
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("board-move ") {
+            let mut parts = rest.split_whitespace();
+            let item = story_core::PlanningBoardItemId(
+                parts.next().ok_or("missing board item UUID")?.parse()?,
+            );
+            let x = parts.next().ok_or("missing x coordinate")?.parse()?;
+            let y = parts.next().ok_or("missing y coordinate")?.parse()?;
+            self.app.move_planning_board_item(item, x, y)?;
+            self.message = format!("Moved planning card to ({x}, {y})");
+        } else if let Some(rest) = cmd.strip_prefix("board-connect ") {
+            let mut parts = rest.split_whitespace();
+            let board =
+                story_core::PlanningBoardId(parts.next().ok_or("missing board UUID")?.parse()?);
+            let source = story_core::PlanningBoardItemId(
+                parts.next().ok_or("missing source item UUID")?.parse()?,
+            );
+            let target = story_core::PlanningBoardItemId(
+                parts.next().ok_or("missing target item UUID")?.parse()?,
+            );
+            let label = parts.next().unwrap_or("");
+            let id = self
+                .app
+                .connect_planning_board_items(board, source, target, label)?;
+            self.message = format!("Added board connector {id}");
+        } else if let Some(rest) = cmd.strip_prefix("board-add ") {
+            let mut parts = rest.split_whitespace();
+            let board =
+                story_core::PlanningBoardId(parts.next().ok_or("missing board UUID")?.parse()?);
+            let kind = parts.next().ok_or("missing entity kind")?;
+            let entity = parts.next().ok_or("missing entity UUID")?;
+            let x: f64 = parts.next().ok_or("missing x coordinate")?.parse()?;
+            let y: f64 = parts.next().ok_or("missing y coordinate")?.parse()?;
+            let note = parts.collect::<Vec<_>>().join(" ");
+            let id = self
+                .app
+                .add_planning_board_item(board, kind, entity, x, y, &note)?;
+            self.message = format!("Placed {kind} on planning board as {id}");
+        } else if let Some(title) = cmd.strip_prefix("assembly ") {
+            let id = self.app.create_assembly(title.trim())?;
+            self.message = format!("Created manuscript assembly {id}");
+        } else if cmd == "assembly-list" {
+            self.message = self
+                .app
+                .list_assemblies()?
+                .into_iter()
+                .map(|assembly| format!("{} · {}", assembly.id, assembly.title))
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("assembly-add ") {
+            let mut parts = rest.split_whitespace();
+            let assembly =
+                story_core::AssemblyId(parts.next().ok_or("missing assembly UUID")?.parse()?);
+            let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let position = parts.next().ok_or("missing position")?.parse()?;
+            let item = self.app.add_assembly_scene(assembly, scene, position)?;
+            self.message = format!("Added scene to assembly as item {item}");
+        } else if let Some(rest) = cmd.strip_prefix("assembly-move ") {
+            let mut parts = rest.split_whitespace();
+            let assembly =
+                story_core::AssemblyId(parts.next().ok_or("missing assembly UUID")?.parse()?);
+            let item =
+                story_core::AssemblyItemId(parts.next().ok_or("missing item UUID")?.parse()?);
+            let position = parts.next().ok_or("missing position")?.parse()?;
+            self.app.move_assembly_item(assembly, item, position)?;
+            self.message = "Moved assembly item; canonical manuscript order is unchanged".into();
+        } else if let Some(rest) = cmd.strip_prefix("assembly-include ") {
+            let mut parts = rest.split_whitespace();
+            let item =
+                story_core::AssemblyItemId(parts.next().ok_or("missing item UUID")?.parse()?);
+            let included = match parts.next().ok_or("use on or off")? {
+                "on" => true,
+                "off" => false,
+                _ => return Err("assembly inclusion must be on or off".into()),
+            };
+            self.app.set_assembly_item_included(item, included)?;
+            self.message = format!(
+                "Assembly item {}",
+                if included { "included" } else { "excluded" }
+            );
+        } else if let Some(value) = cmd.strip_prefix("assembly-compile ") {
+            let assembly = story_core::AssemblyId(value.trim().parse()?);
+            let text = self.app.compile_assembly_markdown(assembly)?;
+            let destination = self
+                .app
+                .project_root()
+                .join("exports")
+                .join(format!("assembly-{assembly}.md"));
+            fs::write(&destination, text.as_bytes())?;
+            self.message = format!("Compiled assembly to {}", destination.display());
+        } else if let Some(rest) = cmd.strip_prefix("scratchpad ") {
+            let (title, body) = rest.split_once('|').unwrap_or((rest, ""));
+            let id = self.app.create_scratchpad_note(title.trim(), body.trim())?;
+            self.message = format!("Captured scratchpad note {id}");
+        } else if cmd == "scratchpad-list" {
+            self.message = self
+                .app
+                .list_scratchpad_notes(true)?
+                .into_iter()
+                .map(|note| {
+                    format!(
+                        "{}{} · {} · {}",
+                        if note.pinned { "📌 " } else { "" },
+                        note.title,
+                        note.state,
+                        note.body
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("scratchpad-pin ") {
+            let mut parts = rest.split_whitespace();
+            let id = story_core::ScratchpadId(parts.next().ok_or("missing note UUID")?.parse()?);
+            let pinned = match parts.next().ok_or("use on or off")? {
+                "on" => true,
+                "off" => false,
+                _ => return Err("pin value must be on or off".into()),
+            };
+            let note = self
+                .app
+                .list_scratchpad_notes(true)?
+                .into_iter()
+                .find(|note| note.id == id)
+                .ok_or("scratchpad note not found")?;
+            self.app
+                .update_scratchpad_note(id, &note.title, &note.body, pinned)?;
+            self.message = if pinned {
+                "Scratchpad note pinned"
+            } else {
+                "Scratchpad note unpinned"
+            }
+            .into();
+        } else if let Some(rest) = cmd.strip_prefix("scratchpad-promote ") {
+            let mut parts = rest.split_whitespace();
+            let id = story_core::ScratchpadId(parts.next().ok_or("missing note UUID")?.parse()?);
+            let kind = parts.next().ok_or("missing destination kind")?;
+            let destination = parts.next().ok_or("missing destination UUID")?;
+            self.app.promote_scratchpad_note(id, kind, destination)?;
+            self.message =
+                format!("Promoted note {id} to {kind} {destination}; source text retained");
+        } else if cmd == "mentions" {
+            let scene = self
+                .editing_scene
+                .or_else(|| self.active_scene())
+                .ok_or("open or select a scene first")?;
+            self.message = self
+                .app
+                .list_scene_mentions(scene)?
+                .into_iter()
+                .map(|mention| {
+                    let candidates = mention
+                        .candidates
+                        .iter()
+                        .map(|candidate| {
+                            format!(
+                                "{}:{} ({})",
+                                candidate.entity_kind, candidate.entity_id, candidate.matched_name
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    format!(
+                        "{} · {} · bytes {}..{} · {}",
+                        mention.state,
+                        mention.quote,
+                        mention.start_byte,
+                        mention.end_byte,
+                        candidates
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(value) = cmd.strip_prefix("mention-jump ") {
+            let mention_id = story_core::MentionId(value.trim().parse()?);
+            let scene_id = self
+                .editing_scene
+                .or_else(|| self.active_scene())
+                .ok_or("open or select a scene first")?;
+            let mention = self
+                .app
+                .list_scene_mentions(scene_id)?
+                .into_iter()
+                .find(|mention| mention.id == mention_id)
+                .ok_or("mention is not in the current scene")?;
+            self.open_scene(scene_id)?;
+            let text = self.app.load_scene_text(scene_id)?.0;
+            let offset = usize::try_from(mention.start_byte)?;
+            let prefix = text
+                .get(..offset)
+                .ok_or("mention offset is no longer valid")?;
+            self.cursor.0 = prefix
+                .chars()
+                .filter(|character| *character == '\n')
+                .count();
+            self.cursor.1 = prefix
+                .rsplit('\n')
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .count();
+            self.message = format!("Jumped to {} · {}", mention.state, mention.quote);
+        } else if let Some(rest) = cmd.strip_prefix("mention-appearances ") {
+            let mut parts = rest.split_whitespace();
+            let kind = parts.next().ok_or("missing entity kind")?;
+            let entity = parts.next().ok_or("missing entity UUID")?;
+            let mut appearances = Vec::new();
+            for record in self.app.list_scenes(false)? {
+                for mention in self.app.list_scene_mentions(record.scene.id)? {
+                    if mention.state == "confirmed"
+                        && mention.entity_kind.as_deref() == Some(kind)
+                        && mention.entity_id.as_deref() == Some(entity)
+                    {
+                        appearances.push(format!("{} · {}", record.scene.title, mention.quote));
+                    }
+                }
+            }
+            self.message = appearances.join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("mention-confirm ") {
+            let mut parts = rest.split_whitespace();
+            let mention =
+                story_core::MentionId(parts.next().ok_or("missing mention UUID")?.parse()?);
+            let kind = match parts.next().ok_or("missing candidate kind")? {
+                "character" => story_core::MentionEntityKind::Character,
+                "location" => story_core::MentionEntityKind::Location,
+                "object" => story_core::MentionEntityKind::Object,
+                _ => return Err("candidate kind must be character, location or object".into()),
+            };
+            let entity = parts.next().ok_or("missing entity UUID")?;
+            self.app.confirm_scene_mention(mention, kind, entity)?;
+            self.message = "Mention confirmed; narrative participation was not changed".into();
+        } else if let Some(value) = cmd.strip_prefix("mention-dismiss ") {
+            let id = story_core::MentionId(value.trim().parse()?);
+            self.app.dismiss_scene_mention(id)?;
+            self.message = "Mention dismissed".into();
+        } else if let Some(body) = cmd.strip_prefix("comment ") {
+            if self.dirty {
+                return Err("save the current scene before creating a passage comment".into());
+            }
+            let scene = self.editing_scene.ok_or("open a scene first")?;
+            let ((start_row, start_col), (end_row, end_col)) = self
+                .selection_bounds()
+                .ok_or("select manuscript text first")?;
+            let quote = self.selected_text().ok_or("select manuscript text first")?;
+            let start = editor_position_byte(&self.editor, start_row, start_col);
+            let end = editor_position_byte(&self.editor, end_row, end_col);
+            let id = self.app.create_personal_comment(
+                scene,
+                start as u64,
+                end as u64,
+                &quote,
+                body.trim(),
+            )?;
+            self.message = format!("Added personal comment {id} to selected passage");
+            let _ = (start_row, start_col, end_row, end_col);
+        } else if cmd == "comments" {
+            let scene = self
+                .editing_scene
+                .or_else(|| self.active_scene())
+                .ok_or("open or select a scene first")?;
+            self.message = self
+                .app
+                .list_scene_comments(scene)?
+                .into_iter()
+                .map(|comment| {
+                    format!(
+                        "{} · {} · {} · {}",
+                        comment.state,
+                        comment.anchor_state.as_deref().unwrap_or("orphaned"),
+                        comment.quote.as_deref().unwrap_or("passage unavailable"),
+                        comment.body
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("comment-state ") {
+            let mut parts = rest.split_whitespace();
+            let id =
+                story_core::PersonalCommentId(parts.next().ok_or("missing comment UUID")?.parse()?);
+            let state = parts.next().ok_or("use open or resolved")?;
+            self.app.set_personal_comment_state(id, state)?;
+            self.message = format!("Comment {id} marked {state}");
+        } else if let Some(rest) = cmd.strip_prefix("object ") {
+            let (name, description) = rest.split_once('|').unwrap_or((rest, ""));
+            let id = self
+                .app
+                .create_story_object(name.trim(), description.trim())?;
+            self.message = format!("Created story object {id}");
+        } else if let Some(title) = cmd.strip_prefix("section ") {
             let position = self
                 .app
                 .list_structural_nodes()?
@@ -2232,6 +3509,137 @@ impl AppState {
                     .find(|w| w.title().eq_ignore_ascii_case(rest))
                     .ok_or("unknown workspace")?,
             );
+        } else if let Some(code) = cmd.strip_prefix("project-language ") {
+            self.app.set_project_language(code.trim())?;
+            self.message = format!(
+                "Project language set to {}",
+                self.app.get_project()?.language_code
+            );
+        } else if let Some(id) = cmd.strip_prefix("reference-scene ") {
+            let id = SceneId(id.parse()?);
+            let row = self.app.get_scene(id)?;
+            let (content, _) = self.app.load_scene_text(id)?;
+            if let Some(index) = self
+                .reference_panes
+                .iter()
+                .position(|pane| pane.scene_id == id)
+            {
+                self.active_reference = index;
+            } else {
+                self.reference_panes.push(ReferencePane {
+                    scene_id: id,
+                    title: row.scene.title,
+                    content,
+                    scroll: 0,
+                });
+                self.active_reference = self.reference_panes.len() - 1;
+            }
+            self.reference_focused = false;
+            self.message = format!(
+                "Reference buffer {} of {} opened · :reference-next/prev switches buffers",
+                self.active_reference + 1,
+                self.reference_panes.len()
+            );
+        } else if cmd == "reference-next" {
+            if !self.reference_panes.is_empty() {
+                self.active_reference = (self.active_reference + 1) % self.reference_panes.len();
+            }
+            self.message = "Next reference buffer".into();
+        } else if cmd == "reference-prev" {
+            if !self.reference_panes.is_empty() {
+                self.active_reference = (self.active_reference + self.reference_panes.len() - 1)
+                    % self.reference_panes.len();
+            }
+            self.message = "Previous reference buffer".into();
+        } else if cmd == "reference-close" {
+            if !self.reference_panes.is_empty() {
+                self.reference_panes.remove(self.active_reference);
+            }
+            self.active_reference = self
+                .active_reference
+                .min(self.reference_panes.len().saturating_sub(1));
+            self.reference_focused = false;
+            self.message = if self.reference_panes.is_empty() {
+                "Reference pane closed"
+            } else {
+                "Reference buffer closed"
+            }
+            .into();
+        } else if let Some(chapter) = cmd.strip_prefix("narrow ") {
+            let chapter = story_core::NodeId(chapter.parse()?);
+            self.scenes = self
+                .app
+                .list_scenes(false)?
+                .into_iter()
+                .filter(|record| record.chapter_id == Some(chapter))
+                .map(|record| {
+                    (
+                        record.scene.id,
+                        record.scene.title,
+                        record.scene.status,
+                        record.actual_words,
+                    )
+                })
+                .collect();
+            self.selected = self
+                .editing_scene
+                .and_then(|id| self.scenes.iter().position(|scene| scene.0 == id))
+                .unwrap_or(0);
+            self.message =
+                format!("Outline narrowed to chapter {chapter} · :widen restores all scenes");
+        } else if cmd == "widen" {
+            self.scenes = self
+                .app
+                .list_scenes(false)?
+                .into_iter()
+                .map(|record| {
+                    (
+                        record.scene.id,
+                        record.scene.title,
+                        record.scene.status,
+                        record.actual_words,
+                    )
+                })
+                .collect();
+            self.selected = self
+                .editing_scene
+                .and_then(|id| self.scenes.iter().position(|scene| scene.0 == id))
+                .unwrap_or(0);
+            self.message = "Full outline restored".into();
+        } else if cmd == "proofread" || cmd.starts_with("proofread ") {
+            let scope = cmd.strip_prefix("proofread ").unwrap_or("current");
+            let target = self
+                .editing_scene
+                .or(self.active_scene())
+                .ok_or("select a scene first")?;
+            let records = if scope == "all" {
+                self.app.list_scenes(false)?
+            } else {
+                self.app
+                    .list_scenes(false)?
+                    .into_iter()
+                    .filter(|record| record.scene.id == target)
+                    .collect()
+            };
+            let mut rows = Vec::new();
+            for record in records {
+                let (text, _) = self.app.load_scene_text(record.scene.id)?;
+                for finding in story_analysis::proofread(&text) {
+                    rows.push(format!(
+                        "{} {}..{} {} · {}",
+                        record.scene.title,
+                        finding.byte_range.start,
+                        finding.byte_range.end,
+                        finding.category,
+                        finding.message
+                    ));
+                }
+            }
+            self.message = if rows.is_empty() {
+                "No mechanical proofreading suggestions".into()
+            } else {
+                rows.join(" | ")
+            };
         } else if cmd == "query-list" {
             self.message = self
                 .app
@@ -2408,10 +3816,79 @@ impl AppState {
             self.selected = 0;
             self.switch(Workspace::Search);
             self.message = format!("{} project-wide matches", self.search_hits.len());
+        } else if let Some(rest) = cmd.strip_prefix("find ") {
+            let mut parts = rest.splitn(3, ' ');
+            let mode = parse_find_mode(parts.next().ok_or("use find MODE current|all PATTERN")?)?;
+            let scope = parts.next().ok_or("missing find scope")?;
+            let pattern = parts.next().ok_or("missing search pattern")?;
+            let scenes = self.scenes_for_scope(scope)?;
+            let mut found = Vec::new();
+            self.search_locations.clear();
+            for record in scenes {
+                let (text, _) = self.app.load_scene_text(record.scene.id)?;
+                let matches = story_core::find_matches(&text, pattern, mode)?;
+                if !matches.is_empty() {
+                    for matched in &matches {
+                        self.search_locations
+                            .push((record.scene.id, matched.start, matched.end));
+                    }
+                    found.push((record.scene.id, record.scene.title, matches.len()));
+                }
+            }
+            self.search_location_index = self.search_locations.len().saturating_sub(1);
+            if let Some((scene, title, _)) = found.first() {
+                if self.dirty && self.editing_scene != Some(*scene) {
+                    self.message = format!(
+                        "{} matches found; save the current scene before navigating to {title}",
+                        self.search_locations.len()
+                    );
+                } else {
+                    self.navigate_search_match(true)?;
+                    self.message = format!(
+                        "{} match(es) in {} scene(s); F3/Shift-F3 navigates · first in {title}",
+                        self.search_locations.len(),
+                        found.len()
+                    );
+                }
+            } else {
+                self.message = "No matches".into();
+            }
+        } else if let Some(rest) = cmd.strip_prefix("replace ") {
+            self.search_locations.clear();
+            let (head, replacement) = rest
+                .split_once(" => ")
+                .ok_or("use replace MODE current|all PATTERN => REPLACEMENT")?;
+            let mut parts = head.splitn(3, ' ');
+            let mode = parse_find_mode(parts.next().ok_or("missing replace mode")?)?;
+            let scope = parts.next().ok_or("missing replace scope")?;
+            let pattern = parts.next().ok_or("missing replace pattern")?;
+            let scenes = self.scenes_for_scope(scope)?;
+            let mut changed = 0usize;
+            let mut replacements = 0usize;
+            for record in scenes {
+                let (text, hash) = self.app.load_scene_text(record.scene.id)?;
+                let (updated, count) =
+                    story_core::replace_matches(&text, pattern, replacement, mode)?;
+                if count != 0 {
+                    self.app
+                        .save_scene_text(record.scene.id, Some(&hash), &updated)?;
+                    changed += 1;
+                    replacements += count;
+                    if self.editing_scene == Some(record.scene.id) {
+                        self.editor = updated.lines().map(str::to_owned).collect();
+                        if self.editor.is_empty() {
+                            self.editor.push(String::new());
+                        }
+                        self.dirty = false;
+                        self.saved_hash = self.app.load_scene_text(record.scene.id)?.1;
+                    }
+                }
+            }
+            self.message = format!("Replaced {replacements} occurrence(s) in {changed} scene(s)");
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | process-expand | process-only STAGE,STAGE | process-expand-only STAGE,STAGE | extract scene|reading UUID MODEL | proposals | approve PROPOSAL-PATH CLAIM-INDEX | dismiss PROPOSAL-PATH CLAIM-INDEX | knowledge | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | project-language TAG | reference-scene UUID | reference-next | reference-prev | reference-close | narrow CHAPTER-UUID | widen | proofread [all] | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | process-expand | process-only STAGE,STAGE | process-expand-only STAGE,STAGE | extract scene|reading UUID MODEL | proposals | approve PROPOSAL-PATH CLAIM-INDEX | dismiss PROPOSAL-PATH CLAIM-INDEX | knowledge | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
         }
         Ok(())
     }
@@ -2428,16 +3905,18 @@ impl AppState {
         Ok(())
     }
     fn insert(&mut self, ch: char) {
+        if self.writing_stats_enabled {
+            self.typed_characters = self.typed_characters.saturating_add(1);
+        }
+        self.insert_text_char(ch);
+    }
+    fn insert_text_char(&mut self, ch: char) {
         self.delete_selection();
         let (row, col) = self.cursor;
         let line = &mut self.editor[row];
-        let byte = line
-            .char_indices()
-            .nth(col)
-            .map(|(b, _)| b)
-            .unwrap_or(line.len());
+        let byte = grapheme_byte(line, col);
         line.insert(byte, ch);
-        self.cursor.1 += 1;
+        self.cursor.1 = grapheme_count(&line[..byte + ch.len_utf8()]);
         self.dirty = true;
     }
     fn backspace(&mut self) {
@@ -2447,23 +3926,15 @@ impl AppState {
         let (row, col) = self.cursor;
         if col > 0 {
             let line = &mut self.editor[row];
-            let end = line
-                .char_indices()
-                .nth(col)
-                .map(|(b, _)| b)
-                .unwrap_or(line.len());
-            let start = line
-                .char_indices()
-                .nth(col - 1)
-                .map(|(b, _)| b)
-                .unwrap_or(0);
+            let end = grapheme_byte(line, col);
+            let start = grapheme_byte(line, col - 1);
             line.replace_range(start..end, "");
             self.cursor.1 -= 1;
             self.dirty = true;
         } else if row > 0 {
             let tail = self.editor.remove(row);
             self.cursor.0 -= 1;
-            self.cursor.1 = self.editor[self.cursor.0].chars().count();
+            self.cursor.1 = grapheme_count(&self.editor[self.cursor.0]);
             self.editor[self.cursor.0].push_str(&tail);
             self.dirty = true;
         }
@@ -2473,19 +3944,11 @@ impl AppState {
             return;
         }
         let (row, col) = self.cursor;
-        let count = self.editor[row].chars().count();
+        let count = grapheme_count(&self.editor[row]);
         if col < count {
             let line = &mut self.editor[row];
-            let start = line
-                .char_indices()
-                .nth(col)
-                .map(|(b, _)| b)
-                .unwrap_or(line.len());
-            let end = line
-                .char_indices()
-                .nth(col + 1)
-                .map(|(b, _)| b)
-                .unwrap_or(line.len());
+            let start = grapheme_byte(line, col);
+            let end = grapheme_byte(line, col + 1);
             line.replace_range(start..end, "");
             self.dirty = true;
         } else if row + 1 < self.editor.len() {
@@ -2496,11 +3959,17 @@ impl AppState {
     }
     fn paste_text(&mut self, text: &str) {
         self.delete_selection();
-        for ch in text.replace("\r\n", "\n").replace('\r', "\n").chars() {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.writing_stats_enabled {
+            self.pasted_characters = self
+                .pasted_characters
+                .saturating_add(normalized.chars().count() as u64);
+        }
+        for ch in normalized.chars() {
             if ch == '\n' {
                 self.enter()
             } else {
-                self.insert(ch)
+                self.insert_text_char(ch)
             }
         }
     }
@@ -2508,11 +3977,7 @@ impl AppState {
         self.delete_selection();
         let (row, col) = self.cursor;
         let line = &mut self.editor[row];
-        let byte = line
-            .char_indices()
-            .nth(col)
-            .map(|(b, _)| b)
-            .unwrap_or(line.len());
+        let byte = grapheme_byte(line, col);
         let tail = line.split_off(byte);
         self.editor.insert(row + 1, tail);
         self.cursor = (row + 1, 0);
@@ -2534,7 +3999,7 @@ impl AppState {
         if start_row == end_row {
             return Some(
                 self.editor[start_row]
-                    .chars()
+                    .graphemes(true)
                     .skip(start_col)
                     .take(end_col - start_col)
                     .collect(),
@@ -2543,20 +4008,23 @@ impl AppState {
         let mut lines = Vec::new();
         lines.push(
             self.editor[start_row]
-                .chars()
+                .graphemes(true)
                 .skip(start_col)
                 .collect::<String>(),
         );
         lines.extend(self.editor[start_row + 1..end_row].iter().cloned());
-        lines.push(self.editor[end_row].chars().take(end_col).collect());
+        lines.push(self.editor[end_row].graphemes(true).take(end_col).collect());
         Some(lines.join("\n"))
     }
     fn delete_selection(&mut self) -> bool {
         let Some(((start_row, start_col), (end_row, end_col))) = self.selection_bounds() else {
             return false;
         };
-        let prefix: String = self.editor[start_row].chars().take(start_col).collect();
-        let suffix: String = self.editor[end_row].chars().skip(end_col).collect();
+        let prefix: String = self.editor[start_row]
+            .graphemes(true)
+            .take(start_col)
+            .collect();
+        let suffix: String = self.editor[end_row].graphemes(true).skip(end_col).collect();
         self.editor[start_row] = format!("{prefix}{suffix}");
         if end_row > start_row {
             self.editor.drain(start_row + 1..=end_row);
@@ -2573,7 +4041,51 @@ impl AppState {
             self.editor_selection = None;
         }
         let row = row.min(self.editor.len().saturating_sub(1));
-        self.cursor = (row, col.min(self.editor[row].chars().count()));
+        self.cursor = (row, col.min(grapheme_count(&self.editor[row])));
+    }
+    fn push_undo(&mut self) {
+        const MAX_UNDO_STEPS: usize = 100;
+        self.undo_stack.push(EditorSnapshot {
+            lines: self.editor.clone(),
+            cursor: self.cursor,
+            selection: self.editor_selection,
+        });
+        if self.undo_stack.len() > MAX_UNDO_STEPS {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+    fn undo_edit(&mut self) {
+        if let Some(previous) = self.undo_stack.pop() {
+            self.redo_stack.push(EditorSnapshot {
+                lines: self.editor.clone(),
+                cursor: self.cursor,
+                selection: self.editor_selection,
+            });
+            self.editor = previous.lines;
+            self.cursor = previous.cursor;
+            self.editor_selection = previous.selection;
+            self.dirty = true;
+            self.message = "Edit undone".into();
+        } else {
+            self.message = "No editor changes to undo".into();
+        }
+    }
+    fn redo_edit(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(EditorSnapshot {
+                lines: self.editor.clone(),
+                cursor: self.cursor,
+                selection: self.editor_selection,
+            });
+            self.editor = next.lines;
+            self.cursor = next.cursor;
+            self.editor_selection = next.selection;
+            self.dirty = true;
+            self.message = "Edit redone".into();
+        } else {
+            self.message = "No editor changes to redo".into();
+        }
     }
     fn create_reading_selection(
         &mut self,
@@ -2649,42 +4161,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let project_path = std::path::PathBuf::from(path);
     let function_bindings = load_bindings(&project_path)?;
     let app = WriterApp::open_project(&project_path)?;
-    let mut state = AppState {
-        app,
-        workspace: Workspace::Dashboard,
-        scenes: Vec::new(),
-        selected: 0,
-        editor: vec![String::new()],
-        editing_scene: None,
-        cursor: (0, 0),
-        saved_hash: String::new(),
-        dirty: false,
-        mode: None,
-        prompt: String::new(),
-        message: String::new(),
-        history: vec![Workspace::Dashboard],
-        history_index: 0,
-        width: 80,
-        scroll: 0,
-        reading_document: None,
-        reading_text: String::new(),
-        reading_offset: 0,
-        reading_focus: false,
-        reading_selection_start: None,
-        function_bindings,
-        revision_diff: None,
-        revision_scene: None,
-        revision_index: 0,
-        revision_hunk: 0,
-        search_hits: Vec::new(),
-        query_view: None,
-        proposal_review_active: false,
-        proposal_review_rows: Vec::new(),
-        proposal_review_index: 0,
-        editor_selection: None,
-        clipboard: String::new(),
-        menu: None,
-    };
+    let mut state = AppState::new(app, function_bindings);
+    state.restore_session()?;
     state.refresh()?;
     let mut terminal = setup()?;
     let result = run(&mut terminal, &mut state);
@@ -2716,13 +4194,47 @@ fn run(
     t: &mut Terminal<CrosstermBackend<io::Stdout>>,
     s: &mut AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut autosave_deadline: Option<Instant> = None;
     loop {
         t.draw(|f| draw(f, s))?;
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
-                Event::Key(k) if handle(s, k)? => break,
-                Event::Paste(text) if s.workspace == Workspace::Editor => s.paste_text(&text),
+                Event::Key(k) => {
+                    let should_quit = handle(s, k)?;
+                    autosave_deadline = if s.dirty {
+                        Some(Instant::now() + Duration::from_secs(2))
+                    } else {
+                        None
+                    };
+                    if let Err(error) = s.save_session() {
+                        s.message = format!("Session state could not be saved: {error}");
+                    }
+                    if should_quit {
+                        break;
+                    }
+                }
+                Event::Paste(text) if s.workspace == Workspace::Editor => {
+                    s.push_undo();
+                    s.paste_text(&text);
+                    autosave_deadline = Some(Instant::now() + Duration::from_secs(2));
+                    if let Err(error) = s.save_session() {
+                        s.message = format!("Session state could not be saved: {error}");
+                    }
+                }
                 _ => {}
+            }
+        }
+        if autosave_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            autosave_deadline = None;
+            s.save()?;
+            if s.dirty {
+                s.message = "Autosave found a conflict; your text remains open and unsaved. Resolve it before saving again.".into();
+            } else {
+                s.message = "Autosaved".into();
+                if let Err(error) = s.save_session() {
+                    s.message =
+                        format!("Saved manuscript; session state could not be saved: {error}");
+                }
             }
         }
     }
@@ -2750,33 +4262,41 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             format!(" {project}  |  {}  |  {dirty} ", s.workspace.title()),
             Style::default().add_modifier(Modifier::BOLD),
         ),
-        Span::raw("F1-F9, F11-F14 workspaces  Ctrl+/ or F10 menu  ? help  : commands  / search  Ctrl-S save  q quit"),
+        Span::raw("F1-F9, F11-F14 workspaces  Ctrl+/ or F10 menu  Ctrl-G focus  Ctrl+arrows split  ? help  : commands  / search  Ctrl-S save  q quit"),
     ]))
     .block(Block::default().borders(Borders::BOTTOM));
     f.render_widget(head, rows[0]);
     let body = if pane_direction(s.width) == Direction::Vertical {
         Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+            .constraints([
+                Constraint::Percentage(s.vertical_split_ratio),
+                Constraint::Percentage(100 - s.vertical_split_ratio),
+            ])
             .split(rows[1])
     } else {
         Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
+            .constraints([
+                Constraint::Percentage(s.horizontal_split_ratio),
+                Constraint::Percentage(100 - s.horizontal_split_ratio),
+            ])
             .split(rows[1])
     };
     if s.workspace == Workspace::Editor {
-        let list = List::new(
-            s.scenes
-                .iter()
-                .map(|(_, title, status, words)| {
-                    ListItem::new(format!("{title}  [{}] {words}", status.as_str()))
-                })
-                .collect::<Vec<_>>(),
-        )
-        .block(Block::default().title("Scenes").borders(Borders::ALL));
-        let mut state = ListState::default().with_selected(Some(s.selected));
-        f.render_stateful_widget(list, body[0], &mut state);
+        if !s.editor_focus_mode {
+            let list = List::new(
+                s.scenes
+                    .iter()
+                    .map(|(_, title, status, words)| {
+                        ListItem::new(format!("{title}  [{}] {words}", status.as_str()))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .block(Block::default().title("Scenes").borders(Borders::ALL));
+            let mut state = ListState::default().with_selected(Some(s.selected));
+            f.render_stateful_widget(list, body[0], &mut state);
+        }
         let selection = s.selection_bounds();
         let content = s
             .editor
@@ -2786,7 +4306,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             .map(|(row, line)| {
                 let prefix = if row == s.cursor.0 { "> " } else { "  " };
                 let mut spans = vec![Span::raw(prefix)];
-                for (col, ch) in line.chars().enumerate() {
+                for (col, ch) in line.graphemes(true).enumerate() {
                     let selected = selection.is_some_and(|((sr, sc), (er, ec))| {
                         (row > sr || (row == sr && col >= sc))
                             && (row < er || (row == er && col < ec))
@@ -2803,12 +4323,61 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 Line::from(spans)
             })
             .collect::<Vec<_>>();
+        let editor_title = s
+            .assembly_draft
+            .map(|id| format!("Assembly Draft {id} · stable scene markers required"))
+            .unwrap_or_else(|| format!("Editor — {}", s.selected_scene()));
         let editor = Paragraph::new(content).wrap(Wrap { trim: false }).block(
             Block::default()
-                .title(format!("Editor — {}", s.selected_scene()))
+                .title(if s.reference_focused {
+                    format!("{editor_title} · reference focused")
+                } else {
+                    editor_title
+                })
                 .borders(Borders::ALL),
         );
-        f.render_widget(editor, body[1]);
+        let editor_and_reference = if s.editor_focus_mode {
+            rows[1]
+        } else {
+            body[1]
+        };
+        if let Some(reference) = s.active_reference_pane() {
+            let panes = Layout::default()
+                .direction(pane_direction(s.width))
+                .constraints([
+                    Constraint::Percentage(s.horizontal_split_ratio),
+                    Constraint::Percentage(100 - s.horizontal_split_ratio),
+                ])
+                .split(editor_and_reference);
+            f.render_widget(editor, panes[0]);
+            let reference = Paragraph::new(
+                reference
+                    .content
+                    .lines()
+                    .skip(reference.scroll)
+                    .map(Line::from)
+                    .collect::<Vec<_>>(),
+            )
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(format!(
+                        "{} · buffer {}/{}{} · Ctrl-Tab focus · :reference-next/prev · :reference-close",
+                        reference.title,
+                        s.active_reference + 1,
+                        s.reference_panes.len(),
+                        if s.reference_focused {
+                            " · active"
+                        } else {
+                            ""
+                        }
+                    ))
+                    .borders(Borders::ALL),
+            );
+            f.render_widget(reference, panes[1]);
+        } else {
+            f.render_widget(editor, editor_and_reference);
+        }
     } else if s.workspace == Workspace::Reading {
         let items = workspace_items(s)
             .into_iter()
@@ -3112,6 +4681,126 @@ fn pane_direction(width: usize) -> Direction {
     } else {
         Direction::Horizontal
     }
+}
+
+fn default_split_ratio() -> u16 {
+    40
+}
+
+#[cfg(test)]
+mod assembly_buffer_tests {
+    use super::*;
+    #[test]
+    fn continuous_assembly_buffer_round_trips_scene_text_and_rejects_marker_damage() {
+        let draft_id = story_core::AssemblyDraftId::new();
+        let first = SceneId::new();
+        let second = SceneId::new();
+        let draft = story_core::AssemblyDraft {
+            id: draft_id,
+            assembly_id: story_core::AssemblyId::new(),
+            project_id: story_core::ProjectId::new(),
+            created_at: String::new(),
+            items: vec![
+                story_core::AssemblyDraftItem {
+                    scene_id: first,
+                    expected_hash: "a".into(),
+                    text: "Opening line\nSecond line".into(),
+                },
+                story_core::AssemblyDraftItem {
+                    scene_id: second,
+                    expected_hash: "b".into(),
+                    text: String::new(),
+                },
+            ],
+        };
+        let rendered = format_assembly_draft(&draft);
+        assert_eq!(
+            parse_assembly_draft(&draft, &rendered).unwrap(),
+            vec![
+                (first, "Opening line\nSecond line".into()),
+                (second, String::new())
+            ]
+        );
+        let edited = rendered.replace("Opening line", "Revised opening");
+        assert_eq!(
+            parse_assembly_draft(&draft, &edited).unwrap()[0].1,
+            "Revised opening\nSecond line"
+        );
+        assert!(
+            parse_assembly_draft(
+                &draft,
+                &rendered.replace(&assembly_scene_marker(draft_id, first), "removed marker")
+            )
+            .is_err()
+        );
+    }
+}
+
+fn assembly_scene_marker(draft: story_core::AssemblyDraftId, scene: SceneId) -> String {
+    format!("<!-- WI-ASSEMBLY-DRAFT:{draft}:SCENE:{scene} -->")
+}
+
+fn format_assembly_draft(draft: &story_core::AssemblyDraft) -> String {
+    draft
+        .items
+        .iter()
+        .map(|item| {
+            format!(
+                "{}\n{}",
+                assembly_scene_marker(draft.id, item.scene_id),
+                item.text
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn parse_assembly_draft(
+    draft: &story_core::AssemblyDraft,
+    text: &str,
+) -> Result<Vec<(SceneId, String)>, Box<dyn std::error::Error>> {
+    let lines = text.split('\n').collect::<Vec<_>>();
+    let markers = draft
+        .items
+        .iter()
+        .map(|item| assembly_scene_marker(draft.id, item.scene_id))
+        .collect::<Vec<_>>();
+    let mut result = Vec::with_capacity(draft.items.len());
+    let mut cursor = 0;
+    for (index, item) in draft.items.iter().enumerate() {
+        if lines.get(cursor).copied() != Some(markers[index].as_str()) {
+            return Err(format!(
+                "expected stable scene marker for {} at buffer line {}",
+                item.scene_id,
+                cursor + 1
+            )
+            .into());
+        }
+        cursor += 1;
+        let end = if index + 1 < markers.len() {
+            (cursor..lines.len())
+                .find(|line| lines[*line] == markers[index + 1])
+                .ok_or("next assembly scene marker is missing or out of order")?
+        } else {
+            if lines[cursor..]
+                .iter()
+                .any(|line| markers.iter().any(|marker| line == marker))
+            {
+                return Err("assembly scene markers are duplicated or out of order".into());
+            }
+            lines.len()
+        };
+        let mut section = lines[cursor..end].to_vec();
+        if index + 1 < markers.len() && section.last() == Some(&"") {
+            section.pop();
+        }
+        result.push((item.scene_id, section.join("\n")));
+        cursor = end;
+    }
+    if result.len() != draft.items.len() {
+        return Err("assembly buffer is incomplete".into());
+    }
+    Ok(result)
 }
 fn reading_text_display(
     text: &str,
@@ -3741,6 +5430,28 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 )
             })
             .collect(),
+        Workspace::PlanningBoards => {
+            if let Some(board) = s.planning_board_id {
+                s.app
+                    .list_planning_board_items(board)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|item| {
+                        format!(
+                            "{} · {} {} · ({:.1}, {:.1}) · {}",
+                            item.id, item.entity_kind, item.entity_id, item.x, item.y, item.note
+                        )
+                    })
+                    .collect()
+            } else {
+                s.app
+                    .list_planning_boards()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|board| format!("{} · {}", board.id, board.title))
+                    .collect()
+            }
+        }
     }
 }
 
@@ -3838,6 +5549,19 @@ fn character_matrix_rows(s: &AppState) -> Vec<String> {
     }
     rows
 }
+fn parse_story_bible_kind(
+    value: &str,
+) -> Result<story_core::StoryBibleEntityKind, Box<dyn std::error::Error>> {
+    match value {
+        "character" => Ok(story_core::StoryBibleEntityKind::Character),
+        "location" => Ok(story_core::StoryBibleEntityKind::Location),
+        "object" => Ok(story_core::StoryBibleEntityKind::Object),
+        "plotline" => Ok(story_core::StoryBibleEntityKind::Plotline),
+        "event" => Ok(story_core::StoryBibleEntityKind::Event),
+        _ => Err("entity kind must be character, location, object, plotline, or event".into()),
+    }
+}
+
 fn parse_entity(kind: &str, id: &str) -> Result<story_core::EntityRef, Box<dyn std::error::Error>> {
     Ok(match kind {
         "scene" => story_core::EntityRef::Scene(SceneId(id.parse()?)),
@@ -3921,6 +5645,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         return Ok(false);
     }
+    if s.workspace == Workspace::Editor && k.code == KeyCode::F(3) {
+        s.navigate_search_match(!k.modifiers.contains(KeyModifiers::SHIFT))?;
+        return Ok(false);
+    }
     if s.workspace == Workspace::Reading {
         match k.code {
             KeyCode::Char('h') => s.reading_focus = false,
@@ -3994,6 +5722,92 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         return Ok(false);
     }
+    if s.workspace == Workspace::Editor
+        && k.modifiers.contains(KeyModifiers::CONTROL)
+        && k.code == KeyCode::Tab
+        && !s.reference_panes.is_empty()
+    {
+        s.reference_focused = !s.reference_focused;
+        s.message = if s.reference_focused {
+            "Reference pane focused · arrows scroll"
+        } else {
+            "Manuscript editor focused"
+        }
+        .into();
+        return Ok(false);
+    }
+    if s.workspace == Workspace::Editor
+        && k.modifiers.contains(KeyModifiers::CONTROL)
+        && k.code == KeyCode::Char('g')
+    {
+        s.editor_focus_mode = !s.editor_focus_mode;
+        s.message = if s.editor_focus_mode {
+            "Focus mode enabled".into()
+        } else {
+            "Focus mode disabled".into()
+        };
+        let _ = s.save_session();
+        return Ok(false);
+    }
+    if s.workspace == Workspace::Editor && k.modifiers.contains(KeyModifiers::CONTROL) {
+        let ratio = match k.code {
+            KeyCode::Left => Some((&mut s.horizontal_split_ratio, -5i16)),
+            KeyCode::Right => Some((&mut s.horizontal_split_ratio, 5)),
+            KeyCode::Up => Some((&mut s.vertical_split_ratio, -5)),
+            KeyCode::Down => Some((&mut s.vertical_split_ratio, 5)),
+            _ => None,
+        };
+        if let Some((value, delta)) = ratio {
+            *value = (*value as i16 + delta).clamp(20, 80) as u16;
+            s.message = format!(
+                "Split ratio updated: horizontal {}%, vertical {}%",
+                s.horizontal_split_ratio, s.vertical_split_ratio
+            );
+            let _ = s.save_session();
+            return Ok(false);
+        }
+    }
+    if s.workspace == Workspace::PlanningBoards
+        && let Some(board) = s.planning_board_id
+        && k.modifiers.contains(KeyModifiers::CONTROL)
+    {
+        let delta = match k.code {
+            KeyCode::Left => Some((-1.0, 0.0)),
+            KeyCode::Right => Some((1.0, 0.0)),
+            KeyCode::Up => Some((0.0, -1.0)),
+            KeyCode::Down => Some((0.0, 1.0)),
+            _ => None,
+        };
+        if let Some((dx, dy)) = delta {
+            let items = s.app.list_planning_board_items(board)?;
+            if let Some(item) = items.get(s.selected) {
+                let item_id = item.id;
+                s.app
+                    .move_planning_board_item(item_id, item.x + dx, item.y + dy)?;
+                if let Some(index) = s
+                    .app
+                    .list_planning_board_items(board)?
+                    .iter()
+                    .position(|card| card.id == item_id)
+                {
+                    s.selected = index;
+                }
+                s.message = format!(
+                    "Moved {} card to ({:.1}, {:.1})",
+                    item.entity_kind,
+                    item.x + dx,
+                    item.y + dy
+                );
+            }
+            return Ok(false);
+        }
+    }
+    if s.workspace == Workspace::PlanningBoards && k.code == KeyCode::Esc {
+        s.planning_board_id = None;
+        s.selected = 0;
+        s.message = "Planning board list".into();
+        return Ok(false);
+    }
     if k.modifiers.contains(KeyModifiers::ALT) && k.code == KeyCode::Left {
         if s.history_index > 0 {
             s.history_index -= 1;
@@ -4016,6 +5830,54 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(true);
     }
     if s.workspace == Workspace::Editor {
+        if s.reference_focused {
+            if let Some(reference) = s.active_reference_pane_mut() {
+                match k.code {
+                    KeyCode::Up => reference.scroll = reference.scroll.saturating_sub(1),
+                    KeyCode::Down => {
+                        reference.scroll = reference
+                            .scroll
+                            .saturating_add(1)
+                            .min(reference.content.lines().count().saturating_sub(1))
+                    }
+                    KeyCode::PageUp => reference.scroll = reference.scroll.saturating_sub(10),
+                    KeyCode::PageDown => {
+                        reference.scroll = reference
+                            .scroll
+                            .saturating_add(10)
+                            .min(reference.content.lines().count().saturating_sub(1))
+                    }
+                    _ => {}
+                }
+            }
+            return Ok(false);
+        }
+        if k.modifiers.contains(KeyModifiers::CONTROL)
+            && !k.modifiers.contains(KeyModifiers::SHIFT)
+            && k.code == KeyCode::Char('z')
+        {
+            s.undo_edit();
+            return Ok(false);
+        }
+        if k.modifiers.contains(KeyModifiers::CONTROL)
+            && (k.code == KeyCode::Char('y')
+                || (k.code == KeyCode::Char('z') && k.modifiers.contains(KeyModifiers::SHIFT)))
+        {
+            s.redo_edit();
+            return Ok(false);
+        }
+        let mutating = matches!(
+            k.code,
+            KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete
+        ) || (matches!(k.code, KeyCode::Char(_))
+            && (!k.modifiers.contains(KeyModifiers::CONTROL)
+                && !k.modifiers.contains(KeyModifiers::ALT)
+                || (k.modifiers.contains(KeyModifiers::CONTROL)
+                    && matches!(k.code, KeyCode::Char('x' | 'v')))));
+        if mutating {
+            s.search_locations.clear();
+            s.push_undo();
+        }
         if k.modifiers.contains(KeyModifiers::CONTROL) {
             match k.code {
                 KeyCode::Char('c') => {
@@ -4046,23 +5908,23 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             KeyCode::Delete => s.delete_forward(),
             KeyCode::Home => s.move_cursor(s.cursor.0, 0, selecting),
             KeyCode::End => {
-                s.move_cursor(s.cursor.0, s.editor[s.cursor.0].chars().count(), selecting)
+                s.move_cursor(s.cursor.0, grapheme_count(&s.editor[s.cursor.0]), selecting)
             }
             KeyCode::Char('w') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 let row = s.cursor.0;
                 while s.cursor.1 > 0
                     && s.editor[row]
-                        .chars()
+                        .graphemes(true)
                         .nth(s.cursor.1 - 1)
-                        .is_some_and(char::is_whitespace)
+                        .is_some_and(|g| g.chars().all(char::is_whitespace))
                 {
                     s.backspace();
                 }
                 while s.cursor.1 > 0
                     && s.editor[row]
-                        .chars()
+                        .graphemes(true)
                         .nth(s.cursor.1 - 1)
-                        .is_some_and(|c| !c.is_whitespace())
+                        .is_some_and(|g| !g.chars().all(char::is_whitespace))
                 {
                     s.backspace();
                 }
@@ -4070,10 +5932,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             KeyCode::Left if s.cursor.1 > 0 => s.move_cursor(s.cursor.0, s.cursor.1 - 1, selecting),
             KeyCode::Left if s.cursor.0 > 0 => {
                 let row = s.cursor.0 - 1;
-                let col = s.editor[row].chars().count();
+                let col = grapheme_count(&s.editor[row]);
                 s.move_cursor(row, col, selecting);
             }
-            KeyCode::Right if s.cursor.1 < s.editor[s.cursor.0].chars().count() => {
+            KeyCode::Right if s.cursor.1 < grapheme_count(&s.editor[s.cursor.0]) => {
                 s.move_cursor(s.cursor.0, s.cursor.1 + 1, selecting)
             }
             KeyCode::Right if s.cursor.0 + 1 < s.editor.len() => {
@@ -4363,6 +6225,15 @@ mod tests {
             history: vec![Workspace::Editor],
             history_index: 0,
             width: 80,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -4375,13 +6246,20 @@ mod tests {
             revision_index: 0,
             revision_hunk: 0,
             search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
             proposal_review_index: 0,
             editor_selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: String::new(),
             menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
         };
         handle(
             &mut state,
@@ -4405,7 +6283,7 @@ mod tests {
         assert!(state.menu.is_some());
         assert_eq!(
             state.command_disabled_reason(command_by_id("file.save").unwrap()),
-            Some("Open a scene first")
+            Some("Open a scene or assembly draft first")
         );
         handle(
             &mut state,
@@ -4476,6 +6354,98 @@ mod tests {
         assert!(state.menu.is_none());
         assert_eq!(state.mode, Some(':'));
         assert_eq!(state.prompt, "scene ");
+        state
+            .execute_legacy_palette_command("writing-stats on")
+            .unwrap();
+        state.insert('é');
+        state.paste_text("α\nβ");
+        assert_eq!(state.typed_characters, 1);
+        assert_eq!(state.pasted_characters, 3);
+        state
+            .execute_legacy_palette_command("writing-stats off")
+            .unwrap();
+        state.insert('x');
+        assert_eq!(state.typed_characters, 1);
+        state.workspace = Workspace::Editor;
+        state.editor_focus_mode = true;
+        state.horizontal_split_ratio = 55;
+        state.vertical_split_ratio = 65;
+        state.scroll = 13;
+        state.save_session().unwrap();
+        state.workspace = Workspace::Dashboard;
+        state.scroll = 0;
+        state.horizontal_split_ratio = default_split_ratio();
+        state.vertical_split_ratio = default_split_ratio();
+        state.typed_characters = 0;
+        state.pasted_characters = 0;
+        state.restore_session().unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert!(state.editor_focus_mode);
+        assert_eq!(state.scroll, 13);
+        assert_eq!(state.horizontal_split_ratio, 55);
+        assert_eq!(state.vertical_split_ratio, 65);
+        state.mode = None;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.horizontal_split_ratio, 60);
+        assert_eq!(state.vertical_split_ratio, 70);
+        assert!(!state.writing_stats_enabled);
+        assert_eq!(state.typed_characters, 1);
+        assert_eq!(state.pasted_characters, 3);
+        let mut stale =
+            serde_json::from_slice::<SessionSnapshot>(&fs::read(state.session_path()).unwrap())
+                .unwrap();
+        stale.editing_scene = Some(uuid::Uuid::new_v4().to_string());
+        fs::write(state.session_path(), serde_json::to_vec(&stale).unwrap()).unwrap();
+        state.restore_session().unwrap();
+        assert!(
+            state
+                .message
+                .contains("removed scene or reading reference was skipped")
+        );
+        assert!(state.editing_scene.is_none());
+
+        let chapter = state.app.create_chapter(None, "Board chapter", 0).unwrap();
+        let scene = state.app.create_scene(chapter, "Board scene", 0).unwrap();
+        let board = state.app.create_planning_board("Canvas").unwrap();
+        let card = state
+            .app
+            .add_planning_board_item(board, "scene", &scene.to_string(), 3.0, 4.0, "beat")
+            .unwrap();
+        state.refresh().unwrap();
+        state.planning_board_id = Some(board);
+        state.workspace = Workspace::PlanningBoards;
+        state.selected = 0;
+        state.mode = None;
+        state.dirty = false;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        let moved = state
+            .app
+            .list_planning_board_items(board)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == card)
+            .unwrap();
+        assert_eq!((moved.x, moved.y), (4.0, 4.0));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert_eq!(state.editing_scene, Some(scene));
     }
 
     #[test]
@@ -4506,6 +6476,189 @@ mod tests {
     use crossterm::event::KeyModifiers;
 
     #[test]
+    fn editor_positions_follow_extended_grapheme_boundaries() {
+        let line = "e\u{301}👩‍🚀字";
+        assert_eq!(grapheme_count(line), 3);
+        assert_eq!(&line[..grapheme_byte(line, 1)], "e\u{301}");
+        assert_eq!(&line[..grapheme_byte(line, 2)], "e\u{301}👩‍🚀");
+        assert_eq!(grapheme_byte(line, 99), line.len());
+    }
+
+    #[test]
+    fn reference_buffers_switch_close_and_restore_by_stable_scene_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "Main", 0).unwrap();
+        let second = app.create_scene(chapter, "Reference A", 1).unwrap();
+        let third = app.create_scene(chapter, "Reference B", 2).unwrap();
+        for (scene, prose) in [
+            (first, "Main prose"),
+            (second, "Reference A text"),
+            (third, "Reference B text"),
+        ] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), prose).unwrap();
+        }
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.open_scene(first).unwrap();
+        let execute = |state: &mut AppState, command: String| {
+            state.mode = Some(':');
+            state.prompt = command;
+            state.command().unwrap();
+        };
+        execute(&mut state, format!("reference-scene {second}"));
+        execute(&mut state, format!("reference-scene {third}"));
+        execute(&mut state, "reference-prev".into());
+        assert_eq!(state.active_reference_pane().unwrap().scene_id, second);
+        assert_eq!(state.reference_panes.len(), 2);
+        state.save_session().unwrap();
+        let mut restored = AppState::new(
+            WriterApp::open_project(&project).unwrap(),
+            default_bindings(),
+        );
+        restored.restore_session().unwrap();
+        assert_eq!(restored.reference_panes.len(), 2);
+        assert_eq!(restored.active_reference_pane().unwrap().scene_id, second);
+        execute(&mut restored, "reference-close".into());
+        assert_eq!(restored.reference_panes.len(), 1);
+        assert_eq!(restored.active_reference_pane().unwrap().scene_id, third);
+    }
+
+    #[test]
+    fn editor_deletes_and_inserts_whole_combining_and_emoji_graphemes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Unicode", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "e\u{301}👩‍🚀字")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.open_scene(scene).unwrap();
+        state.cursor = (0, 1);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "👩‍🚀字");
+        assert_eq!(state.cursor, (0, 0));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "字");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('\u{301}'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "e\u{301}字");
+        assert_eq!(state.cursor, (0, 1));
+    }
+
+    #[test]
+    fn editor_undo_redo_restores_text_cursor_and_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Undo", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.open_scene(scene).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "ab");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "a");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "ab");
+        handle(
+            &mut state,
+            KeyEvent::new(
+                KeyCode::Char('z'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "ab");
+        assert_eq!(state.cursor, (0, 2));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "a");
+        assert!(state.dirty);
+    }
+
+    #[test]
+    fn find_navigates_all_matches_and_supports_chapter_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let first_chapter = app.create_chapter(None, "One", 0).unwrap();
+        let second_chapter = app.create_chapter(None, "Two", 1).unwrap();
+        let first = app.create_scene(first_chapter, "First", 0).unwrap();
+        let second = app.create_scene(first_chapter, "Second", 1).unwrap();
+        let third = app.create_scene(second_chapter, "Third", 0).unwrap();
+        for (scene, text) in [
+            (first, "Mara met Mara."),
+            (second, "Mara again."),
+            (third, "Mara elsewhere."),
+        ] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), text).unwrap();
+        }
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.open_scene(first).unwrap();
+        state.mode = Some(':');
+        state.prompt = format!("find normal chapter:{first_chapter} Mara");
+        state.command().unwrap();
+        assert_eq!(state.search_locations.len(), 3);
+        assert_eq!(state.search_locations[0].0, first);
+        assert_eq!(state.search_locations[1].0, first);
+        handle(&mut state, KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.selected_text().as_deref(), Some("Mara"));
+        assert_eq!(
+            state.cursor,
+            editor_position_from_byte("Mara met Mara.", 13).unwrap()
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(3), KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        assert_eq!(state.search_location_index, 0);
+    }
+
+    #[test]
     fn editor_selection_copy_cut_and_paste_preserve_multiline_text() {
         let mut state = AppState {
             app: WriterApp::create_project(tempfile::tempdir().unwrap().path().join("N"), "N")
@@ -4524,6 +6677,15 @@ mod tests {
             history: vec![Workspace::Editor],
             history_index: 0,
             width: 80,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -4536,13 +6698,20 @@ mod tests {
             revision_index: 0,
             revision_hunk: 0,
             search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
             proposal_review_index: 0,
             editor_selection: Some((0, 2)),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: String::new(),
             menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
         };
         assert_eq!(state.selected_text().as_deref(), Some("pha\nbe"));
         handle(
@@ -4586,6 +6755,15 @@ mod tests {
             history: vec![Workspace::Editor],
             history_index: 0,
             width: 80,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -4598,13 +6776,20 @@ mod tests {
             revision_index: 0,
             revision_hunk: 0,
             search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
             proposal_review_index: 0,
             editor_selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: String::new(),
             menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
         };
         handle(
             &mut state,
@@ -4640,6 +6825,15 @@ mod tests {
             history: vec![Workspace::Editor],
             history_index: 0,
             width: 80,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -4652,13 +6846,20 @@ mod tests {
             revision_index: 0,
             revision_hunk: 0,
             search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
             proposal_review_index: 0,
             editor_selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: String::new(),
             menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
         };
         handle(
             &mut state,
@@ -4706,6 +6907,15 @@ mod tests {
             history: vec![Workspace::Outline],
             history_index: 0,
             width: 80,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -4718,13 +6928,20 @@ mod tests {
             revision_index: 0,
             revision_hunk: 0,
             search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
             proposal_review_index: 0,
             editor_selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: String::new(),
             menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -4886,6 +7103,15 @@ mod tests {
             history: vec![Workspace::Dashboard],
             history_index: 0,
             width: 80,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -4898,13 +7124,20 @@ mod tests {
             revision_index: 0,
             revision_hunk: 0,
             search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
             proposal_review_index: 0,
             editor_selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: String::new(),
             menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
         };
         assert!(
             !handle(
@@ -4952,6 +7185,15 @@ mod tests {
             history: vec![Workspace::Outline],
             history_index: 0,
             width: 80,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -4964,13 +7206,20 @@ mod tests {
             revision_index: 0,
             revision_hunk: 0,
             search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
             proposal_review_index: 0,
             editor_selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: String::new(),
             menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -5035,6 +7284,15 @@ mod tests {
             history: vec![Workspace::Revisions],
             history_index: 0,
             width: 100,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -5047,13 +7305,20 @@ mod tests {
             revision_index: 0,
             revision_hunk: 0,
             search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
             proposal_review_index: 0,
             editor_selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: String::new(),
             menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
         };
         handle(
             &mut state,
@@ -5236,6 +7501,15 @@ mod tests {
             history: vec![Workspace::Reading],
             history_index: 0,
             width: 80,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
             scroll: 0,
             reading_document: Some(reading),
             reading_text: imported.extracted_text.clone(),
@@ -5248,13 +7522,20 @@ mod tests {
             revision_index: 0,
             revision_hunk: 0,
             search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
             proposal_review_index: 0,
             editor_selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: String::new(),
             menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
         };
         state.mode = Some(':');
         state.prompt = "reading-links".into();
@@ -5541,6 +7822,15 @@ mod tests {
             history: vec![Workspace::Search],
             history_index: 0,
             width: 80,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -5553,13 +7843,20 @@ mod tests {
             revision_index: 0,
             revision_hunk: 0,
             search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
             proposal_review_index: 0,
             editor_selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: String::new(),
             menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
         };
         state.mode = Some(':');
         state.prompt = format!("query {}", query.id);
@@ -5618,6 +7915,15 @@ mod tests {
             history: vec![Workspace::Search],
             history_index: 0,
             width: 80,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -5630,13 +7936,20 @@ mod tests {
             revision_index: 0,
             revision_hunk: 0,
             search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
             proposal_review_index: 0,
             editor_selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: String::new(),
             menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
         };
         let hit = |kind: &str, id: String, title: &str| story_storage::ProjectSearchHit {
             entity_kind: kind.into(),
@@ -5747,6 +8060,15 @@ mod tests {
             history: vec![Workspace::Outline],
             history_index: 0,
             width: 80,
+            editor_focus_mode: false,
+            horizontal_split_ratio: default_split_ratio(),
+            vertical_split_ratio: default_split_ratio(),
+            assembly_draft: None,
+            planning_board_id: None,
+            writing_stats_enabled: false,
+            typed_characters: 0,
+            pasted_characters: 0,
+            successful_saves: 0,
             scroll: 0,
             reading_document: None,
             reading_text: String::new(),
@@ -5759,13 +8081,20 @@ mod tests {
             revision_index: 0,
             revision_hunk: 0,
             search_hits: Vec::new(),
+            search_locations: Vec::new(),
+            search_location_index: 0,
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
             proposal_review_index: 0,
             editor_selection: None,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             clipboard: String::new(),
             menu: None,
+            reference_panes: Vec::new(),
+            active_reference: 0,
+            reference_focused: false,
         };
         let execute = |state: &mut AppState, command: String| {
             state.mode = Some(':');

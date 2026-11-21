@@ -58,6 +58,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.validate_project()?;
             println!("Project is valid.");
         }
+        "backup-archive" => {
+            let path = args.next().ok_or("missing project path")?;
+            let archive = args.next().ok_or("missing destination archive path")?;
+            let mut app = WriterApp::open_project(path)?;
+            app.backup_project_archive(archive)?;
+            println!("Project backup archive created and verified.");
+        }
+        "restore-archive" => {
+            let archive = args.next().ok_or("missing source archive path")?;
+            let destination = args.next().ok_or("missing new project directory")?;
+            WriterApp::restore_project_archive(archive, destination)?;
+            println!("Project archive restored and validated.");
+        }
         "chapter" => {
             let path = args.next().ok_or("missing project path")?;
             let title = args.next().ok_or("missing chapter title")?;
@@ -124,6 +137,66 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 row.scene.title, row.actual_words, row.content_hash
             );
         }
+        "language" => {
+            let path = args.next().ok_or("missing project path")?;
+            let code = args.next();
+            let mut app = WriterApp::open_project(path)?;
+            if let Some(code) = code {
+                app.set_project_language(&code)?;
+            }
+            println!("{}", app.get_project()?.language_code);
+        }
+        "find" => {
+            let path = args.next().ok_or("missing project path")?;
+            let mode = parse_find_mode(&args.next().ok_or("missing mode")?)?;
+            let scope = args.next().ok_or("missing scope: all or scene UUID")?;
+            validate_scene_scope(&scope)?;
+            let pattern = args.collect::<Vec<_>>().join(" ");
+            if pattern.is_empty() {
+                return Err("missing search pattern".into());
+            }
+            let app = WriterApp::open_project(path)?;
+            let scenes = app.list_scenes(false)?;
+            for scene in scenes
+                .into_iter()
+                .filter(|s| scene_matches_scope(s, &scope))
+            {
+                let (text, _) = app.load_scene_text(scene.scene.id)?;
+                for range in story_core::find_matches(&text, &pattern, mode)? {
+                    println!(
+                        "{}\t{}\t{}..{}",
+                        scene.scene.id, scene.scene.title, range.start, range.end
+                    );
+                }
+            }
+        }
+        "replace" => {
+            let path = args.next().ok_or("missing project path")?;
+            let mode = parse_find_mode(&args.next().ok_or("missing mode")?)?;
+            let scope = args.next().ok_or("missing scope: all or scene UUID")?;
+            validate_scene_scope(&scope)?;
+            let rest = args.collect::<Vec<_>>().join(" ");
+            let (pattern, replacement) = rest
+                .split_once(" => ")
+                .ok_or("use: replace PROJECT MODE all|SCENE_UUID PATTERN => REPLACEMENT")?;
+            let mut app = WriterApp::open_project(path)?;
+            let scenes = app.list_scenes(false)?;
+            let mut changed = 0;
+            for scene in scenes
+                .into_iter()
+                .filter(|s| scene_matches_scope(s, &scope))
+            {
+                let (text, hash) = app.load_scene_text(scene.scene.id)?;
+                let (updated, count) =
+                    story_core::replace_matches(&text, pattern, replacement, mode)?;
+                if count > 0 {
+                    app.save_scene_text(scene.scene.id, Some(&hash), &updated)?;
+                    println!("{}\t{} replacements", scene.scene.id, count);
+                    changed += count;
+                }
+            }
+            println!("Total: {changed}");
+        }
         "write" => {
             let path = args.next().ok_or("missing project path")?;
             let id = args.next().ok_or("missing scene id")?.parse()?;
@@ -132,6 +205,254 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let (_, hash) = app.load_scene_text(SceneId(id))?;
             let new = app.save_scene_text(SceneId(id), Some(&hash), &text)?;
             println!("Saved {new}");
+        }
+        "scratchpad-create" => {
+            let path = args.next().ok_or("missing project path")?;
+            let title = args.next().ok_or("missing note title")?;
+            let body = args.next().unwrap_or_default();
+            let mut app = WriterApp::open_project(path)?;
+            println!("{}", app.create_scratchpad_note(&title, &body)?);
+        }
+        "scratchpad-list" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            for note in app.list_scratchpad_notes(true)? {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    note.id,
+                    note.state,
+                    if note.pinned { "pinned" } else { "" },
+                    note.title,
+                    note.body
+                );
+            }
+        }
+        "scratchpad-promote" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = story_core::ScratchpadId(args.next().ok_or("missing note UUID")?.parse()?);
+            let kind = args.next().ok_or("missing destination kind")?;
+            let destination = args.next().ok_or("missing destination UUID")?;
+            let mut app = WriterApp::open_project(path)?;
+            app.promote_scratchpad_note(id, &kind, &destination)?;
+            println!("Promoted {id}; note content is retained.");
+        }
+        "mentions" => {
+            let path = args.next().ok_or("missing project path")?;
+            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let mut app = WriterApp::open_project(path)?;
+            let (text, hash) = app.load_scene_text(scene)?;
+            app.reindex_scene_mentions(scene, &text, &hash)?;
+            for mention in app.list_scene_mentions(scene)? {
+                let candidates = mention
+                    .candidates
+                    .iter()
+                    .map(|candidate| {
+                        format!(
+                            "{}:{} ({})",
+                            candidate.entity_kind, candidate.entity_id, candidate.matched_name
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "{}\t{}\t{}..{}\t{}\t{}",
+                    mention.id,
+                    mention.state,
+                    mention.start_byte,
+                    mention.end_byte,
+                    mention.quote,
+                    candidates
+                );
+            }
+        }
+        "mention-confirm" => {
+            let path = args.next().ok_or("missing project path")?;
+            let mention =
+                story_core::MentionId(args.next().ok_or("missing mention UUID")?.parse()?);
+            let kind = match args.next().as_deref().ok_or("missing entity kind")? {
+                "character" => story_core::MentionEntityKind::Character,
+                "location" => story_core::MentionEntityKind::Location,
+                "object" => story_core::MentionEntityKind::Object,
+                _ => return Err("entity kind must be character, location, or object".into()),
+            };
+            let entity = args.next().ok_or("missing entity UUID")?;
+            let mut app = WriterApp::open_project(path)?;
+            app.confirm_scene_mention(mention, kind, &entity)?;
+        }
+        "mention-dismiss" => {
+            let path = args.next().ok_or("missing project path")?;
+            let mention =
+                story_core::MentionId(args.next().ok_or("missing mention UUID")?.parse()?);
+            let mut app = WriterApp::open_project(path)?;
+            app.dismiss_scene_mention(mention)?;
+        }
+        "object-create" => {
+            let path = args.next().ok_or("missing project path")?;
+            let name = args.next().ok_or("missing object name")?;
+            let description = args.next().unwrap_or_default();
+            let mut app = WriterApp::open_project(path)?;
+            println!("{}", app.create_story_object(&name, &description)?);
+        }
+        "assembly-create" => {
+            let path = args.next().ok_or("missing project path")?;
+            let title = args.next().ok_or("missing assembly title")?;
+            let mut app = WriterApp::open_project(path)?;
+            println!("{}", app.create_assembly(&title)?);
+        }
+        "assembly-list" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            for assembly in app.list_assemblies()? {
+                println!("{}\t{}", assembly.id, assembly.title);
+            }
+        }
+        "assembly-add-scene" => {
+            let path = args.next().ok_or("missing project path")?;
+            let assembly =
+                story_core::AssemblyId(args.next().ok_or("missing assembly UUID")?.parse()?);
+            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let position = args.next().ok_or("missing position")?.parse()?;
+            let mut app = WriterApp::open_project(path)?;
+            println!("{}", app.add_assembly_scene(assembly, scene, position)?);
+        }
+        "assembly-move" => {
+            let path = args.next().ok_or("missing project path")?;
+            let assembly =
+                story_core::AssemblyId(args.next().ok_or("missing assembly UUID")?.parse()?);
+            let item = story_core::AssemblyItemId(args.next().ok_or("missing item UUID")?.parse()?);
+            let position = args.next().ok_or("missing position")?.parse()?;
+            let mut app = WriterApp::open_project(path)?;
+            app.move_assembly_item(assembly, item, position)?;
+        }
+        "assembly-include" => {
+            let path = args.next().ok_or("missing project path")?;
+            let item = story_core::AssemblyItemId(args.next().ok_or("missing item UUID")?.parse()?);
+            let value = match args.next().as_deref().ok_or("use on or off")? {
+                "on" => true,
+                "off" => false,
+                _ => return Err("assembly inclusion must be on or off".into()),
+            };
+            let mut app = WriterApp::open_project(path)?;
+            app.set_assembly_item_included(item, value)?;
+        }
+        "assembly-compile" => {
+            let path = args.next().ok_or("missing project path")?;
+            let assembly =
+                story_core::AssemblyId(args.next().ok_or("missing assembly UUID")?.parse()?);
+            let app = WriterApp::open_project(path)?;
+            print!("{}", app.compile_assembly_markdown(assembly)?);
+        }
+        "assembly-draft-create" => {
+            let path = args.next().ok_or("missing project path")?;
+            let assembly =
+                story_core::AssemblyId(args.next().ok_or("missing assembly UUID")?.parse()?);
+            let mut app = WriterApp::open_project(path)?;
+            let draft = app.create_assembly_draft(assembly)?;
+            println!("{}", draft.id);
+        }
+        "assembly-draft-list" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            for draft in app.list_assembly_drafts()? {
+                println!(
+                    "{}\t{}\t{} scene files",
+                    draft.id,
+                    draft.assembly_id,
+                    draft.items.len()
+                );
+            }
+        }
+        "assembly-draft-set" => {
+            let path = args.next().ok_or("missing project path")?;
+            let draft =
+                story_core::AssemblyDraftId(args.next().ok_or("missing draft UUID")?.parse()?);
+            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let source = args.next().ok_or("missing UTF-8 text file")?;
+            let text = std::fs::read_to_string(source)?;
+            let mut app = WriterApp::open_project(path)?;
+            app.update_assembly_draft_item(draft, scene, &text)?;
+        }
+        "assembly-draft-commit" => {
+            let path = args.next().ok_or("missing project path")?;
+            let draft =
+                story_core::AssemblyDraftId(args.next().ok_or("missing draft UUID")?.parse()?);
+            let mut app = WriterApp::open_project(path)?;
+            app.commit_assembly_draft(draft)?;
+        }
+        "board-create" => {
+            let path = args.next().ok_or("missing project path")?;
+            let title = args.next().ok_or("missing board title")?;
+            let mut app = WriterApp::open_project(path)?;
+            println!("{}", app.create_planning_board(&title)?);
+        }
+        "story-template-import" => {
+            let path = args.next().ok_or("missing project path")?;
+            let source = args.next().ok_or("missing template TOML path")?;
+            let template: story_core::StoryBibleTemplate =
+                toml::from_str(&std::fs::read_to_string(source)?)?;
+            let app = WriterApp::open_project(path)?;
+            app.save_story_bible_template(&template)?;
+            println!("{}", template.id);
+        }
+        "story-template-list" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            for template in app.list_story_bible_templates()? {
+                println!(
+                    "{}\t{}\t{}\t{} fields",
+                    template.id,
+                    template.entity_kind.as_str(),
+                    template.name,
+                    template.fields.len()
+                );
+            }
+        }
+        "story-profile-import" => {
+            let path = args.next().ok_or("missing project path")?;
+            let source = args.next().ok_or("missing profile JSON path")?;
+            let profile: story_core::StoryBibleProfile =
+                serde_json::from_slice(&std::fs::read(source)?)?;
+            let mut app = WriterApp::open_project(path)?;
+            app.save_story_bible_profile(&profile)?;
+            println!(
+                "Stored profile for {} {}",
+                profile.entity_kind.as_str(),
+                profile.entity_id
+            );
+        }
+        "story-profile-show" => {
+            let path = args.next().ok_or("missing project path")?;
+            let kind = parse_story_entity_kind(&args.next().ok_or("missing entity kind")?)?;
+            let id = args.next().ok_or("missing entity UUID")?;
+            let app = WriterApp::open_project(path)?;
+            let profile = app.load_story_bible_profile(kind, &id)?;
+            println!("{}", serde_json::to_string_pretty(&profile)?);
+        }
+        "board-add-scene" => {
+            let path = args.next().ok_or("missing project path")?;
+            let board =
+                story_core::PlanningBoardId(args.next().ok_or("missing board UUID")?.parse()?);
+            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let x = args.next().ok_or("missing x coordinate")?.parse()?;
+            let y = args.next().ok_or("missing y coordinate")?.parse()?;
+            let note = args.next().unwrap_or_default();
+            let mut app = WriterApp::open_project(path)?;
+            println!(
+                "{}",
+                app.add_planning_board_item(board, "scene", &scene.to_string(), x, y, &note)?
+            );
+        }
+        "board-list" => {
+            let path = args.next().ok_or("missing project path")?;
+            let board =
+                story_core::PlanningBoardId(args.next().ok_or("missing board UUID")?.parse()?);
+            let app = WriterApp::open_project(path)?;
+            for item in app.list_planning_board_items(board)? {
+                println!(
+                    "{}\t{}\t{}\t{},{}\t{}",
+                    item.id, item.entity_kind, item.entity_id, item.x, item.y, item.note
+                );
+            }
         }
         "resolve" => {
             let path = args.next().ok_or("missing project path")?;
@@ -474,6 +795,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        "proofread" => {
+            let path = args.next().ok_or("missing project path")?;
+            let scope = args.next().unwrap_or_else(|| "all".into());
+            let app = WriterApp::open_project(path)?;
+            for scene in app
+                .list_scenes(false)?
+                .into_iter()
+                .filter(|scene| scope == "all" || scene.scene.id.to_string() == scope)
+            {
+                let (text, _) = app.load_scene_text(scene.scene.id)?;
+                for finding in story_analysis::proofread(&text) {
+                    println!(
+                        "{}\t{}\t{}..{}\t{}\t{}",
+                        scene.scene.id,
+                        scene.scene.title,
+                        finding.byte_range.start,
+                        finding.byte_range.end,
+                        finding.category,
+                        finding.message
+                    );
+                }
+            }
+        }
         "knowledge" => {
             let path = args.next().ok_or("missing project path")?;
             let app = WriterApp::open_project(path)?;
@@ -693,7 +1037,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     }
     Ok(())
 }
+
+fn parse_find_mode(value: &str) -> Result<story_core::FindMode, Box<dyn std::error::Error>> {
+    Ok(match value.to_ascii_lowercase().as_str() {
+        "normal" => story_core::FindMode::Normal,
+        "extended" => story_core::FindMode::Extended,
+        "regex" => story_core::FindMode::Regex,
+        _ => return Err("mode must be normal, extended, or regex".into()),
+    })
+}
+
+fn validate_scene_scope(scope: &str) -> Result<(), Box<dyn std::error::Error>> {
+    if scope == "all" {
+        return Ok(());
+    }
+    if let Some(chapter) = scope.strip_prefix("chapter:") {
+        let _: uuid::Uuid = chapter.parse()?;
+    } else {
+        let _: uuid::Uuid = scope.parse()?;
+    }
+    Ok(())
+}
+
+fn scene_matches_scope(scene: &story_storage::SceneRecord, scope: &str) -> bool {
+    if scope == "all" {
+        return true;
+    }
+    if let Some(chapter) = scope.strip_prefix("chapter:") {
+        scene.chapter_id.is_some_and(|id| id.to_string() == chapter)
+    } else {
+        scene.scene.id.to_string() == scope
+    }
+}
 fn usage() {
+    eprintln!(
+        "writers-ide find <path> <normal|extended|regex> <all|scene-uuid> <pattern>\nwriters-ide replace <path> <normal|extended|regex> <all|scene-uuid> <pattern> => <replacement>\nwriters-ide language <path> [language-tag]"
+    );
     eprintln!(
         "writers-ide create <path> [title]\nwriters-ide create-kind <path> <fiction|nonfiction|custom> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
     );
@@ -704,6 +1083,22 @@ fn usage() {
     eprintln!(
         "writers-ide create-template <path> <blank-fiction|novel|short-story|blank-nonfiction|nonfiction-book> [title]\nwriters-ide content <path> <chapter|section|front|back> <parent-uuid|-> <title>\nwriters-ide read-content <path> <content-uuid>\nwriters-ide write-content <path> <content-uuid> <text>\nwriters-ide resolve-content <path> <transaction-id> external|prepared\nwriters-ide git-snapshot <path> <label>\nwriters-ide git-history <path>\nwriters-ide git-diff <path> <commit-a> <commit-b> [project-relative-path]"
     );
+    eprintln!(
+        "writers-ide scratchpad-create <path> <title> [body]\nwriters-ide scratchpad-list <path>\nwriters-ide scratchpad-promote <path> <note-uuid> <scene|character|location|object|research> <entity-uuid>\nwriters-ide mentions <path> <scene-uuid>\nwriters-ide mention-confirm <path> <mention-uuid> <character|location|object> <entity-uuid>\nwriters-ide mention-dismiss <path> <mention-uuid>\nwriters-ide object-create <path> <name> [description]\nwriters-ide assembly-draft-create <path> <assembly-uuid>\nwriters-ide assembly-draft-list <path>\nwriters-ide assembly-draft-set <path> <draft-uuid> <scene-uuid> <text.md>\nwriters-ide assembly-draft-commit <path> <draft-uuid>\nwriters-ide board-create <path> <title>\nwriters-ide board-add-scene <path> <board-uuid> <scene-uuid> <x> <y> [note]\nwriters-ide board-list <path> <board-uuid>\nwriters-ide backup-archive <project-path> <archive.zip>\nwriters-ide restore-archive <archive.zip> <new-project-directory>"
+    );
+}
+
+fn parse_story_entity_kind(
+    value: &str,
+) -> Result<story_core::StoryBibleEntityKind, Box<dyn std::error::Error>> {
+    match value {
+        "character" => Ok(story_core::StoryBibleEntityKind::Character),
+        "location" => Ok(story_core::StoryBibleEntityKind::Location),
+        "object" => Ok(story_core::StoryBibleEntityKind::Object),
+        "plotline" => Ok(story_core::StoryBibleEntityKind::Plotline),
+        "event" => Ok(story_core::StoryBibleEntityKind::Event),
+        _ => Err("entity kind must be character, location, object, plotline, or event".into()),
+    }
 }
 fn parse_status(value: &str) -> Result<story_core::SceneStatus, Box<dyn std::error::Error>> {
     use story_core::SceneStatus::*;

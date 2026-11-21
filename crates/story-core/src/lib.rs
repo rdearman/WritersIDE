@@ -1,7 +1,117 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
+use unicode_segmentation::UnicodeSegmentation;
 use uuid::Uuid;
+
+/// Counts Unicode word-boundary segments, independent of the operating system locale.
+/// This gives consistent counts for multilingual prose, including scripts without spaces.
+pub fn count_words(text: &str) -> u32 {
+    text.unicode_words().count().min(u32::MAX as usize) as u32
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FindMode {
+    Normal,
+    Extended,
+    Regex,
+}
+
+pub fn find_matches(
+    text: &str,
+    pattern: &str,
+    mode: FindMode,
+) -> Result<Vec<std::ops::Range<usize>>, String> {
+    if pattern.is_empty() {
+        return Err("search pattern cannot be empty".into());
+    }
+    let source = match mode {
+        FindMode::Normal => regex::escape(pattern),
+        FindMode::Extended => regex::escape(&decode_extended(pattern)?),
+        FindMode::Regex => pattern.to_owned(),
+    };
+    let re = regex::Regex::new(&source).map_err(|e| format!("invalid regular expression: {e}"))?;
+    Ok(re.find_iter(text).map(|m| m.start()..m.end()).collect())
+}
+
+pub fn replace_matches(
+    text: &str,
+    pattern: &str,
+    replacement: &str,
+    mode: FindMode,
+) -> Result<(String, usize), String> {
+    if pattern.is_empty() {
+        return Err("search pattern cannot be empty".into());
+    }
+    let (source, replacement) = match mode {
+        FindMode::Normal => (regex::escape(pattern), replacement.to_owned()),
+        FindMode::Extended => (
+            regex::escape(&decode_extended(pattern)?),
+            decode_extended(replacement)?,
+        ),
+        FindMode::Regex => (pattern.to_owned(), replacement.to_owned()),
+    };
+    let re = regex::Regex::new(&source).map_err(|e| format!("invalid regular expression: {e}"))?;
+    let count = re.find_iter(text).count();
+    Ok((
+        re.replace_all(text, replacement.as_str()).into_owned(),
+        count,
+    ))
+}
+
+fn decode_extended(text: &str) -> Result<String, String> {
+    let mut result = String::new();
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            result.push(
+                match chars.next().ok_or("trailing escape in extended search")? {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '\\' => '\\',
+                    other => return Err(format!("unsupported escape \\{other}")),
+                },
+            );
+        } else {
+            result.push(ch);
+        }
+    }
+    Ok(result)
+}
+
+#[cfg(test)]
+mod multilingual_tests {
+    use super::count_words;
+
+    #[test]
+    fn word_count_uses_unicode_boundaries_for_multilingual_text() {
+        assert_eq!(count_words("café déjà-vu l’esprit"), 4);
+        assert_eq!(count_words("你好 世界"), 4);
+        assert_eq!(count_words(""), 0);
+    }
+
+    #[test]
+    fn find_replace_support_normal_extended_and_regex_modes() {
+        use super::{FindMode, find_matches, replace_matches};
+        let source = "one\ntwo 22";
+        assert_eq!(
+            find_matches(source, "two", FindMode::Normal).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            find_matches(source, r"\ntwo", FindMode::Extended)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            replace_matches(source, r"(\w+) (\d+)", "$2 $1", FindMode::Regex).unwrap(),
+            ("one\n22 two".to_owned(), 1)
+        );
+        assert!(find_matches(source, "[", FindMode::Regex).is_err());
+    }
+}
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -50,6 +160,137 @@ id_type!(ReadingTermId);
 id_type!(SnapshotId);
 id_type!(KnowledgeClaimId);
 id_type!(ContentUnitId);
+id_type!(StoryObjectId);
+id_type!(MentionId);
+id_type!(ScratchpadId);
+id_type!(PersonalCommentId);
+id_type!(AssemblyId);
+id_type!(AssemblyItemId);
+id_type!(PlanningBoardId);
+id_type!(PlanningBoardItemId);
+id_type!(PlanningBoardConnectorId);
+id_type!(AssemblyDraftId);
+id_type!(StoryBibleTemplateId);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryBibleEntityKind {
+    Character,
+    Location,
+    Object,
+    Plotline,
+    Event,
+}
+impl StoryBibleEntityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Character => "character",
+            Self::Location => "location",
+            Self::Object => "object",
+            Self::Plotline => "plotline",
+            Self::Event => "event",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoryBibleFieldType {
+    Text,
+    LongText,
+    Integer,
+    Decimal,
+    Boolean,
+    DateTime,
+    Enum,
+    EntityRef,
+    EntityRefs,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoryBibleFieldDefinition {
+    pub id: String,
+    pub label: String,
+    pub field_type: StoryBibleFieldType,
+    pub required: bool,
+    pub enum_values: Vec<String>,
+    pub reference_kind: Option<StoryBibleEntityKind>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoryBibleTemplate {
+    pub id: StoryBibleTemplateId,
+    pub name: String,
+    pub entity_kind: StoryBibleEntityKind,
+    pub fields: Vec<StoryBibleFieldDefinition>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum StoryBibleFieldValue {
+    Text(String),
+    LongText(String),
+    Integer(i64),
+    Decimal(String),
+    Boolean(bool),
+    DateTime(String),
+    Enum(String),
+    EntityRef(String),
+    EntityRefs(Vec<String>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoryBibleProfile {
+    pub entity_kind: StoryBibleEntityKind,
+    pub entity_id: String,
+    pub template_id: StoryBibleTemplateId,
+    pub values: BTreeMap<String, StoryBibleFieldValue>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssemblyDraftItem {
+    pub scene_id: SceneId,
+    pub expected_hash: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssemblyDraft {
+    pub id: AssemblyDraftId,
+    pub assembly_id: AssemblyId,
+    pub project_id: ProjectId,
+    pub created_at: String,
+    pub items: Vec<AssemblyDraftItem>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MentionEntityKind {
+    Character,
+    Location,
+    Object,
+}
+impl MentionEntityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Character => "character",
+            Self::Location => "location",
+            Self::Object => "object",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScratchpadNote {
+    pub id: ScratchpadId,
+    pub title: String,
+    pub body: String,
+    pub pinned: bool,
+    pub position: u32,
+    pub state: String,
+    pub destination_kind: Option<String>,
+    pub destination_id: Option<String>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotRestoreSelection {
@@ -397,6 +638,12 @@ pub struct Project {
     pub target_words: Option<u64>,
     pub story_epoch_label: String,
     pub story_calendar_id: Option<String>,
+    #[serde(default = "default_language_code")]
+    pub language_code: String,
+}
+
+pub fn default_language_code() -> String {
+    "en".to_owned()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

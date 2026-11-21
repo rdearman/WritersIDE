@@ -14,9 +14,11 @@ story-pipeline = { path = "../../crates/story-pipeline" }
 toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
 story-ollama = { path = "../../crates/story-ollama" }
 ratatui.workspace = true
 crossterm.workspace = true
+unicode-segmentation.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

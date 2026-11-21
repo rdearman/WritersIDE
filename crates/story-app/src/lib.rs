@@ -26,6 +26,9 @@ pub struct WriterApp {
     store: ProjectStore,
 }
 impl WriterApp {
+    pub fn project_root(&self) -> &Path {
+        self.store.project_root()
+    }
     pub fn create_project(path: impl AsRef<Path>, title: &str) -> Result<Self> {
         Ok(Self {
             store: ProjectStore::create(path, title)?,
@@ -47,6 +50,7 @@ impl WriterApp {
             target_words: None,
             story_epoch_label: "Day 0".into(),
             story_calendar_id: None,
+            language_code: default_language_code(),
         };
         Self::create_project_with_metadata(path, &project)
     }
@@ -66,6 +70,7 @@ impl WriterApp {
             target_words: None,
             story_epoch_label: "Day 0".into(),
             story_calendar_id: None,
+            language_code: default_language_code(),
         };
         Self::create_project_with_metadata(path, &project)
     }
@@ -76,6 +81,9 @@ impl WriterApp {
     }
     pub fn get_project(&self) -> Result<Project> {
         Ok(self.store.get_project()?)
+    }
+    pub fn set_project_language(&mut self, language_code: &str) -> Result<()> {
+        Ok(self.store.set_project_language(language_code)?)
     }
     pub fn open_project(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
@@ -922,6 +930,290 @@ impl WriterApp {
     ) -> Result<String> {
         Ok(self.store.save_text(id, expected_hash, text)?)
     }
+    pub fn create_story_object(&mut self, name: &str, description: &str) -> Result<StoryObjectId> {
+        Ok(self.store.create_story_object(name, description)?)
+    }
+    pub fn list_story_objects(&self) -> Result<Vec<story_storage::StoryObjectRecord>> {
+        Ok(self.store.list_story_objects()?)
+    }
+    pub fn list_scene_mentions(
+        &self,
+        scene: SceneId,
+    ) -> Result<Vec<story_storage::DetectedMentionRecord>> {
+        Ok(self.store.list_scene_mentions(scene)?)
+    }
+    pub fn reindex_scene_mentions(&mut self, scene: SceneId, text: &str, hash: &str) -> Result<()> {
+        Ok(self.store.reindex_scene_mentions(scene, text, hash)?)
+    }
+    pub fn confirm_scene_mention(
+        &mut self,
+        mention: MentionId,
+        kind: MentionEntityKind,
+        entity_id: &str,
+    ) -> Result<()> {
+        Ok(self.store.confirm_scene_mention(mention, kind, entity_id)?)
+    }
+    pub fn dismiss_scene_mention(&mut self, mention: MentionId) -> Result<()> {
+        Ok(self.store.dismiss_scene_mention(mention)?)
+    }
+    pub fn create_personal_comment(
+        &mut self,
+        scene: SceneId,
+        start: u64,
+        end: u64,
+        quote: &str,
+        body: &str,
+    ) -> Result<PersonalCommentId> {
+        Ok(self
+            .store
+            .create_personal_comment(scene, start, end, quote, body)?)
+    }
+    pub fn create_assembly(&mut self, title: &str) -> Result<AssemblyId> {
+        Ok(self.store.create_assembly(title)?)
+    }
+
+    pub fn create_assembly_draft(&mut self, assembly: AssemblyId) -> Result<AssemblyDraft> {
+        Ok(self.store.create_assembly_draft(assembly)?)
+    }
+
+    pub fn load_assembly_draft(&self, id: AssemblyDraftId) -> Result<AssemblyDraft> {
+        Ok(self.store.load_assembly_draft(id)?)
+    }
+
+    pub fn list_assembly_drafts(&self) -> Result<Vec<AssemblyDraft>> {
+        Ok(self.store.list_assembly_drafts()?)
+    }
+
+    pub fn update_assembly_draft_item(
+        &mut self,
+        draft: AssemblyDraftId,
+        scene: SceneId,
+        text: &str,
+    ) -> Result<()> {
+        Ok(self.store.update_assembly_draft_item(draft, scene, text)?)
+    }
+
+    pub fn replace_assembly_draft_items(
+        &mut self,
+        draft: AssemblyDraftId,
+        items: &[(SceneId, String)],
+    ) -> Result<()> {
+        Ok(self.store.replace_assembly_draft_items(draft, items)?)
+    }
+
+    pub fn commit_assembly_draft(&mut self, draft: AssemblyDraftId) -> Result<()> {
+        Ok(self.store.commit_assembly_draft(draft)?)
+    }
+
+    pub fn create_planning_board(&mut self, title: &str) -> Result<PlanningBoardId> {
+        Ok(self.store.create_planning_board(title)?)
+    }
+
+    pub fn list_planning_boards(&self) -> Result<Vec<story_storage::PlanningBoardSummary>> {
+        Ok(self.store.list_planning_boards()?)
+    }
+
+    pub fn save_story_bible_template(&self, template: &StoryBibleTemplate) -> Result<()> {
+        Ok(self.store.save_story_bible_template(template)?)
+    }
+
+    pub fn list_story_bible_templates(&self) -> Result<Vec<StoryBibleTemplate>> {
+        Ok(self.store.list_story_bible_templates()?)
+    }
+
+    pub fn load_story_bible_template(
+        &self,
+        id: StoryBibleTemplateId,
+    ) -> Result<StoryBibleTemplate> {
+        Ok(self.store.load_story_bible_template(id)?)
+    }
+
+    pub fn save_story_bible_profile(&mut self, profile: &StoryBibleProfile) -> Result<()> {
+        Ok(self.store.save_story_bible_profile(profile)?)
+    }
+
+    pub fn load_story_bible_profile(
+        &self,
+        kind: StoryBibleEntityKind,
+        id: &str,
+    ) -> Result<StoryBibleProfile> {
+        Ok(self.store.load_story_bible_profile(kind, id)?)
+    }
+
+    pub fn add_planning_board_item(
+        &mut self,
+        board: PlanningBoardId,
+        kind: &str,
+        entity_id: &str,
+        x: f64,
+        y: f64,
+        note: &str,
+    ) -> Result<PlanningBoardItemId> {
+        Ok(self
+            .store
+            .add_planning_board_item(board, kind, entity_id, x, y, note)?)
+    }
+
+    pub fn list_planning_board_items(
+        &self,
+        board: PlanningBoardId,
+    ) -> Result<Vec<story_storage::PlanningBoardItemRecord>> {
+        Ok(self.store.list_planning_board_items(board)?)
+    }
+
+    pub fn move_planning_board_item(
+        &mut self,
+        item: PlanningBoardItemId,
+        x: f64,
+        y: f64,
+    ) -> Result<()> {
+        Ok(self.store.move_planning_board_item(item, x, y)?)
+    }
+
+    pub fn connect_planning_board_items(
+        &mut self,
+        board: PlanningBoardId,
+        source: PlanningBoardItemId,
+        target: PlanningBoardItemId,
+        label: &str,
+    ) -> Result<PlanningBoardConnectorId> {
+        Ok(self
+            .store
+            .connect_planning_board_items(board, source, target, label)?)
+    }
+    pub fn list_assemblies(&self) -> Result<Vec<story_storage::AssemblySummary>> {
+        Ok(self.store.list_assemblies()?)
+    }
+    pub fn list_assembly_items(
+        &self,
+        assembly: AssemblyId,
+    ) -> Result<Vec<story_storage::AssemblyItemRecord>> {
+        Ok(self.store.list_assembly_items(assembly)?)
+    }
+    pub fn add_assembly_scene(
+        &mut self,
+        assembly: AssemblyId,
+        scene: SceneId,
+        position: u32,
+    ) -> Result<AssemblyItemId> {
+        Ok(self.store.add_assembly_scene(assembly, scene, position)?)
+    }
+    pub fn add_assembly_content_unit(
+        &mut self,
+        assembly: AssemblyId,
+        content: ContentUnitId,
+        position: u32,
+    ) -> Result<AssemblyItemId> {
+        Ok(self
+            .store
+            .add_assembly_content_unit(assembly, content, position)?)
+    }
+    pub fn move_assembly_item(
+        &mut self,
+        assembly: AssemblyId,
+        item: AssemblyItemId,
+        position: u32,
+    ) -> Result<()> {
+        Ok(self.store.move_assembly_item(assembly, item, position)?)
+    }
+    pub fn set_assembly_item_included(
+        &mut self,
+        item: AssemblyItemId,
+        included: bool,
+    ) -> Result<()> {
+        Ok(self.store.set_assembly_item_included(item, included)?)
+    }
+    pub fn compile_assembly_markdown(&self, assembly: AssemblyId) -> Result<String> {
+        let title = self
+            .store
+            .list_assemblies()?
+            .into_iter()
+            .find(|item| item.id == assembly)
+            .ok_or_else(|| StorageError::NotFound(assembly.to_string()))?
+            .title;
+        let mut ir = story_document::CompileIr::new(&title);
+        for item in self.store.list_assembly_items(assembly)? {
+            if !item.included {
+                continue;
+            }
+            let (kind, title, source_id, text) = if let Some(scene) = item.scene_id {
+                let row = self.store.get_scene(scene)?;
+                let (text, _) = self.store.load_text(scene)?;
+                (
+                    story_document::ContentUnitKind::Scene,
+                    row.scene.title,
+                    scene.to_string(),
+                    text,
+                )
+            } else if let Some(content) = item.content_unit_id {
+                let row = self.store.get_content_unit(content)?;
+                let (text, _) = self.store.load_content_unit_text(content)?;
+                let kind = match row.kind {
+                    ContentUnitKind::FrontMatter => story_document::ContentUnitKind::FrontMatter,
+                    ContentUnitKind::SectionBody => story_document::ContentUnitKind::SectionBody,
+                    ContentUnitKind::ChapterBody => story_document::ContentUnitKind::ChapterBody,
+                    ContentUnitKind::BackMatter => story_document::ContentUnitKind::BackMatter,
+                };
+                (kind, row.title, content.to_string(), text)
+            } else {
+                return Err(AppError::Domain(
+                    "assembly item has no source entity".into(),
+                ));
+            };
+            ir.push(story_document::CompileUnit {
+                id: item.id.to_string(),
+                parent_id: None,
+                kind,
+                title,
+                segments: vec![story_document::CompileSegment::new(source_id, text)],
+            });
+        }
+        if !ir.validate() {
+            return Err(AppError::Domain(
+                "assembly produced invalid Compile IR".into(),
+            ));
+        }
+        let (content, _) = ir.render_markdown();
+        Ok(format!("# {title}\n\n{content}"))
+    }
+    pub fn list_scene_comments(
+        &self,
+        scene: SceneId,
+    ) -> Result<Vec<story_storage::PersonalCommentRecord>> {
+        Ok(self.store.list_scene_comments(scene)?)
+    }
+    pub fn set_personal_comment_state(
+        &mut self,
+        comment: PersonalCommentId,
+        state: &str,
+    ) -> Result<()> {
+        Ok(self.store.set_personal_comment_state(comment, state)?)
+    }
+    pub fn create_scratchpad_note(&mut self, title: &str, body: &str) -> Result<ScratchpadId> {
+        Ok(self.store.create_scratchpad_note(title, body)?)
+    }
+    pub fn list_scratchpad_notes(&self, include_archived: bool) -> Result<Vec<ScratchpadNote>> {
+        Ok(self.store.list_scratchpad_notes(include_archived)?)
+    }
+    pub fn update_scratchpad_note(
+        &mut self,
+        id: ScratchpadId,
+        title: &str,
+        body: &str,
+        pinned: bool,
+    ) -> Result<()> {
+        Ok(self.store.update_scratchpad_note(id, title, body, pinned)?)
+    }
+    pub fn promote_scratchpad_note(
+        &mut self,
+        id: ScratchpadId,
+        destination_kind: &str,
+        destination_id: &str,
+    ) -> Result<()> {
+        Ok(self
+            .store
+            .promote_scratchpad_note(id, destination_kind, destination_id)?)
+    }
     pub fn load_scene_text(&self, id: SceneId) -> Result<(String, String)> {
         Ok(self.store.load_text(id)?)
     }
@@ -944,6 +1236,15 @@ impl WriterApp {
     }
     pub fn backup_project(&mut self, destination: impl AsRef<Path>) -> Result<()> {
         Ok(self.store.backup_to(destination)?)
+    }
+    pub fn backup_project_archive(&mut self, destination: impl AsRef<Path>) -> Result<()> {
+        Ok(self.store.backup_archive_to(destination)?)
+    }
+    pub fn restore_project_archive(
+        archive: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        Ok(ProjectStore::restore_archive_to(archive, destination)?)
     }
     pub fn git_snapshot(&mut self, label: &str) -> Result<Option<String>> {
         let author = self.get_project()?.author;
@@ -1387,5 +1688,38 @@ mod tests {
         drop(app);
         let app = WriterApp::open_project(dir.path().join("Novel")).unwrap();
         assert_eq!(app.get_character(id).unwrap(), character);
+    }
+
+    #[test]
+    fn assembly_compile_uses_alternate_order_and_exclusion_without_mutating_canonical_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        for (scene, content) in [
+            (first, "First canonical prose."),
+            (second, "Second canonical prose."),
+        ] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), content).unwrap();
+        }
+        let assembly = app.create_assembly("Audio Edition").unwrap();
+        let first_item = app.add_assembly_scene(assembly, first, 0).unwrap();
+        let second_item = app.add_assembly_scene(assembly, second, 1).unwrap();
+        app.move_assembly_item(assembly, second_item, 0).unwrap();
+        app.set_assembly_item_included(first_item, false).unwrap();
+        let compiled = app.compile_assembly_markdown(assembly).unwrap();
+        assert!(compiled.contains("Audio Edition"));
+        assert!(compiled.contains("Second canonical prose."));
+        assert!(!compiled.contains("First canonical prose."));
+        assert_eq!(
+            app.list_scenes(false)
+                .unwrap()
+                .into_iter()
+                .map(|scene| scene.scene.id)
+                .collect::<Vec<_>>(),
+            [first, second]
+        );
     }
 }

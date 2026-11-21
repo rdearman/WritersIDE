@@ -24,6 +24,11 @@ const MIGRATION_9: &str = include_str!("../migrations/0009_reading_document_link
 const MIGRATION_10: &str = include_str!("../migrations/0010_character_profiles.sql");
 const MIGRATION_11: &str = include_str!("../migrations/0011_book_types_content_units.sql");
 const MIGRATION_12: &str = include_str!("../migrations/0012_project_template.sql");
+const MIGRATION_13: &str = include_str!("../migrations/0013_writing_workflow.sql");
+const MIGRATION_14: &str = include_str!("../migrations/0014_editorial_comments.sql");
+const MIGRATION_15: &str = include_str!("../migrations/0015_manuscript_assemblies.sql");
+const MIGRATION_16: &str = include_str!("../migrations/0016_planning_boards.sql");
+const MIGRATION_17: &str = include_str!("../migrations/0017_project_language.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -31,6 +36,8 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("SQLite: {0}")]
     Sql(#[from] rusqlite::Error),
+    #[error("backup archive: {0}")]
+    Archive(#[from] zip::result::ZipError),
     #[error("project configuration: {0}")]
     Config(String),
     #[error("project identity mismatch: config {config}, database {database}")]
@@ -152,6 +159,88 @@ pub struct ProjectSearchHit {
     pub entity_id: String,
     pub title: String,
     pub excerpt: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MentionCandidate {
+    pub entity_kind: String,
+    pub entity_id: String,
+    pub matched_name: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DetectedMentionRecord {
+    pub id: MentionId,
+    pub scene_id: SceneId,
+    pub start_byte: u64,
+    pub end_byte: u64,
+    pub quote: String,
+    pub state: String,
+    pub entity_kind: Option<String>,
+    pub entity_id: Option<String>,
+    pub candidates: Vec<MentionCandidate>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoryObjectRecord {
+    pub id: StoryObjectId,
+    pub name: String,
+    pub description: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersonalCommentRecord {
+    pub id: PersonalCommentId,
+    pub scene_id: SceneId,
+    pub anchor_id: Option<AnchorId>,
+    pub quote: Option<String>,
+    pub start_byte: Option<u64>,
+    pub end_byte: Option<u64>,
+    pub anchor_state: Option<String>,
+    pub body: String,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssemblySummary {
+    pub id: AssemblyId,
+    pub title: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AssemblyItemRecord {
+    pub id: AssemblyItemId,
+    pub assembly_id: AssemblyId,
+    pub position: u32,
+    pub scene_id: Option<SceneId>,
+    pub content_unit_id: Option<ContentUnitId>,
+    pub included: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlanningBoardItemRecord {
+    pub id: PlanningBoardItemId,
+    pub board_id: PlanningBoardId,
+    pub entity_kind: String,
+    pub entity_id: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub note: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanningBoardSummary {
+    pub id: PlanningBoardId,
+    pub title: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct BackupManifest {
+    format_version: u32,
+    project_id: String,
+    files: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -350,6 +439,7 @@ impl ProjectStore {
             target_words: None,
             story_epoch_label: "Day 0".into(),
             story_calendar_id: None,
+            language_code: default_language_code(),
         };
         Self::create_for(root, &project)
     }
@@ -394,8 +484,13 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_10}\nINSERT INTO schema_migrations(version,applied_at) VALUES(10,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_11}\nINSERT INTO schema_migrations(version,applied_at) VALUES(11,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_12}\nINSERT INTO schema_migrations(version,applied_at) VALUES(12,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_13}\nINSERT INTO schema_migrations(version,applied_at) VALUES(13,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_14}\nINSERT INTO schema_migrations(version,applied_at) VALUES(14,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_15}\nINSERT INTO schema_migrations(version,applied_at) VALUES(15,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_16}\nINSERT INTO schema_migrations(version,applied_at) VALUES(16,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_17}\nINSERT INTO schema_migrations(version,applied_at) VALUES(17,'{}');\nCOMMIT;", now()))?;
         let now = now();
-        conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id])?;
+        conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
             root: root.to_path_buf(),
             conn,
@@ -436,7 +531,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 12 {
+        if version > 17 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -485,6 +580,26 @@ impl ProjectStore {
         }
         if current_version == 11 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_12}\nINSERT INTO schema_migrations(version,applied_at) VALUES(12,'{}');\nCOMMIT;", now()))?;
+            current_version = 12;
+        }
+        if current_version == 12 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_13}\nINSERT INTO schema_migrations(version,applied_at) VALUES(13,'{}');\nCOMMIT;", now()))?;
+            current_version = 13;
+        }
+        if current_version == 13 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_14}\nINSERT INTO schema_migrations(version,applied_at) VALUES(14,'{}');\nCOMMIT;", now()))?;
+            current_version = 14;
+        }
+        if current_version == 14 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_15}\nINSERT INTO schema_migrations(version,applied_at) VALUES(15,'{}');\nCOMMIT;", now()))?;
+            current_version = 15;
+        }
+        if current_version == 15 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_16}\nINSERT INTO schema_migrations(version,applied_at) VALUES(16,'{}');\nCOMMIT;", now()))?;
+            current_version = 16;
+        }
+        if current_version == 16 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_17}\nINSERT INTO schema_migrations(version,applied_at) VALUES(17,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -680,7 +795,35 @@ impl ProjectStore {
             target_words: row.5,
             story_epoch_label: row.6,
             story_calendar_id: row.7,
+            language_code: self.conn.query_row(
+                "SELECT language_code FROM project WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?,
         })
+    }
+    pub fn set_project_language(&mut self, language_code: &str) -> Result<()> {
+        let parts = language_code.split('-').collect::<Vec<_>>();
+        if parts.is_empty()
+            || parts[0].len() < 2
+            || parts[0].len() > 8
+            || !parts[0].bytes().all(|b| b.is_ascii_alphabetic())
+            || parts.iter().skip(1).any(|part| {
+                part.is_empty()
+                    || part.len() > 8
+                    || !part.bytes().all(|b| b.is_ascii_alphanumeric())
+            })
+        {
+            return Err(StorageError::Invalid(
+                "language must be a valid BCP-47-style language tag (for example en or fr-CA)"
+                    .into(),
+            ));
+        }
+        self.conn.execute(
+            "UPDATE project SET language_code=?1,updated_at=?2 WHERE singleton=1",
+            params![language_code, now()],
+        )?;
+        Ok(())
     }
     pub fn backup_to(&mut self, destination: impl AsRef<Path>) -> Result<()> {
         let destination = destination.as_ref();
@@ -746,6 +889,150 @@ impl ProjectStore {
         fs::rename(&stage, destination)?;
         sync_dir(parent)?;
         Ok(())
+    }
+
+    pub fn backup_archive_to(&mut self, destination: impl AsRef<Path>) -> Result<()> {
+        let destination = destination.as_ref();
+        if destination.exists() {
+            return Err(StorageError::Invalid(
+                "backup archive destination already exists".into(),
+            ));
+        }
+        if destination.starts_with(&self.root) || self.root.starts_with(destination) {
+            return Err(StorageError::Invalid(
+                "backup archive must be outside the project directory".into(),
+            ));
+        }
+        self.validate()?;
+        let parent = destination.parent().ok_or_else(|| {
+            StorageError::Invalid("backup archive needs a parent directory".into())
+        })?;
+        fs::create_dir_all(parent)?;
+        let stage = parent.join(format!(".writers-ide-backup-{}", Uuid::new_v4()));
+        fs::create_dir(&stage)?;
+        let result = (|| -> Result<()> {
+            let payload = stage.join("project");
+            self.backup_to(&payload)?;
+            let mut files = Vec::new();
+            collect_regular_files(&payload, &payload, &mut files)?;
+            files.sort();
+            let mut hashes = std::collections::BTreeMap::new();
+            for relative in &files {
+                let bytes = fs::read(payload.join(relative))?;
+                hashes.insert(
+                    relative.to_string_lossy().replace('\\', "/"),
+                    hash_bytes(&bytes),
+                );
+            }
+            let project_id = self.get_project()?.id.to_string();
+            let manifest = BackupManifest {
+                format_version: 1,
+                project_id,
+                files: hashes,
+            };
+            let archive_file = File::create(stage.join("archive.zip"))?;
+            let mut archive = zip::ZipWriter::new(archive_file);
+            let options = zip::write::FileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for relative in &files {
+                let name = relative.to_string_lossy().replace('\\', "/");
+                archive.start_file(name, options)?;
+                archive.write_all(&fs::read(payload.join(relative))?)?;
+            }
+            archive.start_file("manifest.json", options)?;
+            archive.write_all(&serde_json::to_vec_pretty(&manifest).map_err(|error| {
+                StorageError::Invalid(format!("serialize backup manifest: {error}"))
+            })?)?;
+            let archive_file = archive.finish()?;
+            archive_file.sync_all()?;
+            fs::rename(stage.join("archive.zip"), destination)?;
+            sync_dir(parent)?;
+            Ok(())
+        })();
+        let _ = fs::remove_dir_all(&stage);
+        result
+    }
+
+    pub fn restore_archive_to(
+        archive_path: impl AsRef<Path>,
+        destination: impl AsRef<Path>,
+    ) -> Result<()> {
+        let archive_path = archive_path.as_ref();
+        let destination = destination.as_ref();
+        if destination.exists() {
+            return Err(StorageError::Invalid(
+                "restore destination already exists".into(),
+            ));
+        }
+        let parent = destination.parent().ok_or_else(|| {
+            StorageError::Invalid("restore destination needs a parent directory".into())
+        })?;
+        fs::create_dir_all(parent)?;
+        let stage = parent.join(format!(".writers-ide-restore-{}", Uuid::new_v4()));
+        fs::create_dir(&stage)?;
+        let result = (|| -> Result<()> {
+            let file = File::open(archive_path)?;
+            let mut archive = zip::ZipArchive::new(file)?;
+            let mut observed = std::collections::BTreeMap::new();
+            for index in 0..archive.len() {
+                let mut entry = archive.by_index(index)?;
+                let name = entry.name().to_owned();
+                if name == "manifest.json" {
+                    continue;
+                }
+                let relative = safe_archive_path(&name)?;
+                if let Some(mode) = entry.unix_mode()
+                    && mode & 0o170000 != 0
+                    && mode & 0o170000 != 0o100000
+                {
+                    return Err(StorageError::Invalid(
+                        "backup archive contains a non-regular file".into(),
+                    ));
+                }
+                let output = stage.join(&relative);
+                let output_parent = output
+                    .parent()
+                    .ok_or_else(|| StorageError::Invalid("invalid archive file path".into()))?;
+                fs::create_dir_all(output_parent)?;
+                let mut target = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&output)?;
+                std::io::copy(&mut entry, &mut target)?;
+                target.sync_all()?;
+                let normalized = relative.to_string_lossy().replace('\\', "/");
+                observed.insert(normalized, hash_file(&output)?);
+            }
+            let manifest: BackupManifest = {
+                let mut entry = archive.by_name("manifest.json")?;
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes)?;
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    StorageError::Invalid(format!("invalid backup manifest: {error}"))
+                })?
+            };
+            if manifest.format_version != 1 || observed != manifest.files {
+                return Err(StorageError::Invalid(
+                    "backup manifest contents or hashes do not match the archive".into(),
+                ));
+            }
+            fs::create_dir_all(stage.join(".writers-ide/recovery"))?;
+            let project = ProjectStore::open(&stage)?;
+            if project.get_project()?.id.to_string() != manifest.project_id {
+                return Err(StorageError::IdentityMismatch {
+                    config: manifest.project_id,
+                    database: project.get_project()?.id.to_string(),
+                });
+            }
+            project.validate()?;
+            fs::rename(&stage, destination)?;
+            sync_dir(parent)?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_dir_all(&stage);
+        }
+        result
     }
     /// Exports and consumes a single consistent project revision while SQLite's writer barrier
     /// prevents journaled file replacements from crossing the snapshot boundary.
@@ -1878,7 +2165,7 @@ impl ProjectStore {
             let tx = self
                 .conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)?;
-            tx.execute("UPDATE content_unit SET sha256=?2,byte_length=?3,word_count=?4,generation=?5,updated_at=?6 WHERE id=?1",params![id.to_string(),new_hash,bytes.len() as i64,text.split_whitespace().count() as i64,generation,now()])?;
+            tx.execute("UPDATE content_unit SET sha256=?2,byte_length=?3,word_count=?4,generation=?5,updated_at=?6 WHERE id=?1",params![id.to_string(),new_hash,bytes.len() as i64,count_words(text) as i64,generation,now()])?;
             tx.execute(
                 "UPDATE content_unit_search_content SET content=?2 WHERE content_unit_id=?1",
                 params![id.to_string(), text],
@@ -2117,7 +2404,7 @@ impl ProjectStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("UPDATE content_unit SET sha256=?2,byte_length=?3,word_count=?4,generation=?5,updated_at=?6 WHERE id=?1",params![id,hash,length,content.split_whitespace().count() as i64,generation,now()])?;
+        tx.execute("UPDATE content_unit SET sha256=?2,byte_length=?3,word_count=?4,generation=?5,updated_at=?6 WHERE id=?1",params![id,hash,length,count_words(&content) as i64,generation,now()])?;
         tx.execute(
             "UPDATE content_unit_search_content SET content=?2 WHERE content_unit_id=?1",
             params![id, content],
@@ -2248,6 +2535,7 @@ impl ProjectStore {
                 [&txid],
             )?;
             update_scene_index(&tx, id, text)?;
+            refresh_scene_mentions(&tx, id, text, &new_hash)?;
             if new_hash != current {
                 revalidate_scene_anchors(&tx, id, text, &new_hash)?;
             }
@@ -2557,6 +2845,7 @@ impl ProjectStore {
             params![sid, new, len, generation],
         )?;
         update_scene_index(&tx, scene, &text)?;
+        refresh_scene_mentions(&tx, scene, &text, new)?;
         revalidate_scene_anchors(&tx, scene, &text, new)?;
         tx.execute(
             "UPDATE write_journal SET state='db_committed' WHERE tx_id=?1",
@@ -2584,6 +2873,7 @@ impl ProjectStore {
             params![sid, hash, len, generation],
         )?;
         update_scene_index(&tx, scene, &text)?;
+        refresh_scene_mentions(&tx, scene, &text, hash)?;
         revalidate_scene_anchors(&tx, scene, &text, hash)?;
         tx.execute("DELETE FROM write_journal WHERE tx_id=?1", [txid])?;
         tx.execute(
@@ -2702,6 +2992,975 @@ impl ProjectStore {
         })
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
+    }
+
+    pub fn create_story_object(&mut self, name: &str, description: &str) -> Result<StoryObjectId> {
+        if name.trim().is_empty() {
+            return Err(StorageError::Invalid("object name cannot be empty".into()));
+        }
+        let id = StoryObjectId::new();
+        self.conn.execute(
+            "INSERT INTO story_object(id,name,description) VALUES(?1,?2,?3)",
+            params![id.to_string(), name.trim(), description],
+        )?;
+        Ok(id)
+    }
+
+    fn story_bible_template_path(&self, id: StoryBibleTemplateId) -> Result<PathBuf> {
+        self.safe_path(
+            &Path::new("templates")
+                .join("story-bible")
+                .join(format!("{id}.toml")),
+        )
+    }
+
+    pub fn save_story_bible_template(&self, template: &StoryBibleTemplate) -> Result<()> {
+        validate_story_bible_template(template)?;
+        let target = self.story_bible_template_path(template.id)?;
+        fs::create_dir_all(target.parent().unwrap())?;
+        let temporary = target.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let bytes = toml::to_string_pretty(template)
+            .map_err(|error| StorageError::Invalid(error.to_string()))?;
+        write_synced(&temporary, bytes.as_bytes())?;
+        fs::rename(&temporary, &target)?;
+        sync_dir(target.parent().unwrap())?;
+        Ok(())
+    }
+
+    pub fn load_story_bible_template(
+        &self,
+        id: StoryBibleTemplateId,
+    ) -> Result<StoryBibleTemplate> {
+        let path = self.story_bible_template_path(id)?;
+        let text = fs::read_to_string(path)?;
+        let template: StoryBibleTemplate = toml::from_str(&text).map_err(|error| {
+            StorageError::Invalid(format!("invalid Story Bible template {id}: {error}"))
+        })?;
+        if template.id != id {
+            return Err(StorageError::Config(
+                "Story Bible template filename and stable identity disagree".into(),
+            ));
+        }
+        validate_story_bible_template(&template)?;
+        Ok(template)
+    }
+
+    pub fn list_story_bible_templates(&self) -> Result<Vec<StoryBibleTemplate>> {
+        let directory = self.safe_path(Path::new("templates").join("story-bible").as_path())?;
+        if !directory.exists() {
+            return Ok(Vec::new());
+        }
+        let mut templates = Vec::new();
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            if entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "toml")
+            {
+                let id = StoryBibleTemplateId(
+                    Uuid::parse_str(
+                        entry
+                            .path()
+                            .file_stem()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or_default(),
+                    )
+                    .map_err(|error| {
+                        StorageError::Invalid(format!(
+                            "invalid Story Bible template file name: {error}"
+                        ))
+                    })?,
+                );
+                templates.push(self.load_story_bible_template(id)?);
+            }
+        }
+        templates.sort_by(|first, second| {
+            first
+                .name
+                .to_lowercase()
+                .cmp(&second.name.to_lowercase())
+                .then(first.id.cmp(&second.id))
+        });
+        Ok(templates)
+    }
+
+    fn story_bible_profile_path(
+        &self,
+        kind: StoryBibleEntityKind,
+        entity_id: &str,
+    ) -> Result<PathBuf> {
+        let entity = Uuid::parse_str(entity_id).map_err(|error| {
+            StorageError::Invalid(format!("invalid story-bible entity ID: {error}"))
+        })?;
+        self.safe_path(
+            &Path::new(".writers-ide")
+                .join("story-bible-profiles")
+                .join(format!("{}-{entity}.json", kind.as_str())),
+        )
+    }
+
+    pub fn save_story_bible_profile(&mut self, profile: &StoryBibleProfile) -> Result<()> {
+        self.validate_story_bible_entity(profile.entity_kind, &profile.entity_id)?;
+        let template = self.load_story_bible_template(profile.template_id)?;
+        if template.entity_kind != profile.entity_kind {
+            return Err(StorageError::Invalid(
+                "profile entity kind does not match its template".into(),
+            ));
+        }
+        validate_story_bible_values(&template, &profile.values)?;
+        self.validate_story_bible_profile_references(&template, &profile.values)?;
+        let path = self.story_bible_profile_path(profile.entity_kind, &profile.entity_id)?;
+        fs::create_dir_all(path.parent().unwrap())?;
+        let temporary = path.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        let bytes = serde_json::to_vec_pretty(profile)
+            .map_err(|error| StorageError::Invalid(error.to_string()))?;
+        write_synced(&temporary, &bytes)?;
+        fs::rename(&temporary, &path)?;
+        sync_dir(path.parent().unwrap())?;
+        Ok(())
+    }
+
+    pub fn load_story_bible_profile(
+        &self,
+        kind: StoryBibleEntityKind,
+        entity_id: &str,
+    ) -> Result<StoryBibleProfile> {
+        self.validate_story_bible_entity(kind, entity_id)?;
+        let path = self.story_bible_profile_path(kind, entity_id)?;
+        let bytes = fs::read(path)?;
+        let profile: StoryBibleProfile = serde_json::from_slice(&bytes).map_err(|error| {
+            StorageError::Invalid(format!("invalid Story Bible profile: {error}"))
+        })?;
+        if profile.entity_kind != kind || profile.entity_id != entity_id {
+            return Err(StorageError::Config(
+                "Story Bible profile identity mismatch".into(),
+            ));
+        }
+        let template = self.load_story_bible_template(profile.template_id)?;
+        if template.entity_kind != kind {
+            return Err(StorageError::Invalid(
+                "profile entity kind does not match its template".into(),
+            ));
+        }
+        validate_story_bible_values(&template, &profile.values)?;
+        self.validate_story_bible_profile_references(&template, &profile.values)?;
+        Ok(profile)
+    }
+
+    fn validate_story_bible_profile_references(
+        &self,
+        template: &StoryBibleTemplate,
+        values: &std::collections::BTreeMap<String, StoryBibleFieldValue>,
+    ) -> Result<()> {
+        for (field_id, value) in values {
+            let Some(field) = template.fields.iter().find(|field| field.id == *field_id) else {
+                continue;
+            };
+            if !matches!(
+                field.field_type,
+                StoryBibleFieldType::EntityRef | StoryBibleFieldType::EntityRefs
+            ) {
+                continue;
+            }
+            let targets: Vec<&str> = match value {
+                StoryBibleFieldValue::EntityRef(id) => vec![id],
+                StoryBibleFieldValue::EntityRefs(ids) => ids.iter().map(String::as_str).collect(),
+                _ => Vec::new(),
+            };
+            let kind = field.reference_kind.ok_or_else(|| {
+                StorageError::Invalid("reference field has no target kind".into())
+            })?;
+            for target in targets {
+                self.validate_story_bible_entity(kind, target)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_story_bible_entity(&self, kind: StoryBibleEntityKind, id: &str) -> Result<()> {
+        let table = match kind {
+            StoryBibleEntityKind::Character => "character",
+            StoryBibleEntityKind::Location => "location",
+            StoryBibleEntityKind::Object => "story_object",
+            StoryBibleEntityKind::Plotline => "plotline",
+            StoryBibleEntityKind::Event => "story_event",
+        };
+        let exists: bool = self.conn.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE id=?1)"),
+            [id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StorageError::NotFound(format!("{} {id}", kind.as_str())));
+        }
+        Ok(())
+    }
+
+    pub fn create_planning_board(&mut self, title: &str) -> Result<PlanningBoardId> {
+        if title.trim().is_empty() {
+            return Err(StorageError::Invalid(
+                "planning board title cannot be empty".into(),
+            ));
+        }
+        let id = PlanningBoardId::new();
+        let timestamp = now();
+        self.conn.execute(
+            "INSERT INTO planning_board(id,title,created_at,updated_at) VALUES(?1,?2,?3,?3)",
+            params![id.to_string(), title.trim(), timestamp],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_planning_boards(&self) -> Result<Vec<PlanningBoardSummary>> {
+        let mut statement = self
+            .conn
+            .prepare("SELECT id,title FROM planning_board ORDER BY title COLLATE NOCASE,id")?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (id, title) = row?;
+            Ok::<_, rusqlite::Error>(PlanningBoardSummary {
+                id: PlanningBoardId(Uuid::parse_str(&id).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?),
+                title,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
+
+    pub fn add_planning_board_item(
+        &mut self,
+        board: PlanningBoardId,
+        kind: &str,
+        entity_id: &str,
+        x: f64,
+        y: f64,
+        note: &str,
+    ) -> Result<PlanningBoardItemId> {
+        const KINDS: &[&str] = &[
+            "scene",
+            "character",
+            "plotline",
+            "location",
+            "event",
+            "object",
+        ];
+        if !KINDS.contains(&kind) || !x.is_finite() || !y.is_finite() {
+            return Err(StorageError::Invalid(
+                "invalid board item kind or coordinates".into(),
+            ));
+        }
+        let id = PlanningBoardItemId::new();
+        self.conn.execute("INSERT INTO planning_board_item(id,board_id,entity_kind,entity_id,x,y,note) VALUES(?1,?2,?3,?4,?5,?6,?7)", params![id.to_string(), board.to_string(), kind, entity_id, x, y, note])?;
+        Ok(id)
+    }
+
+    pub fn list_planning_board_items(
+        &self,
+        board: PlanningBoardId,
+    ) -> Result<Vec<PlanningBoardItemRecord>> {
+        let mut stmt = self.conn.prepare("SELECT id,entity_kind,entity_id,x,y,width,height,note FROM planning_board_item WHERE board_id=?1 ORDER BY y,x,id")?;
+        let rows = stmt.query_map([board.to_string()], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, f64>(4)?,
+                r.get::<_, f64>(5)?,
+                r.get::<_, f64>(6)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, entity_kind, entity_id, x, y, width, height, note) = row?;
+            Ok::<_, rusqlite::Error>(PlanningBoardItemRecord {
+                id: PlanningBoardItemId(Uuid::parse_str(&id).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?),
+                board_id: board,
+                entity_kind,
+                entity_id,
+                x,
+                y,
+                width,
+                height,
+                note,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
+
+    pub fn move_planning_board_item(
+        &mut self,
+        item: PlanningBoardItemId,
+        x: f64,
+        y: f64,
+    ) -> Result<()> {
+        if !x.is_finite() || !y.is_finite() {
+            return Err(StorageError::Invalid(
+                "board coordinates must be finite".into(),
+            ));
+        }
+        let changed = self.conn.execute(
+            "UPDATE planning_board_item SET x=?2,y=?3 WHERE id=?1",
+            params![item.to_string(), x, y],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(item.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn connect_planning_board_items(
+        &mut self,
+        board: PlanningBoardId,
+        source: PlanningBoardItemId,
+        target: PlanningBoardItemId,
+        label: &str,
+    ) -> Result<PlanningBoardConnectorId> {
+        if source == target {
+            return Err(StorageError::Invalid(
+                "board connectors cannot target themselves".into(),
+            ));
+        }
+        let id = PlanningBoardConnectorId::new();
+        self.conn.execute("INSERT INTO planning_board_connector(id,board_id,source_item_id,target_item_id,label) VALUES(?1,?2,?3,?4,?5)",params![id.to_string(),board.to_string(),source.to_string(),target.to_string(),label])?;
+        Ok(id)
+    }
+
+    pub fn create_assembly(&mut self, title: &str) -> Result<AssemblyId> {
+        if title.trim().is_empty() {
+            return Err(StorageError::Invalid(
+                "assembly title cannot be empty".into(),
+            ));
+        }
+        let id = AssemblyId::new();
+        let timestamp = now();
+        self.conn.execute(
+            "INSERT INTO manuscript_assembly(id,title,created_at,updated_at) VALUES(?1,?2,?3,?3)",
+            params![id.to_string(), title.trim(), timestamp],
+        )?;
+        Ok(id)
+    }
+
+    fn assembly_draft_path(&self, id: AssemblyDraftId) -> Result<PathBuf> {
+        self.safe_path(
+            &Path::new(".writers-ide")
+                .join("assembly-drafts")
+                .join(format!("{id}.json")),
+        )
+    }
+
+    fn persist_assembly_draft(&self, draft: &AssemblyDraft) -> Result<()> {
+        let target = self.assembly_draft_path(draft.id)?;
+        fs::create_dir_all(target.parent().unwrap())?;
+        let temp = target.with_extension(format!("{}.tmp", Uuid::new_v4()));
+        write_synced(
+            &temp,
+            &serde_json::to_vec(draft).map_err(|e| StorageError::Invalid(e.to_string()))?,
+        )?;
+        fs::rename(&temp, &target)?;
+        sync_dir(target.parent().unwrap())?;
+        Ok(())
+    }
+
+    pub fn create_assembly_draft(&mut self, assembly: AssemblyId) -> Result<AssemblyDraft> {
+        let project_id = self.get_project()?.id;
+        let mut items = Vec::new();
+        for item in self.list_assembly_items(assembly)? {
+            if let Some(scene_id) = item.scene_id {
+                let (text, expected_hash) = self.load_text(scene_id)?;
+                items.push(AssemblyDraftItem {
+                    scene_id,
+                    expected_hash,
+                    text,
+                });
+            }
+        }
+        if items.is_empty() {
+            return Err(StorageError::Invalid(
+                "assembly has no scene items to edit".into(),
+            ));
+        }
+        let draft = AssemblyDraft {
+            id: AssemblyDraftId::new(),
+            assembly_id: assembly,
+            project_id,
+            created_at: now(),
+            items,
+        };
+        self.persist_assembly_draft(&draft)?;
+        Ok(draft)
+    }
+
+    pub fn load_assembly_draft(&self, id: AssemblyDraftId) -> Result<AssemblyDraft> {
+        let path = self.assembly_draft_path(id)?;
+        let bytes = fs::read(path)?;
+        let draft: AssemblyDraft = serde_json::from_slice(&bytes)
+            .map_err(|e| StorageError::Invalid(format!("invalid assembly draft {id}: {e}")))?;
+        if draft.id != id || draft.project_id != self.get_project()?.id {
+            return Err(StorageError::Config(
+                "assembly draft identity does not match this project".into(),
+            ));
+        }
+        Ok(draft)
+    }
+
+    pub fn list_assembly_drafts(&self) -> Result<Vec<AssemblyDraft>> {
+        let dir = self.safe_path(&Path::new(".writers-ide").join("assembly-drafts"))?;
+        let mut drafts = Vec::new();
+        if !dir.exists() {
+            return Ok(drafts);
+        }
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.path().extension().is_some_and(|ext| ext == "json") {
+                let id = AssemblyDraftId(
+                    Uuid::parse_str(
+                        entry
+                            .path()
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or_default(),
+                    )
+                    .map_err(|e| {
+                        StorageError::Invalid(format!("invalid assembly draft filename: {e}"))
+                    })?,
+                );
+                drafts.push(self.load_assembly_draft(id)?);
+            }
+        }
+        drafts.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
+        Ok(drafts)
+    }
+
+    pub fn update_assembly_draft_item(
+        &mut self,
+        draft_id: AssemblyDraftId,
+        scene: SceneId,
+        text: &str,
+    ) -> Result<()> {
+        let mut draft = self.load_assembly_draft(draft_id)?;
+        let item = draft
+            .items
+            .iter_mut()
+            .find(|item| item.scene_id == scene)
+            .ok_or_else(|| {
+                StorageError::NotFound(format!("scene {scene} is not in assembly draft"))
+            })?;
+        item.text = text.to_owned();
+        self.persist_assembly_draft(&draft)
+    }
+
+    pub fn replace_assembly_draft_items(
+        &mut self,
+        id: AssemblyDraftId,
+        replacements: &[(SceneId, String)],
+    ) -> Result<()> {
+        let mut draft = self.load_assembly_draft(id)?;
+        if replacements.len() != draft.items.len() {
+            return Err(StorageError::Invalid(
+                "assembly draft replacement must include every scene exactly once".into(),
+            ));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (scene, text) in replacements {
+            if !seen.insert(*scene) {
+                return Err(StorageError::Invalid(
+                    "assembly draft contains a duplicate scene".into(),
+                ));
+            }
+            let item = draft
+                .items
+                .iter_mut()
+                .find(|item| item.scene_id == *scene)
+                .ok_or_else(|| {
+                    StorageError::Invalid(format!("scene {scene} is not in the assembly draft"))
+                })?;
+            item.text = text.clone();
+        }
+        self.persist_assembly_draft(&draft)
+    }
+
+    /// Applies a durable assembly draft using each scene's normal optimistic journal.
+    /// A restart may leave some scene files committed and others pending; the persisted draft
+    /// lets this operation safely resume by recognizing either the original or proposed hash.
+    pub fn commit_assembly_draft(&mut self, id: AssemblyDraftId) -> Result<()> {
+        let draft = self.load_assembly_draft(id)?;
+        let mut current = Vec::with_capacity(draft.items.len());
+        for item in &draft.items {
+            let (_, hash) = self.load_text(item.scene_id)?;
+            let proposed = hash_bytes(item.text.as_bytes());
+            if hash != item.expected_hash && hash != proposed {
+                return Err(StorageError::Conflict(format!(
+                    "scene {} changed outside this assembly draft; draft preserved",
+                    item.scene_id
+                )));
+            }
+            current.push((hash, proposed));
+        }
+        for (item, (hash, proposed)) in draft.items.iter().zip(current) {
+            if hash != proposed {
+                self.save_text(item.scene_id, Some(&hash), &item.text)?;
+            }
+        }
+        let path = self.assembly_draft_path(id)?;
+        fs::remove_file(&path)?;
+        sync_dir(path.parent().unwrap())?;
+        Ok(())
+    }
+
+    pub fn list_assemblies(&self) -> Result<Vec<AssemblySummary>> {
+        let mut query = self
+            .conn
+            .prepare("SELECT id,title FROM manuscript_assembly ORDER BY title COLLATE NOCASE,id")?;
+        let rows = query.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        rows.map(|row| {
+            let (id, title) = row?;
+            Ok::<AssemblySummary, rusqlite::Error>(AssemblySummary {
+                id: AssemblyId(Uuid::parse_str(&id).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?),
+                title,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
+
+    pub fn list_assembly_items(&self, assembly: AssemblyId) -> Result<Vec<AssemblyItemRecord>> {
+        let mut query = self.conn.prepare(
+            "SELECT id,position,scene_id,content_unit_id,included FROM assembly_item WHERE assembly_id=?1 ORDER BY position,id",
+        )?;
+        let rows = query.query_map([assembly.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, bool>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, position, scene, content, included) = row?;
+            let parse_id = |value: String| {
+                Uuid::parse_str(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            };
+            Ok(AssemblyItemRecord {
+                id: AssemblyItemId(parse_id(id)?),
+                assembly_id: assembly,
+                position,
+                scene_id: scene.map(parse_id).transpose()?.map(SceneId),
+                content_unit_id: content.map(parse_id).transpose()?.map(ContentUnitId),
+                included,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+        .map_err(StorageError::from)
+    }
+
+    pub fn add_assembly_scene(
+        &mut self,
+        assembly: AssemblyId,
+        scene: SceneId,
+        position: u32,
+    ) -> Result<AssemblyItemId> {
+        self.add_assembly_item(assembly, Some(scene), None, position)
+    }
+
+    pub fn add_assembly_content_unit(
+        &mut self,
+        assembly: AssemblyId,
+        content: ContentUnitId,
+        position: u32,
+    ) -> Result<AssemblyItemId> {
+        self.add_assembly_item(assembly, None, Some(content), position)
+    }
+
+    fn add_assembly_item(
+        &mut self,
+        assembly: AssemblyId,
+        scene: Option<SceneId>,
+        content: Option<ContentUnitId>,
+        position: u32,
+    ) -> Result<AssemblyItemId> {
+        if scene.is_some() == content.is_some() {
+            return Err(StorageError::Invalid(
+                "assembly item must identify exactly one content entity".into(),
+            ));
+        }
+        let id = AssemblyItemId::new();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let count: u32 = tx.query_row(
+            "SELECT count(*) FROM assembly_item WHERE assembly_id=?1",
+            [assembly.to_string()],
+            |row| row.get(0),
+        )?;
+        if position > count {
+            return Err(StorageError::Invalid(
+                "assembly position beyond item count".into(),
+            ));
+        }
+        let max: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position),0) FROM assembly_item WHERE assembly_id=?1",
+            [assembly.to_string()],
+            |row| row.get(0),
+        )?;
+        let temporary = max
+            .checked_mul(3)
+            .and_then(|value| value.checked_add(100))
+            .ok_or_else(|| StorageError::Invalid("assembly positions exhausted".into()))?;
+        tx.execute(
+            "INSERT INTO assembly_item(id,assembly_id,position,scene_id,content_unit_id) VALUES(?1,?2,?3,?4,?5)",
+            params![id.to_string(), assembly.to_string(), temporary, scene.map(|value| value.to_string()), content.map(|value| value.to_string())],
+        )?;
+        let mut ids = query_assembly_item_ids(&tx, assembly)?;
+        let inserted = ids
+            .iter()
+            .position(|value| value == &id.to_string())
+            .unwrap();
+        let item = ids.remove(inserted);
+        ids.insert(position as usize, item);
+        compact_assembly_positions(&tx, assembly, &ids)?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    pub fn move_assembly_item(
+        &mut self,
+        assembly: AssemblyId,
+        item: AssemblyItemId,
+        position: u32,
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut ids = query_assembly_item_ids(&tx, assembly)?;
+        let existing = ids
+            .iter()
+            .position(|value| value == &item.to_string())
+            .ok_or_else(|| StorageError::NotFound(item.to_string()))?;
+        let item_id = ids.remove(existing);
+        if position as usize > ids.len() {
+            return Err(StorageError::Invalid(
+                "assembly position beyond item count".into(),
+            ));
+        }
+        ids.insert(position as usize, item_id);
+        compact_assembly_positions(&tx, assembly, &ids)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn set_assembly_item_included(
+        &mut self,
+        item: AssemblyItemId,
+        included: bool,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE assembly_item SET included=?2 WHERE id=?1",
+            params![item.to_string(), included],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(item.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn list_story_objects(&self) -> Result<Vec<StoryObjectRecord>> {
+        let mut query = self.conn.prepare(
+            "SELECT id,name,description FROM story_object ORDER BY name COLLATE NOCASE,id",
+        )?;
+        let rows = query.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, name, description) = row?;
+            Ok(StoryObjectRecord {
+                id: StoryObjectId(Uuid::parse_str(&id).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?),
+                name,
+                description,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+        .map_err(StorageError::from)
+    }
+
+    pub fn list_scene_mentions(&self, scene: SceneId) -> Result<Vec<DetectedMentionRecord>> {
+        let mut query = self.conn.prepare(
+            "SELECT id,start_byte,end_byte,quote,state,entity_kind,entity_id FROM detected_mention WHERE scene_id=?1 ORDER BY start_byte,end_byte,id",
+        )?;
+        let rows = query.query_map([scene.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, u64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
+        })?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (id, start_byte, end_byte, quote, state, entity_kind, entity_id) = row?;
+            let id = MentionId(Uuid::parse_str(&id).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    0,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?);
+            let mut candidates_query = self.conn.prepare(
+                "SELECT entity_kind,entity_id,matched_name FROM detected_mention_candidate WHERE mention_id=?1 ORDER BY entity_kind,entity_id,matched_name",
+            )?;
+            let candidates = candidates_query
+                .query_map([id.to_string()], |candidate| {
+                    Ok(MentionCandidate {
+                        entity_kind: candidate.get(0)?,
+                        entity_id: candidate.get(1)?,
+                        matched_name: candidate.get(2)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            records.push(DetectedMentionRecord {
+                id,
+                scene_id: scene,
+                start_byte,
+                end_byte,
+                quote,
+                state,
+                entity_kind,
+                entity_id,
+                candidates,
+            });
+        }
+        Ok(records)
+    }
+
+    pub fn reindex_scene_mentions(
+        &mut self,
+        scene: SceneId,
+        text: &str,
+        expected_hash: &str,
+    ) -> Result<()> {
+        let actual: String = self.conn.query_row(
+            "SELECT sha256 FROM scene_content WHERE scene_id=?1",
+            [scene.to_string()],
+            |row| row.get(0),
+        )?;
+        if actual != expected_hash || hash_bytes(text.as_bytes()) != expected_hash {
+            return Err(StorageError::Conflict(
+                "cannot index mentions for stale manuscript content".into(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        refresh_scene_mentions(&tx, scene, text, expected_hash)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn confirm_scene_mention(
+        &mut self,
+        mention: MentionId,
+        entity_kind: MentionEntityKind,
+        entity_id: &str,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE detected_mention SET state='confirmed',entity_kind=?2,entity_id=?3,updated_at=?4 WHERE id=?1 AND EXISTS(SELECT 1 FROM detected_mention_candidate WHERE mention_id=?1 AND entity_kind=?2 AND entity_id=?3)",
+            params![mention.to_string(), entity_kind.as_str(), entity_id, now()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::Invalid(
+                "the selected entity is not a candidate for this mention".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn dismiss_scene_mention(&mut self, mention: MentionId) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE detected_mention SET state='dismissed',updated_at=?2 WHERE id=?1 AND state IN('detected','ambiguous','needs_review')",
+            params![mention.to_string(), now()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(mention.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn create_scratchpad_note(&mut self, title: &str, body: &str) -> Result<ScratchpadId> {
+        if title.trim().is_empty() {
+            return Err(StorageError::Invalid(
+                "scratchpad title cannot be empty".into(),
+            ));
+        }
+        let position: u32 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position),-1)+1 FROM scratchpad_note WHERE state='active'",
+            [],
+            |row| row.get(0),
+        )?;
+        let id = ScratchpadId::new();
+        let timestamp = now();
+        self.conn.execute(
+            "INSERT INTO scratchpad_note(id,title,body,position,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5)",
+            params![id.to_string(), title.trim(), body, position, timestamp],
+        )?;
+        Ok(id)
+    }
+
+    pub fn list_scratchpad_notes(&self, include_archived: bool) -> Result<Vec<ScratchpadNote>> {
+        let mut query = self.conn.prepare(if include_archived {
+            "SELECT id,title,body,pinned,position,state,destination_kind,destination_id FROM scratchpad_note ORDER BY pinned DESC,position,id"
+        } else {
+            "SELECT id,title,body,pinned,position,state,destination_kind,destination_id FROM scratchpad_note WHERE state='active' ORDER BY pinned DESC,position,id"
+        })?;
+        let rows = query.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, u32>(4)?,
+                row.get::<_, String>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, title, body, pinned, position, state, destination_kind, destination_id) = row?;
+            Ok(ScratchpadNote {
+                id: ScratchpadId(Uuid::parse_str(&id).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?),
+                title,
+                body,
+                pinned,
+                position,
+                state,
+                destination_kind,
+                destination_id,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+        .map_err(StorageError::from)
+    }
+
+    pub fn update_scratchpad_note(
+        &mut self,
+        id: ScratchpadId,
+        title: &str,
+        body: &str,
+        pinned: bool,
+    ) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE scratchpad_note SET title=?2,body=?3,pinned=?4,updated_at=?5 WHERE id=?1",
+            params![id.to_string(), title.trim(), body, pinned, now()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn promote_scratchpad_note(
+        &mut self,
+        id: ScratchpadId,
+        destination_kind: &str,
+        destination_id: &str,
+    ) -> Result<()> {
+        let exists: bool = match destination_kind {
+            "scene" => self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM scene WHERE id=?1)",
+                [destination_id],
+                |row| row.get(0),
+            )?,
+            "character" => self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM character WHERE id=?1)",
+                [destination_id],
+                |row| row.get(0),
+            )?,
+            "location" => self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM location WHERE id=?1)",
+                [destination_id],
+                |row| row.get(0),
+            )?,
+            "object" => self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM story_object WHERE id=?1)",
+                [destination_id],
+                |row| row.get(0),
+            )?,
+            "plotline" => self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM plotline WHERE id=?1)",
+                [destination_id],
+                |row| row.get(0),
+            )?,
+            "research" => self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM research_item WHERE id=?1)",
+                [destination_id],
+                |row| row.get(0),
+            )?,
+            _ => {
+                return Err(StorageError::Invalid(
+                    "unsupported scratchpad destination kind".into(),
+                ));
+            }
+        };
+        if !exists {
+            return Err(StorageError::NotFound(destination_id.into()));
+        }
+        let changed = self.conn.execute(
+            "UPDATE scratchpad_note SET state='promoted',destination_kind=?2,destination_id=?3,updated_at=?4 WHERE id=?1 AND state='active'",
+            params![id.to_string(), destination_kind, destination_id, now()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
     pub fn add_location(&mut self, id: LocationId, name: &str) -> Result<()> {
         self.conn.execute(
@@ -2997,7 +4256,7 @@ impl ProjectStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("UPDATE content_unit SET sha256=?2,byte_length=?3,word_count=?4,generation=?5,updated_at=?6 WHERE id=?1",params![id,hash,text.len() as i64,text.split_whitespace().count() as i64,generation,now()])?;
+        tx.execute("UPDATE content_unit SET sha256=?2,byte_length=?3,word_count=?4,generation=?5,updated_at=?6 WHERE id=?1",params![id,hash,text.len() as i64,count_words(&text) as i64,generation,now()])?;
         tx.execute(
             "UPDATE content_unit_search_content SET content=?2 WHERE content_unit_id=?1",
             params![id, text],
@@ -3731,6 +4990,130 @@ impl ProjectStore {
         .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
         .map_err(StorageError::from)
     }
+    pub fn create_personal_comment(
+        &mut self,
+        scene: SceneId,
+        start: u64,
+        end: u64,
+        quote: &str,
+        body: &str,
+    ) -> Result<PersonalCommentId> {
+        if body.trim().is_empty() {
+            return Err(StorageError::Invalid("comment text cannot be empty".into()));
+        }
+        let (text, hash) = self.load_text(scene)?;
+        let start_usize = usize::try_from(start)
+            .map_err(|_| StorageError::Invalid("comment offset overflow".into()))?;
+        let end_usize = usize::try_from(end)
+            .map_err(|_| StorageError::Invalid("comment offset overflow".into()))?;
+        if quote.is_empty()
+            || start_usize > end_usize
+            || end_usize > text.len()
+            || !text.is_char_boundary(start_usize)
+            || !text.is_char_boundary(end_usize)
+            || text.get(start_usize..end_usize) != Some(quote)
+        {
+            return Err(StorageError::Invalid(
+                "comment offsets must select the supplied UTF-8 passage".into(),
+            ));
+        }
+        let prefix = &text[..start_usize];
+        let suffix = &text[end_usize..];
+        let prefix = prefix
+            .chars()
+            .rev()
+            .take(32)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect::<String>();
+        let suffix = suffix.chars().take(32).collect::<String>();
+        let anchor_id = AnchorId::new();
+        let comment_id = PersonalCommentId::new();
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO passage_anchor(id,scene_id,start_byte,end_byte,quote,prefix_context,suffix_context,source_sha256,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'current',?9,?9)",
+            params![anchor_id.to_string(), scene.to_string(), start, end, quote, prefix, suffix, hash, now()],
+        )?;
+        transaction.execute(
+            "INSERT INTO personal_comment(id,scene_id,anchor_id,body,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5)",
+            params![comment_id.to_string(), scene.to_string(), anchor_id.to_string(), body.trim(), now()],
+        )?;
+        transaction.commit()?;
+        Ok(comment_id)
+    }
+
+    pub fn list_scene_comments(&self, scene: SceneId) -> Result<Vec<PersonalCommentRecord>> {
+        let mut query = self.conn.prepare(
+            "SELECT c.id,c.anchor_id,c.body,c.state,a.quote,a.start_byte,a.end_byte,a.state FROM personal_comment c LEFT JOIN passage_anchor a ON a.id=c.anchor_id WHERE c.scene_id=?1 ORDER BY COALESCE(a.start_byte,0),c.created_at,c.id",
+        )?;
+        let rows = query.query_map([scene.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<u64>>(5)?,
+                row.get::<_, Option<u64>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, anchor, body, state, quote, start_byte, end_byte, anchor_state) = row?;
+            Ok(PersonalCommentRecord {
+                id: PersonalCommentId(Uuid::parse_str(&id).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?),
+                scene_id: scene,
+                anchor_id: anchor
+                    .map(|value| {
+                        Uuid::parse_str(&value).map(AnchorId).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                1,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()?,
+                quote,
+                start_byte,
+                end_byte,
+                anchor_state,
+                body,
+                state,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
+        .map_err(StorageError::from)
+    }
+
+    pub fn set_personal_comment_state(
+        &mut self,
+        comment: PersonalCommentId,
+        state: &str,
+    ) -> Result<()> {
+        if !matches!(state, "open" | "resolved") {
+            return Err(StorageError::Invalid(
+                "comment state must be open or resolved".into(),
+            ));
+        }
+        let changed = self.conn.execute(
+            "UPDATE personal_comment SET state=?2,updated_at=?3 WHERE id=?1",
+            params![comment.to_string(), state, now()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(comment.to_string()));
+        }
+        Ok(())
+    }
     pub fn outgoing_links(&self, source: EntityRef) -> Result<Vec<StoryLink>> {
         let mut q = self.conn.prepare("SELECT id,source_kind,source_id,source_anchor_id,target_kind,target_id,target_anchor_id,link_kind,label FROM story_link WHERE source_kind=?1 AND source_id=?2 ORDER BY created_at,id")?;
         let rows = q.query_map(params![source.kind(), source.id()], read_story_link)?;
@@ -4004,6 +5387,12 @@ impl ProjectStore {
                 SceneId(Uuid::parse_str(&id).map_err(|e| StorageError::Invalid(e.to_string()))?);
             let text = fs::read_to_string(self.safe_path(&self.content_path(scene)?)?)?;
             update_scene_index(&self.conn, scene, &text)?;
+            let hash: String = self.conn.query_row(
+                "SELECT sha256 FROM scene_content WHERE scene_id=?1",
+                [scene.to_string()],
+                |row| row.get(0),
+            )?;
+            refresh_scene_mentions(&self.conn, scene, &text, &hash)?;
         }
         Ok(())
     }
@@ -4358,6 +5747,191 @@ fn common_prefix_chars(left: &str, right: &str) -> usize {
         .count()
 }
 
+#[derive(Clone)]
+struct MentionTerm {
+    kind: String,
+    id: String,
+    name: String,
+}
+
+fn refresh_scene_mentions(
+    conn: &Connection,
+    scene: SceneId,
+    text: &str,
+    content_hash: &str,
+) -> Result<()> {
+    let previous: Vec<(String, u64, u64, String, String)> = {
+        let mut query = conn.prepare(
+            "SELECT id,start_byte,end_byte,quote,state FROM detected_mention WHERE scene_id=?1 AND state IN('confirmed','dismissed')",
+        )?;
+        query
+            .query_map([scene.to_string()], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<std::result::Result<_, _>>()?
+    };
+    let mut retained = std::collections::BTreeSet::new();
+    for (id, start, end, quote, state) in previous {
+        let current = usize::try_from(start)
+            .ok()
+            .zip(usize::try_from(end).ok())
+            .and_then(|(start, end)| text.get(start..end));
+        if current == Some(quote.as_str()) {
+            conn.execute(
+                "UPDATE detected_mention SET source_sha256=?2,updated_at=?3 WHERE id=?1",
+                params![id, content_hash, now()],
+            )?;
+            retained.insert((start, end));
+        } else if state == "confirmed" {
+            conn.execute(
+                "UPDATE detected_mention SET state='needs_review',source_sha256=?2,updated_at=?3 WHERE id=?1",
+                params![id, content_hash, now()],
+            )?;
+        } else {
+            conn.execute("DELETE FROM detected_mention WHERE id=?1", [&id])?;
+        }
+    }
+    conn.execute(
+        "DELETE FROM detected_mention WHERE scene_id=?1 AND state IN('detected','ambiguous')",
+        [scene.to_string()],
+    )?;
+
+    let mut terms = Vec::new();
+    {
+        let mut query = conn.prepare("SELECT id,name FROM character UNION SELECT id,preferred_name FROM character WHERE preferred_name<>'' UNION SELECT character_id,alias FROM character_alias")?;
+        terms.extend(
+            query
+                .query_map([], |row| {
+                    Ok(MentionTerm {
+                        kind: "character".into(),
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+    }
+    {
+        let mut query = conn.prepare("SELECT id,name FROM location")?;
+        terms.extend(
+            query
+                .query_map([], |row| {
+                    Ok(MentionTerm {
+                        kind: "location".into(),
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+    }
+    {
+        let mut query = conn.prepare("SELECT id,name FROM story_object")?;
+        terms.extend(
+            query
+                .query_map([], |row| {
+                    Ok(MentionTerm {
+                        kind: "object".into(),
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                    })
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        );
+    }
+    let mut matches: std::collections::BTreeMap<(usize, usize), Vec<MentionCandidate>> =
+        std::collections::BTreeMap::new();
+    let starts = text
+        .char_indices()
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    for term in terms
+        .into_iter()
+        .filter(|term| !term.name.trim().is_empty())
+    {
+        let needle = term.name.trim();
+        let folded = needle.to_lowercase();
+        for &start in &starts {
+            let Some(end) = start.checked_add(needle.len()) else {
+                continue;
+            };
+            let Some(candidate) = text.get(start..end) else {
+                continue;
+            };
+            if candidate.to_lowercase() != folded {
+                continue;
+            }
+            let before_ok = text[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|character| !character.is_alphanumeric());
+            let after_ok = text[end..]
+                .chars()
+                .next()
+                .is_none_or(|character| !character.is_alphanumeric());
+            if !before_ok || !after_ok {
+                continue;
+            }
+            let entry = matches.entry((start, end)).or_default();
+            let found = MentionCandidate {
+                entity_kind: term.kind.clone(),
+                entity_id: term.id.clone(),
+                matched_name: needle.to_owned(),
+            };
+            if !entry.contains(&found) {
+                entry.push(found);
+            }
+        }
+    }
+    for ((start, end), mut candidates) in matches {
+        let (Ok(start_i64), Ok(end_i64)) = (i64::try_from(start), i64::try_from(end)) else {
+            continue;
+        };
+        let (Ok(start_u64), Ok(end_u64)) = (u64::try_from(start), u64::try_from(end)) else {
+            continue;
+        };
+        if retained.contains(&(start_u64, end_u64)) {
+            continue;
+        }
+        candidates.sort_by(|a, b| {
+            (&a.entity_kind, &a.entity_id, &a.matched_name).cmp(&(
+                &b.entity_kind,
+                &b.entity_id,
+                &b.matched_name,
+            ))
+        });
+        let id = MentionId::new();
+        let state = if candidates
+            .iter()
+            .map(|candidate| (&candidate.entity_kind, &candidate.entity_id))
+            .collect::<std::collections::BTreeSet<_>>()
+            .len()
+            > 1
+        {
+            "ambiguous"
+        } else {
+            "detected"
+        };
+        conn.execute(
+            "INSERT INTO detected_mention(id,scene_id,start_byte,end_byte,quote,source_sha256,state,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)",
+            params![id.to_string(), scene.to_string(), start_i64, end_i64, &text[start..end], content_hash, state, now()],
+        )?;
+        for candidate in candidates {
+            conn.execute(
+                "INSERT INTO detected_mention_candidate(mention_id,entity_kind,entity_id,matched_name) VALUES(?1,?2,?3,?4)",
+                params![id.to_string(), candidate.entity_kind, candidate.entity_id, candidate.matched_name],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn update_scene_index(conn: &Connection, scene: SceneId, text: &str) -> Result<()> {
     let (title, synopsis): (String, String) = conn.query_row(
         "SELECT title,synopsis FROM scene WHERE id=?1",
@@ -4386,6 +5960,128 @@ fn now() -> String {
 }
 fn hash_bytes(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
+}
+
+fn validate_story_bible_template(template: &StoryBibleTemplate) -> Result<()> {
+    if template.name.trim().is_empty() || template.fields.is_empty() {
+        return Err(StorageError::Invalid(
+            "Story Bible templates need a name and at least one field".into(),
+        ));
+    }
+    let mut ids = std::collections::HashSet::new();
+    let mut labels = std::collections::HashSet::new();
+    for field in &template.fields {
+        if field.id.trim().is_empty()
+            || field.id.chars().any(char::is_whitespace)
+            || field.label.trim().is_empty()
+        {
+            return Err(StorageError::Invalid("template field IDs must be nonempty and contain no whitespace; labels are required".into()));
+        }
+        if !ids.insert(field.id.to_lowercase()) || !labels.insert(field.label.to_lowercase()) {
+            return Err(StorageError::Invalid(
+                "template field IDs and labels must be unique".into(),
+            ));
+        }
+        match field.field_type {
+            StoryBibleFieldType::Enum if field.enum_values.is_empty() => {
+                return Err(StorageError::Invalid(format!(
+                    "enum field {} needs values",
+                    field.id
+                )));
+            }
+            StoryBibleFieldType::Enum => {
+                let mut choices = std::collections::HashSet::new();
+                if field.enum_values.iter().any(|choice| {
+                    choice.trim().is_empty() || !choices.insert(choice.to_lowercase())
+                }) {
+                    return Err(StorageError::Invalid(format!(
+                        "enum field {} has an empty or duplicate choice",
+                        field.id
+                    )));
+                }
+            }
+            _ if !field.enum_values.is_empty() => {
+                return Err(StorageError::Invalid(format!(
+                    "non-enum field {} cannot have enum choices",
+                    field.id
+                )));
+            }
+            _ => {}
+        }
+        if matches!(
+            field.field_type,
+            StoryBibleFieldType::EntityRef | StoryBibleFieldType::EntityRefs
+        ) != field.reference_kind.is_some()
+        {
+            return Err(StorageError::Invalid(format!(
+                "entity-reference field {} must declare exactly one target kind",
+                field.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_story_bible_values(
+    template: &StoryBibleTemplate,
+    values: &std::collections::BTreeMap<String, StoryBibleFieldValue>,
+) -> Result<()> {
+    for field in &template.fields {
+        let value = values.get(&field.id);
+        if field.required && value.is_none() {
+            return Err(StorageError::Invalid(format!(
+                "required Story Bible field {} is missing",
+                field.id
+            )));
+        }
+        let Some(value) = value else { continue };
+        let matches = match (field.field_type, value) {
+            (StoryBibleFieldType::Text, StoryBibleFieldValue::Text(text)) => {
+                !field.required || !text.trim().is_empty()
+            }
+            (StoryBibleFieldType::LongText, StoryBibleFieldValue::LongText(text)) => {
+                !field.required || !text.trim().is_empty()
+            }
+            (StoryBibleFieldType::Integer, StoryBibleFieldValue::Integer(_)) => true,
+            (StoryBibleFieldType::Decimal, StoryBibleFieldValue::Decimal(number)) => {
+                number.parse::<f64>().is_ok_and(f64::is_finite)
+            }
+            (StoryBibleFieldType::Boolean, StoryBibleFieldValue::Boolean(_)) => true,
+            (StoryBibleFieldType::DateTime, StoryBibleFieldValue::DateTime(value)) => {
+                (!field.required && value.trim().is_empty())
+                    || time::OffsetDateTime::parse(
+                        value,
+                        &time::format_description::well_known::Rfc3339,
+                    )
+                    .is_ok()
+            }
+            (StoryBibleFieldType::Enum, StoryBibleFieldValue::Enum(choice)) => {
+                field.enum_values.contains(choice)
+            }
+            (StoryBibleFieldType::EntityRef, StoryBibleFieldValue::EntityRef(id)) => {
+                !id.trim().is_empty()
+            }
+            (StoryBibleFieldType::EntityRefs, StoryBibleFieldValue::EntityRefs(ids)) => {
+                !field.required || !ids.is_empty()
+            }
+            _ => false,
+        };
+        if !matches {
+            return Err(StorageError::Invalid(format!(
+                "value type or value does not satisfy Story Bible field {}",
+                field.id
+            )));
+        }
+    }
+    if values
+        .keys()
+        .any(|key| !template.fields.iter().any(|field| &field.id == key))
+    {
+        return Err(StorageError::Invalid(
+            "Story Bible profile contains an unknown template field".into(),
+        ));
+    }
+    Ok(())
 }
 fn unique_occurrence(text: &str, quote: &str) -> Option<(usize, usize)> {
     if quote.is_empty() {
@@ -4496,6 +6192,48 @@ fn atomic_write(p: &Path, b: &[u8]) -> Result<()> {
     sync_dir(p.parent().unwrap())?;
     Ok(())
 }
+fn collect_regular_files(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(StorageError::Invalid(
+                "project backup contains a symbolic link".into(),
+            ));
+        }
+        if metadata.is_dir() {
+            collect_regular_files(root, &path, files)?;
+        } else if metadata.is_file() {
+            files.push(
+                path.strip_prefix(root)
+                    .map_err(|_| StorageError::Invalid("backup path escaped project".into()))?
+                    .to_path_buf(),
+            );
+        } else {
+            return Err(StorageError::Invalid(
+                "project backup contains a non-regular file".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn safe_archive_path(value: &str) -> Result<PathBuf> {
+    if value.is_empty() || value.contains(['\\', ':']) {
+        return Err(StorageError::Invalid("unsafe backup archive path".into()));
+    }
+    let path = Path::new(value);
+    if path.is_absolute()
+        || !path
+            .components()
+            .all(|part| matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(StorageError::Invalid("unsafe backup archive path".into()));
+    }
+    Ok(path.to_path_buf())
+}
+
 fn copy_synced(source: &Path, destination: &Path) -> Result<()> {
     let bytes = fs::read(source)?;
     write_synced(destination, &bytes)?;
@@ -4672,7 +6410,7 @@ fn validate_sql_dump(sql: &str) -> Result<()> {
     Ok(())
 }
 fn word_count(s: &str) -> u32 {
-    s.split_whitespace().count().min(u32::MAX as usize) as u32
+    count_words(s)
 }
 fn parse_status(s: &str) -> SceneStatus {
     match s {
@@ -4714,6 +6452,46 @@ fn query_scene_ids(conn: &Connection, chapter: &str) -> Result<Vec<String>> {
     Ok(q.query_map([chapter], |r| r.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?)
 }
+fn query_assembly_item_ids(
+    transaction: &rusqlite::Transaction<'_>,
+    assembly: AssemblyId,
+) -> Result<Vec<String>> {
+    let mut query = transaction
+        .prepare("SELECT id FROM assembly_item WHERE assembly_id=?1 ORDER BY position,id")?;
+    Ok(query
+        .query_map([assembly.to_string()], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn compact_assembly_positions(
+    transaction: &rusqlite::Transaction<'_>,
+    assembly: AssemblyId,
+    ids: &[String],
+) -> Result<()> {
+    let max = ids.len() as i64;
+    let offset = max
+        .checked_mul(4)
+        .and_then(|value| value.checked_add(100))
+        .ok_or_else(|| StorageError::Invalid("assembly positions exhausted".into()))?;
+    transaction.execute(
+        "UPDATE assembly_item SET position=position+?2 WHERE assembly_id=?1",
+        params![assembly.to_string(), offset],
+    )?;
+    for (index, id) in ids.iter().enumerate() {
+        transaction.execute(
+            "UPDATE assembly_item SET position=?2 WHERE id=?1",
+            params![id, offset * 2 + index as i64],
+        )?;
+    }
+    for (index, id) in ids.iter().enumerate() {
+        transaction.execute(
+            "UPDATE assembly_item SET position=?2 WHERE id=?1",
+            params![id, index as i64],
+        )?;
+    }
+    Ok(())
+}
+
 fn query_node_ids(conn: &Connection, parent: Option<&str>) -> Result<Vec<String>> {
     match parent {
         Some(p) => {
@@ -4846,6 +6624,239 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     #[test]
+    fn spatial_planning_board_keeps_positions_separate_from_manuscript_order() {
+        let d = tempdir().unwrap();
+        let mut store = ProjectStore::create(d.path().join("Book"), "Book").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Scene").unwrap();
+        let board = store.create_planning_board("Story map").unwrap();
+        let first = store
+            .add_planning_board_item(board, "scene", &scene.to_string(), 5.5, 2.0, "Opening")
+            .unwrap();
+        let object = store.create_story_object("Key", "").unwrap();
+        let second = store
+            .add_planning_board_item(board, "object", &object.to_string(), 18.0, 4.0, "")
+            .unwrap();
+        store
+            .connect_planning_board_items(board, first, second, "meets")
+            .unwrap();
+        store.move_planning_board_item(first, 8.0, -1.25).unwrap();
+        assert_eq!(store.list_planning_board_items(board).unwrap()[0].x, 8.0);
+        assert_eq!(store.get_scene(scene).unwrap().position, Some(0));
+        assert!(
+            store
+                .add_planning_board_item(board, "scene", "missing", 0.0, 0.0, "")
+                .is_err()
+        );
+        let other_board = store.create_planning_board("Other").unwrap();
+        let other_item = store
+            .add_planning_board_item(other_board, "scene", &scene.to_string(), 0.0, 0.0, "")
+            .unwrap();
+        assert!(
+            store
+                .connect_planning_board_items(board, first, other_item, "invalid")
+                .is_err()
+        );
+        let duplicate = store.conn.execute("INSERT INTO planning_board_connector(id,board_id,source_item_id,target_item_id,label) VALUES(?1,?2,?3,?4,'')", params![PlanningBoardConnectorId::new().to_string(),board.to_string(),first.to_string(),other_item.to_string()]);
+        assert!(
+            duplicate.is_err(),
+            "direct SQL cannot connect items on different boards"
+        );
+    }
+
+    #[test]
+    fn assembly_draft_resumes_mixed_scene_commits_and_preserves_external_conflicts() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let first = store.create_scene(chapter, 0, "First").unwrap();
+        let second = store.create_scene(chapter, 1, "Second").unwrap();
+        let assembly = store.create_assembly("Edition").unwrap();
+        store.add_assembly_scene(assembly, first, 0).unwrap();
+        store.add_assembly_scene(assembly, second, 1).unwrap();
+        let draft = store.create_assembly_draft(assembly).unwrap();
+        store
+            .update_assembly_draft_item(draft.id, first, "Drafted first scene.")
+            .unwrap();
+        store
+            .update_assembly_draft_item(draft.id, second, "Drafted second scene.")
+            .unwrap();
+
+        // Simulate interruption after the first file's independently journaled save.
+        let first_old = draft
+            .items
+            .iter()
+            .find(|item| item.scene_id == first)
+            .unwrap()
+            .expected_hash
+            .clone();
+        store
+            .save_text(first, Some(&first_old), "Drafted first scene.")
+            .unwrap();
+        drop(store);
+
+        let mut reopened = ProjectStore::open(&project).unwrap();
+        reopened.commit_assembly_draft(draft.id).unwrap();
+        assert_eq!(reopened.load_text(first).unwrap().0, "Drafted first scene.");
+        assert_eq!(
+            reopened.load_text(second).unwrap().0,
+            "Drafted second scene."
+        );
+        assert!(reopened.list_assembly_drafts().unwrap().is_empty());
+
+        let conflict_draft = reopened.create_assembly_draft(assembly).unwrap();
+        reopened
+            .update_assembly_draft_item(conflict_draft.id, second, "Proposed text.")
+            .unwrap();
+        let (_, current_hash) = reopened.load_text(second).unwrap();
+        reopened
+            .save_text(second, Some(&current_hash), "Independent external edit.")
+            .unwrap();
+        assert!(reopened.commit_assembly_draft(conflict_draft.id).is_err());
+        assert_eq!(
+            reopened.load_text(second).unwrap().0,
+            "Independent external edit."
+        );
+        assert_eq!(
+            reopened
+                .load_assembly_draft(conflict_draft.id)
+                .unwrap()
+                .items
+                .iter()
+                .find(|item| item.scene_id == second)
+                .unwrap()
+                .text,
+            "Proposed text."
+        );
+    }
+
+    #[test]
+    fn story_bible_templates_are_portable_typed_and_validate_profile_values() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let character = CharacterId::new();
+        let location = LocationId::new();
+        store
+            .conn
+            .execute(
+                "INSERT INTO character(id,name) VALUES(?1,'Mara')",
+                [character.to_string()],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO location(id,name) VALUES(?1,'Harbor')",
+                [location.to_string()],
+            )
+            .unwrap();
+        let template = StoryBibleTemplate {
+            id: StoryBibleTemplateId::new(),
+            name: "Investigator".into(),
+            entity_kind: StoryBibleEntityKind::Character,
+            fields: vec![
+                StoryBibleFieldDefinition {
+                    id: "profession".into(),
+                    label: "Profession".into(),
+                    field_type: StoryBibleFieldType::Text,
+                    required: true,
+                    enum_values: vec![],
+                    reference_kind: None,
+                },
+                StoryBibleFieldDefinition {
+                    id: "temperament".into(),
+                    label: "Temperament".into(),
+                    field_type: StoryBibleFieldType::Enum,
+                    required: true,
+                    enum_values: vec!["cautious".into(), "impulsive".into()],
+                    reference_kind: None,
+                },
+                StoryBibleFieldDefinition {
+                    id: "home".into(),
+                    label: "Home".into(),
+                    field_type: StoryBibleFieldType::EntityRef,
+                    required: false,
+                    enum_values: vec![],
+                    reference_kind: Some(StoryBibleEntityKind::Location),
+                },
+                StoryBibleFieldDefinition {
+                    id: "last_seen".into(),
+                    label: "Last seen".into(),
+                    field_type: StoryBibleFieldType::DateTime,
+                    required: false,
+                    enum_values: vec![],
+                    reference_kind: None,
+                },
+            ],
+        };
+        store.save_story_bible_template(&template).unwrap();
+        assert_eq!(
+            store.list_story_bible_templates().unwrap(),
+            vec![template.clone()]
+        );
+        let mut values = std::collections::BTreeMap::new();
+        values.insert(
+            "profession".into(),
+            StoryBibleFieldValue::Text("Investigator".into()),
+        );
+        values.insert(
+            "temperament".into(),
+            StoryBibleFieldValue::Enum("reckless".into()),
+        );
+        let mut profile = StoryBibleProfile {
+            entity_kind: StoryBibleEntityKind::Character,
+            entity_id: character.to_string(),
+            template_id: template.id,
+            values: values.clone(),
+        };
+        assert!(store.save_story_bible_profile(&profile).is_err());
+        values.insert(
+            "temperament".into(),
+            StoryBibleFieldValue::Enum("cautious".into()),
+        );
+        values.insert(
+            "home".into(),
+            StoryBibleFieldValue::EntityRef(Uuid::new_v4().to_string()),
+        );
+        profile.values = values.clone();
+        assert!(store.save_story_bible_profile(&profile).is_err());
+        values.insert(
+            "home".into(),
+            StoryBibleFieldValue::EntityRef(location.to_string()),
+        );
+        values.insert(
+            "last_seen".into(),
+            StoryBibleFieldValue::DateTime("not a date".into()),
+        );
+        profile.values = values.clone();
+        assert!(store.save_story_bible_profile(&profile).is_err());
+        values.insert(
+            "last_seen".into(),
+            StoryBibleFieldValue::DateTime("2026-11-21T12:30:00Z".into()),
+        );
+        profile.values = values;
+        store.save_story_bible_profile(&profile).unwrap();
+        drop(store);
+        let store = ProjectStore::open(&project).unwrap();
+        assert_eq!(
+            store.load_story_bible_template(template.id).unwrap(),
+            template
+        );
+        assert_eq!(
+            store
+                .load_story_bible_profile(StoryBibleEntityKind::Character, &character.to_string())
+                .unwrap(),
+            profile
+        );
+    }
+
+    #[test]
     fn chapter_content_units_persist_and_compile_without_scenes() {
         let d = tempdir().unwrap();
         let project = d.path().join("Book");
@@ -4862,6 +6873,7 @@ mod tests {
                 target_words: None,
                 story_epoch_label: "Day 0".into(),
                 story_calendar_id: None,
+                language_code: default_language_code(),
             },
         )
         .unwrap();
@@ -5632,7 +7644,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -5642,7 +7654,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 12);
+        assert_eq!(version, 17);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -5671,7 +7683,8 @@ mod tests {
 
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch(
-            "DROP TRIGGER story_link_source_exists_insert;
+            "DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
+             DROP TRIGGER story_link_source_exists_insert;
              DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update;
              DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update;
              DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert;
@@ -5718,6 +7731,7 @@ mod tests {
              ALTER TABLE character DROP COLUMN background;
              ALTER TABLE character DROP COLUMN description;
              ALTER TABLE character DROP COLUMN preferred_name;
+             ALTER TABLE project DROP COLUMN language_code;
              DELETE FROM schema_migrations WHERE version>=9;",
         )
         .unwrap();
@@ -5883,6 +7897,36 @@ mod tests {
             1
         );
     }
+
+    #[test]
+    fn sustained_editing_preserves_large_unicode_buffer_and_scene_identity() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("Writing");
+        let mut store = ProjectStore::create(&project, "Writing").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Long scene").unwrap();
+        let mut expected = String::new();
+        let mut hash = store.load_text(scene).unwrap().1;
+        for revision in 0..24 {
+            expected = format!(
+                "Revision {revision}: {}\n",
+                "e\u{301} 👩‍🚀 你好. ".repeat(2_000)
+            );
+            hash = store.save_text(scene, Some(&hash), &expected).unwrap();
+            if revision % 6 == 5 {
+                drop(store);
+                store = ProjectStore::open(&project).unwrap();
+                assert_eq!(store.load_text(scene).unwrap().0, expected);
+            }
+        }
+        let record = store.get_scene(scene).unwrap();
+        assert_eq!(record.content_hash, hash);
+        assert_eq!(record.scene.id, scene);
+        assert_eq!(store.load_text(scene).unwrap().0, expected);
+        assert_eq!(record.actual_words, count_words(&expected));
+    }
     #[test]
     fn mismatched_identity_rejected() {
         let d = tempdir().unwrap();
@@ -5935,6 +7979,7 @@ mod tests {
             target_words: Some(90000),
             story_epoch_label: "Before the Sundering".into(),
             story_calendar_id: Some("twelve-moons".into()),
+            language_code: "fr-CA".into(),
         };
         let s = ProjectStore::create_for(&p, &project).unwrap();
         let got = s.get_project().unwrap();
@@ -5943,6 +7988,20 @@ mod tests {
         assert_eq!(got.target_words, Some(90000));
         assert_eq!(got.story_epoch_label, "Before the Sundering");
         assert_eq!(got.story_calendar_id.as_deref(), Some("twelve-moons"));
+        assert_eq!(got.language_code, "fr-CA");
+        let mut s = s;
+        s.set_project_language("ja-JP").unwrap();
+        assert!(s.set_project_language("bad tag").is_err());
+        drop(s);
+        assert_eq!(
+            ProjectStore::open(&p)
+                .unwrap()
+                .get_project()
+                .unwrap()
+                .language_code,
+            "ja-JP"
+        );
+        let s = ProjectStore::open(&p).unwrap();
         assert!(s.conn.execute("UPDATE project SET id='00000000-0000-0000-0000-000000000000' WHERE singleton=1",[]).is_err());
         assert!(s.conn.execute("INSERT INTO project(singleton,id,title,created_at,updated_at) VALUES(1,?1,'Other','0','0')",[Uuid::new_v4().to_string()]).is_err());
     }
@@ -5960,6 +8019,66 @@ mod tests {
         let b = ProjectStore::open(&backup).unwrap();
         assert_eq!(b.load_text(sc).unwrap().0, "backup text");
         assert!(b.validate().is_ok());
+    }
+
+    #[test]
+    fn verified_single_file_backup_restores_to_relocated_project_without_overwrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("Original");
+        let mut project = ProjectStore::create(&project_path, "Portable Novel").unwrap();
+        let chapter = project
+            .create_node(None, NodeKind::Chapter, "Chapter One", 0)
+            .unwrap();
+        let scene = project.create_scene(chapter, 0, "Opening").unwrap();
+        let (_, hash) = project.load_text(scene).unwrap();
+        project
+            .save_text(scene, Some(&hash), "Portable manuscript text.")
+            .unwrap();
+        fs::create_dir_all(project_path.join("attachments")).unwrap();
+        fs::write(
+            project_path.join("attachments/source.txt"),
+            b"research source",
+        )
+        .unwrap();
+        let archive = directory.path().join("novel.wide.zip");
+        project.backup_archive_to(&archive).unwrap();
+        let pending: i64 = project
+            .conn
+            .query_row("SELECT count(*) FROM write_journal", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(pending, 0);
+        drop(project);
+
+        let relocated = directory.path().join("Relocated");
+        ProjectStore::restore_archive_to(&archive, &relocated).unwrap();
+        let restored = ProjectStore::open(&relocated).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored.get_project().unwrap().title, "Portable Novel");
+        assert_eq!(
+            restored.load_text(scene).unwrap().0,
+            "Portable manuscript text."
+        );
+        assert_eq!(
+            fs::read(relocated.join("attachments/source.txt")).unwrap(),
+            b"research source"
+        );
+        assert!(ProjectStore::restore_archive_to(&archive, &relocated).is_err());
+    }
+
+    #[test]
+    fn archive_restore_rejects_path_traversal_before_publishing() {
+        let directory = tempfile::tempdir().unwrap();
+        let archive_path = directory.path().join("malicious.zip");
+        let mut writer = zip::ZipWriter::new(File::create(&archive_path).unwrap());
+        writer
+            .start_file("../outside.txt", zip::write::FileOptions::default())
+            .unwrap();
+        writer.write_all(b"do not extract").unwrap();
+        writer.finish().unwrap();
+        let destination = directory.path().join("Restored");
+        assert!(ProjectStore::restore_archive_to(&archive_path, &destination).is_err());
+        assert!(!destination.exists());
+        assert!(!directory.path().join("outside.txt").exists());
     }
     #[test]
     fn placement_trigger_rejects_non_chapter_sql() {
@@ -6528,5 +8647,195 @@ mod tests {
                 .any(|hit| { hit.entity_kind == "character" && hit.entity_id == id.to_string() })
         );
         assert_eq!(store.list_characters().unwrap()[0].name, "Mara");
+    }
+
+    #[test]
+    fn mention_detection_is_separate_from_participation_and_updates_on_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ProjectStore::create(dir.path().join("Novel"), "Novel").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter 1", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Arrival").unwrap();
+        let character = CharacterId::new();
+        store.add_character(character, "Mara").unwrap();
+        store.add_location(LocationId::new(), "Mara").unwrap();
+        store
+            .add_location(LocationId::new(), "Glass House")
+            .unwrap();
+        store
+            .create_story_object("Brass Key", "A small key")
+            .unwrap();
+        let (_, initial_hash) = store.load_text(scene).unwrap();
+        let hash = store
+            .save_text(
+                scene,
+                Some(&initial_hash),
+                "Mara passed the Glass House and picked up the Brass Key. A Marathian waited.",
+            )
+            .unwrap();
+        let mentions = store.list_scene_mentions(scene).unwrap();
+        assert_eq!(mentions.len(), 3);
+        assert!(mentions.iter().any(|mention| mention.quote == "Mara"));
+        assert!(
+            mentions
+                .iter()
+                .any(|mention| mention.quote == "Glass House")
+        );
+        assert!(mentions.iter().any(|mention| mention.quote == "Brass Key"));
+        assert_eq!(
+            mentions
+                .iter()
+                .find(|mention| mention.quote == "Mara")
+                .unwrap()
+                .state,
+            "ambiguous"
+        );
+        assert!(store.scene_character_analytics(scene).unwrap().is_empty());
+
+        let mara = mentions
+            .iter()
+            .find(|mention| mention.quote == "Mara")
+            .unwrap();
+        store
+            .confirm_scene_mention(
+                mara.id,
+                MentionEntityKind::Character,
+                &character.to_string(),
+            )
+            .unwrap();
+        let shifted = format!("Preface. {}", store.load_text(scene).unwrap().0);
+        store.save_text(scene, Some(&hash), &shifted).unwrap();
+        assert!(
+            store
+                .list_scene_mentions(scene)
+                .unwrap()
+                .iter()
+                .any(|mention| mention.state == "needs_review")
+        );
+        let key = store
+            .list_scene_mentions(scene)
+            .unwrap()
+            .into_iter()
+            .find(|mention| mention.quote == "Brass Key")
+            .unwrap();
+        store.dismiss_scene_mention(key.id).unwrap();
+        let (current, current_hash) = store.load_text(scene).unwrap();
+        store
+            .reindex_scene_mentions(scene, &current, &current_hash)
+            .unwrap();
+        assert!(
+            store
+                .list_scene_mentions(scene)
+                .unwrap()
+                .iter()
+                .any(|mention| { mention.quote == "Brass Key" && mention.state == "dismissed" })
+        );
+    }
+
+    #[test]
+    fn scratchpad_notes_persist_pin_and_promote_without_losing_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = ProjectStore::create(dir.path().join("Novel"), "Novel").unwrap();
+        let character = CharacterId::new();
+        store.add_character(character, "Mara").unwrap();
+        let note = store
+            .create_scratchpad_note("Remember", "The atlas is hidden under the bridge.")
+            .unwrap();
+        store
+            .update_scratchpad_note(
+                note,
+                "Atlas clue",
+                "The atlas is hidden under the bridge.",
+                true,
+            )
+            .unwrap();
+        store
+            .promote_scratchpad_note(note, "character", &character.to_string())
+            .unwrap();
+        let note = &store.list_scratchpad_notes(true).unwrap()[0];
+        assert_eq!(note.state, "promoted");
+        assert!(note.pinned);
+        assert_eq!(note.body, "The atlas is hidden under the bridge.");
+        assert_eq!(note.destination_id, Some(character.to_string()));
+        assert!(store.list_scratchpad_notes(false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn personal_comments_follow_passage_anchors_and_report_orphans() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = ProjectStore::create(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Scene").unwrap();
+        let (_, hash) = store.load_text(scene).unwrap();
+        let text = "Élodie said hello.\n";
+        store.save_text(scene, Some(&hash), text).unwrap();
+        let start = text.find("said").unwrap() as u64;
+        let comment = store
+            .create_personal_comment(
+                scene,
+                start,
+                start + 4,
+                "said",
+                "Clarify who she addresses.",
+            )
+            .unwrap();
+        store
+            .set_personal_comment_state(comment, "resolved")
+            .unwrap();
+        let (current, hash) = store.load_text(scene).unwrap();
+        let hash = store
+            .save_text(scene, Some(&hash), &format!("Before. {current}"))
+            .unwrap();
+        let record = store.list_scene_comments(scene).unwrap().remove(0);
+        assert_eq!(record.state, "resolved");
+        assert_eq!(record.anchor_state.as_deref(), Some("current"));
+        assert_eq!(record.quote.as_deref(), Some("said"));
+        let text = "Before. Élodie greeted everyone.\n";
+        store.save_text(scene, Some(&hash), text).unwrap();
+        let record = store.list_scene_comments(scene).unwrap().remove(0);
+        assert_eq!(record.state, "resolved");
+        assert_ne!(record.anchor_state.as_deref(), Some("current"));
+        assert!(record.anchor_id.is_some());
+    }
+
+    #[test]
+    fn assemblies_reorder_and_filter_content_without_touching_canonical_placement() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = ProjectStore::create(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let first = store.create_scene(chapter, 0, "First").unwrap();
+        let second = store.create_scene(chapter, 1, "Second").unwrap();
+        let assembly = store.create_assembly("Alternate edition").unwrap();
+        let first_item = store.add_assembly_scene(assembly, first, 0).unwrap();
+        let second_item = store.add_assembly_scene(assembly, second, 1).unwrap();
+        store.move_assembly_item(assembly, second_item, 0).unwrap();
+        store.set_assembly_item_included(first_item, false).unwrap();
+        let items = store.list_assembly_items(assembly).unwrap();
+        assert_eq!(items[0].id, second_item);
+        assert_eq!(items[0].position, 0);
+        assert!(items[0].included);
+        assert_eq!(items[1].id, first_item);
+        assert_eq!(items[1].position, 1);
+        assert!(!items[1].included);
+        assert!(store.add_assembly_scene(assembly, first, 2).is_err());
+        let other = store.create_assembly("Reading copy").unwrap();
+        assert!(store.add_assembly_scene(other, first, 0).is_ok());
+        let canonical = store.list_scenes(false).unwrap();
+        assert_eq!(
+            canonical.iter().map(|row| row.scene.id).collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert_eq!(
+            canonical
+                .iter()
+                .map(|row| row.position.unwrap())
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
     }
 }

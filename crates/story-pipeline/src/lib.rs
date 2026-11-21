@@ -378,7 +378,7 @@ fn render_stage(
             let text = outputs
                 .get(&Stage::Compile)
                 .ok_or("compiled manuscript unavailable")?;
-            let words = text.split_whitespace().count();
+            let words = story_core::count_words(text) as usize;
             let mut output = format!(
                 "{} words\nTarget: {}\n",
                 words,
@@ -607,7 +607,7 @@ fn analysis_input(input: &PipelineInput) -> Vec<SceneAnalysisInput> {
             scene_id: scene.id.clone(),
             title: scene.title.clone(),
             chapter_id: None,
-            actual_words: scene.text.split_whitespace().count().min(u32::MAX as usize) as u32,
+            actual_words: story_core::count_words(&scene.text),
             target_words: scene.target_words,
             start_time: scene.start,
             end_time: scene.end,

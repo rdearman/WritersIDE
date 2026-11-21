@@ -18,5 +18,9 @@ tempfile = "3.23"
 ratatui = "0.29"
 crossterm = "0.28"
 serde_json = "1.0"
+zip = "0.6.6"
+time = { version = "0.3.47", features = ["parsing"] }
+unicode-segmentation = "1.12"
+regex = "1.12"
 pulldown-cmark = "0.9.6"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
