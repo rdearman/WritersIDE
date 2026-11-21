@@ -1,0 +1,1 @@
+A generic opening scene for importer regression tests.

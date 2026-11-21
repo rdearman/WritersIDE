@@ -1915,7 +1915,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "inventory": inventory,
                     "proposed_plan": plan,
                     "preview": preview,
-                    "compatibility": "experimental; one licensed Scrivener for Mac 3.1.4 fixture is tested, broader product/version/platform coverage is unverified"
+                    "compatibility": "experimental; tested against a small licensed Scrivener for Mac 3.1.4 fixture and a local Scrivener for Windows 3.1.1.0 project; broad product/version/platform coverage is unverified"
                 }))?
             );
         }
@@ -1954,7 +1954,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "plan": plan,
                         "preview": preview,
                         "action": "review the plan, set each selected binder item's destination_kind, save it as JSON, and rerun import-scrivener",
-                        "compatibility": "experimental; one licensed Scrivener for Mac 3.1.4 fixture is tested, broader product/version/platform coverage is unverified"
+                        "compatibility": "experimental; tested against a small licensed Scrivener for Mac 3.1.4 fixture and a local Scrivener for Windows 3.1.1.0 project; broad product/version/platform coverage is unverified"
                     }))?
                 );
                 if mapping_path.is_some() {

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ScrivenerProject Version="2.0" Creator="SCRWIN-3.1.1.0" Identifier="00000000-0000-4000-8000-000000000001">
+  <Binder>
+    <BinderItem UUID="00000000-0000-4000-8000-000000000010" Type="DraftFolder">
+      <Title>Draft</Title>
+      <MetaData><IncludeInCompile>Yes</IncludeInCompile></MetaData>
+      <Children>
+        <BinderItem UUID="00000000-0000-4000-8000-000000000011" Type="Text">
+          <Title>Opening Scene</Title>
+          <MetaData><IncludeInCompile>Yes</IncludeInCompile></MetaData>
+          <Children/>
+        </BinderItem>
+      </Children>
+    </BinderItem>
+    <BinderItem UUID="00000000-0000-4000-8000-000000000020" Type="ResearchFolder">
+      <Title>Research</Title>
+      <MetaData><IncludeInCompile>Yes</IncludeInCompile></MetaData>
+      <Children/>
+    </BinderItem>
+    <BinderItem UUID="00000000-0000-4000-8000-000000000030" Type="TrashFolder">
+      <Title>Trash</Title>
+      <MetaData><IncludeInCompile>Yes</IncludeInCompile></MetaData>
+      <Children>
+        <BinderItem UUID="00000000-0000-4000-8000-000000000031" Type="Text">
+          <Title>Discarded Note</Title>
+          <MetaData><IncludeInCompile>No</IncludeInCompile></MetaData>
+          <Children/>
+        </BinderItem>
+      </Children>
+    </BinderItem>
+  </Binder>
+</ScrivenerProject>

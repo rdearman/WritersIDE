@@ -8,7 +8,7 @@ use story_core::{BookId, ProjectId, SeriesId};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const SERIES_SCHEMA_VERSION: i64 = 1;
+const SERIES_SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Error)]
 pub enum SeriesError {
@@ -115,8 +115,10 @@ impl SeriesStore {
                     source_fingerprint TEXT,
                     created_at INTEGER NOT NULL
                  );
+                 CREATE UNIQUE INDEX series_book_title_unique
+                    ON series_book(title COLLATE NOCASE);
                  INSERT INTO schema_migrations(version,applied_at)
-                    VALUES(1,unixepoch());",
+                    VALUES(1,unixepoch()),(2,unixepoch());",
         )?;
         conn.execute(
             "INSERT INTO series_metadata(singleton,id,title,schema_version) VALUES(1,?1,?2,?3)",
@@ -145,7 +147,7 @@ impl SeriesStore {
                 manifest.format_version,
             )));
         }
-        let conn = Connection::open(root.join("series.db"))?;
+        let mut conn = Connection::open(root.join("series.db"))?;
         configure(&conn)?;
         let (database_id, database_title, schema_version): (String, String, i64) = conn.query_row(
             "SELECT id,title,schema_version FROM series_metadata WHERE singleton=1",
@@ -154,6 +156,12 @@ impl SeriesStore {
         )?;
         if schema_version > SERIES_SCHEMA_VERSION {
             return Err(SeriesError::UnsupportedSchema(schema_version));
+        }
+        if schema_version < 1 {
+            return Err(SeriesError::UnsupportedSchema(schema_version));
+        }
+        if schema_version < SERIES_SCHEMA_VERSION {
+            migrate_series_schema(&mut conn, schema_version)?;
         }
         let database_id = parse_id::<SeriesId>(&database_id)?;
         if database_id != manifest.id {
@@ -224,6 +232,15 @@ impl SeriesStore {
             }
             self.write_membership(&existing)?;
             return Ok(existing);
+        }
+        if self
+            .list_books()?
+            .iter()
+            .any(|book| book.title.eq_ignore_ascii_case(title))
+        {
+            return Err(SeriesError::Config(
+                "a book with that name already exists in this series".into(),
+            ));
         }
         let position: u32 = self
             .conn
@@ -408,6 +425,32 @@ impl SeriesStore {
     }
 }
 
+fn migrate_series_schema(conn: &mut Connection, current_version: i64) -> Result<()> {
+    if current_version != 1 {
+        return Err(SeriesError::UnsupportedSchema(current_version));
+    }
+    let transaction = conn.transaction()?;
+    let duplicate: Option<String> = transaction
+        .query_row(
+            "SELECT title FROM series_book GROUP BY title COLLATE NOCASE HAVING count(*) > 1 LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if duplicate.is_some() {
+        return Err(SeriesError::Config(
+            "existing series contains duplicate book names; resolve them before opening".into(),
+        ));
+    }
+    transaction.execute_batch(
+        "CREATE UNIQUE INDEX series_book_title_unique ON series_book(title COLLATE NOCASE);
+         INSERT INTO schema_migrations(version,applied_at) VALUES(2,unixepoch());
+         UPDATE series_metadata SET schema_version=2 WHERE singleton=1;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn configure(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", "ON")?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -495,6 +538,124 @@ mod tests {
                 .is_file()
         );
         assert!(SeriesStore::open_for_book(relocated.join("Book 1")).is_ok());
+    }
+
+    #[test]
+    fn duplicate_book_names_are_rejected_by_services_and_sql_constraints() {
+        let temp = tempfile::tempdir().unwrap();
+        let series_root = temp.path().join("Series");
+        let mut series = SeriesStore::create(&series_root, "Series").unwrap();
+        let (first_path, first_id) = book_folder(&series_root, "Book 1");
+        series
+            .add_book(first_id, &first_path, "The First Book", None)
+            .unwrap();
+        let (second_path, second_id) = book_folder(&series_root, "Book 2");
+        assert!(matches!(
+            series.add_book(second_id, &second_path, "the first book", None),
+            Err(SeriesError::Config(message)) if message.contains("already exists")
+        ));
+
+        let connection = Connection::open(series_root.join("series.db")).unwrap();
+        let direct_insert = connection.execute(
+            "INSERT INTO series_book(id,project_id,title,relative_path,position,source_fingerprint,created_at)
+             VALUES(?1,?2,?3,?4,?5,NULL,unixepoch())",
+            params![
+                uuid::Uuid::new_v4().to_string(),
+                uuid::Uuid::new_v4().to_string(),
+                "THE FIRST BOOK",
+                "Book 2",
+                1
+            ],
+        );
+        assert!(direct_insert.is_err());
+    }
+
+    #[test]
+    fn version_one_series_database_migrates_title_uniqueness() {
+        let temp = tempfile::tempdir().unwrap();
+        let series_root = temp.path().join("Series");
+        drop(SeriesStore::create(&series_root, "Series").unwrap());
+        let database_path = series_root.join("series.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX series_book_title_unique;
+                 DELETE FROM schema_migrations WHERE version=2;
+                 UPDATE series_metadata SET schema_version=1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let series = SeriesStore::open(&series_root).unwrap();
+        let schema_version: i64 = series
+            .conn
+            .query_row(
+                "SELECT schema_version FROM series_metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, 2);
+        let migrations: i64 = series
+            .conn
+            .query_row(
+                "SELECT count(*) FROM schema_migrations WHERE version=2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migrations, 1);
+    }
+
+    #[test]
+    fn version_one_series_with_duplicate_names_is_left_unmodified() {
+        let temp = tempfile::tempdir().unwrap();
+        let series_root = temp.path().join("Series");
+        drop(SeriesStore::create(&series_root, "Series").unwrap());
+        let database_path = series_root.join("series.db");
+        let connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX series_book_title_unique;
+                 DELETE FROM schema_migrations WHERE version=2;
+                 UPDATE series_metadata SET schema_version=1;",
+            )
+            .unwrap();
+        for (id, project_id, path) in [
+            ("book-1", "project-1", "Book 1"),
+            ("book-2", "project-2", "Book 2"),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO series_book(id,project_id,title,relative_path,position,source_fingerprint,created_at)
+                     VALUES(?1,?2,'Same Name',?3,?4,NULL,unixepoch())",
+                    params![id, project_id, path, if id == "book-1" { 0 } else { 1 }],
+                )
+                .unwrap();
+        }
+        drop(connection);
+
+        assert!(matches!(
+            SeriesStore::open(&series_root),
+            Err(SeriesError::Config(message)) if message.contains("duplicate book names")
+        ));
+        let connection = Connection::open(&database_path).unwrap();
+        let schema_version: i64 = connection
+            .query_row(
+                "SELECT schema_version FROM series_metadata WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(schema_version, 1);
+        let migration_applied: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM schema_migrations WHERE version=2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_applied, 0);
     }
 
     #[test]
