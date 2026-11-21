@@ -162,6 +162,7 @@ struct AppState {
     kill_ring_index: usize,
     last_yank: Option<LastYank>,
     macro_preview: Option<MacroPreview>,
+    pending_replace: Option<Vec<ReplaceTarget>>,
     extra_cursors: Vec<(usize, usize)>,
     active_challenge: Option<ActiveWritingChallenge>,
     menu: Option<MenuState>,
@@ -363,6 +364,16 @@ struct MacroPreview {
     name: String,
     repetitions: usize,
     source: String,
+}
+
+#[derive(Clone, Debug)]
+struct ReplaceTarget {
+    scene: SceneId,
+    title: String,
+    expected_hash: String,
+    original: String,
+    proposed: String,
+    replacements: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -718,6 +729,30 @@ fn command_registry() -> Vec<CommandSpec> {
             "Edit",
             "scene-field",
             true,
+        ),
+        legacy_command(
+            "search.replace-preview",
+            "Preview Find and Replace",
+            "Review proposed replacements before changing manuscript files",
+            "Edit",
+            "replace-preview",
+            true,
+        ),
+        legacy_command(
+            "search.replace-apply",
+            "Apply Replacement Preview",
+            "Apply the current replacement preview after stale-content checks",
+            "Edit",
+            "replace-apply",
+            false,
+        ),
+        legacy_command(
+            "search.replace-cancel",
+            "Cancel Replacement Preview",
+            "Discard the current replacement preview without changing files",
+            "Edit",
+            "replace-cancel",
+            false,
         ),
         legacy_command(
             "scene.subchapter",
@@ -2430,6 +2465,7 @@ impl AppState {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -3106,6 +3142,31 @@ impl AppState {
                 .filter(|record| record.chapter_id == Some(chapter))
                 .collect());
         }
+        if let Some(id) = scope.strip_prefix("assembly:") {
+            let assembly = story_core::AssemblyId(id.parse()?);
+            if !self
+                .app
+                .list_assemblies()?
+                .iter()
+                .any(|candidate| candidate.id == assembly)
+            {
+                return Err("manuscript assembly does not exist".into());
+            }
+            let mut by_id = scenes
+                .into_iter()
+                .map(|record| (record.scene.id, record))
+                .collect::<std::collections::HashMap<_, _>>();
+            let mut ordered = Vec::new();
+            for item in self.app.list_assembly_items(assembly)? {
+                if item.included
+                    && let Some(scene) = item.scene_id
+                    && let Some(record) = by_id.remove(&scene)
+                {
+                    ordered.push(record);
+                }
+            }
+            return Ok(ordered);
+        }
         let id = if scope == "current" {
             self.editing_scene
                 .or(self.active_scene())
@@ -3720,7 +3781,11 @@ impl AppState {
                         return Ok(());
                     }
                     self.menu = None;
-                    self.dispatch_registered(spec.action)?;
+                    if spec.action == CommandAction::LegacyPalette {
+                        self.dispatch_registered_with_args(spec.action, spec.palette_prefix)?;
+                    } else {
+                        self.dispatch_registered(spec.action)?;
+                    }
                     return Ok(());
                 }
                 return Ok(());
@@ -7389,17 +7454,26 @@ impl AppState {
             let pattern = parts.next().ok_or("missing replace pattern")?;
             let scenes = self.scenes_for_scope(scope)?;
             let mut output = Vec::new();
+            let mut targets = Vec::new();
             let mut total = 0usize;
             for record in scenes {
-                let source = if self.editing_scene == Some(record.scene.id) {
-                    self.editor.join("\n")
+                let (source, expected_hash) = if self.editing_scene == Some(record.scene.id) {
+                    (self.editor.join("\n"), self.saved_hash.clone())
                 } else {
-                    self.app.load_scene_text(record.scene.id)?.0
+                    self.app.load_scene_text(record.scene.id)?
                 };
                 let (updated, count) =
                     story_core::replace_matches(&source, pattern, replacement, mode)?;
                 if count > 0 {
                     total += count;
+                    targets.push(ReplaceTarget {
+                        scene: record.scene.id,
+                        title: record.scene.title.clone(),
+                        expected_hash,
+                        original: source.clone(),
+                        proposed: updated.clone(),
+                        replacements: count,
+                    });
                     output.push(format!(
                         "## {} — {count} replacement(s)\n--- current ---\n{}\n--- proposed ---\n{}",
                         record.scene.title, source, updated
@@ -7407,8 +7481,10 @@ impl AppState {
                 }
             }
             if output.is_empty() {
+                self.pending_replace = None;
                 self.message = "Preview: no replacements found; manuscript unchanged".into();
             } else {
+                self.pending_replace = Some(targets);
                 let preview = output.join("\n\n");
                 let mut clipped = String::new();
                 for ch in preview.chars().take(12_000) {
@@ -7420,10 +7496,114 @@ impl AppState {
                     ""
                 };
                 self.message = format!(
-                    "Read-only preview: {total} replacement(s) in {} scene(s). Use replace to apply.\n\n{clipped}{suffix}",
+                    "Read-only preview staged: {total} replacement(s) in {} scene(s). Use replace-apply to commit or replace-cancel to discard.\n\n{clipped}{suffix}",
                     output.len()
                 );
             }
+        } else if cmd == "replace-cancel" {
+            if self.pending_replace.take().is_some() {
+                self.message = "Replacement preview discarded; manuscript unchanged".into();
+            } else {
+                self.message = "There is no pending replacement preview".into();
+            }
+        } else if cmd == "replace-apply" {
+            let targets = self
+                .pending_replace
+                .clone()
+                .ok_or("run replace-preview before replace-apply")?;
+            if self.dirty
+                && self
+                    .editing_scene
+                    .is_some_and(|scene| targets.iter().any(|target| target.scene == scene))
+                && targets.len() > 1
+            {
+                return Err(
+                    "save the dirty editor buffer before applying a multi-scene replacement preview"
+                        .into(),
+                );
+            }
+            for target in &targets {
+                if self.editing_scene == Some(target.scene) {
+                    if self.editor.join("\n") != target.original {
+                        return Err(format!(
+                            "replacement preview is stale for {}; preview again",
+                            target.title
+                        )
+                        .into());
+                    }
+                    let (_, disk_hash) = self.app.load_scene_text(target.scene)?;
+                    if disk_hash != target.expected_hash {
+                        return Err(format!(
+                            "saved manuscript changed after preview for {}; preview again",
+                            target.title
+                        )
+                        .into());
+                    }
+                } else {
+                    let (current, hash) = self.app.load_scene_text(target.scene)?;
+                    if current != target.original || hash != target.expected_hash {
+                        return Err(format!(
+                            "manuscript changed after preview for {}; preview again",
+                            target.title
+                        )
+                        .into());
+                    }
+                }
+            }
+            let mut applied: Vec<(ReplaceTarget, String)> = Vec::new();
+            for target in &targets {
+                match self.app.save_scene_text(
+                    target.scene,
+                    Some(&target.expected_hash),
+                    &target.proposed,
+                ) {
+                    Ok(new_hash) => applied.push((target.clone(), new_hash)),
+                    Err(error) => {
+                        let mut rollback_errors = Vec::new();
+                        for (previous, new_hash) in applied.iter().rev() {
+                            if let Err(rollback) = self.app.save_scene_text(
+                                previous.scene,
+                                Some(new_hash),
+                                &previous.original,
+                            ) {
+                                rollback_errors.push(format!("{}: {rollback}", previous.title));
+                            }
+                        }
+                        self.pending_replace = None;
+                        if rollback_errors.is_empty() {
+                            return Err(format!(
+                                "replacement failed and earlier files were restored: {error}"
+                            )
+                            .into());
+                        }
+                        return Err(format!(
+                            "replacement failed: {error}; rollback needs attention for {}",
+                            rollback_errors.join(", ")
+                        )
+                        .into());
+                    }
+                }
+            }
+            let replacements = targets
+                .iter()
+                .map(|target| target.replacements)
+                .sum::<usize>();
+            if let Some(active) = self.editing_scene
+                && let Some((target, hash)) =
+                    applied.iter().find(|(target, _)| target.scene == active)
+            {
+                self.editor = target.proposed.split('\n').map(str::to_owned).collect();
+                if self.editor.is_empty() {
+                    self.editor.push(String::new());
+                }
+                self.saved_hash = hash.clone();
+                self.dirty = false;
+            }
+            self.pending_replace = None;
+            self.message = format!(
+                "Applied {replacements} replacement(s) to {} scene(s)",
+                targets.len()
+            );
         } else if let Some(rest) = cmd.strip_prefix("replace ") {
             self.search_locations.clear();
             let (head, replacement) = rest
@@ -7434,6 +7614,12 @@ impl AppState {
             let scope = parts.next().ok_or("missing replace scope")?;
             let pattern = parts.next().ok_or("missing replace pattern")?;
             let scenes = self.scenes_for_scope(scope)?;
+            if scenes.len() > 1 {
+                return Err(
+                    "multi-scene replacement requires replace-preview followed by replace-apply; no files were changed"
+                        .into(),
+                );
+            }
             let mut changed = 0usize;
             let mut replacements = 0usize;
             for record in scenes {
@@ -13459,6 +13645,7 @@ mod tests {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -13793,6 +13980,143 @@ mod tests {
         assert_eq!(
             state.app.load_scene_text(scene).unwrap().0,
             "A cat waits.\nThe cat leaves."
+        );
+        assert!(state.pending_replace.is_some());
+        state
+            .execute_legacy_palette_command("replace-cancel")
+            .unwrap();
+        assert!(state.pending_replace.is_none());
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "A cat waits.\nThe cat leaves."
+        );
+    }
+
+    #[test]
+    fn confirmed_replace_preview_applies_to_multiple_scenes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Replace"), "Replace").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        for scene in [first, second] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), "A cat waits.")
+                .unwrap();
+        }
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command("replace-preview normal all cat => fox")
+            .unwrap();
+        assert_eq!(state.app.load_scene_text(first).unwrap().0, "A cat waits.");
+        assert_eq!(state.app.load_scene_text(second).unwrap().0, "A cat waits.");
+        state
+            .execute_legacy_palette_command("replace-apply")
+            .unwrap();
+        assert_eq!(state.app.load_scene_text(first).unwrap().0, "A fox waits.");
+        assert_eq!(state.app.load_scene_text(second).unwrap().0, "A fox waits.");
+        assert!(state.pending_replace.is_none());
+        assert!(state.message.contains("2 replacement(s)"));
+    }
+
+    #[test]
+    fn stale_replace_preview_rejects_all_writes() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Replace"), "Replace").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        for scene in [first, second] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), "A cat waits.")
+                .unwrap();
+        }
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command("replace-preview normal all cat => fox")
+            .unwrap();
+        let (_, hash) = state.app.load_scene_text(second).unwrap();
+        state
+            .app
+            .save_scene_text(second, Some(&hash), "An external edit.")
+            .unwrap();
+        assert!(
+            state
+                .execute_legacy_palette_command("replace-apply")
+                .is_err()
+        );
+        assert_eq!(state.app.load_scene_text(first).unwrap().0, "A cat waits.");
+        assert_eq!(
+            state.app.load_scene_text(second).unwrap().0,
+            "An external edit."
+        );
+    }
+
+    #[test]
+    fn multi_scene_replace_requires_dirty_active_buffer_to_be_saved_first() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Replace"), "Replace").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        for scene in [first, second] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), "A cat waits.")
+                .unwrap();
+        }
+        let saved_hash = app.load_scene_text(first).unwrap().1;
+        let mut state = AppState::new(app, default_bindings());
+        state.editing_scene = Some(first);
+        state.editor = vec!["A cat waits after an unsaved edit.".into()];
+        state.saved_hash = saved_hash;
+        state.dirty = true;
+        state
+            .execute_legacy_palette_command("replace-preview normal all cat => fox")
+            .unwrap();
+        assert!(
+            state
+                .execute_legacy_palette_command("replace-apply")
+                .unwrap_err()
+                .to_string()
+                .contains("save the dirty editor buffer")
+        );
+        assert_eq!(state.app.load_scene_text(first).unwrap().0, "A cat waits.");
+        assert!(state.dirty);
+        assert_eq!(
+            state.editor.join("\n"),
+            "A cat waits after an unsaved edit."
+        );
+    }
+
+    #[test]
+    fn direct_multi_scene_replace_requires_a_preview() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Replace"), "Replace").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        for index in 0..2 {
+            let scene = app
+                .create_scene(chapter, &format!("Scene {index}"), index)
+                .unwrap();
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), "A cat waits.")
+                .unwrap();
+        }
+        let mut state = AppState::new(app, default_bindings());
+        assert!(
+            state
+                .execute_legacy_palette_command("replace normal all cat => fox")
+                .is_err()
+        );
+        assert!(
+            state
+                .app
+                .list_scenes(false)
+                .unwrap()
+                .iter()
+                .all(
+                    |record| state.app.load_scene_text(record.scene.id).unwrap().0
+                        == "A cat waits."
+                )
         );
     }
 
@@ -14350,6 +14674,38 @@ mod tests {
     }
 
     #[test]
+    fn find_scope_respects_included_assembly_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let omitted = app.create_scene(chapter, "Omitted", 1).unwrap();
+        let last = app.create_scene(chapter, "Last", 2).unwrap();
+        for scene in [first, omitted, last] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), "Mara arrives.")
+                .unwrap();
+        }
+        let assembly = app.create_assembly("Reading order").unwrap();
+        app.add_assembly_scene(assembly, last, 0).unwrap();
+        let omitted_item = app.add_assembly_scene(assembly, omitted, 1).unwrap();
+        app.set_assembly_item_included(omitted_item, false).unwrap();
+        app.add_assembly_scene(assembly, first, 2).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.mode = Some(':');
+        state.prompt = format!("find normal assembly:{assembly} Mara");
+        state.command().unwrap();
+        assert_eq!(
+            state
+                .search_locations
+                .iter()
+                .map(|(scene, _, _)| *scene)
+                .collect::<Vec<_>>(),
+            [last, first]
+        );
+    }
+
+    #[test]
     fn proofread_scopes_to_a_chapter_and_rejects_non_chapters() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -14441,6 +14797,7 @@ mod tests {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -14537,6 +14894,7 @@ mod tests {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -14625,6 +14983,7 @@ mod tests {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -14725,6 +15084,7 @@ mod tests {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -14975,6 +15335,7 @@ mod tests {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -15075,6 +15436,7 @@ mod tests {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -15192,6 +15554,7 @@ mod tests {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -15427,6 +15790,7 @@ mod tests {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -15793,6 +16157,7 @@ mod tests {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -15904,6 +16269,7 @@ mod tests {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -16067,6 +16433,7 @@ mod tests {
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            pending_replace: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,

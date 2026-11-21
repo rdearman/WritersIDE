@@ -262,11 +262,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("missing search pattern".into());
             }
             let app = WriterApp::open_project(path)?;
-            let scenes = app.list_scenes(false)?;
-            for scene in scenes
-                .into_iter()
-                .filter(|s| scene_matches_scope(s, &scope))
-            {
+            let scenes = scenes_for_scope(&app, &scope)?;
+            for scene in scenes {
                 let (text, _) = app.load_scene_text(scene.scene.id)?;
                 for range in story_core::find_matches(&text, &pattern, mode)? {
                     println!(
@@ -284,14 +281,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let rest = args.collect::<Vec<_>>().join(" ");
             let (pattern, replacement) = rest
                 .split_once(" => ")
-                .ok_or("use: replace PROJECT MODE all|SCENE_UUID PATTERN => REPLACEMENT")?;
+                .ok_or("use: replace PROJECT MODE SCOPE PATTERN => REPLACEMENT")?;
             let mut app = WriterApp::open_project(path)?;
-            let scenes = app.list_scenes(false)?;
+            let scenes = scenes_for_scope(&app, &scope)?;
+            if scenes.len() > 1 {
+                return Err(
+                    "multi-scene replacement requires replace-preview; no files were changed"
+                        .into(),
+                );
+            }
             let mut changed = 0;
-            for scene in scenes
-                .into_iter()
-                .filter(|s| scene_matches_scope(s, &scope))
-            {
+            for scene in scenes {
                 let (text, hash) = app.load_scene_text(scene.scene.id)?;
                 let (updated, count) =
                     story_core::replace_matches(&text, pattern, replacement, mode)?;
@@ -314,11 +314,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .ok_or("use: replace-preview PROJECT MODE all|SCENE_UUID PATTERN => REPLACEMENT")?;
             let app = WriterApp::open_project(path)?;
             let mut preview = Vec::new();
-            for scene in app
-                .list_scenes(false)?
-                .into_iter()
-                .filter(|scene| scene_matches_scope(scene, &scope))
-            {
+            for scene in scenes_for_scope(&app, &scope)? {
                 let (original, hash) = app.load_scene_text(scene.scene.id)?;
                 let (proposed, replacements) =
                     story_core::replace_matches(&original, pattern, replacement, mode)?;
@@ -334,6 +330,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             println!("{}", serde_json::to_string_pretty(&preview)?);
+        }
+        "replace-apply" => {
+            let path = args.next().ok_or("missing project path")?;
+            let preview_path = args.next().ok_or("missing replace-preview JSON file")?;
+            let preview: Vec<CliReplaceTarget> = serde_json::from_slice(&fs::read(preview_path)?)?;
+            let mut app = WriterApp::open_project(path)?;
+            let (scenes, count) = apply_replace_preview(&mut app, &preview)?;
+            println!("Applied {count} replacement(s) to {scenes} scene(s)");
         }
         "write" => {
             let path = args.next().ok_or("missing project path")?;
@@ -2170,21 +2174,121 @@ fn validate_scene_scope(scope: &str) -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(chapter) = scope.strip_prefix("chapter:") {
         let _: uuid::Uuid = chapter.parse()?;
+    } else if let Some(assembly) = scope.strip_prefix("assembly:") {
+        let _: uuid::Uuid = assembly.parse()?;
     } else {
         let _: uuid::Uuid = scope.parse()?;
     }
     Ok(())
 }
 
-fn scene_matches_scope(scene: &story_storage::SceneRecord, scope: &str) -> bool {
+#[derive(serde::Deserialize)]
+struct CliReplaceTarget {
+    scene_id: SceneId,
+    title: String,
+    content_hash: String,
+    replacements: usize,
+    original: String,
+    proposed: String,
+}
+
+fn apply_replace_preview(
+    app: &mut WriterApp,
+    targets: &[CliReplaceTarget],
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    let mut seen = std::collections::HashSet::new();
+    for target in targets {
+        if target.replacements == 0 || !seen.insert(target.scene_id) {
+            return Err("preview contains an empty or duplicate scene target".into());
+        }
+        let (text, hash) = app.load_scene_text(target.scene_id)?;
+        if text != target.original || hash != target.content_hash {
+            return Err(format!(
+                "replacement preview is stale for {}; no files were changed",
+                target.title
+            )
+            .into());
+        }
+    }
+    let total = targets.iter().map(|target| target.replacements).sum();
+    let mut applied: Vec<(&CliReplaceTarget, String)> = Vec::new();
+    for target in targets {
+        match app.save_scene_text(
+            target.scene_id,
+            Some(&target.content_hash),
+            &target.proposed,
+        ) {
+            Ok(hash) => applied.push((target, hash)),
+            Err(error) => {
+                let mut rollback_errors = Vec::new();
+                for (previous, hash) in applied.iter().rev() {
+                    if let Err(rollback) =
+                        app.save_scene_text(previous.scene_id, Some(hash), &previous.original)
+                    {
+                        rollback_errors.push(format!("{}: {rollback}", previous.title));
+                    }
+                }
+                if rollback_errors.is_empty() {
+                    return Err(format!(
+                        "replacement failed and earlier files were restored: {error}"
+                    )
+                    .into());
+                }
+                return Err(format!(
+                    "replacement failed: {error}; rollback needs attention for {}",
+                    rollback_errors.join(", ")
+                )
+                .into());
+            }
+        }
+    }
+    Ok((targets.len(), total))
+}
+
+fn scenes_for_scope(
+    app: &WriterApp,
+    scope: &str,
+) -> Result<Vec<story_storage::SceneRecord>, Box<dyn std::error::Error>> {
+    let scenes = app.list_scenes(false)?;
     if scope == "all" {
-        return true;
+        return Ok(scenes);
     }
     if let Some(chapter) = scope.strip_prefix("chapter:") {
-        scene.chapter_id.is_some_and(|id| id.to_string() == chapter)
-    } else {
-        scene.scene.id.to_string() == scope
+        let chapter = story_core::NodeId(chapter.parse()?);
+        return Ok(scenes
+            .into_iter()
+            .filter(|scene| scene.chapter_id == Some(chapter))
+            .collect());
     }
+    if let Some(assembly) = scope.strip_prefix("assembly:") {
+        let assembly = story_core::AssemblyId(assembly.parse()?);
+        if !app
+            .list_assemblies()?
+            .iter()
+            .any(|candidate| candidate.id == assembly)
+        {
+            return Err("manuscript assembly does not exist".into());
+        }
+        let mut by_id = scenes
+            .into_iter()
+            .map(|record| (record.scene.id, record))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut ordered = Vec::new();
+        for item in app.list_assembly_items(assembly)? {
+            if item.included
+                && let Some(scene_id) = item.scene_id
+                && let Some(record) = by_id.remove(&scene_id)
+            {
+                ordered.push(record);
+            }
+        }
+        return Ok(ordered);
+    }
+    let scene = SceneId(scope.parse()?);
+    Ok(scenes
+        .into_iter()
+        .filter(|record| record.scene.id == scene)
+        .collect())
 }
 fn parse_cli_story_time(value: &str) -> Result<story_core::StoryTime, Box<dyn std::error::Error>> {
     use story_core::{StoryTime, TimePrecision};
@@ -2266,7 +2370,7 @@ fn usage() {
         "writers-ide proofread-config <project> (creates editable .writers-ide/diagnostics.toml)"
     );
     eprintln!(
-        "writers-ide find <path> <normal|extended|regex> <all|scene-uuid> <pattern>\nwriters-ide replace-preview <path> <normal|extended|regex> <all|scene-uuid> <pattern> => <replacement>\nwriters-ide replace <path> <normal|extended|regex> <all|scene-uuid> <pattern> => <replacement>\nwriters-ide language <path> [language-tag]"
+        "writers-ide find <path> <normal|extended|regex> <all|scene-uuid|chapter:uuid|assembly:uuid> <pattern>\nwriters-ide replace-preview <path> <normal|extended|regex> <scope> <pattern> => <replacement>\nwriters-ide replace-apply <path> <preview.json>\nwriters-ide replace <path> <normal|extended|regex> <scope> <pattern> => <replacement>\nwriters-ide language <path> [language-tag]"
     );
     eprintln!(
         "writers-ide create <path> [title]\nwriters-ide create-kind <path> <fiction|nonfiction|custom> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide compile <path> <markdown|html|epub|docx|pdf> [output-path] [--expand-transclusions]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|present=UUID|mentioned=UUID|absent=UUID|location=UUID|event=UUID|chapter=UUID|text=TERM|plotline=UUID|assembly=UUID|issue-status=STATUS|meta=FIELD:VALUE|meta-contains=FIELD:KIND:ENTITY|meta-exists=FIELD|meta-text=FIELD:TEXT|meta-number=FIELD:OP:int|decimal:VALUE|before-definitely=TICK|before-possibly=TICK|after-definitely=TICK|after-possibly=TICK|before=TICK|after=TICK]...\nwriters-ide character-absence <path> <scene-uuid> <character-uuid> [notes]\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide query-explain <path> <query-uuid> <scene-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
@@ -2826,9 +2930,10 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod watch_tests {
     use super::{
-        WatchSuccess, compile_edition, compile_edition_with_aspell, edition_watch_fingerprint,
-        parse_scene_query_filter, run_auto_snapshot_check, run_processing_recipe,
-        spellcheck_project, watch_fingerprint,
+        CliReplaceTarget, WatchSuccess, apply_replace_preview, compile_edition,
+        compile_edition_with_aspell, edition_watch_fingerprint, parse_scene_query_filter,
+        run_auto_snapshot_check, run_processing_recipe, scenes_for_scope, spellcheck_project,
+        watch_fingerprint,
     };
     use std::fs;
     use story_app::WriterApp;
@@ -3073,6 +3178,60 @@ mod watch_tests {
             parse_scene_query_filter("not-status=complete").unwrap(),
             story_core::SceneQueryFilter::ExcludeStatus(story_core::SceneStatus::Complete)
         );
+    }
+
+    #[test]
+    fn assembly_search_scope_follows_included_assembly_scene_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let omitted = app.create_scene(chapter, "Omitted", 1).unwrap();
+        let last = app.create_scene(chapter, "Last", 2).unwrap();
+        let assembly = app.create_assembly("Selected edition").unwrap();
+        app.add_assembly_scene(assembly, last, 0).unwrap();
+        let omitted_item = app.add_assembly_scene(assembly, omitted, 1).unwrap();
+        app.set_assembly_item_included(omitted_item, false).unwrap();
+        app.add_assembly_scene(assembly, first, 2).unwrap();
+
+        let selected = scenes_for_scope(&app, &format!("assembly:{assembly}")).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|record| record.scene.id)
+                .collect::<Vec<_>>(),
+            [last, first]
+        );
+    }
+
+    #[test]
+    fn replace_preview_apply_rechecks_all_targets_before_writing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let mut targets = Vec::new();
+        for scene_id in [first, second] {
+            let (_, content_hash) = app.load_scene_text(scene_id).unwrap();
+            app.save_scene_text(scene_id, Some(&content_hash), "A cat waits.")
+                .unwrap();
+            let (original, content_hash) = app.load_scene_text(scene_id).unwrap();
+            targets.push(CliReplaceTarget {
+                scene_id,
+                title: scene_id.to_string(),
+                content_hash,
+                replacements: 1,
+                original,
+                proposed: "A fox waits.".into(),
+            });
+        }
+        let (_, stale_hash) = app.load_scene_text(second).unwrap();
+        app.save_scene_text(second, Some(&stale_hash), "Externally edited.")
+            .unwrap();
+        assert!(apply_replace_preview(&mut app, &targets).is_err());
+        assert_eq!(app.load_scene_text(first).unwrap().0, "A cat waits.");
+        assert_eq!(app.load_scene_text(second).unwrap().0, "Externally edited.");
     }
 
     #[cfg(unix)]
