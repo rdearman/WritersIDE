@@ -203,7 +203,8 @@ struct ActiveWritingSession {
 
 #[derive(Clone, Debug)]
 struct ReferencePane {
-    scene_id: SceneId,
+    source_key: String,
+    scene_id: Option<SceneId>,
     title: String,
     content: String,
     scroll: usize,
@@ -272,6 +273,8 @@ struct SessionSnapshot {
     reference_scroll: usize,
     #[serde(default)]
     reference_scenes: Vec<String>,
+    #[serde(default)]
+    reference_sources: Vec<String>,
     #[serde(default)]
     active_reference: usize,
     #[serde(default)]
@@ -2295,12 +2298,18 @@ impl AppState {
             successful_saves: self.successful_saves,
             reference_scene: self
                 .active_reference_pane()
-                .map(|pane| pane.scene_id.to_string()),
+                .and_then(|pane| pane.scene_id)
+                .map(|id| id.to_string()),
             reference_scroll: self.active_reference_pane().map_or(0, |pane| pane.scroll),
             reference_scenes: self
                 .reference_panes
                 .iter()
-                .map(|pane| pane.scene_id.to_string())
+                .filter_map(|pane| pane.scene_id.map(|id| id.to_string()))
+                .collect(),
+            reference_sources: self
+                .reference_panes
+                .iter()
+                .map(|pane| pane.source_key.clone())
                 .collect(),
             reference_scrolls: self
                 .reference_panes
@@ -2423,38 +2432,67 @@ impl AppState {
         self.typed_characters = snapshot.typed_characters;
         self.pasted_characters = snapshot.pasted_characters;
         self.successful_saves = snapshot.successful_saves;
-        let mut saved_references = snapshot.reference_scenes.clone();
+        let mut saved_references = if snapshot.reference_sources.is_empty() {
+            snapshot
+                .reference_scenes
+                .iter()
+                .map(|id| format!("scene:{id}"))
+                .collect::<Vec<_>>()
+        } else {
+            snapshot.reference_sources.clone()
+        };
         if let Some(legacy) = snapshot.reference_scene.as_ref()
-            && !saved_references.contains(legacy)
+            && !saved_references.contains(&format!("scene:{legacy}"))
         {
-            saved_references.push(legacy.clone());
+            saved_references.push(format!("scene:{legacy}"));
         }
         for (index, value) in saved_references.iter().enumerate() {
-            if let Ok(raw_id) = value.parse::<uuid::Uuid>() {
-                let id = SceneId(raw_id);
-                if let Ok(row) = self.app.get_scene(id)
-                    && let Ok((content, _)) = self.app.load_scene_text(id)
-                {
-                    let fallback_scroll = if Some(value) == snapshot.reference_scene.as_ref() {
-                        snapshot.reference_scroll
-                    } else {
-                        0
-                    };
-                    let requested = snapshot
-                        .reference_scrolls
-                        .get(index)
-                        .copied()
-                        .unwrap_or(fallback_scroll);
-                    let scroll = requested.min(content.lines().count().saturating_sub(1));
-                    self.reference_panes.push(ReferencePane {
-                        scene_id: id,
-                        title: row.scene.title,
-                        content,
-                        scroll,
-                    });
+            let (source_kind, source_id) = value.split_once(':').unwrap_or(("scene", value));
+            let loaded = match source_kind {
+                "scene" => source_id
+                    .parse::<uuid::Uuid>()
+                    .map(SceneId)
+                    .ok()
+                    .and_then(|id| {
+                        let row = self.app.get_scene(id).ok()?;
+                        let (content, _) = self.app.load_scene_text(id).ok()?;
+                        Some((Some(id), row.scene.title, content))
+                    }),
+                "research" => source_id
+                    .parse::<uuid::Uuid>()
+                    .ok()
+                    .map(story_core::ResearchId)
+                    .and_then(|id| {
+                        let row = self
+                            .app
+                            .list_research_items()
+                            .ok()?
+                            .into_iter()
+                            .find(|row| row.id == id)?;
+                        let content = self.app.load_research_text(id).ok()?;
+                        Some((None, row.title, content))
+                    }),
+                _ => None,
+            };
+            if let Some((scene_id, title, content)) = loaded {
+                let fallback_scroll = if Some(source_id) == snapshot.reference_scene.as_deref() {
+                    snapshot.reference_scroll
                 } else {
-                    stale_reference = true;
-                }
+                    0
+                };
+                let requested = snapshot
+                    .reference_scrolls
+                    .get(index)
+                    .copied()
+                    .unwrap_or(fallback_scroll);
+                let scroll = requested.min(content.lines().count().saturating_sub(1));
+                self.reference_panes.push(ReferencePane {
+                    source_key: value.clone(),
+                    scene_id,
+                    title,
+                    content,
+                    scroll,
+                });
             } else {
                 stale_reference = true;
             }
@@ -2595,6 +2633,38 @@ impl AppState {
     }
     fn active_reference_pane_mut(&mut self) -> Option<&mut ReferencePane> {
         self.reference_panes.get_mut(self.active_reference)
+    }
+    fn open_reference_buffer(
+        &mut self,
+        source_key: String,
+        scene_id: Option<SceneId>,
+        title: String,
+        content: String,
+    ) {
+        if let Some(index) = self
+            .reference_panes
+            .iter()
+            .position(|pane| pane.source_key == source_key)
+        {
+            let scroll = self.reference_panes[index].scroll;
+            self.reference_panes[index] = ReferencePane {
+                source_key,
+                scene_id,
+                title,
+                content,
+                scroll,
+            };
+            self.active_reference = index;
+        } else {
+            self.reference_panes.push(ReferencePane {
+                source_key,
+                scene_id,
+                title,
+                content,
+                scroll: 0,
+            });
+            self.active_reference = self.reference_panes.len() - 1;
+        }
     }
     fn navigate_search_match(&mut self, forward: bool) -> Result<(), Box<dyn std::error::Error>> {
         if self.search_locations.is_empty() {
@@ -4355,27 +4425,12 @@ impl AppState {
                 }
                 self.open_scene(scene)?;
                 let content = format_conflict_review(&result.conflicts, self.width);
-                if let Some(index) = self
-                    .reference_panes
-                    .iter()
-                    .position(|pane| pane.scene_id == scene)
-                {
-                    self.reference_panes[index] = ReferencePane {
-                        scene_id: scene,
-                        title: "Editorial conflict review".into(),
-                        content,
-                        scroll: 0,
-                    };
-                    self.active_reference = index;
-                } else {
-                    self.reference_panes.push(ReferencePane {
-                        scene_id: scene,
-                        title: "Editorial conflict review".into(),
-                        content,
-                        scroll: 0,
-                    });
-                    self.active_reference = self.reference_panes.len() - 1;
-                }
+                self.open_reference_buffer(
+                    format!("scene:{scene}"),
+                    Some(scene),
+                    "Editorial conflict review".into(),
+                    content,
+                );
                 self.reference_focused = false;
                 format!(
                     "{} conflict(s) shown beside the canonical scene; prose unchanged",
@@ -5495,21 +5550,23 @@ impl AppState {
             let id = SceneId(id.parse()?);
             let row = self.app.get_scene(id)?;
             let (content, _) = self.app.load_scene_text(id)?;
-            if let Some(index) = self
-                .reference_panes
-                .iter()
-                .position(|pane| pane.scene_id == id)
-            {
-                self.active_reference = index;
-            } else {
-                self.reference_panes.push(ReferencePane {
-                    scene_id: id,
-                    title: row.scene.title,
-                    content,
-                    scroll: 0,
-                });
-                self.active_reference = self.reference_panes.len() - 1;
-            }
+            self.open_reference_buffer(format!("scene:{id}"), Some(id), row.scene.title, content);
+            self.reference_focused = false;
+            self.message = format!(
+                "Reference buffer {} of {} opened · :reference-next/prev switches buffers",
+                self.active_reference + 1,
+                self.reference_panes.len()
+            );
+        } else if let Some(id) = cmd.strip_prefix("reference-research ") {
+            let id = story_core::ResearchId(id.parse()?);
+            let row = self
+                .app
+                .list_research_items()?
+                .into_iter()
+                .find(|row| row.id == id)
+                .ok_or("research reference not found")?;
+            let content = self.app.load_research_text(id)?;
+            self.open_reference_buffer(format!("research:{id}"), None, row.title, content);
             self.reference_focused = false;
             self.message = format!(
                 "Reference buffer {} of {} opened · :reference-next/prev switches buffers",
@@ -12239,6 +12296,15 @@ mod tests {
         let first = app.create_scene(chapter, "Main", 0).unwrap();
         let second = app.create_scene(chapter, "Reference A", 1).unwrap();
         let third = app.create_scene(chapter, "Reference B", 2).unwrap();
+        let research = app
+            .create_research_item(
+                "World Notes",
+                "The city follows a lunar calendar.",
+                "text",
+                None,
+                None,
+            )
+            .unwrap();
         for (scene, prose) in [
             (first, "Main prose"),
             (second, "Reference A text"),
@@ -12258,19 +12324,46 @@ mod tests {
         execute(&mut state, format!("reference-scene {second}"));
         execute(&mut state, format!("reference-scene {third}"));
         execute(&mut state, "reference-prev".into());
-        assert_eq!(state.active_reference_pane().unwrap().scene_id, second);
+        assert_eq!(
+            state.active_reference_pane().unwrap().scene_id,
+            Some(second)
+        );
         assert_eq!(state.reference_panes.len(), 2);
+        execute(&mut state, format!("reference-research {research}"));
+        assert_eq!(
+            state.active_reference_pane().unwrap().content,
+            "The city follows a lunar calendar."
+        );
+        execute(&mut state, "reference-next".into());
+        assert_eq!(
+            state.active_reference_pane().unwrap().scene_id,
+            Some(second)
+        );
+        assert_eq!(state.reference_panes.len(), 3);
         state.save_session().unwrap();
+        let saved: SessionSnapshot =
+            serde_json::from_slice(&fs::read(state.session_path()).unwrap()).unwrap();
+        assert_eq!(saved.reference_sources.len(), 3);
         let mut restored = AppState::new(
             WriterApp::open_project(&project).unwrap(),
             default_bindings(),
         );
         restored.restore_session().unwrap();
-        assert_eq!(restored.reference_panes.len(), 2);
-        assert_eq!(restored.active_reference_pane().unwrap().scene_id, second);
+        assert_eq!(restored.reference_panes.len(), 3);
+        assert_eq!(
+            restored.active_reference_pane().unwrap().scene_id,
+            Some(second)
+        );
         execute(&mut restored, "reference-close".into());
-        assert_eq!(restored.reference_panes.len(), 1);
-        assert_eq!(restored.active_reference_pane().unwrap().scene_id, third);
+        assert_eq!(restored.reference_panes.len(), 2);
+        assert_eq!(
+            restored.active_reference_pane().unwrap().scene_id,
+            Some(third)
+        );
+        assert!(restored.reference_panes.iter().any(|pane| {
+            pane.source_key == format!("research:{research}")
+                && pane.content == "The city follows a lunar calendar."
+        }));
     }
 
     #[test]

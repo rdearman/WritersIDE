@@ -978,6 +978,9 @@ impl WriterApp {
     pub fn list_research_items(&self) -> Result<Vec<story_storage::ResearchSummary>> {
         Ok(self.store.list_research_items()?)
     }
+    pub fn load_research_text(&self, id: ResearchId) -> Result<String> {
+        Ok(self.store.load_research_text(id)?)
+    }
     pub fn create_issue(&mut self, title: &str) -> Result<IssueId> {
         Ok(self.store.create_issue(title)?)
     }
