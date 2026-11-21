@@ -114,6 +114,7 @@ struct AppState {
     message: String,
     history: Vec<Workspace>,
     history_index: usize,
+    location_history: Vec<EditorBookmark>,
     width: usize,
     editor_focus_mode: bool,
     horizontal_split_ratio: u16,
@@ -140,7 +141,9 @@ struct AppState {
     revision_hunk: usize,
     search_hits: Vec<story_storage::ProjectSearchHit>,
     search_locations: Vec<(SceneId, usize, usize)>,
+    search_result_rows: Vec<String>,
     search_location_index: usize,
+    selected_scenes: BTreeSet<SceneId>,
     query_view: Option<story_core::QueryId>,
     proposal_review_active: bool,
     proposal_review_rows: Vec<String>,
@@ -163,6 +166,8 @@ struct AppState {
     last_yank: Option<LastYank>,
     macro_preview: Option<MacroPreview>,
     pending_replace: Option<Vec<ReplaceTarget>>,
+    replace_preview_target: usize,
+    replace_preview_match: usize,
     find_panel: Option<FindPanel>,
     extra_cursors: Vec<(usize, usize)>,
     active_challenge: Option<ActiveWritingChallenge>,
@@ -375,6 +380,52 @@ struct ReplaceTarget {
     original: String,
     proposed: String,
     replacements: usize,
+    pattern: String,
+    replacement: String,
+    options: story_core::FindOptions,
+    selected_file: bool,
+    selected_matches: Vec<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReplaceRecoveryFile {
+    version: u16,
+    operation_id: String,
+    entries: Vec<ReplaceRecoveryEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReplaceRecoveryEntry {
+    scene_id: SceneId,
+    title: String,
+    original: String,
+    expected_hash: String,
+    proposed: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReplaceUndoFile {
+    version: u16,
+    operation_id: String,
+    entries: Vec<ReplaceUndoEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ReplaceUndoEntry {
+    scene_id: SceneId,
+    title: String,
+    before: String,
+    after: String,
+    after_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExSubstitution {
+    current_line_only: bool,
+    pattern: String,
+    replacement: String,
+    global_per_line: bool,
+    case_sensitive: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -394,6 +445,30 @@ struct FindPanel {
     pattern: String,
     replacement: String,
     field: FindPanelField,
+    history_position: Option<usize>,
+    history_draft: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct FindPanelSession {
+    pattern: String,
+    replacement: String,
+    case_sensitive: bool,
+    whole_word: bool,
+    history: Vec<String>,
+}
+
+impl Default for FindPanelSession {
+    fn default() -> Self {
+        Self {
+            pattern: String::new(),
+            replacement: String::new(),
+            case_sensitive: true,
+            whole_word: false,
+            history: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -759,11 +834,83 @@ fn command_registry() -> Vec<CommandSpec> {
             false,
         ),
         legacy_command(
+            "search.find-open",
+            "Find in All Open Files",
+            "Open the Find panel scoped to open manuscripts and buffers",
+            "Edit",
+            "find-open",
+            false,
+        ),
+        legacy_command(
+            "search.find-project",
+            "Find in Project",
+            "Open the Find panel scoped to all manuscript scenes",
+            "Edit",
+            "find-project",
+            false,
+        ),
+        legacy_command(
+            "search.tags",
+            "Go to Definition",
+            "Search stable story symbols and jump to a definition",
+            "Navigate",
+            "tags",
+            true,
+        ),
+        legacy_command(
+            "search.refs",
+            "Find References",
+            "Find raw prose occurrences of a story name or alias",
+            "Navigate",
+            "refs",
+            true,
+        ),
+        legacy_command(
+            "search.return-position",
+            "Return to Previous Position",
+            "Return to the editor location before the last symbol jump",
+            "Navigate",
+            "return-position",
+            false,
+        ),
+        legacy_command(
+            "search.history-older",
+            "Previous Search Query",
+            "Recall an older query in the Find panel",
+            "Navigate",
+            "find-history-older",
+            false,
+        ),
+        legacy_command(
+            "search.history-newer",
+            "Next Search Query",
+            "Recall a newer query or restore the in-progress query",
+            "Navigate",
+            "find-history-newer",
+            false,
+        ),
+        legacy_command(
             "search.replace-panel",
             "Find and Replace",
             "Open the bottom Find and Replace panel",
             "Edit",
             "replace-panel",
+            false,
+        ),
+        legacy_command(
+            "search.replace-next",
+            "Replace Next in Current Scene",
+            "Replace the next match from the editor cursor as one undoable edit",
+            "Edit",
+            "replace-next",
+            false,
+        ),
+        legacy_command(
+            "search.replace-undo",
+            "Undo Last Scoped Replacement",
+            "Restore all scenes from the last confirmed replacement operation",
+            "Edit",
+            "replace-undo",
             false,
         ),
         legacy_command(
@@ -1880,6 +2027,71 @@ fn parse_find_mode(value: &str) -> Result<story_core::FindMode, String> {
     }
 }
 
+fn parse_ex_substitution(command: &str) -> Result<Option<ExSubstitution>, String> {
+    let command = command.strip_prefix(':').unwrap_or(command);
+    let (current_line_only, source) = if let Some(source) = command.strip_prefix("%s/") {
+        (false, format!("/{source}"))
+    } else if let Some(source) = command.strip_prefix("s/") {
+        (true, format!("/{source}"))
+    } else {
+        return Ok(None);
+    };
+    let mut chars = source.chars().peekable();
+    if chars.next() != Some('/') {
+        return Err(
+            "substitution syntax is :%s/pattern/replacement/flags or :s/pattern/replacement/flags"
+                .into(),
+        );
+    }
+    let read_segment =
+        |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| -> Result<String, String> {
+            let mut value = String::new();
+            while let Some(character) = chars.next() {
+                match character {
+                    '/' => return Ok(value),
+                    '\\' if chars.peek() == Some(&'/') => {
+                        chars.next();
+                        value.push('/');
+                    }
+                    '\\' => {
+                        value.push('\\');
+                        if let Some(escaped) = chars.next() {
+                            value.push(escaped);
+                        }
+                    }
+                    _ => value.push(character),
+                }
+            }
+            Err("substitution requires a pattern and replacement separated by '/'".into())
+        };
+    let pattern = read_segment(&mut chars)?;
+    if pattern.is_empty() {
+        return Err("substitution pattern cannot be empty".into());
+    }
+    let replacement = read_segment(&mut chars)?;
+    let flags = chars.collect::<String>();
+    let mut global_per_line = false;
+    let mut case_sensitive = true;
+    for flag in flags.chars() {
+        match flag {
+            'g' if !global_per_line => global_per_line = true,
+            'i' => case_sensitive = false,
+            _ => {
+                return Err(format!(
+                    "unsupported or repeated substitution flag '{flag}'"
+                ));
+            }
+        }
+    }
+    Ok(Some(ExSubstitution {
+        current_line_only,
+        pattern,
+        replacement,
+        global_per_line,
+        case_sensitive,
+    }))
+}
+
 fn load_editor_tools(root: &Path) -> Result<EditorToolsFile, Box<dyn std::error::Error>> {
     let path = root.join(".writers-ide/editor-tools.json");
     let bytes = match fs::read(path) {
@@ -1980,6 +2192,205 @@ fn save_editor_preferences(
     temporary.persist(&path)?;
     fs::File::open(directory)?.sync_all()?;
     Ok(())
+}
+
+fn load_find_panel_session(root: &Path) -> FindPanelSession {
+    let path = root.join(".writers-ide/find-session.json");
+    fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_find_panel_session(
+    root: &Path,
+    session: &FindPanelSession,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = root.join(".writers-ide");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join("find-session.json");
+    let bytes = serde_json::to_vec_pretty(session)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    use std::io::Write;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path)?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn replace_recovery_directory(root: &Path) -> PathBuf {
+    root.join(".writers-ide/recovery")
+}
+
+fn ensure_replace_recovery_directory(root: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let root = root.canonicalize()?;
+    let directory = root.join(".writers-ide/recovery");
+    fs::create_dir_all(&directory)?;
+    let metadata = fs::symlink_metadata(&directory)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("replacement recovery path must be a real project directory".into());
+    }
+    let canonical = directory.canonicalize()?;
+    if !canonical.starts_with(&root) {
+        return Err("replacement recovery path escapes the project".into());
+    }
+    Ok(canonical)
+}
+
+fn persist_replace_recovery(
+    root: &Path,
+    operation: &ReplaceRecoveryFile,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let directory = ensure_replace_recovery_directory(root)?;
+    let path = directory.join(format!("replace-group-{}.json", operation.operation_id));
+    let bytes = serde_json::to_vec_pretty(operation)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    use std::io::Write;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path)?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(path)
+}
+
+fn remove_replace_recovery(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = path
+        .parent()
+        .ok_or("replacement recovery record has no parent")?;
+    fs::remove_file(path)?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn replace_undo_path(root: &Path) -> PathBuf {
+    replace_recovery_directory(root).join("replace-undo.json")
+}
+
+fn persist_replace_undo(
+    root: &Path,
+    undo: &ReplaceUndoFile,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = ensure_replace_recovery_directory(root)?;
+    let path = directory.join("replace-undo.json");
+    let bytes = serde_json::to_vec_pretty(undo)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    use std::io::Write;
+    temporary.write_all(&bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path)?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn load_replace_undo(root: &Path) -> Result<Option<ReplaceUndoFile>, Box<dyn std::error::Error>> {
+    let path = replace_undo_path(root);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("replacement undo record cannot be a symlink".into());
+    }
+    let bytes = fs::read(&path)?;
+    let undo: ReplaceUndoFile = serde_json::from_slice(&bytes)?;
+    if undo.version != 1 || undo.entries.is_empty() {
+        return Err("invalid replacement undo record".into());
+    }
+    Ok(Some(undo))
+}
+
+fn remove_replace_undo(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let path = replace_undo_path(root);
+    match fs::remove_file(&path) {
+        Ok(()) => fs::File::open(path.parent().ok_or("undo file has no parent")?)?.sync_all()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn recover_replace_groups(app: &mut WriterApp) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let configured_directory = replace_recovery_directory(app.project_root());
+    if fs::symlink_metadata(&configured_directory)
+        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    {
+        return Ok(Vec::new());
+    }
+    let directory = ensure_replace_recovery_directory(app.project_root())?;
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("replace-group-") && name.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut notices = Vec::new();
+    for path in paths {
+        if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(format!(
+                "refusing symlinked replacement recovery file {}",
+                path.display()
+            )
+            .into());
+        }
+        let operation: ReplaceRecoveryFile = serde_json::from_slice(&fs::read(&path)?)?;
+        if operation.version != 1 || operation.entries.is_empty() {
+            return Err(format!("invalid replacement recovery record {}", path.display()).into());
+        }
+        let mut states = Vec::new();
+        let mut conflict = None;
+        for entry in &operation.entries {
+            let (current, hash) = app.load_scene_text(entry.scene_id)?;
+            if current == entry.original && hash == entry.expected_hash {
+                states.push((entry.scene_id, hash, false));
+            } else if current == entry.proposed {
+                states.push((entry.scene_id, hash, true));
+            } else {
+                conflict = Some(format!(
+                    "replacement recovery {} conflicts with externally changed scene {}; record retained at {}",
+                    operation.operation_id,
+                    entry.title,
+                    path.display()
+                ));
+                break;
+            }
+        }
+        if let Some(conflict) = conflict {
+            notices.push(conflict);
+            continue;
+        }
+        for (scene_id, hash, was_replaced) in states {
+            if was_replaced {
+                let original = operation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.scene_id == scene_id)
+                    .ok_or("replacement recovery entry disappeared")?;
+                app.save_scene_text(scene_id, Some(&hash), &original.original)?;
+            }
+        }
+        remove_replace_recovery(&path)?;
+        if load_replace_undo(app.project_root())?
+            .is_some_and(|undo| undo.operation_id == operation.operation_id)
+        {
+            remove_replace_undo(app.project_root())?;
+        }
+        notices.push(format!(
+            "Interrupted replacement {} was rolled back safely",
+            operation.operation_id
+        ));
+    }
+    Ok(notices)
 }
 
 fn validate_editor_preferences(
@@ -2375,7 +2786,11 @@ fn read_keymap(project: &Path) -> Result<KeymapFile, Box<dyn std::error::Error>>
     }
 }
 impl AppState {
-    fn new(app: WriterApp, function_bindings: Vec<(u8, Workspace)>) -> Self {
+    fn new(mut app: WriterApp, function_bindings: Vec<(u8, Workspace)>) -> Self {
+        let replacement_recovery_notice = match recover_replace_groups(&mut app) {
+            Ok(notices) => notices.join(" · "),
+            Err(error) => format!("Replacement recovery requires attention: {error}"),
+        };
         let draft_notice = list_challenge_drafts(app.project_root(), |scene_id| {
             let project = app.get_project().ok();
             scene_id
@@ -2428,6 +2843,22 @@ impl AppState {
                 scene_id: session.scene_id,
                 initial_words: session.start_words,
             });
+        let existing_notice = draft_notice.unwrap_or({
+            if tools_error.is_empty() {
+                if expansion_error.is_empty() {
+                    preferences_error
+                } else {
+                    expansion_error
+                }
+            } else {
+                tools_error
+            }
+        });
+        let message = [existing_notice, replacement_recovery_notice]
+            .into_iter()
+            .filter(|notice| !notice.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
         Self {
             app,
             workspace: Workspace::Dashboard,
@@ -2440,19 +2871,10 @@ impl AppState {
             dirty: false,
             mode: None,
             prompt: String::new(),
-            message: draft_notice.unwrap_or({
-                if tools_error.is_empty() {
-                    if expansion_error.is_empty() {
-                        preferences_error
-                    } else {
-                        expansion_error
-                    }
-                } else {
-                    tools_error
-                }
-            }),
+            message,
             history: vec![Workspace::Dashboard],
             history_index: 0,
+            location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -2479,7 +2901,9 @@ impl AppState {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -2502,6 +2926,8 @@ impl AppState {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
@@ -2535,6 +2961,35 @@ impl AppState {
         temporary.persist(&path)?;
         fs::File::open(directory)?.sync_all()?;
         Ok(())
+    }
+    fn persist_find_panel_session(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(panel) = self.find_panel.as_ref() else {
+            return Ok(());
+        };
+        let mut session = load_find_panel_session(self.app.project_root());
+        session.pattern = panel.pattern.clone();
+        session.replacement = panel.replacement.clone();
+        session.case_sensitive = panel.case_sensitive;
+        session.whole_word = panel.whole_word;
+        save_find_panel_session(self.app.project_root(), &session)
+    }
+    fn remember_find_panel_query(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(panel) = self
+            .find_panel
+            .as_ref()
+            .filter(|panel| !panel.pattern.is_empty())
+        else {
+            return Ok(());
+        };
+        let mut session = load_find_panel_session(self.app.project_root());
+        session.history.retain(|query| query != &panel.pattern);
+        session.history.insert(0, panel.pattern.clone());
+        session.history.truncate(50);
+        session.pattern = panel.pattern.clone();
+        session.replacement = panel.replacement.clone();
+        session.case_sensitive = panel.case_sensitive;
+        session.whole_word = panel.whole_word;
+        save_find_panel_session(self.app.project_root(), &session)
     }
     fn record_command_macro_step(
         &mut self,
@@ -3172,6 +3627,35 @@ impl AppState {
         if scope == "all" {
             return Ok(scenes);
         }
+        if scope == "selected" {
+            if self.selected_scenes.is_empty() {
+                return Err("select one or more scenes first".into());
+            }
+            return Ok(scenes
+                .into_iter()
+                .filter(|record| self.selected_scenes.contains(&record.scene.id))
+                .collect());
+        }
+        if scope == "open" {
+            let mut open_ids = BTreeSet::new();
+            if let Some(scene) = self.editing_scene {
+                open_ids.insert(scene);
+            }
+            open_ids.extend(self.reference_panes.iter().filter_map(|pane| pane.scene_id));
+            if let Some(draft_id) = self.assembly_draft {
+                open_ids.extend(
+                    self.app
+                        .load_assembly_draft(draft_id)?
+                        .items
+                        .into_iter()
+                        .map(|item| item.scene_id),
+                );
+            }
+            return Ok(scenes
+                .into_iter()
+                .filter(|record| open_ids.contains(&record.scene.id))
+                .collect());
+        }
         if let Some(id) = scope.strip_prefix("chapter:") {
             let chapter = story_core::NodeId(id.parse()?);
             return Ok(scenes
@@ -3222,18 +3706,16 @@ impl AppState {
             .as_ref()
             .ok_or("find panel is closed")?
             .clone();
+        self.persist_find_panel_session()?;
         if panel.pattern.is_empty() {
             return Err("enter a search pattern first".into());
         }
         let scenes = self.scenes_for_scope(&panel.scope)?;
         let mut found = Vec::new();
         self.search_locations.clear();
+        self.search_result_rows.clear();
         for record in scenes {
-            let text = if self.editing_scene == Some(record.scene.id) {
-                self.editor.join("\n")
-            } else {
-                self.app.load_scene_text(record.scene.id)?.0
-            };
+            let text = self.find_scope_text(record.scene.id, &panel.scope)?.0;
             let matches = story_core::find_matches_with_options(
                 &text,
                 &panel.pattern,
@@ -3244,11 +3726,15 @@ impl AppState {
                 },
             )?;
             if !matches.is_empty() {
-                self.search_locations.extend(
-                    matches
-                        .iter()
-                        .map(|matched| (record.scene.id, matched.start, matched.end)),
-                );
+                for matched in &matches {
+                    self.search_locations
+                        .push((record.scene.id, matched.start, matched.end));
+                    self.search_result_rows.push(format_search_result_row(
+                        &record.scene.title,
+                        &text,
+                        matched.start,
+                    ));
+                }
                 found.push((record.scene.id, record.scene.title));
             }
         }
@@ -3273,6 +3759,244 @@ impl AppState {
         }
         Ok(())
     }
+    fn search_symbol_definitions(&mut self, query: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let query = query.trim().to_lowercase();
+        if query.is_empty() {
+            return Err("enter a symbol name to find its definition".into());
+        }
+        let mut hits = Vec::new();
+        let mut push = |kind: &str, id: String, title: String, matched: &str| {
+            hits.push(story_storage::ProjectSearchHit {
+                entity_kind: kind.into(),
+                entity_id: id,
+                title,
+                excerpt: format!("definition · matched {matched}"),
+            });
+        };
+        for scene in self.app.list_scenes(false)? {
+            if scene.scene.title.to_lowercase().contains(&query) {
+                push(
+                    "scene",
+                    scene.scene.id.to_string(),
+                    format!("Scene · {}", scene.scene.title),
+                    &scene.scene.title,
+                );
+            }
+        }
+        for node in self
+            .app
+            .list_structural_nodes()?
+            .into_iter()
+            .filter(|node| node.kind == "chapter")
+        {
+            if node.title.to_lowercase().contains(&query) {
+                push(
+                    "chapter",
+                    node.id.to_string(),
+                    format!("{} · {}", node.kind, node.title),
+                    &node.title,
+                );
+            }
+        }
+        for character in self.app.list_characters()? {
+            let record = self.app.get_character(character.id)?;
+            let names = std::iter::once(record.preferred_name.as_str())
+                .chain(std::iter::once(record.full_name.as_str()))
+                .chain(record.aliases.iter().map(String::as_str));
+            for name in names {
+                if !name.is_empty() && name.to_lowercase().contains(&query) {
+                    push(
+                        "character",
+                        character.id.to_string(),
+                        format!("Character · {}", character.name),
+                        name,
+                    );
+                }
+            }
+        }
+        for location in self.app.list_locations()? {
+            if location.name.to_lowercase().contains(&query) {
+                push(
+                    "location",
+                    location.id.to_string(),
+                    format!("Location · {}", location.name),
+                    &location.name,
+                );
+            }
+        }
+        for object in self.app.list_story_objects()? {
+            if object.name.to_lowercase().contains(&query) {
+                push(
+                    "object",
+                    object.id.to_string(),
+                    format!("Object · {}", object.name),
+                    &object.name,
+                );
+            }
+        }
+        for plotline in self.app.list_plotlines()? {
+            if plotline.name.to_lowercase().contains(&query) {
+                push(
+                    "plotline",
+                    plotline.id.to_string(),
+                    format!("Plotline · {}", plotline.name),
+                    &plotline.name,
+                );
+            }
+        }
+        for event in self.app.list_events()? {
+            if event.title.to_lowercase().contains(&query) {
+                push(
+                    "event",
+                    event.id.to_string(),
+                    format!("Event · {}", event.title),
+                    &event.title,
+                );
+            }
+        }
+        hits.sort_by(|left, right| {
+            left.title
+                .to_lowercase()
+                .cmp(&right.title.to_lowercase())
+                .then_with(|| left.entity_kind.cmp(&right.entity_kind))
+                .then_with(|| left.entity_id.cmp(&right.entity_id))
+        });
+        self.search_hits = hits;
+        self.search_locations.clear();
+        self.search_result_rows.clear();
+        self.query_view = None;
+        self.selected = 0;
+        self.switch(Workspace::Search);
+        self.message = format!(
+            "{} symbol definition(s) matching ‘{query}’ · stable entity IDs; Enter opens",
+            self.search_hits.len()
+        );
+        Ok(())
+    }
+    fn remember_editor_location(&mut self) {
+        if self.dirty {
+            return;
+        }
+        let Some(scene_id) = self.editing_scene else {
+            return;
+        };
+        let offset = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+        let text = self.editor.join("\n");
+        let line_end = text[offset..]
+            .find('\n')
+            .map_or(text.len(), |position| offset + position);
+        let quote = text[offset..line_end].to_owned();
+        self.location_history.push(EditorBookmark {
+            scene_id,
+            offset,
+            quote,
+        });
+    }
+    fn return_to_previous_location(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let location = self
+            .location_history
+            .last()
+            .cloned()
+            .ok_or("there is no previous manuscript position")?;
+        if self.dirty {
+            return Err(
+                "save the current manuscript before returning to the previous position".into(),
+            );
+        }
+        let (text, _) = self.app.load_scene_text(location.scene_id)?;
+        let offset = if location.quote.is_empty() {
+            if location.offset > text.len() || !text.is_char_boundary(location.offset) {
+                return Err("previous position no longer exists in the source scene".into());
+            }
+            location.offset
+        } else {
+            text.get(location.offset..location.offset.saturating_add(location.quote.len()))
+                .filter(|candidate| *candidate == location.quote)
+                .map(|_| location.offset)
+                .or_else(|| {
+                    let mut occurrences = text.match_indices(&location.quote);
+                    let first = occurrences.next()?.0;
+                    occurrences.next().is_none().then_some(first)
+                })
+                .ok_or("previous passage is missing or ambiguous; source was left unchanged")?
+        };
+        self.open_scene(location.scene_id)?;
+        self.cursor = editor_position_from_byte(&text, offset)
+            .ok_or("previous position is not a valid UTF-8 editor position")?;
+        self.location_history.pop();
+        self.message = "Returned to the previous manuscript position".into();
+        Ok(())
+    }
+    fn step_replace_preview_match(&mut self, forward: bool) {
+        let Some(targets) = self.pending_replace.as_ref() else {
+            self.navigate_search_match(forward).ok();
+            return;
+        };
+        let positions = targets
+            .iter()
+            .enumerate()
+            .flat_map(|(target_index, target)| {
+                (0..target.selected_matches.len())
+                    .map(move |match_index| (target_index, match_index))
+            })
+            .collect::<Vec<_>>();
+        if positions.is_empty() {
+            self.message = "Replacement preview contains no matches".into();
+            return;
+        }
+        let current = positions
+            .iter()
+            .position(|(target, matched)| {
+                *target == self.replace_preview_target && *matched == self.replace_preview_match
+            })
+            .unwrap_or(0);
+        let next = if forward {
+            (current + 1) % positions.len()
+        } else {
+            (current + positions.len() - 1) % positions.len()
+        };
+        (self.replace_preview_target, self.replace_preview_match) = positions[next];
+    }
+    fn toggle_replace_preview_match(&mut self) {
+        let Some(target) = self
+            .pending_replace
+            .as_mut()
+            .and_then(|targets| targets.get_mut(self.replace_preview_target))
+        else {
+            return;
+        };
+        let Some(selected) = target.selected_matches.get_mut(self.replace_preview_match) else {
+            return;
+        };
+        *selected = !*selected;
+        let is_selected = *selected;
+        target.selected_file = target.selected_matches.iter().any(|selected| *selected);
+        self.message = format!(
+            "Preview match {} {}",
+            self.replace_preview_match + 1,
+            if is_selected { "selected" } else { "skipped" }
+        );
+    }
+    fn toggle_replace_preview_file(&mut self) {
+        let Some(target) = self
+            .pending_replace
+            .as_mut()
+            .and_then(|targets| targets.get_mut(self.replace_preview_target))
+        else {
+            return;
+        };
+        target.selected_file = !target.selected_file;
+        target.selected_matches.fill(target.selected_file);
+        self.message = format!(
+            "{} {} in replacement preview",
+            target.title,
+            if target.selected_file {
+                "included"
+            } else {
+                "skipped"
+            }
+        );
+    }
     fn stage_replace_preview(
         &mut self,
         mode: story_core::FindMode,
@@ -3288,15 +4012,16 @@ impl AppState {
             whole_word,
         };
         let scenes = self.scenes_for_scope(scope)?;
-        let mut output = Vec::new();
+        if let Some(panel) = self.find_panel.as_ref()
+            && panel.pattern == pattern
+        {
+            self.remember_find_panel_query()?;
+        }
         let mut targets = Vec::new();
         let mut total = 0usize;
         for record in scenes {
-            let (source, expected_hash) = if self.editing_scene == Some(record.scene.id) {
-                (self.editor.join("\n"), self.saved_hash.clone())
-            } else {
-                self.app.load_scene_text(record.scene.id)?
-            };
+            let (source, expected_hash) = self.find_scope_text(record.scene.id, scope)?;
+            let matches = story_core::find_matches_with_options(&source, pattern, options)?;
             let (updated, count) =
                 story_core::replace_matches_with_options(&source, pattern, replacement, options)?;
             if count > 0 {
@@ -3308,31 +4033,267 @@ impl AppState {
                     original: source.clone(),
                     proposed: updated.clone(),
                     replacements: count,
+                    pattern: pattern.into(),
+                    replacement: replacement.into(),
+                    options,
+                    selected_file: true,
+                    selected_matches: vec![true; matches.len()],
                 });
-                output.push(format!(
-                    "## {} — {count} replacement(s)\n--- current ---\n{}\n--- proposed ---\n{}",
-                    record.scene.title, source, updated
-                ));
             }
         }
-        if output.is_empty() {
+        if targets.is_empty() {
             self.pending_replace = None;
             self.message = "Preview: no replacements found; manuscript unchanged".into();
         } else {
+            let target_count = targets.len();
             self.pending_replace = Some(targets);
-            let preview = output.join("\n\n");
-            let clipped = preview.chars().take(12_000).collect::<String>();
-            let suffix = if preview.chars().count() > 12_000 {
-                "\n\n[Preview truncated at 12,000 characters]"
-            } else {
-                ""
-            };
+            self.replace_preview_target = 0;
+            self.replace_preview_match = 0;
+            self.scroll = 0;
             self.message = format!(
-                "Read-only preview staged: {total} replacement(s) in {} scene(s). Use F5 to apply.\n\n{clipped}{suffix}",
-                output.len()
+                "Read-only preview: {total} match(es) in {target_count} scene(s). F3 match · F6 toggle match · F8 toggle file · F5 apply selected · Esc cancel"
             );
         }
         Ok(())
+    }
+    fn replace_next_in_current_scene(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let panel = self
+            .find_panel
+            .as_ref()
+            .filter(|panel| panel.replacing)
+            .ok_or("open the Find and Replace panel first")?
+            .clone();
+        let scene = self.editing_scene.ok_or("open a manuscript scene first")?;
+        if panel.pattern.is_empty() {
+            return Err("enter a search pattern first".into());
+        }
+        self.remember_find_panel_query()?;
+        let source = self.editor.join("\n");
+        let options = story_core::FindOptions {
+            mode: panel.mode,
+            case_sensitive: panel.case_sensitive,
+            whole_word: panel.whole_word,
+        };
+        let matches = story_core::find_matches_with_options(&source, &panel.pattern, options)?;
+        if matches.is_empty() {
+            self.message = "No match in the current scene".into();
+            return Ok(());
+        }
+        let cursor = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+        let index = matches
+            .iter()
+            .position(|matched| matched.start >= cursor)
+            .unwrap_or(0);
+        let mut selected = vec![false; matches.len()];
+        selected[index] = true;
+        let (updated, count) = story_core::replace_selected_matches_with_options(
+            &source,
+            &panel.pattern,
+            &panel.replacement,
+            options,
+            &selected,
+        )?;
+        if count == 0 {
+            self.message = "No match selected; manuscript unchanged".into();
+            return Ok(());
+        }
+        let matched = &matches[index];
+        let inserted_length = updated
+            .len()
+            .checked_sub(source.len().saturating_sub(matched.end - matched.start))
+            .ok_or("replacement cursor calculation underflowed")?;
+        let cursor_byte = matched
+            .start
+            .checked_add(inserted_length)
+            .ok_or("replacement cursor position overflowed")?;
+        self.push_undo();
+        self.editor = updated.split('\n').map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        self.cursor =
+            editor_position_from_byte(&self.editor.join("\n"), cursor_byte).unwrap_or((0, 0));
+        self.editor_selection = None;
+        self.dirty = true;
+        self.search_locations.clear();
+        self.search_result_rows.clear();
+        self.message = format!("Replaced the next match in scene {scene}; Ctrl-S to save");
+        Ok(())
+    }
+    fn execute_ex_substitution(
+        &mut self,
+        substitution: ExSubstitution,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.editing_scene.ok_or("open a manuscript scene first")?;
+        let source = self.editor.join("\n");
+        let options = story_core::FindOptions {
+            mode: story_core::FindMode::Regex,
+            case_sensitive: substitution.case_sensitive,
+            whole_word: false,
+        };
+        let matches =
+            story_core::find_matches_with_options(&source, &substitution.pattern, options)?;
+        let mut selected = vec![false; matches.len()];
+        let mut line_numbers = BTreeSet::new();
+        for (index, matched) in matches.iter().enumerate() {
+            let line = source[..matched.start]
+                .bytes()
+                .filter(|byte| *byte == b'\n')
+                .count();
+            if substitution.current_line_only && line != self.cursor.0 {
+                continue;
+            }
+            if substitution.global_per_line || line_numbers.insert(line) {
+                selected[index] = true;
+            }
+        }
+        let start = matches
+            .iter()
+            .zip(&selected)
+            .find_map(|(matched, selected)| selected.then_some(matched.start));
+        let Some(first_start) = start else {
+            self.message = "Substitution found no matches in the addressed lines".into();
+            return Ok(());
+        };
+        let (updated, count) = story_core::replace_selected_matches_with_options(
+            &source,
+            &substitution.pattern,
+            &substitution.replacement,
+            options,
+            &selected,
+        )?;
+        self.push_undo();
+        self.editor = updated.split('\n').map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        self.cursor =
+            editor_position_from_byte(&self.editor.join("\n"), first_start).unwrap_or((0, 0));
+        self.editor_selection = None;
+        self.dirty = true;
+        self.search_locations.clear();
+        self.search_result_rows.clear();
+        self.message = format!(
+            "Ex-style substitution replaced {count} match(es) in {} · Ctrl-S to save",
+            if substitution.current_line_only {
+                "the current line"
+            } else if substitution.global_per_line {
+                "the current scene (all matches per line)"
+            } else {
+                "the current scene (first match per line)"
+            }
+        );
+        Ok(())
+    }
+    fn undo_last_scoped_replace(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err(
+                "save the current manuscript buffer before undoing a scoped replacement".into(),
+            );
+        }
+        let undo = load_replace_undo(self.app.project_root())?
+            .ok_or("there is no saved scoped replacement to undo")?;
+        for entry in &undo.entries {
+            let (current, hash) = self.app.load_scene_text(entry.scene_id)?;
+            if current != entry.after || hash != entry.after_hash {
+                return Err(format!(
+                    "cannot undo replacement because scene {} changed after the operation",
+                    entry.title
+                )
+                .into());
+            }
+        }
+        let recovery = ReplaceRecoveryFile {
+            version: 1,
+            operation_id: undo.operation_id.clone(),
+            entries: undo
+                .entries
+                .iter()
+                .map(|entry| ReplaceRecoveryEntry {
+                    scene_id: entry.scene_id,
+                    title: entry.title.clone(),
+                    original: entry.after.clone(),
+                    expected_hash: entry.after_hash.clone(),
+                    proposed: entry.before.clone(),
+                })
+                .collect(),
+        };
+        let recovery_path = persist_replace_recovery(self.app.project_root(), &recovery)?;
+        let mut applied = Vec::new();
+        for entry in &undo.entries {
+            match self
+                .app
+                .save_scene_text(entry.scene_id, Some(&entry.after_hash), &entry.before)
+            {
+                Ok(hash) => applied.push((entry, hash)),
+                Err(error) => {
+                    let mut rollback_errors = Vec::new();
+                    for (previous, hash) in applied.iter().rev() {
+                        if let Err(rollback) =
+                            self.app
+                                .save_scene_text(previous.scene_id, Some(hash), &previous.after)
+                        {
+                            rollback_errors.push(format!("{}: {rollback}", previous.title));
+                        }
+                    }
+                    if rollback_errors.is_empty() {
+                        remove_replace_recovery(&recovery_path)?;
+                        return Err(format!(
+                            "replacement undo failed; original text was restored: {error}"
+                        )
+                        .into());
+                    }
+                    return Err(format!(
+                        "replacement undo needs recovery for {}: {error}",
+                        rollback_errors.join(", ")
+                    )
+                    .into());
+                }
+            }
+        }
+        remove_replace_undo(self.app.project_root())?;
+        remove_replace_recovery(&recovery_path)?;
+        if let Some(scene) = self.editing_scene
+            && undo.entries.iter().any(|entry| entry.scene_id == scene)
+        {
+            let (text, hash) = self.app.load_scene_text(scene)?;
+            self.editor = text.split('\n').map(str::to_owned).collect();
+            self.saved_hash = hash;
+            self.cursor = (0, 0);
+            self.editor_selection = None;
+            self.dirty = false;
+        }
+        self.message = format!(
+            "Undid scoped replacement across {} scene(s)",
+            undo.entries.len()
+        );
+        Ok(())
+    }
+    fn find_scope_text(
+        &self,
+        scene: SceneId,
+        scope: &str,
+    ) -> Result<(String, String), Box<dyn std::error::Error>> {
+        if self.editing_scene == Some(scene) {
+            return Ok((self.editor.join("\n"), self.saved_hash.clone()));
+        }
+        if scope == "open"
+            && let Some(draft_id) = self.assembly_draft
+        {
+            let draft = self.app.load_assembly_draft(draft_id)?;
+            let item = draft
+                .items
+                .iter()
+                .find(|item| item.scene_id == scene)
+                .ok_or("open assembly buffer no longer contains this scene")?;
+            let edited = parse_assembly_draft(&draft, &self.editor.join("\n"))?
+                .into_iter()
+                .find(|(scene_id, _)| *scene_id == scene)
+                .ok_or("open assembly buffer scene marker is missing")?
+                .1;
+            return Ok((edited, item.expected_hash.clone()));
+        }
+        Ok(self.app.load_scene_text(scene)?)
     }
     fn active_reference_pane(&self) -> Option<&ReferencePane> {
         self.reference_panes.get(self.active_reference)
@@ -3446,6 +4407,7 @@ impl AppState {
                 .get(self.selected)
                 .cloned()
                 .ok_or("search selection is out of range")?;
+            self.remember_editor_location();
             self.search_hits.clear();
             match hit.entity_kind.as_str() {
                 "scene" => {
@@ -3456,6 +4418,16 @@ impl AppState {
                         .position(|scene| scene.0 == id)
                         .ok_or("search scene no longer exists")?;
                     return self.open_scene(id);
+                }
+                "chapter" | "section" => {
+                    let id = story_core::NodeId(hit.entity_id.parse()?);
+                    let row = outline_rows(self)
+                        .iter()
+                        .position(|row| matches!(row, OutlineRow::Chapter { id: row_id, .. } if *row_id == id))
+                        .ok_or("symbol chapter no longer exists in the current outline")?;
+                    self.selected = row;
+                    self.switch(Workspace::Outline);
+                    return Ok(());
                 }
                 "reading" => {
                     let id = story_core::ReadingId(hit.entity_id.parse()?);
@@ -3501,6 +4473,22 @@ impl AppState {
                         .position(|location| location.id == id)
                         .ok_or("search location no longer exists")?;
                     self.selected = self.app.list_characters()?.len() + location_index;
+                    self.switch(Workspace::StoryBible);
+                    return Ok(());
+                }
+                "object" => {
+                    let id = story_core::StoryObjectId(hit.entity_id.parse()?);
+                    let objects = self.app.list_story_objects()?;
+                    let object_index = objects
+                        .iter()
+                        .position(|object| object.id == id)
+                        .ok_or("search object no longer exists")?;
+                    self.selected = self.app.list_characters()?.len()
+                        + self.app.list_locations()?.len()
+                        + self.app.list_plotlines()?.len()
+                        + self.app.list_events()?.len()
+                        + self.app.list_approved_knowledge_claims()?.len()
+                        + object_index;
                     self.switch(Workspace::StoryBible);
                     return Ok(());
                 }
@@ -4109,6 +5097,10 @@ impl AppState {
         &mut self,
         cmd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if cmd == "find-history-older" || cmd == "find-history-newer" {
+            step_find_query_history(self, cmd == "find-history-older")?;
+            return Ok(());
+        }
         if cmd == "keybinding-list" {
             let config = read_keymap(self.app.project_root())?;
             self.message = if config.commands.is_empty() {
@@ -4123,8 +5115,21 @@ impl AppState {
             };
             return Ok(());
         }
-        if cmd == "find-panel" || cmd == "replace-panel" {
+        if matches!(
+            cmd,
+            "find-panel" | "replace-panel" | "find-open" | "find-project"
+        ) {
             open_find_panel(self, cmd == "replace-panel");
+            if cmd == "find-open"
+                && let Some(panel) = &mut self.find_panel
+            {
+                panel.scope = "open".into();
+            }
+            if cmd == "find-project"
+                && let Some(panel) = &mut self.find_panel
+            {
+                panel.scope = "all".into();
+            }
             return Ok(());
         }
         if let Some(rest) = cmd.strip_prefix("keybinding-set ") {
@@ -7566,6 +8571,35 @@ impl AppState {
             self.selected = 0;
             self.switch(Workspace::Search);
             self.message = format!("{} project-wide matches", self.search_hits.len());
+        } else if let Some(query) = cmd.strip_prefix("tags ") {
+            self.search_symbol_definitions(query)?;
+        } else if let Some(query) = cmd.strip_prefix("refs ") {
+            let query = query.trim();
+            if query.is_empty() {
+                return Err("use refs <name or alias>".into());
+            }
+            self.remember_editor_location();
+            self.find_panel = Some(FindPanel {
+                replacing: false,
+                mode: story_core::FindMode::Normal,
+                case_sensitive: false,
+                whole_word: true,
+                scope: "all".into(),
+                pattern: query.into(),
+                replacement: String::new(),
+                field: FindPanelField::Pattern,
+                history_position: None,
+                history_draft: None,
+            });
+            self.run_find_panel_search()?;
+            self.message = format!(
+                "{} raw textual reference(s) for ‘{query}’; text matches do not imply character presence",
+                self.search_locations.len()
+            );
+        } else if cmd == "return-position" {
+            self.return_to_previous_location()?;
+        } else if cmd == "replace-next" {
+            self.replace_next_in_current_scene()?;
         } else if let Some(rest) = cmd.strip_prefix("find ") {
             let mut parts = rest.splitn(3, ' ');
             let mode = parse_find_mode(parts.next().ok_or("use find MODE current|all PATTERN")?)?;
@@ -7574,13 +8608,19 @@ impl AppState {
             let scenes = self.scenes_for_scope(scope)?;
             let mut found = Vec::new();
             self.search_locations.clear();
+            self.search_result_rows.clear();
             for record in scenes {
-                let (text, _) = self.app.load_scene_text(record.scene.id)?;
+                let (text, _) = self.find_scope_text(record.scene.id, scope)?;
                 let matches = story_core::find_matches(&text, pattern, mode)?;
                 if !matches.is_empty() {
                     for matched in &matches {
                         self.search_locations
                             .push((record.scene.id, matched.start, matched.end));
+                        self.search_result_rows.push(format_search_result_row(
+                            &record.scene.title,
+                            &text,
+                            matched.start,
+                        ));
                     }
                     found.push((record.scene.id, record.scene.title, matches.len()));
                 }
@@ -7618,6 +8658,8 @@ impl AppState {
             } else {
                 self.message = "There is no pending replacement preview".into();
             }
+        } else if cmd == "replace-undo" {
+            self.undo_last_scoped_replace()?;
         } else if cmd == "replace-apply" {
             let targets = self
                 .pending_replace
@@ -7633,6 +8675,29 @@ impl AppState {
                     "save the dirty editor buffer before applying a multi-scene replacement preview"
                         .into(),
                 );
+            }
+            if self.dirty && self.assembly_draft.is_some() {
+                return Err(
+                    "save the dirty assembly buffer before applying a replacement preview".into(),
+                );
+            }
+            if let Some(draft_id) = self.assembly_draft {
+                let open_scenes = self
+                    .app
+                    .load_assembly_draft(draft_id)?
+                    .items
+                    .into_iter()
+                    .map(|item| item.scene_id)
+                    .collect::<BTreeSet<_>>();
+                if targets
+                    .iter()
+                    .any(|target| open_scenes.contains(&target.scene))
+                {
+                    return Err(
+                        "save and close the assembly buffer, then preview the replacement again"
+                            .into(),
+                    );
+                }
             }
             for target in &targets {
                 if self.editing_scene == Some(target.scene) {
@@ -7662,14 +8727,56 @@ impl AppState {
                     }
                 }
             }
+            let mut prepared = Vec::new();
+            for target in targets.iter().filter(|target| {
+                target.selected_file && target.selected_matches.iter().any(|selected| *selected)
+            }) {
+                let (proposed, replacement_count) =
+                    story_core::replace_selected_matches_with_options(
+                        &target.original,
+                        &target.pattern,
+                        &target.replacement,
+                        target.options,
+                        &target.selected_matches,
+                    )?;
+                let mut applied_target = target.clone();
+                applied_target.proposed = proposed;
+                applied_target.replacements = replacement_count;
+                prepared.push(applied_target);
+            }
+            if prepared.is_empty() {
+                self.pending_replace = None;
+                self.message = "No replacements selected; manuscript unchanged".into();
+                return Ok(());
+            }
+            let operation_id = uuid::Uuid::new_v4().to_string();
+            if self.app.project_root().join(".git").exists() {
+                self.app
+                    .git_snapshot(&format!("Before scoped replace {operation_id}"))?;
+            }
+            let recovery = ReplaceRecoveryFile {
+                version: 1,
+                operation_id: operation_id.clone(),
+                entries: prepared
+                    .iter()
+                    .map(|target| ReplaceRecoveryEntry {
+                        scene_id: target.scene,
+                        title: target.title.clone(),
+                        original: target.original.clone(),
+                        expected_hash: target.expected_hash.clone(),
+                        proposed: target.proposed.clone(),
+                    })
+                    .collect(),
+            };
+            let recovery_path = persist_replace_recovery(self.app.project_root(), &recovery)?;
             let mut applied: Vec<(ReplaceTarget, String)> = Vec::new();
-            for target in &targets {
+            for applied_target in prepared.iter().cloned() {
                 match self.app.save_scene_text(
-                    target.scene,
-                    Some(&target.expected_hash),
-                    &target.proposed,
+                    applied_target.scene,
+                    Some(&applied_target.expected_hash),
+                    &applied_target.proposed,
                 ) {
-                    Ok(new_hash) => applied.push((target.clone(), new_hash)),
+                    Ok(new_hash) => applied.push((applied_target, new_hash)),
                     Err(error) => {
                         let mut rollback_errors = Vec::new();
                         for (previous, new_hash) in applied.iter().rev() {
@@ -7683,6 +8790,7 @@ impl AppState {
                         }
                         self.pending_replace = None;
                         if rollback_errors.is_empty() {
+                            remove_replace_recovery(&recovery_path)?;
                             return Err(format!(
                                 "replacement failed and earlier files were restored: {error}"
                             )
@@ -7696,10 +8804,37 @@ impl AppState {
                     }
                 }
             }
-            let replacements = targets
+            let replacements = prepared
                 .iter()
                 .map(|target| target.replacements)
                 .sum::<usize>();
+            let changed_files = prepared.len();
+            let undo_entries = prepared
+                .iter()
+                .map(|target| {
+                    let after_hash = applied
+                        .iter()
+                        .find(|(applied_target, _)| applied_target.scene == target.scene)
+                        .map(|(_, hash)| hash.clone())
+                        .ok_or("applied replacement is missing its new content hash")?;
+                    Ok(ReplaceUndoEntry {
+                        scene_id: target.scene,
+                        title: target.title.clone(),
+                        before: target.original.clone(),
+                        after: target.proposed.clone(),
+                        after_hash,
+                    })
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            persist_replace_undo(
+                self.app.project_root(),
+                &ReplaceUndoFile {
+                    version: 1,
+                    operation_id: operation_id.clone(),
+                    entries: undo_entries,
+                },
+            )?;
+            remove_replace_recovery(&recovery_path)?;
             if let Some(active) = self.editing_scene
                 && let Some((target, hash)) =
                     applied.iter().find(|(target, _)| target.scene == active)
@@ -7711,13 +8846,16 @@ impl AppState {
                 self.saved_hash = hash.clone();
                 self.dirty = false;
             }
+            self.undo_stack.clear();
+            self.redo_stack.clear();
             self.pending_replace = None;
-            self.message = format!(
-                "Applied {replacements} replacement(s) to {} scene(s)",
-                targets.len()
-            );
+            self.message =
+                format!("Applied {replacements} replacement(s) to {changed_files} scene(s)");
+        } else if let Some(substitution) = parse_ex_substitution(cmd)? {
+            self.execute_ex_substitution(substitution)?;
         } else if let Some(rest) = cmd.strip_prefix("replace ") {
             self.search_locations.clear();
+            self.search_result_rows.clear();
             let (head, replacement) = rest
                 .split_once(" => ")
                 .ok_or("use replace MODE current|all PATTERN => REPLACEMENT")?;
@@ -7735,11 +8873,7 @@ impl AppState {
             let mut changed = 0usize;
             let mut replacements = 0usize;
             for record in scenes {
-                let (text, hash) = if self.editing_scene == Some(record.scene.id) {
-                    (self.editor.join("\n"), self.saved_hash.clone())
-                } else {
-                    self.app.load_scene_text(record.scene.id)?
-                };
+                let (text, hash) = self.find_scope_text(record.scene.id, scope)?;
                 let (updated, count) =
                     story_core::replace_matches(&text, pattern, replacement, mode)?;
                 if count != 0 {
@@ -8704,6 +9838,26 @@ fn editor_grapheme_is_mentioned(byte_offset: u64, byte_len: u64, ranges: &[(u64,
         .any(|(start, finish)| *start < end && *finish > byte_offset)
 }
 
+fn format_search_result_row(title: &str, text: &str, byte_offset: usize) -> String {
+    if byte_offset > text.len() || !text.is_char_boundary(byte_offset) {
+        return format!("{title} · unknown line");
+    }
+    let line_start = text[..byte_offset]
+        .rfind('\n')
+        .map_or(0, |position| position + 1);
+    let line_end = text[byte_offset..]
+        .find('\n')
+        .map_or(text.len(), |position| byte_offset + position);
+    let line_number = text[..line_start]
+        .bytes()
+        .filter(|byte| *byte == b'\n')
+        .count()
+        + 1;
+    let excerpt = text[line_start..line_end].trim();
+    let excerpt = excerpt.chars().take(100).collect::<String>();
+    format!("{title}:{line_number}: {excerpt}")
+}
+
 fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     let area = f.area();
     let rows = Layout::default()
@@ -8749,16 +9903,62 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     };
     if s.workspace == Workspace::Editor {
         if !s.editor_focus_mode {
-            let list = List::new(
-                s.scenes
-                    .iter()
-                    .map(|(_, title, status, words)| {
-                        ListItem::new(format!("{title}  [{}] {words}", status.as_str()))
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .block(Block::default().title("Scenes").borders(Borders::ALL));
-            let mut state = ListState::default().with_selected(Some(s.selected));
+            let (items, title, selected) = if let Some(targets) = &s.pending_replace {
+                (
+                    targets
+                        .iter()
+                        .map(|target| {
+                            let selected_count = target
+                                .selected_matches
+                                .iter()
+                                .filter(|selected| **selected)
+                                .count();
+                            ListItem::new(format!(
+                                "{} {} · {selected_count}/{} matches",
+                                if target.selected_file { "[x]" } else { "[ ]" },
+                                target.title,
+                                target.replacements
+                            ))
+                        })
+                        .collect::<Vec<_>>(),
+                    format!(
+                        "Replacement Preview · file {}/{} · F3 match, F6 match, F8 file",
+                        s.replace_preview_target + 1,
+                        targets.len()
+                    ),
+                    s.replace_preview_target,
+                )
+            } else if !s.search_result_rows.is_empty() {
+                (
+                    s.search_result_rows
+                        .iter()
+                        .cloned()
+                        .map(ListItem::new)
+                        .collect::<Vec<_>>(),
+                    format!(
+                        "Find Results · {}/{} · F3 / Shift-F3",
+                        s.search_location_index + 1,
+                        s.search_result_rows.len()
+                    ),
+                    s.search_location_index,
+                )
+            } else {
+                (
+                    s.scenes
+                        .iter()
+                        .map(|(_, title, status, words)| {
+                            ListItem::new(format!("{title}  [{}] {words}", status.as_str()))
+                        })
+                        .collect(),
+                    "Scenes".into(),
+                    s.selected,
+                )
+            };
+            let list = List::new(items)
+                .highlight_symbol("▸ ")
+                .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+                .block(Block::default().title(title).borders(Borders::ALL));
+            let mut state = ListState::default().with_selected(Some(selected));
             f.render_stateful_widget(list, body[0], &mut state);
         }
         let selection = s.selection_bounds();
@@ -8777,47 +9977,94 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             .take(s.scroll)
             .map(|line| line.len() as u64 + 1)
             .sum::<u64>();
-        let content = s
-            .editor
-            .iter()
-            .enumerate()
-            .skip(s.scroll)
-            .map(|(row, line)| {
-                let prefix = if row == s.cursor.0 { "> " } else { "  " };
-                let mut spans = vec![Span::raw(prefix)];
-                let mut byte_offset = line_start_byte;
-                for (col, ch) in line.graphemes(true).enumerate() {
-                    let selected = selection.is_some_and(|((sr, sc), (er, ec))| {
-                        (row > sr || (row == sr && col >= sc))
-                            && (row < er || (row == er && col < ec))
-                    });
-                    let decorated =
-                        editor_grapheme_is_mentioned(byte_offset, ch.len() as u64, &mention_ranges);
-                    if selected {
-                        spans.push(Span::styled(
-                            ch.to_string(),
-                            Style::default().fg(Color::White).bg(Color::Blue),
-                        ));
-                    } else if decorated {
-                        spans.push(Span::styled(
-                            ch.to_string(),
-                            Style::default()
-                                .fg(Color::Cyan)
-                                .add_modifier(Modifier::UNDERLINED),
-                        ));
+        let (content, editor_title) = if let Some(targets) = &s.pending_replace {
+            let target = targets
+                .get(s.replace_preview_target)
+                .or_else(|| targets.first());
+            if let Some(target) = target {
+                let (proposed, _) = story_core::replace_selected_matches_with_options(
+                    &target.original,
+                    &target.pattern,
+                    &target.replacement,
+                    target.options,
+                    &target.selected_matches,
+                )
+                .unwrap_or_else(|_| (target.proposed.clone(), target.replacements));
+                let match_selected = target
+                    .selected_matches
+                    .get(s.replace_preview_match)
+                    .copied()
+                    .unwrap_or(false);
+                let preview = format!(
+                    "File: {}\nMatch {}/{} · {} · F6 toggle match · F8 toggle file\n\n--- Original ---\n{}\n\n--- Proposed selection ---\n{}",
+                    target.title,
+                    s.replace_preview_match + 1,
+                    target.replacements,
+                    if match_selected {
+                        "selected"
                     } else {
-                        spans.push(Span::raw(ch.to_string()));
+                        "skipped"
+                    },
+                    target.original,
+                    proposed
+                );
+                (
+                    preview
+                        .lines()
+                        .map(|line| Line::from(line.to_owned()))
+                        .collect(),
+                    format!("Replacement Preview — {}", target.title),
+                )
+            } else {
+                (Vec::new(), "Replacement Preview".into())
+            }
+        } else {
+            let content = s
+                .editor
+                .iter()
+                .enumerate()
+                .skip(s.scroll)
+                .map(|(row, line)| {
+                    let prefix = if row == s.cursor.0 { "> " } else { "  " };
+                    let mut spans = vec![Span::raw(prefix)];
+                    let mut byte_offset = line_start_byte;
+                    for (col, ch) in line.graphemes(true).enumerate() {
+                        let selected = selection.is_some_and(|((sr, sc), (er, ec))| {
+                            (row > sr || (row == sr && col >= sc))
+                                && (row < er || (row == er && col < ec))
+                        });
+                        let decorated = editor_grapheme_is_mentioned(
+                            byte_offset,
+                            ch.len() as u64,
+                            &mention_ranges,
+                        );
+                        if selected {
+                            spans.push(Span::styled(
+                                ch.to_string(),
+                                Style::default().fg(Color::White).bg(Color::Blue),
+                            ));
+                        } else if decorated {
+                            spans.push(Span::styled(
+                                ch.to_string(),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::UNDERLINED),
+                            ));
+                        } else {
+                            spans.push(Span::raw(ch.to_string()));
+                        }
+                        byte_offset += ch.len() as u64;
                     }
-                    byte_offset += ch.len() as u64;
-                }
-                line_start_byte = byte_offset + 1;
-                Line::from(spans)
-            })
-            .collect::<Vec<_>>();
-        let editor_title = s
-            .assembly_draft
-            .map(|id| format!("Assembly Draft {id} · stable scene markers required"))
-            .unwrap_or_else(|| format!("Editor — {}", s.selected_scene()));
+                    line_start_byte = byte_offset + 1;
+                    Line::from(spans)
+                })
+                .collect::<Vec<_>>();
+            let title = s
+                .assembly_draft
+                .map(|id| format!("Assembly Draft {id} · stable scene markers required"))
+                .unwrap_or_else(|| format!("Editor — {}", s.selected_scene()));
+            (content, title)
+        };
         let editor = Paragraph::new(content).wrap(Wrap { trim: false }).block(
             Block::default()
                 .title(if s.reference_focused {
@@ -9145,10 +10392,12 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         } else {
             "(Ctrl+H to enable replacement)"
         };
-        let help = if panel.replacing {
-            "Enter preview · F5 apply · F3 next · F2 mode · F4 scope · F6 case · F7 word · Tab fields · Esc close"
+        let help = if panel.replacing && s.pending_replace.is_some() {
+            "F3 next match · F6 toggle match · F8 toggle file · F5 apply selected · Esc cancel"
+        } else if panel.replacing {
+            "F9 replace next · Enter preview all · F5 apply · F3 match · F6 toggle · F8 file · F11 older query · F12 newer query · Esc"
         } else {
-            "Enter find · F3 next · F2 mode · F4 scope · F6 case · F7 word · Tab fields · Ctrl+H replace · Esc close"
+            "Enter find · F3 next · F2 mode · F4 scope · F6 case · F7 word · F11 older query · F12 newer query · Tab · Ctrl+H replace · Esc"
         };
         let options = format!(
             "Case {} · whole word {}",
@@ -10196,6 +11445,31 @@ fn next_list_selection(selected: usize, item_count: usize) -> usize {
     }
 }
 
+fn selected_scene_for_workspace(s: &AppState) -> Option<SceneId> {
+    match s.workspace {
+        Workspace::Outline => match outline_rows(s).get(s.selected) {
+            Some(OutlineRow::Scene(scene)) => Some(*scene),
+            _ => None,
+        },
+        Workspace::Cards => s.scenes.get(s.selected).map(|scene| scene.0),
+        Workspace::Search if !s.search_hits.is_empty() => s
+            .search_hits
+            .get(s.selected)
+            .filter(|hit| hit.entity_kind == "scene")
+            .and_then(|hit| hit.entity_id.parse::<uuid::Uuid>().ok())
+            .map(SceneId),
+        Workspace::Search => s.scenes.get(s.selected).map(|scene| scene.0),
+        _ => None,
+    }
+}
+
+fn toggle_scene_selection(s: &mut AppState, scene: SceneId) {
+    if !s.selected_scenes.remove(&scene) {
+        s.selected_scenes.insert(scene);
+    }
+    s.message = format!("{} selected scene(s)", s.selected_scenes.len());
+}
+
 fn revision_hunks(diff: &[story_storage::SnapshotDiffLine]) -> Vec<RevisionHunk> {
     let mut hunks = Vec::new();
     let (mut snapshot_line, mut current_line, mut index) = (0usize, 0usize, 0usize);
@@ -10357,21 +11631,53 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 ),
                 OutlineRow::Scene(id) => s.scenes.iter().find(|scene| scene.0 == id).map_or_else(
                     || format!("  <missing scene {id}>"),
-                    |scene| format!("  {}   {}   {} words", scene.1, scene.2.as_str(), scene.3),
+                    |scene| {
+                        format!(
+                            "  {}{}   {}   {} words",
+                            if s.selected_scenes.contains(&id) {
+                                "[x] "
+                            } else {
+                                "[ ] "
+                            },
+                            scene.1,
+                            scene.2.as_str(),
+                            scene.3
+                        )
+                    },
                 ),
             })
             .collect(),
         Workspace::Cards => s
             .scenes
             .iter()
-            .map(|(_, title, status, words)| {
-                format!("{title}   {}   {words} words", status.as_str())
+            .map(|(id, title, status, words)| {
+                format!(
+                    "{} {title}   {}   {words} words",
+                    if s.selected_scenes.contains(id) {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    },
+                    status.as_str()
+                )
             })
             .collect(),
         Workspace::Search if !s.search_hits.is_empty() => s
             .search_hits
             .iter()
-            .map(|hit| format!("{} · {} · {}", hit.entity_kind, hit.title, hit.excerpt))
+            .map(|hit| {
+                let selected = (hit.entity_kind == "scene")
+                    .then(|| hit.entity_id.parse::<uuid::Uuid>().ok().map(SceneId))
+                    .flatten()
+                    .is_some_and(|id| s.selected_scenes.contains(&id));
+                format!(
+                    "{} {} · {} · {}",
+                    if selected { "[x]" } else { "[ ]" },
+                    hit.entity_kind,
+                    hit.title,
+                    hit.excerpt
+                )
+            })
             .collect(),
         Workspace::Search if let Some(query) = s.query_view => {
             let matches = s
@@ -10383,16 +11689,32 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             s.scenes
                 .iter()
                 .filter(|scene| matches.contains(&scene.0))
-                .map(|(_, title, status, words)| {
-                    format!("{title}   {}   {words} words", status.as_str())
+                .map(|(id, title, status, words)| {
+                    format!(
+                        "{} {title}   {}   {words} words",
+                        if s.selected_scenes.contains(id) {
+                            "[x]"
+                        } else {
+                            "[ ]"
+                        },
+                        status.as_str()
+                    )
                 })
                 .collect()
         }
         Workspace::Search => s
             .scenes
             .iter()
-            .map(|(_, title, status, words)| {
-                format!("{title}   {}   {words} words", status.as_str())
+            .map(|(id, title, status, words)| {
+                format!(
+                    "{} {title}   {}   {words} words",
+                    if s.selected_scenes.contains(id) {
+                        "[x]"
+                    } else {
+                        "[ ]"
+                    },
+                    status.as_str()
+                )
             })
             .collect(),
         Workspace::Editor => Vec::new(),
@@ -10444,6 +11766,13 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                             claim.evidence_quote
                         )
                     }),
+            );
+            rows.extend(
+                s.app
+                    .list_story_objects()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|object| format!("Object · {}", object.name)),
             );
             rows
         }
@@ -11404,15 +12733,18 @@ fn open_find_panel(s: &mut AppState, replacing: bool) {
             panel.field
         };
     } else {
+        let session = load_find_panel_session(s.app.project_root());
         s.find_panel = Some(FindPanel {
             replacing,
             mode: story_core::FindMode::Normal,
             scope: "current".into(),
-            pattern: String::new(),
-            replacement: String::new(),
-            case_sensitive: true,
-            whole_word: false,
+            pattern: session.pattern,
+            replacement: session.replacement,
+            case_sensitive: session.case_sensitive,
+            whole_word: session.whole_word,
             field: FindPanelField::Pattern,
+            history_position: None,
+            history_draft: None,
         });
     }
     s.mode = None;
@@ -11423,9 +12755,35 @@ fn handle_find_panel_key(
     s: &mut AppState,
     key: KeyEvent,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some((_, command_id)) = s
+        .command_bindings
+        .iter()
+        .find(|(event, _)| same_keycode(event.code, key.code) && event.modifiers == key.modifiers)
+        && matches!(
+            command_id.as_str(),
+            "search.history-older" | "search.history-newer"
+        )
+    {
+        let command = command_by_id(command_id).ok_or("search history command is unavailable")?;
+        s.dispatch_registered_with_args(command.action, command.palette_prefix)?;
+        return Ok(());
+    }
+    if key.code == KeyCode::F(11) || key.code == KeyCode::F(12) {
+        step_find_query_history(s, key.code == KeyCode::F(11))?;
+        return Ok(());
+    }
     if key.code == KeyCode::Esc {
+        if let Err(error) = s.persist_find_panel_session() {
+            s.message = format!("Find preferences could not be saved: {error}");
+        }
         s.find_panel = None;
-        s.message = "Find panel closed".into();
+        if s.pending_replace.take().is_some() {
+            s.message = "Replacement preview cancelled; manuscript unchanged".into();
+        } else if s.message.is_empty()
+            || !s.message.starts_with("Find preferences could not be saved")
+        {
+            s.message = "Find panel closed".into();
+        }
         return Ok(());
     }
     if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
@@ -11436,7 +12794,12 @@ fn handle_find_panel_key(
         return Ok(());
     }
     if key.code == KeyCode::F(4) {
+        let invalidate_preview = s.pending_replace.is_some();
         let mut scopes = vec!["current".to_owned()];
+        scopes.push("open".into());
+        if !s.selected_scenes.is_empty() {
+            scopes.push("selected".into());
+        }
         if let Some(scene) = s.editing_scene.or_else(|| s.active_scene())
             && let Ok(record) = s.app.get_scene(scene)
             && let Some(chapter) = record.chapter_id
@@ -11457,10 +12820,42 @@ fn handle_find_panel_key(
                 .unwrap_or(scopes.len() - 1);
             panel.scope = scopes[(index + 1) % scopes.len()].clone();
         }
+        if invalidate_preview {
+            s.pending_replace = None;
+            s.message = "Replacement preview cancelled because its scope changed".into();
+        }
+        if s.find_panel
+            .as_ref()
+            .is_some_and(|panel| !panel.replacing && !panel.pattern.is_empty())
+            && let Err(error) = s.run_find_panel_search()
+        {
+            s.message = error.to_string();
+        }
         return Ok(());
     }
     if key.code == KeyCode::F(3) {
-        s.navigate_search_match(!key.modifiers.contains(KeyModifiers::SHIFT))?;
+        if s.pending_replace.is_some() {
+            s.step_replace_preview_match(!key.modifiers.contains(KeyModifiers::SHIFT));
+        } else {
+            s.navigate_search_match(!key.modifiers.contains(KeyModifiers::SHIFT))?;
+        }
+        return Ok(());
+    }
+    if key.code == KeyCode::F(6) && s.pending_replace.is_some() {
+        s.toggle_replace_preview_match();
+        return Ok(());
+    }
+    if key.code == KeyCode::F(8) && s.pending_replace.is_some() {
+        s.toggle_replace_preview_file();
+        return Ok(());
+    }
+    if key.code == KeyCode::F(9)
+        && s.find_panel.as_ref().is_some_and(|panel| panel.replacing)
+        && s.pending_replace.is_none()
+    {
+        if let Err(error) = s.replace_next_in_current_scene() {
+            s.message = error.to_string();
+        }
         return Ok(());
     }
     if key.code == KeyCode::F(5) && s.find_panel.as_ref().is_some_and(|panel| panel.replacing) {
@@ -11482,8 +12877,12 @@ fn handle_find_panel_key(
             ) {
                 s.message = error.to_string();
             }
-        } else if let Err(error) = s.run_find_panel_search() {
-            s.message = error.to_string();
+        } else {
+            if let Err(error) = s.remember_find_panel_query() {
+                s.message = error.to_string();
+            } else if let Err(error) = s.run_find_panel_search() {
+                s.message = error.to_string();
+            }
         }
         return Ok(());
     }
@@ -11535,6 +12934,86 @@ fn handle_find_panel_key(
             }
         }
         _ => {}
+    }
+    if matches!(key.code, KeyCode::Backspace | KeyCode::Char(_))
+        && panel.field == FindPanelField::Pattern
+    {
+        panel.history_position = None;
+        panel.history_draft = None;
+    }
+    let edits_preview_inputs = matches!(
+        key.code,
+        KeyCode::F(2) | KeyCode::F(7) | KeyCode::Backspace | KeyCode::Char(_)
+    );
+    if edits_preview_inputs && s.pending_replace.take().is_some() {
+        s.message = "Replacement preview cancelled because its settings changed".into();
+    }
+    if let Err(error) = s.persist_find_panel_session() {
+        s.message = format!("Find preferences could not be saved: {error}");
+    }
+    let incremental = s.find_panel.as_ref().is_some_and(|panel| {
+        !panel.replacing
+            && !panel.pattern.is_empty()
+            && matches!(
+                key.code,
+                KeyCode::Char(_)
+                    | KeyCode::Backspace
+                    | KeyCode::F(2)
+                    | KeyCode::F(6)
+                    | KeyCode::F(7)
+            )
+    });
+    if incremental && let Err(error) = s.run_find_panel_search() {
+        s.message = error.to_string();
+    }
+    Ok(())
+}
+
+fn step_find_query_history(
+    s: &mut AppState,
+    older: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let session = load_find_panel_session(s.app.project_root());
+    if session.history.is_empty() {
+        s.message = "Search history is empty".into();
+        return Ok(());
+    }
+    let panel = s.find_panel.as_mut().ok_or("find panel is closed")?;
+    let next_position = if older {
+        match panel.history_position {
+            Some(position) => Some((position + 1).min(session.history.len() - 1)),
+            None => {
+                panel.history_draft = Some(panel.pattern.clone());
+                Some(usize::from(
+                    session.history.first() == Some(&panel.pattern) && session.history.len() > 1,
+                ))
+            }
+        }
+    } else {
+        match panel.history_position {
+            Some(0) => None,
+            Some(position) => Some(position - 1),
+            None => return Ok(()),
+        }
+    };
+    panel.history_position = next_position;
+    panel.pattern = match next_position {
+        Some(position) => session.history[position].clone(),
+        None => panel
+            .history_draft
+            .take()
+            .unwrap_or_else(|| session.pattern.clone()),
+    };
+    if s.pending_replace.take().is_some() {
+        s.message = "Replacement preview cancelled because the query changed".into();
+    }
+    s.persist_find_panel_session()?;
+    let should_search = s
+        .find_panel
+        .as_ref()
+        .is_some_and(|panel| !panel.replacing && !panel.pattern.is_empty());
+    if should_search && let Err(error) = s.run_find_panel_search() {
+        s.message = error.to_string();
     }
     Ok(())
 }
@@ -11875,7 +13354,13 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             && !k.modifiers.contains(KeyModifiers::SHIFT)
             && k.code == KeyCode::Char('z')
         {
-            s.undo_edit();
+            if s.undo_stack.is_empty() && load_replace_undo(s.app.project_root())?.is_some() {
+                if let Err(error) = s.undo_last_scoped_replace() {
+                    s.message = error.to_string();
+                }
+            } else {
+                s.undo_edit();
+            }
             return Ok(false);
         }
         if k.modifiers.contains(KeyModifiers::CONTROL)
@@ -11895,6 +13380,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     && matches!(k.code, KeyCode::Char('x' | 'v')))));
         if mutating {
             s.search_locations.clear();
+            s.search_result_rows.clear();
             s.push_undo();
         }
         if k.modifiers.contains(KeyModifiers::CONTROL) {
@@ -12109,10 +13595,18 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.message = format!("Diff for {}", snapshot.label);
             }
         }
-        KeyCode::Char(' ') if s.workspace == Workspace::Outline => {
-            if let Some(OutlineRow::Chapter { id, .. }) = outline_rows(s).get(s.selected) {
-                let id = *id;
-                s.toggle_outline_node(id)?;
+        KeyCode::Char(' ')
+            if matches!(
+                s.workspace,
+                Workspace::Outline | Workspace::Cards | Workspace::Search
+            ) =>
+        {
+            if let Some(scene) = selected_scene_for_workspace(s) {
+                toggle_scene_selection(s, scene);
+            } else if s.workspace == Workspace::Outline
+                && let Some(OutlineRow::Chapter { id, .. }) = outline_rows(s).get(s.selected)
+            {
+                s.toggle_outline_node(*id)?;
             }
         }
         KeyCode::Enter if s.workspace == Workspace::Assemblies => {
@@ -13919,6 +15413,7 @@ mod tests {
             message: String::new(),
             history: vec![Workspace::Editor],
             history_index: 0,
+            location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -13945,7 +15440,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -13968,6 +15465,8 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
@@ -14297,9 +15796,10 @@ mod tests {
         state
             .execute_legacy_palette_command("replace-preview normal all cat => fox")
             .unwrap();
-        assert!(state.message.contains("2 replacement(s)"));
-        assert!(state.message.contains("A cat waits."));
-        assert!(state.message.contains("A fox waits."));
+        let preview = state.pending_replace.as_ref().unwrap();
+        assert_eq!(preview[0].replacements, 2);
+        assert!(preview[0].original.contains("A cat waits."));
+        assert!(preview[0].proposed.contains("A fox waits."));
         assert_eq!(
             state.app.load_scene_text(scene).unwrap().0,
             "A cat waits.\nThe cat leaves."
@@ -14982,6 +16482,7 @@ mod tests {
         assert_eq!(state.search_locations.len(), 3);
         assert_eq!(state.search_locations[0].0, first);
         assert_eq!(state.search_locations[1].0, first);
+        assert_eq!(state.search_result_rows[0], "First:1: Mara met Mara.");
         handle(&mut state, KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE)).unwrap();
         assert_eq!(state.selected_text().as_deref(), Some("Mara"));
         assert_eq!(
@@ -14994,6 +16495,92 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.search_location_index, 0);
+    }
+
+    #[test]
+    fn tags_find_character_alias_and_return_to_previous_editor_position() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+        let scene = app.create_scene(chapter, "At the Gate", 0).unwrap();
+        let character = app.create_character("Mara Vale").unwrap();
+        app.add_character_alias(character, "The Cartographer")
+            .unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Mara waits at the old gate.")
+            .unwrap();
+
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.open_scene(scene).unwrap();
+        state.cursor = (0, 7);
+        state.mode = Some(':');
+        state.prompt = "tags Cartographer".into();
+        state.command().unwrap();
+        assert_eq!(state.search_hits.len(), 1);
+        assert_eq!(state.search_hits[0].entity_kind, "character");
+        assert_eq!(state.search_hits[0].entity_id, character.to_string());
+
+        state.open_selected().unwrap();
+        assert_eq!(state.workspace, Workspace::StoryBible);
+        assert_eq!(state.location_history.len(), 1);
+        state.mode = Some(':');
+        state.prompt = "return-position".into();
+        state.command().unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert_eq!(state.editing_scene, Some(scene));
+        assert_eq!(state.cursor, (0, 7));
+        assert!(state.location_history.is_empty());
+    }
+
+    #[test]
+    fn refs_search_reports_raw_text_matches_without_claiming_presence() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Mention", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Someone mentioned Mara in a letter.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.mode = Some(':');
+        state.prompt = "refs Mara".into();
+        state.command().unwrap();
+        assert_eq!(state.search_locations.len(), 1);
+        assert!(state.message.contains("raw textual reference"));
+        assert!(state.message.contains("do not imply character presence"));
+        assert!(state.search_result_rows[0].contains("Mention:1:"));
+    }
+
+    #[test]
+    fn ex_style_percent_substitution_uses_line_anchors_without_touching_embedded_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Codes", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "CH12\nCH34\nxCH56")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.mode = Some(':');
+        state.prompt = ":%s/^CH/Ch/g".into();
+        state.command().unwrap();
+        assert_eq!(state.editor.join("\n"), "Ch12\nCh34\nxCH56");
+        assert!(state.dirty);
+        assert!(state.message.contains("all matches per line"));
+    }
+
+    #[test]
+    fn ex_substitution_parser_accepts_escaped_delimiters_and_rejects_unknown_flags() {
+        let substitution = parse_ex_substitution(r":%s/a\/b/x\/y/gi").unwrap().unwrap();
+        assert!(!substitution.current_line_only);
+        assert_eq!(substitution.pattern, "a/b");
+        assert_eq!(substitution.replacement, "x/y");
+        assert!(substitution.global_per_line);
+        assert!(!substitution.case_sensitive);
+        assert!(parse_ex_substitution(":%s/a/b/z").is_err());
     }
 
     #[test]
@@ -15068,6 +16655,223 @@ mod tests {
     }
 
     #[test]
+    fn find_panel_remembers_query_and_toggles_without_restoring_regex_or_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        open_find_panel(&mut state, false);
+        let panel = state.find_panel.as_mut().unwrap();
+        panel.pattern = "Mara".into();
+        panel.replacement = "Mira".into();
+        panel.case_sensitive = false;
+        panel.whole_word = true;
+        panel.mode = story_core::FindMode::Regex;
+        panel.scope = "all".into();
+        state.persist_find_panel_session().unwrap();
+        state.find_panel = None;
+
+        let app = WriterApp::open_project(directory.path().join("Novel")).unwrap();
+        let mut reopened = AppState::new(app, default_bindings());
+        open_find_panel(&mut reopened, false);
+        let panel = reopened.find_panel.as_ref().unwrap();
+        assert_eq!(panel.pattern, "Mara");
+        assert_eq!(panel.replacement, "Mira");
+        assert!(!panel.case_sensitive);
+        assert!(panel.whole_word);
+        assert_eq!(panel.mode, story_core::FindMode::Normal);
+        assert_eq!(panel.scope, "current");
+    }
+
+    #[test]
+    fn find_panel_history_persists_and_f11_f12_navigate_older_and_draft_queries() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Mara met Mira.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        open_find_panel(&mut state, false);
+
+        for query in ["Mara", "Mira"] {
+            state.find_panel.as_mut().unwrap().pattern = query.into();
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        let session = load_find_panel_session(state.app.project_root());
+        assert_eq!(session.history, vec!["Mira", "Mara"]);
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.find_panel.as_ref().unwrap().pattern, "Mara");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.find_panel.as_ref().unwrap().pattern, "Mira");
+        state.command_bindings.push((
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            "search.history-older".into(),
+        ));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.find_panel.as_ref().unwrap().pattern, "Mara");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.find_panel.as_ref().unwrap().pattern, "Mira");
+
+        state.find_panel.as_mut().unwrap().pattern = "draft query".into();
+        state.find_panel.as_mut().unwrap().history_position = None;
+        state.find_panel.as_mut().unwrap().history_draft = None;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.find_panel.as_ref().unwrap().pattern, "Mira");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.find_panel.as_ref().unwrap().pattern, "draft query");
+
+        state.find_panel = None;
+        open_find_panel(&mut state, false);
+        assert_eq!(state.find_panel.as_ref().unwrap().pattern, "draft query");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(11), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.find_panel.as_ref().unwrap().pattern, "Mira");
+        assert_eq!(
+            load_find_panel_session(state.app.project_root()).history,
+            vec!["Mira", "Mara"]
+        );
+    }
+
+    #[test]
+    fn open_and_selected_scopes_include_unsaved_and_explicitly_selected_scenes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        for scene in [first, second] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), "Mara is here.")
+                .unwrap();
+        }
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.workspace = Workspace::Cards;
+        state.selected = 1;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.selected_scenes, BTreeSet::from([second]));
+        state.open_scene(first).unwrap();
+        state.editor = vec!["An unsaved passage mentions Mara.".into()];
+        state.dirty = true;
+        state.find_panel = Some(FindPanel {
+            replacing: false,
+            mode: story_core::FindMode::Normal,
+            scope: "open".into(),
+            pattern: "unsaved".into(),
+            replacement: String::new(),
+            case_sensitive: true,
+            whole_word: false,
+            field: FindPanelField::Pattern,
+            history_position: None,
+            history_draft: None,
+        });
+        state.run_find_panel_search().unwrap();
+        assert_eq!(state.search_locations.len(), 1);
+        assert_eq!(state.search_locations[0].0, first);
+
+        state.find_panel.as_mut().unwrap().scope = "selected".into();
+        state.find_panel.as_mut().unwrap().pattern = "Mara".into();
+        state.run_find_panel_search().unwrap();
+        assert_eq!(state.search_locations.len(), 1);
+        assert_eq!(state.search_locations[0].0, second);
+    }
+
+    #[test]
+    fn open_scope_searches_unsaved_assembly_text_and_replace_apply_preserves_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "The cat waits.")
+            .unwrap();
+        let assembly = app.create_assembly("Reading order").unwrap();
+        app.add_assembly_scene(assembly, scene, 0).unwrap();
+        let draft = app.create_assembly_draft(assembly).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_assembly_draft(draft.id).unwrap();
+        state.editor = format_assembly_draft(&state.app.load_assembly_draft(draft.id).unwrap())
+            .replace("The cat waits.", "The unsaved cat waits.")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        state.dirty = true;
+        state.find_panel = Some(FindPanel {
+            replacing: false,
+            mode: story_core::FindMode::Normal,
+            scope: "open".into(),
+            pattern: "unsaved".into(),
+            replacement: String::new(),
+            case_sensitive: true,
+            whole_word: false,
+            field: FindPanelField::Pattern,
+            history_position: None,
+            history_draft: None,
+        });
+        state.run_find_panel_search().unwrap();
+        assert_eq!(state.search_locations.len(), 1);
+        assert_eq!(state.search_locations[0].0, scene);
+        state
+            .stage_replace_preview(
+                story_core::FindMode::Normal,
+                "open",
+                "cat",
+                "fox",
+                true,
+                false,
+            )
+            .unwrap();
+        assert!(
+            state
+                .execute_legacy_palette_command("replace-apply")
+                .is_err()
+        );
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "The cat waits."
+        );
+        assert!(state.dirty);
+    }
+
+    #[test]
     fn bottom_replace_panel_requires_enter_preview_then_f5_apply() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -15117,6 +16921,176 @@ mod tests {
     }
 
     #[test]
+    fn replacement_preview_can_skip_individual_matches_and_whole_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        for scene in [first, second] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), "cat cat").unwrap();
+        }
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .stage_replace_preview(
+                story_core::FindMode::Normal,
+                "all",
+                "cat",
+                "fox",
+                true,
+                false,
+            )
+            .unwrap();
+        state.replace_preview_match = 0;
+        state.toggle_replace_preview_match();
+        state.replace_preview_target = 1;
+        state.toggle_replace_preview_file();
+        state
+            .execute_legacy_palette_command("replace-apply")
+            .unwrap();
+        assert_eq!(state.app.load_scene_text(first).unwrap().0, "cat fox");
+        assert_eq!(state.app.load_scene_text(second).unwrap().0, "cat cat");
+        assert_eq!(state.message, "Applied 1 replacement(s) to 1 scene(s)");
+        state.workspace = Workspace::Editor;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.app.load_scene_text(first).unwrap().0, "cat cat");
+        assert_eq!(state.app.load_scene_text(second).unwrap().0, "cat cat");
+    }
+
+    #[test]
+    fn interrupted_replace_group_recovers_by_rolling_forward_files_to_originals() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let (_, first_hash) = app.load_scene_text(first).unwrap();
+        let (_, second_hash) = app.load_scene_text(second).unwrap();
+        let new_first_hash = app
+            .save_scene_text(first, Some(&first_hash), "fox fox")
+            .unwrap();
+        let operation = ReplaceRecoveryFile {
+            version: 1,
+            operation_id: "interrupted".into(),
+            entries: vec![
+                ReplaceRecoveryEntry {
+                    scene_id: first,
+                    title: "First".into(),
+                    original: String::new(),
+                    expected_hash: first_hash,
+                    proposed: "fox fox".into(),
+                },
+                ReplaceRecoveryEntry {
+                    scene_id: second,
+                    title: "Second".into(),
+                    original: String::new(),
+                    expected_hash: second_hash,
+                    proposed: "fox fox".into(),
+                },
+            ],
+        };
+        persist_replace_undo(
+            app.project_root(),
+            &ReplaceUndoFile {
+                version: 1,
+                operation_id: "interrupted".into(),
+                entries: vec![ReplaceUndoEntry {
+                    scene_id: first,
+                    title: "First".into(),
+                    before: String::new(),
+                    after: "fox fox".into(),
+                    after_hash: new_first_hash,
+                }],
+            },
+        )
+        .unwrap();
+        let path = persist_replace_recovery(app.project_root(), &operation).unwrap();
+        let notices = recover_replace_groups(&mut app).unwrap();
+        assert!(notices[0].contains("rolled back safely"));
+        assert_eq!(app.load_scene_text(first).unwrap().0, "");
+        assert_eq!(app.load_scene_text(second).unwrap().0, "");
+        assert!(!path.exists());
+        assert!(!replace_undo_path(app.project_root()).exists());
+    }
+
+    #[test]
+    fn replace_group_recovery_preserves_external_conflicts_without_partial_rollback() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let (_, first_hash) = app.load_scene_text(first).unwrap();
+        let (_, second_hash) = app.load_scene_text(second).unwrap();
+        app.save_scene_text(first, Some(&first_hash), "fox")
+            .unwrap();
+        app.save_scene_text(second, Some(&second_hash), "external edit")
+            .unwrap();
+        let operation = ReplaceRecoveryFile {
+            version: 1,
+            operation_id: "conflict".into(),
+            entries: vec![
+                ReplaceRecoveryEntry {
+                    scene_id: first,
+                    title: "First".into(),
+                    original: String::new(),
+                    expected_hash: first_hash,
+                    proposed: "fox".into(),
+                },
+                ReplaceRecoveryEntry {
+                    scene_id: second,
+                    title: "Second".into(),
+                    original: String::new(),
+                    expected_hash: second_hash,
+                    proposed: "fox".into(),
+                },
+            ],
+        };
+        let path = persist_replace_recovery(app.project_root(), &operation).unwrap();
+        let notices = recover_replace_groups(&mut app).unwrap();
+        assert!(notices[0].contains("conflicts with externally changed scene Second"));
+        assert_eq!(app.load_scene_text(first).unwrap().0, "fox");
+        assert_eq!(app.load_scene_text(second).unwrap().0, "external edit");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn replace_next_changes_only_the_next_current_scene_match_and_is_undoable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Current", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "cat cat").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.cursor = (0, 0);
+        state.find_panel = Some(FindPanel {
+            replacing: true,
+            mode: story_core::FindMode::Normal,
+            case_sensitive: true,
+            whole_word: false,
+            scope: "current".into(),
+            pattern: "cat".into(),
+            replacement: "fox".into(),
+            field: FindPanelField::Pattern,
+            history_position: None,
+            history_draft: None,
+        });
+        state.replace_next_in_current_scene().unwrap();
+        assert_eq!(state.editor.join("\n"), "fox cat");
+        assert!(state.dirty);
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), "cat cat");
+        assert!(state.dirty);
+    }
+
+    #[test]
     fn proofread_scopes_to_a_chapter_and_rejects_non_chapters() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -15160,6 +17134,7 @@ mod tests {
             message: String::new(),
             history: vec![Workspace::Editor],
             history_index: 0,
+            location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -15186,7 +17161,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -15209,6 +17186,8 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
@@ -15258,6 +17237,7 @@ mod tests {
             message: String::new(),
             history: vec![Workspace::Editor],
             history_index: 0,
+            location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -15284,7 +17264,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -15307,6 +17289,8 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
@@ -15348,6 +17332,7 @@ mod tests {
             message: String::new(),
             history: vec![Workspace::Editor],
             history_index: 0,
+            location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -15374,7 +17359,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -15397,6 +17384,8 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
@@ -15450,6 +17439,7 @@ mod tests {
             message: String::new(),
             history: vec![Workspace::Outline],
             history_index: 0,
+            location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -15476,7 +17466,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -15499,6 +17491,8 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
@@ -15702,6 +17696,7 @@ mod tests {
             message: String::new(),
             history: vec![Workspace::Dashboard],
             history_index: 0,
+            location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -15728,7 +17723,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -15751,6 +17748,8 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
@@ -15804,6 +17803,7 @@ mod tests {
             message: String::new(),
             history: vec![Workspace::Outline],
             history_index: 0,
+            location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -15830,7 +17830,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -15853,6 +17855,8 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
@@ -15923,6 +17927,7 @@ mod tests {
             message: String::new(),
             history: vec![Workspace::Revisions],
             history_index: 0,
+            location_history: Vec::new(),
             width: 100,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -15949,7 +17954,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -15972,6 +17979,8 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
@@ -16160,6 +18169,7 @@ mod tests {
             message: String::new(),
             history: vec![Workspace::Reading],
             history_index: 0,
+            location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -16186,7 +18196,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -16209,6 +18221,8 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
@@ -16528,6 +18542,7 @@ mod tests {
             message: String::new(),
             history: vec![Workspace::Search],
             history_index: 0,
+            location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -16554,7 +18569,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -16577,6 +18594,8 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
@@ -16595,7 +18614,7 @@ mod tests {
         state.app.update_scene_metadata(&scene).unwrap();
         let rows = workspace_items(&state);
         assert_eq!(rows.len(), 1);
-        assert!(rows[0].starts_with("Matching"));
+        assert!(rows[0].starts_with("[ ] Matching"));
         assert_eq!(state.scenes.len(), 2);
         assert_eq!(state.scenes[0].0, first);
         assert_eq!(state.scenes[1].0, matching);
@@ -16641,6 +18660,7 @@ mod tests {
             message: String::new(),
             history: vec![Workspace::Search],
             history_index: 0,
+            location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -16667,7 +18687,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -16690,6 +18712,8 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
@@ -16806,6 +18830,7 @@ mod tests {
             message: String::new(),
             history: vec![Workspace::Outline],
             history_index: 0,
+            location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -16832,7 +18857,9 @@ mod tests {
             revision_hunk: 0,
             search_hits: Vec::new(),
             search_locations: Vec::new(),
+            search_result_rows: Vec::new(),
             search_location_index: 0,
+            selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
             proposal_review_rows: Vec::new(),
@@ -16855,6 +18882,8 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            replace_preview_target: 0,
+            replace_preview_match: 0,
             find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,

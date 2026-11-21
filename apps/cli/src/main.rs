@@ -2176,6 +2176,14 @@ fn validate_scene_scope(scope: &str) -> Result<(), Box<dyn std::error::Error>> {
         let _: uuid::Uuid = chapter.parse()?;
     } else if let Some(assembly) = scope.strip_prefix("assembly:") {
         let _: uuid::Uuid = assembly.parse()?;
+    } else if let Some(selected) = scope.strip_prefix("selected:") {
+        let values = selected.split(',').collect::<Vec<_>>();
+        if values.is_empty() || values.iter().any(|value| value.is_empty()) {
+            return Err("selected scope needs comma-separated scene UUIDs".into());
+        }
+        for value in values {
+            let _: uuid::Uuid = value.parse()?;
+        }
     } else {
         let _: uuid::Uuid = scope.parse()?;
     }
@@ -2284,6 +2292,20 @@ fn scenes_for_scope(
         }
         return Ok(ordered);
     }
+    if let Some(selected) = scope.strip_prefix("selected:") {
+        let ids = selected
+            .split(',')
+            .map(|value| value.parse().map(SceneId))
+            .collect::<Result<std::collections::BTreeSet<_>, uuid::Error>>()?;
+        let selected_records = scenes
+            .into_iter()
+            .filter(|record| ids.contains(&record.scene.id))
+            .collect::<Vec<_>>();
+        if selected_records.len() != ids.len() {
+            return Err("selected scope contains a scene that does not exist".into());
+        }
+        return Ok(selected_records);
+    }
     let scene = SceneId(scope.parse()?);
     Ok(scenes
         .into_iter()
@@ -2370,7 +2392,7 @@ fn usage() {
         "writers-ide proofread-config <project> (creates editable .writers-ide/diagnostics.toml)"
     );
     eprintln!(
-        "writers-ide find <path> <normal|extended|regex> <all|scene-uuid|chapter:uuid|assembly:uuid> <pattern>\nwriters-ide replace-preview <path> <normal|extended|regex> <scope> <pattern> => <replacement>\nwriters-ide replace-apply <path> <preview.json>\nwriters-ide replace <path> <normal|extended|regex> <scope> <pattern> => <replacement>\nwriters-ide language <path> [language-tag]"
+        "writers-ide find <path> <normal|extended|regex> <all|scene-uuid|chapter:uuid|assembly:uuid|selected:uuid,uuid> <pattern>\nwriters-ide replace-preview <path> <normal|extended|regex> <scope> <pattern> => <replacement>\nwriters-ide replace-apply <path> <preview.json>\nwriters-ide replace <path> <normal|extended|regex> <scope> <pattern> => <replacement>\nwriters-ide language <path> [language-tag]"
     );
     eprintln!(
         "writers-ide create <path> [title]\nwriters-ide create-kind <path> <fiction|nonfiction|custom> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide compile <path> <markdown|html|epub|docx|pdf> [output-path] [--expand-transclusions]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|present=UUID|mentioned=UUID|absent=UUID|location=UUID|event=UUID|chapter=UUID|text=TERM|plotline=UUID|assembly=UUID|issue-status=STATUS|meta=FIELD:VALUE|meta-contains=FIELD:KIND:ENTITY|meta-exists=FIELD|meta-text=FIELD:TEXT|meta-number=FIELD:OP:int|decimal:VALUE|before-definitely=TICK|before-possibly=TICK|after-definitely=TICK|after-possibly=TICK|before=TICK|after=TICK]...\nwriters-ide character-absence <path> <scene-uuid> <character-uuid> [notes]\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide query-explain <path> <query-uuid> <scene-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
@@ -3201,6 +3223,26 @@ mod watch_tests {
                 .map(|record| record.scene.id)
                 .collect::<Vec<_>>(),
             [last, first]
+        );
+    }
+
+    #[test]
+    fn selected_cli_scope_contains_only_the_named_scene_files() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let selected = scenes_for_scope(&app, &format!("selected:{second},{first}")).unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|record| record.scene.id)
+                .collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert!(
+            scenes_for_scope(&app, &format!("selected:{first},{}", uuid::Uuid::new_v4())).is_err()
         );
     }
 

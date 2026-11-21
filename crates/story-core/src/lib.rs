@@ -458,6 +458,7 @@ pub fn find_matches_with_options(
     }
     let re = regex::RegexBuilder::new(&source)
         .case_insensitive(!options.case_sensitive)
+        .multi_line(true)
         .build()
         .map_err(|e| format!("invalid regular expression: {e}"))?;
     Ok(re.find_iter(text).map(|m| m.start()..m.end()).collect())
@@ -486,29 +487,74 @@ pub fn replace_matches_with_options(
     replacement: &str,
     options: FindOptions,
 ) -> Result<(String, usize), String> {
+    let regex = build_find_regex(pattern, options)?;
+    let selected = vec![true; regex.find_iter(text).count()];
+    replace_selected_matches_with_options(text, pattern, replacement, options, &selected)
+}
+
+/// Replace only the indexed matches from a stable preview. `selected` must
+/// contain one choice for every match in the unchanged source text.
+pub fn replace_selected_matches_with_options(
+    text: &str,
+    pattern: &str,
+    replacement: &str,
+    options: FindOptions,
+    selected: &[bool],
+) -> Result<(String, usize), String> {
     if pattern.is_empty() {
         return Err("search pattern cannot be empty".into());
     }
-    let (mut source, replacement) = match options.mode {
-        FindMode::Normal => (regex::escape(pattern), replacement.to_owned()),
-        FindMode::Extended => (
-            regex::escape(&decode_extended(pattern)?),
-            decode_extended(replacement)?,
-        ),
-        FindMode::Regex => (pattern.to_owned(), replacement.to_owned()),
+    let regex = build_find_regex(pattern, options)?;
+    let captures = regex.captures_iter(text).collect::<Vec<_>>();
+    if captures.len() != selected.len() {
+        return Err("replacement selection no longer matches the preview source".into());
+    }
+    let replacement = match options.mode {
+        FindMode::Normal => replacement.to_owned(),
+        FindMode::Extended => decode_extended(replacement)?,
+        FindMode::Regex => replacement.to_owned(),
+    };
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    let mut count = 0;
+    for (captures, selected) in captures.iter().zip(selected) {
+        let matched = captures
+            .get(0)
+            .ok_or("regular expression returned an empty capture set")?;
+        output.push_str(&text[cursor..matched.start()]);
+        if *selected {
+            count += 1;
+            if options.mode == FindMode::Regex {
+                captures.expand(&replacement, &mut output);
+            } else {
+                output.push_str(&replacement);
+            }
+        } else {
+            output.push_str(matched.as_str());
+        }
+        cursor = matched.end();
+    }
+    output.push_str(&text[cursor..]);
+    Ok((output, count))
+}
+
+fn build_find_regex(pattern: &str, options: FindOptions) -> Result<regex::Regex, String> {
+    if pattern.is_empty() {
+        return Err("search pattern cannot be empty".into());
+    }
+    let mut source = match options.mode {
+        FindMode::Normal => regex::escape(pattern),
+        FindMode::Extended => regex::escape(&decode_extended(pattern)?),
+        FindMode::Regex => pattern.to_owned(),
     };
     if options.whole_word {
         source = format!(r"\b(?:{source})\b");
     }
-    let re = regex::RegexBuilder::new(&source)
+    regex::RegexBuilder::new(&source)
         .case_insensitive(!options.case_sensitive)
+        .multi_line(true)
         .build()
-        .map_err(|e| format!("invalid regular expression: {e}"))?;
-    let count = re.find_iter(text).count();
-    Ok((
-        re.replace_all(text, replacement.as_str()).into_owned(),
-        count,
-    ))
+        .map_err(|error| format!("invalid regular expression: {error}"))
 }
 
 fn decode_extended(text: &str) -> Result<String, String> {
@@ -633,6 +679,102 @@ mod multilingual_tests {
         assert_eq!(
             replace_matches_with_options(source, "cat", "fox", options).unwrap(),
             ("fox catalog fox café".to_owned(), 2)
+        );
+    }
+
+    #[test]
+    fn selected_regex_replacements_keep_capture_groups_and_skip_unselected_matches() {
+        use super::{
+            FindMode, FindOptions, replace_matches_with_options,
+            replace_selected_matches_with_options,
+        };
+        let options = FindOptions {
+            mode: FindMode::Regex,
+            case_sensitive: true,
+            whole_word: false,
+        };
+        assert_eq!(
+            replace_selected_matches_with_options(
+                "CH12 and CH34",
+                r"CH([0-9]+)",
+                "Ch$1",
+                options,
+                &[true, false],
+            )
+            .unwrap(),
+            ("Ch12 and CH34".into(), 1)
+        );
+        assert_eq!(
+            replace_matches_with_options("A $1 cat", "cat", "$1", FindOptions::default()).unwrap(),
+            ("A $1 $1".into(), 1)
+        );
+        assert!(
+            replace_selected_matches_with_options(
+                "cat cat",
+                "cat",
+                "fox",
+                FindOptions::default(),
+                &[true],
+            )
+            .is_err()
+        );
+        assert_eq!(
+            replace_matches_with_options("CH12\nCH34\nxCH56", r"^CH([0-9]+)$", "Ch$1", options,)
+                .unwrap(),
+            ("Ch12\nCh34\nxCH56".into(), 2)
+        );
+    }
+
+    #[test]
+    fn regex_zero_width_matches_replace_at_unicode_boundaries_safely() {
+        use super::{
+            FindMode, FindOptions, find_matches_with_options, replace_matches_with_options,
+            replace_selected_matches_with_options,
+        };
+        let options = FindOptions {
+            mode: FindMode::Regex,
+            case_sensitive: true,
+            whole_word: false,
+        };
+        let source = "café 한국";
+        let matches = find_matches_with_options(source, r"\b", options).unwrap();
+        assert_eq!(matches.len(), 4);
+        assert!(matches.iter().all(
+            |range| source.is_char_boundary(range.start) && source.is_char_boundary(range.end)
+        ));
+        assert_eq!(
+            replace_matches_with_options(source, r"\b", "|", options).unwrap(),
+            ("|café| |한국|".into(), 4)
+        );
+        assert_eq!(
+            replace_selected_matches_with_options(
+                source,
+                r"\b",
+                "|",
+                options,
+                &[false, true, false, false]
+            )
+            .unwrap(),
+            ("café| 한국".into(), 1)
+        );
+    }
+
+    #[test]
+    fn regex_named_capture_replacement_uses_standard_rust_replacement_syntax() {
+        use super::{FindMode, FindOptions, replace_matches_with_options};
+        assert_eq!(
+            replace_matches_with_options(
+                "CH42",
+                r"(?P<prefix>CH)(?P<number>[0-9]+)",
+                "${prefix}apter $number",
+                FindOptions {
+                    mode: FindMode::Regex,
+                    case_sensitive: true,
+                    whole_word: false,
+                },
+            )
+            .unwrap(),
+            ("CHapter 42".into(), 1)
         );
     }
 }
