@@ -36,6 +36,15 @@ struct EventTimeUpdateRequest {
     end: String,
     source_time: String,
 }
+#[derive(Deserialize)]
+struct CreateIssueRequest {
+    title: String,
+    scene_id: Option<String>,
+}
+#[derive(Deserialize)]
+struct IssueStatusRequest {
+    status: String,
+}
 
 const PAGE: &str = r#"<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -44,13 +53,14 @@ body{font:16px system-ui;margin:0;color:#20242a;background:#f3f5f7}header{paddin
 <header><h1 id="title">Writer's IDE</h1><p>Local planning graph · manuscript prose remains read-only here</p></header><main>
 <section><h2>Scenes</h2><label>Search<input id="scene-filter-text" type="search" placeholder="Title or synopsis"></label><label>Status<select id="scene-filter-status"><option value="">Any status</option><option>idea</option><option>outlined</option><option>ready_to_draft</option><option>drafting</option><option>draft_complete</option><option>revising</option><option>complete</option><option>archived</option></select></label><label>Character<select id="scene-filter-character"><option value="">Any character</option></select></label><label>Plotline<select id="scene-filter-plot"><option value="">Any plotline</option></select></label><div id="scenes">Loading…</div><h3>Add chapter</h3><form id="create-chapter"><input id="new-chapter-title" required placeholder="Chapter title"><button>Add chapter</button></form><h3>Add scene</h3><form id="create-scene"><select id="new-chapter"></select><input id="new-title" required placeholder="Scene title"><button>Add scene</button></form></section>
 <section><h2 id="scene-title">Select a scene</h2><small id="scene-meta"></small><p><label>Scene title<input id="scene-name"></label><label>Planning synopsis<textarea id="synopsis" rows="4"></textarea></label><label>Status<select id="status"><option>idea</option><option>outlined</option><option>ready_to_draft</option><option>drafting</option><option>draft_complete</option><option>revising</option><option>complete</option></select></label><button id="save-planning">Save planning</button></p><p><label>Move to chapter<select id="move-chapter"></select></label><label>Position<input id="move-position" type="number" min="0" value="0"></label><button id="move-scene">Move scene</button></p><p class="notice" id="notice"></p><h3>Read-only manuscript</h3><pre id="prose">Select a scene to inspect its text.</pre></section>
-<section><h2>Characters</h2><div id="characters"></div></section><section><h2>Plotlines</h2><div id="plotlines"></div></section><section><h2>Locations and events</h2><div id="world"></div></section><section><h2>Research and issues</h2><div id="work"></div></section><section><h2>Story structure and graph</h2><div id="structure"></div><div class="graph"><svg id="graph" role="img" aria-label="Story relationship graph"></svg></div><div id="edges"></div></section></main>
+<section><h2>Characters</h2><div id="characters"></div></section><section><h2>Plotlines</h2><div id="plotlines"></div></section><section><h2>Locations and events</h2><div id="world"></div></section><section><h2>Research and issues</h2><form id="create-issue"><input id="new-issue-title" required placeholder="Issue title"><button>Create issue</button></form><div id="work"></div></section><section><h2>Story structure and graph</h2><div id="structure"></div><div class="graph"><svg id="graph" role="img" aria-label="Story relationship graph"></svg></div><div id="edges"></div></section></main>
 <script>
 let plan,selected;async function api(path,method='GET',data){const r=await fetch(path,{method,headers:data?{'Content-Type':'application/json'}:{},body:data?JSON.stringify(data):undefined});const j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.error||r.statusText);return j}
 function renderScenes(){const query=document.querySelector('#scene-filter-text').value.trim().toLocaleLowerCase();const status=document.querySelector('#scene-filter-status').value;const character=document.querySelector('#scene-filter-character').value;const plot=document.querySelector('#scene-filter-plot').value;const matches=plan.scenes.filter(s=>(!query||`${s.title} ${s.synopsis||''}`.toLocaleLowerCase().includes(query))&&(!status||s.status===status)&&(!character||s.characters.some(x=>x.id===character))&&(!plot||s.plotlines.some(x=>x.id===plot)));document.querySelector('#scenes').innerHTML=matches.map(s=>`<button class="scene" data-id="${s.id}"><b>${esc(s.title)}</b><br><small>${esc(s.chapter||'Unplaced')} · ${s.actual_words} words · ${esc(s.status)}</small><p>${esc(s.synopsis||'')}</p></button>`).join('')||'No matching scenes';document.querySelectorAll('#scenes [data-id]').forEach(b=>b.onclick=()=>openScene(b.dataset.id))}
-async function load(){plan=await api('/api/plan');document.querySelector('#title').textContent=plan.project.title;document.querySelector('#scene-filter-character').innerHTML='<option value="">Any character</option>'+plan.characters.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');document.querySelector('#scene-filter-plot').innerHTML='<option value="">Any plotline</option>'+plan.plotlines.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');renderScenes();document.querySelector('#characters').innerHTML=plan.characters.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No characters';document.querySelector('#plotlines').innerHTML=plan.plotlines.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No plotlines';document.querySelector('#world').innerHTML=[...plan.locations.map(x=>`<p>Location · ${esc(x.name)}</p>`),...plan.events.map(x=>`<p><button data-event="${esc(x.id)}" data-start="${esc(timeLabel(x.start))}" data-end="${esc(timeLabel(x.end))}" data-source="${esc(x.source_time)}">Edit time · ${esc(x.title)}</button> <small>${esc(x.source_time)} · ${esc(timeLabel(x.start))} → ${esc(timeLabel(x.end))}</small></p>`)].join('')||'No locations or events';document.querySelector('#work').innerHTML=[...plan.research.map(x=>`<p>Research · ${esc(x.title)}</p>`),...plan.issues.map(x=>`<p>Issue · ${esc(x.title)} <small>${esc(x.status)}</small></p>`)].join('')||'No research or issues';document.querySelector('#structure').innerHTML=plan.groups.map(x=>`<p>${'　'.repeat(x.depth)}${esc(x.title)} <small>${esc(x.kind)}</small></p>`).join('')||'No structure';drawGraph();document.querySelector('#edges').innerHTML=`<small>${plan.edges.length} stable-ID relationships in the project graph</small>`;const chapters=plan.groups.filter(x=>x.kind==='chapter');for(const id of ['new-chapter','move-chapter'])document.querySelector('#'+id).innerHTML=chapters.map(c=>`<option value="${c.id}">${esc(c.title)}</option>`).join('');document.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>openScene(b.dataset.id))}
+async function load(){plan=await api('/api/plan');document.querySelector('#title').textContent=plan.project.title;document.querySelector('#scene-filter-character').innerHTML='<option value="">Any character</option>'+plan.characters.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');document.querySelector('#scene-filter-plot').innerHTML='<option value="">Any plotline</option>'+plan.plotlines.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');renderScenes();document.querySelector('#characters').innerHTML=plan.characters.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No characters';document.querySelector('#plotlines').innerHTML=plan.plotlines.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No plotlines';document.querySelector('#world').innerHTML=[...plan.locations.map(x=>`<p>Location · ${esc(x.name)}</p>`),...plan.events.map(x=>`<p><button data-event="${esc(x.id)}" data-start="${esc(timeLabel(x.start))}" data-end="${esc(timeLabel(x.end))}" data-source="${esc(x.source_time)}">Edit time · ${esc(x.title)}</button> <small>${esc(x.source_time)} · ${esc(timeLabel(x.start))} → ${esc(timeLabel(x.end))}</small></p>`)].join('')||'No locations or events';document.querySelector('#work').innerHTML=[...plan.research.map(x=>`<p>Research · ${esc(x.title)}</p>`),...plan.issues.map(x=>`<p>Issue · ${esc(x.title)} <small>${esc(x.status)}</small><select data-issue-status="${esc(x.id)}"><option value="open" ${x.status==='open'?'selected':''}>Open</option><option value="in_progress" ${x.status==='in_progress'?'selected':''}>In progress</option><option value="resolved" ${x.status==='resolved'?'selected':''}>Resolved</option><option value="deferred" ${x.status==='deferred'?'selected':''}>Deferred</option><option value="closed" ${x.status==='closed'?'selected':''}>Closed</option></select></p>`)].join('')||'No research or issues';document.querySelector('#structure').innerHTML=plan.groups.map(x=>`<p>${'　'.repeat(x.depth)}${esc(x.title)} <small>${esc(x.kind)}</small></p>`).join('')||'No structure';drawGraph();document.querySelector('#edges').innerHTML=`<small>${plan.edges.length} stable-ID relationships in the project graph</small>`;const chapters=plan.groups.filter(x=>x.kind==='chapter');for(const id of ['new-chapter','move-chapter'])document.querySelector('#'+id).innerHTML=chapters.map(c=>`<option value="${c.id}">${esc(c.title)}</option>`).join('');document.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>openScene(b.dataset.id))}
 function drawGraph(){const columns=[['group',plan.groups.map(n=>({...n,label:n.title}))],['scene',plan.scenes.map(n=>({...n,label:n.title}))],['character',plan.characters.map(n=>({...n,label:n.name}))],['plotline',plan.plotlines.map(n=>({...n,label:n.name}))],['world',[...plan.locations.map(n=>({...n,label:'Location · '+n.name})),...plan.events.map(n=>({...n,label:'Event · '+n.title}))]]];const nodes=[],positions=new Map();let height=180;columns.forEach(([kind,items],col)=>{items.forEach((n,row)=>{const x=20+col*190,y=24+row*54;const node={id:String(n.id),kind,label:n.label,x,y};nodes.push(node);if(!positions.has(node.id))positions.set(node.id,node);height=Math.max(height,y+52)})});const lines=plan.edges.map(e=>{const a=positions.get(String(e.from)),b=positions.get(String(e.to));return a&&b?`<line x1="${a.x+160}" y1="${a.y+16}" x2="${b.x}" y2="${b.y+16}"><title>${esc(e.kind)}</title></line>`:''}).join('');const cards=nodes.map(n=>`<g class="${n.kind}" ${n.kind==='scene'?`data-scene-id="${esc(n.id)}"`:''}><rect x="${n.x}" y="${n.y}" width="160" height="32"></rect><text x="${n.x+8}" y="${n.y+21}">${esc(n.label.slice(0,22))}</text><title>${esc(n.label)}</title></g>`).join('');const svg=document.querySelector('#graph');svg.setAttribute('viewBox',`0 0 980 ${height}`);svg.setAttribute('height',height);svg.innerHTML=lines+cards;svg.querySelectorAll('[data-scene-id]').forEach(node=>node.onclick=()=>openScene(node.dataset.sceneId))}
 async function openScene(id){selected=id;const s=await api('/api/scenes/'+encodeURIComponent(id));document.querySelector('#scene-title').textContent=s.title;document.querySelector('#scene-meta').textContent=`${s.actual_words} words · ${s.status} · POV ${s.pov||'unset'}`;document.querySelector('#scene-name').value=s.title;document.querySelector('#synopsis').value=s.synopsis;document.querySelector('#status').value=s.status;document.querySelector('#prose').textContent=s.text}
+document.querySelector('#create-issue').onsubmit=async e=>{e.preventDefault();try{await api('/api/issues','POST',{title:document.querySelector('#new-issue-title').value,scene_id:selected||null});document.querySelector('#new-issue-title').value='';await load();notice('Issue created')}catch(e){notice(e.message)}};document.querySelector('#work').addEventListener('change',async e=>{const select=e.target.closest('[data-issue-status]');if(!select)return;try{await api('/api/issues/'+encodeURIComponent(select.dataset.issueStatus)+'/status','POST',{status:select.value});await load();notice('Issue status saved')}catch(error){notice(error.message)}});
 document.querySelector('#create-scene').onsubmit=async e=>{e.preventDefault();try{const chapter=document.querySelector('#new-chapter').value;const position=plan.scenes.filter(s=>s.chapter_id===chapter).length;const s=await api('/api/scenes','POST',{chapter_id:chapter,title:document.querySelector('#new-title').value,position});document.querySelector('#new-title').value='';await load();await openScene(s.id);notice('Scene created')}catch(e){notice(e.message)}};
 document.querySelector('#create-chapter').onsubmit=async e=>{e.preventDefault();try{await api('/api/chapters','POST',{title:document.querySelector('#new-chapter-title').value,position:plan.groups.filter(g=>g.kind==='chapter').length});document.querySelector('#new-chapter-title').value='';await load();notice('Chapter created')}catch(e){notice(e.message)}};
 document.querySelector('#save-planning').onclick=async()=>{if(!selected)return;try{await api('/api/scenes/'+selected+'/planning','POST',{title:document.querySelector('#scene-name').value,synopsis:document.querySelector('#synopsis').value,status:document.querySelector('#status').value});await load();await openScene(selected);notice('Planning metadata saved')}catch(e){notice(e.message)}};
@@ -244,6 +254,61 @@ fn route(app: &mut WriterApp, method: &str, path: &str, body: &str) -> (u16, &'s
         return match plan_json(app) {
             Ok(body) => (200, "application/json; charset=utf-8", body),
             Err(error) => api_error(error),
+        };
+    }
+    if method == "POST" && path == "/api/issues" {
+        return match serde_json::from_str::<CreateIssueRequest>(body) {
+            Ok(request) => {
+                let scene = match request.scene_id.as_deref() {
+                    Some(value) => match uuid::Uuid::from_str(value) {
+                        Ok(id) => {
+                            let id = story_core::SceneId(id);
+                            if let Err(error) = app.get_scene(id) {
+                                return api_error(error.to_string());
+                            }
+                            Some(id)
+                        }
+                        Err(error) => return api_error(error.to_string()),
+                    },
+                    None => None,
+                };
+                match app.create_issue(request.title.trim()) {
+                    Ok(id) => {
+                        if let Some(scene) = scene
+                            && let Err(error) = app.link_issue(scene, id)
+                        {
+                            return api_error(error.to_string());
+                        }
+                        (
+                            201,
+                            "application/json; charset=utf-8",
+                            serde_json::json!({"created":true,"id":id}).to_string(),
+                        )
+                    }
+                    Err(error) => api_error(error.to_string()),
+                }
+            }
+            Err(error) => api_error(error.to_string()),
+        };
+    }
+    if let Some(id) = path.strip_prefix("/api/issues/")
+        && let Some(id) = id.strip_suffix("/status")
+        && method == "POST"
+    {
+        let id = match uuid::Uuid::from_str(id) {
+            Ok(id) => story_core::IssueId(id),
+            Err(error) => return api_error(error.to_string()),
+        };
+        return match serde_json::from_str::<IssueStatusRequest>(body) {
+            Ok(request) => match app.set_issue_status(id, &request.status) {
+                Ok(()) => (
+                    200,
+                    "application/json; charset=utf-8",
+                    serde_json::json!({"saved":true,"id":id}).to_string(),
+                ),
+                Err(error) => api_error(error.to_string()),
+            },
+            Err(error) => api_error(error.to_string()),
         };
     }
     if let Some(id) = path.strip_prefix("/api/events/") {
@@ -503,6 +568,8 @@ mod tests {
         assert!(page.contains("scene-filter-character"));
         assert!(page.contains("scene-filter-plot"));
         assert!(page.contains("function renderScenes()"));
+        assert!(page.contains("create-issue"));
+        assert!(page.contains("data-issue-status"));
         let (status, _, document) = route(&mut app, "GET", &format!("/api/scenes/{scene}"), "");
         assert_eq!(status, 200);
         assert!(document.contains("Review only."));
@@ -517,6 +584,31 @@ mod tests {
         let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
         let chapter_two = app.create_chapter(None, "Chapter Two", 1).unwrap();
         let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let issue_body =
+            serde_json::json!({"title":"Check the opening","scene_id":scene}).to_string();
+        let (status, _, created) = route(&mut app, "POST", "/api/issues", &issue_body);
+        assert_eq!(status, 201);
+        let issue_id = serde_json::from_str::<serde_json::Value>(&created).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let status_body = serde_json::json!({"status":"in_progress"}).to_string();
+        assert_eq!(
+            route(
+                &mut app,
+                "POST",
+                &format!("/api/issues/{issue_id}/status"),
+                &status_body
+            )
+            .0,
+            200
+        );
+        assert!(
+            app.list_issues()
+                .unwrap()
+                .iter()
+                .any(|issue| { issue.id.to_string() == issue_id && issue.status == "in_progress" })
+        );
         let event_id = story_core::EventId::new();
         app.add_story_event(&story_core::StoryEvent {
             id: event_id,
