@@ -36,6 +36,7 @@ const MIGRATION_21: &str = include_str!("../migrations/0021_query_boolean_filter
 const MIGRATION_22: &str = include_str!("../migrations/0022_challenge_outcomes.sql");
 const MIGRATION_23: &str = include_str!("../migrations/0023_query_expressions.sql");
 const MIGRATION_24: &str = include_str!("../migrations/0024_writing_goal_ledger.sql");
+const MIGRATION_25: &str = include_str!("../migrations/0025_inspection_query_filters.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -152,6 +153,14 @@ fn compile_query_expression(
                 values.push(id.to_string());
                 "EXISTS(SELECT 1 FROM scene_character sc WHERE sc.scene_id=s.id AND sc.character_id=?)".into()
             }
+            SceneQueryFilter::CharacterPresent(id) => {
+                values.push(id.to_string());
+                "EXISTS(SELECT 1 FROM scene_character sc WHERE sc.scene_id=s.id AND sc.character_id=? AND sc.participation_role IN('pov','major','minor','off_camera'))".into()
+            }
+            SceneQueryFilter::CharacterMentioned(id) => {
+                values.push(id.to_string());
+                "EXISTS(SELECT 1 FROM scene_character sc WHERE sc.scene_id=s.id AND sc.character_id=? AND sc.participation_role='mentioned')".into()
+            }
             SceneQueryFilter::AnyCharacter(ids) => {
                 if ids.is_empty() {
                     return Err(StorageError::Invalid("character-any query filter cannot be empty".into()));
@@ -169,6 +178,25 @@ fn compile_query_expression(
                 }
                 values.extend(ids.iter().map(ToString::to_string));
                 format!("EXISTS(SELECT 1 FROM scene_plotline sp WHERE sp.scene_id=s.id AND sp.plotline_id IN ({}))", vec!["?"; ids.len()].join(","))
+            }
+            SceneQueryFilter::Location(id) => {
+                values.push(id.to_string());
+                values.push(id.to_string());
+                "(s.start_location_id=? OR s.end_location_id=?)".into()
+            }
+            SceneQueryFilter::Event(id) => {
+                values.push(id.to_string());
+                "EXISTS(SELECT 1 FROM scene_event se WHERE se.scene_id=s.id AND se.event_id=?)".into()
+            }
+            SceneQueryFilter::Chapter(id) => {
+                values.push(id.clone());
+                "p.chapter_id=?".into()
+            }
+            SceneQueryFilter::TextContains(text) => {
+                if text.trim().is_empty() { return Err(StorageError::Invalid("text query cannot be empty".into())); }
+                let pattern = format!("%{}%", text.replace('%', "\\%").replace('_', "\\_"));
+                values.extend([pattern.clone(), pattern.clone(), pattern]);
+                "(s.title LIKE ? ESCAPE '\\' OR s.synopsis LIKE ? ESCAPE '\\' OR EXISTS(SELECT 1 FROM scene_search_content sc WHERE sc.scene_id=s.id AND sc.content LIKE ? ESCAPE '\\'))".into()
             }
             SceneQueryFilter::TimeBefore(tick) => {
                 values.push(tick.to_string());
@@ -752,7 +780,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_19}\nINSERT INTO schema_migrations(version,applied_at) VALUES(19,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_20}\nINSERT INTO schema_migrations(version,applied_at) VALUES(20,'{}');\nCOMMIT;", now()))?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\nCOMMIT;", now(), now(), now(), now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\n{MIGRATION_25}\nINSERT INTO schema_migrations(version,applied_at) VALUES(25,'{}');\nCOMMIT;", now(), now(), now(), now(), now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
@@ -795,7 +823,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 24 {
+        if version > 25 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -892,6 +920,10 @@ impl ProjectStore {
         }
         if current_version == 23 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\nCOMMIT;", now()))?;
+            current_version = 24;
+        }
+        if current_version == 24 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_25}\nINSERT INTO schema_migrations(version,applied_at) VALUES(25,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -6078,6 +6110,8 @@ impl ProjectStore {
                     ("exclude_status", status.as_str().to_owned())
                 }
                 SceneQueryFilter::Character(id) => ("character", id.to_string()),
+                SceneQueryFilter::CharacterPresent(id) => ("character_present", id.to_string()),
+                SceneQueryFilter::CharacterMentioned(id) => ("character_mentioned", id.to_string()),
                 SceneQueryFilter::AnyCharacter(ids) => {
                     if ids.is_empty() {
                         return Err(StorageError::Invalid(
@@ -6106,6 +6140,15 @@ impl ProjectStore {
                             .collect::<Vec<_>>()
                             .join(","),
                     )
+                }
+                SceneQueryFilter::Location(id) => ("location", id.to_string()),
+                SceneQueryFilter::Event(id) => ("event", id.to_string()),
+                SceneQueryFilter::Chapter(id) => ("chapter", id.clone()),
+                SceneQueryFilter::TextContains(text) => {
+                    if text.trim().is_empty() {
+                        return Err(StorageError::Invalid("text query cannot be empty".into()));
+                    }
+                    ("text_contains", text.clone())
                 }
                 SceneQueryFilter::TimeBefore(tick) => ("time_before", tick.to_string()),
                 SceneQueryFilter::TimeAfter(tick) => ("time_after", tick.to_string()),
@@ -6293,6 +6336,8 @@ impl ProjectStore {
                 "status" => { sql.push_str(" AND s.status=?"); values.push(value); }
                 "exclude_status" => { sql.push_str(" AND s.status<>?"); values.push(value); }
                 "character" => { sql.push_str(" AND EXISTS(SELECT 1 FROM scene_character sc WHERE sc.scene_id=s.id AND sc.character_id=?)"); values.push(value); }
+                "character_present" => { sql.push_str(" AND EXISTS(SELECT 1 FROM scene_character sc WHERE sc.scene_id=s.id AND sc.character_id=? AND sc.participation_role IN('pov','major','minor','off_camera'))"); values.push(value); }
+                "character_mentioned" => { sql.push_str(" AND EXISTS(SELECT 1 FROM scene_character sc WHERE sc.scene_id=s.id AND sc.character_id=? AND sc.participation_role='mentioned')"); values.push(value); }
                 "character_any" => {
                     let ids = value.split(',').filter(|id| !id.is_empty()).collect::<Vec<_>>();
                     if ids.is_empty() { return Err(StorageError::Invalid("empty character-any query filter".into())); }
@@ -6300,6 +6345,14 @@ impl ProjectStore {
                     values.extend(ids.into_iter().map(str::to_owned));
                 }
                 "plotline" => { sql.push_str(" AND EXISTS(SELECT 1 FROM scene_plotline sp WHERE sp.scene_id=s.id AND sp.plotline_id=?)"); values.push(value); }
+                "location" => { sql.push_str(" AND (s.start_location_id=? OR s.end_location_id=?)"); values.push(value.clone()); values.push(value); }
+                "event" => { sql.push_str(" AND EXISTS(SELECT 1 FROM scene_event se WHERE se.scene_id=s.id AND se.event_id=?)"); values.push(value); }
+                "chapter" => { sql.push_str(" AND p.chapter_id=?"); values.push(value); }
+                "text_contains" => {
+                    let pattern = format!("%{}%", value.replace('%', "\\%").replace('_', "\\_"));
+                    sql.push_str(" AND (s.title LIKE ? ESCAPE '\\' OR s.synopsis LIKE ? ESCAPE '\\' OR EXISTS(SELECT 1 FROM scene_search_content sc WHERE sc.scene_id=s.id AND sc.content LIKE ? ESCAPE '\\'))");
+                    values.extend([pattern.clone(), pattern.clone(), pattern]);
+                }
                 "plotline_any" => {
                     let ids = value.split(',').filter(|id| !id.is_empty()).collect::<Vec<_>>();
                     if ids.is_empty() { return Err(StorageError::Invalid("empty plotline-any query filter".into())); }
@@ -9059,6 +9112,76 @@ mod tests {
     }
 
     #[test]
+    fn inspection_queries_distinguish_confirmed_presence_mentions_and_story_facts() {
+        let d = tempdir().unwrap();
+        let mut store = ProjectStore::create(d.path().join("Inspect"), "Inspect").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let present = store.create_scene(chapter, 0, "The meeting").unwrap();
+        let mentioned = store.create_scene(chapter, 1, "A report").unwrap();
+        let mara = CharacterId::new();
+        store.add_character(mara, "Mara").unwrap();
+        store
+            .link_character(present, mara, ParticipationRole::Major)
+            .unwrap();
+        store
+            .link_character(mentioned, mara, ParticipationRole::Mentioned)
+            .unwrap();
+        let (_, initial_hash) = store.load_text(present).unwrap();
+        store
+            .save_text(present, Some(&initial_hash), "Mara entered the station.")
+            .unwrap();
+        let location = LocationId::new();
+        store.add_location(location, "Station").unwrap();
+        let mut scene = store.get_scene(present).unwrap().scene;
+        scene.start_location = Some(location);
+        store.update_scene(&scene).unwrap();
+
+        let query = SavedSceneQuery {
+            id: QueryId::new(),
+            name: "Present at station".into(),
+            description: String::new(),
+            filters: vec![],
+        };
+        store.save_scene_query(&query).unwrap();
+        store
+            .set_scene_query_expression(
+                query.id,
+                Some(&QueryExpression::All(vec![
+                    QueryExpression::Filter(SceneQueryFilter::CharacterPresent(mara)),
+                    QueryExpression::Filter(SceneQueryFilter::Location(location)),
+                    QueryExpression::Filter(SceneQueryFilter::TextContains("entered".into())),
+                    QueryExpression::Filter(SceneQueryFilter::Chapter(chapter.to_string())),
+                ])),
+            )
+            .unwrap();
+        assert_eq!(store.run_scene_query(query.id).unwrap(), vec![present]);
+        store
+            .set_scene_query_expression(
+                query.id,
+                Some(&QueryExpression::Filter(
+                    SceneQueryFilter::CharacterMentioned(mara),
+                )),
+            )
+            .unwrap();
+        assert_eq!(store.run_scene_query(query.id).unwrap(), vec![mentioned]);
+
+        let direct = SavedSceneQuery {
+            id: QueryId::new(),
+            name: "direct inspection filters".into(),
+            description: String::new(),
+            filters: vec![
+                SceneQueryFilter::CharacterPresent(mara),
+                SceneQueryFilter::Location(location),
+                SceneQueryFilter::TextContains("entered".into()),
+            ],
+        };
+        store.save_scene_query(&direct).unwrap();
+        assert_eq!(store.run_scene_query(direct.id).unwrap(), vec![present]);
+    }
+
+    #[test]
     fn nested_saved_query_expressions_are_validated_persistent_and_dynamic() {
         let directory = tempdir().unwrap();
         let mut store = ProjectStore::create(directory.path().join("Novel"), "Novel").unwrap();
@@ -9134,7 +9257,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 24))
+            .map(|version| assert_eq!(version, 25))
             .unwrap();
     }
 
@@ -9398,7 +9521,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 24);
+        assert_eq!(version, 25);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }

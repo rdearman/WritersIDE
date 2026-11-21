@@ -1661,6 +1661,24 @@ impl WriterApp {
     pub fn git_diff(&self, from: &str, to: &str, path: Option<&str>) -> Result<String> {
         Ok(story_git::GitHistory::open(self.store.project_root())?.diff(from, to, path)?)
     }
+    pub fn git_search_history(
+        &self,
+        text: &str,
+        path: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<story_git::HistoricalTextChange>> {
+        Ok(story_git::GitHistory::open(self.store.project_root())?
+            .search_text_history(text, path, limit)?)
+    }
+    pub fn git_blame(
+        &self,
+        path: &str,
+        first_line: usize,
+        last_line: usize,
+    ) -> Result<Vec<story_git::BlamedLine>> {
+        Ok(story_git::GitHistory::open(self.store.project_root())?
+            .blame(path, first_line, last_line)?)
+    }
     pub fn resolve_conflict(&mut self, txid: &str, resolution: ConflictResolution) -> Result<()> {
         Ok(self.store.resolve_write_conflict(txid, resolution)?)
     }

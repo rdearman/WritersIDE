@@ -519,6 +519,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let app = WriterApp::open_project(path)?;
             print!("{}", app.git_diff(&from, &to, file.as_deref())?);
         }
+        "git-search-history" => {
+            let path = args.next().ok_or("missing project path")?;
+            let text = args.next().ok_or("missing literal text to search")?;
+            let file = args.next();
+            let app = WriterApp::open_project(path)?;
+            for change in app.git_search_history(&text, file.as_deref(), 100)? {
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    change.commit.id, change.commit.date, change.path, change.commit.subject
+                );
+                print!("{}", change.evidence_diff);
+            }
+        }
+        "git-blame" => {
+            let path = args.next().ok_or("missing project path")?;
+            let file = args.next().ok_or("missing project-relative file")?;
+            let first = args.next().ok_or("missing first line")?.parse::<usize>()?;
+            let last = args.next().ok_or("missing last line")?.parse::<usize>()?;
+            let app = WriterApp::open_project(path)?;
+            for line in app.git_blame(&file, first, last)? {
+                println!(
+                    "{}\t{}\t{}\t{}\t{}",
+                    line.line, line.commit, line.author, line.date, line.content
+                );
+            }
+        }
         "git-restore-new" => {
             let path = args.next().ok_or("missing source project path")?;
             let commit = args.next().ok_or("missing commit identifier")?;
@@ -1723,6 +1749,9 @@ fn usage() {
     );
     eprintln!("writers-ide search-all <path> <terms>\nwriters-ide rebuild-search <path>");
     eprintln!("writers-ide query-expression-set <path> <query-uuid> <JSON|clear>");
+    eprintln!(
+        "writers-ide git-search-history <path> <literal-text> [project-relative-path]\nwriters-ide git-blame <path> <project-relative-file> <first-line> <last-line>"
+    );
     eprintln!(
         "writers-ide create-template <path> <blank-fiction|novel|short-story|blank-nonfiction|nonfiction-book> [title]\nwriters-ide content <path> <chapter|section|front|back> <parent-uuid|-> <title>\nwriters-ide read-content <path> <content-uuid>\nwriters-ide write-content <path> <content-uuid> <text>\nwriters-ide resolve-content <path> <transaction-id> external|prepared\nwriters-ide git-snapshot <path> <label>\nwriters-ide git-history <path>\nwriters-ide git-diff <path> <commit-a> <commit-b> [project-relative-path]\nwriters-ide git-restore-new <source-project> <commit> <new-project-directory>"
     );

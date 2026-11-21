@@ -25,6 +25,25 @@ pub struct GitCommit {
     pub subject: String,
 }
 
+/// A historical occurrence of text, with the introducing commit and its evidence diff.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HistoricalTextChange {
+    pub commit: GitCommit,
+    pub path: String,
+    pub evidence_diff: String,
+}
+
+/// A line's origin in the project-local Git history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlamedLine {
+    pub line: usize,
+    pub commit: String,
+    pub author: String,
+    pub date: String,
+    pub summary: String,
+    pub content: String,
+}
+
 pub struct GitHistory {
     root: PathBuf,
 }
@@ -140,6 +159,124 @@ impl GitHistory {
         }
         let spec = format!("{commit}:{path}");
         Ok(self.output(&["show", &spec])?.stdout)
+    }
+
+    /// Finds commits that introduced or changed a literal passage/fact. Results are oldest first.
+    /// The search is read-only and restricted to project-owned paths.
+    pub fn search_text_history(
+        &self,
+        needle: &str,
+        path: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<HistoricalTextChange>> {
+        let needle = needle.trim();
+        if needle.is_empty() {
+            return Err(GitError::Command(
+                "history search text cannot be empty".into(),
+            ));
+        }
+        if let Some(path) = path
+            && !is_owned_path(path)
+        {
+            return Err(GitError::Command(
+                "path is outside the versioned project content".into(),
+            ));
+        }
+        let count = limit.clamp(1, 1000).to_string();
+        let mut args = vec![
+            "log".to_owned(),
+            "--all".into(),
+            "--reverse".into(),
+            format!("-n{count}"),
+            "--format=%H%x1f%cI%x1f%s".into(),
+            "-S".into(),
+            needle.to_owned(),
+            "--".into(),
+        ];
+        if let Some(path) = path {
+            args.push(path.to_owned());
+        }
+        let output = self.output(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+        let commits = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.splitn(3, '\u{1f}');
+                Some(GitCommit {
+                    id: fields.next()?.into(),
+                    date: fields.next()?.into(),
+                    subject: fields.next()?.into(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut changes = Vec::new();
+        for commit in commits {
+            let parent = self.output(&["rev-parse", "-q", "--verify", &format!("{}^", commit.id)]);
+            let mut diff_args = if let Ok(parent) = parent {
+                let parent_id = String::from_utf8_lossy(&parent.stdout).trim().to_owned();
+                vec![
+                    "diff".to_owned(),
+                    "--no-ext-diff".into(),
+                    "--unified=3".into(),
+                    parent_id,
+                    commit.id.clone(),
+                    "--".into(),
+                ]
+            } else {
+                vec![
+                    "show".to_owned(),
+                    "--no-ext-diff".into(),
+                    "--format=".into(),
+                    "--unified=3".into(),
+                    commit.id.clone(),
+                    "--".into(),
+                ]
+            };
+            if let Some(path) = path {
+                diff_args.push(path.to_owned());
+            }
+            let diff = String::from_utf8_lossy(
+                &self
+                    .output(&diff_args.iter().map(String::as_str).collect::<Vec<_>>())?
+                    .stdout,
+            )
+            .into_owned();
+            if diff.contains(needle) {
+                let changed_path = path
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        diff.lines()
+                            .find_map(|line| line.strip_prefix("+++ b/").map(str::to_owned))
+                    })
+                    .unwrap_or_default();
+                changes.push(HistoricalTextChange {
+                    commit,
+                    path: changed_path,
+                    evidence_diff: diff,
+                });
+            }
+        }
+        Ok(changes)
+    }
+
+    /// Returns Git's line-level provenance for a project-owned text file.
+    pub fn blame(
+        &self,
+        path: &str,
+        first_line: usize,
+        last_line: usize,
+    ) -> Result<Vec<BlamedLine>> {
+        if !is_owned_path(path)
+            || first_line == 0
+            || last_line < first_line
+            || last_line - first_line > 10000
+        {
+            return Err(GitError::Command(
+                "invalid project path or line range".into(),
+            ));
+        }
+        let range = format!("-L{first_line},{last_line}");
+        let output = self.output(&["blame", "--line-porcelain", &range, "--", path])?;
+        parse_blame(&String::from_utf8_lossy(&output.stdout))
     }
 
     /// Restores the application-owned files from a commit into a new directory.
@@ -261,6 +398,44 @@ fn validate_commit(value: &str) -> Result<()> {
         Ok(())
     }
 }
+fn parse_blame(source: &str) -> Result<Vec<BlamedLine>> {
+    let mut result = Vec::new();
+    let mut lines = source.lines().peekable();
+    while let Some(header) = lines.next() {
+        let mut fields = header.split_whitespace();
+        let commit = fields
+            .next()
+            .ok_or_else(|| GitError::Command("malformed git blame output".into()))?;
+        let _original = fields.next();
+        let final_line = fields
+            .next()
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| GitError::Command("malformed git blame line number".into()))?;
+        let mut author = String::new();
+        let mut date = String::new();
+        let mut summary = String::new();
+        for metadata in lines.by_ref() {
+            if let Some(value) = metadata.strip_prefix("author ") {
+                author = value.into();
+            } else if let Some(value) = metadata.strip_prefix("author-time ") {
+                date = value.into();
+            } else if let Some(value) = metadata.strip_prefix("summary ") {
+                summary = value.into();
+            } else if let Some(value) = metadata.strip_prefix('\t') {
+                result.push(BlamedLine {
+                    line: final_line,
+                    commit: commit.into(),
+                    author,
+                    date,
+                    summary,
+                    content: value.into(),
+                });
+                break;
+            }
+        }
+    }
+    Ok(result)
+}
 fn is_owned_path(path: &str) -> bool {
     let safe_relative = Path::new(path)
         .components()
@@ -352,5 +527,41 @@ mod tests {
             git.restore_files_to_new_directory(&commit, &destination)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn archaeology_finds_first_literal_introduction_and_blames_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("project.toml"), "title='Test'\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("manuscript")).unwrap();
+        let manuscript = dir.path().join("manuscript/chapter.md");
+        std::fs::write(&manuscript, "Opening.\n").unwrap();
+        let git = GitHistory::open(dir.path()).unwrap();
+        git.snapshot("initial", "Author").unwrap();
+        std::fs::write(&manuscript, "Opening.\nThe key was in the chapel.\n").unwrap();
+        let introduction = git.snapshot("recorded fact", "Author").unwrap().unwrap();
+        std::fs::write(
+            &manuscript,
+            "Opening.\nThe key was in the chapel.\nLater.\n",
+        )
+        .unwrap();
+        git.snapshot("later passage", "Author").unwrap();
+
+        let found = git
+            .search_text_history("key was in the chapel", Some("manuscript/chapter.md"), 20)
+            .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].commit.id, introduction);
+        assert!(
+            found[0]
+                .evidence_diff
+                .contains("+The key was in the chapel.")
+        );
+        let blame = git.blame("manuscript/chapter.md", 2, 2).unwrap();
+        assert_eq!(blame.len(), 1);
+        assert_eq!(blame[0].commit, introduction);
+        assert_eq!(blame[0].content, "The key was in the chapel.");
+        assert!(git.search_text_history(" ", None, 2).is_err());
+        assert!(git.blame("../project.toml", 1, 1).is_err());
     }
 }

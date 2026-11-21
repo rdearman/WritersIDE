@@ -1,0 +1,16 @@
+ALTER TABLE saved_query_filter RENAME TO saved_query_filter_v24;
+CREATE TABLE saved_query_filter(
+  query_id TEXT NOT NULL REFERENCES saved_query(id) ON DELETE CASCADE,
+  ordinal INTEGER NOT NULL CHECK(ordinal>=0),
+  filter_kind TEXT NOT NULL CHECK(filter_kind IN(
+    'status','exclude_status','character','character_any','character_present','character_mentioned',
+    'plotline','plotline_any','location','event','chapter','text_contains',
+    'time_before','time_after','unresolved_issue'
+  )),
+  value TEXT NOT NULL,
+  PRIMARY KEY(query_id,ordinal)
+);
+INSERT INTO saved_query_filter(query_id,ordinal,filter_kind,value)
+  SELECT query_id,ordinal,filter_kind,value FROM saved_query_filter_v24;
+DROP TABLE saved_query_filter_v24;
+CREATE INDEX saved_query_filter_lookup ON saved_query_filter(query_id,filter_kind,value);

@@ -699,8 +699,16 @@ pub enum SceneQueryFilter {
     ExcludeStatus(SceneStatus),
     Character(CharacterId),
     AnyCharacter(Vec<CharacterId>),
+    /// Character is an explicitly confirmed participant (mentions do not count).
+    CharacterPresent(CharacterId),
+    /// Character is explicitly listed as mentioned, which is distinct from presence.
+    CharacterMentioned(CharacterId),
     Plotline(PlotlineId),
     AnyPlotline(Vec<PlotlineId>),
+    Location(LocationId),
+    Event(EventId),
+    Chapter(String),
+    TextContains(String),
     TimeBefore(i64),
     TimeAfter(i64),
     UnresolvedIssue,

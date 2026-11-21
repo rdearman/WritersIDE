@@ -386,6 +386,72 @@ pub struct AssertionResult {
     pub expectation: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum InspectionStatus {
+    Pass,
+    Fail,
+    Unknown,
+    Skip,
+}
+
+/// Deterministic author assertions never infer success from absent records.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct InspectionResult {
+    pub status: InspectionStatus,
+    pub assertion: String,
+    pub evidence: Vec<String>,
+}
+
+/// Evaluate an explicitly recorded event-order assertion. Ambiguous intervals stay unknown.
+pub fn evaluate_event_precedence(
+    earlier_label: &str,
+    later_label: &str,
+    comparison: Option<TimeOrdering>,
+) -> InspectionResult {
+    let status = match comparison {
+        Some(TimeOrdering::Before) => InspectionStatus::Pass,
+        Some(TimeOrdering::After) => InspectionStatus::Fail,
+        Some(TimeOrdering::Same | TimeOrdering::Ambiguous) | None => InspectionStatus::Unknown,
+    };
+    let evidence = comparison
+        .map(|value| vec![format!("Recorded interval comparison: {value:?}")])
+        .unwrap_or_else(|| vec!["One or both events have no usable recorded story time".into()]);
+    InspectionResult {
+        status,
+        assertion: format!("{earlier_label} precedes {later_label}"),
+        evidence,
+    }
+}
+
+/// Evaluate knowledge only when the author has recorded whether the character knows the fact.
+pub fn evaluate_recorded_knowledge(
+    character: &str,
+    claim: &str,
+    recorded_knows: Option<bool>,
+    check_enabled: bool,
+    evidence: Vec<String>,
+) -> InspectionResult {
+    let status = if !check_enabled {
+        InspectionStatus::Skip
+    } else {
+        match recorded_knows {
+            Some(true) => InspectionStatus::Pass,
+            Some(false) => InspectionStatus::Fail,
+            None => InspectionStatus::Unknown,
+        }
+    };
+    let evidence = if evidence.is_empty() && recorded_knows.is_none() {
+        vec!["No author-approved knowledge record exists; this is unknown, not a pass".into()]
+    } else {
+        evidence
+    };
+    InspectionResult {
+        status,
+        assertion: format!("{character} knows {claim}"),
+        evidence,
+    }
+}
+
 pub fn evaluate_query_assertion(
     actual: usize,
     assertion: &story_core::QueryAssertion,
@@ -408,6 +474,29 @@ pub fn evaluate_query_assertion(
 #[cfg(test)]
 mod inspection_tests {
     use super::*;
+
+    #[test]
+    fn recorded_story_assertions_never_turn_missing_or_ambiguous_facts_into_passes() {
+        assert_eq!(
+            evaluate_event_precedence("arrival", "departure", Some(TimeOrdering::Before)).status,
+            InspectionStatus::Pass
+        );
+        assert_eq!(
+            evaluate_event_precedence("arrival", "departure", Some(TimeOrdering::After)).status,
+            InspectionStatus::Fail
+        );
+        assert_eq!(
+            evaluate_event_precedence("arrival", "departure", Some(TimeOrdering::Ambiguous)).status,
+            InspectionStatus::Unknown
+        );
+        let missing = evaluate_recorded_knowledge("Mara", "the secret", None, true, vec![]);
+        assert_eq!(missing.status, InspectionStatus::Unknown);
+        assert!(missing.evidence[0].contains("unknown, not a pass"));
+        assert_eq!(
+            evaluate_recorded_knowledge("Mara", "the secret", None, false, vec![]).status,
+            InspectionStatus::Skip
+        );
+    }
 
     #[test]
     fn coverage_and_query_assertions_are_read_only_and_report_gaps() {
