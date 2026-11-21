@@ -761,6 +761,9 @@ pub struct QueryEvidence {
     pub source_kind: String,
     pub source_id: String,
     pub detail: String,
+    /// UTF-8 byte range in the canonical manuscript file, when the fact comes
+    /// from a specific passage rather than scene-level structured metadata.
+    pub passage_bytes: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

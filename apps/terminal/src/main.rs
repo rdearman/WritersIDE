@@ -5374,7 +5374,16 @@ impl AppState {
             let evidence = self.app.explain_scene_query_match(query, scene)?;
             self.message = evidence
                 .iter()
-                .map(|fact| format!("{} {} · {}", fact.source_kind, fact.source_id, fact.detail))
+                .map(|fact| {
+                    let range = fact
+                        .passage_bytes
+                        .map(|(start, end)| format!(" [{start}..{end} bytes]"))
+                        .unwrap_or_default();
+                    format!(
+                        "{} {}{} · {}",
+                        fact.source_kind, fact.source_id, range, fact.detail
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join(" | ");
         } else if let Some(rest) = cmd.strip_prefix("location-rule-add ") {

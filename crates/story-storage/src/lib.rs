@@ -141,6 +141,40 @@ fn validate_query_expression(expression: &QueryExpression) -> Result<()> {
     walk(expression, 1, &mut 0)
 }
 
+fn positive_text_query_terms(expression: &QueryExpression, negated: bool, terms: &mut Vec<String>) {
+    match expression {
+        QueryExpression::Filter(SceneQueryFilter::TextContains(term)) if !negated => {
+            terms.push(term.clone());
+        }
+        QueryExpression::All(children) | QueryExpression::Any(children) => {
+            for child in children {
+                positive_text_query_terms(child, negated, terms);
+            }
+        }
+        QueryExpression::Not(child) => positive_text_query_terms(child, !negated, terms),
+        QueryExpression::Filter(_) => {}
+    }
+}
+
+fn find_ascii_case_insensitive(haystack: &str, needle: &str) -> Vec<(u64, u64)> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return Vec::new();
+    }
+    let bytes = haystack.as_bytes();
+    let needle = needle.as_bytes();
+    bytes
+        .windows(needle.len())
+        .enumerate()
+        .filter(|(offset, candidate)| {
+            haystack.is_char_boundary(*offset)
+                && haystack.is_char_boundary(offset + needle.len())
+                && candidate.eq_ignore_ascii_case(needle)
+        })
+        .take(32)
+        .map(|(start, _)| (start as u64, (start + needle.len()) as u64))
+        .collect()
+}
+
 fn compile_query_expression(
     expression: &QueryExpression,
     values: &mut Vec<String>,
@@ -6787,8 +6821,8 @@ impl ProjectStore {
             .collect()
     }
     /// Return the stable story-model sources attached to a scene that currently
-    /// satisfies the saved query. Prose evidence is represented by the scene ID
-    /// and its current content hash, never copied into this report.
+    /// satisfies the saved query. Positive literal text predicates additionally
+    /// receive byte ranges in the verified canonical manuscript file.
     pub fn explain_scene_query_match(
         &self,
         query: QueryId,
@@ -6799,6 +6833,7 @@ impl ProjectStore {
                 "scene does not currently match the saved query".into(),
             ));
         }
+        let (prose, _current_hash) = self.load_text(scene)?;
         let mut statement = self.conn.prepare(
             "SELECT 'scene',s.id,'title: '||s.title||'; status: '||s.status||'; sha256: '||c.sha256
                FROM scene s JOIN scene_content c ON c.scene_id=s.id WHERE s.id=?1
@@ -6822,10 +6857,36 @@ impl ProjectStore {
                 source_kind: row.get(0)?,
                 source_id: row.get(1)?,
                 detail: row.get(2)?,
+                passage_bytes: None,
             })
         })?;
-        rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(StorageError::from)
+        let mut evidence = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut terms = {
+            let mut statement = self.conn.prepare(
+                "SELECT value FROM saved_query_filter WHERE query_id=?1 AND filter_kind='text_contains' ORDER BY ordinal",
+            )?;
+            statement
+                .query_map([query.to_string()], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        if let Some(expression) = self.get_scene_query_expression(query)? {
+            positive_text_query_terms(&expression, false, &mut terms);
+        }
+        terms.sort();
+        terms.dedup();
+        if !terms.is_empty() {
+            for term in terms {
+                for passage_bytes in find_ascii_case_insensitive(&prose, &term) {
+                    evidence.push(QueryEvidence {
+                        source_kind: "scene-passage".into(),
+                        source_id: scene.to_string(),
+                        detail: format!("matched literal query text {term:?}"),
+                        passage_bytes: Some(passage_bytes),
+                    });
+                }
+            }
+        }
+        Ok(evidence)
     }
     pub fn search_scenes(&self, terms: &str) -> Result<Vec<SceneId>> {
         if terms.trim().is_empty() {
@@ -10890,6 +10951,24 @@ mod tests {
             s.explain_scene_query_match(entity_query.id, SceneId::new())
                 .is_err()
         );
+        let (before_text, text_hash) = s.load_text(sc).unwrap();
+        s.save_text(
+            sc,
+            Some(&text_hash),
+            &format!("Mara opens a door. {before_text}"),
+        )
+        .unwrap();
+        let text_query = SavedSceneQuery {
+            id: QueryId::new(),
+            name: "Mara passage".into(),
+            description: String::new(),
+            filters: vec![SceneQueryFilter::TextContains("MARA".into())],
+        };
+        s.save_scene_query(&text_query).unwrap();
+        let passage_evidence = s.explain_scene_query_match(text_query.id, sc).unwrap();
+        assert!(passage_evidence.iter().any(|item| {
+            item.source_kind == "scene-passage" && item.passage_bytes == Some((0, 4))
+        }));
         s.validate().unwrap();
         let ev1 = EventId::new();
         let ev2 = EventId::new();
@@ -11044,8 +11123,16 @@ mod tests {
         let ch = s.create_node(None, NodeKind::Chapter, "C", 0).unwrap();
         let sc = s.create_scene(ch, 0, "S").unwrap();
         let (_, h) = s.load_text(sc).unwrap();
+        let query = SavedSceneQuery {
+            id: QueryId::new(),
+            name: "all".into(),
+            description: String::new(),
+            filters: vec![],
+        };
+        s.save_scene_query(&query).unwrap();
         fs::write(p.join("manuscript").join(format!("{sc}.md")), "external").unwrap();
         assert!(s.save_text(sc, Some(&h), "ours").is_err());
+        assert!(s.explain_scene_query_match(query.id, sc).is_err());
     }
     #[cfg(unix)]
     #[test]
