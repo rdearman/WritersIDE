@@ -376,6 +376,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut app = WriterApp::open_project(path)?;
             println!("{}", app.add_assembly_scene(assembly, scene, position)?);
         }
+        "assembly-add-content" => {
+            let path = args.next().ok_or("missing project path")?;
+            let assembly =
+                story_core::AssemblyId(args.next().ok_or("missing assembly UUID")?.parse()?);
+            let content =
+                story_core::ContentUnitId(args.next().ok_or("missing content-unit UUID")?.parse()?);
+            let position = args.next().ok_or("missing position")?.parse()?;
+            let mut app = WriterApp::open_project(path)?;
+            println!(
+                "{}",
+                app.add_assembly_content_unit(assembly, content, position)?
+            );
+        }
         "assembly-move" => {
             let path = args.next().ok_or("missing project path")?;
             let assembly =

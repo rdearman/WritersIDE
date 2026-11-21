@@ -2985,14 +2985,27 @@ mod tests {
             app.save_scene_text(scene, Some(&hash), content).unwrap();
         }
         let assembly = app.create_assembly("Audio Edition").unwrap();
-        let first_item = app.add_assembly_scene(assembly, first, 0).unwrap();
-        let second_item = app.add_assembly_scene(assembly, second, 1).unwrap();
-        app.move_assembly_item(assembly, second_item, 0).unwrap();
+        let front_matter = app
+            .create_content_unit(ContentUnitKind::FrontMatter, "Dedication", None, 0, None)
+            .unwrap();
+        let (_, front_hash) = app.load_content_unit_text(front_matter).unwrap();
+        app.save_content_unit_text(front_matter, Some(&front_hash), "For the readers.")
+            .unwrap();
+        app.add_assembly_content_unit(assembly, front_matter, 0)
+            .unwrap();
+        let first_item = app.add_assembly_scene(assembly, first, 1).unwrap();
+        let second_item = app.add_assembly_scene(assembly, second, 2).unwrap();
+        app.move_assembly_item(assembly, second_item, 1).unwrap();
         app.set_assembly_item_included(first_item, false).unwrap();
         let compiled = app.compile_assembly_markdown(assembly).unwrap();
         assert!(compiled.contains("Audio Edition"));
+        assert!(compiled.contains("For the readers."));
         assert!(compiled.contains("Second canonical prose."));
         assert!(!compiled.contains("First canonical prose."));
+        assert!(
+            compiled.find("For the readers.").unwrap()
+                < compiled.find("Second canonical prose.").unwrap()
+        );
         assert_eq!(
             app.list_scenes(false)
                 .unwrap()

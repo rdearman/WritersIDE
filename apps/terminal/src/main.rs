@@ -1449,6 +1449,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "assembly.add-content",
+            "Add Content Unit to Assembly",
+            "Add front matter, chapter prose, or back matter by stable identity",
+            "Compile",
+            "assembly-add-content",
+            true,
+        ),
+        legacy_command(
             "assembly.move",
             "Reorder Assembly Item",
             "Reorder content in an assembly only",
@@ -4913,6 +4921,18 @@ impl AppState {
             let position = parts.next().ok_or("missing position")?.parse()?;
             let item = self.app.add_assembly_scene(assembly, scene, position)?;
             self.message = format!("Added scene to assembly as item {item}");
+        } else if let Some(rest) = cmd.strip_prefix("assembly-add-content ") {
+            let mut parts = rest.split_whitespace();
+            let assembly =
+                story_core::AssemblyId(parts.next().ok_or("missing assembly UUID")?.parse()?);
+            let content = story_core::ContentUnitId(
+                parts.next().ok_or("missing content-unit UUID")?.parse()?,
+            );
+            let position = parts.next().ok_or("missing position")?.parse()?;
+            let item = self
+                .app
+                .add_assembly_content_unit(assembly, content, position)?;
+            self.message = format!("Added content unit to assembly as item {item}");
         } else if let Some(rest) = cmd.strip_prefix("assembly-move ") {
             let mut parts = rest.split_whitespace();
             let assembly =
@@ -13611,7 +13631,21 @@ mod tests {
         let scene = app.create_scene(chapter, "Opening", 0).unwrap();
         let assembly = app.create_assembly("Alternate edition").unwrap();
         app.add_assembly_scene(assembly, scene, 0).unwrap();
+        let front = app
+            .create_content_unit(
+                story_core::ContentUnitKind::FrontMatter,
+                "Dedication",
+                None,
+                0,
+                None,
+            )
+            .unwrap();
         let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command(&format!("assembly-add-content {assembly} {front} 0"))
+            .unwrap();
+        assert!(state.message.contains("Added content unit"));
+        assert_eq!(state.app.list_assembly_items(assembly).unwrap().len(), 2);
         state.switch(Workspace::Assemblies);
         assert!(workspace_items(&state)[0].contains("Alternate edition"));
         handle(
