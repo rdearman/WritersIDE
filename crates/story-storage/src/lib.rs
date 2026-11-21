@@ -6683,6 +6683,47 @@ impl ProjectStore {
             })
             .collect()
     }
+    /// Return the stable story-model sources attached to a scene that currently
+    /// satisfies the saved query. Prose evidence is represented by the scene ID
+    /// and its current content hash, never copied into this report.
+    pub fn explain_scene_query_match(
+        &self,
+        query: QueryId,
+        scene: SceneId,
+    ) -> Result<Vec<QueryEvidence>> {
+        if !self.run_scene_query(query)?.contains(&scene) {
+            return Err(StorageError::Invalid(
+                "scene does not currently match the saved query".into(),
+            ));
+        }
+        let mut statement = self.conn.prepare(
+            "SELECT 'scene',s.id,'title: '||s.title||'; status: '||s.status||'; sha256: '||c.sha256
+               FROM scene s JOIN scene_content c ON c.scene_id=s.id WHERE s.id=?1
+             UNION ALL SELECT 'character',c.id,c.name||' ('||sc.participation_role||')'
+               FROM scene_character sc JOIN character c ON c.id=sc.character_id WHERE sc.scene_id=?1
+             UNION ALL SELECT 'plotline',p.id,p.name||' ('||sp.role||')'
+               FROM scene_plotline sp JOIN plotline p ON p.id=sp.plotline_id WHERE sp.scene_id=?1
+             UNION ALL SELECT 'event',e.id,e.title FROM scene_event se JOIN story_event e ON e.id=se.event_id WHERE se.scene_id=?1
+             UNION ALL SELECT 'location',l.id,'start: '||l.name FROM scene s JOIN location l ON l.id=s.start_location_id WHERE s.id=?1
+             UNION ALL SELECT 'location',l.id,'end: '||l.name FROM scene s JOIN location l ON l.id=s.end_location_id WHERE s.id=?1
+             UNION ALL SELECT 'issue',i.id,i.title||' ('||i.status||')'
+               FROM scene_issue si JOIN story_issue i ON i.id=si.issue_id WHERE si.scene_id=?1
+             UNION ALL SELECT 'custom-field',d.id,d.name||': '||COALESCE(v.text_value,CAST(v.integer_value AS TEXT),v.decimal_value,CAST(v.boolean_value AS TEXT),v.entity_ref,'(reference list)')
+               FROM custom_field_value v JOIN custom_field_definition d ON d.id=v.field_id WHERE v.scene_id=?1
+             UNION ALL SELECT 'custom-reference',r.target_id,d.name||' references '||r.target_kind
+               FROM custom_field_entity_ref r JOIN custom_field_definition d ON d.id=r.field_id WHERE r.scene_id=?1
+             ORDER BY 1,2,3",
+        )?;
+        let rows = statement.query_map([scene.to_string()], |row| {
+            Ok(QueryEvidence {
+                source_kind: row.get(0)?,
+                source_id: row.get(1)?,
+                detail: row.get(2)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
     pub fn search_scenes(&self, terms: &str) -> Result<Vec<SceneId>> {
         if terms.trim().is_empty() {
             return Ok(Vec::new());
@@ -10693,6 +10734,16 @@ mod tests {
         };
         s.save_scene_query(&entity_query).unwrap();
         assert_eq!(s.run_scene_query(entity_query.id).unwrap(), vec![sc]);
+        let evidence = s.explain_scene_query_match(entity_query.id, sc).unwrap();
+        assert!(
+            evidence
+                .iter()
+                .any(|item| item.source_kind == "character" && item.source_id == char.to_string())
+        );
+        assert!(
+            s.explain_scene_query_match(entity_query.id, SceneId::new())
+                .is_err()
+        );
         s.validate().unwrap();
         let ev1 = EventId::new();
         let ev2 = EventId::new();

@@ -1320,6 +1320,13 @@ impl WriterApp {
     pub fn run_scene_query(&self, query: QueryId) -> Result<Vec<SceneId>> {
         Ok(self.store.run_scene_query(query)?)
     }
+    pub fn explain_scene_query_match(
+        &self,
+        query: QueryId,
+        scene: SceneId,
+    ) -> Result<Vec<story_core::QueryEvidence>> {
+        Ok(self.store.explain_scene_query_match(query, scene)?)
+    }
     pub fn record_character_absence(
         &mut self,
         scene: SceneId,

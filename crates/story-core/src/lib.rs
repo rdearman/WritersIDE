@@ -754,6 +754,14 @@ pub struct SavedSceneQuery {
     pub filters: Vec<SceneQueryFilter>,
 }
 
+/// A traceable story-model fact that can be inspected from a query match.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct QueryEvidence {
+    pub source_kind: String,
+    pub source_id: String,
+    pub detail: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum QueryAssertion {
     AtLeast(u64),
