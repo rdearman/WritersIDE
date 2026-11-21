@@ -107,6 +107,7 @@ struct AppState {
     editor: Vec<String>,
     editing_scene: Option<SceneId>,
     cursor: (usize, usize),
+    narrowed_passage: Option<(usize, usize)>,
     saved_hash: String,
     dirty: bool,
     mode: Option<char>,
@@ -265,6 +266,7 @@ struct EditorSnapshot {
     lines: Vec<String>,
     cursor: (usize, usize),
     selection: Option<(usize, usize)>,
+    narrowed_passage: Option<(usize, usize)>,
 }
 
 #[derive(Clone, Copy)]
@@ -299,6 +301,8 @@ struct SessionSnapshot {
     narrowed_chapter: Option<String>,
     #[serde(default)]
     narrowed_node: Option<String>,
+    #[serde(default)]
+    narrowed_passage: Option<(usize, usize)>,
     reading_document: Option<String>,
     reading_offset: u64,
     #[serde(default)]
@@ -1557,6 +1561,22 @@ fn command_registry() -> Vec<CommandSpec> {
             "View",
             "open",
             true,
+        ),
+        legacy_command(
+            "editor.narrow-passage",
+            "Narrow to Selection",
+            "Restrict the editing view to the selected passage without removing surrounding text",
+            "View",
+            "narrow-passage",
+            false,
+        ),
+        legacy_command(
+            "editor.widen",
+            "Widen Editing View",
+            "Restore the full scene and outline after narrowing",
+            "View",
+            "widen",
+            false,
         ),
         legacy_command(
             "view.follow-scene-card",
@@ -3031,6 +3051,7 @@ impl AppState {
             editor: vec![String::new()],
             editing_scene: None,
             cursor: (0, 0),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: false,
             mode: None,
@@ -3328,6 +3349,7 @@ impl AppState {
             selected: self.selected,
             narrowed_chapter,
             narrowed_node,
+            narrowed_passage: self.narrowed_passage,
             reading_document: self.reading_document.map(|id| id.to_string()),
             reading_offset: self.reading_offset,
             editor_focus_mode: self.editor_focus_mode,
@@ -3478,6 +3500,24 @@ impl AppState {
             } else {
                 stale_reference = true;
                 self.editing_scene = None;
+            }
+        }
+        if self.editing_scene.is_some()
+            && let Some((start, end)) = snapshot.narrowed_passage
+        {
+            let text = self.editor.join("\n");
+            if start <= end
+                && end <= text.len()
+                && text.is_char_boundary(start)
+                && text.is_char_boundary(end)
+            {
+                self.narrowed_passage = Some((start, end));
+                let absolute = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+                if absolute < start || absolute > end {
+                    self.cursor = editor_position_from_byte(&text, start).unwrap_or((0, 0));
+                }
+            } else {
+                stale_reference = true;
             }
         }
         self.scroll = snapshot.scroll;
@@ -4914,6 +4954,9 @@ impl AppState {
             return Ok(());
         }
         let (text, hash) = self.app.load_scene_text(id)?;
+        if self.editing_scene != Some(id) {
+            self.narrowed_passage = None;
+        }
         self.app.reindex_scene_mentions(id, &text, &hash)?;
         // Preserve the final empty editor row when prose ends in a newline so
         // restored end-of-document cursors remain after the last paragraph.
@@ -8224,7 +8267,26 @@ impl AppState {
                 .unwrap_or(0);
             self.message =
                 format!("Outline hoisted to structural node {node} · :widen restores all scenes");
+        } else if cmd == "narrow-passage" {
+            let Some(((start_row, start_col), (end_row, end_col))) = self.selection_bounds() else {
+                return Err("select a passage first, then use narrow-passage".into());
+            };
+            let start = editor_position_byte(&self.editor, start_row, start_col);
+            let end = editor_position_byte(&self.editor, end_row, end_col);
+            if start >= end {
+                return Err("the selected passage is empty".into());
+            }
+            self.narrowed_passage = Some((start, end));
+            self.cursor = (start_row, start_col);
+            self.editor_selection = None;
+            self.extra_cursors.clear();
+            self.scroll = 0;
+            self.message =
+                "Editing view narrowed to selected passage · :widen restores the scene".into();
         } else if cmd == "widen" {
+            if self.narrowed_passage.take().is_some() {
+                self.message = "Full scene view restored".into();
+            }
             self.scenes = self
                 .app
                 .list_scenes(false)?
@@ -8242,7 +8304,11 @@ impl AppState {
                 .editing_scene
                 .and_then(|id| self.scenes.iter().position(|scene| scene.0 == id))
                 .unwrap_or(0);
-            self.message = "Full outline restored".into();
+            self.message = if self.message == "Full scene view restored" {
+                "Full scene and outline restored".into()
+            } else {
+                "Full outline restored".into()
+            };
         } else if cmd == "proofread" || cmd.starts_with("proofread ") {
             let mut scope = "current";
             let mut severities = None;
@@ -9641,6 +9707,12 @@ impl AppState {
             return false;
         };
         let start = token_end - abbreviation.len();
+        if self
+            .narrowed_passage
+            .is_some_and(|(narrow_start, narrow_end)| start < narrow_start || cursor > narrow_end)
+        {
+            return false;
+        }
         if start > 0 {
             let previous = original[..start].chars().next_back();
             if previous.is_some_and(|ch| ch.is_alphanumeric() || ch == '_') {
@@ -9650,6 +9722,7 @@ impl AppState {
         if record_undo {
             self.push_undo();
         }
+        let before = original.clone();
         let mut updated = original;
         updated.replace_range(start..token_end, &replacement);
         self.editor = updated.split('\n').map(str::to_owned).collect();
@@ -9662,11 +9735,19 @@ impl AppState {
             self.cursor = (row, column);
         }
         self.dirty = true;
+        self.update_narrowed_passage(&before);
         true
     }
     fn insert_text_at_cursor(&mut self, insertion: &str) -> Result<(), Box<dyn std::error::Error>> {
         let original = self.editor.join("\n");
         let at = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+        if self
+            .narrowed_passage
+            .is_some_and(|(start, end)| at < start || at > end)
+        {
+            return Err("cursor is outside the narrowed passage".into());
+        }
+        let before = original.clone();
         let mut updated = original;
         if !updated.is_char_boundary(at) {
             return Err("cursor is not at a UTF-8 boundary".into());
@@ -9681,7 +9762,59 @@ impl AppState {
             self.cursor = (row, column);
         }
         self.dirty = true;
+        self.update_narrowed_passage(&before);
         Ok(())
+    }
+    fn update_narrowed_passage(&mut self, old_text: &str) {
+        let Some((start, end)) = self.narrowed_passage else {
+            return;
+        };
+        let new_text = self.editor.join("\n");
+        let mut prefix = old_text
+            .bytes()
+            .zip(new_text.bytes())
+            .take_while(|(old, new)| old == new)
+            .count();
+        while prefix > 0
+            && (!old_text.is_char_boundary(prefix) || !new_text.is_char_boundary(prefix))
+        {
+            prefix -= 1;
+        }
+        let mut suffix = old_text[prefix..]
+            .bytes()
+            .rev()
+            .zip(new_text[prefix.min(new_text.len())..].bytes().rev())
+            .take_while(|(old, new)| old == new)
+            .count();
+        while suffix > 0
+            && (!old_text.is_char_boundary(old_text.len() - suffix)
+                || !new_text.is_char_boundary(new_text.len() - suffix))
+        {
+            suffix -= 1;
+        }
+        let old_end = old_text.len().saturating_sub(suffix);
+        let new_end = new_text.len().saturating_sub(suffix);
+        if prefix >= start && old_end <= end {
+            let new_range_end = end as i128 + new_end as i128 - old_end as i128;
+            if new_range_end >= start as i128 && new_range_end <= new_text.len() as i128 {
+                self.narrowed_passage = Some((start, new_range_end as usize));
+            } else {
+                self.narrowed_passage = None;
+            }
+        } else if old_end <= start {
+            let shift = new_end as i128 - old_end as i128;
+            let shifted_start = start as i128 + shift;
+            let shifted_end = end as i128 + shift;
+            if shifted_start >= 0 && shifted_end <= new_text.len() as i128 {
+                self.narrowed_passage = Some((shifted_start as usize, shifted_end as usize));
+            } else {
+                self.narrowed_passage = None;
+            }
+        } else if prefix < end {
+            self.narrowed_passage = None;
+            self.message =
+                "Passage changed outside its narrowed boundary; full scene view restored".into();
+        }
     }
     fn insert_text_char(&mut self, ch: char) {
         if let Some(challenge) = &mut self.active_challenge {
@@ -9689,6 +9822,12 @@ impl AppState {
         }
         if self.editor_selection.is_none() && !self.extra_cursors.is_empty() {
             let original = self.editor.join("\n");
+            if self.narrowed_passage.is_some() {
+                self.message =
+                    "Multi-cursor insertion is unavailable while passage narrowing is active"
+                        .into();
+                return;
+            }
             let mut cursors = vec![self.cursor];
             cursors.extend(self.extra_cursors.iter().copied());
             let anchors = cursors
@@ -9721,13 +9860,24 @@ impl AppState {
             self.dirty = true;
             return;
         }
-        self.delete_selection();
+        let insertion_at = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+        if self
+            .narrowed_passage
+            .is_some_and(|(start, end)| insertion_at < start || insertion_at > end)
+        {
+            return;
+        }
+        if self.selection_bounds().is_some() && !self.delete_selection() {
+            return;
+        }
+        let original = self.editor.join("\n");
         let (row, col) = self.cursor;
         let line = &mut self.editor[row];
         let byte = grapheme_byte(line, col);
         line.insert(byte, ch);
         self.cursor.1 = grapheme_count(&line[..byte + ch.len_utf8()]);
         self.dirty = true;
+        self.update_narrowed_passage(&original);
     }
     fn backspace(&mut self) {
         self.last_yank = None;
@@ -9738,23 +9888,38 @@ impl AppState {
         if self.delete_at_all_cursors(true) {
             return;
         }
-        if self.delete_selection() {
+        if self.selection_bounds().is_some() {
+            if self.delete_selection() {
+                return;
+            }
             return;
         }
         let (row, col) = self.cursor;
         if col > 0 {
+            let original = self.editor.join("\n");
+            let at = editor_position_byte(&self.editor, row, col);
+            if self.narrowed_passage.is_some_and(|(start, _)| at <= start) {
+                return;
+            }
             let line = &mut self.editor[row];
             let end = grapheme_byte(line, col);
             let start = grapheme_byte(line, col - 1);
             line.replace_range(start..end, "");
             self.cursor.1 -= 1;
             self.dirty = true;
+            self.update_narrowed_passage(&original);
         } else if row > 0 {
+            let original = self.editor.join("\n");
+            let at = editor_position_byte(&self.editor, row, col);
+            if self.narrowed_passage.is_some_and(|(start, _)| at <= start) {
+                return;
+            }
             let tail = self.editor.remove(row);
             self.cursor.0 -= 1;
             self.cursor.1 = grapheme_count(&self.editor[self.cursor.0]);
             self.editor[self.cursor.0].push_str(&tail);
             self.dirty = true;
+            self.update_narrowed_passage(&original);
         }
     }
     fn delete_forward(&mut self) {
@@ -9766,21 +9931,36 @@ impl AppState {
         if self.delete_at_all_cursors(false) {
             return;
         }
-        if self.delete_selection() {
+        if self.selection_bounds().is_some() {
+            if self.delete_selection() {
+                return;
+            }
             return;
         }
         let (row, col) = self.cursor;
         let count = grapheme_count(&self.editor[row]);
         if col < count {
+            let original = self.editor.join("\n");
+            let at = editor_position_byte(&self.editor, row, col);
+            if self.narrowed_passage.is_some_and(|(_, end)| at >= end) {
+                return;
+            }
             let line = &mut self.editor[row];
             let start = grapheme_byte(line, col);
             let end = grapheme_byte(line, col + 1);
             line.replace_range(start..end, "");
             self.dirty = true;
+            self.update_narrowed_passage(&original);
         } else if row + 1 < self.editor.len() {
+            let original = self.editor.join("\n");
+            let at = editor_position_byte(&self.editor, row, col);
+            if self.narrowed_passage.is_some_and(|(_, end)| at >= end) {
+                return;
+            }
             let tail = self.editor.remove(row + 1);
             self.editor[row].push_str(&tail);
             self.dirty = true;
+            self.update_narrowed_passage(&original);
         }
     }
     fn paste_text(&mut self, text: &str) {
@@ -9788,7 +9968,15 @@ impl AppState {
             .selection_bounds()
             .map(|((row, column), _)| editor_position_byte(&self.editor, row, column))
             .unwrap_or_else(|| editor_position_byte(&self.editor, self.cursor.0, self.cursor.1));
-        self.delete_selection();
+        if self
+            .narrowed_passage
+            .is_some_and(|(start, end)| range_start < start || range_start > end)
+        {
+            return;
+        }
+        if self.selection_bounds().is_some() && !self.delete_selection() {
+            return;
+        }
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         self.record_macro_op(story_core::EditMacroOp::Insert(normalized.clone()));
         if self.writing_stats_enabled {
@@ -9832,14 +10020,25 @@ impl AppState {
         }
     }
     fn split_line(&mut self) {
-        self.delete_selection();
+        if self.selection_bounds().is_some() && !self.delete_selection() {
+            return;
+        }
+        let original = self.editor.join("\n");
         let (row, col) = self.cursor;
+        let at = editor_position_byte(&self.editor, row, col);
+        if self
+            .narrowed_passage
+            .is_some_and(|(start, end)| at < start || at > end)
+        {
+            return;
+        }
         let line = &mut self.editor[row];
         let byte = grapheme_byte(line, col);
         let tail = line.split_off(byte);
         self.editor.insert(row + 1, tail);
         self.cursor = (row + 1, 0);
         self.dirty = true;
+        self.update_narrowed_passage(&original);
     }
     fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
         let anchor = self.editor_selection?;
@@ -9874,10 +10073,32 @@ impl AppState {
         lines.push(self.editor[end_row].graphemes(true).take(end_col).collect());
         Some(lines.join("\n"))
     }
+    fn visible_editor_line_count(&self) -> usize {
+        let text = self.editor.join("\n");
+        self.narrowed_passage
+            .filter(|(start, end)| {
+                start <= end
+                    && *end <= text.len()
+                    && text.is_char_boundary(*start)
+                    && text.is_char_boundary(*end)
+            })
+            .map_or(self.editor.len(), |(start, end)| {
+                text[start..end].split('\n').count()
+            })
+    }
     fn delete_selection(&mut self) -> bool {
         let Some(((start_row, start_col), (end_row, end_col))) = self.selection_bounds() else {
             return false;
         };
+        let range_start = editor_position_byte(&self.editor, start_row, start_col);
+        let range_end = editor_position_byte(&self.editor, end_row, end_col);
+        if self
+            .narrowed_passage
+            .is_some_and(|(start, end)| range_start < start || range_end > end)
+        {
+            return false;
+        }
+        let original = self.editor.join("\n");
         let prefix: String = self.editor[start_row]
             .graphemes(true)
             .take(start_col)
@@ -9890,6 +10111,7 @@ impl AppState {
         self.cursor = (start_row, start_col);
         self.editor_selection = None;
         self.dirty = true;
+        self.update_narrowed_passage(&original);
         true
     }
     fn move_cursor(&mut self, row: usize, col: usize, selecting: bool) {
@@ -9899,7 +10121,13 @@ impl AppState {
             self.editor_selection = None;
         }
         let row = row.min(self.editor.len().saturating_sub(1));
-        self.cursor = (row, col.min(grapheme_count(&self.editor[row])));
+        let mut target = (row, col.min(grapheme_count(&self.editor[row])));
+        if let Some((start, end)) = self.narrowed_passage {
+            let text = self.editor.join("\n");
+            let byte = editor_position_byte(&self.editor, target.0, target.1).clamp(start, end);
+            target = editor_position_from_byte(&text, byte).unwrap_or(self.cursor);
+        }
+        self.cursor = target;
     }
     fn move_editor_cursors(&mut self, motion: CursorMotion, selecting: bool) {
         self.last_yank = None;
@@ -9934,7 +10162,10 @@ impl AppState {
     }
 
     fn delete_at_all_cursors(&mut self, backward: bool) -> bool {
-        if self.extra_cursors.is_empty() || self.editor_selection.is_some() {
+        if self.extra_cursors.is_empty()
+            || self.editor_selection.is_some()
+            || self.narrowed_passage.is_some()
+        {
             return false;
         }
         let cursors = std::iter::once(self.cursor)
@@ -10011,6 +10242,7 @@ impl AppState {
             lines: self.editor.clone(),
             cursor: self.cursor,
             selection: self.editor_selection,
+            narrowed_passage: self.narrowed_passage,
         });
         if self.undo_stack.len() > MAX_UNDO_STEPS {
             self.undo_stack.remove(0);
@@ -10023,10 +10255,12 @@ impl AppState {
                 lines: self.editor.clone(),
                 cursor: self.cursor,
                 selection: self.editor_selection,
+                narrowed_passage: self.narrowed_passage,
             });
             self.editor = previous.lines;
             self.cursor = previous.cursor;
             self.editor_selection = previous.selection;
+            self.narrowed_passage = previous.narrowed_passage;
             self.dirty = true;
             self.message = "Edit undone".into();
         } else {
@@ -10039,10 +10273,12 @@ impl AppState {
                 lines: self.editor.clone(),
                 cursor: self.cursor,
                 selection: self.editor_selection,
+                narrowed_passage: self.narrowed_passage,
             });
             self.editor = next.lines;
             self.cursor = next.cursor;
             self.editor_selection = next.selection;
+            self.narrowed_passage = next.narrowed_passage;
             self.dirty = true;
             self.message = "Edit redone".into();
         } else {
@@ -10419,7 +10655,6 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             let mut state = ListState::default().with_selected(Some(selected));
             f.render_stateful_widget(list, body[0], &mut state);
         }
-        let selection = s.selection_bounds();
         let main_cursor = if s.reference_focused && s.active_reference_shares_open_scene() {
             s.active_reference_pane()
                 .map_or(s.cursor, |pane| pane.cursor)
@@ -10435,12 +10670,6 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             .filter(|mention| matches!(mention.state.as_str(), "detected" | "confirmed"))
             .map(|mention| (mention.start_byte, mention.end_byte))
             .collect::<Vec<_>>();
-        let mut line_start_byte = s
-            .editor
-            .iter()
-            .take(s.scroll)
-            .map(|line| line.len() as u64 + 1)
-            .sum::<u64>();
         let maximized_reference = s.editor_focus_mode
             && s.reference_focused
             && !s.reference_panes_hidden
@@ -10512,13 +10741,46 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 (Vec::new(), "Replacement Preview".into())
             }
         } else {
-            let content = s
-                .editor
+            let full_text = s.editor.join("\n");
+            let (view_start, view_end) = s
+                .narrowed_passage
+                .filter(|(start, end)| {
+                    start <= end
+                        && *end <= full_text.len()
+                        && full_text.is_char_boundary(*start)
+                        && full_text.is_char_boundary(*end)
+                })
+                .unwrap_or((0, full_text.len()));
+            let view_text = &full_text[view_start..view_end];
+            let view_lines = view_text.split('\n').collect::<Vec<_>>();
+            let cursor_byte = editor_position_byte(&s.editor, main_cursor.0, main_cursor.1);
+            let view_cursor = editor_position_from_byte(
+                view_text,
+                cursor_byte.saturating_sub(view_start).min(view_text.len()),
+            )
+            .unwrap_or((0, 0));
+            let selection = s.selection_bounds().and_then(|(start, end)| {
+                let a = editor_position_byte(&s.editor, start.0, start.1).max(view_start);
+                let b = editor_position_byte(&s.editor, end.0, end.1).min(view_end);
+                (a < b).then(|| {
+                    (
+                        editor_position_from_byte(view_text, a - view_start).unwrap_or((0, 0)),
+                        editor_position_from_byte(view_text, b - view_start).unwrap_or(view_cursor),
+                    )
+                })
+            });
+            let mut line_start_byte = view_start as u64
+                + view_lines
+                    .iter()
+                    .take(s.scroll)
+                    .map(|line| line.len() as u64 + 1)
+                    .sum::<u64>();
+            let content = view_lines
                 .iter()
                 .enumerate()
                 .skip(s.scroll)
                 .map(|(row, line)| {
-                    let prefix = if !s.reference_focused && row == main_cursor.0 {
+                    let prefix = if !s.reference_focused && row == view_cursor.0 {
                         "> "
                     } else {
                         "  "
@@ -10559,7 +10821,13 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             let title = s
                 .assembly_draft
                 .map(|id| format!("Assembly Draft {id} · stable scene markers required"))
-                .unwrap_or_else(|| format!("Editor — {}", s.selected_scene()));
+                .unwrap_or_else(|| {
+                    if s.narrowed_passage.is_some() {
+                        format!("Editor — {} · narrowed passage", s.selected_scene())
+                    } else {
+                        format!("Editor — {}", s.selected_scene())
+                    }
+                });
             (content, title)
         };
         let editor = Paragraph::new(content).wrap(Wrap { trim: false }).block(
@@ -14085,7 +14353,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             } else {
                 s.scroll
                     .saturating_add(10)
-                    .min(s.editor.len().saturating_sub(1))
+                    .min(s.visible_editor_line_count().saturating_sub(1))
             };
             return Ok(false);
         }
@@ -16145,6 +16413,7 @@ mod tests {
             editor: vec!["text".into()],
             editing_scene: None,
             cursor: (0, 4),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: true,
             mode: None,
@@ -16474,6 +16743,66 @@ mod tests {
         assert!(!reopened.scenes.iter().any(|scene| scene.0 == first_scene));
         assert_eq!(reopened.horizontal_split_ratio, 60);
         assert_eq!(reopened.vertical_split_ratio, 40);
+    }
+
+    #[test]
+    fn passage_narrowing_edits_only_the_selection_and_survives_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Passage"), "Passage").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "before middle after")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor_selection = Some((0, 7));
+        state.cursor = (0, 13);
+        state
+            .execute_legacy_palette_command("narrow-passage")
+            .unwrap();
+        assert_eq!(state.narrowed_passage, Some((7, 13)));
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(visible.contains("middle"));
+        assert!(!visible.contains("before"));
+        assert!(!visible.contains("after"));
+        state.backspace();
+        assert_eq!(state.editor.join("\n"), "before middle after");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "before !middle after");
+        assert_eq!(state.narrowed_passage, Some((7, 14)));
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), "before middle after");
+        assert_eq!(state.narrowed_passage, Some((7, 13)));
+        state.redo_edit();
+        assert_eq!(state.editor.join("\n"), "before !middle after");
+        assert_eq!(state.narrowed_passage, Some((7, 14)));
+        state.save().unwrap();
+        state.save_session().unwrap();
+
+        let mut reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        assert_eq!(reopened.editor.join("\n"), "before !middle after");
+        assert_eq!(reopened.narrowed_passage, Some((7, 14)));
+        reopened.execute_legacy_palette_command("widen").unwrap();
+        assert_eq!(reopened.narrowed_passage, None);
+        assert_eq!(reopened.editor.join("\n"), "before !middle after");
     }
 
     #[test]
@@ -18197,6 +18526,7 @@ mod tests {
             editor: vec!["alpha".into(), "beta".into()],
             editing_scene: None,
             cursor: (1, 2),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: false,
             mode: None,
@@ -18303,6 +18633,7 @@ mod tests {
             editor: vec!["hello".into()],
             editing_scene: None,
             cursor: (0, 1),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: false,
             mode: None,
@@ -18401,6 +18732,7 @@ mod tests {
             editor: vec![String::new(), "next".into()],
             editing_scene: None,
             cursor: (0, 0),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: false,
             mode: None,
@@ -18511,6 +18843,7 @@ mod tests {
             editor: vec![String::new()],
             editing_scene: None,
             cursor: (0, 0),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: false,
             mode: None,
@@ -18771,6 +19104,7 @@ mod tests {
             editor: vec![String::new()],
             editing_scene: None,
             cursor: (0, 0),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: false,
             mode: None,
@@ -18881,6 +19215,7 @@ mod tests {
             editor: vec![String::new()],
             editing_scene: None,
             cursor: (0, 0),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: false,
             mode: None,
@@ -19008,6 +19343,7 @@ mod tests {
             editor: vec![String::new()],
             editing_scene: None,
             cursor: (0, 0),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: false,
             mode: None,
@@ -19253,6 +19589,7 @@ mod tests {
             editor: vec![String::new()],
             editing_scene: None,
             cursor: (0, 0),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: false,
             mode: None,
@@ -19629,6 +19966,7 @@ mod tests {
             editor: vec![String::new()],
             editing_scene: None,
             cursor: (0, 0),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: false,
             mode: None,
@@ -19750,6 +20088,7 @@ mod tests {
             editor: vec![String::new()],
             editing_scene: None,
             cursor: (0, 0),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: false,
             mode: None,
@@ -19923,6 +20262,7 @@ mod tests {
             editor: vec![String::new()],
             editing_scene: None,
             cursor: (0, 0),
+            narrowed_passage: None,
             saved_hash: String::new(),
             dirty: false,
             mode: None,
