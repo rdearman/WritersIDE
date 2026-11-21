@@ -34,6 +34,7 @@ pub struct PipelineScene {
     pub chapter_id: Option<String>,
     pub title: String,
     pub language_code: Option<String>,
+    pub language_spans: Vec<story_document::CompileLanguageSpan>,
     pub text: String,
     /// Resolved inclusion text. This is a derived compilation view; `text` remains canonical.
     pub expanded_text: Option<String>,
@@ -987,6 +988,16 @@ pub fn compile_ir(input: &PipelineInput) -> story_document::CompileIr {
                 scene.text.clone(),
             )]
         };
+        let segments = segments
+            .into_iter()
+            .map(|segment| {
+                if segment.source_entity_id == scene.id {
+                    segment.with_language_spans(scene.language_spans.clone())
+                } else {
+                    segment
+                }
+            })
+            .collect();
         scenes.push(story_document::CompileUnit {
             id: scene.id.clone(),
             parent_id: scene.chapter_id.clone(),
@@ -1171,6 +1182,7 @@ mod tests {
                 chapter_id: Some("chapter-1".into()),
                 title: "Opening".into(),
                 language_code: None,
+                language_spans: vec![],
                 text: text.into(),
                 expanded_text: None,
                 expanded_passages: None,
@@ -1205,6 +1217,20 @@ mod tests {
             &markdown[source_map[0].output.start..source_map[0].output.end],
             "Bonjour."
         );
+    }
+
+    #[test]
+    fn compile_ir_carries_valid_passage_language_spans() {
+        let mut manuscript = input("Bonjour.");
+        manuscript.language_code = Some("en-GB".into());
+        manuscript.scenes[0].language_spans = vec![story_document::CompileLanguageSpan {
+            start_byte: 0,
+            end_byte: 7,
+            language_code: "fr-FR".into(),
+        }];
+        let ir = compile_ir(&manuscript);
+        assert!(ir.validate());
+        assert!(ir.render_markdown().0.contains("[Bonjour]{lang=fr-FR}."));
     }
 
     #[test]

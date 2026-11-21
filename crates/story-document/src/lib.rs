@@ -217,6 +217,15 @@ pub enum ContentUnitKind {
 pub struct CompileSegment {
     pub source_entity_id: String,
     pub document: SemanticDocument,
+    #[serde(default)]
+    pub language_spans: Vec<CompileLanguageSpan>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompileLanguageSpan {
+    pub start_byte: u64,
+    pub end_byte: u64,
+    pub language_code: String,
 }
 
 impl CompileSegment {
@@ -224,7 +233,13 @@ impl CompileSegment {
         Self {
             source_entity_id: source_entity_id.into(),
             document: SemanticDocument::parse(text),
+            language_spans: Vec::new(),
         }
+    }
+
+    pub fn with_language_spans(mut self, spans: Vec<CompileLanguageSpan>) -> Self {
+        self.language_spans = spans;
+        self
     }
 }
 
@@ -323,11 +338,7 @@ impl CompileIr {
                 return false;
             }
             parents.insert(&unit.id, unit.parent_id.as_deref());
-            if unit
-                .segments
-                .iter()
-                .any(|segment| !segment.document.validate_ranges())
-            {
+            if unit.segments.iter().any(|segment| !segment_valid(segment)) {
                 return false;
             }
         }
@@ -352,6 +363,13 @@ impl CompileIr {
     }
 
     pub fn render_markdown(&self) -> (String, Vec<CompileSourceMapEntry>) {
+        self.render_markdown_with_language_markup(true)
+    }
+
+    fn render_markdown_with_language_markup(
+        &self,
+        include_language_markup: bool,
+    ) -> (String, Vec<CompileSourceMapEntry>) {
         let mut output = String::new();
         let mut source_map = Vec::new();
         if let Some(language) = self.language_code.as_deref() {
@@ -422,7 +440,20 @@ impl CompileIr {
                     output.push_str("\n\n---\n\n");
                 }
                 let start = output.len();
-                output.push_str(&segment.document.source);
+                if include_language_markup {
+                    let inherited_language = unit
+                        .language_code
+                        .as_deref()
+                        .or(self.language_code.as_deref());
+                    append_language_spans(
+                        &mut output,
+                        &segment.document.source,
+                        &segment.language_spans,
+                        inherited_language,
+                    );
+                } else {
+                    output.push_str(&segment.document.source);
+                }
                 source_map.push(CompileSourceMapEntry {
                     output: SourceRange {
                         start,
@@ -443,6 +474,56 @@ impl CompileIr {
         }
         (output, source_map)
     }
+}
+
+fn segment_valid(segment: &CompileSegment) -> bool {
+    let source = &segment.document.source;
+    if !segment.document.validate_ranges() {
+        return false;
+    }
+    let mut spans = segment.language_spans.iter().collect::<Vec<_>>();
+    spans.sort_by_key(|span| (span.start_byte, span.end_byte));
+    let mut previous_end = 0u64;
+    spans.into_iter().all(|span| {
+        let start = span.start_byte as usize;
+        let end = span.end_byte as usize;
+        let valid = span.start_byte < span.end_byte
+            && span.start_byte >= previous_end
+            && end <= source.len()
+            && source.is_char_boundary(start)
+            && source.is_char_boundary(end)
+            && valid_language_tag(&span.language_code);
+        previous_end = span.end_byte;
+        valid
+    })
+}
+
+fn append_language_spans(
+    output: &mut String,
+    source: &str,
+    spans: &[CompileLanguageSpan],
+    inherited_language: Option<&str>,
+) {
+    let mut spans = spans.iter().collect::<Vec<_>>();
+    spans.sort_by_key(|span| (span.start_byte, span.end_byte));
+    let mut cursor = 0usize;
+    for span in spans {
+        let start = span.start_byte as usize;
+        let end = span.end_byte as usize;
+        output.push_str(&source[cursor..start]);
+        let content = &source[start..end];
+        if Some(span.language_code.as_str()) == inherited_language {
+            output.push_str(content);
+        } else {
+            output.push('[');
+            output.push_str(&content.replace(']', "\\]"));
+            output.push_str("]{lang=");
+            output.push_str(&span.language_code);
+            output.push('}');
+        }
+        cursor = end;
+    }
+    output.push_str(&source[cursor..]);
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1023,7 +1104,8 @@ impl PandocRenderer {
         } else {
             None
         };
-        let (markdown, source_map) = ir.render_markdown();
+        let (markdown, source_map) =
+            ir.render_markdown_with_language_markup(format != CompileFormat::PlainText);
         let mut auxiliary_files = Vec::new();
         let bytes = if format == CompileFormat::PlainText {
             let language_metadata_present = ir.language_code.is_some()
@@ -1051,7 +1133,7 @@ impl PandocRenderer {
             let mut command = Command::new(&self.program);
             command
                 .arg(
-                    "--from=markdown+footnotes+pipe_tables+task_lists+strikeout+fenced_code_blocks+fenced_divs",
+                    "--from=markdown+footnotes+pipe_tables+task_lists+strikeout+fenced_code_blocks+fenced_divs+bracketed_spans",
                 )
                 .arg(match format {
                     CompileFormat::PlainText => unreachable!(),
@@ -1427,6 +1509,43 @@ mod tests {
     }
 
     #[test]
+    fn inline_language_spans_validate_render_and_leave_plain_prose_untouched() {
+        let text = "Hello, bonjour.";
+        let mut ir = CompileIr::new("Book");
+        ir.language_code = Some("en-GB".into());
+        ir.push(CompileUnit {
+            id: "scene".into(),
+            parent_id: None,
+            kind: ContentUnitKind::Scene,
+            title: "Scene".into(),
+            language_code: None,
+            segments: vec![CompileSegment::new("scene", text).with_language_spans(vec![
+                CompileLanguageSpan {
+                    start_byte: 7,
+                    end_byte: 14,
+                    language_code: "fr-FR".into(),
+                },
+            ])],
+        });
+        assert!(ir.validate());
+        let (markdown, _) = ir.render_markdown();
+        assert!(markdown.contains("Hello, [bonjour]{lang=fr-FR}."));
+        let (plain_markdown, _) = ir.render_markdown_with_language_markup(false);
+        assert!(plain_markdown.contains(text));
+        assert!(!plain_markdown.contains("{lang=fr-FR}"));
+
+        ir.units[0].segments[0].language_spans[0].end_byte = 15;
+        ir.units[0].segments[0]
+            .language_spans
+            .push(CompileLanguageSpan {
+                start_byte: 8,
+                end_byte: 10,
+                language_code: "it-IT".into(),
+            });
+        assert!(!ir.validate());
+    }
+
+    #[test]
     fn plain_text_compile_uses_the_compile_ir_without_external_tools() {
         let mut ir = CompileIr::new("Novel");
         ir.language_code = Some("en-GB".into());
@@ -1513,10 +1632,17 @@ mod tests {
             kind: ContentUnitKind::Scene,
             title: "A Door Opens".into(),
             language_code: Some("fr-FR".into()),
-            segments: vec![CompileSegment::new(
-                "scene-uuid",
-                "Élodie *opened* the **door**.\n\n- One\n- Two\n",
-            )],
+            segments: vec![
+                CompileSegment::new(
+                    "scene-uuid",
+                    "Élodie *opened* the **door**.\n\n- One\n- Two\n",
+                )
+                .with_language_spans(vec![CompileLanguageSpan {
+                    start_byte: 0,
+                    end_byte: 7,
+                    language_code: "it-IT".into(),
+                }]),
+            ],
         });
         let renderer = PandocRenderer::default();
         for format in [
@@ -1533,6 +1659,7 @@ mod tests {
                 let html = String::from_utf8_lossy(&artifact.bytes);
                 assert!(html.contains("lang=\"en-GB\""), "{html}");
                 assert!(html.contains("lang=\"fr-FR\""), "{html}");
+                assert!(html.contains("lang=\"it-IT\""), "{html}");
             }
             if format == CompileFormat::Latex {
                 assert!(String::from_utf8_lossy(&artifact.bytes).contains("\\documentclass"));
@@ -1548,6 +1675,7 @@ mod tests {
             .unwrap();
         assert!(document.contains("Élodie"));
         assert!(document.contains("fr-FR"), "{document}");
+        assert!(document.contains("it-IT"), "{document}");
         let epub = renderer.render(&ir, CompileFormat::Epub, None).unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(epub.bytes)).unwrap();
         assert!(archive.by_name("META-INF/container.xml").is_ok());

@@ -554,6 +554,17 @@ impl WriterApp {
         for row in self.store.list_scenes(false)? {
             let (text, _) = self.store.load_text(row.scene.id)?;
             let language_code = Some(row.scene.effective_language_code(&project).to_owned());
+            let language_spans = self
+                .store
+                .list_passage_language_tags(row.scene.id)?
+                .into_iter()
+                .filter(|tag| tag.anchor.state == "current")
+                .map(|tag| story_document::CompileLanguageSpan {
+                    start_byte: tag.anchor.start_byte,
+                    end_byte: tag.anchor.end_byte,
+                    language_code: tag.language_code,
+                })
+                .collect();
             let expanded_passages = if expand_transclusions {
                 Some(
                     self.store
@@ -602,6 +613,7 @@ impl WriterApp {
                 chapter_id: row.chapter_id.map(|id| id.to_string()),
                 title: row.scene.title,
                 language_code,
+                language_spans,
                 text,
                 expanded_text,
                 expanded_passages,
@@ -2663,6 +2675,7 @@ mod tests {
         let (_, expected) = app.load_scene_text(scene).unwrap();
         app.save_scene_text(scene, Some(&expected), "Élodie arrives.")
             .unwrap();
+        app.tag_passage_language(scene, 8, 15, "it-IT").unwrap();
         let artifact = app
             .compile_artifact(story_document::CompileFormat::Markdown, false)
             .unwrap();
@@ -2672,7 +2685,8 @@ mod tests {
         assert!(markdown.contains("::: {lang=ko-KR}"));
         assert!(markdown.contains("## Opening"));
         assert!(markdown.contains("### Arrival"));
-        assert!(markdown.contains("Élodie arrives."));
+        assert!(markdown.contains("Élodie [arrives]"));
+        assert!(markdown.contains("[arrives]{lang=it-IT}"));
         assert_eq!(artifact.source_map.len(), 2);
         assert!(
             artifact
@@ -2680,6 +2694,12 @@ mod tests {
                 .iter()
                 .any(|entry| entry.source_entity_id == scene.to_string())
         );
+        let plain = app
+            .compile_artifact(story_document::CompileFormat::PlainText, false)
+            .unwrap();
+        let plain = String::from_utf8(plain.bytes).unwrap();
+        assert!(plain.contains("Élodie arrives."));
+        assert!(!plain.contains("{lang=it-IT}"));
     }
 
     #[test]
