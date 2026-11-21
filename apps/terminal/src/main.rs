@@ -1473,6 +1473,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "content.language",
+            "Set Prose Document Language",
+            "Override the project language for chapter or section prose",
+            "Project",
+            "content-language",
+            true,
+        ),
+        legacy_command(
             "scene.word-count-policy",
             "Set Scene Word-count Policy",
             "Override the project word-count policy for a scene or restore inheritance",
@@ -6290,6 +6298,25 @@ impl AppState {
                 "Scene language: {}{}",
                 record.scene.effective_language_code(&project),
                 if record.scene.language_code.is_some() {
+                    " (override)"
+                } else {
+                    " (inherited)"
+                }
+            );
+        } else if let Some(rest) = cmd.strip_prefix("content-language ") {
+            let (id, language) = rest
+                .split_once(' ')
+                .ok_or("usage: content-language <content-unit-uuid> <BCP-47-tag|inherit>")?;
+            let content = story_core::ContentUnitId(id.parse()?);
+            let language = language.trim();
+            self.app
+                .set_content_unit_language(content, (language != "inherit").then_some(language))?;
+            let project = self.app.get_project()?;
+            let record = self.app.get_content_unit(content)?;
+            self.message = format!(
+                "Document language: {}{}",
+                record.effective_language_code(&project),
+                if record.language_code.is_some() {
                     " (override)"
                 } else {
                     " (inherited)"
@@ -12569,6 +12596,15 @@ mod tests {
         app.set_project_language("it-IT").unwrap();
         let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
         let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let chapter_text = app
+            .create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "Chapter prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
         let (empty, hash) = app.load_scene_text(scene).unwrap();
         assert!(empty.is_empty());
         app.save_scene_text(scene, Some(&hash), "Dialog: Bonjour")
@@ -12585,6 +12621,14 @@ mod tests {
         let record = state.app.get_scene(scene).unwrap();
         assert_eq!(record.scene.language_code, None);
         assert_eq!(state.app.get_project().unwrap().language_code, "it-IT");
+        state
+            .execute_legacy_palette_command(&format!("content-language {chapter_text} fr-FR"))
+            .unwrap();
+        assert!(state.message.contains("fr-FR (override)"));
+        state
+            .execute_legacy_palette_command(&format!("content-language {chapter_text} inherit"))
+            .unwrap();
+        assert!(state.message.contains("it-IT (inherited)"));
         state
             .execute_legacy_palette_command(&format!("passage-language {scene} 8 15 fr-FR"))
             .unwrap();

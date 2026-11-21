@@ -9,8 +9,8 @@ use std::{
 };
 use story_app::WriterApp;
 use story_core::{
-    EntityRef, LinkId, LinkKind, NodeId, QueryId, SavedSceneQuery, SceneId, SceneQueryFilter,
-    SnapshotId,
+    ContentUnitId, EntityRef, LinkId, LinkKind, NodeId, QueryId, SavedSceneQuery, SceneId,
+    SceneQueryFilter, SnapshotId,
 };
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -174,6 +174,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let project = app.get_project()?;
             let record = app.get_scene(scene)?;
             println!("{}", record.scene.effective_language_code(&project));
+        }
+        "content-language" => {
+            let path = args.next().ok_or("missing project path")?;
+            let content = ContentUnitId(args.next().ok_or("missing content unit id")?.parse()?);
+            let requested = args.next();
+            let mut app = WriterApp::open_project(path)?;
+            if let Some(tag) = requested.as_deref() {
+                app.set_content_unit_language(content, (tag != "inherit").then_some(tag))?;
+            }
+            let project = app.get_project()?;
+            println!(
+                "{}",
+                app.get_content_unit(content)?
+                    .effective_language_code(&project)
+            );
         }
         "scene-word-count-policy" => {
             let path = args.next().ok_or("missing project path")?;

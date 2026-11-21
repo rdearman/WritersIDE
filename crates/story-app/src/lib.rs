@@ -313,6 +313,13 @@ impl WriterApp {
     pub fn get_content_unit(&self, id: ContentUnitId) -> Result<story_storage::ContentUnitRecord> {
         Ok(self.store.get_content_unit(id)?)
     }
+    pub fn set_content_unit_language(
+        &mut self,
+        id: ContentUnitId,
+        language_code: Option<&str>,
+    ) -> Result<()> {
+        Ok(self.store.set_content_unit_language(id, language_code)?)
+    }
     pub fn list_content_units(
         &self,
         include_archived: bool,

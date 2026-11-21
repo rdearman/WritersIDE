@@ -51,6 +51,7 @@ const MIGRATION_34: &str = include_str!("../migrations/0034_word_count_policy.sq
 const MIGRATION_35: &str = include_str!("../migrations/0035_scene_language.sql");
 const MIGRATION_36: &str = include_str!("../migrations/0036_passage_language_tags.sql");
 const MIGRATION_37: &str = include_str!("../migrations/0037_scene_word_count_policy.sql");
+const MIGRATION_38: &str = include_str!("../migrations/0038_content_unit_language.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -471,6 +472,14 @@ pub struct ContentUnitRecord {
     pub actual_words: u32,
     pub content_hash: String,
     pub archived: bool,
+    pub language_code: Option<String>,
+}
+impl ContentUnitRecord {
+    pub fn effective_language_code<'a>(&'a self, project: &'a Project) -> &'a str {
+        self.language_code
+            .as_deref()
+            .unwrap_or(&project.language_code)
+    }
 }
 #[derive(Clone, Debug)]
 pub struct ContentUnitRecoveryConflict {
@@ -1015,6 +1024,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_35}\nINSERT INTO schema_migrations(version,applied_at) VALUES(35,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_36}\nINSERT INTO schema_migrations(version,applied_at) VALUES(36,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_37}\nINSERT INTO schema_migrations(version,applied_at) VALUES(37,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_38}\nINSERT INTO schema_migrations(version,applied_at) VALUES(38,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1057,7 +1067,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 37 {
+        if version > 38 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1206,6 +1216,10 @@ impl ProjectStore {
         }
         if current_version == 36 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_37}\nINSERT INTO schema_migrations(version,applied_at) VALUES(37,'{}');\nCOMMIT;", now()))?;
+            current_version = 37;
+        }
+        if current_version == 37 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_38}\nINSERT INTO schema_migrations(version,applied_at) VALUES(38,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -2229,9 +2243,9 @@ impl ProjectStore {
     }
     pub fn get_content_unit(&self, id: ContentUnitId) -> Result<ContentUnitRecord> {
         let row = self.conn.query_row(
-            "SELECT kind,title,parent_node_id,position,target_words,word_count,sha256,archived FROM content_unit WHERE id=?1",
+            "SELECT kind,title,parent_node_id,position,target_words,word_count,sha256,archived,language_code FROM content_unit WHERE id=?1",
             [id.to_string()],
-            |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, Option<String>>(2)?,row.get::<_, u32>(3)?,row.get::<_, Option<u64>>(4)?,row.get::<_, u32>(5)?,row.get::<_, String>(6)?,row.get::<_, bool>(7)?)),
+            |row| Ok((row.get::<_, String>(0)?,row.get::<_, String>(1)?,row.get::<_, Option<String>>(2)?,row.get::<_, u32>(3)?,row.get::<_, Option<u64>>(4)?,row.get::<_, u32>(5)?,row.get::<_, String>(6)?,row.get::<_, bool>(7)?,row.get::<_, Option<String>>(8)?)),
         ).optional()?.ok_or_else(|| StorageError::NotFound(format!("content unit {id}")))?;
         let parent_id = row
             .2
@@ -2253,7 +2267,30 @@ impl ProjectStore {
             actual_words: row.5,
             content_hash: row.6,
             archived: row.7,
+            language_code: row.8,
         })
+    }
+    pub fn set_content_unit_language(
+        &mut self,
+        id: ContentUnitId,
+        language_code: Option<&str>,
+    ) -> Result<()> {
+        if let Some(language_code) = language_code
+            && !is_valid_language_tag(language_code)
+        {
+            return Err(StorageError::Invalid(
+                "language must be a valid BCP-47-style language tag (for example en or fr-CA)"
+                    .into(),
+            ));
+        }
+        let updated = self.conn.execute(
+            "UPDATE content_unit SET language_code=?2,updated_at=?3 WHERE id=?1",
+            params![id.to_string(), language_code, now()],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::NotFound(format!("content unit {id}")));
+        }
+        Ok(())
     }
     pub fn list_content_units(&self, include_archived: bool) -> Result<Vec<ContentUnitRecord>> {
         let mut query = self.conn.prepare("SELECT id FROM content_unit WHERE (?1 OR archived=0) ORDER BY CASE kind WHEN 'front_matter' THEN 0 WHEN 'section_body' THEN 1 WHEN 'chapter_body' THEN 2 ELSE 3 END,parent_node_id,position,id")?;
@@ -10753,7 +10790,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 37))
+            .map(|version| assert_eq!(version, 38))
             .unwrap();
     }
 
@@ -11044,7 +11081,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 37);
+        assert_eq!(version, 38);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -11486,6 +11523,56 @@ mod tests {
         let record = reopened.get_scene(scene).unwrap();
         assert_eq!(record.scene.language_code, None);
         assert_eq!(record.scene.effective_language_code(&project), "ko-KR");
+    }
+
+    #[test]
+    fn prose_document_language_inherits_and_overrides_project_default() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("Documents");
+        let mut store = ProjectStore::create(&root, "Documents").unwrap();
+        store.set_project_language("it-IT").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let unit = store
+            .create_content_unit(
+                ContentUnitKind::ChapterBody,
+                "Chapter prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let project = store.get_project().unwrap();
+        let record = store.get_content_unit(unit).unwrap();
+        assert_eq!(record.language_code, None);
+        assert_eq!(record.effective_language_code(&project), "it-IT");
+
+        store
+            .set_content_unit_language(unit, Some("fr-FR"))
+            .unwrap();
+        assert!(
+            store
+                .set_content_unit_language(unit, Some("not a tag"))
+                .is_err()
+        );
+        let project = store.get_project().unwrap();
+        assert_eq!(
+            store
+                .get_content_unit(unit)
+                .unwrap()
+                .effective_language_code(&project),
+            "fr-FR"
+        );
+        store.set_content_unit_language(unit, None).unwrap();
+        store.set_project_language("ko-KR").unwrap();
+        drop(store);
+
+        let reopened = ProjectStore::open(&root).unwrap();
+        let project = reopened.get_project().unwrap();
+        let record = reopened.get_content_unit(unit).unwrap();
+        assert_eq!(record.language_code, None);
+        assert_eq!(record.effective_language_code(&project), "ko-KR");
     }
 
     #[test]
