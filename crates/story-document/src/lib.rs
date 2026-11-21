@@ -9,7 +9,16 @@ use std::{
 };
 
 pub const SEMANTIC_SCHEMA_VERSION: u16 = 1;
-pub const COMPILE_IR_VERSION: u16 = 1;
+pub const COMPILE_IR_VERSION: u16 = 2;
+
+fn valid_language_tag(tag: &str) -> bool {
+    let mut parts = tag.split('-');
+    parts.next().is_some_and(|language| {
+        !language.is_empty() && language.chars().all(|ch| ch.is_ascii_alphabetic())
+    }) && parts.all(|part| {
+        (1..=8).contains(&part.len()) && part.chars().all(|ch| ch.is_ascii_alphanumeric())
+    })
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SourceRange {
@@ -225,6 +234,8 @@ pub struct CompileUnit {
     pub parent_id: Option<String>,
     pub kind: ContentUnitKind,
     pub title: String,
+    #[serde(default)]
+    pub language_code: Option<String>,
     pub segments: Vec<CompileSegment>,
 }
 
@@ -257,6 +268,8 @@ pub struct CompileSourceMapEntry {
 pub struct CompileIr {
     pub version: u16,
     pub title: String,
+    #[serde(default)]
+    pub language_code: Option<String>,
     pub groups: Vec<CompileGroup>,
     pub units: Vec<CompileUnit>,
 }
@@ -266,6 +279,7 @@ impl CompileIr {
         Self {
             version: COMPILE_IR_VERSION,
             title: title.into(),
+            language_code: None,
             groups: Vec::new(),
             units: Vec::new(),
         }
@@ -283,6 +297,13 @@ impl CompileIr {
         if self.version != COMPILE_IR_VERSION {
             return false;
         }
+        if self
+            .language_code
+            .as_deref()
+            .is_some_and(|tag| !valid_language_tag(tag))
+        {
+            return false;
+        }
         let mut ids = std::collections::BTreeSet::new();
         let mut parents = std::collections::BTreeMap::<&str, Option<&str>>::new();
         for group in &self.groups {
@@ -292,7 +313,13 @@ impl CompileIr {
             parents.insert(&group.id, group.parent_id.as_deref());
         }
         for unit in &self.units {
-            if unit.id.is_empty() || !ids.insert(unit.id.as_str()) {
+            if unit.id.is_empty()
+                || unit
+                    .language_code
+                    .as_deref()
+                    .is_some_and(|tag| !valid_language_tag(tag))
+                || !ids.insert(unit.id.as_str())
+            {
                 return false;
             }
             parents.insert(&unit.id, unit.parent_id.as_deref());
@@ -327,6 +354,11 @@ impl CompileIr {
     pub fn render_markdown(&self) -> (String, Vec<CompileSourceMapEntry>) {
         let mut output = String::new();
         let mut source_map = Vec::new();
+        if let Some(language) = self.language_code.as_deref() {
+            output.push_str("---\nlang: ");
+            output.push_str(language);
+            output.push_str("\n---\n\n");
+        }
         let groups = self
             .groups
             .iter()
@@ -334,6 +366,15 @@ impl CompileIr {
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut active_group_path: Vec<&str> = Vec::new();
         for unit in &self.units {
+            let language_wrapper = unit
+                .language_code
+                .as_deref()
+                .filter(|language| Some(*language) != self.language_code.as_deref());
+            if let Some(language) = language_wrapper {
+                output.push_str("::: {lang=");
+                output.push_str(language);
+                output.push_str("}\n\n");
+            }
             let mut target_group_path = Vec::new();
             let mut parent = unit.parent_id.as_deref();
             while let Some(id) = parent {
@@ -396,6 +437,9 @@ impl CompileIr {
                 });
             }
             output.push_str("\n\n");
+            if language_wrapper.is_some() {
+                output.push_str(":::\n\n");
+            }
         }
         (output, source_map)
     }
@@ -982,7 +1026,14 @@ impl PandocRenderer {
         let (markdown, source_map) = ir.render_markdown();
         let mut auxiliary_files = Vec::new();
         let bytes = if format == CompileFormat::PlainText {
-            markdown_to_plain_text(&markdown).into_bytes()
+            let language_metadata_present = ir.language_code.is_some()
+                || ir.units.iter().any(|unit| unit.language_code.is_some());
+            let plain_source = if language_metadata_present {
+                strip_compile_language_markup(&markdown)
+            } else {
+                markdown.clone()
+            };
+            markdown_to_plain_text(&plain_source).into_bytes()
         } else if format == CompileFormat::Markdown {
             markdown.into_bytes()
         } else {
@@ -1000,7 +1051,7 @@ impl PandocRenderer {
             let mut command = Command::new(&self.program);
             command
                 .arg(
-                    "--from=markdown+footnotes+pipe_tables+task_lists+strikeout+fenced_code_blocks",
+                    "--from=markdown+footnotes+pipe_tables+task_lists+strikeout+fenced_code_blocks+fenced_divs",
                 )
                 .arg(match format {
                     CompileFormat::PlainText => unreachable!(),
@@ -1020,6 +1071,9 @@ impl PandocRenderer {
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped());
+            if let Some(language) = ir.language_code.as_deref() {
+                command.arg("--metadata").arg(format!("lang={language}"));
+            }
             if format == CompileFormat::Pdf {
                 command
                     .arg("--pdf-engine=lualatex")
@@ -1113,6 +1167,28 @@ impl PandocRenderer {
             auxiliary_files,
         })
     }
+}
+
+fn strip_compile_language_markup(markdown: &str) -> String {
+    let mut lines = markdown.lines().peekable();
+    let mut output = String::new();
+    while let Some(line) = lines.next() {
+        if line == "---" && lines.peek().is_some_and(|next| next.starts_with("lang: ")) {
+            let _ = lines.next();
+            if lines.next_if_eq(&"---").is_some() {
+                continue;
+            }
+            return markdown.to_owned();
+        }
+        if line.starts_with("::: {lang=") || line == ":::" {
+            continue;
+        }
+        output.push_str(line);
+        if lines.peek().is_some() {
+            output.push('\n');
+        }
+    }
+    output
 }
 
 fn markdown_to_plain_text(markdown: &str) -> String {
@@ -1335,6 +1411,7 @@ mod tests {
             parent_id: Some("chapter-1".into()),
             kind: ContentUnitKind::Scene,
             title: "Chapter One".into(),
+            language_code: None,
             segments: vec![CompileSegment::new("scene-1", text)],
         });
         let (markdown, map) = ir.render_markdown();
@@ -1352,6 +1429,7 @@ mod tests {
     #[test]
     fn plain_text_compile_uses_the_compile_ir_without_external_tools() {
         let mut ir = CompileIr::new("Novel");
+        ir.language_code = Some("en-GB".into());
         ir.push_group(CompileGroup {
             id: "chapter".into(),
             parent_id: None,
@@ -1363,6 +1441,7 @@ mod tests {
             parent_id: Some("chapter".into()),
             kind: ContentUnitKind::Scene,
             title: "Harbour Lights".into(),
+            language_code: Some("fr-FR".into()),
             segments: vec![CompileSegment::new(
                 "scene",
                 "Mara *waited* by the harbour.\n\n- A lantern\n- A signal\n\n1. First clue\n2. Second clue",
@@ -1381,6 +1460,7 @@ mod tests {
         assert!(text.contains("1. First clue"));
         assert!(text.contains("2. Second clue"));
         assert!(!text.contains("**") && !text.contains('*'));
+        assert!(!text.contains("fr-FR") && !text.contains(":::"));
         assert_eq!(artifact.media_type, "text/plain; charset=utf-8");
         assert_eq!(artifact.format.extension(), "txt");
     }
@@ -1408,6 +1488,7 @@ mod tests {
             parent_id: None,
             kind: ContentUnitKind::Scene,
             title: "Duplicate".into(),
+            language_code: None,
             segments: Vec::new(),
         });
         assert!(!ir.validate());
@@ -1419,6 +1500,7 @@ mod tests {
             return;
         }
         let mut ir = CompileIr::new("Writer’s Novel");
+        ir.language_code = Some("en-GB".into());
         ir.push_group(CompileGroup {
             id: "chapter".into(),
             parent_id: None,
@@ -1430,6 +1512,7 @@ mod tests {
             parent_id: Some("chapter".into()),
             kind: ContentUnitKind::Scene,
             title: "A Door Opens".into(),
+            language_code: Some("fr-FR".into()),
             segments: vec![CompileSegment::new(
                 "scene-uuid",
                 "Élodie *opened* the **door**.\n\n- One\n- Two\n",
@@ -1446,6 +1529,11 @@ mod tests {
             assert!(!artifact.bytes.is_empty());
             assert_eq!(artifact.media_type, format.media_type());
             assert_eq!(artifact.source_map.len(), 1);
+            if format == CompileFormat::Html {
+                let html = String::from_utf8_lossy(&artifact.bytes);
+                assert!(html.contains("lang=\"en-GB\""), "{html}");
+                assert!(html.contains("lang=\"fr-FR\""), "{html}");
+            }
             if format == CompileFormat::Latex {
                 assert!(String::from_utf8_lossy(&artifact.bytes).contains("\\documentclass"));
             }
@@ -1459,9 +1547,21 @@ mod tests {
             .read_to_string(&mut document)
             .unwrap();
         assert!(document.contains("Élodie"));
+        assert!(document.contains("fr-FR"), "{document}");
         let epub = renderer.render(&ir, CompileFormat::Epub, None).unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(epub.bytes)).unwrap();
         assert!(archive.by_name("META-INF/container.xml").is_ok());
+        let package_name = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_owned())
+            .find(|name| name.ends_with(".opf"))
+            .unwrap();
+        let mut package = String::new();
+        archive
+            .by_name(&package_name)
+            .unwrap()
+            .read_to_string(&mut package)
+            .unwrap();
+        assert!(package.contains("en-GB"), "{package}");
         if Command::new("lualatex").arg("--version").output().is_ok() {
             let pdf = renderer.render(&ir, CompileFormat::Pdf, None).unwrap();
             assert!(pdf.bytes.starts_with(b"%PDF-"));
@@ -1484,6 +1584,7 @@ mod tests {
             parent_id: None,
             kind: ContentUnitKind::Scene,
             title: "Scene".into(),
+            language_code: None,
             segments: vec![CompileSegment::new("scene", "Prose.")],
         });
         let missing = PandocRenderer::with_program("writers-ide-test-missing-pandoc");
@@ -1539,6 +1640,7 @@ mod tests {
             parent_id: None,
             kind: ContentUnitKind::ChapterBody,
             title: "Empty chapter".into(),
+            language_code: None,
             segments: vec![CompileSegment::new("empty-unit", "  ")],
         });
         ir.push(CompileUnit {
@@ -1546,6 +1648,7 @@ mod tests {
             parent_id: None,
             kind: ContentUnitKind::Scene,
             title: "Draft scene".into(),
+            language_code: None,
             segments: vec![CompileSegment::new(
                 "draft-scene",
                 "Mara finds the key. TODO: check the lock; [INSERT FINAL CLUE].",
@@ -1631,6 +1734,7 @@ mod tests {
             parent_id: None,
             kind: ContentUnitKind::Scene,
             title: "Scene".into(),
+            language_code: None,
             segments: vec![CompileSegment::new("scene", "Prose.")],
         });
         let profile = BookDesignProfile {

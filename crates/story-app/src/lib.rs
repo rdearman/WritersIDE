@@ -535,6 +535,7 @@ impl WriterApp {
         let mut content_units = Vec::new();
         for unit in self.store.list_content_units(false)? {
             let (text, _) = self.store.load_content_unit_text(unit.id)?;
+            let language_code = Some(unit.effective_language_code(&project).to_owned());
             content_units.push(story_pipeline::PipelineContentUnit {
                 id: unit.id.to_string(),
                 parent_id: unit.parent_id.map(|id| id.to_string()),
@@ -545,12 +546,14 @@ impl WriterApp {
                     ContentUnitKind::BackMatter => story_document::ContentUnitKind::BackMatter,
                 },
                 title: unit.title,
+                language_code,
                 text,
             });
         }
         let mut snapshots = 0usize;
         for row in self.store.list_scenes(false)? {
             let (text, _) = self.store.load_text(row.scene.id)?;
+            let language_code = Some(row.scene.effective_language_code(&project).to_owned());
             let expanded_passages = if expand_transclusions {
                 Some(
                     self.store
@@ -598,6 +601,7 @@ impl WriterApp {
                 id: row.scene.id.to_string(),
                 chapter_id: row.chapter_id.map(|id| id.to_string()),
                 title: row.scene.title,
+                language_code,
                 text,
                 expanded_text,
                 expanded_passages,
@@ -632,6 +636,7 @@ impl WriterApp {
             .collect();
         Ok(story_pipeline::PipelineInput {
             title: project.title,
+            language_code: Some(project.language_code.clone()),
             target_words: project.target_words,
             word_count_policy: project.word_count_policy,
             expand_transclusions,
@@ -2025,16 +2030,23 @@ impl WriterApp {
             .ok_or_else(|| StorageError::NotFound(assembly.to_string()))?
             .title;
         let mut ir = story_document::CompileIr::new(&title);
+        ir.language_code = Some(self.get_project()?.language_code);
         for item in self.store.list_assembly_items(assembly)? {
             if !item.included {
                 continue;
             }
-            let (kind, title, source_id, text) = if let Some(scene) = item.scene_id {
+            let (kind, title, language_code, source_id, text) = if let Some(scene) = item.scene_id {
                 let row = self.store.get_scene(scene)?;
                 let (text, _) = self.store.load_text(scene)?;
+                let language_code = Some(
+                    row.scene
+                        .effective_language_code(&self.get_project()?)
+                        .to_owned(),
+                );
                 (
                     story_document::ContentUnitKind::Scene,
                     row.scene.title,
+                    language_code,
                     scene.to_string(),
                     text,
                 )
@@ -2047,7 +2059,9 @@ impl WriterApp {
                     ContentUnitKind::ChapterBody => story_document::ContentUnitKind::ChapterBody,
                     ContentUnitKind::BackMatter => story_document::ContentUnitKind::BackMatter,
                 };
-                (kind, row.title, content.to_string(), text)
+                let language_code =
+                    Some(row.effective_language_code(&self.get_project()?).to_owned());
+                (kind, row.title, language_code, content.to_string(), text)
             } else {
                 return Err(AppError::Domain(
                     "assembly item has no source entity".into(),
@@ -2058,6 +2072,7 @@ impl WriterApp {
                 parent_id: None,
                 kind,
                 title,
+                language_code,
                 segments: vec![story_document::CompileSegment::new(source_id, text)],
             });
         }
@@ -2066,8 +2081,15 @@ impl WriterApp {
                 "assembly produced invalid Compile IR".into(),
             ));
         }
+        let language = ir.language_code.clone();
         let (content, _) = ir.render_markdown();
-        Ok(format!("# {title}\n\n{content}"))
+        if let Some(language) = language {
+            let metadata = format!("---\nlang: {language}\n---\n\n");
+            let body = content.strip_prefix(&metadata).unwrap_or(&content);
+            Ok(format!("{metadata}# {title}\n\n{body}"))
+        } else {
+            Ok(format!("# {title}\n\n{content}"))
+        }
     }
     pub fn list_scene_comments(
         &self,
@@ -2442,7 +2464,7 @@ mod tests {
         let (compiled, _) = story_pipeline::compile_ir(&input).render_markdown();
         assert_eq!(
             compiled,
-            "## Introduction\n\nThis is direct chapter prose.\n\n"
+            "---\nlang: en-GB\n---\n\n## Introduction\n\nThis is direct chapter prose.\n\n"
         );
     }
 
@@ -2603,8 +2625,24 @@ mod tests {
     fn compile_artifact_exposes_portable_markdown_and_source_map() {
         let dir = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(dir.path().join("Novel"), "A Novel").unwrap();
+        app.set_project_language("it-IT").unwrap();
         let chapter = app.create_chapter(None, "Opening", 0).unwrap();
         let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+        app.set_scene_language(scene, Some("fr-FR")).unwrap();
+        let chapter_prose = app
+            .create_content_unit(
+                ContentUnitKind::ChapterBody,
+                "Chapter prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        app.set_content_unit_language(chapter_prose, Some("ko-KR"))
+            .unwrap();
+        let (_, prose_hash) = app.load_content_unit_text(chapter_prose).unwrap();
+        app.save_content_unit_text(chapter_prose, Some(&prose_hash), "한국어")
+            .unwrap();
         let (_, expected) = app.load_scene_text(scene).unwrap();
         app.save_scene_text(scene, Some(&expected), "Élodie arrives.")
             .unwrap();
@@ -2612,11 +2650,19 @@ mod tests {
             .compile_artifact(story_document::CompileFormat::Markdown, false)
             .unwrap();
         let markdown = String::from_utf8(artifact.bytes).unwrap();
+        assert!(markdown.starts_with("---\nlang: it-IT\n---"));
+        assert!(markdown.contains("::: {lang=fr-FR}"));
+        assert!(markdown.contains("::: {lang=ko-KR}"));
         assert!(markdown.contains("## Opening"));
         assert!(markdown.contains("### Arrival"));
         assert!(markdown.contains("Élodie arrives."));
-        assert_eq!(artifact.source_map.len(), 1);
-        assert_eq!(artifact.source_map[0].source_entity_id, scene.to_string());
+        assert_eq!(artifact.source_map.len(), 2);
+        assert!(
+            artifact
+                .source_map
+                .iter()
+                .any(|entry| entry.source_entity_id == scene.to_string())
+        );
     }
 
     #[test]

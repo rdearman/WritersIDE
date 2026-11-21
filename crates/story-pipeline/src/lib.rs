@@ -33,6 +33,7 @@ pub struct PipelineScene {
     pub id: String,
     pub chapter_id: Option<String>,
     pub title: String,
+    pub language_code: Option<String>,
     pub text: String,
     /// Resolved inclusion text. This is a derived compilation view; `text` remains canonical.
     pub expanded_text: Option<String>,
@@ -60,6 +61,7 @@ pub struct PipelineContentUnit {
     pub parent_id: Option<String>,
     pub kind: story_document::ContentUnitKind,
     pub title: String,
+    pub language_code: Option<String>,
     pub text: String,
 }
 
@@ -87,6 +89,7 @@ pub struct PipelinePassage {
 #[derive(Clone, Debug)]
 pub struct PipelineInput {
     pub title: String,
+    pub language_code: Option<String>,
     pub target_words: Option<u64>,
     pub word_count_policy: story_core::WordCountPolicy,
     pub expand_transclusions: bool,
@@ -943,6 +946,7 @@ fn read_proofreading_config(root: &Path) -> Result<ProofreadingConfig, String> {
 
 pub fn compile_ir(input: &PipelineInput) -> story_document::CompileIr {
     let mut ir = story_document::CompileIr::new(input.title.clone());
+    ir.language_code = input.language_code.clone();
     for group in &input.groups {
         ir.push_group(story_document::CompileGroup {
             id: group.id.clone(),
@@ -988,6 +992,7 @@ pub fn compile_ir(input: &PipelineInput) -> story_document::CompileIr {
             parent_id: scene.chapter_id.clone(),
             kind: story_document::ContentUnitKind::Scene,
             title: scene.title.clone(),
+            language_code: scene.language_code.clone(),
             segments,
         });
     }
@@ -1073,6 +1078,7 @@ fn push_content(ir: &mut story_document::CompileIr, content: &PipelineContentUni
         parent_id: content.parent_id.clone(),
         kind: content.kind,
         title: content.title.clone(),
+        language_code: content.language_code.clone(),
         segments: vec![story_document::CompileSegment::new(
             content.id.clone(),
             content.text.clone(),
@@ -1149,6 +1155,7 @@ mod tests {
     fn input(text: &str) -> PipelineInput {
         PipelineInput {
             title: "Novel".into(),
+            language_code: None,
             target_words: Some(100),
             word_count_policy: story_core::WordCountPolicy::UnicodeWords,
             expand_transclusions: false,
@@ -1163,6 +1170,7 @@ mod tests {
                 id: "scene-1".into(),
                 chapter_id: Some("chapter-1".into()),
                 title: "Opening".into(),
+                language_code: None,
                 text: text.into(),
                 expanded_text: None,
                 expanded_passages: None,
@@ -1180,6 +1188,23 @@ mod tests {
             event_dependencies: vec![],
             revision_summary: "one snapshot".into(),
         }
+    }
+
+    #[test]
+    fn compile_ir_carries_project_and_scene_language_metadata() {
+        let mut manuscript = input("Bonjour.");
+        manuscript.language_code = Some("en-GB".into());
+        manuscript.scenes[0].language_code = Some("fr-FR".into());
+        let ir = compile_ir(&manuscript);
+        assert_eq!(ir.language_code.as_deref(), Some("en-GB"));
+        assert_eq!(ir.units[0].language_code.as_deref(), Some("fr-FR"));
+        let (markdown, source_map) = ir.render_markdown();
+        assert!(markdown.starts_with("---\nlang: en-GB\n---"));
+        assert!(markdown.contains("::: {lang=fr-FR}"));
+        assert_eq!(
+            &markdown[source_map[0].output.start..source_map[0].output.end],
+            "Bonjour."
+        );
     }
 
     #[test]
@@ -1265,6 +1290,7 @@ mod tests {
             parent_id: Some("chapter-1".into()),
             kind: story_document::ContentUnitKind::ChapterBody,
             title: "Chapter".into(),
+            language_code: None,
             text: "Chapter-level introduction.".into(),
         });
         let (compiled, _) = compile_ir(&novel).render_markdown();
