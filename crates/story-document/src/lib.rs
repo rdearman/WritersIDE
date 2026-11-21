@@ -489,6 +489,8 @@ pub struct BookDesignProfile {
     pub paper_size: String,
     #[serde(default)]
     pub class_options: Vec<String>,
+    #[serde(default)]
+    pub template: Option<String>,
     pub geometry: String,
     pub font_size_pt: u8,
     pub line_spacing_hundredths: u16,
@@ -528,6 +530,9 @@ impl BookDesignProfile {
             || !(100..=300).contains(&self.line_spacing_hundredths)
         {
             return Err("book design dimensions are outside supported ranges".into());
+        }
+        if let Some(template) = &self.template {
+            validate_project_relative_path(template)?;
         }
         Ok(())
     }
@@ -759,6 +764,7 @@ impl BookDesign {
             document_class: document_class.into(),
             paper_size: paper_size.into(),
             class_options: class_options.into_iter().map(str::to_owned).collect(),
+            template: None,
             geometry: geometry.into(),
             font_size_pt,
             line_spacing_hundredths,
@@ -868,6 +874,25 @@ impl PandocRenderer {
             return Err("refusing to render invalid Compile IR".into());
         }
         design.validate()?;
+        let template_path = if let Some(template) = &design.template {
+            if !matches!(format, CompileFormat::Latex | CompileFormat::Pdf) {
+                return Err("custom book templates are supported only for LaTeX and PDF".into());
+            }
+            let root = resource_root.ok_or("custom book templates require a project root")?;
+            let root = root
+                .canonicalize()
+                .map_err(|error| format!("resolve project root: {error}"))?;
+            let path = root
+                .join(template)
+                .canonicalize()
+                .map_err(|error| format!("resolve custom book template: {error}"))?;
+            if !path.starts_with(&root) || !path.is_file() {
+                return Err("custom book template must be a project-local regular file".into());
+            }
+            Some(path)
+        } else {
+            None
+        };
         let (markdown, source_map) = ir.render_markdown();
         let mut auxiliary_files = Vec::new();
         let bytes = if format == CompileFormat::Markdown {
@@ -917,6 +942,9 @@ impl PandocRenderer {
                 for variable in design.pandoc_variables() {
                     command.arg(format!("--variable={variable}"));
                 }
+            }
+            if let Some(template) = &template_path {
+                command.arg("--template").arg(template);
             }
             if let Some(root) = resource_root {
                 command.arg(format!("--resource-path={}", root.display()));
@@ -1306,6 +1334,7 @@ mod tests {
             document_class: "book".into(),
             paper_size: "a4".into(),
             class_options: vec!["oneside".into(), "openany".into()],
+            template: None,
             geometry: "margin=0.8in".into(),
             font_size_pt: 10,
             line_spacing_hundredths: 118,
@@ -1315,5 +1344,60 @@ mod tests {
         assert!(profile.pandoc_variables().contains(&"fontsize=10pt".into()));
         let malicious = encoded.replace("margin=0.8in", "margin=0.8in\\\\input{evil}");
         assert!(BookDesignProfile::from_toml(&malicious).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn custom_latex_template_is_project_local_and_passed_to_pandoc() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let template = directory.path().join("templates/custom.tex");
+        std::fs::create_dir_all(template.parent().unwrap()).unwrap();
+        std::fs::write(
+            &template,
+            "\\documentclass{book}\\begin{document}$body$\\end{document}",
+        )
+        .unwrap();
+        let arguments = directory.path().join("arguments.txt");
+        let program = directory.path().join("pandoc-mock");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nwhile [ \"$1\" != \"--output\" ]; do shift; done\nshift\nprintf 'latex' > \"$1\"\ncat >/dev/null\n",
+                arguments.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut ir = CompileIr::new("Novel");
+        ir.push(CompileUnit {
+            id: "scene".into(),
+            parent_id: None,
+            kind: ContentUnitKind::Scene,
+            title: "Scene".into(),
+            segments: vec![CompileSegment::new("scene", "Prose.")],
+        });
+        let profile = BookDesignProfile {
+            version: 1,
+            name: "Custom".into(),
+            document_class: "book".into(),
+            paper_size: "letter".into(),
+            class_options: vec![],
+            template: Some("templates/custom.tex".into()),
+            geometry: "margin=1in".into(),
+            font_size_pt: 11,
+            line_spacing_hundredths: 120,
+        };
+        let renderer = PandocRenderer::with_program(&program);
+        let artifact = renderer
+            .render_with_profile(&ir, CompileFormat::Latex, Some(directory.path()), &profile)
+            .unwrap();
+        assert_eq!(artifact.bytes, b"latex");
+        let args = std::fs::read_to_string(&arguments).unwrap();
+        assert!(args.contains("--template"));
+        assert!(args.contains(template.to_str().unwrap()));
+        let mut escaping = profile;
+        escaping.template = Some("../outside.tex".into());
+        assert!(escaping.validate().is_err());
     }
 }
