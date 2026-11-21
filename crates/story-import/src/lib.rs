@@ -442,7 +442,7 @@ pub fn inspect_manuscript(path: impl AsRef<Path>) -> Result<ManuscriptStaging, I
     match source_type {
         SourceType::Docx => {
             let xml = read_zip_text(&bytes, "word/document.xml")?;
-            let blocks = extract_docx_blocks(&xml);
+            let blocks = extract_docx_blocks(&xml)?;
             split_blocks_into_units(&mut staging, blocks, "docx");
             if xml.contains("<w:tbl") {
                 staging
@@ -453,6 +453,12 @@ pub fn inspect_manuscript(path: impl AsRef<Path>) -> Result<ManuscriptStaging, I
                 staging
                     .unsupported
                     .push("Embedded images and drawings are not imported".into());
+            }
+            if xml.contains("<w:rPr") || xml.contains("<w:hyperlink") {
+                staging.unsupported.push(
+                    "Inline DOCX formatting and hyperlink semantics are flattened to plain text"
+                        .into(),
+                );
             }
             for feature in [
                 "<w:ins",
@@ -481,6 +487,11 @@ pub fn inspect_manuscript(path: impl AsRef<Path>) -> Result<ManuscriptStaging, I
                 staging
                     .unsupported
                     .push("Tables are flattened to text".into());
+            }
+            if xml.contains("<text:span") || xml.contains("<text:a ") {
+                staging.unsupported.push(
+                    "Inline ODT styling and hyperlink semantics are flattened to plain text".into(),
+                );
             }
         }
         SourceType::Rtf => {
@@ -563,24 +574,107 @@ fn read_zip_text(bytes: &[u8], member: &str) -> Result<String, ImportError> {
     Ok(text)
 }
 
-fn extract_docx_blocks(xml: &str) -> Vec<(String, bool)> {
+fn extract_docx_blocks(xml: &str) -> Result<Vec<(String, bool)>, ImportError> {
     let mut blocks = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find("<w:p") {
-        rest = &rest[start..];
-        let Some(end) = rest.find("</w:p>") else {
-            break;
-        };
-        let paragraph = &rest[..end];
-        let is_heading = paragraph.contains("w:pStyle")
-            && (paragraph.contains("Heading") || paragraph.contains("Title"));
-        let text = paragraph_xml_to_text(paragraph, "w:t");
-        if !text.trim().is_empty() {
-            blocks.push((text, is_heading));
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut in_paragraph = false;
+    let mut is_heading = false;
+    let mut paragraph = String::new();
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(event)) => match event.local_name().as_ref() {
+                b"p" => {
+                    in_paragraph = true;
+                    is_heading = false;
+                    paragraph.clear();
+                }
+                b"pStyle" if in_paragraph => {
+                    for attribute in event.attributes().flatten() {
+                        if attribute.key.local_name().as_ref() == b"val" {
+                            let style = attribute
+                                .decoded_and_normalized_value(
+                                    quick_xml::XmlVersion::Implicit1_0,
+                                    reader.decoder(),
+                                )
+                                .map_err(|error| ImportError::Archive(error.to_string()))?;
+                            is_heading = style.to_ascii_lowercase().contains("heading")
+                                || style.eq_ignore_ascii_case("title");
+                        }
+                    }
+                }
+                b"tab" if in_paragraph => paragraph.push('\t'),
+                b"br" | b"cr" if in_paragraph => paragraph.push('\n'),
+                _ => {}
+            },
+            Ok(quick_xml::events::Event::Empty(event)) if in_paragraph => {
+                match event.local_name().as_ref() {
+                    b"tab" => paragraph.push('\t'),
+                    b"br" | b"cr" => paragraph.push('\n'),
+                    b"pStyle" => {
+                        for attribute in event.attributes().flatten() {
+                            if attribute.key.local_name().as_ref() == b"val" {
+                                let style = attribute
+                                    .decoded_and_normalized_value(
+                                        quick_xml::XmlVersion::Implicit1_0,
+                                        reader.decoder(),
+                                    )
+                                    .map_err(|error| ImportError::Archive(error.to_string()))?;
+                                is_heading = style.to_ascii_lowercase().contains("heading")
+                                    || style.eq_ignore_ascii_case("title");
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Text(event)) if in_paragraph => {
+                let decoded = event
+                    .xml_content(quick_xml::XmlVersion::Implicit1_0)
+                    .map_err(|error| ImportError::Archive(error.to_string()))?;
+                paragraph.push_str(&decoded);
+            }
+            Ok(quick_xml::events::Event::GeneralRef(event)) if in_paragraph => {
+                let reference = event
+                    .xml_content(quick_xml::XmlVersion::Implicit1_0)
+                    .map_err(|error| ImportError::Archive(error.to_string()))?;
+                if let Some(character) = event
+                    .resolve_char_ref()
+                    .map_err(|error| ImportError::Archive(error.to_string()))?
+                {
+                    paragraph.push(character);
+                } else {
+                    paragraph.push_str(match reference.as_ref() {
+                        "amp" => "&",
+                        "lt" => "<",
+                        "gt" => ">",
+                        "quot" => "\"",
+                        "apos" => "'",
+                        unknown => {
+                            return Err(ImportError::Archive(format!(
+                                "unsupported XML entity reference: &{unknown};"
+                            )));
+                        }
+                    });
+                }
+            }
+            Ok(quick_xml::events::Event::End(event)) if event.local_name().as_ref() == b"p" => {
+                if !paragraph.trim().is_empty() {
+                    blocks.push((paragraph.clone(), is_heading));
+                }
+                in_paragraph = false;
+            }
+            Ok(quick_xml::events::Event::Eof) if in_paragraph => {
+                return Err(ImportError::Archive(
+                    "DOCX document ends inside a paragraph".into(),
+                ));
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(ImportError::Archive(error.to_string())),
         }
-        rest = &rest[end + 6..];
     }
-    blocks
+    Ok(blocks)
 }
 
 fn extract_odt_blocks(xml: &str) -> Vec<(String, bool)> {
@@ -987,7 +1081,7 @@ mod tests {
         archive(
             &docx,
             "word/document.xml",
-            "<w:document><w:body><w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:r><w:t>Chapter One</w:t></w:r></w:p><w:p><w:r><w:t>Élodie &amp; Sam.</w:t></w:r></w:p></w:body></w:document>",
+            "<w:document><w:body><w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:r><w:t>Chapter One</w:t></w:r></w:p><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Élodie &amp; Sam.</w:t><w:tab/><w:t>Still here.</w:t><w:br/><w:t>New line.</w:t></w:r></w:p></w:body></w:document>",
         );
         let source_before = std::fs::read(&docx).unwrap();
         let staged = inspect_manuscript(&docx).unwrap();
@@ -995,6 +1089,17 @@ mod tests {
         assert_eq!(staged.units.len(), 1);
         assert_eq!(staged.units[0].title, "Chapter One");
         assert!(staged.units[0].body_markdown.contains("Élodie & Sam."));
+        assert!(
+            staged.units[0]
+                .body_markdown
+                .contains("\tStill here.\nNew line.")
+        );
+        assert!(
+            staged
+                .unsupported
+                .iter()
+                .any(|item| item.contains("Inline DOCX"))
+        );
         assert_eq!(
             staged.source_fingerprint,
             format!("{:x}", Sha256::digest(&source_before))
@@ -1011,6 +1116,21 @@ mod tests {
         assert_eq!(staged.units.len(), 1);
         assert_eq!(staged.units[0].title, "Part One");
         assert!(staged.units[0].body_markdown.contains("First & foremost."));
+    }
+
+    #[test]
+    fn malformed_docx_xml_is_reported_instead_of_partially_imported() {
+        let directory = tempfile::tempdir().unwrap();
+        let docx = directory.path().join("malformed.docx");
+        archive(
+            &docx,
+            "word/document.xml",
+            "<w:document><w:p><w:t>unfinished",
+        );
+        assert!(matches!(
+            inspect_manuscript(&docx),
+            Err(ImportError::Archive(_))
+        ));
     }
 
     #[test]
