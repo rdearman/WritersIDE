@@ -10059,12 +10059,19 @@ fn format_search_result_row(title: &str, text: &str, byte_offset: usize) -> Stri
 
 fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     let area = f.area();
+    let focus_only = s.workspace == Workspace::Editor && s.editor_focus_mode;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),
+            Constraint::Length(if focus_only { 0 } else { 1 }),
             Constraint::Min(3),
-            Constraint::Length(if s.find_panel.is_some() { 6 } else { 2 }),
+            Constraint::Length(if focus_only {
+                0
+            } else if s.find_panel.is_some() {
+                6
+            } else {
+                2
+            }),
         ])
         .split(area);
     s.width = area.width as usize;
@@ -10288,7 +10295,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         } else {
             body[1]
         };
-        if !s.reference_panes.is_empty() {
+        if !s.reference_panes.is_empty() && !s.editor_focus_mode {
             let panes = Layout::default()
                 .direction(pane_direction(s.width))
                 .constraints([
@@ -16722,6 +16729,47 @@ mod tests {
         reopened.focus_main_editor();
         assert_eq!(reopened.cursor, (0, 5));
         assert_eq!(reopened.editor.join("\n"), "aXbcdef");
+    }
+
+    #[test]
+    fn focus_mode_hides_reference_panes_and_application_chrome() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Draft", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["PROSEVISIBLE".into()];
+        state.open_reference_buffer(
+            "research:fixture".into(),
+            None,
+            "Pinned reference".into(),
+            "REFERENCEHIDDEN".into(),
+        );
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(visible.contains("REFERENCEHIDDEN"));
+
+        state.editor_focus_mode = true;
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let focused = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(focused.contains("PROSEVISIBLE"));
+        assert!(!focused.contains("REFERENCEHIDDEN"));
+        assert!(!focused.contains("F1-F9"));
     }
 
     #[test]
