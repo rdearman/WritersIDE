@@ -7784,6 +7784,15 @@ fn run(
     }
     Ok(())
 }
+fn editor_grapheme_is_mentioned(byte_offset: u64, byte_len: u64, ranges: &[(u64, u64)]) -> bool {
+    let Some(end) = byte_offset.checked_add(byte_len) else {
+        return false;
+    };
+    ranges
+        .iter()
+        .any(|(start, finish)| *start < end && *finish > byte_offset)
+}
+
 fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     let area = f.area();
     let rows = Layout::default()
@@ -7842,6 +7851,21 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             f.render_stateful_widget(list, body[0], &mut state);
         }
         let selection = s.selection_bounds();
+        let mention_ranges = (!s.dirty)
+            .then_some(s.editing_scene)
+            .flatten()
+            .and_then(|scene| s.app.list_scene_mentions(scene).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|mention| matches!(mention.state.as_str(), "detected" | "confirmed"))
+            .map(|mention| (mention.start_byte, mention.end_byte))
+            .collect::<Vec<_>>();
+        let mut line_start_byte = s
+            .editor
+            .iter()
+            .take(s.scroll)
+            .map(|line| line.len() as u64 + 1)
+            .sum::<u64>();
         let content = s
             .editor
             .iter()
@@ -7850,20 +7874,32 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             .map(|(row, line)| {
                 let prefix = if row == s.cursor.0 { "> " } else { "  " };
                 let mut spans = vec![Span::raw(prefix)];
+                let mut byte_offset = line_start_byte;
                 for (col, ch) in line.graphemes(true).enumerate() {
                     let selected = selection.is_some_and(|((sr, sc), (er, ec))| {
                         (row > sr || (row == sr && col >= sc))
                             && (row < er || (row == er && col < ec))
                     });
+                    let decorated =
+                        editor_grapheme_is_mentioned(byte_offset, ch.len() as u64, &mention_ranges);
                     if selected {
                         spans.push(Span::styled(
                             ch.to_string(),
                             Style::default().fg(Color::White).bg(Color::Blue),
                         ));
+                    } else if decorated {
+                        spans.push(Span::styled(
+                            ch.to_string(),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::UNDERLINED),
+                        ));
                     } else {
                         spans.push(Span::raw(ch.to_string()));
                     }
+                    byte_offset += ch.len() as u64;
                 }
+                line_start_byte = byte_offset + 1;
                 Line::from(spans)
             })
             .collect::<Vec<_>>();
@@ -10867,6 +10903,20 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mention_highlighting_uses_utf8_byte_ranges_and_does_not_mark_adjacent_text() {
+        let text = "Éowyn met Éomer";
+        let start = text.find("Éomer").unwrap() as u64;
+        let end = start + "Éomer".len() as u64;
+        assert!(editor_grapheme_is_mentioned(
+            start,
+            "É".len() as u64,
+            &[(start, end)]
+        ));
+        assert!(!editor_grapheme_is_mentioned(start - 1, 1, &[(start, end)]));
+        assert!(!editor_grapheme_is_mentioned(end, 1, &[(start, end)]));
+    }
 
     #[test]
     fn command_shortcuts_load_from_registry_and_dispatch_without_replacing_slash_input() {
