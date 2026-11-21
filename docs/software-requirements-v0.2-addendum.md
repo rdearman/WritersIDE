@@ -225,3 +225,5 @@ Saved queries now include typed scalar custom-metadata equality predicates keyed
 Events can now have explicit `precedes` and `requires` dependency edges with notes. SQLite rejects self-links and dependency cycles, including direct SQL attempts. Inspection compares the recorded end and start story-time intervals and keeps ambiguous/missing dates UNKNOWN; manuscript disclosure order does not substitute for fictional chronology.
 
 Inspection queries now filter scenes by included membership in a named assembly and by any issue status. Coverage requirements now include POV, location and event, using stable entity relationships; mention-only character records remain excluded from presence coverage. These analytical projections do not reorder or mutate manuscript content.
+
+Entity-reference-list custom fields can now participate in saved scene queries through `meta-contains=FIELD-UUID:KIND:ENTITY-UUID`. The field's declared type/reference kind and the referenced entity are validated before saving; query results remain dynamic and read-only.

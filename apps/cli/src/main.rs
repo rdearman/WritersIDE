@@ -2129,6 +2129,28 @@ fn parse_scene_query_filter(
             };
             SceneQueryFilter::CustomMetadataEquals { field_id, value }
         }
+        "meta-contains" => {
+            let mut parts = value.splitn(3, ':');
+            let field_id = story_core::FieldId(
+                parts
+                    .next()
+                    .ok_or("meta-contains uses FIELD-UUID:KIND:ENTITY-UUID")?
+                    .parse()?,
+            );
+            let target_kind = parts
+                .next()
+                .ok_or("meta-contains uses FIELD-UUID:KIND:ENTITY-UUID")?
+                .to_owned();
+            let target_id = parts
+                .next()
+                .ok_or("meta-contains uses FIELD-UUID:KIND:ENTITY-UUID")?
+                .to_owned();
+            SceneQueryFilter::CustomMetadataContainsEntity {
+                field_id,
+                target_kind,
+                target_id,
+            }
+        }
         "plotline-any" => SceneQueryFilter::AnyPlotline(
             parse_ids(value)?
                 .into_iter()
@@ -2194,6 +2216,19 @@ mod watch_tests {
     };
     use std::fs;
     use story_app::WriterApp;
+    #[test]
+    fn custom_entity_reference_query_filter_parses_stable_identity() {
+        let field = uuid::Uuid::new_v4();
+        let entity = uuid::Uuid::new_v4();
+        assert_eq!(
+            parse_scene_query_filter(&format!("meta-contains={field}:character:{entity}")).unwrap(),
+            story_core::SceneQueryFilter::CustomMetadataContainsEntity {
+                field_id: story_core::FieldId(field),
+                target_kind: "character".into(),
+                target_id: entity.to_string(),
+            }
+        );
+    }
     #[test]
     fn watch_fingerprint_tracks_manuscript_and_ignores_generated_exports() {
         let root = tempfile::tempdir().unwrap();

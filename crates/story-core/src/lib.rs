@@ -718,6 +718,12 @@ pub enum SceneQueryFilter {
         field_id: FieldId,
         value: FieldValue,
     },
+    /// Matches a scene whose entity-reference-list field contains this target.
+    CustomMetadataContainsEntity {
+        field_id: FieldId,
+        target_kind: String,
+        target_id: String,
+    },
     TimeBefore(i64),
     TimeAfter(i64),
     UnresolvedIssue,

@@ -40,6 +40,7 @@ const MIGRATION_25: &str = include_str!("../migrations/0025_inspection_query_fil
 const MIGRATION_26: &str = include_str!("../migrations/0026_explicit_scene_absence.sql");
 const MIGRATION_27: &str = include_str!("../migrations/0027_event_dependencies.sql");
 const MIGRATION_28: &str = include_str!("../migrations/0028_assembly_issue_query_filters.sql");
+const MIGRATION_29: &str = include_str!("../migrations/0029_entity_ref_query_filters.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -240,6 +241,13 @@ fn compile_query_expression(
                 values.push(field_id.to_string());
                 values.push(encoded);
                 format!("EXISTS(SELECT 1 FROM custom_field_value cv WHERE cv.scene_id=s.id AND cv.field_id=? AND CAST(cv.{column} AS TEXT)=?)")
+            }
+            SceneQueryFilter::CustomMetadataContainsEntity { field_id, target_kind, target_id } => {
+                if !matches!(target_kind.as_str(), "scene" | "character" | "location" | "object" | "plotline" | "event") {
+                    return Err(StorageError::Invalid(format!("unsupported custom-metadata entity kind: {target_kind}")));
+                }
+                values.extend([field_id.to_string(), target_kind.clone(), target_id.clone()]);
+                "EXISTS(SELECT 1 FROM custom_field_entity_ref r WHERE r.scene_id=s.id AND r.field_id=? AND r.target_kind=? AND r.target_id=?)".into()
             }
             SceneQueryFilter::TimeBefore(tick) => {
                 values.push(tick.to_string());
@@ -823,7 +831,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_19}\nINSERT INTO schema_migrations(version,applied_at) VALUES(19,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_20}\nINSERT INTO schema_migrations(version,applied_at) VALUES(20,'{}');\nCOMMIT;", now()))?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\n{MIGRATION_25}\nINSERT INTO schema_migrations(version,applied_at) VALUES(25,'{}');\n{MIGRATION_26}\nINSERT INTO schema_migrations(version,applied_at) VALUES(26,'{}');\n{MIGRATION_27}\nINSERT INTO schema_migrations(version,applied_at) VALUES(27,'{}');\n{MIGRATION_28}\nINSERT INTO schema_migrations(version,applied_at) VALUES(28,'{}');\nCOMMIT;", now(), now(), now(), now(), now(), now(), now(), now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\n{MIGRATION_25}\nINSERT INTO schema_migrations(version,applied_at) VALUES(25,'{}');\n{MIGRATION_26}\nINSERT INTO schema_migrations(version,applied_at) VALUES(26,'{}');\n{MIGRATION_27}\nINSERT INTO schema_migrations(version,applied_at) VALUES(27,'{}');\n{MIGRATION_28}\nINSERT INTO schema_migrations(version,applied_at) VALUES(28,'{}');\n{MIGRATION_29}\nINSERT INTO schema_migrations(version,applied_at) VALUES(29,'{}');\nCOMMIT;", now(), now(), now(), now(), now(), now(), now(), now(), now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
@@ -866,7 +874,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 28 {
+        if version > 29 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -979,6 +987,10 @@ impl ProjectStore {
         }
         if current_version == 27 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_28}\nINSERT INTO schema_migrations(version,applied_at) VALUES(28,'{}');\nCOMMIT;", now()))?;
+            current_version = 28;
+        }
+        if current_version == 28 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_29}\nINSERT INTO schema_migrations(version,applied_at) VALUES(29,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -6252,7 +6264,29 @@ impl ProjectStore {
             ));
         }
         for filter in &query.filters {
-            if let SceneQueryFilter::CustomMetadataEquals { field_id, value } = filter {
+            if let SceneQueryFilter::CustomMetadataContainsEntity {
+                field_id,
+                target_kind,
+                target_id,
+            } = filter
+            {
+                let (kind, reference_kind): (String, Option<String>) = self
+                    .conn
+                    .query_row(
+                        "SELECT field_type,reference_kind FROM custom_field_definition WHERE id=?1",
+                        [field_id.to_string()],
+                        |row| Ok((row.get(0)?, row.get(1)?)),
+                    )
+                    .map_err(|_| StorageError::NotFound(field_id.to_string()))?;
+                if kind != "entity_refs" || reference_kind.as_deref() != Some(target_kind.as_str())
+                {
+                    return Err(StorageError::Invalid(
+                        "entity membership filter must match an entity-reference-list field kind"
+                            .into(),
+                    ));
+                }
+                validate_entity_ref(&self.conn, Some(target_kind), target_id)?;
+            } else if let SceneQueryFilter::CustomMetadataEquals { field_id, value } = filter {
                 if matches!(value, FieldValue::EntityRefs(_)) {
                     return Err(StorageError::Invalid(
                         "entity-reference lists cannot be compared for equality".into(),
@@ -6345,6 +6379,15 @@ impl ProjectStore {
                 SceneQueryFilter::CustomMetadataEquals { field_id, value } => (
                     "custom_metadata_equals",
                     serde_json::to_string(&(field_id, value))
+                        .map_err(|error| StorageError::Invalid(error.to_string()))?,
+                ),
+                SceneQueryFilter::CustomMetadataContainsEntity {
+                    field_id,
+                    target_kind,
+                    target_id,
+                } => (
+                    "custom_metadata_contains_entity",
+                    serde_json::to_string(&(field_id, target_kind, target_id))
                         .map_err(|error| StorageError::Invalid(error.to_string()))?,
                 ),
                 SceneQueryFilter::TimeBefore(tick) => ("time_before", tick.to_string()),
@@ -6560,6 +6603,13 @@ impl ProjectStore {
                     let (field_id, value): (FieldId, FieldValue) = serde_json::from_str(&value)
                         .map_err(|error| StorageError::Invalid(format!("invalid custom metadata query: {error}")))?;
                     let expression = QueryExpression::Filter(SceneQueryFilter::CustomMetadataEquals { field_id, value });
+                    sql.push_str(" AND ");
+                    sql.push_str(&compile_query_expression(&expression, &mut values)?);
+                }
+                "custom_metadata_contains_entity" => {
+                    let (field_id, target_kind, target_id) = serde_json::from_str(&value)
+                        .map_err(|error| StorageError::Invalid(format!("invalid custom entity query: {error}")))?;
+                    let expression = QueryExpression::Filter(SceneQueryFilter::CustomMetadataContainsEntity { field_id, target_kind, target_id });
                     sql.push_str(" AND ");
                     sql.push_str(&compile_query_expression(&expression, &mut values)?);
                 }
@@ -9622,7 +9672,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 28))
+            .map(|version| assert_eq!(version, 29))
             .unwrap();
     }
 
@@ -9886,7 +9936,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 28);
+        assert_eq!(version, 29);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -10506,6 +10556,35 @@ mod tests {
                 .unwrap(),
             vec![sc]
         );
+        let refs_field = FieldId::new();
+        s.define_custom_field(&CustomFieldDefinition {
+            id: refs_field,
+            name: "Referenced people".into(),
+            field_type: FieldType::EntityRefs,
+            required: false,
+            default_value: None,
+            enum_values: vec![],
+            reference_kind: Some("character".into()),
+        })
+        .unwrap();
+        s.set_custom_field(
+            sc,
+            refs_field,
+            &FieldValue::EntityRefs(vec![char.to_string()]),
+        )
+        .unwrap();
+        let entity_query = SavedSceneQuery {
+            id: QueryId::new(),
+            name: "scenes referencing Mara in metadata".into(),
+            description: String::new(),
+            filters: vec![SceneQueryFilter::CustomMetadataContainsEntity {
+                field_id: refs_field,
+                target_kind: "character".into(),
+                target_id: char.to_string(),
+            }],
+        };
+        s.save_scene_query(&entity_query).unwrap();
+        assert_eq!(s.run_scene_query(entity_query.id).unwrap(), vec![sc]);
         s.validate().unwrap();
         let ev1 = EventId::new();
         let ev2 = EventId::new();

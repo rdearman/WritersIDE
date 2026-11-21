@@ -5570,6 +5570,28 @@ impl AppState {
                         };
                         story_core::SceneQueryFilter::CustomMetadataEquals { field_id, value }
                     }
+                    "meta-contains" => {
+                        let mut parts = value.splitn(3, ':');
+                        let field_id = story_core::FieldId(
+                            parts
+                                .next()
+                                .ok_or("meta-contains uses FIELD-UUID:KIND:ENTITY-UUID")?
+                                .parse()?,
+                        );
+                        let target_kind = parts
+                            .next()
+                            .ok_or("meta-contains uses FIELD-UUID:KIND:ENTITY-UUID")?
+                            .to_owned();
+                        let target_id = parts
+                            .next()
+                            .ok_or("meta-contains uses FIELD-UUID:KIND:ENTITY-UUID")?
+                            .to_owned();
+                        story_core::SceneQueryFilter::CustomMetadataContainsEntity {
+                            field_id,
+                            target_kind,
+                            target_id,
+                        }
+                    }
                     "character-any" => story_core::SceneQueryFilter::AnyCharacter(
                         value
                             .split(',')
