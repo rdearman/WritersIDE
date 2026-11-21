@@ -30,6 +30,7 @@ const MIGRATION_15: &str = include_str!("../migrations/0015_manuscript_assemblie
 const MIGRATION_16: &str = include_str!("../migrations/0016_planning_boards.sql");
 const MIGRATION_17: &str = include_str!("../migrations/0017_project_language.sql");
 const MIGRATION_18: &str = include_str!("../migrations/0018_writing_challenges.sql");
+const MIGRATION_19: &str = include_str!("../migrations/0019_query_assertions.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -527,6 +528,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_16}\nINSERT INTO schema_migrations(version,applied_at) VALUES(16,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_17}\nINSERT INTO schema_migrations(version,applied_at) VALUES(17,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_19}\nINSERT INTO schema_migrations(version,applied_at) VALUES(19,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
@@ -569,7 +571,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 18 {
+        if version > 19 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -642,6 +644,10 @@ impl ProjectStore {
         }
         if current_version == 17 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
+            current_version = 18;
+        }
+        if current_version == 18 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_19}\nINSERT INTO schema_migrations(version,applied_at) VALUES(19,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -5291,6 +5297,89 @@ impl ProjectStore {
         tx.commit()?;
         Ok(())
     }
+    pub fn set_query_assertions(
+        &mut self,
+        query: QueryId,
+        assertions: &[QueryAssertion],
+    ) -> Result<()> {
+        let exists: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM saved_query WHERE id=?1)",
+            [query.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StorageError::NotFound(query.to_string()));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM saved_query_assertion WHERE query_id=?1",
+            [query.to_string()],
+        )?;
+        for (ordinal, assertion) in assertions.iter().enumerate() {
+            let (kind, threshold) = match assertion {
+                QueryAssertion::AtLeast(value) => (
+                    "at_least",
+                    Some(i64::try_from(*value).map_err(|_| {
+                        StorageError::Invalid(
+                            "assertion threshold exceeds SQLite integer range".into(),
+                        )
+                    })?),
+                ),
+                QueryAssertion::AtMost(value) => (
+                    "at_most",
+                    Some(i64::try_from(*value).map_err(|_| {
+                        StorageError::Invalid(
+                            "assertion threshold exceeds SQLite integer range".into(),
+                        )
+                    })?),
+                ),
+                QueryAssertion::Exactly(value) => (
+                    "exactly",
+                    Some(i64::try_from(*value).map_err(|_| {
+                        StorageError::Invalid(
+                            "assertion threshold exceeds SQLite integer range".into(),
+                        )
+                    })?),
+                ),
+                QueryAssertion::NonEmpty => ("non_empty", None),
+                QueryAssertion::Empty => ("empty", None),
+            };
+            tx.execute("INSERT INTO saved_query_assertion(query_id,ordinal,assertion_kind,threshold) VALUES(?1,?2,?3,?4)", params![query.to_string(), ordinal as i64, kind, threshold])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn get_query_assertions(&self, query: QueryId) -> Result<Vec<QueryAssertion>> {
+        let mut statement = self.conn.prepare("SELECT assertion_kind,threshold FROM saved_query_assertion WHERE query_id=?1 ORDER BY ordinal")?;
+        let rows = statement.query_map([query.to_string()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+        rows.map(|row| {
+            let (kind, threshold) = row?;
+            let numeric = || {
+                threshold
+                    .and_then(|value| u64::try_from(value).ok())
+                    .ok_or_else(|| {
+                        StorageError::Invalid(format!("invalid assertion threshold for {kind}"))
+                    })
+            };
+            Ok(match kind.as_str() {
+                "at_least" => QueryAssertion::AtLeast(numeric()?),
+                "at_most" => QueryAssertion::AtMost(numeric()?),
+                "exactly" => QueryAssertion::Exactly(numeric()?),
+                "non_empty" if threshold.is_none() => QueryAssertion::NonEmpty,
+                "empty" if threshold.is_none() => QueryAssertion::Empty,
+                _ => {
+                    return Err(StorageError::Invalid(format!(
+                        "invalid saved query assertion {kind}"
+                    )));
+                }
+            })
+        })
+        .collect()
+    }
     pub fn list_saved_queries(&self) -> Result<Vec<SavedQuerySummary>> {
         let mut stmt = self
             .conn
@@ -7517,6 +7606,18 @@ mod tests {
             filters: vec![SceneQueryFilter::Character(character)],
         };
         st.save_scene_query(&query).unwrap();
+        let assertions = [
+            QueryAssertion::AtLeast(1),
+            QueryAssertion::AtMost(3),
+            QueryAssertion::NonEmpty,
+        ];
+        st.set_query_assertions(query.id, &assertions).unwrap();
+        assert_eq!(st.get_query_assertions(query.id).unwrap(), assertions);
+        assert!(st.set_query_assertions(QueryId::new(), &[]).is_err());
+        assert!(
+            st.set_query_assertions(query.id, &[QueryAssertion::Exactly(u64::MAX)])
+                .is_err()
+        );
         assert_eq!(st.list_saved_queries().unwrap()[0].name, "Mara scenes");
         assert_eq!(st.run_scene_query(query.id).unwrap(), vec![second]);
         st.link_character(first, character, ParticipationRole::Minor)
@@ -7524,6 +7625,9 @@ mod tests {
         assert_eq!(st.run_scene_query(query.id).unwrap(), vec![first, second]);
         let order = query_scene_ids(&st.conn, &chapter.to_string()).unwrap();
         assert_eq!(order, vec![first.to_string(), second.to_string()]);
+        drop(st);
+        let reopened = ProjectStore::open(d.path().join("N")).unwrap();
+        assert_eq!(reopened.get_query_assertions(query.id).unwrap(), assertions);
     }
 
     #[test]
@@ -7774,7 +7878,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -7784,7 +7888,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 18);
+        assert_eq!(version, 19);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -7813,7 +7917,7 @@ mod tests {
 
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch(
-            "DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
+            "DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
              DROP TRIGGER story_link_source_exists_insert;
              DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update;
              DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update;

@@ -533,6 +533,15 @@ pub struct SavedSceneQuery {
     pub filters: Vec<SceneQueryFilter>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum QueryAssertion {
+    AtLeast(u64),
+    AtMost(u64),
+    Exactly(u64),
+    NonEmpty,
+    Empty,
+}
+
 #[derive(Debug, Error)]
 pub enum DomainError {
     #[error("invalid story time: {0}")]

@@ -655,28 +655,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let rule = args
                 .next()
                 .ok_or("missing assertion: non-empty|empty|at-least:N|at-most:N|exactly:N")?;
-            let assertion = match rule.as_str() {
-                "non-empty" => story_analysis::QueryAssertion::NonEmpty,
-                "empty" => story_analysis::QueryAssertion::Empty,
-                _ => {
-                    let (kind, number) = rule
-                        .split_once(':')
-                        .ok_or("assertion requires a numeric value")?;
-                    let number = number.parse::<usize>()?;
-                    match kind {
-                        "at-least" => story_analysis::QueryAssertion::AtLeast(number),
-                        "at-most" => story_analysis::QueryAssertion::AtMost(number),
-                        "exactly" => story_analysis::QueryAssertion::Exactly(number),
-                        _ => return Err("unknown assertion kind".into()),
-                    }
-                }
-            };
+            let assertion = parse_query_assertion(&rule)?;
             let app = WriterApp::open_project(path)?;
             let count = app.run_scene_query(id)?.len();
             let report = story_analysis::evaluate_query_assertion(count, &assertion);
             println!("{}", serde_json::to_string_pretty(&report)?);
             if !report.passed {
                 return Err("saved query assertion failed".into());
+            }
+        }
+        "query-assert-save" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = QueryId(args.next().ok_or("missing query ID")?.parse()?);
+            let assertions = args
+                .map(|value| parse_query_assertion(&value))
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut app = WriterApp::open_project(path)?;
+            app.set_query_assertions(id, &assertions)?;
+            println!("Saved {} assertion(s) for query {id}", assertions.len());
+        }
+        "query-assert-check" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = QueryId(args.next().ok_or("missing query ID")?.parse()?);
+            let app = WriterApp::open_project(path)?;
+            let assertions = app.get_query_assertions(id)?;
+            if assertions.is_empty() {
+                return Err("query has no saved assertions".into());
+            }
+            let count = app.run_scene_query(id)?.len();
+            let reports = assertions
+                .iter()
+                .map(|assertion| story_analysis::evaluate_query_assertion(count, assertion))
+                .collect::<Vec<_>>();
+            println!("{}", serde_json::to_string_pretty(&reports)?);
+            if reports.iter().any(|report| !report.passed) {
+                return Err("one or more saved query assertions failed".into());
             }
         }
         "coverage" => {
@@ -1346,6 +1359,31 @@ fn dimension_label(dimension: story_analysis::CoverageDimension) -> &'static str
     }
 }
 
+fn parse_query_assertion(
+    value: &str,
+) -> Result<story_core::QueryAssertion, Box<dyn std::error::Error>> {
+    match value {
+        "non-empty" => Ok(story_core::QueryAssertion::NonEmpty),
+        "empty" => Ok(story_core::QueryAssertion::Empty),
+        _ => {
+            let (kind, threshold) = value
+                .split_once(':')
+                .ok_or("numeric assertion must be kind:threshold")?;
+            let threshold = threshold.parse::<u64>()?;
+            Ok(match kind {
+                "at-least" => story_core::QueryAssertion::AtLeast(threshold),
+                "at-most" => story_core::QueryAssertion::AtMost(threshold),
+                "exactly" => story_core::QueryAssertion::Exactly(threshold),
+                _ => {
+                    return Err(
+                        "assertion must be at-least, at-most, exactly, non-empty, or empty".into(),
+                    );
+                }
+            })
+        }
+    }
+}
+
 fn validate_scene_scope(scope: &str) -> Result<(), Box<dyn std::error::Error>> {
     if scope == "all" {
         return Ok(());
@@ -1376,6 +1414,9 @@ fn usage() {
     eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");
     eprintln!("writers-ide import-manuscript <source-file> <new-project-directory> [title]");
     eprintln!("writers-ide browse <project> [loopback-port]");
+    eprintln!(
+        "writers-ide query-assert-save <project> <query-uuid> <non-empty|empty|at-least:N|at-most:N|exactly:N>...\nwriters-ide query-assert-check <project> <query-uuid>"
+    );
     eprintln!(
         "writers-ide proofread-config <project> (creates editable .writers-ide/diagnostics.toml)"
     );

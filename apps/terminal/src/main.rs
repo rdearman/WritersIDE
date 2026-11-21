@@ -718,6 +718,8 @@ fn command_registry() -> Vec<CommandSpec> {
             "query-clear",
             false,
         ),
+        legacy_command("search.query-assert-save", "Save Query Assertions", "Persist count assertions for a saved query", "View", "query-assert-save", true),
+        legacy_command("search.query-assert-check", "Check Query Assertions", "Evaluate saved count assertions against refreshed results", "View", "query-assert-check", true),
         legacy_command(
             "link.create",
             "Create Story Link",
@@ -1423,6 +1425,32 @@ fn parse_macro_recipe(
             }
         })
         .collect()
+}
+
+fn parse_terminal_query_assertion(
+    value: &str,
+) -> Result<story_core::QueryAssertion, Box<dyn std::error::Error>> {
+    match value {
+        "non-empty" => Ok(story_core::QueryAssertion::NonEmpty),
+        "empty" => Ok(story_core::QueryAssertion::Empty),
+        _ => {
+            let (kind, value) = value
+                .split_once(':')
+                .ok_or("numeric assertion must be kind:threshold")?;
+            let value = value.parse::<u64>()?;
+            Ok(match kind {
+                "at-least" => story_core::QueryAssertion::AtLeast(value),
+                "at-most" => story_core::QueryAssertion::AtMost(value),
+                "exactly" => story_core::QueryAssertion::Exactly(value),
+                _ => {
+                    return Err(
+                        "assertion kind must be at-least, at-most, exactly, empty, or non-empty"
+                            .into(),
+                    );
+                }
+            })
+        }
+    }
 }
 
 fn default_bindings() -> Vec<(u8, Workspace)> {
@@ -4006,6 +4034,42 @@ impl AppState {
             self.search_hits.clear();
             self.selected = 0;
             self.message = "Saved query view cleared".into();
+        } else if let Some(rest) = cmd.strip_prefix("query-assert-save ") {
+            let mut parts = rest.split_whitespace();
+            let query = story_core::QueryId(
+                parts
+                    .next()
+                    .ok_or("use query-assert-save QUERY-UUID RULE...")?
+                    .parse()?,
+            );
+            let assertions = parts
+                .map(parse_terminal_query_assertion)
+                .collect::<Result<Vec<_>, _>>()?;
+            self.app.set_query_assertions(query, &assertions)?;
+            self.message = format!("Saved {} query assertion(s)", assertions.len());
+        } else if let Some(value) = cmd.strip_prefix("query-assert-check ") {
+            let query = story_core::QueryId(value.trim().parse()?);
+            let assertions = self.app.get_query_assertions(query)?;
+            if assertions.is_empty() {
+                return Err("query has no saved assertions".into());
+            }
+            let actual = self.app.run_scene_query(query)?.len();
+            let results = assertions
+                .iter()
+                .map(|assertion| story_analysis::evaluate_query_assertion(actual, assertion))
+                .collect::<Vec<_>>();
+            self.message = results
+                .iter()
+                .map(|result| {
+                    format!(
+                        "{} {} (actual {})",
+                        if result.passed { "PASS" } else { "FAIL" },
+                        result.expectation,
+                        result.actual
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
         } else if let Some(rest) = cmd.strip_prefix("link ") {
             let mut parts = rest.splitn(6, ' ');
             let source_kind = parts.next().ok_or("missing source kind")?;
@@ -4241,7 +4305,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert via CLI | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | multi-insert BYTE,BYTE,... TEXT | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [steady|kamikaze] | challenge-finish | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | multi-insert BYTE,BYTE,... TEXT | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [steady|kamikaze] | challenge-finish | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -6888,6 +6952,34 @@ mod tests {
         assert!(rows[0].contains("5/10 words"));
         assert!(rows[0].contains("██████████░░░░░░░░░░"));
         assert!(rows[1].contains("████████████████████"));
+    }
+
+    #[test]
+    fn terminal_persists_and_checks_saved_query_assertions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let chapter = project.create_chapter(None, "Chapter", 0).unwrap();
+        project.create_scene(chapter, "One", 0).unwrap();
+        let query = story_core::SavedSceneQuery {
+            id: story_core::QueryId::new(),
+            name: "All scenes".into(),
+            description: String::new(),
+            filters: vec![],
+        };
+        project.save_scene_query(&query).unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.prompt = format!("query-assert-save {} exactly:1 non-empty", query.id);
+        state.command().unwrap();
+        state.prompt = format!("query-assert-check {}", query.id);
+        state.command().unwrap();
+        assert!(state.message.contains("PASS exactly 1"));
+        assert_eq!(
+            state.app.get_query_assertions(query.id).unwrap(),
+            [
+                story_core::QueryAssertion::Exactly(1),
+                story_core::QueryAssertion::NonEmpty
+            ]
+        );
     }
 
     #[test]

@@ -205,7 +205,7 @@ Issue #14 now has UTF-8 safe snippet expansion, saved macros, persistent snippet
 
 Issue #5 adds persisted challenge start/deadline/target/mode/results, terminal countdown and word-delta recording, CLI controls, and bounded per-challenge progress bars in Analytics. Challenge history supplies a basic session ledger; project-wide cumulative graphs and chapter/scene target reports remain open.
 
-Issue #15 adds read-only character/plotline scene coverage checks exposed through `coverage`, plus saved-query count assertions exposed through `query-assert`. Coverage/assertion authoring UI and persistent assertion definitions remain outstanding.
+Issue #15 adds read-only character/plotline scene coverage checks exposed through `coverage`, plus persisted saved-query count assertions exposed through `query-assert-save`/`query-assert-check` in CLI and terminal. Coverage authoring UI remains outstanding.
 
 Issue #16 adds `compile-watch`, which recompiles on changes to project metadata, database or manuscript source while preserving the last successful output on failure. Assemblies support alternate editions; edition dictionaries and declarative build recipes remain outstanding.
 

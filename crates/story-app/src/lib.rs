@@ -1088,6 +1088,16 @@ impl WriterApp {
     pub fn run_scene_query(&self, query: QueryId) -> Result<Vec<SceneId>> {
         Ok(self.store.run_scene_query(query)?)
     }
+    pub fn set_query_assertions(
+        &mut self,
+        query: QueryId,
+        assertions: &[QueryAssertion],
+    ) -> Result<()> {
+        Ok(self.store.set_query_assertions(query, assertions)?)
+    }
+    pub fn get_query_assertions(&self, query: QueryId) -> Result<Vec<QueryAssertion>> {
+        Ok(self.store.get_query_assertions(query)?)
+    }
     pub fn search_scenes(&self, terms: &str) -> Result<Vec<SceneId>> {
         Ok(self.store.search_scenes(terms)?)
     }

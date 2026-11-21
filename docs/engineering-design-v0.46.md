@@ -236,7 +236,7 @@ Migration 0018 adds durable writing challenge records with target words, start/d
 
 ### Issue #15 — Advanced inspection foundation
 
-The analysis crate evaluates saved-query count assertions (`empty`, `non-empty`, `at-least`, `at-most`, and `exactly`) and read-only character/plotline scene-coverage requirements. CLI `query-assert` evaluates a saved query against the current project snapshot; `coverage` checks minimum scene appearances for a character or plotline. Both return a failing exit status when the requirement is unmet. Coverage results identify matching scene IDs, required minimum coverage and whether the requirement is met. Persistent assertion documents, coverage UI, arbitrary query expression evaluation and broader assertion operators remain open.
+Migration 0019 persists typed count assertions on saved queries. CLI `query-assert-save`/`query-assert-check` and terminal `query-assert-save`/`query-assert-check` save and evaluate assertion sets against refreshed results. The analysis crate also evaluates read-only character/plotline scene-coverage requirements; CLI `coverage` checks a minimum appearance count. Checks report actual counts and return a failing status when unmet. Coverage configuration UI, arbitrary query expression evaluation, and broader assertion operators remain open.
 
 ### Issue #16 — Compile automation foundation
 

@@ -379,15 +379,6 @@ pub fn evaluate_coverage(
 }
 
 /// A saved-query assertion is a declarative expectation over the current result set.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum QueryAssertion {
-    AtLeast(usize),
-    AtMost(usize),
-    Exactly(usize),
-    NonEmpty,
-    Empty,
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct AssertionResult {
     pub passed: bool,
@@ -395,13 +386,17 @@ pub struct AssertionResult {
     pub expectation: String,
 }
 
-pub fn evaluate_query_assertion(actual: usize, assertion: &QueryAssertion) -> AssertionResult {
+pub fn evaluate_query_assertion(
+    actual: usize,
+    assertion: &story_core::QueryAssertion,
+) -> AssertionResult {
+    let actual_u64 = u64::try_from(actual).unwrap_or(u64::MAX);
     let (passed, expectation) = match assertion {
-        QueryAssertion::AtLeast(n) => (actual >= *n, format!("at least {n}")),
-        QueryAssertion::AtMost(n) => (actual <= *n, format!("at most {n}")),
-        QueryAssertion::Exactly(n) => (actual == *n, format!("exactly {n}")),
-        QueryAssertion::NonEmpty => (actual > 0, "non-empty".into()),
-        QueryAssertion::Empty => (actual == 0, "empty".into()),
+        story_core::QueryAssertion::AtLeast(n) => (actual_u64 >= *n, format!("at least {n}")),
+        story_core::QueryAssertion::AtMost(n) => (actual_u64 <= *n, format!("at most {n}")),
+        story_core::QueryAssertion::Exactly(n) => (actual_u64 == *n, format!("exactly {n}")),
+        story_core::QueryAssertion::NonEmpty => (actual > 0, "non-empty".into()),
+        story_core::QueryAssertion::Empty => (actual == 0, "empty".into()),
     };
     AssertionResult {
         passed,
@@ -442,8 +437,8 @@ mod inspection_tests {
         let coverage = evaluate_coverage(&scenes, &[requirement]);
         assert_eq!(coverage[0].matching_scene_ids, ["s1"]);
         assert!(!coverage[0].coverage_met);
-        assert!(evaluate_query_assertion(1, &QueryAssertion::Exactly(1)).passed);
-        assert!(!evaluate_query_assertion(0, &QueryAssertion::NonEmpty).passed);
+        assert!(evaluate_query_assertion(1, &story_core::QueryAssertion::Exactly(1)).passed);
+        assert!(!evaluate_query_assertion(0, &story_core::QueryAssertion::NonEmpty).passed);
     }
 }
 
