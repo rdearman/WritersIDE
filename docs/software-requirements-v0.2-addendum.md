@@ -180,3 +180,21 @@ The import crate now performs read-only DOCX, RTF, ODT, and EPUB inventory into 
 ### Issue #19 — Editorial merge foundation
 
 The review layer now inventories DOCX insertion/deletion markup and comments with author/date/comment IDs (`review-inspect`), and performs a line-oriented three-way merge from a base manuscript, current local scene, and reviewed external text. Non-overlapping edits merge automatically; overlapping edits return explicit base/local/external conflict regions and leave canonical text unchanged. CLI `review-merge <project> <scene-uuid> <base-file> <review-file>` and terminal `review-merge` use this merge through the journaled scene save. Mapping DOCX markup to anchored scene edits, side-by-side terminal conflict resolution, and one-hunk acceptance are not yet implemented.
+
+### Issue #17 — Local browser planning and review foundation
+
+An optional standard-library HTTP server (`writers-ide browse <project> [port]`) binds only to IPv4 loopback. The browser view reads the shared project hierarchy, scene metadata, character and plotline participation, and scene prose by stable ID; browser prose review is read-only and is served from the project application API. Browser planning edits use explicit local application-service calls. The server makes no external network calls.
+
+The browser now supports chapter/scene creation, scene synopsis/status changes, and scene moves through the same WriterApp services used by the terminal. Its JSON projection includes stable-ID planning nodes and graph edges for placements, character participation, plotlines, events, locations, and story links; prose remains served through GET only. Host/origin validation complements the loopback bind. Query editing, all Story Bible and issue workflows, full workspace parity, and browser visualization of the graph remain open.
+
+### Issue #10 — Configurable deterministic diagnostics foundation
+
+Mechanical proofing now loads an optional project-local `.writers-ide/diagnostics.toml` rule set. It supports the existing repeated-word, double-space, and space-before-punctuation checks plus bounded Rust-regex rules; each rule has a stable ID, enabled flag, severity and message. Invalid config and regex patterns fail visibly. CLI `proofread-config` writes a default file without overwriting an existing one; CLI and terminal proofread commands use the project config and return UTF-8 byte ranges. Findings remain advisory and do not modify prose. Broader publishing/continuity rule families, dictionary-backed spelling, rule scoping and severity filtering remain incomplete.
+
+### Issue #1 — Hypertext and knowledge workflows status
+
+Existing stable-ID links, passage anchors, backlinks, broken-link checks, typed document inclusion/transclusion, cycle detection, Reading materials, annotations/bookmarks, term indexes, and explicit evidence-checked knowledge approval are available in the application and terminal workflows. Imported Reading files remain unchanged and link targets are navigable through entity IDs. Cross-document transclusion and provisional extraction provenance are covered by storage/app tests. Rich passage-level annotations across all imported formats and a graphical knowledge map remain future work.
+
+### Issue #9 — Chronology and structured relationships status
+
+Scenes and events use optional signed-integer `StoryTime` values with unknown/approximate/bounded precision, source labels, start/end values, and checked duration arithmetic. Character participation, scene-event links, locations, plotlines, and story links are separate relationships from manuscript placement. Timeline views and deterministic uncertainty-aware diagnostics distinguish definite overlaps, possible overlaps, unknown time, and adjacency. Full fictional-calendar display/entry tools and interactive multi-entity timeline editing remain open.

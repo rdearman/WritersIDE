@@ -3706,13 +3706,14 @@ impl AppState {
             let mut rows = Vec::new();
             for record in records {
                 let (text, _) = self.app.load_scene_text(record.scene.id)?;
-                for finding in story_analysis::proofread(&text) {
+                for finding in self.app.proofread_text(&text)? {
                     rows.push(format!(
-                        "{} {}..{} {} · {}",
+                        "{} {}..{} {} {} · {}",
                         record.scene.title,
                         finding.byte_range.start,
                         finding.byte_range.end,
                         finding.category,
+                        finding.severity,
                         finding.message
                     ));
                 }

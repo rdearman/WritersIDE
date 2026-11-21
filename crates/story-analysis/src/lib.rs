@@ -1,18 +1,117 @@
 //! Read-only analytical projections over the canonical story model.
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use story_core::{ParticipationRole, TimeOrdering};
 use unicode_segmentation::UnicodeSegmentation;
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProofreadingConfig {
+    pub version: u16,
+    pub rules: Vec<ProofreadingRule>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProofreadingRule {
+    pub id: String,
+    pub enabled: bool,
+    /// Built-ins: `repeated-word`, `double-space`, `space-before-punctuation`; custom: `regex`.
+    pub kind: String,
+    pub pattern: Option<String>,
+    pub severity: String,
+    pub message: String,
+}
+
+impl Default for ProofreadingConfig {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            rules: vec![
+                ProofreadingRule {
+                    id: "repeated-word".into(),
+                    enabled: true,
+                    kind: "repeated-word".into(),
+                    pattern: None,
+                    severity: "warning".into(),
+                    message: "Repeated word".into(),
+                },
+                ProofreadingRule {
+                    id: "double-space".into(),
+                    enabled: true,
+                    kind: "double-space".into(),
+                    pattern: None,
+                    severity: "information".into(),
+                    message: "Repeated spaces".into(),
+                },
+                ProofreadingRule {
+                    id: "space-before-punctuation".into(),
+                    enabled: true,
+                    kind: "space-before-punctuation".into(),
+                    pattern: None,
+                    severity: "information".into(),
+                    message: "Space before punctuation".into(),
+                },
+            ],
+        }
+    }
+}
+
+impl ProofreadingConfig {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err(format!(
+                "unsupported diagnostics configuration version {}",
+                self.version
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for rule in &self.rules {
+            if rule.id.trim().is_empty() || !ids.insert(rule.id.as_str()) {
+                return Err(format!(
+                    "diagnostic rule ID is empty or duplicated: {}",
+                    rule.id
+                ));
+            }
+            if !matches!(rule.severity.as_str(), "error" | "warning" | "information") {
+                return Err(format!("invalid severity in rule {}", rule.id));
+            }
+            match rule.kind.as_str() {
+                "repeated-word" | "double-space" | "space-before-punctuation" => {}
+                "regex" => {
+                    let pattern = rule
+                        .pattern
+                        .as_deref()
+                        .ok_or_else(|| format!("regex rule {} has no pattern", rule.id))?;
+                    regex::Regex::new(pattern)
+                        .map_err(|error| format!("invalid regex in rule {}: {error}", rule.id))?;
+                }
+                other => return Err(format!("unknown diagnostic rule kind: {other}")),
+            }
+        }
+        Ok(())
+    }
+    pub fn to_toml(&self) -> Result<String, String> {
+        self.validate()?;
+        toml::to_string_pretty(self).map_err(|error| error.to_string())
+    }
+    pub fn from_toml(source: &str) -> Result<Self, String> {
+        let config: Self = toml::from_str(source).map_err(|error| error.to_string())?;
+        config.validate()?;
+        Ok(config)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProofreadingFinding {
     pub byte_range: std::ops::Range<usize>,
-    pub category: &'static str,
+    pub category: String,
+    pub severity: String,
     pub message: String,
 }
 
 #[cfg(test)]
 mod proofread_tests {
-    use super::proofread;
+    use super::{ProofreadingConfig, ProofreadingRule, proofread, proofread_with_config};
 
     #[test]
     fn mechanical_findings_are_unicode_byte_mapped_and_non_mutating() {
@@ -21,7 +120,7 @@ mod proofread_tests {
         assert_eq!(
             findings
                 .iter()
-                .map(|finding| finding.category)
+                .map(|finding| finding.category.as_str())
                 .collect::<Vec<_>>(),
             ["repeated-word", "double-space", "space-before-punctuation"]
         );
@@ -30,48 +129,114 @@ mod proofread_tests {
         }
         assert_eq!(text, "Élodie said said  hello !");
     }
+
+    #[test]
+    fn configurable_regex_rules_round_trip_validate_and_report_utf8_offsets() {
+        let mut config = ProofreadingConfig::default();
+        config.rules.push(ProofreadingRule {
+            id: "passive-voice-hint".into(),
+            enabled: true,
+            kind: "regex".into(),
+            pattern: Some(r"\bwas\s+\w+ed\b".into()),
+            severity: "warning".into(),
+            message: "Review possible passive voice".into(),
+        });
+        let serialized = config.to_toml().unwrap();
+        let parsed = ProofreadingConfig::from_toml(&serialized).unwrap();
+        let text = "Élodie was followed.";
+        let finding = proofread_with_config(text, &parsed)
+            .unwrap()
+            .into_iter()
+            .find(|finding| finding.category == "passive-voice-hint")
+            .unwrap();
+        assert_eq!(&text[finding.byte_range.clone()], "was followed");
+        assert_eq!(finding.severity, "warning");
+        assert!(ProofreadingConfig::from_toml("version=1\n[[rules]]\nid='x'\nenabled=true\nkind='regex'\npattern='['\nseverity='warning'\nmessage='bad'").is_err());
+    }
 }
 
 /// Deterministic mechanical checks. These are suggestions and never edit manuscript text.
 pub fn proofread(text: &str) -> Vec<ProofreadingFinding> {
+    proofread_with_config(text, &ProofreadingConfig::default())
+        .expect("default proofreader config is valid")
+}
+
+/// Runs deterministic advisory rules without modifying source text.
+pub fn proofread_with_config(
+    text: &str,
+    config: &ProofreadingConfig,
+) -> Result<Vec<ProofreadingFinding>, String> {
+    config.validate()?;
     let mut findings = Vec::new();
-    let words = text.unicode_word_indices().collect::<Vec<_>>();
-    for pair in words.windows(2) {
-        let (a_start, a) = pair[0];
-        let (b_start, b) = pair[1];
-        let between = &text[a_start + a.len()..b_start];
-        if !between.is_empty()
-            && between.chars().all(char::is_whitespace)
-            && a.eq_ignore_ascii_case(b)
-        {
-            findings.push(ProofreadingFinding {
-                byte_range: b_start..b_start + b.len(),
-                category: "repeated-word",
-                message: format!("Repeated word: {b}"),
-            });
+    for rule in config.rules.iter().filter(|rule| rule.enabled) {
+        match rule.kind.as_str() {
+            "repeated-word" => {
+                let words = text.unicode_word_indices().collect::<Vec<_>>();
+                for pair in words.windows(2) {
+                    let (a_start, a) = pair[0];
+                    let (b_start, b) = pair[1];
+                    let between = &text[a_start + a.len()..b_start];
+                    if !between.is_empty()
+                        && between.chars().all(char::is_whitespace)
+                        && a.eq_ignore_ascii_case(b)
+                    {
+                        findings.push(finding(
+                            rule,
+                            b_start..b_start + b.len(),
+                            format!("{}: {b}", rule.message),
+                        ));
+                    }
+                }
+            }
+            "double-space" => {
+                for (offset, _) in text.match_indices("  ") {
+                    findings.push(finding(rule, offset..offset + 2, rule.message.clone()));
+                }
+            }
+            "space-before-punctuation" => {
+                let chars = text.char_indices().collect::<Vec<_>>();
+                for pair in chars.windows(2) {
+                    let (offset, ch) = pair[0];
+                    let (next_offset, next) = pair[1];
+                    if ch == ' ' && matches!(next, ',' | '.' | ';' | ':' | '!' | '?') {
+                        findings.push(finding(
+                            rule,
+                            offset..next_offset + next.len_utf8(),
+                            format!("{}: {next}", rule.message),
+                        ));
+                    }
+                }
+            }
+            "regex" => {
+                let regex =
+                    regex::Regex::new(rule.pattern.as_deref().expect("validated regex rule"))
+                        .map_err(|error| error.to_string())?;
+                for matched in regex.find_iter(text) {
+                    findings.push(finding(
+                        rule,
+                        matched.start()..matched.end(),
+                        format!("{}: {}", rule.message, matched.as_str()),
+                    ));
+                }
+            }
+            _ => unreachable!("validated rule kind"),
         }
     }
-    for (offset, _) in text.match_indices("  ") {
-        findings.push(ProofreadingFinding {
-            byte_range: offset..offset + 2,
-            category: "double-space",
-            message: "Repeated spaces".into(),
-        });
+    findings.sort_by_key(|finding| (finding.byte_range.start, finding.category.clone()));
+    Ok(findings)
+}
+
+fn finding(
+    rule: &ProofreadingRule,
+    byte_range: std::ops::Range<usize>,
+    message: String,
+) -> ProofreadingFinding {
+    ProofreadingFinding {
+        byte_range,
+        category: rule.id.clone(),
+        severity: rule.severity.clone(),
+        message,
     }
-    let chars = text.char_indices().collect::<Vec<_>>();
-    for pair in chars.windows(2) {
-        let (offset, ch) = pair[0];
-        let (next_offset, next) = pair[1];
-        if ch == ' ' && matches!(next, ',' | '.' | ';' | ':' | '!' | '?') {
-            findings.push(ProofreadingFinding {
-                byte_range: offset..next_offset + next.len_utf8(),
-                category: "space-before-punctuation",
-                message: format!("Remove space before {next}"),
-            });
-        }
-    }
-    findings.sort_by_key(|finding| (finding.byte_range.start, finding.category));
-    findings
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

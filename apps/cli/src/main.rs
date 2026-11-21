@@ -809,14 +809,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .filter(|scene| scope == "all" || scene.scene.id.to_string() == scope)
             {
                 let (text, _) = app.load_scene_text(scene.scene.id)?;
-                for finding in story_analysis::proofread(&text) {
+                for finding in app.proofread_text(&text)? {
                     println!(
-                        "{}\t{}\t{}..{}\t{}\t{}",
+                        "{}\t{}\t{}..{}\t{}\t{}: {}",
                         scene.scene.id,
                         scene.scene.title,
                         finding.byte_range.start,
                         finding.byte_range.end,
                         finding.category,
+                        finding.severity,
                         finding.message
                     );
                 }
@@ -840,6 +841,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     claim.evidence_quote
                 );
             }
+        }
+        "proofread-config" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            println!(
+                "Created diagnostics configuration at {}",
+                app.write_default_proofreading_config()?.display()
+            );
         }
         "process" => {
             let path = args.next().ok_or("missing project path")?;
@@ -1007,6 +1016,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}", serde_json::to_string_pretty(&result.conflicts)?);
                 return Err("overlapping editorial changes require author resolution".into());
             }
+        }
+        "browse" => {
+            let project = args.next().ok_or("missing project path")?;
+            let port = args
+                .next()
+                .map(|value| value.parse())
+                .transpose()?
+                .unwrap_or(7878);
+            let mut app = WriterApp::open_project(project)?;
+            let server = story_web::BrowserServer::bind(port)?;
+            println!(
+                "Read-only Writer's IDE browser view at http://{} (Ctrl-C to stop)",
+                server.address()
+            );
+            server.serve(&mut app)?;
         }
         "extract" => {
             let path = std::path::PathBuf::from(args.next().ok_or("missing project path")?);
@@ -1201,6 +1225,10 @@ fn usage() {
     eprintln!("writers-ide compile-check <project>");
     eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");
     eprintln!("writers-ide import-manuscript <source-file> <new-project-directory> [title]");
+    eprintln!("writers-ide browse <project> [loopback-port]");
+    eprintln!(
+        "writers-ide proofread-config <project> (creates editable .writers-ide/diagnostics.toml)"
+    );
     eprintln!(
         "writers-ide find <path> <normal|extended|regex> <all|scene-uuid> <pattern>\nwriters-ide replace <path> <normal|extended|regex> <all|scene-uuid> <pattern> => <replacement>\nwriters-ide language <path> [language-tag]"
     );

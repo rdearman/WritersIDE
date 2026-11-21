@@ -1534,8 +1534,11 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 name = "story-analysis"
 version = "0.1.0"
 dependencies = [
+ "regex",
+ "serde",
  "story-core",
  "story-storage",
+ "toml",
  "unicode-segmentation",
 ]
 
@@ -1657,6 +1660,19 @@ dependencies = [
  "unicode-segmentation",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "story-web"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "story-app",
+ "story-core",
+ "story-storage",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -2301,6 +2317,7 @@ dependencies = [
  "story-ollama",
  "story-pipeline",
  "story-storage",
+ "story-web",
  "tempfile",
  "toml",
  "uuid",
