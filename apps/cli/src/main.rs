@@ -519,6 +519,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let app = WriterApp::open_project(path)?;
             print!("{}", app.git_diff(&from, &to, file.as_deref())?);
         }
+        "git-restore-new" => {
+            let path = args.next().ok_or("missing source project path")?;
+            let commit = args.next().ok_or("missing commit identifier")?;
+            let destination = args.next().ok_or("missing new project destination")?;
+            let files = WriterApp::restore_git_snapshot(path, &commit, &destination)?;
+            println!(
+                "Restored {commit} into {destination} ({} project files).",
+                files.len()
+            );
+        }
         "character" => {
             let path = args.next().ok_or("missing project path")?;
             let name = args.next().ok_or("missing character name")?;
@@ -1501,7 +1511,7 @@ fn usage() {
     );
     eprintln!("writers-ide search-all <path> <terms>\nwriters-ide rebuild-search <path>");
     eprintln!(
-        "writers-ide create-template <path> <blank-fiction|novel|short-story|blank-nonfiction|nonfiction-book> [title]\nwriters-ide content <path> <chapter|section|front|back> <parent-uuid|-> <title>\nwriters-ide read-content <path> <content-uuid>\nwriters-ide write-content <path> <content-uuid> <text>\nwriters-ide resolve-content <path> <transaction-id> external|prepared\nwriters-ide git-snapshot <path> <label>\nwriters-ide git-history <path>\nwriters-ide git-diff <path> <commit-a> <commit-b> [project-relative-path]"
+        "writers-ide create-template <path> <blank-fiction|novel|short-story|blank-nonfiction|nonfiction-book> [title]\nwriters-ide content <path> <chapter|section|front|back> <parent-uuid|-> <title>\nwriters-ide read-content <path> <content-uuid>\nwriters-ide write-content <path> <content-uuid> <text>\nwriters-ide resolve-content <path> <transaction-id> external|prepared\nwriters-ide git-snapshot <path> <label>\nwriters-ide git-history <path>\nwriters-ide git-diff <path> <commit-a> <commit-b> [project-relative-path]\nwriters-ide git-restore-new <source-project> <commit> <new-project-directory>"
     );
     eprintln!(
         "writers-ide scratchpad-create <path> <title> [body]\nwriters-ide scratchpad-list <path>\nwriters-ide scratchpad-promote <path> <note-uuid> <scene|character|location|object|research> <entity-uuid>\nwriters-ide mentions <path> <scene-uuid>\nwriters-ide mention-confirm <path> <mention-uuid> <character|location|object> <entity-uuid>\nwriters-ide mention-dismiss <path> <mention-uuid>\nwriters-ide object-create <path> <name> [description]\nwriters-ide assembly-draft-create <path> <assembly-uuid>\nwriters-ide assembly-draft-list <path>\nwriters-ide assembly-draft-set <path> <draft-uuid> <scene-uuid> <text.md>\nwriters-ide assembly-draft-commit <path> <draft-uuid>\nwriters-ide board-create <path> <title>\nwriters-ide board-add-scene <path> <board-uuid> <scene-uuid> <x> <y> [note]\nwriters-ide board-list <path> <board-uuid>\nwriters-ide backup-archive <project-path> <archive.zip>\nwriters-ide restore-archive <archive.zip> <new-project-directory>"

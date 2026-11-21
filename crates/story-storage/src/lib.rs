@@ -464,6 +464,40 @@ pub enum ConflictResolution {
 }
 
 impl ProjectStore {
+    /// Recreates a project database from a validated deterministic metadata snapshot.
+    /// The caller supplies an already-staged project directory and removes it on failure.
+    pub fn restore_metadata_snapshot(root: impl AsRef<Path>) -> Result<()> {
+        let root = root.as_ref();
+        for directory in [
+            "manuscript",
+            "research",
+            "research/readings",
+            "attachments",
+            "templates",
+            "exports",
+            ".writers-ide/recovery",
+        ] {
+            fs::create_dir_all(root.join(directory))?;
+        }
+        let database = root.join("story.db");
+        if database.exists() {
+            return Err(StorageError::Invalid(
+                "restore destination already contains story.db".into(),
+            ));
+        }
+        let sql = fs::read_to_string(root.join("snapshots/database.sql"))?;
+        validate_sql_dump(&sql)?;
+        let conn = Connection::open(&database)?;
+        conn.execute_batch(&sql)?;
+        drop(conn);
+        fs::File::open(&database)?.sync_all()?;
+        fs::File::open(root)?.sync_all()?;
+        let store = Self::open(root)?;
+        store.validate()?;
+        drop(store);
+        Ok(())
+    }
+
     pub fn get_import_run_summary(&self, id: ImportRunId) -> Result<ImportRunSummary> {
         self.conn.query_row(
             "SELECT r.source_type,r.source_identifier,r.source_fingerprint,r.status,(SELECT count(*) FROM import_source_item i WHERE i.run_id=r.id),(SELECT count(*) FROM entity_provenance p JOIN import_source_item i ON i.id=p.source_item_id WHERE i.run_id=r.id) FROM import_run r WHERE r.id=?1",
@@ -6735,13 +6769,7 @@ fn excluded_snapshot_table(name: &str) -> bool {
     )
 }
 fn is_transient_or_fts_shadow(name: &str) -> bool {
-    matches!(
-        name,
-        "write_journal"
-            | "write_conflict"
-            | "content_unit_write_journal"
-            | "content_unit_write_conflict"
-    ) || name.starts_with("sqlite_")
+    name.starts_with("sqlite_")
         || ["scene_fts_", "reading_fts_", "project_search_fts_"]
             .iter()
             .any(|prefix| name.starts_with(prefix))
@@ -7457,12 +7485,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(title, "Quoted ' title");
-        assert!(
-            restored
-                .query_row("SELECT count(*) FROM write_journal", [], |r| r
-                    .get::<_, i64>(0))
-                .is_err()
-        );
+        let transient_rows: i64 = restored
+            .query_row("SELECT count(*) FROM write_journal", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(transient_rows, 0);
     }
 
     #[test]

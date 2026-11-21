@@ -961,6 +961,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "git.restore-new",
+            "Restore Snapshot as New Project",
+            "Reconstruct a validated historical project in a new directory",
+            "File",
+            "git-restore-new",
+            true,
+        ),
+        legacy_command(
             "extract.propose",
             "Extract Story Candidates",
             "Create provisional Ollama candidates",
@@ -4123,6 +4131,20 @@ impl AppState {
                 .ok_or("use git-diff <commit-a> <commit-b> [path]")?;
             let diff = self.app.git_diff(from, to, parts.next())?;
             self.message = diff.lines().take(12).collect::<Vec<_>>().join(" · ");
+        } else if let Some(args) = cmd.strip_prefix("git-restore-new ") {
+            let mut parts = args.splitn(2, ' ');
+            let commit = parts
+                .next()
+                .ok_or("use git-restore-new COMMIT DESTINATION")?;
+            let destination = parts
+                .next()
+                .ok_or("use git-restore-new COMMIT DESTINATION")?;
+            let files =
+                WriterApp::restore_git_snapshot(self.app.project_root(), commit, destination)?;
+            self.message = format!(
+                "Restored {commit} to {destination} ({} project files); current project unchanged",
+                files.len()
+            );
         } else if let Some(label) = cmd.strip_prefix("snapshot ") {
             let scene = self
                 .editing_scene

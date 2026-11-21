@@ -1492,6 +1492,36 @@ impl WriterApp {
     ) -> Result<()> {
         Ok(ProjectStore::restore_archive_to(archive, destination)?)
     }
+    pub fn restore_git_snapshot(
+        project: impl AsRef<Path>,
+        commit: &str,
+        destination: impl AsRef<Path>,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        let destination = destination.as_ref();
+        if destination.exists() {
+            return Err(AppError::Domain(
+                "Git restore destination already exists".into(),
+            ));
+        }
+        let stage =
+            destination.with_extension(format!("writers-ide-stage-{}", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let files = story_git::GitHistory::open(project)?
+                .restore_files_to_new_directory(commit, &stage)?;
+            ProjectStore::restore_metadata_snapshot(&stage)?;
+            std::fs::rename(&stage, destination).map_err(story_storage::StorageError::from)?;
+            if let Some(parent) = destination.parent() {
+                std::fs::File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .map_err(story_storage::StorageError::from)?;
+            }
+            Ok(files)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&stage);
+        }
+        result
+    }
     pub fn git_snapshot(&mut self, label: &str) -> Result<Option<String>> {
         let author = self.get_project()?.author;
         Ok(self.store.with_git_snapshot_barrier(|root| {
@@ -1637,6 +1667,38 @@ mod tests {
         );
         assert!(project.join("snapshots/database.sql").exists());
         assert!(app.git_diff(&first, &second, Some("story.db")).is_err());
+    }
+
+    #[test]
+    fn git_snapshot_restores_complete_project_to_new_relocatable_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Original"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "A restored passage.")
+            .unwrap();
+        let commit = app.git_snapshot("Initial complete state").unwrap().unwrap();
+
+        let restored_path = root.path().join("Restored");
+        let files =
+            WriterApp::restore_git_snapshot(app.store.project_root(), &commit, &restored_path)
+                .unwrap();
+        assert!(files.iter().any(|path| path == Path::new("project.toml")));
+        let restored = WriterApp::open_project(&restored_path).unwrap();
+        assert_eq!(restored.get_project().unwrap().title, "Novel");
+        assert_eq!(
+            restored.load_scene_text(scene).unwrap().0,
+            "A restored passage."
+        );
+
+        let duplicate =
+            WriterApp::restore_git_snapshot(app.store.project_root(), &commit, &restored_path);
+        assert!(duplicate.is_err());
+        assert_eq!(
+            restored.load_scene_text(scene).unwrap().0,
+            "A restored passage."
+        );
     }
 
     #[test]

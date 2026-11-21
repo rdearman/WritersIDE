@@ -133,16 +133,84 @@ impl GitHistory {
 
     pub fn read_file_at(&self, commit: &str, path: &str) -> Result<Vec<u8>> {
         validate_commit(commit)?;
-        if !(path.starts_with("manuscript/")
-            || path == "project.toml"
-            || path == "snapshots/database.sql")
-        {
+        if !is_owned_path(path) {
             return Err(GitError::Command(
                 "path is outside the versioned project content".into(),
             ));
         }
         let spec = format!("{commit}:{path}");
         Ok(self.output(&["show", &spec])?.stdout)
+    }
+
+    /// Restores the application-owned files from a commit into a new directory.
+    /// The live project and destination are never modified if the destination already exists.
+    pub fn restore_files_to_new_directory(
+        &self,
+        commit: &str,
+        destination: impl AsRef<Path>,
+    ) -> Result<Vec<PathBuf>> {
+        validate_commit(commit)?;
+        self.output(&["cat-file", "-e", &format!("{commit}^{{commit}}")])?;
+        let destination = destination.as_ref();
+        if destination.exists() {
+            return Err(GitError::Command(
+                "restore destination already exists; choose a new directory".into(),
+            ));
+        }
+        let listing = self.output(&["ls-tree", "-r", "--name-only", "-z", commit])?;
+        let mut files = Vec::new();
+        let stage =
+            destination.with_extension(format!("writers-ide-restore-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&stage)?;
+        let result = (|| {
+            for raw in listing
+                .stdout
+                .split(|byte| *byte == 0)
+                .filter(|item| !item.is_empty())
+            {
+                let relative = std::str::from_utf8(raw)
+                    .map_err(|_| GitError::Command("snapshot contains a non-UTF-8 path".into()))?;
+                if !is_owned_path(relative)
+                    || !(relative == ".gitignore"
+                        || relative == "project.toml"
+                        || relative == "snapshots/database.sql"
+                        || ["manuscript/", "research/", "attachments/", "templates/"]
+                            .iter()
+                            .any(|prefix| relative.starts_with(prefix)))
+                {
+                    continue;
+                }
+                let target = stage.join(relative);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                let bytes = self.read_file_at(commit, relative)?;
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)?;
+                use std::io::Write;
+                file.write_all(&bytes)?;
+                file.sync_all()?;
+                files.push(PathBuf::from(relative));
+            }
+            if !stage.join("project.toml").is_file()
+                || !stage.join("snapshots/database.sql").is_file()
+            {
+                return Err(GitError::Command(
+                    "commit does not contain a restorable Writer's IDE metadata snapshot".into(),
+                ));
+            }
+            std::fs::rename(&stage, destination)?;
+            if let Some(parent) = destination.parent() {
+                std::fs::File::open(parent)?.sync_all()?;
+            }
+            Ok(files.clone())
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(&stage);
+        }
+        result
     }
 
     fn ensure_ignore(&self) -> Result<()> {
@@ -250,5 +318,39 @@ mod tests {
                 .is_err()
         );
         assert_eq!(git.history(10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn restore_copies_only_owned_commit_files_into_new_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("project.toml"), "title='Test'\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("manuscript")).unwrap();
+        std::fs::write(dir.path().join("manuscript/one.md"), "First draft\n").unwrap();
+        std::fs::write(dir.path().join("story.db"), "live database is excluded").unwrap();
+        std::fs::create_dir_all(dir.path().join("snapshots")).unwrap();
+        std::fs::write(dir.path().join("snapshots/database.sql"), "-- snapshot\n").unwrap();
+        std::fs::write(dir.path().join("unrelated.txt"), "not managed").unwrap();
+        let git = GitHistory::open(dir.path()).unwrap();
+        let commit = git.snapshot("restore test", "Author").unwrap().unwrap();
+
+        let destination = dir.path().join("restored");
+        let restored = git
+            .restore_files_to_new_directory(&commit, &destination)
+            .unwrap();
+        assert!(
+            restored
+                .iter()
+                .any(|path| path == Path::new("manuscript/one.md"))
+        );
+        assert_eq!(
+            std::fs::read(destination.join("manuscript/one.md")).unwrap(),
+            b"First draft\n"
+        );
+        assert!(!destination.join("story.db").exists());
+        assert!(!destination.join("unrelated.txt").exists());
+        assert!(
+            git.restore_files_to_new_directory(&commit, &destination)
+                .is_err()
+        );
     }
 }
