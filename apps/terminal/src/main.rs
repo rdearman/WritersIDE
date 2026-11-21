@@ -136,6 +136,8 @@ struct AppState {
     registers: BTreeMap<String, String>,
     macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
     recording_macro: Option<(String, Vec<story_core::EditMacroOp>)>,
+    command_macros: BTreeMap<String, Vec<RecordedCommand>>,
+    recording_command_macro: Option<(String, Vec<RecordedCommand>)>,
     text_expansion: TextExpansionConfig,
     editor_preferences: EditorPreferences,
     bookmarks: BTreeMap<String, EditorBookmark>,
@@ -313,9 +315,19 @@ struct EditorToolsFile {
     #[serde(default)]
     macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
     #[serde(default)]
+    command_macros: BTreeMap<String, Vec<RecordedCommand>>,
+    #[serde(default)]
+    recording_command_macro: Option<(String, Vec<RecordedCommand>)>,
+    #[serde(default)]
     bookmarks: BTreeMap<String, EditorBookmark>,
     #[serde(default)]
     kill_ring: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct RecordedCommand {
+    command_id: String,
+    invocation: String,
 }
 
 #[derive(Clone, Debug)]
@@ -1514,6 +1526,10 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.macro-preview", "Preview Named Edit Macro", "Preview a macro and repetition count without changing manuscript text", "Edit", "macro-preview", true),
         legacy_command("edit.macro-record", "Record Edit Macro", "Record editor insertions, deletions, cursor movement, and selection changes", "Edit", "macro-record", true),
         legacy_command("edit.macro-stop", "Stop Macro Recording", "Save the currently recorded edit macro", "Edit", "macro-stop", false),
+        legacy_command("command-macro.record", "Record Command Sequence", "Record stable command-registry actions for later replay", "Edit", "command-macro-record", true),
+        legacy_command("command-macro.stop", "Stop Command Recording", "Save the currently recorded command sequence", "Edit", "command-macro-stop", false),
+        legacy_command("command-macro.run", "Run Command Sequence", "Replay a saved command sequence through the shared dispatcher", "Edit", "command-macro-run", true),
+        legacy_command("command-macro.list", "List Command Sequences", "List saved command sequences", "Edit", "command-macro-list", false),
         legacy_command("edit.text-expansion-set", "Set Text Expansion", "Add a literal abbreviation and replacement to the project dictionary", "Insert", "text-expansion-set", true),
         legacy_command("edit.text-expansion", "Text Expansion Settings", "Enable, disable, or list project text expansions", "Insert", "text-expansion", true),
         legacy_command("edit.text-expand", "Expand Abbreviation", "Expand the abbreviation immediately before the editor cursor", "Insert", "text-expand", false),
@@ -2178,6 +2194,8 @@ impl AppState {
             registers: tools.registers,
             macros: tools.macros,
             recording_macro: None,
+            command_macros: tools.command_macros,
+            recording_command_macro: tools.recording_command_macro,
             text_expansion,
             editor_preferences,
             bookmarks: tools.bookmarks,
@@ -2205,6 +2223,8 @@ impl AppState {
             snippets: self.snippets.clone(),
             registers: self.registers.clone(),
             macros: self.macros.clone(),
+            command_macros: self.command_macros.clone(),
+            recording_command_macro: self.recording_command_macro.clone(),
             bookmarks: self.bookmarks.clone(),
             kill_ring: self.kill_ring.clone(),
         })?;
@@ -2214,6 +2234,97 @@ impl AppState {
         temporary.as_file().sync_all()?;
         temporary.persist(&path)?;
         fs::File::open(directory)?.sync_all()?;
+        Ok(())
+    }
+    fn record_command_macro_step(
+        &mut self,
+        command: CommandSpec,
+        invocation: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some((_, steps)) = self.recording_command_macro.as_mut() else {
+            return Ok(());
+        };
+        if command.id.starts_with("command-macro.") {
+            return Ok(());
+        }
+        if invocation.len() > 4096 {
+            return Err("command macro invocation exceeds the 4096-byte limit".into());
+        }
+        if steps.len() >= 256 {
+            return Err("command macro reached its 256-step limit".into());
+        }
+        steps.push(RecordedCommand {
+            command_id: command.id.to_owned(),
+            invocation: invocation.to_owned(),
+        });
+        self.persist_editor_tools()?;
+        Ok(())
+    }
+    fn replay_command_macro(&mut self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if self.recording_command_macro.is_some() {
+            return Err("stop command recording before replaying a command macro".into());
+        }
+        let steps = self
+            .command_macros
+            .get(name)
+            .ok_or("unknown saved command macro")?
+            .clone();
+        if steps.is_empty() {
+            return Err("saved command macro contains no steps".into());
+        }
+        let mut resolved = Vec::with_capacity(steps.len());
+        for (index, step) in steps.into_iter().enumerate() {
+            let spec = command_by_id(&step.command_id).ok_or_else(|| {
+                format!(
+                    "command macro step {} uses unknown command ID {}",
+                    index + 1,
+                    step.command_id
+                )
+            })?;
+            if spec.id.starts_with("command-macro.") {
+                return Err(format!(
+                    "command macro step {} recursively invokes command recording",
+                    index + 1
+                )
+                .into());
+            }
+            let (invoked_spec, arguments) = command_palette_invocation(&step.invocation)
+                .ok_or_else(|| {
+                    format!("command macro step {} has an invalid invocation", index + 1)
+                })?;
+            if invoked_spec.id != spec.id {
+                return Err(format!(
+                    "command macro step {} no longer matches registry ID {}",
+                    index + 1,
+                    spec.id
+                )
+                .into());
+            }
+            if let Some(reason) = self.command_disabled_reason(spec) {
+                return Err(
+                    format!("command macro step {} is unavailable: {reason}", index + 1).into(),
+                );
+            }
+            let dispatch_arguments = if spec.action == CommandAction::LegacyPalette {
+                Some(step.invocation.clone())
+            } else {
+                arguments.map(str::to_owned)
+            };
+            resolved.push((spec.action, dispatch_arguments));
+        }
+        for (index, (action, arguments)) in resolved.into_iter().enumerate() {
+            self.dispatch_registered_with_args(action, arguments.as_deref())
+                .map_err(|error| {
+                    format!(
+                        "command macro {name} stopped at step {}: {error}",
+                        index + 1
+                    )
+                })?;
+        }
+        self.message = format!(
+            "Replayed command macro {name} ({} steps)",
+            self.command_macros[name].len()
+        );
         Ok(())
     }
     fn remember_kill(&mut self, text: String) -> Result<(), Box<dyn std::error::Error>> {
@@ -3354,6 +3465,7 @@ impl AppState {
                 arguments
             };
             self.dispatch_registered_with_args(spec.action, dispatch_arguments)?;
+            self.record_command_macro_step(spec, &cmd)?;
         } else {
             self.execute_legacy_palette_command(&cmd)?;
         }
@@ -3363,6 +3475,50 @@ impl AppState {
         &mut self,
         cmd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(name) = cmd.strip_prefix("command-macro-record ") {
+            let name = name.trim();
+            if name.is_empty() || name.chars().any(char::is_whitespace) {
+                return Err("use command-macro-record NAME with a single-word name".into());
+            }
+            if self.recording_command_macro.is_some() {
+                return Err("stop the current command macro recording first".into());
+            }
+            self.recording_command_macro = Some((name.to_owned(), Vec::new()));
+            self.persist_editor_tools()?;
+            self.message =
+                format!("Recording command macro {name}; run commands, then command-macro-stop");
+            return Ok(());
+        }
+        if cmd == "command-macro-stop" {
+            let (name, steps) = self
+                .recording_command_macro
+                .take()
+                .ok_or("no command macro is being recorded")?;
+            if steps.is_empty() {
+                self.persist_editor_tools()?;
+                self.message = format!("Discarded empty command macro {name}");
+            } else {
+                self.command_macros.insert(name.clone(), steps.clone());
+                self.persist_editor_tools()?;
+                self.message = format!("Saved command macro {name} ({} steps)", steps.len());
+            }
+            return Ok(());
+        }
+        if cmd == "command-macro-list" {
+            self.message = if self.command_macros.is_empty() {
+                "No saved command macros".into()
+            } else {
+                self.command_macros
+                    .iter()
+                    .map(|(name, steps)| format!("{name} ({} steps)", steps.len()))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            };
+            return Ok(());
+        }
+        if let Some(name) = cmd.strip_prefix("command-macro-run ") {
+            return self.replay_command_macro(name.trim());
+        }
         if let Some(start) = parse_challenge_command(cmd)? {
             let target = start.target_words;
             let seconds = start.duration_seconds;
@@ -6547,7 +6703,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -11093,6 +11249,66 @@ mod tests {
     }
 
     #[test]
+    fn command_macros_record_registry_ids_persist_and_replay_via_dispatcher() {
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Book");
+        let project = WriterApp::create_project(&project_path, "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.prompt = "command-macro-record add_character".into();
+        state.command().unwrap();
+        state.prompt = "character Mara".into();
+        state.command().unwrap();
+        assert_eq!(state.app.list_characters().unwrap().len(), 1);
+        assert_eq!(state.recording_command_macro.as_ref().unwrap().1.len(), 1);
+        assert_eq!(
+            state.recording_command_macro.as_ref().unwrap().1[0].command_id,
+            "character.create"
+        );
+        drop(state);
+
+        let reopened = WriterApp::open_project(&project_path).unwrap();
+        let mut state = AppState::new(reopened, default_bindings());
+        assert_eq!(
+            state.recording_command_macro.as_ref().unwrap().1.len(),
+            1,
+            "in-progress command recording is recovered after reopening"
+        );
+        state.prompt = "command-macro-stop".into();
+        state.command().unwrap();
+        drop(state);
+
+        let reopened = WriterApp::open_project(&project_path).unwrap();
+        let mut state = AppState::new(reopened, default_bindings());
+        assert_eq!(state.command_macros["add_character"].len(), 1);
+        state.prompt = "command-macro-run add_character".into();
+        state.command().unwrap();
+        assert_eq!(state.app.list_characters().unwrap().len(), 2);
+        assert!(
+            state
+                .message
+                .contains("Replayed command macro add_character")
+        );
+    }
+
+    #[test]
+    fn command_macro_rejects_a_stale_registry_invocation_before_running_steps() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.command_macros.insert(
+            "stale".into(),
+            vec![RecordedCommand {
+                command_id: "character.create".into(),
+                invocation: "location Hidden Place".into(),
+            }],
+        );
+        state.prompt = "command-macro-run stale".into();
+        assert!(state.command().is_err());
+        assert!(state.app.list_characters().unwrap().is_empty());
+        assert!(state.app.list_locations().unwrap().is_empty());
+    }
+
+    #[test]
     fn destructive_repeated_macros_preview_then_apply_as_one_undoable_edit() {
         let root = tempfile::tempdir().unwrap();
         let mut project = WriterApp::create_project(root.path().join("Macro"), "Macro").unwrap();
@@ -12075,6 +12291,8 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            command_macros: BTreeMap::new(),
+            recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
@@ -12784,6 +13002,8 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            command_macros: BTreeMap::new(),
+            recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
@@ -12877,6 +13097,8 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            command_macros: BTreeMap::new(),
+            recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
@@ -12962,6 +13184,8 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            command_macros: BTreeMap::new(),
+            recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
@@ -13059,6 +13283,8 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            command_macros: BTreeMap::new(),
+            recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
@@ -13306,6 +13532,8 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            command_macros: BTreeMap::new(),
+            recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
@@ -13403,6 +13631,8 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            command_macros: BTreeMap::new(),
+            recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
@@ -13517,6 +13747,8 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            command_macros: BTreeMap::new(),
+            recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
@@ -13749,6 +13981,8 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            command_macros: BTreeMap::new(),
+            recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
@@ -14112,6 +14346,8 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            command_macros: BTreeMap::new(),
+            recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
@@ -14220,6 +14456,8 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            command_macros: BTreeMap::new(),
+            recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
@@ -14380,6 +14618,8 @@ mod tests {
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
+            command_macros: BTreeMap::new(),
+            recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
