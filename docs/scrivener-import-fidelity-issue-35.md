@@ -101,3 +101,8 @@ and bounded to the tested project structure and preserved formatting subset.
 ## Terminal workflow follow-up
 
 The terminal Series menu now exposes series creation and selection, current-book registration, Scrivener import, new-book creation, and read-only series references through the central command registry. The mapping screen lets the author inspect each binder item and adjust its destination or inclusion before import. Commit validates the mapping and refuses unsaved manuscript buffers or active writing challenges before creating staging data. A sanitized-fixture terminal integration test covers preview, mapping, import, series registration, imported emphasis, and source fingerprint preservation. The actual author-provided project remains covered by the separate read-only importer integration test described above; it is not copied into terminal regression fixtures or Git.
+
+
+## Semantic Markdown and Compile IR check
+
+The real-project integration test now also validates the imported Markdown through the WYSIWYM semantic projection and application Compile IR. It verifies exact source-byte retention, paragraph/strong/emphasis node coverage, UTF-8 boundary validity and a stable scene-ID/source-hash source-map entry after Markdown compilation. The test records no manuscript text. This check begins after the RTF importer has produced Markdown and therefore does not upgrade the separately documented RTF line-break normalization or Scrivener style/layout limitations.

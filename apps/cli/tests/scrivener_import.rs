@@ -428,6 +428,49 @@ fn author_scrivener_project_import_and_series_book_three_smoke() {
         imported_text.chars().filter(|ch| !ch.is_ascii()).count(),
         366
     );
+
+    // Exercise the WYSIWYM semantic contract with the locally supplied real
+    // manuscript, without embedding its source text in this regression test.
+    let semantic = story_document::SemanticDocument::parse(imported_text.clone());
+    assert!(semantic.validate_ranges());
+    assert_eq!(semantic.to_markdown().as_bytes(), imported_text.as_bytes());
+    assert!(
+        semantic
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, story_document::SemanticKind::Paragraph))
+    );
+    assert!(
+        semantic
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, story_document::SemanticKind::Strong))
+    );
+    assert!(
+        semantic
+            .nodes
+            .iter()
+            .any(|node| matches!(node.kind, story_document::SemanticKind::Emphasis))
+    );
+
+    let markdown_artifact = app
+        .compile_artifact(story_document::CompileFormat::Markdown, false)
+        .unwrap();
+    let compiled_markdown = String::from_utf8(markdown_artifact.bytes).unwrap();
+    let compiled_semantic = story_document::SemanticDocument::parse(compiled_markdown.clone());
+    assert!(compiled_semantic.validate_ranges());
+    assert_eq!(
+        compiled_semantic.to_markdown().as_bytes(),
+        compiled_markdown.as_bytes()
+    );
+    assert!(markdown_artifact.source_map.iter().any(|entry| {
+        entry.source_entity_id == scene_id.to_string()
+            && entry.source_sha256 == semantic.source_sha256
+            && entry.source.end <= imported_text.len()
+            && imported_text.is_char_boundary(entry.source.start)
+            && imported_text.is_char_boundary(entry.source.end)
+    }));
+
     assert!(app.get_scene(scene_id).unwrap().scene.synopsis.is_empty());
 
     let marker = "\n\nWriter's IDE import regression edit.";
