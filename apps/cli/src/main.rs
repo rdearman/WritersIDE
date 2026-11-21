@@ -615,22 +615,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let name = args.next().ok_or("missing query name")?;
             let mut filters = Vec::new();
             for arg in args {
-                let (key, value) = arg
-                    .split_once('=')
-                    .ok_or("filters must use key=value syntax")?;
-                filters.push(match key {
-                    "status" => SceneQueryFilter::Status(parse_status(value)?),
-                    "character" => {
-                        SceneQueryFilter::Character(story_core::CharacterId(value.parse()?))
-                    }
-                    "plotline" => {
-                        SceneQueryFilter::Plotline(story_core::PlotlineId(value.parse()?))
-                    }
-                    "before" => SceneQueryFilter::TimeBefore(value.parse()?),
-                    "after" => SceneQueryFilter::TimeAfter(value.parse()?),
-                    "issue" if value == "unresolved" => SceneQueryFilter::UnresolvedIssue,
-                    _ => return Err(format!("unsupported query filter: {arg}").into()),
-                });
+                filters.push(parse_scene_query_filter(&arg)?);
             }
             let query = SavedSceneQuery {
                 id: QueryId::new(),
@@ -1509,7 +1494,7 @@ fn usage() {
         "writers-ide find <path> <normal|extended|regex> <all|scene-uuid> <pattern>\nwriters-ide replace <path> <normal|extended|regex> <all|scene-uuid> <pattern> => <replacement>\nwriters-ide language <path> [language-tag]"
     );
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide create-kind <path> <fiction|nonfiction|custom> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide compile <path> <markdown|html|epub|docx|pdf> [output-path] [--expand-transclusions]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
+        "writers-ide create <path> [title]\nwriters-ide create-kind <path> <fiction|nonfiction|custom> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide compile <path> <markdown|html|epub|docx|pdf> [output-path] [--expand-transclusions]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|not-status=...|character=UUID|character-any=UUID,UUID|plotline=UUID|plotline-any=UUID,UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
     );
     eprintln!(
         "writers-ide anchors <path> <scene-uuid>\nwriters-ide anchor-move <path> <anchor-uuid> <start-byte> <end-byte>"
@@ -1801,6 +1786,42 @@ fn parse_story_entity_kind(
         _ => Err("entity kind must be character, location, object, plotline, or event".into()),
     }
 }
+fn parse_scene_query_filter(
+    argument: &str,
+) -> Result<SceneQueryFilter, Box<dyn std::error::Error>> {
+    let (key, value) = argument
+        .split_once('=')
+        .ok_or("filters must use key=value syntax")?;
+    let parse_ids = |value: &str| {
+        value
+            .split(',')
+            .map(str::parse::<uuid::Uuid>)
+            .collect::<Result<Vec<_>, _>>()
+    };
+    Ok(match key {
+        "status" => SceneQueryFilter::Status(parse_status(value)?),
+        "not-status" => SceneQueryFilter::ExcludeStatus(parse_status(value)?),
+        "character" => SceneQueryFilter::Character(story_core::CharacterId(value.parse()?)),
+        "character-any" => SceneQueryFilter::AnyCharacter(
+            parse_ids(value)?
+                .into_iter()
+                .map(story_core::CharacterId)
+                .collect(),
+        ),
+        "plotline" => SceneQueryFilter::Plotline(story_core::PlotlineId(value.parse()?)),
+        "plotline-any" => SceneQueryFilter::AnyPlotline(
+            parse_ids(value)?
+                .into_iter()
+                .map(story_core::PlotlineId)
+                .collect(),
+        ),
+        "before" => SceneQueryFilter::TimeBefore(value.parse()?),
+        "after" => SceneQueryFilter::TimeAfter(value.parse()?),
+        "issue" if value == "unresolved" => SceneQueryFilter::UnresolvedIssue,
+        _ => return Err(format!("unsupported query filter: {argument}").into()),
+    })
+}
+
 fn parse_status(value: &str) -> Result<story_core::SceneStatus, Box<dyn std::error::Error>> {
     use story_core::SceneStatus::*;
     Ok(match value {
@@ -1848,8 +1869,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod watch_tests {
     use super::{
-        compile_edition, compile_edition_with_aspell, run_processing_recipe, spellcheck_project,
-        watch_fingerprint,
+        compile_edition, compile_edition_with_aspell, parse_scene_query_filter,
+        run_processing_recipe, spellcheck_project, watch_fingerprint,
     };
     use std::fs;
     use story_app::WriterApp;
@@ -1953,6 +1974,23 @@ mod watch_tests {
         .unwrap();
         let after = super::processing_watch_fingerprint(&project, &recipe).unwrap();
         assert_ne!(before, after);
+    }
+
+    #[test]
+    fn query_filter_parser_supports_or_groups_and_exclusions() {
+        let one = uuid::Uuid::new_v4();
+        let two = uuid::Uuid::new_v4();
+        assert_eq!(
+            parse_scene_query_filter(&format!("character-any={one},{two}")).unwrap(),
+            story_core::SceneQueryFilter::AnyCharacter(vec![
+                story_core::CharacterId(one),
+                story_core::CharacterId(two),
+            ])
+        );
+        assert_eq!(
+            parse_scene_query_filter("not-status=complete").unwrap(),
+            story_core::SceneQueryFilter::ExcludeStatus(story_core::SceneStatus::Complete)
+        );
     }
 
     #[cfg(unix)]

@@ -32,6 +32,7 @@ const MIGRATION_17: &str = include_str!("../migrations/0017_project_language.sql
 const MIGRATION_18: &str = include_str!("../migrations/0018_writing_challenges.sql");
 const MIGRATION_19: &str = include_str!("../migrations/0019_query_assertions.sql");
 const MIGRATION_20: &str = include_str!("../migrations/0020_writing_sessions.sql");
+const MIGRATION_21: &str = include_str!("../migrations/0021_query_boolean_filters.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -542,6 +543,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_19}\nINSERT INTO schema_migrations(version,applied_at) VALUES(19,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_20}\nINSERT INTO schema_migrations(version,applied_at) VALUES(20,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
@@ -584,7 +586,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 20 {
+        if version > 21 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -665,6 +667,10 @@ impl ProjectStore {
         }
         if current_version == 19 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_20}\nINSERT INTO schema_migrations(version,applied_at) VALUES(20,'{}');\nCOMMIT;", now()))?;
+            current_version = 20;
+        }
+        if current_version == 20 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -5371,8 +5377,39 @@ impl ProjectStore {
         for (index, filter) in query.filters.iter().enumerate() {
             let (kind, value) = match filter {
                 SceneQueryFilter::Status(status) => ("status", status.as_str().to_owned()),
+                SceneQueryFilter::ExcludeStatus(status) => {
+                    ("exclude_status", status.as_str().to_owned())
+                }
                 SceneQueryFilter::Character(id) => ("character", id.to_string()),
+                SceneQueryFilter::AnyCharacter(ids) => {
+                    if ids.is_empty() {
+                        return Err(StorageError::Invalid(
+                            "character-any query filter cannot be empty".into(),
+                        ));
+                    }
+                    (
+                        "character_any",
+                        ids.iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                }
                 SceneQueryFilter::Plotline(id) => ("plotline", id.to_string()),
+                SceneQueryFilter::AnyPlotline(ids) => {
+                    if ids.is_empty() {
+                        return Err(StorageError::Invalid(
+                            "plotline-any query filter cannot be empty".into(),
+                        ));
+                    }
+                    (
+                        "plotline_any",
+                        ids.iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                }
                 SceneQueryFilter::TimeBefore(tick) => ("time_before", tick.to_string()),
                 SceneQueryFilter::TimeAfter(tick) => ("time_after", tick.to_string()),
                 SceneQueryFilter::UnresolvedIssue => ("unresolved_issue", "1".into()),
@@ -5504,8 +5541,21 @@ impl ProjectStore {
         for (kind, value) in filters {
             match kind.as_str() {
                 "status" => { sql.push_str(" AND s.status=?"); values.push(value); }
+                "exclude_status" => { sql.push_str(" AND s.status<>?"); values.push(value); }
                 "character" => { sql.push_str(" AND EXISTS(SELECT 1 FROM scene_character sc WHERE sc.scene_id=s.id AND sc.character_id=?)"); values.push(value); }
+                "character_any" => {
+                    let ids = value.split(',').filter(|id| !id.is_empty()).collect::<Vec<_>>();
+                    if ids.is_empty() { return Err(StorageError::Invalid("empty character-any query filter".into())); }
+                    sql.push_str(&format!(" AND EXISTS(SELECT 1 FROM scene_character sc WHERE sc.scene_id=s.id AND sc.character_id IN ({}))", vec!["?"; ids.len()].join(",")));
+                    values.extend(ids.into_iter().map(str::to_owned));
+                }
                 "plotline" => { sql.push_str(" AND EXISTS(SELECT 1 FROM scene_plotline sp WHERE sp.scene_id=s.id AND sp.plotline_id=?)"); values.push(value); }
+                "plotline_any" => {
+                    let ids = value.split(',').filter(|id| !id.is_empty()).collect::<Vec<_>>();
+                    if ids.is_empty() { return Err(StorageError::Invalid("empty plotline-any query filter".into())); }
+                    sql.push_str(&format!(" AND EXISTS(SELECT 1 FROM scene_plotline sp WHERE sp.scene_id=s.id AND sp.plotline_id IN ({}))", vec!["?"; ids.len()].join(",")));
+                    values.extend(ids.into_iter().map(str::to_owned));
+                }
                 "time_before" => { sql.push_str(" AND s.start_nominal IS NOT NULL AND s.start_nominal<?"); values.push(value); }
                 "time_after" => { sql.push_str(" AND s.start_nominal IS NOT NULL AND s.start_nominal>?"); values.push(value); }
                 "unresolved_issue" => sql.push_str(" AND EXISTS(SELECT 1 FROM scene_issue si JOIN story_issue i ON i.id=si.issue_id WHERE si.scene_id=s.id AND i.status IN('open','in_progress'))"),
@@ -7729,7 +7779,11 @@ mod tests {
         let second = st.create_scene(chapter, 1, "Second").unwrap();
         let character = CharacterId::new();
         st.add_character(character, "Mara").unwrap();
+        let alternate_character = CharacterId::new();
+        st.add_character(alternate_character, "Ivo").unwrap();
         st.link_character(second, character, ParticipationRole::Pov)
+            .unwrap();
+        st.link_character(first, alternate_character, ParticipationRole::Major)
             .unwrap();
         let query = SavedSceneQuery {
             id: QueryId::new(),
@@ -7755,6 +7809,37 @@ mod tests {
         st.link_character(first, character, ParticipationRole::Minor)
             .unwrap();
         assert_eq!(st.run_scene_query(query.id).unwrap(), vec![first, second]);
+        let plot_a = PlotlineId::new();
+        let plot_b = PlotlineId::new();
+        st.add_plotline(plot_a, "Political").unwrap();
+        st.add_plotline(plot_b, "Personal").unwrap();
+        st.link_plotline(first, plot_a, "main", None).unwrap();
+        let multi = SavedSceneQuery {
+            id: QueryId::new(),
+            name: "Any thread participant, excluding complete scenes".into(),
+            description: String::new(),
+            filters: vec![
+                SceneQueryFilter::AnyCharacter(vec![character, alternate_character]),
+                SceneQueryFilter::AnyPlotline(vec![plot_a, plot_b]),
+                SceneQueryFilter::ExcludeStatus(SceneStatus::Complete),
+            ],
+        };
+        st.save_scene_query(&multi).unwrap();
+        assert_eq!(st.run_scene_query(multi.id).unwrap(), vec![first]);
+        assert!(st
+            .conn
+            .execute(
+                "INSERT INTO saved_query_filter(query_id,ordinal,filter_kind,value) VALUES(?1,99,'invalid','x')",
+                [multi.id.to_string()],
+            )
+            .is_err());
+        let empty_any = SavedSceneQuery {
+            id: QueryId::new(),
+            name: "Invalid empty OR".into(),
+            description: String::new(),
+            filters: vec![SceneQueryFilter::AnyCharacter(Vec::new())],
+        };
+        assert!(st.save_scene_query(&empty_any).is_err());
         let order = query_scene_ids(&st.conn, &chapter.to_string()).unwrap();
         assert_eq!(order, vec![first.to_string(), second.to_string()]);
         drop(st);
@@ -8020,7 +8105,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 20);
+        assert_eq!(version, 21);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }

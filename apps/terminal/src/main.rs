@@ -4413,7 +4413,7 @@ impl AppState {
             let mut parts = rest.split_whitespace();
             let name = parts
                 .next()
-                .ok_or("use query-save <name> [key=value ...]")?;
+                .ok_or("use query-save <name> [status=...|not-status=...|character=UUID|character-any=UUID,UUID|plotline=UUID|plotline-any=UUID,UUID|before=TICK|after=TICK|issue=unresolved]")?;
             let mut filters = Vec::new();
             for filter in parts {
                 let (key, value) = filter
@@ -4421,12 +4421,27 @@ impl AppState {
                     .ok_or("query filters use key=value")?;
                 filters.push(match key {
                     "status" => story_core::SceneQueryFilter::Status(parse_terminal_status(value)?),
+                    "not-status" => {
+                        story_core::SceneQueryFilter::ExcludeStatus(parse_terminal_status(value)?)
+                    }
                     "character" => story_core::SceneQueryFilter::Character(
                         story_core::CharacterId(value.parse()?),
+                    ),
+                    "character-any" => story_core::SceneQueryFilter::AnyCharacter(
+                        value
+                            .split(',')
+                            .map(|id| id.parse().map(story_core::CharacterId))
+                            .collect::<Result<Vec<_>, _>>()?,
                     ),
                     "plotline" => story_core::SceneQueryFilter::Plotline(story_core::PlotlineId(
                         value.parse()?,
                     )),
+                    "plotline-any" => story_core::SceneQueryFilter::AnyPlotline(
+                        value
+                            .split(',')
+                            .map(|id| id.parse().map(story_core::PlotlineId))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    ),
                     "before" => story_core::SceneQueryFilter::TimeBefore(value.parse()?),
                     "after" => story_core::SceneQueryFilter::TimeAfter(value.parse()?),
                     "issue" if value == "unresolved" => {
@@ -8796,6 +8811,21 @@ mod tests {
         state.mode = Some(':');
         state.prompt = format!("plotline-link {first} {plot_id} overlap advances");
         state.command().unwrap();
+        let other_character = story_core::CharacterId::new();
+        let other_plotline = story_core::PlotlineId::new();
+        state.mode = Some(':');
+        state.prompt = format!(
+            "query-save mixed character-any={character_id},{other_character} plotline-any={plot_id},{other_plotline} not-status=complete"
+        );
+        state.command().unwrap();
+        let query = state
+            .app
+            .list_saved_queries()
+            .unwrap()
+            .into_iter()
+            .find(|query| query.name == "mixed")
+            .unwrap();
+        assert_eq!(state.app.run_scene_query(query.id).unwrap(), vec![first]);
         let grid = plot_grid_rows(&state);
         assert!(grid[0].contains("Political intrigue"));
         assert!(

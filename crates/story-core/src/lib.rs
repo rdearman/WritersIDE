@@ -617,8 +617,11 @@ pub struct StoryLink {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SceneQueryFilter {
     Status(SceneStatus),
+    ExcludeStatus(SceneStatus),
     Character(CharacterId),
+    AnyCharacter(Vec<CharacterId>),
     Plotline(PlotlineId),
+    AnyPlotline(Vec<PlotlineId>),
     TimeBefore(i64),
     TimeAfter(i64),
     UnresolvedIssue,
