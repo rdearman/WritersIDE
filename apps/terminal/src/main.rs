@@ -5953,7 +5953,11 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 .count();
             let data = s.app.analytics_dataset().unwrap_or_default();
             let target = s.app.get_project().ok().and_then(|p| p.target_words);
-            analytics_report_rows(&data, target, total, draft)
+            let mut rows = analytics_report_rows(&data, target, total, draft);
+            rows.extend(challenge_progress_rows(
+                &s.app.list_writing_challenges().unwrap_or_default(),
+            ));
+            rows
         }
         Workspace::Research if s.proposal_review_active => s.proposal_review_rows.clone(),
         Workspace::Research => s
@@ -6022,6 +6026,29 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             }
         }
     }
+}
+
+fn challenge_progress_rows(challenges: &[story_storage::WritingChallengeRecord]) -> Vec<String> {
+    if challenges.is_empty() {
+        return vec!["No writing challenge sessions recorded".into()];
+    }
+    challenges
+        .iter()
+        .map(|challenge| {
+            let written = challenge.words_written.unwrap_or(0);
+            let filled = if challenge.target_words == 0 {
+                0
+            } else {
+                ((u64::from(written).saturating_mul(20) / u64::from(challenge.target_words))
+                    .min(20)) as usize
+            };
+            let bar = format!("{}{}", "█".repeat(filled), "░".repeat(20 - filled));
+            format!(
+                "Challenge · {} · {written}/{} words · {bar} · {} · {}",
+                challenge.mode, challenge.target_words, challenge.status, challenge.started_at
+            )
+        })
+        .collect()
 }
 
 fn plot_grid_rows(s: &AppState) -> Vec<String> {
@@ -6832,6 +6859,35 @@ mod tests {
             ]
         );
         assert_eq!(loaded.registers["a"], "Saved text");
+    }
+
+    #[test]
+    fn writing_challenge_graph_is_bounded_and_exposes_target_progress() {
+        let rows = challenge_progress_rows(&[
+            story_storage::WritingChallengeRecord {
+                id: "a".into(),
+                started_at: 1,
+                deadline_at: 60,
+                target_words: 10,
+                mode: "steady".into(),
+                ended_at: Some(30),
+                words_written: Some(5),
+                status: "completed".into(),
+            },
+            story_storage::WritingChallengeRecord {
+                id: "b".into(),
+                started_at: 2,
+                deadline_at: 60,
+                target_words: 10,
+                mode: "steady".into(),
+                ended_at: Some(30),
+                words_written: Some(100),
+                status: "completed".into(),
+            },
+        ]);
+        assert!(rows[0].contains("5/10 words"));
+        assert!(rows[0].contains("██████████░░░░░░░░░░"));
+        assert!(rows[1].contains("████████████████████"));
     }
 
     #[test]

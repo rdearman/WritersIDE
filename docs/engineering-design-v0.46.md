@@ -232,7 +232,7 @@ Stable-ID typed links, anchors, backlinks, broken-link scans, cycle-safe inclusi
 
 ### Issue #5 — Writing challenges foundation
 
-Migration 0018 adds durable writing challenge records with target words, start/deadline, `steady` or explicitly requested `kamikaze` mode, completion status, and words written. App services validate and record start/completion; CLI commands are `challenge-start`, `challenge-finish`, and `challenge-list`. The terminal command palette provides an integrated countdown, records the open editor's word delta on finish or timeout, and can abandon a session. Explicit Kamikaze mode deletes the previous word after ten seconds without typing; the deletion is undoable and the normal journaled save remains in effect. Challenge history acts as a basic event ledger. Project-wide progress graphs and chapter/scene target progress views remain open.
+Migration 0018 adds durable writing challenge records with target words, start/deadline, `steady` or explicitly requested `kamikaze` mode, completion status, and words written. App services validate and record start/completion; CLI commands are `challenge-start`, `challenge-finish`, and `challenge-list`. The terminal command palette provides an integrated countdown, records the open editor's word delta on finish or timeout, and can abandon a session. Explicit Kamikaze mode deletes the previous word after ten seconds without typing; the deletion is undoable and the normal journaled save remains in effect. Challenge history acts as a basic event ledger. Analytics renders a bounded progress bar for each recorded challenge; project-wide cumulative progress graphs and chapter/scene target progress views remain open.
 
 ### Issue #15 — Advanced inspection foundation
 

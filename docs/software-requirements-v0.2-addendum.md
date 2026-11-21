@@ -203,7 +203,7 @@ Scenes and events use optional signed-integer `StoryTime` values with unknown/ap
 
 Issue #14 now has UTF-8 safe snippet expansion, saved macros, persistent snippets/registers, multi-cursor insertion, and terminal cursor placement/clearing commands. Macro recording and multi-cursor deletion/navigation remain outstanding.
 
-Issue #5 adds persisted challenge start/deadline/target/mode/results, terminal countdown and word-delta recording, and CLI controls. Challenge history supplies a basic session ledger; progress graphs and project-wide target reports remain open.
+Issue #5 adds persisted challenge start/deadline/target/mode/results, terminal countdown and word-delta recording, CLI controls, and bounded per-challenge progress bars in Analytics. Challenge history supplies a basic session ledger; project-wide cumulative graphs and chapter/scene target reports remain open.
 
 Issue #15 adds read-only character/plotline scene coverage checks exposed through `coverage`, plus saved-query count assertions exposed through `query-assert`. Coverage/assertion authoring UI and persistent assertion definitions remain outstanding.
 
