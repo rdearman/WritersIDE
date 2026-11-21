@@ -499,6 +499,58 @@ pub struct EditionRecipe {
     pub dictionary: Option<String>,
 }
 
+/// Parse a project-local personal word list. Supports plain one-word-per-line
+/// files, Aspell personal-word-list headers, and Hunspell `.dic` count headers
+/// with optional slash-delimited flags. Affix expansion remains the engine's
+/// responsibility; flags are discarded while preserving the authored stem.
+pub fn parse_personal_dictionary(
+    source: &str,
+) -> Result<std::collections::BTreeSet<String>, String> {
+    let mut lines = source.lines().map(str::trim).peekable();
+    let mut expected_count = None;
+    if let Some(header) = lines.peek().copied() {
+        let parts = header.split_whitespace().collect::<Vec<_>>();
+        if parts.first() == Some(&"personal_ws-1.1") {
+            if parts.len() < 4 || parts[3] != "UTF-8" {
+                return Err("invalid Aspell personal dictionary header".into());
+            }
+            expected_count = Some(
+                parts[2]
+                    .parse::<usize>()
+                    .map_err(|_| "invalid Aspell dictionary word count")?,
+            );
+            lines.next();
+        } else if parts.len() == 1 && parts[0].parse::<usize>().is_ok() {
+            expected_count = Some(
+                parts[0]
+                    .parse::<usize>()
+                    .map_err(|_| "invalid Hunspell dictionary word count")?,
+            );
+            lines.next();
+        }
+    }
+    let mut words = std::collections::BTreeSet::new();
+    let mut entries = 0usize;
+    for line in lines {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let stem = line.split('/').next().unwrap_or_default().trim();
+        if stem.is_empty() || stem.chars().any(char::is_whitespace) {
+            return Err(format!("invalid personal dictionary entry: {line}"));
+        }
+        entries += 1;
+        words.insert(stem.to_lowercase());
+    }
+    if expected_count.is_some_and(|count| count != entries) {
+        return Err(format!(
+            "personal dictionary header declares {} entries, found {entries}",
+            expected_count.unwrap_or_default()
+        ));
+    }
+    Ok(words)
+}
+
 impl EditionRecipe {
     pub fn validate(&self) -> Result<(), String> {
         if self.version != 1 {
@@ -834,6 +886,19 @@ pub fn source_fingerprint(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn personal_dictionary_accepts_plain_aspell_and_hunspell_lists() {
+        let plain = parse_personal_dictionary("TARDIS\nTime-Lord\n").unwrap();
+        assert!(plain.contains("tardis"));
+        let aspell =
+            parse_personal_dictionary("personal_ws-1.1 en_GB 2 UTF-8\nTARDIS\nGallifrey\n")
+                .unwrap();
+        assert_eq!(aspell.len(), 2);
+        let hunspell = parse_personal_dictionary("2\nTARDIS/SM\nGallifrey\n").unwrap();
+        assert!(hunspell.contains("tardis"));
+        assert!(parse_personal_dictionary("2\nTARDIS\n").is_err());
+    }
 
     #[test]
     fn edition_recipes_validate_round_trip_and_reject_path_escape() {

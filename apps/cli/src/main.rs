@@ -1941,11 +1941,8 @@ fn spellcheck_project(
         if !fs::symlink_metadata(&path)?.is_file() {
             return Err("personal dictionary must be a regular file".into());
         }
-        fs::read_to_string(path)?
-            .lines()
-            .map(|line| line.trim().to_lowercase())
-            .filter(|word| !word.is_empty())
-            .collect::<std::collections::BTreeSet<_>>()
+        story_document::parse_personal_dictionary(&fs::read_to_string(path)?)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?
     } else {
         std::collections::BTreeSet::new()
     };
