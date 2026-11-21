@@ -234,6 +234,7 @@ struct ReferencePane {
     title: String,
     content: String,
     scroll: usize,
+    follow_context: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -311,6 +312,8 @@ struct SessionSnapshot {
     reference_scrolls: Vec<usize>,
     #[serde(default)]
     reference_focused: bool,
+    #[serde(default)]
+    reference_follow_modes: Vec<bool>,
 }
 
 #[derive(Clone, Debug)]
@@ -1521,6 +1524,22 @@ fn command_registry() -> Vec<CommandSpec> {
             "View",
             "open",
             true,
+        ),
+        legacy_command(
+            "view.follow-scene-card",
+            "Follow Scene Card",
+            "Open a scene-card reference that follows the active scene",
+            "View",
+            "reference-follow-card",
+            false,
+        ),
+        legacy_command(
+            "view.pin-reference",
+            "Pin Reference Pane",
+            "Keep the selected reference pane on its current entity",
+            "View",
+            "reference-pin",
+            false,
         ),
         legacy_command(
             "scratchpad.create",
@@ -3201,6 +3220,11 @@ impl AppState {
                 .collect(),
             active_reference: self.active_reference,
             reference_focused: self.reference_focused,
+            reference_follow_modes: self
+                .reference_panes
+                .iter()
+                .map(|pane| pane.follow_context)
+                .collect(),
         };
         let bytes = serde_json::to_vec_pretty(&snapshot)?;
         let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
@@ -3343,6 +3367,7 @@ impl AppState {
         };
         if let Some(legacy) = snapshot.reference_scene.as_ref()
             && !saved_references.contains(&format!("scene:{legacy}"))
+            && !saved_references.contains(&format!("scene-card:{legacy}"))
         {
             saved_references.push(format!("scene:{legacy}"));
         }
@@ -3357,6 +3382,14 @@ impl AppState {
                         let row = self.app.get_scene(id).ok()?;
                         let (content, _) = self.app.load_scene_text(id).ok()?;
                         Some((Some(id), row.scene.title, content))
+                    }),
+                "scene-card" => source_id
+                    .parse::<uuid::Uuid>()
+                    .map(SceneId)
+                    .ok()
+                    .and_then(|id| {
+                        let row = self.app.get_scene(id).ok()?;
+                        Some((Some(id), row.scene.title.clone(), format_scene_card(&row)))
                     }),
                 "research" => source_id
                     .parse::<uuid::Uuid>()
@@ -3470,6 +3503,11 @@ impl AppState {
                     title,
                     content,
                     scroll,
+                    follow_context: snapshot
+                        .reference_follow_modes
+                        .get(index)
+                        .copied()
+                        .unwrap_or(false),
                 });
             } else {
                 stale_reference = true;
@@ -4245,6 +4283,50 @@ impl AppState {
     fn active_reference_pane_mut(&mut self) -> Option<&mut ReferencePane> {
         self.reference_panes.get_mut(self.active_reference)
     }
+    fn follow_active_scene_card(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let scene = self
+            .editing_scene
+            .or(self.active_scene())
+            .ok_or("select or open a scene before following its scene card")?;
+        let row = self.app.get_scene(scene)?;
+        self.open_reference_buffer(
+            format!("scene-card:{scene}"),
+            Some(scene),
+            row.scene.title.clone(),
+            format_scene_card(&row),
+        );
+        if let Some(pane) = self.active_reference_pane_mut() {
+            pane.follow_context = true;
+        }
+        self.reference_focused = true;
+        Ok(())
+    }
+    fn refresh_following_scene_cards(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(scene) = self.editing_scene else {
+            return Ok(());
+        };
+        let indices = self
+            .reference_panes
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pane)| pane.follow_context.then_some(index))
+            .collect::<Vec<_>>();
+        if indices.is_empty() {
+            return Ok(());
+        }
+        let row = self.app.get_scene(scene)?;
+        for index in indices {
+            let pane = &mut self.reference_panes[index];
+            pane.source_key = format!("scene-card:{scene}");
+            pane.scene_id = Some(scene);
+            pane.title = row.scene.title.clone();
+            pane.content = format_scene_card(&row);
+            pane.scroll = pane
+                .scroll
+                .min(pane.content.lines().count().saturating_sub(1));
+        }
+        Ok(())
+    }
     fn open_reference_buffer(
         &mut self,
         source_key: String,
@@ -4264,6 +4346,7 @@ impl AppState {
                 title,
                 content,
                 scroll,
+                follow_context: false,
             };
             self.active_reference = index;
         } else {
@@ -4273,6 +4356,7 @@ impl AppState {
                 title,
                 content,
                 scroll: 0,
+                follow_context: false,
             });
             self.active_reference = self.reference_panes.len() - 1;
         }
@@ -4579,6 +4663,7 @@ impl AppState {
         self.assembly_draft = None;
         self.dirty = false;
         self.workspace = Workspace::Editor;
+        self.refresh_following_scene_cards()?;
         let mentions = self.app.list_scene_mentions(id)?;
         let detected = mentions
             .iter()
@@ -7716,6 +7801,17 @@ impl AppState {
                 "Object reference opened in buffer {}",
                 self.active_reference + 1
             );
+        } else if cmd == "reference-follow-card" {
+            self.follow_active_scene_card()?;
+            self.message =
+                "Scene card follows the active scene · :reference-pin to keep it here".into();
+        } else if cmd == "reference-pin" {
+            if let Some(pane) = self.active_reference_pane_mut() {
+                pane.follow_context = false;
+                self.message = format!("Pinned reference: {}", pane.title);
+            } else {
+                self.message = "No reference pane is open".into();
+            }
         } else if cmd == "reference-next" {
             if !self.reference_panes.is_empty() {
                 self.active_reference = (self.active_reference + 1) % self.reference_panes.len();
@@ -10094,9 +10190,14 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 .block(
                     Block::default()
                         .title(format!(
-                            "{} · {}{}",
+                            "{} · {} · {}{}",
                             reference.title,
                             index + 1,
+                            if reference.follow_context {
+                                "follow"
+                            } else {
+                                "pinned"
+                            },
                             if index == s.active_reference {
                                 if s.reference_focused {
                                     " · active · Ctrl-Tab focus"
@@ -10615,6 +10716,29 @@ fn format_character_reference(character: &story_core::Character) -> String {
         }
     }
     lines.join("\n")
+}
+
+fn format_scene_card(record: &story_storage::SceneRecord) -> String {
+    format!(
+        "Scene: {}\nStatus: {:?}\nWords: {}{}\nPOV: {}\n\nSynopsis\n{}\n\nPurpose\n{}\n\nGoal\n{}\n\nOutcome\n{}",
+        record.scene.title,
+        record.scene.status,
+        record.actual_words,
+        record
+            .scene
+            .target_words
+            .map(|target| format!(" / {target} target"))
+            .unwrap_or_default(),
+        record
+            .scene
+            .pov_character
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "—".into()),
+        record.scene.synopsis,
+        record.scene.purpose,
+        record.scene.goal,
+        record.scene.outcome,
+    )
 }
 
 fn format_location_reference(location: &story_core::Location) -> String {
@@ -16359,6 +16483,50 @@ mod tests {
             pane.source_key == format!("location:{location}")
                 && pane.content.contains("narrow harbour")
         }));
+    }
+
+    #[test]
+    fn scene_card_reference_follows_context_until_pinned_and_restores_mode() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "Opening", 0).unwrap();
+        let second = app.create_scene(chapter, "Arrival", 1).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(first).unwrap();
+        state
+            .execute_legacy_palette_command("reference-follow-card")
+            .unwrap();
+        assert_eq!(state.reference_panes.len(), 1);
+        assert!(state.reference_panes[0].follow_context);
+        assert!(state.reference_panes[0].content.contains("Scene: Opening"));
+
+        state.open_scene(second).unwrap();
+        assert_eq!(state.reference_panes.len(), 1);
+        assert_eq!(state.reference_panes[0].scene_id, Some(second));
+        assert!(state.reference_panes[0].content.contains("Scene: Arrival"));
+        state
+            .execute_legacy_palette_command("reference-pin")
+            .unwrap();
+        state.open_scene(first).unwrap();
+        assert!(!state.reference_panes[0].follow_context);
+        assert_eq!(state.reference_panes[0].scene_id, Some(second));
+
+        state.save_session().unwrap();
+        let mut reopened = AppState::new(
+            WriterApp::open_project(&project).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        assert_eq!(reopened.reference_panes.len(), 1);
+        assert!(!reopened.reference_panes[0].follow_context);
+        assert_eq!(reopened.reference_panes[0].scene_id, Some(second));
+        assert!(
+            reopened.reference_panes[0]
+                .content
+                .contains("Scene: Arrival")
+        );
     }
 
     #[test]
