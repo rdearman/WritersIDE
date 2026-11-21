@@ -1,4 +1,5 @@
 //! Local Git history operations. Callers provide the storage snapshot barrier.
+use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -42,6 +43,84 @@ pub struct BlamedLine {
     pub date: String,
     pub summary: String,
     pub content: String,
+}
+
+/// Project-local interval snapshot policy. A missing interval disables automation.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoSnapshotPolicy {
+    pub interval_minutes: Option<u32>,
+    #[serde(default)]
+    last_checked_unix: Option<i64>,
+}
+
+impl AutoSnapshotPolicy {
+    pub fn new(interval_minutes: Option<u32>) -> Result<Self> {
+        if interval_minutes.is_some_and(|minutes| !(1..=10_080).contains(&minutes)) {
+            return Err(GitError::Command(
+                "automatic snapshot interval must be between 1 and 10080 minutes".into(),
+            ));
+        }
+        Ok(Self {
+            interval_minutes,
+            last_checked_unix: None,
+        })
+    }
+
+    pub fn due(&self, now_unix: i64) -> bool {
+        let Some(minutes) = self.interval_minutes else {
+            return false;
+        };
+        self.last_checked_unix
+            .and_then(|last| now_unix.checked_sub(last))
+            .is_none_or(|elapsed| elapsed >= i64::from(minutes) * 60)
+    }
+
+    pub fn record_check(&mut self, now_unix: i64) {
+        self.last_checked_unix = Some(now_unix);
+    }
+}
+
+pub fn load_auto_snapshot_policy(root: impl AsRef<Path>) -> Result<AutoSnapshotPolicy> {
+    let path = root.as_ref().join(".writers-ide/git-snapshot.toml");
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let policy: AutoSnapshotPolicy = toml::from_str(&text).map_err(|error| {
+                GitError::Command(format!("invalid Git snapshot policy: {error}"))
+            })?;
+            AutoSnapshotPolicy::new(policy.interval_minutes).map(|mut validated| {
+                validated.last_checked_unix = policy.last_checked_unix;
+                validated
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(AutoSnapshotPolicy::default())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn save_auto_snapshot_policy(
+    root: impl AsRef<Path>,
+    policy: &AutoSnapshotPolicy,
+) -> Result<()> {
+    AutoSnapshotPolicy::new(policy.interval_minutes)?;
+    let root = root.as_ref();
+    let directory = root.join(".writers-ide");
+    std::fs::create_dir_all(&directory)?;
+    let path = directory.join("git-snapshot.toml");
+    let temp = directory.join(format!("git-snapshot-{}.tmp", uuid::Uuid::new_v4()));
+    let text = toml::to_string(policy).map_err(|error| GitError::Command(error.to_string()))?;
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&temp, &path)?;
+    std::fs::File::open(&directory)?.sync_all()?;
+    Ok(())
 }
 
 pub struct GitHistory {
@@ -452,6 +531,27 @@ fn is_owned_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn auto_snapshot_policy_validates_interval_and_tracks_due_time() {
+        assert!(AutoSnapshotPolicy::new(Some(0)).is_err());
+        assert!(AutoSnapshotPolicy::new(Some(10_081)).is_err());
+        let mut policy = AutoSnapshotPolicy::new(Some(2)).unwrap();
+        assert!(policy.due(100));
+        policy.record_check(100);
+        assert!(!policy.due(219));
+        assert!(policy.due(220));
+        assert!(!AutoSnapshotPolicy::default().due(100));
+    }
+
+    #[test]
+    fn auto_snapshot_policy_round_trips_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let mut policy = AutoSnapshotPolicy::new(Some(30)).unwrap();
+        policy.record_check(1234);
+        save_auto_snapshot_policy(root.path(), &policy).unwrap();
+        assert_eq!(load_auto_snapshot_policy(root.path()).unwrap(), policy);
+    }
+
     #[test]
     fn local_snapshots_are_named_deterministic_and_ignore_live_database() {
         let dir = tempfile::tempdir().unwrap();

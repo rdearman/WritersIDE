@@ -7016,7 +7016,21 @@ fn run(
     s: &mut AppState,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut autosave_deadline: Option<Instant> = None;
+    let mut auto_snapshot_check = Instant::now();
     loop {
+        if auto_snapshot_check.elapsed() >= Duration::from_secs(10) {
+            auto_snapshot_check = Instant::now();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_secs() as i64;
+            match s.app.git_auto_snapshot_if_due(now) {
+                Ok(Some(commit)) => {
+                    s.message = format!("Automatic project snapshot created: {commit}")
+                }
+                Ok(None) => {}
+                Err(error) => s.message = format!("Automatic project snapshot failed: {error}"),
+            }
+        }
         t.draw(|f| draw(f, s))?;
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {

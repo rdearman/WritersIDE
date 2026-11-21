@@ -529,6 +529,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None => println!("No changes; snapshot not created."),
             }
         }
+        "git-auto-snapshot" => {
+            let path = args.next().ok_or("missing project path")?;
+            let interval = args.next().ok_or("missing interval minutes or off")?;
+            let interval = if interval.eq_ignore_ascii_case("off") {
+                None
+            } else {
+                Some(interval.parse::<u32>()?)
+            };
+            let app = WriterApp::open_project(path)?;
+            app.set_git_auto_snapshot_interval(interval)?;
+            match interval {
+                Some(minutes) => {
+                    println!("Automatic Git snapshots enabled every {minutes} minutes.")
+                }
+                None => println!("Automatic Git snapshots disabled."),
+            }
+        }
         "git-history" => {
             let path = args.next().ok_or("missing project path")?;
             let app = WriterApp::open_project(path)?;
@@ -2004,6 +2021,7 @@ fn usage() {
         "writers-ide compile <project> <markdown|latex|html|epub|docx|pdf> [output] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"
     );
     eprintln!("writers-ide compile-check <project>");
+    eprintln!("writers-ide git-auto-snapshot <project> <interval-minutes|off> (1–10080 minutes)");
     eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");
     eprintln!(
         "writers-ide event-time-set <project> <event-uuid> <start-tick|?|~nominal,lower,upper|lower..upper> <end-tick|?|~nominal,lower,upper|lower..upper> [source-time-text]"

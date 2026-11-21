@@ -1852,6 +1852,22 @@ impl WriterApp {
                 .map_err(|e| e.to_string())
         })?)
     }
+    pub fn set_git_auto_snapshot_interval(&self, minutes: Option<u32>) -> Result<()> {
+        let policy = story_git::AutoSnapshotPolicy::new(minutes)?;
+        story_git::save_auto_snapshot_policy(self.store.project_root(), &policy)?;
+        Ok(())
+    }
+    /// Create an interval snapshot when due. `now_unix` is injectable for deterministic tests.
+    pub fn git_auto_snapshot_if_due(&mut self, now_unix: i64) -> Result<Option<String>> {
+        let mut policy = story_git::load_auto_snapshot_policy(self.store.project_root())?;
+        if !policy.due(now_unix) {
+            return Ok(None);
+        }
+        let result = self.git_snapshot("Automatic project snapshot")?;
+        policy.record_check(now_unix);
+        story_git::save_auto_snapshot_policy(self.store.project_root(), &policy)?;
+        Ok(result)
+    }
     /// Restore one scene's prose from a local Git commit through the normal
     /// optimistic write journal. Current project state is snapshotted first.
     pub fn restore_scene_from_git(&mut self, commit: &str, scene: SceneId) -> Result<String> {
@@ -2068,6 +2084,25 @@ mod tests {
         );
         assert!(project.join("snapshots/database.sql").exists());
         assert!(app.git_diff(&first, &second, Some("story.db")).is_err());
+    }
+
+    #[test]
+    fn automatic_git_snapshots_run_only_when_due_and_skip_unchanged_projects() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        app.set_git_auto_snapshot_interval(Some(1)).unwrap();
+        assert!(app.git_auto_snapshot_if_due(1_000).unwrap().is_some());
+        assert!(app.git_auto_snapshot_if_due(1_059).unwrap().is_none());
+        assert!(app.git_auto_snapshot_if_due(1_060).unwrap().is_none());
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Changed prose.")
+            .unwrap();
+        assert!(app.git_auto_snapshot_if_due(1_119).unwrap().is_none());
+        assert!(app.git_auto_snapshot_if_due(1_120).unwrap().is_some());
+        app.set_git_auto_snapshot_interval(None).unwrap();
+        assert!(app.git_auto_snapshot_if_due(10_000).unwrap().is_none());
     }
 
     #[test]
