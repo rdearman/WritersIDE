@@ -162,6 +162,16 @@ struct EditorSnapshot {
     selection: Option<(usize, usize)>,
 }
 
+#[derive(Clone, Copy)]
+enum CursorMotion {
+    Left,
+    Right,
+    Up,
+    Down,
+    Home,
+    End,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct MenuState {
     top: usize,
@@ -4508,6 +4518,9 @@ impl AppState {
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
         }
+        if self.delete_at_all_cursors(true) {
+            return;
+        }
         if self.delete_selection() {
             return;
         }
@@ -4530,6 +4543,9 @@ impl AppState {
     fn delete_forward(&mut self) {
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
+        }
+        if self.delete_at_all_cursors(false) {
+            return;
         }
         if self.delete_selection() {
             return;
@@ -4639,6 +4655,109 @@ impl AppState {
         }
         let row = row.min(self.editor.len().saturating_sub(1));
         self.cursor = (row, col.min(grapheme_count(&self.editor[row])));
+    }
+    fn move_editor_cursors(&mut self, motion: CursorMotion, selecting: bool) {
+        let move_position = |(row, column): (usize, usize)| -> (usize, usize) {
+            match motion {
+                CursorMotion::Left if column > 0 => (row, column - 1),
+                CursorMotion::Left if row > 0 => (row - 1, grapheme_count(&self.editor[row - 1])),
+                CursorMotion::Right if column < grapheme_count(&self.editor[row]) => {
+                    (row, column + 1)
+                }
+                CursorMotion::Right if row + 1 < self.editor.len() => (row + 1, 0),
+                CursorMotion::Up => (row.saturating_sub(1), column),
+                CursorMotion::Down => ((row + 1).min(self.editor.len() - 1), column),
+                CursorMotion::Home => (row, 0),
+                CursorMotion::End => (row, grapheme_count(&self.editor[row])),
+                _ => (row, column),
+            }
+        };
+        let new_primary = move_position(self.cursor);
+        let new_extras = self
+            .extra_cursors
+            .iter()
+            .copied()
+            .map(move_position)
+            .collect();
+        self.move_cursor(new_primary.0, new_primary.1, selecting);
+        self.extra_cursors = new_extras;
+        self.extra_cursors
+            .retain(|position| *position != self.cursor);
+        self.extra_cursors.sort_unstable();
+        self.extra_cursors.dedup();
+    }
+
+    fn delete_at_all_cursors(&mut self, backward: bool) -> bool {
+        if self.extra_cursors.is_empty() || self.editor_selection.is_some() {
+            return false;
+        }
+        let cursors = std::iter::once(self.cursor)
+            .chain(self.extra_cursors.iter().copied())
+            .collect::<Vec<_>>();
+        let mut ranges = Vec::new();
+        for (row, column) in &cursors {
+            let base = editor_position_byte(&self.editor, *row, 0);
+            let count = grapheme_count(&self.editor[*row]);
+            if backward && *column > 0 {
+                let line = &self.editor[*row];
+                ranges.push((
+                    base + grapheme_byte(line, column - 1),
+                    base + grapheme_byte(line, *column),
+                ));
+            } else if backward && *row > 0 {
+                ranges.push((base - 1, base));
+            } else if !backward && *column < count {
+                let line = &self.editor[*row];
+                ranges.push((
+                    base + grapheme_byte(line, *column),
+                    base + grapheme_byte(line, column + 1),
+                ));
+            } else if !backward && *row + 1 < self.editor.len() {
+                let end = base + self.editor[*row].len();
+                ranges.push((end, end + 1));
+            }
+        }
+        ranges.sort_unstable();
+        ranges.dedup();
+        if ranges.is_empty() {
+            return false;
+        }
+        self.push_undo();
+        let source = self.editor.join("\n");
+        let original_anchors = cursors
+            .iter()
+            .map(|(row, column)| editor_position_byte(&self.editor, *row, *column))
+            .collect::<Vec<_>>();
+        let mut updated = source;
+        for (start, end) in ranges.iter().rev() {
+            updated.replace_range(*start..*end, "");
+        }
+        let mapped = original_anchors
+            .into_iter()
+            .map(|anchor| {
+                let removed = ranges
+                    .iter()
+                    .filter(|(_, end)| *end <= anchor)
+                    .map(|(start, end)| end - start)
+                    .sum::<usize>();
+                editor_position_from_byte(&updated, anchor.saturating_sub(removed))
+                    .unwrap_or((0, 0))
+            })
+            .collect::<Vec<_>>();
+        self.editor = updated.lines().map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        self.cursor = mapped[0];
+        self.extra_cursors = mapped
+            .into_iter()
+            .skip(1)
+            .filter(|position| *position != self.cursor)
+            .collect();
+        self.extra_cursors.sort_unstable();
+        self.extra_cursors.dedup();
+        self.dirty = true;
+        true
     }
     fn push_undo(&mut self) {
         const MAX_UNDO_STEPS: usize = 100;
@@ -5552,6 +5671,33 @@ fn analytics_report_rows(
         "Character appearance heatmap · P=POV · M=major · m=minor · o=off-camera · ?=mentioned"
             .into(),
     ];
+    if let Some(target) = target_words {
+        let percent = (u64::from(actual_words)
+            .saturating_mul(100)
+            .checked_div(target)
+            .unwrap_or(0))
+        .min(100);
+        let filled = usize::try_from(percent / 5).unwrap_or(20).min(20);
+        rows.push(format!(
+            "Manuscript progress · {actual_words}/{target} words · {percent}% · {}{}",
+            "█".repeat(filled),
+            "░".repeat(20 - filled)
+        ));
+    }
+    let mut chapter_progress = BTreeMap::<String, (usize, u64, u64)>::new();
+    for scene in data {
+        if let Some(chapter) = &scene.chapter_id {
+            let progress = chapter_progress.entry(chapter.clone()).or_default();
+            progress.0 += 1;
+            progress.1 = progress.1.saturating_add(u64::from(scene.actual_words));
+            progress.2 = progress.2.saturating_add(scene.target_words.unwrap_or(0));
+        }
+    }
+    for (chapter, (scenes, words, target)) in chapter_progress {
+        let percent = (words.saturating_mul(100).checked_div(target).unwrap_or(0)).min(100);
+        let filled = usize::try_from(percent / 5).unwrap_or(20).min(20);
+        rows.push(format!("Chapter progress · {chapter} · {scenes} scenes · {words}/{target} words · {percent}% · {}{}", "█".repeat(filled), "░".repeat(20-filled)));
+    }
     rows.extend(heatmap.into_iter().map(|row| {
         let participants = row
             .participants
@@ -6566,10 +6712,8 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             KeyCode::Enter => s.enter(),
             KeyCode::Backspace => s.backspace(),
             KeyCode::Delete => s.delete_forward(),
-            KeyCode::Home => s.move_cursor(s.cursor.0, 0, selecting),
-            KeyCode::End => {
-                s.move_cursor(s.cursor.0, grapheme_count(&s.editor[s.cursor.0]), selecting)
-            }
+            KeyCode::Home => s.move_editor_cursors(CursorMotion::Home, selecting),
+            KeyCode::End => s.move_editor_cursors(CursorMotion::End, selecting),
             KeyCode::Char('w') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 let row = s.cursor.0;
                 while s.cursor.1 > 0
@@ -6589,26 +6733,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     s.backspace();
                 }
             }
-            KeyCode::Left if s.cursor.1 > 0 => s.move_cursor(s.cursor.0, s.cursor.1 - 1, selecting),
-            KeyCode::Left if s.cursor.0 > 0 => {
-                let row = s.cursor.0 - 1;
-                let col = grapheme_count(&s.editor[row]);
-                s.move_cursor(row, col, selecting);
-            }
-            KeyCode::Right if s.cursor.1 < grapheme_count(&s.editor[s.cursor.0]) => {
-                s.move_cursor(s.cursor.0, s.cursor.1 + 1, selecting)
-            }
-            KeyCode::Right if s.cursor.0 + 1 < s.editor.len() => {
-                s.move_cursor(s.cursor.0 + 1, 0, selecting);
-            }
-            KeyCode::Up => {
-                let row = s.cursor.0.saturating_sub(1);
-                s.move_cursor(row, s.cursor.1, selecting);
-            }
-            KeyCode::Down => {
-                let row = (s.cursor.0 + 1).min(s.editor.len() - 1);
-                s.move_cursor(row, s.cursor.1, selecting);
-            }
+            KeyCode::Left => s.move_editor_cursors(CursorMotion::Left, selecting),
+            KeyCode::Right => s.move_editor_cursors(CursorMotion::Right, selecting),
+            KeyCode::Up => s.move_editor_cursors(CursorMotion::Up, selecting),
+            KeyCode::Down => s.move_editor_cursors(CursorMotion::Down, selecting),
             KeyCode::Char(c)
                 if !k.modifiers.contains(KeyModifiers::CONTROL)
                     && !k.modifiers.contains(KeyModifiers::ALT) =>
@@ -6923,6 +7051,25 @@ mod tests {
             ]
         );
         assert_eq!(loaded.registers["a"], "Saved text");
+    }
+
+    #[test]
+    fn multi_cursors_move_and_delete_graphemes_across_lines_together() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.editor = vec!["ab".into(), "cd".into()];
+        state.cursor = (0, 2);
+        state.extra_cursors = vec![(1, 2)];
+        state.move_editor_cursors(CursorMotion::Left, false);
+        assert_eq!(state.cursor, (0, 1));
+        assert_eq!(state.extra_cursors, [(1, 1)]);
+        state.backspace();
+        assert_eq!(state.editor, ["b", "d"]);
+        assert_eq!(state.cursor, (0, 0));
+        assert_eq!(state.extra_cursors, [(1, 0)]);
+        state.undo_edit();
+        assert_eq!(state.editor, ["ab", "cd"]);
     }
 
     #[test]
@@ -8613,6 +8760,29 @@ mod tests {
                 .any(|row| row.contains("Budget suggestion · Scene 4 · 400 words"))
         );
         assert!(scenes.iter().all(|scene| scene.target_words.is_none()));
+    }
+
+    #[test]
+    fn project_and_chapter_progress_rows_show_targeted_word_graphs() {
+        let scene = story_analysis::SceneAnalysisInput {
+            scene_id: "s1".into(),
+            title: "First".into(),
+            chapter_id: Some("chapter-1".into()),
+            actual_words: 50,
+            target_words: Some(100),
+            start_time: story_core::StoryTime::unknown(),
+            end_time: story_core::StoryTime::unknown(),
+            characters: vec![],
+            plotlines: vec![],
+        };
+        let rows = analytics_report_rows(&[scene], Some(200), 50, 0);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Manuscript progress · 50/200 words · 25%"))
+        );
+        assert!(rows.iter().any(|row| {
+            row.contains("Chapter progress · chapter-1 · 1 scenes · 50/100 words · 50%")
+        }));
     }
 
     #[test]
