@@ -6326,6 +6326,51 @@ impl AppState {
             } else {
                 self.message = "No matches".into();
             }
+        } else if let Some(rest) = cmd.strip_prefix("replace-preview ") {
+            let (head, replacement) = rest
+                .split_once(" => ")
+                .ok_or("use replace-preview MODE current|all PATTERN => REPLACEMENT")?;
+            let mut parts = head.splitn(3, ' ');
+            let mode = parse_find_mode(parts.next().ok_or("missing replace mode")?)?;
+            let scope = parts.next().ok_or("missing replace scope")?;
+            let pattern = parts.next().ok_or("missing replace pattern")?;
+            let scenes = self.scenes_for_scope(scope)?;
+            let mut output = Vec::new();
+            let mut total = 0usize;
+            for record in scenes {
+                let source = if self.editing_scene == Some(record.scene.id) {
+                    self.editor.join("\n")
+                } else {
+                    self.app.load_scene_text(record.scene.id)?.0
+                };
+                let (updated, count) =
+                    story_core::replace_matches(&source, pattern, replacement, mode)?;
+                if count > 0 {
+                    total += count;
+                    output.push(format!(
+                        "## {} — {count} replacement(s)\n--- current ---\n{}\n--- proposed ---\n{}",
+                        record.scene.title, source, updated
+                    ));
+                }
+            }
+            if output.is_empty() {
+                self.message = "Preview: no replacements found; manuscript unchanged".into();
+            } else {
+                let preview = output.join("\n\n");
+                let mut clipped = String::new();
+                for ch in preview.chars().take(12_000) {
+                    clipped.push(ch);
+                }
+                let suffix = if preview.chars().count() > 12_000 {
+                    "\n\n[Preview truncated at 12,000 characters; use CLI replace-preview for complete JSON.]"
+                } else {
+                    ""
+                };
+                self.message = format!(
+                    "Read-only preview: {total} replacement(s) in {} scene(s). Use replace to apply.\n\n{clipped}{suffix}",
+                    output.len()
+                );
+            }
         } else if let Some(rest) = cmd.strip_prefix("replace ") {
             self.search_locations.clear();
             let (head, replacement) = rest
@@ -12090,6 +12135,28 @@ mod tests {
         assert!(!reopened.scenes.iter().any(|scene| scene.0 == first_scene));
         assert_eq!(reopened.horizontal_split_ratio, 60);
         assert_eq!(reopened.vertical_split_ratio, 40);
+    }
+
+    #[test]
+    fn replace_preview_shows_proposed_text_without_mutating_manuscript() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Replace"), "Replace").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Cats", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "A cat waits.\nThe cat leaves.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command("replace-preview normal all cat => fox")
+            .unwrap();
+        assert!(state.message.contains("2 replacement(s)"));
+        assert!(state.message.contains("A cat waits."));
+        assert!(state.message.contains("A fox waits."));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "A cat waits.\nThe cat leaves."
+        );
     }
 
     #[test]

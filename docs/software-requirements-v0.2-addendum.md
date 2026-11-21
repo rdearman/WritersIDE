@@ -149,7 +149,7 @@ Terminal manuscript cursor columns now use extended grapheme clusters for naviga
 
 ### Issue #12 — Scoped find and replace foundation
 
-Core search helpers now provide literal Normal search, Extended escapes (`\\n`, `\\r`, `\\t`, `\\\\`), and Rust-regex mode with byte ranges. CLI and terminal support scopes for the current scene, an explicit scene UUID, a chapter UUID, or all scenes. `find` selects the first result; F3/Shift-F3 navigate through all matches. `replace` saves changed scenes through optimistic durable writes. Regex replacement uses Rust regex capture syntax. Search is case-sensitive; interactive replacement preview and transactional multi-scene undo remain open.
+Core search helpers now provide literal Normal search, Extended escapes (`\\n`, `\\r`, `\\t`, `\\\\`), and Rust-regex mode with byte ranges. CLI and terminal support scopes for the current scene, an explicit scene UUID, a chapter UUID, or all scenes. `find` selects the first result; F3/Shift-F3 navigate through all matches. `replace-preview` is read-only: the CLI emits JSON containing each affected scene's current hash, original text, proposed text and replacement count; the terminal shows a bounded before/after preview and uses the dirty editor buffer for the active scene. `replace` continues to save changed scenes through optimistic durable writes. Regex replacement uses Rust regex capture syntax. Search is case-sensitive; transactional multi-scene undo remains open.
 
 ### Issue #13 — Split reference panes and outline narrowing foundation
 
