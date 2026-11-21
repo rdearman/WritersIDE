@@ -244,6 +244,8 @@ struct SessionSnapshot {
     cursor: (usize, usize),
     scroll: usize,
     selected: usize,
+    #[serde(default)]
+    narrowed_chapter: Option<String>,
     reading_document: Option<String>,
     reading_offset: u64,
     #[serde(default)]
@@ -1914,6 +1916,31 @@ fn default_bindings() -> Vec<(u8, Workspace)> {
         .collect()
 }
 
+fn infer_narrowed_chapter(
+    visible: &[(SceneId, String, SceneStatus, u32)],
+    all: &[story_storage::SceneRecord],
+) -> Option<story_core::NodeId> {
+    if visible.is_empty() || visible.len() >= all.len() {
+        return None;
+    }
+    let visible_ids = visible.iter().map(|scene| scene.0).collect::<BTreeSet<_>>();
+    let chapter = all
+        .iter()
+        .filter(|scene| visible_ids.contains(&scene.scene.id))
+        .map(|scene| scene.chapter_id)
+        .collect::<Option<BTreeSet<_>>>()?;
+    if chapter.len() != 1 {
+        return None;
+    }
+    let chapter = *chapter.first()?;
+    let chapter_ids = all
+        .iter()
+        .filter(|scene| scene.chapter_id == Some(chapter))
+        .map(|scene| scene.scene.id)
+        .collect::<BTreeSet<_>>();
+    (chapter_ids == visible_ids).then_some(chapter)
+}
+
 fn load_bindings(project: &Path) -> Result<Vec<(u8, Workspace)>, Box<dyn std::error::Error>> {
     let path = project.join(".writers-ide/keybindings.toml");
     let text = match fs::read_to_string(path) {
@@ -2245,6 +2272,8 @@ impl AppState {
         let path = self.session_path();
         let parent = path.parent().ok_or("session file has no parent")?;
         fs::create_dir_all(parent)?;
+        let narrowed_chapter = infer_narrowed_chapter(&self.scenes, &self.app.list_scenes(false)?)
+            .map(|chapter| chapter.to_string());
         let snapshot = SessionSnapshot {
             workspace: self.workspace.title().to_owned(),
             selected_scene: self.active_scene().map(|id| id.to_string()),
@@ -2252,6 +2281,7 @@ impl AppState {
             cursor: self.cursor,
             scroll: self.scroll,
             selected: self.selected,
+            narrowed_chapter,
             reading_document: self.reading_document.map(|id| id.to_string()),
             reading_offset: self.reading_offset,
             editor_focus_mode: self.editor_focus_mode,
@@ -2308,6 +2338,31 @@ impl AppState {
             }
         };
         self.refresh()?;
+        let mut stale_reference = false;
+        if let Some(chapter) = snapshot
+            .narrowed_chapter
+            .as_deref()
+            .and_then(|value| value.parse::<uuid::Uuid>().ok())
+            .map(story_core::NodeId)
+        {
+            let all = self.app.list_scenes(false)?;
+            if all.iter().any(|scene| scene.chapter_id == Some(chapter)) {
+                self.scenes = all
+                    .into_iter()
+                    .filter(|scene| scene.chapter_id == Some(chapter))
+                    .map(|record| {
+                        (
+                            record.scene.id,
+                            record.scene.title,
+                            record.scene.status,
+                            record.actual_words,
+                        )
+                    })
+                    .collect();
+            } else {
+                stale_reference = true;
+            }
+        }
         self.selected = snapshot.selected.min(self.scenes.len().saturating_sub(1));
         if let Some(scene_id) = snapshot
             .selected_scene
@@ -2318,7 +2373,6 @@ impl AppState {
         {
             self.selected = index;
         }
-        let mut stale_reference = false;
         if let Some(scene_id) = snapshot
             .editing_scene
             .as_deref()
@@ -12001,6 +12055,41 @@ mod tests {
         .unwrap();
         assert_eq!(state.workspace, Workspace::Editor);
         assert_eq!(state.editing_scene, Some(scene));
+    }
+
+    #[test]
+    fn narrowed_outline_and_split_layout_restore_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Session"), "Session").unwrap();
+        let first = app.create_chapter(None, "First", 0).unwrap();
+        let second = app.create_chapter(None, "Second", 1).unwrap();
+        let first_scene = app.create_scene(first, "First scene", 0).unwrap();
+        let second_scene = app.create_scene(second, "Second scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command(&format!("narrow {second}"))
+            .unwrap();
+        state.selected = 0;
+        state.horizontal_split_ratio = 60;
+        state.vertical_split_ratio = 40;
+        state.save_session().unwrap();
+
+        let mut reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        assert_eq!(
+            reopened
+                .scenes
+                .iter()
+                .map(|scene| scene.0)
+                .collect::<Vec<_>>(),
+            [second_scene]
+        );
+        assert!(!reopened.scenes.iter().any(|scene| scene.0 == first_scene));
+        assert_eq!(reopened.horizontal_split_ratio, 60);
+        assert_eq!(reopened.vertical_split_ratio, 40);
     }
 
     #[test]
