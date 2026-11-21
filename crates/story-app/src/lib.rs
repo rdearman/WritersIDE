@@ -822,6 +822,17 @@ impl WriterApp {
     pub fn update_story_event(&mut self, event: &StoryEvent) -> Result<()> {
         Ok(self.store.update_story_event(event)?)
     }
+    pub fn update_story_event_time(
+        &mut self,
+        id: EventId,
+        start: story_core::StoryTime,
+        end: story_core::StoryTime,
+        source_time_text: &str,
+    ) -> Result<()> {
+        Ok(self
+            .store
+            .update_story_event_time(id, start, end, source_time_text)?)
+    }
     pub fn link_event(&mut self, scene: SceneId, event: EventId, kind: &str) -> Result<()> {
         Ok(self.store.link_event(scene, event, kind)?)
     }

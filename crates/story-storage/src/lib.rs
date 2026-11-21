@@ -4724,6 +4724,24 @@ impl ProjectStore {
         }
         Ok(())
     }
+    pub fn update_story_event_time(
+        &mut self,
+        id: EventId,
+        start: StoryTime,
+        end: StoryTime,
+        source_time_text: &str,
+    ) -> Result<()> {
+        validate_time(start)?;
+        validate_time(end)?;
+        let changed = self.conn.execute(
+            "UPDATE story_event SET time_nominal=?2,time_lower=?3,time_upper=?4,time_precision=?5,end_nominal=?6,end_lower=?7,end_upper=?8,end_precision=?9,source_time_text=?10 WHERE id=?1",
+            params![id.to_string(), start.nominal, start.lower, start.upper, precision(start.precision), end.nominal, end.lower, end.upper, precision(end.precision), source_time_text],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
     pub fn list_events(&self) -> Result<Vec<EventSummary>> {
         let mut q=self.conn.prepare("SELECT id,title,time_nominal,time_lower,time_upper,time_precision,end_nominal,end_lower,end_upper,end_precision,source_time_text FROM story_event ORDER BY time_nominal IS NULL,time_nominal,id")?;
         let rows = q.query_map([], |r| {

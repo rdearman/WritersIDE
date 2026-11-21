@@ -797,6 +797,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "event.edit-time",
+            "Edit Event Chronology",
+            "Update story-time bounds while preserving manuscript order",
+            "Plot",
+            "event-time-set",
+            true,
+        ),
+        legacy_command(
             "event.link",
             "Link Event to Scene",
             "Associate a story event with a scene",
@@ -4690,6 +4698,19 @@ impl AppState {
                     .ok_or("created event was not listed")?;
             self.switch(Workspace::StoryBible);
             self.message = format!("Created timed story event {}", event.id);
+        } else if let Some(rest) = cmd.strip_prefix("event-time-set ") {
+            let fields = rest.split('|').map(str::trim).collect::<Vec<_>>();
+            if fields.len() != 4 || fields[0].is_empty() {
+                return Err("use event-time-set EVENT-UUID | START | END | SOURCE-TIME".into());
+            }
+            let id = story_core::EventId(fields[0].parse()?);
+            self.app.update_story_event_time(
+                id,
+                parse_story_time_input(fields[1])?,
+                parse_story_time_input(fields[2])?,
+                fields[3],
+            )?;
+            self.message = format!("Updated story-time bounds for event {id}");
         } else if let Some(rest) = cmd.strip_prefix("event ") {
             let (title, source_time) = rest.split_once('|').unwrap_or((rest, ""));
             let id = self.app.add_event(title.trim(), source_time.trim())?;
@@ -11143,6 +11164,43 @@ mod tests {
             ))
             .unwrap();
         assert!(state.app.list_event_dependencies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn terminal_updates_event_story_time_without_changing_event_identity_or_title() {
+        let root = tempfile::tempdir().unwrap();
+        let mut project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let id = story_core::EventId::new();
+        project
+            .add_story_event(&story_core::StoryEvent {
+                id,
+                title: "Crossing the bridge".into(),
+                description: "They leave before dawn".into(),
+                start: story_core::StoryTime::exact(1),
+                end: story_core::StoryTime::exact(2),
+                source_time_text: "first day".into(),
+            })
+            .unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state
+            .execute_legacy_palette_command(&format!(
+                "event-time-set {id} | ~6,4,8 | 9..12 | during the storm"
+            ))
+            .unwrap();
+        let event = state
+            .app
+            .list_events()
+            .unwrap()
+            .into_iter()
+            .find(|event| event.id == id)
+            .unwrap();
+        assert_eq!(event.title, "Crossing the bridge");
+        assert_eq!(event.start.nominal, Some(6));
+        assert_eq!(event.start.lower, Some(4));
+        assert_eq!(event.start.upper, Some(8));
+        assert_eq!(event.end.lower, Some(9));
+        assert_eq!(event.end.upper, Some(12));
+        assert_eq!(event.source_time, "during the storm");
     }
 
     #[test]

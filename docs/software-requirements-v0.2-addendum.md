@@ -197,7 +197,7 @@ Existing stable-ID links, passage anchors, backlinks, broken-link checks, typed 
 
 ### Issue #9 — Chronology and structured relationships status
 
-Scenes and events use optional signed-integer `StoryTime` values with unknown/approximate/bounded precision, source labels, start/end values, and checked duration arithmetic. Character participation, scene-event links, locations, plotlines, and story links are separate relationships from manuscript placement. Timeline views and deterministic uncertainty-aware diagnostics distinguish definite overlaps, possible overlaps, unknown time, and adjacency. Full fictional-calendar display/entry tools and interactive multi-entity timeline editing remain open.
+Scenes and events use optional signed-integer `StoryTime` values with unknown/approximate/bounded precision, source labels, start/end values, and checked duration arithmetic. Event chronology can be revised with `event-time-set` in the CLI or terminal without overwriting title/description or changing identity. Character participation, scene-event links, locations, plotlines, and story links are separate relationships from manuscript placement. Timeline views and deterministic uncertainty-aware diagnostics distinguish definite overlaps, possible overlaps, unknown time, and adjacency. Full fictional-calendar display/entry tools and interactive multi-entity timeline editing remain open.
 
 ## Phase 5 issue implementation notes
 

@@ -800,6 +800,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 },
             )?;
         }
+        "event-time-set" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = story_core::EventId(args.next().ok_or("missing event UUID")?.parse()?);
+            let start = parse_cli_story_time(&args.next().ok_or("missing start time")?)?;
+            let end = parse_cli_story_time(&args.next().ok_or("missing end time")?)?;
+            let source_time = args.collect::<Vec<_>>().join(" ");
+            WriterApp::open_project(path)?.update_story_event_time(id, start, end, &source_time)?;
+            println!("Updated story-time bounds for event {id}");
+        }
         "event-dependency-list" => {
             let path = args.next().ok_or("missing project path")?;
             println!(
@@ -1948,6 +1957,34 @@ fn scene_matches_scope(scene: &story_storage::SceneRecord, scope: &str) -> bool 
         scene.scene.id.to_string() == scope
     }
 }
+fn parse_cli_story_time(value: &str) -> Result<story_core::StoryTime, Box<dyn std::error::Error>> {
+    use story_core::{StoryTime, TimePrecision};
+    if value == "?" {
+        return Ok(StoryTime::unknown());
+    }
+    if let Some(value) = value.strip_prefix('~') {
+        let parts = value.split(',').collect::<Vec<_>>();
+        if parts.len() != 3 {
+            return Err("approximate time syntax must be ~NOMINAL,LOWER,UPPER".into());
+        }
+        return Ok(StoryTime::new(
+            Some(parts[0].parse()?),
+            Some(parts[1].parse()?),
+            Some(parts[2].parse()?),
+            TimePrecision::Approximate,
+        )?);
+    }
+    if let Some((lower, upper)) = value.split_once("..") {
+        return Ok(StoryTime::new(
+            None,
+            Some(lower.parse()?),
+            Some(upper.parse()?),
+            TimePrecision::Bounded,
+        )?);
+    }
+    Ok(StoryTime::exact(value.parse()?))
+}
+
 fn parse_merge_choices(
     value: &str,
 ) -> Result<Vec<story_import::MergeConflictChoice>, Box<dyn std::error::Error>> {
@@ -1968,6 +2005,9 @@ fn usage() {
     );
     eprintln!("writers-ide compile-check <project>");
     eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");
+    eprintln!(
+        "writers-ide event-time-set <project> <event-uuid> <start-tick|?|~nominal,lower,upper|lower..upper> <end-tick|?|~nominal,lower,upper|lower..upper> [source-time-text]"
+    );
     eprintln!(
         "writers-ide review-resolve <project> <scene-uuid> <base-file> <reviewed-file> <base|local|external,...>"
     );
