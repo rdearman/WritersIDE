@@ -132,6 +132,7 @@ struct AppState {
     macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
     recording_macro: Option<(String, Vec<story_core::EditMacroOp>)>,
     text_expansion: TextExpansionConfig,
+    bookmarks: BTreeMap<String, EditorBookmark>,
     extra_cursors: Vec<(usize, usize)>,
     active_challenge: Option<ActiveWritingChallenge>,
     menu: Option<MenuState>,
@@ -293,6 +294,15 @@ struct EditorToolsFile {
     registers: BTreeMap<String, String>,
     #[serde(default)]
     macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
+    #[serde(default)]
+    bookmarks: BTreeMap<String, EditorBookmark>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct EditorBookmark {
+    scene_id: SceneId,
+    offset: usize,
+    quote: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1390,6 +1400,9 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.text-expansion-set", "Set Text Expansion", "Add a literal abbreviation and replacement to the project dictionary", "Insert", "text-expansion-set", true),
         legacy_command("edit.text-expansion", "Text Expansion Settings", "Enable, disable, or list project text expansions", "Insert", "text-expansion", true),
         legacy_command("edit.text-expand", "Expand Abbreviation", "Expand the abbreviation immediately before the editor cursor", "Insert", "text-expand", false),
+        legacy_command("edit.bookmark-save", "Save Passage Bookmark", "Save a named stable-ID bookmark for the current passage", "Navigate", "manuscript-bookmark-save", true),
+        legacy_command("edit.bookmark-list", "List Passage Bookmarks", "List saved manuscript passage bookmarks", "Navigate", "manuscript-bookmark-list", false),
+        legacy_command("edit.bookmark-jump", "Jump to Passage Bookmark", "Navigate to a saved passage, following stable scene identity", "Navigate", "manuscript-bookmark-jump", true),
         legacy_command("edit.cursor-add", "Add Multi-cursor", "Add an editing cursor at grapheme row and column", "Edit", "cursor-add", true),
         legacy_command("edit.cursor-clear", "Clear Multi-cursors", "Return to the primary editor cursor", "Edit", "cursor-clear", false),
         legacy_command("challenge.start", "Start Writing Challenge", "Start a timed word target; opt-in Kamikaze mode reacts to inactivity", "Tools", "challenge-start", true),
@@ -1831,6 +1844,7 @@ impl AppState {
             macros: tools.macros,
             recording_macro: None,
             text_expansion,
+            bookmarks: tools.bookmarks,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -1851,6 +1865,7 @@ impl AppState {
             snippets: self.snippets.clone(),
             registers: self.registers.clone(),
             macros: self.macros.clone(),
+            bookmarks: self.bookmarks.clone(),
         })?;
         let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
         use std::io::Write;
@@ -3201,6 +3216,72 @@ impl AppState {
             } else {
                 self.message = "No matching abbreviation before the cursor".into();
             }
+        } else if let Some(name) = cmd.strip_prefix("manuscript-bookmark-save ") {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("bookmark name cannot be empty".into());
+            }
+            let scene_id = self.editing_scene.ok_or("open a manuscript scene first")?;
+            let text = self.editor.join("\n");
+            let (offset, quote) = if let Some((start, end)) = self.selection_bounds() {
+                let start = editor_position_byte(&self.editor, start.0, start.1);
+                let end = editor_position_byte(&self.editor, end.0, end.1);
+                let quote = text.get(start..end).ok_or("selection is not valid UTF-8")?;
+                (start, quote.to_owned())
+            } else {
+                let offset = editor_position_byte(&self.editor, self.cursor.0, 0);
+                (offset, self.editor[self.cursor.0].clone())
+            };
+            if quote.is_empty() {
+                return Err("bookmark a non-empty selection or current line".into());
+            }
+            self.bookmarks.insert(
+                name.to_owned(),
+                EditorBookmark {
+                    scene_id,
+                    offset,
+                    quote,
+                },
+            );
+            self.persist_editor_tools()?;
+            self.message = format!("Saved manuscript bookmark {name}");
+        } else if cmd == "manuscript-bookmark-list" {
+            self.message = self
+                .bookmarks
+                .iter()
+                .map(|(name, bookmark)| {
+                    format!(
+                        "{name} · {} · {}",
+                        bookmark.scene_id,
+                        bookmark.quote.replace('\n', " ↵ ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(name) = cmd.strip_prefix("manuscript-bookmark-jump ") {
+            if self.dirty {
+                return Err("save the current manuscript before jumping to a bookmark".into());
+            }
+            let bookmark = self
+                .bookmarks
+                .get(name.trim())
+                .ok_or("unknown manuscript bookmark")?
+                .clone();
+            let (text, _) = self.app.load_scene_text(bookmark.scene_id)?;
+            let offset = text
+                .get(bookmark.offset..bookmark.offset.saturating_add(bookmark.quote.len()))
+                .filter(|candidate| *candidate == bookmark.quote)
+                .map(|_| bookmark.offset)
+                .or_else(|| {
+                    let mut matches = text.match_indices(&bookmark.quote);
+                    let first = matches.next().map(|(offset, _)| offset)?;
+                    matches.next().is_none().then_some(first)
+                })
+                .ok_or("bookmark passage is missing or ambiguous; source was left unchanged")?;
+            self.open_scene(bookmark.scene_id)?;
+            self.cursor = editor_position_from_byte(&text, offset)
+                .ok_or("bookmark offset is not a valid UTF-8 position")?;
+            self.message = format!("Jumped to manuscript bookmark {}", name.trim());
         } else if let Some(rest) = cmd.strip_prefix("macro ") {
             let operations = parse_macro_recipe(rest)?;
             self.apply_edit_macro(&operations)?;
@@ -5079,7 +5160,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -9106,6 +9187,42 @@ mod tests {
     }
 
     #[test]
+    fn named_manuscript_bookmark_survives_restart_and_scene_move() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app =
+            WriterApp::create_project(root.path().join("Bookmarks"), "Bookmarks").unwrap();
+        let first_chapter = app.create_chapter(None, "First", 0).unwrap();
+        let second_chapter = app.create_chapter(None, "Second", 1).unwrap();
+        let scene = app.create_scene(first_chapter, "Road", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "The old road bends.\nA gate stands.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor_selection = Some((0, 4));
+        state.cursor = (0, 12);
+        state
+            .execute_legacy_palette_command("manuscript-bookmark-save old-road")
+            .unwrap();
+        state.app.move_scene(scene, second_chapter, 0).unwrap();
+
+        let mut reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        reopened
+            .execute_legacy_palette_command("manuscript-bookmark-jump old-road")
+            .unwrap();
+        assert_eq!(reopened.editing_scene, Some(scene));
+        assert_eq!(reopened.cursor, (0, 4));
+        assert_eq!(reopened.editor[0], "The old road bends.");
+        reopened
+            .execute_legacy_palette_command("manuscript-bookmark-list")
+            .unwrap();
+        assert!(reopened.message.contains("old-road"));
+    }
+
+    #[test]
     fn recorded_shift_selection_replays_as_a_text_replacement() {
         let root = tempfile::tempdir().unwrap();
         let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
@@ -9638,6 +9755,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            bookmarks: BTreeMap::new(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10103,6 +10221,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            bookmarks: BTreeMap::new(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10189,6 +10308,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            bookmarks: BTreeMap::new(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10267,6 +10387,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            bookmarks: BTreeMap::new(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10357,6 +10478,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            bookmarks: BTreeMap::new(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10597,6 +10719,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            bookmarks: BTreeMap::new(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10687,6 +10810,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            bookmarks: BTreeMap::new(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10794,6 +10918,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            bookmarks: BTreeMap::new(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11019,6 +11144,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            bookmarks: BTreeMap::new(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11371,6 +11497,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            bookmarks: BTreeMap::new(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11472,6 +11599,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            bookmarks: BTreeMap::new(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11625,6 +11753,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            bookmarks: BTreeMap::new(),
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
