@@ -995,12 +995,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut previous = String::new();
             println!("Watching processing recipe; Ctrl-C stops the watcher.");
             loop {
-                let mut fingerprint = Sha256::new();
-                fingerprint.update(watch_fingerprint(&project)?);
-                fingerprint.update(fs::read(&recipe)?);
-                let current = format!("{:x}", fingerprint.finalize());
+                let recipe_config =
+                    story_pipeline::ProcessingRecipe::from_toml(&fs::read_to_string(&recipe)?)?;
+                let current = processing_watch_fingerprint(&project, &recipe)?;
                 if current != previous {
-                    previous = current;
+                    if recipe_config.debounce_ms > 0 {
+                        thread::sleep(Duration::from_millis(recipe_config.debounce_ms));
+                    }
+                    previous = processing_watch_fingerprint(&project, &recipe)?;
                     if let Err(error) = run_processing_recipe(&project, &recipe) {
                         eprintln!("Processing run incomplete; inspect stage failures: {error}");
                     }
@@ -1550,6 +1552,16 @@ fn run_processing_recipe(
     Ok(())
 }
 
+fn processing_watch_fingerprint(
+    project: &Path,
+    recipe_path: &Path,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut fingerprint = Sha256::new();
+    fingerprint.update(watch_fingerprint(project)?);
+    fingerprint.update(fs::read(recipe_path)?);
+    Ok(format!("{:x}", fingerprint.finalize()))
+}
+
 fn watch_fingerprint(project: &Path) -> Result<String, Box<dyn std::error::Error>> {
     fn visit(
         path: &Path,
@@ -1920,6 +1932,27 @@ mod watch_tests {
         .unwrap();
         run_processing_recipe(&project, &recipe_path).unwrap();
         assert!(project.join(".writers-ide/pipeline-cache.json").is_file());
+    }
+
+    #[test]
+    fn processing_watch_fingerprint_tracks_recipe_changes() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("Novel");
+        drop(WriterApp::create_project(&project, "Novel").unwrap());
+        let recipe = root.path().join("pipeline.toml");
+        fs::write(
+            &recipe,
+            "version=1\nstages=[\"compile\"]\ndebounce_ms=100\n",
+        )
+        .unwrap();
+        let before = super::processing_watch_fingerprint(&project, &recipe).unwrap();
+        fs::write(
+            &recipe,
+            "version=1\nstages=[\"compile\"]\ndebounce_ms=500\n",
+        )
+        .unwrap();
+        let after = super::processing_watch_fingerprint(&project, &recipe).unwrap();
+        assert_ne!(before, after);
     }
 
     #[cfg(unix)]

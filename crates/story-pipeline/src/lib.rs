@@ -142,6 +142,12 @@ pub struct ProcessingRecipe {
     pub stages: Vec<Stage>,
     #[serde(default)]
     pub expand_transclusions: bool,
+    #[serde(default = "default_processing_debounce_ms")]
+    pub debounce_ms: u64,
+}
+
+fn default_processing_debounce_ms() -> u64 {
+    300
 }
 
 impl ProcessingRecipe {
@@ -154,6 +160,9 @@ impl ProcessingRecipe {
         }
         if self.stages.is_empty() {
             return Err("processing recipe must select at least one stage".into());
+        }
+        if self.debounce_ms > 60_000 {
+            return Err("processing recipe debounce_ms cannot exceed 60000".into());
         }
         let mut stages = self.stages.clone();
         stages.sort_unstable();
@@ -912,10 +921,25 @@ mod tests {
             version: 1,
             stages: vec![Stage::WordCount, Stage::Continuity],
             expand_transclusions: true,
+            debounce_ms: 150,
         };
         let source = recipe.to_toml().unwrap();
         assert!(source.contains("\"word-count\""));
         assert_eq!(ProcessingRecipe::from_toml(&source).unwrap(), recipe);
+        assert_eq!(
+            ProcessingRecipe::from_toml("version=1\nstages=[\"compile\"]")
+                .unwrap()
+                .debounce_ms,
+            300
+        );
+        assert!(
+            ProcessingRecipe {
+                debounce_ms: 60_001,
+                ..recipe.clone()
+            }
+            .validate()
+            .is_err()
+        );
         assert!(
             ProcessingRecipe {
                 stages: vec![Stage::Compile, Stage::Compile],

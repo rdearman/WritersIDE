@@ -1,3 +1,4 @@
 version = 1
 stages = ["compile", "word-count", "plotline-analysis", "character-analysis", "continuity", "export", "revision-report"]
 expand_transclusions = false
+debounce_ms = 300
