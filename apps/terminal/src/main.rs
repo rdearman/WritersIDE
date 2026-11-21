@@ -177,6 +177,7 @@ struct AppState {
     reference_focused: bool,
     reference_layout: ReferenceLayout,
     reference_panes_hidden: bool,
+    reference_swapped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -344,6 +345,8 @@ struct SessionSnapshot {
     reference_layout: ReferenceLayout,
     #[serde(default)]
     reference_panes_hidden: bool,
+    #[serde(default)]
+    reference_swapped: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1665,6 +1668,14 @@ fn command_registry() -> Vec<CommandSpec> {
             "Restore the prior split layout",
             "View",
             "window-restore",
+            false,
+        ),
+        legacy_command(
+            "window.swap-sides",
+            "Swap Editor and Reference Sides",
+            "Swap the spatial positions of the editor and reference pane group",
+            "View",
+            "window-swap",
             false,
         ),
         legacy_command(
@@ -3090,6 +3101,7 @@ impl AppState {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         }
     }
     fn session_path(&self) -> std::path::PathBuf {
@@ -3356,6 +3368,7 @@ impl AppState {
             reference_focused: self.reference_focused,
             reference_layout: self.reference_layout,
             reference_panes_hidden: self.reference_panes_hidden,
+            reference_swapped: self.reference_swapped,
             reference_follow_modes: self
                 .reference_panes
                 .iter()
@@ -3507,6 +3520,7 @@ impl AppState {
         self.vertical_split_ratio = snapshot.vertical_split_ratio.clamp(20, 80);
         self.reference_layout = snapshot.reference_layout;
         self.reference_panes_hidden = snapshot.reference_panes_hidden;
+        self.reference_swapped = snapshot.reference_swapped;
         self.writing_stats_enabled =
             snapshot.writing_stats_enabled && self.writing_session.is_some();
         self.typed_characters = snapshot.typed_characters;
@@ -8143,6 +8157,18 @@ impl AppState {
         } else if cmd == "reference-prev" {
             self.cycle_reference(false);
             self.message = "Previous reference buffer".into();
+        } else if cmd == "window-swap" {
+            if self.reference_panes.is_empty() {
+                return Err("open a reference pane before swapping window sides".into());
+            }
+            self.reference_swapped = !self.reference_swapped;
+            self.message = if self.reference_swapped {
+                "Editor and reference panes swapped"
+            } else {
+                "Editor and reference panes restored"
+            }
+            .into();
+            self.save_session()?;
         } else if cmd == "window-maximize" {
             self.editor_focus_mode = true;
             if self.reference_focused && self.reference_panes_hidden {
@@ -10558,8 +10584,14 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     Constraint::Percentage(100 - s.horizontal_split_ratio),
                 ])
                 .split(editor_and_reference);
-            f.render_widget(editor, panes[0]);
-            let reference_areas = reference_pane_layout(panes[1], s.reference_panes.len(), s.width);
+            let (editor_area, reference_area) = if s.reference_swapped {
+                (panes[1], panes[0])
+            } else {
+                (panes[0], panes[1])
+            };
+            f.render_widget(editor, editor_area);
+            let reference_areas =
+                reference_pane_layout(reference_area, s.reference_panes.len(), s.width);
             for (index, (reference, area)) in
                 s.reference_panes.iter().zip(reference_areas).enumerate()
             {
@@ -16183,6 +16215,7 @@ mod tests {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         };
         handle(
             &mut state,
@@ -17288,8 +17321,10 @@ mod tests {
         state
             .execute_legacy_palette_command("reference-toggle")
             .unwrap();
+        state.execute_legacy_palette_command("window-swap").unwrap();
         assert_eq!(state.reference_layout, ReferenceLayout::Stacked);
         assert!(state.reference_panes_hidden);
+        assert!(state.reference_swapped);
 
         let mut reopened = AppState::new(
             WriterApp::open_project(&project).unwrap(),
@@ -17298,6 +17333,7 @@ mod tests {
         reopened.restore_session().unwrap();
         assert_eq!(reopened.reference_layout, ReferenceLayout::Stacked);
         assert!(reopened.reference_panes_hidden);
+        assert!(reopened.reference_swapped);
         assert_eq!(reopened.reference_panes.len(), 1);
         reopened
             .execute_legacy_palette_command("reference-toggle")
@@ -18231,6 +18267,7 @@ mod tests {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         };
         assert_eq!(state.selected_text().as_deref(), Some("pha\nbe"));
         handle(
@@ -18336,6 +18373,7 @@ mod tests {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         };
         handle(
             &mut state,
@@ -18433,6 +18471,7 @@ mod tests {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         };
         handle(
             &mut state,
@@ -18542,6 +18581,7 @@ mod tests {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -18801,6 +18841,7 @@ mod tests {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         };
         assert!(
             !handle(
@@ -18910,6 +18951,7 @@ mod tests {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -19036,6 +19078,7 @@ mod tests {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         };
         handle(
             &mut state,
@@ -19280,6 +19323,7 @@ mod tests {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         };
         state.mode = Some(':');
         state.prompt = "reading-links".into();
@@ -19655,6 +19699,7 @@ mod tests {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         };
         state.mode = Some(':');
         state.prompt = format!("query {}", query.id);
@@ -19775,6 +19820,7 @@ mod tests {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         };
         let hit = |kind: &str, id: String, title: &str| story_storage::ProjectSearchHit {
             entity_kind: kind.into(),
@@ -19947,6 +19993,7 @@ mod tests {
             reference_focused: false,
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
+            reference_swapped: false,
         };
         let execute = |state: &mut AppState, command: String| {
             state.mode = Some(':');
