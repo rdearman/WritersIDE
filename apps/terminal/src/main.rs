@@ -175,6 +175,8 @@ struct AppState {
     reference_panes: Vec<ReferencePane>,
     active_reference: usize,
     reference_focused: bool,
+    reference_layout: ReferenceLayout,
+    reference_panes_hidden: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -237,6 +239,24 @@ struct ReferencePane {
     follow_context: bool,
     shared_scene: bool,
     cursor: (usize, usize),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+enum ReferenceLayout {
+    #[default]
+    Auto,
+    SideBySide,
+    Stacked,
+}
+
+impl ReferenceLayout {
+    fn direction(self, terminal_width: usize) -> Direction {
+        match self {
+            Self::Auto => pane_direction(terminal_width),
+            Self::SideBySide => Direction::Horizontal,
+            Self::Stacked => Direction::Vertical,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -320,6 +340,10 @@ struct SessionSnapshot {
     reference_shared_scenes: Vec<bool>,
     #[serde(default)]
     reference_cursors: Vec<(usize, usize)>,
+    #[serde(default)]
+    reference_layout: ReferenceLayout,
+    #[serde(default)]
+    reference_panes_hidden: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1546,6 +1570,22 @@ fn command_registry() -> Vec<CommandSpec> {
             "View",
             "reference-pin",
             false,
+        ),
+        legacy_command(
+            "view.toggle-references",
+            "Hide or Show Reference Panes",
+            "Temporarily hide reference panes without closing their buffers",
+            "View",
+            "reference-toggle",
+            false,
+        ),
+        legacy_command(
+            "view.reference-layout",
+            "Set Reference Split Layout",
+            "Choose automatic, side-by-side, or stacked editor/reference panes",
+            "View",
+            "reference-layout",
+            true,
         ),
         legacy_command(
             "scratchpad.create",
@@ -2968,6 +3008,8 @@ impl AppState {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         }
     }
     fn session_path(&self) -> std::path::PathBuf {
@@ -3232,6 +3274,8 @@ impl AppState {
                 .collect(),
             active_reference: self.active_reference,
             reference_focused: self.reference_focused,
+            reference_layout: self.reference_layout,
+            reference_panes_hidden: self.reference_panes_hidden,
             reference_follow_modes: self
                 .reference_panes
                 .iter()
@@ -3381,6 +3425,8 @@ impl AppState {
             .collect();
         self.horizontal_split_ratio = snapshot.horizontal_split_ratio.clamp(20, 80);
         self.vertical_split_ratio = snapshot.vertical_split_ratio.clamp(20, 80);
+        self.reference_layout = snapshot.reference_layout;
+        self.reference_panes_hidden = snapshot.reference_panes_hidden;
         self.writing_stats_enabled =
             snapshot.writing_stats_enabled && self.writing_session.is_some();
         self.typed_characters = snapshot.typed_characters;
@@ -7916,6 +7962,27 @@ impl AppState {
             } else {
                 self.message = "No reference pane is open".into();
             }
+        } else if cmd == "reference-toggle" {
+            self.reference_panes_hidden = !self.reference_panes_hidden;
+            if self.reference_panes_hidden {
+                self.focus_main_editor();
+            }
+            self.message = if self.reference_panes_hidden {
+                "Reference panes hidden; buffers remain open"
+            } else {
+                "Reference panes shown"
+            }
+            .into();
+            self.save_session()?;
+        } else if let Some(value) = cmd.strip_prefix("reference-layout ") {
+            self.reference_layout = match value.trim() {
+                "auto" => ReferenceLayout::Auto,
+                "horizontal" | "side-by-side" => ReferenceLayout::SideBySide,
+                "vertical" | "stacked" => ReferenceLayout::Stacked,
+                _ => return Err("layout must be auto, horizontal, or vertical".into()),
+            };
+            self.message = format!("Reference layout: {}", value.trim());
+            self.save_session()?;
         } else if cmd == "reference-next" {
             if self.reference_focused {
                 self.focus_main_editor();
@@ -10295,9 +10362,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         } else {
             body[1]
         };
-        if !s.reference_panes.is_empty() && !s.editor_focus_mode {
+        if !s.reference_panes.is_empty() && !s.reference_panes_hidden && !s.editor_focus_mode {
             let panes = Layout::default()
-                .direction(pane_direction(s.width))
+                .direction(s.reference_layout.direction(s.width))
                 .constraints([
                     Constraint::Percentage(s.horizontal_split_ratio),
                     Constraint::Percentage(100 - s.horizontal_split_ratio),
@@ -13464,6 +13531,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         && k.modifiers.contains(KeyModifiers::CONTROL)
         && k.code == KeyCode::Tab
         && !s.reference_panes.is_empty()
+        && !s.reference_panes_hidden
     {
         s.toggle_reference_focus();
         s.message = if s.reference_focused {
@@ -15744,6 +15812,8 @@ mod tests {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         };
         handle(
             &mut state,
@@ -16773,6 +16843,47 @@ mod tests {
     }
 
     #[test]
+    fn reference_visibility_and_split_orientation_restore_from_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Draft", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state
+            .execute_legacy_palette_command(&format!("reference-scene {scene}"))
+            .unwrap();
+        state
+            .execute_legacy_palette_command("reference-layout vertical")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("reference-toggle")
+            .unwrap();
+        assert_eq!(state.reference_layout, ReferenceLayout::Stacked);
+        assert!(state.reference_panes_hidden);
+
+        let mut reopened = AppState::new(
+            WriterApp::open_project(&project).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        assert_eq!(reopened.reference_layout, ReferenceLayout::Stacked);
+        assert!(reopened.reference_panes_hidden);
+        assert_eq!(reopened.reference_panes.len(), 1);
+        reopened
+            .execute_legacy_palette_command("reference-toggle")
+            .unwrap();
+        assert!(!reopened.reference_panes_hidden);
+        assert_eq!(ReferenceLayout::Stacked.direction(120), Direction::Vertical);
+        assert_eq!(
+            ReferenceLayout::SideBySide.direction(80),
+            Direction::Horizontal
+        );
+        assert_eq!(ReferenceLayout::Auto.direction(80), Direction::Vertical);
+    }
+
+    #[test]
     fn editor_deletes_and_inserts_whole_combining_and_emoji_graphemes() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -17602,6 +17713,8 @@ mod tests {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         };
         assert_eq!(state.selected_text().as_deref(), Some("pha\nbe"));
         handle(
@@ -17705,6 +17818,8 @@ mod tests {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         };
         handle(
             &mut state,
@@ -17800,6 +17915,8 @@ mod tests {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         };
         handle(
             &mut state,
@@ -17907,6 +18024,8 @@ mod tests {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -18164,6 +18283,8 @@ mod tests {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         };
         assert!(
             !handle(
@@ -18271,6 +18392,8 @@ mod tests {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -18395,6 +18518,8 @@ mod tests {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         };
         handle(
             &mut state,
@@ -18637,6 +18762,8 @@ mod tests {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         };
         state.mode = Some(':');
         state.prompt = "reading-links".into();
@@ -19010,6 +19137,8 @@ mod tests {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         };
         state.mode = Some(':');
         state.prompt = format!("query {}", query.id);
@@ -19128,6 +19257,8 @@ mod tests {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         };
         let hit = |kind: &str, id: String, title: &str| story_storage::ProjectSearchHit {
             entity_kind: kind.into(),
@@ -19298,6 +19429,8 @@ mod tests {
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
+            reference_layout: ReferenceLayout::Auto,
+            reference_panes_hidden: false,
         };
         let execute = |state: &mut AppState, command: String| {
             state.mode = Some(':');
