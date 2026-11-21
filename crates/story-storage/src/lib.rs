@@ -5125,6 +5125,39 @@ impl ProjectStore {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(StorageError::from)
     }
+    pub fn update_event_dependency(&mut self, dependency: &StoryEventDependency) -> Result<()> {
+        if !matches!(dependency.kind.as_str(), "precedes" | "requires") {
+            return Err(StorageError::Invalid(
+                "event dependency kind must be precedes or requires".into(),
+            ));
+        }
+        if self.conn.execute(
+            "UPDATE story_event_dependency SET notes=?4 WHERE predecessor_event_id=?1 AND successor_event_id=?2 AND dependency_kind=?3",
+            params![dependency.predecessor.to_string(), dependency.successor.to_string(), dependency.kind, dependency.notes],
+        )? == 0 {
+            return Err(StorageError::NotFound(format!(
+                "event dependency {} -> {} ({})",
+                dependency.predecessor, dependency.successor, dependency.kind
+            )));
+        }
+        Ok(())
+    }
+    pub fn remove_event_dependency(
+        &mut self,
+        predecessor: EventId,
+        successor: EventId,
+        kind: &str,
+    ) -> Result<()> {
+        if self.conn.execute(
+            "DELETE FROM story_event_dependency WHERE predecessor_event_id=?1 AND successor_event_id=?2 AND dependency_kind=?3",
+            params![predecessor.to_string(), successor.to_string(), kind],
+        )? == 0 {
+            return Err(StorageError::NotFound(format!(
+                "event dependency {predecessor} -> {successor} ({kind})"
+            )));
+        }
+        Ok(())
+    }
     pub fn add_location_incompatibility_rule(
         &mut self,
         rule: &LocationIncompatibilityRule,
@@ -9747,6 +9780,9 @@ mod tests {
             notes: "The response follows delivery".into(),
         };
         store.add_event_dependency(&dependency).unwrap();
+        let mut updated_dependency = dependency.clone();
+        updated_dependency.notes = "The message reaches the city first".into();
+        store.update_event_dependency(&updated_dependency).unwrap();
         store
             .add_event_dependency(&StoryEventDependency {
                 predecessor: second,
@@ -9771,13 +9807,26 @@ mod tests {
         let reopened = ProjectStore::open(directory.path().join("Events")).unwrap();
         let reopened_dependencies = reopened.list_event_dependencies().unwrap();
         assert_eq!(reopened_dependencies.len(), 2);
-        assert!(reopened_dependencies.contains(&dependency));
-        assert!(reopened_dependencies.contains(&StoryEventDependency {
+        assert!(reopened_dependencies.contains(&updated_dependency));
+        let final_dependency = StoryEventDependency {
             predecessor: second,
             successor: third,
             kind: "requires".into(),
             notes: String::new(),
-        }));
+        };
+        assert!(reopened_dependencies.contains(&final_dependency));
+        let mut reopened = reopened;
+        reopened
+            .remove_event_dependency(second, third, "requires")
+            .unwrap();
+        assert_eq!(
+            reopened.list_event_dependencies().unwrap(),
+            vec![updated_dependency]
+        );
+        reopened
+            .remove_event_dependency(first, second, "precedes")
+            .unwrap();
+        assert!(reopened.list_event_dependencies().unwrap().is_empty());
     }
 
     #[test]

@@ -947,6 +947,11 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("search.query-assert-save", "Save Query Assertions", "Persist count assertions for a saved query", "View", "query-assert-save", true),
         legacy_command("search.query-assert-check", "Check Query Assertions", "Evaluate saved count assertions against refreshed results", "View", "query-assert-check", true),
         legacy_command("analysis.coverage-add", "Add Coverage Rule", "Add a project-local character or plotline appearance requirement", "Plot", "coverage-add", true),
+        legacy_command("analysis.event-dependency-add", "Add Event Dependency", "Record a story-time precedence or prerequisite assertion", "Plot", "event-dependency-add", true),
+        legacy_command("analysis.event-dependency-list", "List Event Dependencies", "Show saved event-order assertions", "Plot", "event-dependency-list", false),
+        legacy_command("analysis.event-dependency-check", "Check Event Dependencies", "Evaluate saved event-order assertions with uncertainty", "Plot", "event-dependency-check", false),
+        legacy_command("analysis.event-dependency-update", "Update Event Dependency", "Edit the note on a saved event assertion", "Plot", "event-dependency-update", true),
+        legacy_command("analysis.event-dependency-remove", "Remove Event Dependency", "Delete a saved event-order assertion", "Plot", "event-dependency-remove", true),
         legacy_command("analysis.location-rule-add", "Add Location Conflict Rule", "Record two locations that cannot overlap in time", "Plot", "location-rule-add", true),
         legacy_command("analysis.location-rule-list", "List Location Conflict Rules", "Show author-defined location incompatibilities", "Plot", "location-rule-list", false),
         legacy_command("analysis.location-rule-update", "Update Location Conflict Rule", "Enable, disable or rename a location incompatibility", "Plot", "location-rule-update", true),
@@ -5386,6 +5391,103 @@ impl AppState {
                 })
                 .collect::<Vec<_>>()
                 .join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("event-dependency-add ") {
+            let mut parts = rest.splitn(4, ' ');
+            let predecessor = story_core::EventId(parts.next().ok_or("use event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES]")?.parse()?);
+            let successor = story_core::EventId(
+                parts
+                    .next()
+                    .ok_or("missing successor event UUID")?
+                    .parse()?,
+            );
+            let kind = parts.next().ok_or("missing precedes|requires")?;
+            let notes = parts.next().unwrap_or_default().trim();
+            self.app
+                .add_event_dependency(&story_core::StoryEventDependency {
+                    predecessor,
+                    successor,
+                    kind: kind.into(),
+                    notes: notes.into(),
+                })?;
+            self.message = "Added event dependency".into();
+        } else if cmd == "event-dependency-list" {
+            self.message = self
+                .app
+                .list_event_dependencies()?
+                .iter()
+                .map(|dep| {
+                    format!(
+                        "{} {} {} · {}",
+                        dep.predecessor, dep.kind, dep.successor, dep.notes
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if self.message.is_empty() {
+                self.message = "No event dependencies".into();
+            }
+        } else if let Some(rest) = cmd.strip_prefix("event-dependency-update ") {
+            let mut parts = rest.splitn(4, ' ');
+            let predecessor = story_core::EventId(
+                parts
+                    .next()
+                    .ok_or("use event-dependency-update BEFORE-EVENT AFTER-EVENT KIND NOTES")?
+                    .parse()?,
+            );
+            let successor = story_core::EventId(
+                parts
+                    .next()
+                    .ok_or("missing successor event UUID")?
+                    .parse()?,
+            );
+            let kind = parts.next().ok_or("missing dependency kind")?;
+            let notes = parts.next().unwrap_or_default().trim();
+            self.app
+                .update_event_dependency(&story_core::StoryEventDependency {
+                    predecessor,
+                    successor,
+                    kind: kind.into(),
+                    notes: notes.into(),
+                })?;
+            self.message = "Updated event dependency".into();
+        } else if let Some(rest) = cmd.strip_prefix("event-dependency-remove ") {
+            let mut parts = rest.split_whitespace();
+            let predecessor = story_core::EventId(
+                parts
+                    .next()
+                    .ok_or("use event-dependency-remove BEFORE-EVENT AFTER-EVENT KIND")?
+                    .parse()?,
+            );
+            let successor = story_core::EventId(
+                parts
+                    .next()
+                    .ok_or("missing successor event UUID")?
+                    .parse()?,
+            );
+            let kind = parts.next().ok_or("missing dependency kind")?;
+            self.app
+                .remove_event_dependency(predecessor, successor, kind)?;
+            self.message = "Removed event dependency".into();
+        } else if cmd == "event-dependency-check" {
+            self.message = self
+                .app
+                .inspect_event_dependencies()?
+                .iter()
+                .map(|(dep, result)| {
+                    format!(
+                        "{:?} {} {} {} · {}",
+                        result.status,
+                        dep.predecessor,
+                        dep.kind,
+                        dep.successor,
+                        result.evidence.join(", ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if self.message.is_empty() {
+                self.message = "No event dependency assertions".into();
+            }
         } else if let Some(rest) = cmd.strip_prefix("location-rule-add ") {
             let mut parts = rest.splitn(3, ' ');
             let first_location = story_core::LocationId(
@@ -5897,7 +5999,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -10651,6 +10753,44 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn terminal_manages_and_checks_event_dependency_assertions() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        let first = state.app.add_event("Message", "").unwrap();
+        let second = state.app.add_event("Response", "").unwrap();
+        state
+            .execute_legacy_palette_command(&format!(
+                "event-dependency-add {first} {second} precedes delivery comes first"
+            ))
+            .unwrap();
+        assert!(state.message.contains("Added event dependency"));
+        state
+            .execute_legacy_palette_command("event-dependency-list")
+            .unwrap();
+        assert!(state.message.contains("delivery comes first"));
+        state
+            .execute_legacy_palette_command("event-dependency-check")
+            .unwrap();
+        assert!(state.message.contains("Unknown"));
+        state
+            .execute_legacy_palette_command(&format!(
+                "event-dependency-update {first} {second} precedes order revised"
+            ))
+            .unwrap();
+        assert_eq!(
+            state.app.list_event_dependencies().unwrap()[0].notes,
+            "order revised"
+        );
+        state
+            .execute_legacy_palette_command(&format!(
+                "event-dependency-remove {first} {second} precedes"
+            ))
+            .unwrap();
+        assert!(state.app.list_event_dependencies().unwrap().is_empty());
     }
 
     #[test]

@@ -823,6 +823,22 @@ impl WriterApp {
     pub fn add_event_dependency(&mut self, dependency: &StoryEventDependency) -> Result<()> {
         Ok(self.store.add_event_dependency(dependency)?)
     }
+    pub fn list_event_dependencies(&self) -> Result<Vec<StoryEventDependency>> {
+        Ok(self.store.list_event_dependencies()?)
+    }
+    pub fn update_event_dependency(&mut self, dependency: &StoryEventDependency) -> Result<()> {
+        Ok(self.store.update_event_dependency(dependency)?)
+    }
+    pub fn remove_event_dependency(
+        &mut self,
+        predecessor: EventId,
+        successor: EventId,
+        kind: &str,
+    ) -> Result<()> {
+        Ok(self
+            .store
+            .remove_event_dependency(predecessor, successor, kind)?)
+    }
     pub fn inspect_event_dependencies(
         &self,
     ) -> Result<Vec<(StoryEventDependency, story_analysis::InspectionResult)>> {

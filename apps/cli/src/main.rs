@@ -747,6 +747,80 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("one or more saved query assertions failed".into());
             }
         }
+        "event-dependency-add" => {
+            let path = args.next().ok_or("missing project path")?;
+            let predecessor = story_core::EventId(
+                args.next()
+                    .ok_or("missing predecessor event UUID")?
+                    .parse()?,
+            );
+            let successor =
+                story_core::EventId(args.next().ok_or("missing successor event UUID")?.parse()?);
+            let kind = args.next().ok_or("missing precedes|requires")?;
+            let notes = args.collect::<Vec<_>>().join(" ");
+            WriterApp::open_project(path)?.add_event_dependency(
+                &story_core::StoryEventDependency {
+                    predecessor,
+                    successor,
+                    kind,
+                    notes,
+                },
+            )?;
+        }
+        "event-dependency-list" => {
+            let path = args.next().ok_or("missing project path")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &WriterApp::open_project(path)?.list_event_dependencies()?
+                )?
+            );
+        }
+        "event-dependency-update" => {
+            let path = args.next().ok_or("missing project path")?;
+            let predecessor = story_core::EventId(
+                args.next()
+                    .ok_or("missing predecessor event UUID")?
+                    .parse()?,
+            );
+            let successor =
+                story_core::EventId(args.next().ok_or("missing successor event UUID")?.parse()?);
+            let kind = args.next().ok_or("missing precedes|requires")?;
+            let notes = args.collect::<Vec<_>>().join(" ");
+            WriterApp::open_project(path)?.update_event_dependency(
+                &story_core::StoryEventDependency {
+                    predecessor,
+                    successor,
+                    kind,
+                    notes,
+                },
+            )?;
+        }
+        "event-dependency-remove" => {
+            let path = args.next().ok_or("missing project path")?;
+            let predecessor = story_core::EventId(
+                args.next()
+                    .ok_or("missing predecessor event UUID")?
+                    .parse()?,
+            );
+            let successor =
+                story_core::EventId(args.next().ok_or("missing successor event UUID")?.parse()?);
+            let kind = args.next().ok_or("missing precedes|requires")?;
+            WriterApp::open_project(path)?.remove_event_dependency(
+                predecessor,
+                successor,
+                &kind,
+            )?;
+        }
+        "event-dependency-check" => {
+            let path = args.next().ok_or("missing project path")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &WriterApp::open_project(path)?.inspect_event_dependencies()?
+                )?
+            );
+        }
         "location-rule-add" => {
             let path = args.next().ok_or("missing project path")?;
             let first_location =
@@ -1848,7 +1922,7 @@ fn usage() {
         "writers-ide scratchpad-create <path> <title> [body]\nwriters-ide scratchpad-list <path>\nwriters-ide scratchpad-promote <path> <note-uuid> <scene|character|location|object|research> <entity-uuid>\nwriters-ide mentions <path> <scene-uuid>\nwriters-ide mention-confirm <path> <mention-uuid> <character|location|object> <entity-uuid>\nwriters-ide mention-dismiss <path> <mention-uuid>\nwriters-ide object-create <path> <name> [description]\nwriters-ide assembly-draft-create <path> <assembly-uuid>\nwriters-ide assembly-draft-list <path>\nwriters-ide assembly-draft-set <path> <draft-uuid> <scene-uuid> <text.md>\nwriters-ide assembly-draft-commit <path> <draft-uuid>\nwriters-ide board-create <path> <title>\nwriters-ide board-add-scene <path> <board-uuid> <scene-uuid> <x> <y> [note]\nwriters-ide board-list <path> <board-uuid>\nwriters-ide backup-archive <project-path> <archive.zip>\nwriters-ide restore-archive <archive.zip> <new-project-directory>"
     );
     eprintln!(
-        "writers-ide compile-watch <path> <format> <output> [poll-ms]\nwriters-ide process-recipe <project> <recipe.toml>\nwriters-ide watch-process <project> <recipe.toml> [poll-ms]\nwriters-ide query-assert <path> <query-uuid> <empty|non-empty|at-least:N|at-most:N|exactly:N>\nwriters-ide coverage <path> <dimension> <entity-uuid> <minimum-scenes>\nwriters-ide location-rule-add <project> <location-a> <location-b> <description>\nwriters-ide location-rule-list <project>\nwriters-ide location-rule-update <project> <rule-uuid> <enabled|disabled> <description>\nwriters-ide location-rule-remove <project> <rule-uuid>\nwriters-ide location-rule-check <project>\nwriters-ide challenge-start <path> <target-words> <duration-seconds> [steady|kamikaze]\nwriters-ide challenge-finish <path> <challenge-id> <words-written> [abandoned]\nwriters-ide challenge-list <path>\nwriters-ide goal-create <project> <start> <end> <target> <baseline> <UTC|±HH:MM> <raw|real> <project|scene-uuid> <title>\nwriters-ide goal-list <project> [--all]\nwriters-ide goal-record <project> <goal> <unix-time> <origin> <source-id> <fingerprint> <scene-uuid|none> <raw> <real> [detail]\nwriters-ide goal-events <project> <goal>\nwriters-ide goal-progress <project> <goal>\nwriters-ide goal-weekly <project> <goal>\nwriters-ide goal-archive <project> <goal>\nwriters-ide goal-reconcile <project> <event> <fingerprint> <raw> <real> <reason>"
+        "writers-ide compile-watch <path> <format> <output> [poll-ms]\nwriters-ide process-recipe <project> <recipe.toml>\nwriters-ide watch-process <project> <recipe.toml> [poll-ms]\nwriters-ide query-assert <path> <query-uuid> <empty|non-empty|at-least:N|at-most:N|exactly:N>\nwriters-ide coverage <path> <dimension> <entity-uuid> <minimum-scenes>\nwriters-ide event-dependency-add <project> <before-event> <after-event> <precedes|requires> [notes]\nwriters-ide event-dependency-list|event-dependency-check <project>\nwriters-ide event-dependency-update <project> <before-event> <after-event> <kind> [notes]\nwriters-ide event-dependency-remove <project> <before-event> <after-event> <kind>\nwriters-ide location-rule-add <project> <location-a> <location-b> <description>\nwriters-ide location-rule-list <project>\nwriters-ide location-rule-update <project> <rule-uuid> <enabled|disabled> <description>\nwriters-ide location-rule-remove <project> <rule-uuid>\nwriters-ide location-rule-check <project>\nwriters-ide challenge-start <path> <target-words> <duration-seconds> [steady|kamikaze]\nwriters-ide challenge-finish <path> <challenge-id> <words-written> [abandoned]\nwriters-ide challenge-list <path>\nwriters-ide goal-create <project> <start> <end> <target> <baseline> <UTC|±HH:MM> <raw|real> <project|scene-uuid> <title>\nwriters-ide goal-list <project> [--all]\nwriters-ide goal-record <project> <goal> <unix-time> <origin> <source-id> <fingerprint> <scene-uuid|none> <raw> <real> [detail]\nwriters-ide goal-events <project> <goal>\nwriters-ide goal-progress <project> <goal>\nwriters-ide goal-weekly <project> <goal>\nwriters-ide goal-archive <project> <goal>\nwriters-ide goal-reconcile <project> <event> <fingerprint> <raw> <real> <reason>"
     );
 }
 
