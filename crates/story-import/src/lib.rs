@@ -91,6 +91,8 @@ pub struct ScrivenerProjectInventory {
     pub source_fingerprint: String,
     pub title: String,
     pub format_version: Option<String>,
+    #[serde(default)]
+    pub creator: Option<String>,
     pub items: Vec<ScrivenerBinderItem>,
     pub warnings: Vec<String>,
     pub unsupported: Vec<String>,
@@ -1007,6 +1009,7 @@ pub fn inspect_scrivener_project(
         fs::read_to_string(&manifest_path).map_err(|error| ImportError::Io(error.to_string()))?;
     let root = parse_scrivener_xml(&xml)?;
     let version = root.attributes.get("Version").cloned();
+    let creator = root.attributes.get("Creator").cloned();
     let mut inventory = ScrivenerProjectInventory {
         source_path: project_root.to_string_lossy().into_owned(),
         source_fingerprint: fingerprint,
@@ -1017,6 +1020,7 @@ pub fn inspect_scrivener_project(
             .unwrap_or("Scrivener Project")
             .to_owned(),
         format_version: version.clone(),
+        creator,
         items: Vec::new(),
         warnings: Vec::new(),
         unsupported: Vec::new(),
@@ -1028,9 +1032,14 @@ pub fn inspect_scrivener_project(
             version.as_deref().unwrap_or("(missing)")
         ));
     } else {
-        inventory.warnings.push(
-            "Manifest revision 2.0 was detected, but real Scrivener projects are still required to establish version and platform compatibility".into(),
-        );
+        inventory.warnings.push(format!(
+            "Manifest revision 2.0 detected{}; this manifest revision does not establish Scrivener application version or platform compatibility",
+            inventory
+                .creator
+                .as_deref()
+                .map(|creator| format!(" (Creator={creator})"))
+                .unwrap_or_default()
+        ));
     }
 
     let binder = find_scrivener_node(&root, "Binder")
@@ -1329,8 +1338,9 @@ fn collect_scrivener_item(
         .attributes
         .get("UUID")
         .cloned()
+        .or_else(|| node.attributes.get("ID").cloned())
         .or_else(|| scrivener_named_value(node, "UUID"))
-        .ok_or_else(|| ImportError::Archive("BinderItem is missing its UUID".into()))?;
+        .ok_or_else(|| ImportError::Archive("BinderItem is missing its UUID/ID".into()))?;
     let position = counts.entry(parent_source_id.clone()).or_default();
     let this_position = *position;
     *position = position.saturating_add(1);
@@ -1820,6 +1830,15 @@ fn extract_rtf_text(source: &str) -> String {
                 let Some(next) = chars.next() else {
                     break;
                 };
+                if matches!(next, '\n' | '\r') {
+                    if skip_depth == 0 {
+                        output.push('\n');
+                    }
+                    if next == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    continue;
+                }
                 if next == '\\' || next == '{' || next == '}' {
                     if skip_depth == 0 {
                         output.push(next);
@@ -1935,6 +1954,15 @@ fn extract_rtf_markdown(source: &str) -> String {
             '}' => style = stack.pop().unwrap_or_default(),
             '\\' => {
                 let Some(next) = chars.next() else { break };
+                if matches!(next, '\n' | '\r') {
+                    if !style.skip {
+                        runs.push(('\n', Style::default()));
+                    }
+                    if next == '\r' && chars.peek() == Some(&'\n') {
+                        chars.next();
+                    }
+                    continue;
+                }
                 if matches!(next, '\\' | '{' | '}') {
                     if !style.skip {
                         runs.push((next, style));
@@ -2278,6 +2306,17 @@ mod tests {
     }
 
     #[test]
+    fn scrivener_rtf_physical_line_boundary_does_not_join_adjacent_words() {
+        let source = r#"{\rtf1\ansi
+Test\
+
+This is an addition to the old file.}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert_eq!(markdown, "Test\n\nThis is an addition to the old file.");
+        assert_eq!(extract_rtf_text(source), markdown);
+    }
+
+    #[test]
     fn synthetic_scrivener_layout_inventory_preserves_hierarchy_and_source() {
         // Synthetic parser fixture only. This exercises the inventory contract
         // and is not evidence of compatibility with real Scrivener projects.
@@ -2330,7 +2369,7 @@ mod tests {
             inventory
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("real Scrivener"))
+                .any(|warning| warning.contains("does not establish Scrivener application version"))
         );
 
         let mut plan = ScrivenerImportPlan::proposed(&inventory);
@@ -2369,6 +2408,7 @@ mod tests {
             source_fingerprint: String::new(),
             title: String::new(),
             format_version: None,
+            creator: None,
             items: vec![
                 ScrivenerBinderItem {
                     source_document_id: "same".into(),

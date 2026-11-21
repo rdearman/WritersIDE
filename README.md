@@ -1,8 +1,8 @@
 # Writer's IDE
 
-Writer's IDE is an early Rust implementation of the scene-centred novel planning and writing environment described in the supplied SRS v0.1 and [active engineering design](docs/engineering-design-v0.47.md).
+Writer's IDE is an early Rust implementation of the scene-centred novel planning and writing environment described in the supplied SRS v0.1 and [active engineering design](docs/engineering-design-v1.22.md).
 
-The current workspace contains a reusable story core, SQLite and manuscript storage, application services, a synthetic import inventory/mapping interface, a CLI and a full-screen terminal prototype. Experimental Scrivener inventory, explicit mapping preview, staged editable/Both import, and a separate series database with CLI book creation are available. Their import coverage uses synthetic parser/workflow tests only. There is no verified real-project importer, and Scrivener/Ranperen compatibility is not claimed because legally usable reference fixtures are not present in the repository.
+The current workspace contains a reusable story core, SQLite and manuscript storage, application services, import staging, a CLI and a full-screen terminal prototype. Experimental Scrivener inventory, explicit mapping preview, staged editable/Both import, and separate series databases with CLI book creation are available. A legally licensed real Scrivener for Mac 3.1.4 project is included and exercises limited inventory/import behavior; a separate Scrivener 2.5 metadata-only fixture exercises version reporting. These fixtures do not establish general Scrivener compatibility, and no supported-version claim is made. Ranperen compatibility remains unverified because the reference spreadsheets are not in the repository.
 
 The WYSIWYM parser and renderer-neutral Compile IR are documented as a prototype in [the Issue #21 contract](docs/wysiwym-contract-v0.1.md); the contract is not frozen until it is checked against a real formatted chapter.
 
@@ -65,4 +65,4 @@ In the Reading workspace, `:annotations` and `:bookmarks` show zero-based indice
 
 Reading references expose their story links with `reading-links`; `reading-follow <index>` navigates to the linked scene or switches to the character, plotline, or research workspace.
 
-The SRS and engineering design are the product baselines. The SRS was supplied in the project brief and is not yet present as a repository file. No Ranperen spreadsheets or Scrivener fixtures are present, so importer compatibility has not been claimed.
+The SRS and engineering design are the product baselines. The SRS was supplied in the project brief and is not yet present as a repository file. No Ranperen spreadsheets or substantial multi-chapter Scrivener fixture are present, so broad importer compatibility has not been claimed.
