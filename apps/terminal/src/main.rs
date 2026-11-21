@@ -1480,6 +1480,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "git.restore-deleted-scene",
+            "Recover Deleted Scene as New",
+            "Restore historical prose and core metadata under a fresh scene ID in a chosen chapter",
+            "File",
+            "git-restore-scene-new",
+            true,
+        ),
+        legacy_command(
             "extract.propose",
             "Extract Story Candidates",
             "Create provisional Ollama candidates",
@@ -8305,6 +8313,38 @@ impl AppState {
             self.refresh()?;
             self.message = format!(
                 "Scene prose restored from {commit}; the prior project state was snapshotted"
+            );
+        } else if let Some(args) = cmd.strip_prefix("git-restore-scene-new ") {
+            let mut parts = args.split_whitespace();
+            let commit = parts
+                .next()
+                .ok_or("use git-restore-scene-new COMMIT SCENE-UUID CHAPTER-UUID POSITION")?;
+            let scene = story_core::SceneId(
+                parts
+                    .next()
+                    .ok_or("missing historical scene UUID")?
+                    .parse()?,
+            );
+            let chapter = story_core::NodeId(
+                parts
+                    .next()
+                    .ok_or("missing destination chapter UUID")?
+                    .parse()?,
+            );
+            let position = parts
+                .next()
+                .ok_or("missing destination position")?
+                .parse::<u32>()?;
+            self.save()?;
+            if self.dirty {
+                return Err("save conflict; deleted-scene recovery was not started".into());
+            }
+            let restored = self
+                .app
+                .restore_deleted_scene_as_new(commit, scene, chapter, position)?;
+            self.refresh()?;
+            self.message = format!(
+                "Recovered as new scene {restored}; review its character, plot and event relationships"
             );
         } else if let Some(label) = cmd.strip_prefix("snapshot ") {
             let scene = self
@@ -15542,6 +15582,45 @@ mod tests {
             "Argument with evidence."
         );
         assert!(reopened_state.app.list_scenes(false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn git_recovery_command_restores_archived_scene_as_new_and_is_registered() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let chapter = state.app.create_chapter(None, "Chapter", 0).unwrap();
+        let original = state.app.create_scene(chapter, "Missing", 0).unwrap();
+        let (_, hash) = state.app.load_scene_text(original).unwrap();
+        state
+            .app
+            .save_scene_text(original, Some(&hash), "Recovered prose.")
+            .unwrap();
+        let commit = state.app.git_snapshot("Before archive").unwrap().unwrap();
+        state.app.archive_scene(original).unwrap();
+        assert!(
+            command_registry()
+                .iter()
+                .any(|command| command.id == "git.restore-deleted-scene"
+                    && command.category == "File")
+        );
+        state
+            .execute_legacy_palette_command(&format!(
+                "git-restore-scene-new {commit} {original} {chapter} 0"
+            ))
+            .unwrap();
+        let active = state.app.list_scenes(false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_ne!(active[0].scene.id, original);
+        assert_eq!(
+            state.app.load_scene_text(active[0].scene.id).unwrap().0,
+            "Recovered prose."
+        );
+        assert!(
+            state
+                .message
+                .contains("review its character, plot and event relationships")
+        );
     }
 
     #[test]

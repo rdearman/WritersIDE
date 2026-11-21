@@ -867,6 +867,29 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.restore_scene_from_git(&commit, scene)?;
             println!("Scene prose restored from {commit}; previous project state snapshotted.");
         }
+        "git-restore-scene-new" => {
+            let path = args.next().ok_or("missing project path")?;
+            let commit = args.next().ok_or("missing commit identifier")?;
+            let scene = story_core::SceneId(
+                args.next()
+                    .ok_or("missing historical scene UUID")?
+                    .parse()?,
+            );
+            let chapter = story_core::NodeId(
+                args.next()
+                    .ok_or("missing destination chapter UUID")?
+                    .parse()?,
+            );
+            let position = args
+                .next()
+                .ok_or("missing destination position")?
+                .parse::<u32>()?;
+            let mut app = WriterApp::open_project(path)?;
+            let restored = app.restore_deleted_scene_as_new(&commit, scene, chapter, position)?;
+            println!(
+                "Recovered as new scene {restored}; manuscript and core scene metadata restored. Character/plot/event relationships were not copied and should be reviewed."
+            );
+        }
         "git-restore-content" => {
             let path = args.next().ok_or("missing project path")?;
             let commit = args.next().ok_or("missing commit identifier")?;
@@ -2956,6 +2979,9 @@ fn usage() {
     eprintln!("writers-ide git-auto-snapshot <project> <interval-minutes|off> (1–10080 minutes)");
     eprintln!(
         "writers-ide git-auto-snapshot-check <project> (one-shot; suitable for cron/systemd timers)"
+    );
+    eprintln!(
+        "writers-ide git-restore-scene-new <project> <commit> <historical-scene-uuid> <destination-chapter-uuid> <position>"
     );
     eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");
     eprintln!(

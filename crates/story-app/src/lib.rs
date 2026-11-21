@@ -2952,6 +2952,82 @@ impl WriterApp {
         }
         result
     }
+
+    /// Recreate an archived or deleted scene from a committed project
+    /// snapshot. A fresh ID prevents stale links or ID collisions from being
+    /// silently reattached to the restored document.
+    pub fn restore_deleted_scene_as_new(
+        &mut self,
+        commit: &str,
+        historical_scene: SceneId,
+        destination_chapter: NodeId,
+        position: u32,
+    ) -> Result<SceneId> {
+        if self
+            .store
+            .list_scenes(false)?
+            .iter()
+            .any(|record| record.scene.id == historical_scene)
+        {
+            return Err(AppError::Domain("an active scene with this identity still exists; use the existing scene restore workflow".into()));
+        }
+        if !self
+            .store
+            .list_structural_nodes()?
+            .iter()
+            .any(|node| node.id == destination_chapter && node.kind == "chapter")
+        {
+            return Err(AppError::Domain(
+                "deleted-scene restore destination must be an existing chapter".into(),
+            ));
+        }
+        let temporary = tempfile::tempdir().map_err(|error| {
+            AppError::Domain(format!("create historical restore workspace: {error}"))
+        })?;
+        let historical_path = temporary.path().join("historical-project");
+        Self::restore_git_snapshot(self.store.project_root(), commit, &historical_path)?;
+        let historical = Self::open_project(&historical_path)?;
+        let source = historical.get_scene(historical_scene)?;
+        let (text, _) = historical.load_scene_text(historical_scene)?;
+        self.git_snapshot(&format!(
+            "Before recovering deleted scene {}",
+            source.scene.title
+        ))?;
+        let restored = self.create_scene(destination_chapter, &source.scene.title, position)?;
+        let mut metadata = source.scene;
+        metadata.id = restored;
+        metadata.archived = false;
+        if metadata
+            .pov_character
+            .is_some_and(|id| self.get_character(id).is_err())
+        {
+            metadata.pov_character = None;
+        }
+        if metadata
+            .start_location
+            .is_some_and(|id| self.get_location(id).is_err())
+        {
+            metadata.start_location = None;
+        }
+        if metadata
+            .end_location
+            .is_some_and(|id| self.get_location(id).is_err())
+        {
+            metadata.end_location = None;
+        }
+        let result = (|| {
+            self.update_scene_metadata(&metadata)?;
+            let (_, expected) = self.load_scene_text(restored)?;
+            self.save_scene_text(restored, Some(&expected), &text)?;
+            Ok::<(), AppError>(())
+        })();
+        if let Err(error) = result {
+            let _ = self.archive_scene(restored);
+            return Err(error);
+        }
+        Ok(restored)
+    }
+
     pub fn git_snapshot(&mut self, label: &str) -> Result<Option<String>> {
         let author = self.get_project()?.author;
         Ok(self.store.with_git_snapshot_barrier(|root| {
@@ -3401,6 +3477,45 @@ unexpected_prose = "must not be silently discarded"
             .contains("Current revision.")
         );
         assert!(app.restore_scene_from_git("not-a-commit", scene).is_err());
+    }
+
+    #[test]
+    fn git_recovers_archived_scene_as_new_identity_with_core_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let original = app.create_scene(chapter, "Lost scene", 0).unwrap();
+        let mut metadata = app.get_scene(original).unwrap().scene;
+        metadata.synopsis = "An important turn".into();
+        metadata.purpose = "Reveal the map".into();
+        metadata.goal = "Find the route".into();
+        metadata.outcome = "The route is found".into();
+        app.update_scene_metadata(&metadata).unwrap();
+        let (_, expected) = app.load_scene_text(original).unwrap();
+        app.save_scene_text(original, Some(&expected), "The map opened.")
+            .unwrap();
+        let commit = app
+            .git_snapshot("Before accidental deletion")
+            .unwrap()
+            .unwrap();
+        app.archive_scene(original).unwrap();
+
+        let restored = app
+            .restore_deleted_scene_as_new(&commit, original, chapter, 0)
+            .unwrap();
+        assert_ne!(restored, original);
+        let restored_record = app.get_scene(restored).unwrap();
+        assert_eq!(restored_record.scene.title, "Lost scene");
+        assert_eq!(restored_record.scene.synopsis, "An important turn");
+        assert_eq!(restored_record.scene.purpose, "Reveal the map");
+        assert_eq!(restored_record.chapter_id, Some(chapter));
+        assert_eq!(app.load_scene_text(restored).unwrap().0, "The map opened.");
+        assert!(
+            app.list_scenes(false)
+                .unwrap()
+                .iter()
+                .any(|item| item.scene.id == restored)
+        );
     }
 
     #[test]
