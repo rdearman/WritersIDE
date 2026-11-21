@@ -17,7 +17,9 @@ toml.workspace = true
 story-pipeline = { path = "../../crates/story-pipeline" }
 story-document = { path = "../../crates/story-document" }
 story-import = { path = "../../crates/story-import" }
+story-series = { path = "../../crates/story-series" }
 story-web = { path = "../../crates/story-web" }
 tempfile.workspace = true
 sha2.workspace = true
 time.workspace = true
+zip.workspace = true

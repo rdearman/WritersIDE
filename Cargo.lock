@@ -1664,6 +1664,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "story-series"
+version = "0.1.0"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "story-core",
+ "story-storage",
+ "tempfile",
+ "thiserror",
+ "toml",
+ "uuid",
+]
+
+[[package]]
 name = "story-storage"
 version = "0.1.0"
 dependencies = [
@@ -2339,12 +2353,14 @@ dependencies = [
  "story-import",
  "story-ollama",
  "story-pipeline",
+ "story-series",
  "story-storage",
  "story-web",
  "tempfile",
  "time",
  "toml",
  "uuid",
+ "zip",
 ]
 
 [[package]]

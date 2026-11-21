@@ -791,6 +791,11 @@ macro_rules! id_type {
                 Self(Uuid::new_v4())
             }
         }
+        impl From<Uuid> for $name {
+            fn from(value: Uuid) -> Self {
+                Self(value)
+            }
+        }
         impl Default for $name {
             fn default() -> Self {
                 Self::new()
@@ -838,6 +843,8 @@ id_type!(ContinuityRuleId);
 id_type!(PlanningBoardConnectorId);
 id_type!(AssemblyDraftId);
 id_type!(StoryBibleTemplateId);
+id_type!(SeriesId);
+id_type!(BookId);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

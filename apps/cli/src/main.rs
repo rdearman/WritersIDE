@@ -1988,6 +1988,123 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("Imported Scrivener project into {}", destination.display());
             }
         }
+        "series-create" => {
+            let root = args.next().ok_or("missing series directory")?;
+            let title = args.next().ok_or("missing series title")?;
+            let series = story_series::SeriesStore::create(&root, &title)?;
+            println!(
+                "Created series '{}' ({}) at {}",
+                series.title(),
+                series.id(),
+                series.root().display()
+            );
+        }
+        "series-list" => {
+            let root = args.next().ok_or("missing series directory")?;
+            let series = story_series::SeriesStore::open(&root)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "series_id": series.id(),
+                    "title": series.title(),
+                    "books": series.list_books()?
+                }))?
+            );
+        }
+        "series-references" => {
+            let root = args.next().ok_or("missing series directory")?;
+            let series = story_series::SeriesStore::open(&root)?;
+            let mut references = Vec::new();
+            for book in series.list_books()? {
+                let book_root = series.root().join(&book.relative_path);
+                if !book_root.is_dir() {
+                    continue;
+                }
+                let app = WriterApp::open_project(&book_root)?;
+                for document in app.list_reading_documents()? {
+                    references.push(serde_json::json!({
+                        "book_id": book.id,
+                        "book_title": book.title,
+                        "document_id": document.id,
+                        "title": document.title,
+                        "source_identifier": document.source_identifier,
+                        "source_sha256": document.source_sha256,
+                        "extracted_text": document.extracted_text
+                    }));
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&references)?);
+        }
+        "series-add-book" => {
+            let series_root = args.next().ok_or("missing series directory")?;
+            let book_root = PathBuf::from(args.next().ok_or("missing book project directory")?);
+            let title = args.next().ok_or("missing book title")?;
+            let source_fingerprint = args.next();
+            let app = WriterApp::open_project(&book_root)?;
+            let project_id = app.get_project()?.id;
+            drop(app);
+            let mut series = story_series::SeriesStore::open(series_root)?;
+            let book = series.add_book(
+                project_id,
+                &book_root,
+                &title,
+                source_fingerprint.as_deref(),
+            )?;
+            println!(
+                "Added '{}' as book {} ({})",
+                book.title, book.id, book.relative_path
+            );
+        }
+        "series-new-book" => {
+            let series_root = PathBuf::from(args.next().ok_or("missing series directory")?);
+            let folder_name = args.next().ok_or("missing new book folder name")?;
+            let title = args.next().ok_or("missing new book title")?;
+            let relative = Path::new(&folder_name);
+            if relative.components().count() != 1
+                || !relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                return Err("book folder name must be a single normal path component".into());
+            }
+            let mut series = story_series::SeriesStore::open(&series_root)?;
+            let book_root = series_root.join(relative);
+            if book_root.exists() {
+                return Err("new book folder already exists".into());
+            }
+            let app = WriterApp::create_project(&book_root, &title)?;
+            let project_id = app.get_project()?.id;
+            drop(app);
+            match series.add_book(project_id, &book_root, &title, None) {
+                Ok(book) => println!(
+                    "Created '{}' in series '{}' at {} (book {}; project {})",
+                    book.title,
+                    series.title(),
+                    book.relative_path,
+                    book.id,
+                    book.project_id
+                ),
+                Err(error) => {
+                    if series.book_for_project(project_id)?.is_none() {
+                        let _ = fs::remove_dir_all(&book_root);
+                    } else {
+                        eprintln!(
+                            "Book is registered in the series; run series-repair-memberships if its membership sidecar is missing."
+                        );
+                    }
+                    return Err(error.into());
+                }
+            }
+        }
+        "series-repair-memberships" => {
+            let root = args.next().ok_or("missing series directory")?;
+            let series = story_series::SeriesStore::open(root)?;
+            let paths = series.repair_memberships()?;
+            println!(
+                "Reconciled membership metadata for {} existing books",
+                paths.len()
+            );
+        }
         "review-inspect" => {
             let source = args.next().ok_or("missing DOCX file")?;
             println!(
@@ -2815,6 +2932,16 @@ fn usage() {
     eprintln!(
         "writers-ide import-scrivener <source> <new-project-directory> [mapping.json] [title] [--editable]"
     );
+    eprintln!("writers-ide series-create <series-directory> <title>");
+    eprintln!("writers-ide series-list <series-directory>");
+    eprintln!(
+        "writers-ide series-references <series-directory> (read-only references from member books)"
+    );
+    eprintln!(
+        "writers-ide series-add-book <series-directory> <book-project-directory> <title> [source-sha256]"
+    );
+    eprintln!("writers-ide series-new-book <series-directory> <folder-name> <title>");
+    eprintln!("writers-ide series-repair-memberships <series-directory>");
     eprintln!(
         "writers-ide event-time-set <project> <event-uuid> <start-tick|?|~nominal,lower,upper|lower..upper> <end-tick|?|~nominal,lower,upper|lower..upper> [source-time-text]"
     );
