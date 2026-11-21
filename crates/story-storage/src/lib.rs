@@ -572,6 +572,15 @@ pub struct PlanningBoardItemRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanningBoardConnectorRecord {
+    pub id: PlanningBoardConnectorId,
+    pub board_id: PlanningBoardId,
+    pub source_item_id: PlanningBoardItemId,
+    pub target_item_id: PlanningBoardItemId,
+    pub label: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlanningBoardSummary {
     pub id: PlanningBoardId,
     pub title: String,
@@ -3872,6 +3881,42 @@ impl ProjectStore {
                 width,
                 height,
                 note,
+            })
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(StorageError::from)
+    }
+
+    pub fn list_planning_board_connectors(
+        &self,
+        board: PlanningBoardId,
+    ) -> Result<Vec<PlanningBoardConnectorRecord>> {
+        let mut stmt = self.conn.prepare("SELECT id,source_item_id,target_item_id,label FROM planning_board_connector WHERE board_id=?1 ORDER BY id")?;
+        let rows = stmt.query_map([board.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, source, target, label) = row?;
+            let parse = |value: String| {
+                Uuid::parse_str(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            };
+            Ok::<_, rusqlite::Error>(PlanningBoardConnectorRecord {
+                id: PlanningBoardConnectorId(parse(id)?),
+                board_id: board,
+                source_item_id: PlanningBoardItemId(parse(source)?),
+                target_item_id: PlanningBoardItemId(parse(target)?),
+                label,
             })
         })
         .collect::<std::result::Result<Vec<_>, _>>()

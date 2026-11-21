@@ -21,6 +21,26 @@ pub enum AppError {
 }
 pub type Result<T> = std::result::Result<T, AppError>;
 
+fn escape_svg_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '\t' | '\n' | '\r')
+                || (ch >= '\u{20}' && ch != '\u{fffe}' && ch != '\u{ffff}')
+            {
+                ch
+            } else {
+                '\u{fffd}'
+            }
+        })
+        .collect::<String>()
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\"', "&quot;")
+        .replace('\'', "&apos;")
+}
+
 /// Application façade: frontends use use cases here and never issue domain SQL.
 pub struct WriterApp {
     store: ProjectStore,
@@ -1630,6 +1650,108 @@ impl WriterApp {
         Ok(self.store.list_planning_board_items(board)?)
     }
 
+    pub fn list_planning_board_connectors(
+        &self,
+        board: PlanningBoardId,
+    ) -> Result<Vec<story_storage::PlanningBoardConnectorRecord>> {
+        Ok(self.store.list_planning_board_connectors(board)?)
+    }
+
+    pub fn planning_board_svg(&self, board: PlanningBoardId) -> Result<String> {
+        let summary = self
+            .list_planning_boards()?
+            .into_iter()
+            .find(|item| item.id == board)
+            .ok_or_else(|| StorageError::NotFound(board.to_string()))?;
+        let items = self.list_planning_board_items(board)?;
+        let connectors = self.list_planning_board_connectors(board)?;
+        if items.iter().any(|item| {
+            [item.x, item.y, item.width, item.height]
+                .iter()
+                .any(|v| !v.is_finite() || v.abs() > 1.0e9)
+        }) {
+            return Err(StorageError::Invalid(
+                "planning board coordinates exceed the SVG export range".into(),
+            )
+            .into());
+        }
+        let min_x = items.iter().map(|item| item.x).fold(0.0_f64, f64::min) - 12.0;
+        let min_y = items.iter().map(|item| item.y).fold(0.0_f64, f64::min) - 12.0;
+        let max_x = items
+            .iter()
+            .map(|item| item.x + item.width)
+            .fold(240.0_f64, f64::max)
+            + 12.0;
+        let max_y = items
+            .iter()
+            .map(|item| item.y + item.height)
+            .fold(160.0_f64, f64::max)
+            + 12.0;
+        let width = max_x - min_x;
+        let height = max_y - min_y;
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            return Err(StorageError::Invalid(
+                "planning board dimensions cannot be rendered".into(),
+            )
+            .into());
+        }
+        let positions = items
+            .iter()
+            .map(|item| (item.id, item))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut svg = format!(
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"{min_x} {min_y} {width} {height}\" role=\"img\" aria-label=\"{}\">\n<title>{}</title>\n<rect x=\"{min_x}\" y=\"{min_y}\" width=\"{width}\" height=\"{height}\" fill=\"white\"/>\n",
+            escape_svg_text(&summary.title),
+            escape_svg_text(&summary.title)
+        );
+        for connector in connectors {
+            let source = positions
+                .get(&connector.source_item_id)
+                .ok_or_else(|| StorageError::Invalid("board connector source is missing".into()))?;
+            let target = positions
+                .get(&connector.target_item_id)
+                .ok_or_else(|| StorageError::Invalid("board connector target is missing".into()))?;
+            let (sx, sy) = (
+                source.x + source.width / 2.0,
+                source.y + source.height / 2.0,
+            );
+            let (tx, ty) = (
+                target.x + target.width / 2.0,
+                target.y + target.height / 2.0,
+            );
+            svg.push_str(&format!("<line x1=\"{sx}\" y1=\"{sy}\" x2=\"{tx}\" y2=\"{ty}\" stroke=\"#64748b\" stroke-width=\"0.8\" marker-end=\"url(#arrow)\"/>\n"));
+            if !connector.label.is_empty() {
+                svg.push_str(&format!(
+                    "<text x=\"{}\" y=\"{}\" font-size=\"3\" fill=\"#334155\">{}</text>\n",
+                    (sx + tx) / 2.0,
+                    (sy + ty) / 2.0 - 1.0,
+                    escape_svg_text(&connector.label)
+                ));
+            }
+        }
+        svg.push_str("<defs><marker id=\"arrow\" markerWidth=\"6\" markerHeight=\"6\" refX=\"5\" refY=\"3\" orient=\"auto\"><path d=\"M0,0 L6,3 L0,6 z\" fill=\"#64748b\"/></marker></defs>\n");
+        for item in items {
+            svg.push_str(&format!("<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" rx=\"1.5\" fill=\"#f8fafc\" stroke=\"#334155\" stroke-width=\"0.6\"/>\n", item.x, item.y, item.width, item.height));
+            let title = format!("{} · {}", item.entity_kind, item.entity_id);
+            svg.push_str(&format!(
+                "<text x=\"{}\" y=\"{}\" font-size=\"3.2\" font-weight=\"bold\">{}</text>\n",
+                item.x + 2.0,
+                item.y + 3.8,
+                escape_svg_text(&title)
+            ));
+            for (index, line) in item.note.lines().take(3).enumerate() {
+                svg.push_str(&format!(
+                    "<text x=\"{}\" y=\"{}\" font-size=\"2.8\">{}</text>\n",
+                    item.x + 2.0,
+                    item.y + 7.5 + index as f64 * 3.4,
+                    escape_svg_text(line)
+                ));
+            }
+        }
+        svg.push_str("</svg>\n");
+        Ok(svg)
+    }
+
     pub fn move_planning_board_item(
         &mut self,
         item: PlanningBoardItemId,
@@ -2741,6 +2863,38 @@ mod tests {
         drop(app);
         let app = WriterApp::open_project(dir.path().join("Novel")).unwrap();
         assert_eq!(app.get_character(id).unwrap(), character);
+    }
+
+    #[test]
+    fn planning_board_svg_exports_cards_connectors_and_escaped_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Board"), "Board").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first_scene = app.create_scene(chapter, "First", 0).unwrap();
+        let second_scene = app.create_scene(chapter, "Second", 1).unwrap();
+        let board = app.create_planning_board("<Idea & map>\u{1}").unwrap();
+        let first = app
+            .add_planning_board_item(board, "scene", &first_scene.to_string(), 0.0, 0.0, "A & B")
+            .unwrap();
+        let second = app
+            .add_planning_board_item(
+                board,
+                "scene",
+                &second_scene.to_string(),
+                42.0,
+                0.0,
+                "Ending",
+            )
+            .unwrap();
+        app.connect_planning_board_items(board, first, second, "<leads>")
+            .unwrap();
+        let svg = app.planning_board_svg(board).unwrap();
+        assert!(svg.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""));
+        assert!(svg.contains("&lt;Idea &amp; map&gt;\u{fffd}"));
+        assert!(!svg.contains('\u{1}'));
+        assert!(svg.contains("A &amp; B"));
+        assert!(svg.contains("&lt;leads&gt;"));
+        assert!(svg.contains("marker-end=\"url(#arrow)\""));
     }
 
     #[test]

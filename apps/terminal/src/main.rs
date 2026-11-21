@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs, io,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -1496,6 +1496,14 @@ fn command_registry() -> Vec<CommandSpec> {
             "Render a portable Markdown table of this board's cards",
             "Plan",
             "board-export",
+            true,
+        ),
+        legacy_command(
+            "board.export-svg",
+            "Export Planning Board SVG",
+            "Render a portable SVG diagram with cards and connectors",
+            "Plan",
+            "board-export-svg",
             true,
         ),
         legacy_command(
@@ -4717,6 +4725,15 @@ impl AppState {
                 .title;
             self.message =
                 format_planning_board_markdown(&title, &self.app.list_planning_board_items(board)?);
+        } else if let Some(rest) = cmd.strip_prefix("board-export-svg ") {
+            let board = story_core::PlanningBoardId(rest.trim().parse()?);
+            let bytes = self.app.planning_board_svg(board)?;
+            let output = write_board_svg_export(
+                self.app.project_root(),
+                &format!("board-{board}.svg"),
+                bytes.as_bytes(),
+            )?;
+            self.message = format!("Exported SVG planning board to {}", output.display());
         } else if let Some(rest) = cmd.strip_prefix("board-move ") {
             let mut parts = rest.split_whitespace();
             let item = story_core::PlanningBoardItemId(
@@ -7992,6 +8009,44 @@ fn run(
     }
     Ok(())
 }
+fn write_board_svg_export(
+    project_root: &Path,
+    filename: &str,
+    bytes: &[u8],
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if Path::new(filename)
+        .file_name()
+        .and_then(|name| name.to_str())
+        != Some(filename)
+    {
+        return Err("board export filename must be a simple file name".into());
+    }
+    let root = project_root.canonicalize()?;
+    let exports = root.join("exports");
+    match fs::symlink_metadata(&exports) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("project exports path must be a real directory".into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(&exports)?,
+        Err(error) => return Err(error.into()),
+    }
+    let parent = exports.canonicalize()?;
+    if !parent.starts_with(&root) {
+        return Err("board export directory escapes the project".into());
+    }
+    let output = parent.join(filename);
+    if fs::symlink_metadata(&output).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err("board export target cannot be a symlink".into());
+    }
+    let mut temporary = tempfile::NamedTempFile::new_in(&parent)?;
+    std::io::Write::write_all(&mut temporary, bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&output)?;
+    fs::File::open(&parent)?.sync_all()?;
+    Ok(output)
+}
+
 fn editor_grapheme_is_mentioned(byte_offset: u64, byte_len: u64, ranges: &[(u64, u64)]) -> bool {
     let Some(end) = byte_offset.checked_add(byte_len) else {
         return false;
@@ -13027,6 +13082,19 @@ mod tests {
         );
         assert!(export.contains("# Canvas"));
         assert!(export.contains("| scene |"));
+        state
+            .execute_legacy_palette_command(&format!("board-export-svg {board}"))
+            .unwrap();
+        let svg = fs::read_to_string(
+            state
+                .app
+                .project_root()
+                .join("exports")
+                .join(format!("board-{board}.svg")),
+        )
+        .unwrap();
+        assert!(svg.contains(&scene.to_string()));
+        assert!(state.message.contains("Exported SVG"));
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -13207,6 +13275,18 @@ mod tests {
             [first, second]
         );
         assert!(!reopened.scenes.iter().any(|scene| scene.0 == outside));
+    }
+
+    #[test]
+    fn planning_board_svg_export_rejects_symlinked_exports_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Project"), "Project").unwrap();
+        let external = root.path().join("external");
+        fs::create_dir(&external).unwrap();
+        fs::remove_dir(project.project_root().join("exports")).unwrap();
+        std::os::unix::fs::symlink(&external, project.project_root().join("exports")).unwrap();
+        assert!(write_board_svg_export(project.project_root(), "board.svg", b"<svg/>").is_err());
+        assert!(!external.join("board.svg").exists());
     }
 
     #[test]
