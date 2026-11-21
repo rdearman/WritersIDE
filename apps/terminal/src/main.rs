@@ -253,6 +253,22 @@ struct EditorToolsFile {
     macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct CoverageConfig {
+    version: u16,
+    #[serde(default)]
+    requirements: Vec<CoverageConfigEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct CoverageConfigEntry {
+    id: String,
+    label: String,
+    entity_id: String,
+    dimension: String,
+    minimum_scenes: usize,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandAction {
     Workspace(Workspace),
@@ -731,6 +747,10 @@ fn command_registry() -> Vec<CommandSpec> {
         ),
         legacy_command("search.query-assert-save", "Save Query Assertions", "Persist count assertions for a saved query", "View", "query-assert-save", true),
         legacy_command("search.query-assert-check", "Check Query Assertions", "Evaluate saved count assertions against refreshed results", "View", "query-assert-check", true),
+        legacy_command("analysis.coverage-add", "Add Coverage Rule", "Add a project-local character or plotline appearance requirement", "Plot", "coverage-add", true),
+        legacy_command("analysis.coverage-check", "Check Coverage Rules", "Evaluate saved coverage requirements without changing story data", "Plot", "coverage-check", false),
+        legacy_command("analysis.coverage-list", "List Coverage Rules", "List project-local coverage requirements", "Plot", "coverage-list", false),
+        legacy_command("analysis.coverage-remove", "Remove Coverage Rule", "Remove a coverage requirement by ID", "Plot", "coverage-remove", true),
         legacy_command(
             "link.create",
             "Create Story Link",
@@ -4126,6 +4146,71 @@ impl AppState {
                 })
                 .collect::<Vec<_>>()
                 .join(" · ");
+        } else if let Some(rest) = cmd.strip_prefix("coverage-add ") {
+            let mut parts = rest.splitn(5, ' ');
+            let id = parts.next().unwrap_or_default().trim();
+            let dimension = parts.next().unwrap_or_default().trim();
+            let entity_id = parts.next().unwrap_or_default().trim();
+            let minimum_scenes = parts
+                .next()
+                .ok_or("use coverage-add ID character|plotline ENTITY-UUID MIN LABEL")?
+                .parse::<usize>()?;
+            let label = parts.next().unwrap_or_default().trim();
+            if id.is_empty()
+                || label.is_empty()
+                || entity_id.is_empty()
+                || !matches!(dimension, "character" | "plotline")
+            {
+                return Err("coverage requires a unique ID, character|plotline dimension, entity UUID, minimum and label".into());
+            }
+            let root = self.app.project_root();
+            let mut config = load_coverage_config(root)?;
+            if config.requirements.iter().any(|entry| entry.id == id) {
+                return Err(
+                    format!("coverage requirement {id} already exists; remove it first").into(),
+                );
+            }
+            config.requirements.push(CoverageConfigEntry {
+                id: id.into(),
+                label: label.into(),
+                entity_id: entity_id.into(),
+                dimension: dimension.into(),
+                minimum_scenes,
+            });
+            save_coverage_config(root, &config)?;
+            self.message = format!("Added coverage requirement {id}");
+        } else if let Some(id) = cmd.strip_prefix("coverage-remove ") {
+            let root = self.app.project_root();
+            let mut config = load_coverage_config(root)?;
+            let before = config.requirements.len();
+            config.requirements.retain(|entry| entry.id != id.trim());
+            if config.requirements.len() == before {
+                return Err(format!("unknown coverage requirement {}", id.trim()).into());
+            }
+            save_coverage_config(root, &config)?;
+            self.message = format!("Removed coverage requirement {}", id.trim());
+        } else if cmd == "coverage-list" {
+            let root = self.app.project_root();
+            let config = load_coverage_config(root)?;
+            self.message = if config.requirements.is_empty() {
+                "No configured coverage requirements".into()
+            } else {
+                config
+                    .requirements
+                    .into_iter()
+                    .map(|entry| {
+                        format!(
+                            "{} {} {} ≥{}",
+                            entry.id, entry.dimension, entry.label, entry.minimum_scenes
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            };
+        } else if cmd == "coverage-check" {
+            let root = self.app.project_root();
+            let data = self.app.analytics_dataset()?;
+            self.message = coverage_report_rows(root, &data).join(" · ");
         } else if let Some(rest) = cmd.strip_prefix("link ") {
             let mut parts = rest.splitn(6, ' ');
             let source_kind = parts.next().ok_or("missing source kind")?;
@@ -4361,7 +4446,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [steady|kamikaze] | challenge-finish | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [steady|kamikaze] | challenge-finish | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -6234,6 +6319,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             rows.extend(daily_writing_rows(
                 &s.app.list_writing_challenges().unwrap_or_default(),
             ));
+            rows.extend(coverage_report_rows(s.app.project_root(), &data));
             rows
         }
         Workspace::Research if s.proposal_review_active => s.proposal_review_rows.clone(),
@@ -6362,6 +6448,103 @@ fn daily_writing_rows(challenges: &[story_storage::WritingChallengeRecord]) -> V
             format!("{date}  {bar}  {words} words · {sessions} {session_label} · {cumulative} cumulative")
         })
         .collect()
+}
+
+fn coverage_config_path(root: &Path) -> std::path::PathBuf {
+    root.join(".writers-ide/coverage.toml")
+}
+
+fn load_coverage_config(root: &Path) -> Result<CoverageConfig, Box<dyn std::error::Error>> {
+    let path = coverage_config_path(root);
+    match fs::read_to_string(path) {
+        Ok(source) => {
+            let config: CoverageConfig = toml::from_str(&source)?;
+            if config.version != 1 {
+                return Err(
+                    format!("unsupported coverage config version {}", config.version).into(),
+                );
+            }
+            let mut ids = BTreeSet::new();
+            for entry in &config.requirements {
+                if entry.id.trim().is_empty()
+                    || entry.label.trim().is_empty()
+                    || entry.entity_id.trim().is_empty()
+                    || !matches!(entry.dimension.as_str(), "character" | "plotline")
+                    || !ids.insert(&entry.id)
+                {
+                    return Err(
+                        format!("invalid or duplicate coverage requirement {}", entry.id).into(),
+                    );
+                }
+            }
+            Ok(config)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(CoverageConfig {
+            version: 1,
+            requirements: Vec::new(),
+        }),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_coverage_config(
+    root: &Path,
+    config: &CoverageConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = root.join(".writers-ide");
+    fs::create_dir_all(&directory)?;
+    let bytes = toml::to_string_pretty(config)?;
+    let path = coverage_config_path(root);
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    use std::io::Write;
+    temporary.write_all(bytes.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path)?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn coverage_report_rows(root: &Path, scenes: &[story_analysis::SceneAnalysisInput]) -> Vec<String> {
+    let config = match load_coverage_config(root) {
+        Ok(config) => config,
+        Err(error) => return vec![format!("Coverage config error: {error}")],
+    };
+    if config.requirements.is_empty() {
+        return vec!["No configured coverage requirements".into()];
+    }
+    let requirements = config
+        .requirements
+        .iter()
+        .map(|entry| {
+            Ok(story_analysis::CoverageRequirement {
+                id: entry.id.clone(),
+                label: entry.label.clone(),
+                entity_id: entry.entity_id.clone(),
+                dimension: match entry.dimension.as_str() {
+                    "character" => story_analysis::CoverageDimension::Character,
+                    "plotline" => story_analysis::CoverageDimension::Plotline,
+                    _ => return Err(format!("unsupported dimension {}", entry.dimension)),
+                },
+                minimum_scenes: entry.minimum_scenes,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>();
+    match requirements {
+        Ok(requirements) => story_analysis::evaluate_coverage(scenes, &requirements)
+            .into_iter()
+            .map(|result| {
+                format!(
+                    "Coverage {} · {} · {}/{} scenes · {}",
+                    if result.coverage_met { "PASS" } else { "GAP" },
+                    result.label,
+                    result.matching_scene_ids.len(),
+                    result.minimum_scenes,
+                    result.requirement_id
+                )
+            })
+            .collect(),
+        Err(error) => vec![format!("Coverage config error: {error}")],
+    }
 }
 
 fn plot_grid_rows(s: &AppState) -> Vec<String> {
@@ -7295,6 +7478,36 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows[0].contains("200 words · 2 sessions · 200 cumulative"));
         assert!(rows[1].contains("100 words · 1 session · 300 cumulative"));
+    }
+
+    #[test]
+    fn coverage_rules_are_project_local_persistent_and_read_only() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        let character_id = story_core::CharacterId::new().to_string();
+        state.prompt =
+            format!("coverage-add protag character {character_id} 2 Protagonist coverage");
+        state.command().unwrap();
+        assert!(state.message.contains("Added coverage requirement"));
+        let rows = coverage_report_rows(state.app.project_root(), &[]);
+        assert!(rows[0].contains("GAP"));
+        state.prompt = "coverage-list".into();
+        state.command().unwrap();
+        assert!(
+            state
+                .message
+                .contains("protag character Protagonist coverage ≥2")
+        );
+        state.prompt = "coverage-remove protag".into();
+        state.command().unwrap();
+        assert_eq!(
+            load_coverage_config(state.app.project_root())
+                .unwrap()
+                .requirements
+                .len(),
+            0
+        );
     }
 
     #[test]

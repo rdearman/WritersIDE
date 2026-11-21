@@ -236,7 +236,7 @@ Migration 0018 adds durable writing challenge records with target words, start/d
 
 ### Issue #15 — Advanced inspection foundation
 
-Migration 0019 persists typed count assertions on saved queries. CLI `query-assert-save`/`query-assert-check` and terminal `query-assert-save`/`query-assert-check` save and evaluate assertion sets against refreshed results. The analysis crate also evaluates read-only character/plotline scene-coverage requirements; CLI `coverage` checks a minimum appearance count. Checks report actual counts and return a failing status when unmet. Coverage configuration UI, arbitrary query expression evaluation, and broader assertion operators remain open.
+Migration 0019 persists typed count assertions on saved queries. CLI `query-assert-save`/`query-assert-check` and terminal `query-assert-save`/`query-assert-check` save and evaluate assertion sets against refreshed results. The analysis crate evaluates read-only character/plotline scene-coverage requirements; CLI `coverage` checks a minimum appearance count. Terminal `coverage-add`, `coverage-remove`, `coverage-list`, and `coverage-check` persist project-local requirements in `.writers-ide/coverage.toml`; Analytics displays pass/gap results. Checks report actual counts and never modify story data. A graphical coverage editor, arbitrary query expression evaluation, and broader assertion operators remain open.
 
 ### Issue #16 — Compile automation foundation
 

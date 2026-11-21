@@ -205,7 +205,7 @@ Issue #14 now has UTF-8 safe snippet expansion, saved macros, persistent snippet
 
 Issue #5 adds persisted challenge start/deadline/target/mode/results, terminal countdown and word-delta recording, CLI controls, and bounded progress bars for project, chapter and challenge targets in Analytics. The view also aggregates completed/abandoned challenge words into daily bars and a cumulative total. General-session and per-scene time-series graphs remain open.
 
-Issue #15 adds read-only character/plotline scene coverage checks exposed through `coverage`, plus persisted saved-query count assertions exposed through `query-assert-save`/`query-assert-check` in CLI and terminal. Coverage authoring UI remains outstanding.
+Issue #15 adds read-only character/plotline scene coverage checks exposed through `coverage`, plus persisted saved-query count assertions exposed through `query-assert-save`/`query-assert-check` in CLI and terminal. Terminal coverage rules can be added, listed, removed, checked, and reviewed in Analytics using the project-local coverage TOML file. A graphical coverage editor remains outstanding.
 
 Issue #16 adds project-relative edition recipes with `compile-edition`/`watch-edition`, source-map output, symlink/traversal protection, and local Aspell-based spellchecking with optional project word lists. The original `compile-watch` command remains. Assemblies support alternate ordering. Multi-stage pipeline automation and broader dictionary formats remain open; spelling requires an Aspell executable installed locally.
 
