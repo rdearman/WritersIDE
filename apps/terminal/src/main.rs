@@ -2935,7 +2935,9 @@ impl AppState {
         }
         let (text, hash) = self.app.load_scene_text(id)?;
         self.app.reindex_scene_mentions(id, &text, &hash)?;
-        self.editor = text.lines().map(str::to_owned).collect();
+        // Preserve the final empty editor row when prose ends in a newline so
+        // restored end-of-document cursors remain after the last paragraph.
+        self.editor = text.split('\n').map(str::to_owned).collect();
         if self.editor.is_empty() {
             self.editor.push(String::new());
         }
@@ -12375,6 +12377,57 @@ mod tests {
         assert_eq!(&line[..grapheme_byte(line, 1)], "e\u{301}");
         assert_eq!(&line[..grapheme_byte(line, 2)], "e\u{301}👩‍🚀");
         assert_eq!(grapheme_byte(line, 99), line.len());
+    }
+
+    #[test]
+    fn sustained_terminal_key_editing_survives_autosaves_and_reopens() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project_path, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Sustained session", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        let mut expected = String::new();
+        for total_paragraphs in 0..120 {
+            let line = format!(
+                "Session paragraph {total_paragraphs}: café — Mira follows the harbour lights."
+            );
+            for character in line.chars() {
+                handle(
+                    &mut state,
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                )
+                .unwrap();
+            }
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .unwrap();
+            expected.push_str(&line);
+            expected.push('\n');
+
+            if total_paragraphs % 30 == 29 {
+                assert!(state.dirty);
+                state.save().unwrap();
+                assert!(!state.dirty);
+                state.save_session().unwrap();
+                drop(state);
+                state = AppState::new(
+                    WriterApp::open_project(&project_path).unwrap(),
+                    default_bindings(),
+                );
+                state.restore_session().unwrap();
+                assert_eq!(state.editing_scene, Some(scene));
+                assert_eq!(state.editor.join("\n"), expected);
+            }
+        }
+
+        let (saved, hash) = state.app.load_scene_text(scene).unwrap();
+        assert_eq!(saved, expected);
+        assert_eq!(hash, state.saved_hash);
+        assert_eq!(state.app.get_scene(scene).unwrap().actual_words, 1080);
     }
 
     #[test]
