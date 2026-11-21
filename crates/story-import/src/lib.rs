@@ -159,6 +159,72 @@ pub fn inspect_docx_review(path: impl AsRef<Path>) -> Result<Vec<DocxReviewItem>
     Ok(items)
 }
 
+/// Produces the accepted or rejected prose view of a DOCX without modifying the source archive.
+/// Formatting and comment ranges are not applied to canonical Markdown; callers must present the
+/// returned text as a review candidate and merge it through the normal conflict-aware workflow.
+pub fn docx_review_text(
+    path: impl AsRef<Path>,
+    accept_changes: bool,
+) -> Result<String, ImportError> {
+    let bytes = std::fs::read(path).map_err(|error| ImportError::Io(error.to_string()))?;
+    let xml = read_zip_text(&bytes, "word/document.xml")?;
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    reader.config_mut().trim_text(false);
+    let mut paragraphs = Vec::<String>::new();
+    let mut in_paragraph = false;
+    let mut inserted = 0usize;
+    let mut deleted = 0usize;
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(event)) => match event.local_name().as_ref() {
+                b"p" => {
+                    paragraphs.push(String::new());
+                    in_paragraph = true;
+                }
+                b"ins" => inserted += 1,
+                b"del" => deleted += 1,
+                _ => {}
+            },
+            Ok(quick_xml::events::Event::Empty(event)) if in_paragraph => {
+                let paragraph = paragraphs.last_mut().expect("paragraph has been started");
+                match event.local_name().as_ref() {
+                    b"tab" => paragraph.push('\t'),
+                    b"br" | b"cr" => paragraph.push('\n'),
+                    _ => {}
+                }
+            }
+            Ok(quick_xml::events::Event::Text(event))
+                if in_paragraph
+                    && (if accept_changes {
+                        deleted == 0
+                    } else {
+                        inserted == 0
+                    }) =>
+            {
+                let decoded = event
+                    .xml_content(quick_xml::XmlVersion::Implicit1_0)
+                    .map_err(|error| ImportError::Archive(error.to_string()))?;
+                let text = quick_xml::escape::unescape(&decoded)
+                    .map_err(|error| ImportError::Archive(error.to_string()))?;
+                paragraphs
+                    .last_mut()
+                    .expect("paragraph has been started")
+                    .push_str(&text);
+            }
+            Ok(quick_xml::events::Event::End(event)) => match event.local_name().as_ref() {
+                b"p" => in_paragraph = false,
+                b"ins" => inserted = inserted.saturating_sub(1),
+                b"del" => deleted = deleted.saturating_sub(1),
+                _ => {}
+            },
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(ImportError::Archive(error.to_string())),
+        }
+    }
+    Ok(paragraphs.join("\n\n"))
+}
+
 fn xml_attribute(xml: &str, name: &str) -> Option<String> {
     let key = format!("{name}=\"");
     let start = xml.find(&key)? + key.len();
@@ -1014,6 +1080,8 @@ mod tests {
         let comment = items.iter().find(|item| item.kind == "comment").unwrap();
         assert_eq!(comment.comment_id.as_deref(), Some("7"));
         assert_eq!(comment.text, "Clarify this.");
+        assert_eq!(docx_review_text(&docx, true).unwrap(), "Base change");
+        assert_eq!(docx_review_text(&docx, false).unwrap(), "Base old");
     }
 
     #[test]

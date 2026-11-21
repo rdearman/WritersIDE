@@ -517,7 +517,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command(
             "compile.format",
             "Compile to a Document Format",
-            "Compile the manuscript to Markdown, HTML, EPUB, DOCX, or PDF",
+            "Compile the manuscript to Markdown, TeX, HTML, EPUB, DOCX, or PDF",
             "Compile",
             "compile-format",
             true,
@@ -528,6 +528,22 @@ fn command_registry() -> Vec<CommandSpec> {
             "Three-way merge a reviewed manuscript into a scene and preserve conflicts for inspection",
             "Edit",
             "review-merge",
+            true,
+        ),
+        legacy_command(
+            "review.docx",
+            "Accept or Reject DOCX Revisions",
+            "Choose a tracked-changes view and three-way merge it into a scene",
+            "Edit",
+            "review-docx",
+            true,
+        ),
+        legacy_command(
+            "review.inspect",
+            "Inspect DOCX Review Markup",
+            "List tracked edits and comments without modifying the source file",
+            "Edit",
+            "review-inspect",
             true,
         ),
         legacy_command(
@@ -3269,9 +3285,9 @@ impl AppState {
             self.message = format!("Compiled assembly to {}", destination.display());
         } else if let Some(arguments) = cmd.strip_prefix("compile-format ") {
             let mut parts = arguments.split_whitespace();
-            let format_name = parts.next().ok_or("usage: compile-format <markdown|html|epub|docx|pdf> [output-path] [--expand-transclusions]")?;
+            let format_name = parts.next().ok_or("usage: compile-format <markdown|latex|html|epub|docx|pdf> [output-path] [--expand-transclusions]")?;
             let format = story_document::CompileFormat::parse(format_name)
-                .ok_or("format must be markdown, html, epub, docx, or pdf")?;
+                .ok_or("format must be markdown, latex, html, epub, docx, or pdf")?;
             let rest = parts.collect::<Vec<_>>();
             let expand = rest.contains(&"--expand-transclusions");
             let design = rest
@@ -3279,7 +3295,7 @@ impl AppState {
                 .find_map(|argument| argument.strip_prefix("--design="))
                 .map(|name| {
                     story_document::BookDesign::parse(name)
-                        .ok_or("design must be trade-paperback, manuscript, or nonfiction")
+                        .ok_or("design must be trade-paperback, hardback, manuscript, nonfiction, or technical-academic")
                 })
                 .transpose()?
                 .unwrap_or_default();
@@ -3297,6 +3313,13 @@ impl AppState {
                         .join(format!("compiled.{}", format.extension()))
                 });
             atomic_export(&destination, &artifact.bytes)?;
+            for auxiliary in &artifact.auxiliary_files {
+                let extension = Path::new(&auxiliary.name)
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("log");
+                atomic_export(&destination.with_extension(extension), &auxiliary.bytes)?;
+            }
             let sidecar =
                 Path::new(&format!("{}.source-map.json", destination.display())).to_path_buf();
             let source_map = serde_json::json!({
@@ -3327,6 +3350,66 @@ impl AppState {
                     self.cursor = (0, 0);
                 }
                 "Editorial merge applied through the manuscript write journal".into()
+            } else {
+                format!(
+                    "{} overlapping review conflict(s); manuscript left unchanged",
+                    result.conflicts.len()
+                )
+            };
+        } else if let Some(path) = cmd.strip_prefix("review-inspect ") {
+            self.message = self
+                .app
+                .inspect_docx_review(path.trim())?
+                .into_iter()
+                .map(|item| {
+                    format!(
+                        "{} p{} {}{}: {}",
+                        item.kind,
+                        item.paragraph_index + 1,
+                        item.author.unwrap_or_else(|| "unknown author".into()),
+                        item.date
+                            .map(|date| format!(" · {date}"))
+                            .unwrap_or_default(),
+                        item.text
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(arguments) = cmd.strip_prefix("review-docx ") {
+            let mut parts = arguments.split_whitespace();
+            let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let base_path = parts.next().ok_or("missing base manuscript file")?;
+            let review_path = parts.next().ok_or("missing reviewed DOCX file")?;
+            let accept_changes = match parts.next().ok_or("choose accept or reject")? {
+                "accept" => true,
+                "reject" => false,
+                _ => return Err("review disposition must be accept or reject".into()),
+            };
+            if parts.next().is_some() {
+                return Err("usage: review-docx SCENE BASE_FILE REVIEW.docx accept|reject".into());
+            }
+            let base = fs::read_to_string(base_path)?;
+            let result = self
+                .app
+                .merge_docx_review(scene, &base, review_path, accept_changes)?;
+            self.message = if let Some(merged) = result.merged_text {
+                if self.editing_scene == Some(scene) {
+                    self.editor = merged.lines().map(str::to_owned).collect();
+                    if self.editor.is_empty() {
+                        self.editor.push(String::new());
+                    }
+                    self.dirty = false;
+                    self.cursor = (0, 0);
+                    self.saved_hash = self.app.load_scene_text(scene)?.1;
+                }
+                format!(
+                    "DOCX review changes {} and merged through the durable save journal",
+                    if accept_changes {
+                        "accepted"
+                    } else {
+                        "rejected"
+                    }
+                )
             } else {
                 format!(
                     "{} overlapping review conflict(s); manuscript left unchanged",
@@ -8860,6 +8943,43 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "One local.\nTwo.\nThree reviewed.\n"
         );
+    }
+
+    #[test]
+    fn terminal_accepts_docx_tracked_changes_through_review_merge() {
+        use std::io::Write;
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let base = "The old door.";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), base).unwrap();
+        let docx = directory.path().join("review.docx");
+        let file = fs::File::create(&docx).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file("word/document.xml", zip::write::FileOptions::default())
+            .unwrap();
+        archive
+            .write_all(b"<w:document><w:body><w:p><w:r><w:t>The </w:t></w:r><w:del><w:r><w:delText>old</w:delText></w:r></w:del><w:ins><w:r><w:t>new</w:t></w:r></w:ins><w:r><w:t> door.</w:t></w:r></w:p></w:body></w:document>")
+            .unwrap();
+        archive.finish().unwrap();
+        let source = fs::read(&docx).unwrap();
+        let base_path = directory.path().join("base.md");
+        fs::write(&base_path, base).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.prompt = format!(
+            "review-docx {scene} {} {} accept",
+            base_path.display(),
+            docx.display()
+        );
+        state.command().unwrap();
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, "The new door.");
+        assert_eq!(state.editor.join("\n"), "The new door.");
+        assert!(state.message.contains("accepted"));
+        assert_eq!(fs::read(docx).unwrap(), source);
     }
 
     #[test]

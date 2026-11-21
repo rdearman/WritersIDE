@@ -1009,9 +1009,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let project = args.next().ok_or("missing project path")?;
             let format_name = args
                 .next()
-                .ok_or("missing format (markdown, html, epub, docx, pdf)")?;
+                .ok_or("missing format (markdown, latex, html, epub, docx, pdf)")?;
             let format = story_document::CompileFormat::parse(&format_name)
-                .ok_or("format must be markdown, html, epub, docx, or pdf")?;
+                .ok_or("format must be markdown, latex, html, epub, docx, or pdf")?;
             let remaining = args.collect::<Vec<_>>();
             let expand = remaining
                 .iter()
@@ -1021,7 +1021,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .find_map(|argument| argument.strip_prefix("--design="))
                 .map(|name| {
                     story_document::BookDesign::parse(name)
-                        .ok_or("design must be trade-paperback, manuscript, or nonfiction")
+                        .ok_or("design must be trade-paperback, hardback, manuscript, nonfiction, or technical-academic")
                 })
                 .transpose()?
                 .unwrap_or_default();
@@ -1036,6 +1036,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .join(format!("compiled.{}", format.extension()))
             });
             atomic_write(&destination, &artifact.bytes)?;
+            write_compile_auxiliary(&destination, &artifact.auxiliary_files)?;
             let sidecar = PathBuf::from(format!("{}.source-map.json", destination.display()));
             let source_map = serde_json::json!({
                 "schema_version": 1,
@@ -1096,7 +1097,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let project = PathBuf::from(args.next().ok_or("missing project path")?);
             let format_name = args.next().ok_or("missing format")?;
             let format = story_document::CompileFormat::parse(&format_name)
-                .ok_or("format must be markdown, html, epub, docx, or pdf")?;
+                .ok_or("format must be markdown, latex, html, epub, docx, or pdf")?;
             let output = PathBuf::from(args.next().ok_or("missing output path")?);
             let poll_ms = args
                 .next()
@@ -1115,6 +1116,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         Ok(artifact) => {
                             atomic_write(&output, &artifact.bytes)?;
+                            write_compile_auxiliary(&output, &artifact.auxiliary_files)?;
                             let map = serde_json::to_vec_pretty(
                                 &serde_json::json!({"schema_version":1,"entries":artifact.source_map}),
                             )?;
@@ -1244,6 +1246,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if result.merged_text.is_some() {
                 println!(
                     "Editorial revision merged and saved through the manuscript write journal."
+                );
+            } else {
+                println!("{}", serde_json::to_string_pretty(&result.conflicts)?);
+                return Err("overlapping editorial changes require author resolution".into());
+            }
+        }
+        "review-docx" => {
+            let project = args.next().ok_or("missing project path")?;
+            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let base = fs::read_to_string(args.next().ok_or("missing base manuscript file")?)?;
+            let docx = args.next().ok_or("missing reviewed DOCX file")?;
+            let disposition = args.next().ok_or("choose accept or reject")?;
+            let accept = match disposition.as_str() {
+                "accept" => true,
+                "reject" => false,
+                _ => return Err("review disposition must be accept or reject".into()),
+            };
+            let mut app = WriterApp::open_project(project)?;
+            let result = app.merge_docx_review(scene, &base, docx, accept)?;
+            if result.merged_text.is_some() {
+                println!(
+                    "DOCX revisions {disposition}ed and merged through the durable save journal."
                 );
             } else {
                 println!("{}", serde_json::to_string_pretty(&result.conflicts)?);
@@ -1485,7 +1509,7 @@ fn scene_matches_scope(scene: &story_storage::SceneRecord, scope: &str) -> bool 
 }
 fn usage() {
     eprintln!(
-        "writers-ide compile <project> <markdown|html|epub|docx|pdf> [output] [--expand-transclusions] [--design=preset]"
+        "writers-ide compile <project> <markdown|latex|html|epub|docx|pdf> [output] [--expand-transclusions] [--design=preset]"
     );
     eprintln!("writers-ide compile-check <project>");
     eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");
@@ -1624,6 +1648,7 @@ fn compile_edition_with_aspell(
     )?;
     let output = project.join(output_relative);
     atomic_write(&output, &artifact.bytes)?;
+    write_compile_auxiliary(&output, &artifact.auxiliary_files)?;
     let sidecar = PathBuf::from(format!("{}.source-map.json", output.display()));
     let map = serde_json::to_vec_pretty(&serde_json::json!({
         "schema_version": 1,
@@ -1781,6 +1806,20 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Err
     temporary.as_file().sync_all()?;
     temporary.persist(path)?;
     fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn write_compile_auxiliary(
+    output: &Path,
+    files: &[story_document::CompileAuxiliaryFile],
+) -> Result<(), Box<dyn std::error::Error>> {
+    for file in files {
+        let extension = Path::new(&file.name)
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or("log");
+        atomic_write(&output.with_extension(extension), &file.bytes)?;
+    }
     Ok(())
 }
 

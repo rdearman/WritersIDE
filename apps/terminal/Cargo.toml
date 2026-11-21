@@ -25,3 +25,4 @@ time.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+zip.workspace = true

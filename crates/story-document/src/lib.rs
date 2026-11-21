@@ -405,6 +405,7 @@ impl CompileIr {
 #[serde(rename_all = "kebab-case")]
 pub enum CompileFormat {
     Markdown,
+    Latex,
     Html,
     Epub,
     Docx,
@@ -415,6 +416,7 @@ impl CompileFormat {
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "md" | "markdown" => Some(Self::Markdown),
+            "tex" | "latex" => Some(Self::Latex),
             "html" | "html5" => Some(Self::Html),
             "epub" | "epub3" => Some(Self::Epub),
             "docx" => Some(Self::Docx),
@@ -425,6 +427,7 @@ impl CompileFormat {
     pub fn extension(self) -> &'static str {
         match self {
             Self::Markdown => "md",
+            Self::Latex => "tex",
             Self::Html => "html",
             Self::Epub => "epub",
             Self::Docx => "docx",
@@ -434,6 +437,7 @@ impl CompileFormat {
     pub fn media_type(self) -> &'static str {
         match self {
             Self::Markdown => "text/markdown; charset=utf-8",
+            Self::Latex => "application/x-tex; charset=utf-8",
             Self::Html => "text/html; charset=utf-8",
             Self::Epub => "application/epub+zip",
             Self::Docx => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -449,6 +453,14 @@ pub struct CompileArtifact {
     pub bytes: Vec<u8>,
     /// Source offsets refer to the UTF-8 Compile IR Markdown stream supplied to the renderer.
     pub source_map: Vec<CompileSourceMapEntry>,
+    /// Renderer inputs and diagnostics useful for inspecting print output.
+    pub auxiliary_files: Vec<CompileAuxiliaryFile>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompileAuxiliaryFile {
+    pub name: String,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -457,10 +469,14 @@ pub enum BookDesign {
     /// General purpose, one-sided book layout suitable for fiction.
     #[default]
     TradePaperback,
+    /// Two-sided hardback trim with room for binding and facing pages.
+    Hardback,
     /// Double-spaced manuscript layout suitable for editorial submission.
     Manuscript,
     /// One-sided, roomy layout for nonfiction and reference works.
     Nonfiction,
+    /// Conventional article-like academic layout with numbered structural hierarchy.
+    TechnicalAcademic,
 }
 
 /// Portable, project-relative compile edition configuration.
@@ -536,8 +552,10 @@ impl BookDesign {
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
             "trade" | "trade-paperback" => Some(Self::TradePaperback),
-            "manuscript" => Some(Self::Manuscript),
+            "hardback" | "fiction-hardback" => Some(Self::Hardback),
+            "manuscript" | "submission-manuscript" => Some(Self::Manuscript),
             "nonfiction" => Some(Self::Nonfiction),
+            "technical" | "academic" | "technical-academic" => Some(Self::TechnicalAcademic),
             _ => None,
         }
     }
@@ -553,6 +571,15 @@ impl BookDesign {
                 "fontsize=11pt",
                 "linestretch=1.15",
             ],
+            Self::Hardback => &[
+                "documentclass=book",
+                "classoption=twoside",
+                "classoption=openright",
+                "papersize=6.125in:9.25in",
+                "geometry=inner=0.9in,outer=0.65in,top=0.8in,bottom=0.8in",
+                "fontsize=11pt",
+                "linestretch=1.15",
+            ],
             Self::Manuscript => &[
                 "documentclass=article",
                 "papersize=letter",
@@ -564,6 +591,14 @@ impl BookDesign {
                 "documentclass=book",
                 "classoption=oneside",
                 "classoption=openany",
+                "papersize=letter",
+                "geometry=margin=1in",
+                "fontsize=11pt",
+                "linestretch=1.25",
+            ],
+            Self::TechnicalAcademic => &[
+                "documentclass=report",
+                "classoption=oneside",
                 "papersize=letter",
                 "geometry=margin=1in",
                 "fontsize=11pt",
@@ -665,6 +700,7 @@ impl PandocRenderer {
             return Err("refusing to render invalid Compile IR".into());
         }
         let (markdown, source_map) = ir.render_markdown();
+        let mut auxiliary_files = Vec::new();
         let bytes = if format == CompileFormat::Markdown {
             markdown.into_bytes()
         } else {
@@ -686,6 +722,7 @@ impl PandocRenderer {
                 )
                 .arg(match format {
                     CompileFormat::Html => "--to=html5",
+                    CompileFormat::Latex => "--to=latex",
                     CompileFormat::Epub => "--to=epub3",
                     CompileFormat::Docx => "--to=docx",
                     CompileFormat::Pdf => "--to=pdf",
@@ -713,10 +750,9 @@ impl PandocRenderer {
                 }
             }
             if let Some(root) = resource_root {
-                command
-                    .current_dir(root)
-                    .arg(format!("--resource-path={}", root.display()));
+                command.arg(format!("--resource-path={}", root.display()));
             }
+            command.current_dir(temporary.path());
             let mut child = command
                 .spawn()
                 .map_err(|e| format!("cannot start {}: {e}", self.program.display()))?;
@@ -729,12 +765,55 @@ impl PandocRenderer {
                 .wait_with_output()
                 .map_err(|e| format!("wait for renderer: {e}"))?;
             if !result.status.success() {
+                let engine_log =
+                    std::fs::read_to_string(temporary.path().join("input.log")).unwrap_or_default();
                 return Err(format!(
-                    "{} failed ({}): {}",
+                    "{} failed ({}): {}{}",
                     self.program.display(),
                     result.status,
-                    String::from_utf8_lossy(&result.stderr).trim()
+                    String::from_utf8_lossy(&result.stderr).trim(),
+                    if engine_log.is_empty() {
+                        String::new()
+                    } else {
+                        format!("\nLuaLaTeX log:\n{engine_log}")
+                    }
                 ));
+            }
+            if format == CompileFormat::Pdf {
+                let tex =
+                    self.render_with_design(ir, CompileFormat::Latex, resource_root, design)?;
+                let tex_path = temporary.path().join("compiled.tex");
+                std::fs::write(&tex_path, &tex.bytes)
+                    .map_err(|error| format!("preserve generated TeX source: {error}"))?;
+                auxiliary_files.push(CompileAuxiliaryFile {
+                    name: "compiled.tex".into(),
+                    bytes: tex.bytes,
+                });
+                let mut tex_command = Command::new("lualatex");
+                tex_command
+                    .arg("--interaction=nonstopmode")
+                    .arg("--halt-on-error")
+                    .arg(format!("--output-directory={}", temporary.path().display()))
+                    .arg(&tex_path)
+                    .current_dir(resource_root.unwrap_or(temporary.path()))
+                    .env("TEXMFVAR", &texmf_var)
+                    .env("TEXMFCACHE", &texmf_var)
+                    .env("TEXMFCONFIG", &texmf_config)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped());
+                let inspection = tex_command.output();
+                let log =
+                    std::fs::read(temporary.path().join("compiled.log")).unwrap_or_else(|_| {
+                        inspection
+                            .map(|output| output.stderr)
+                            .unwrap_or_else(|error| {
+                                format!("LuaLaTeX log unavailable: {error}").into_bytes()
+                            })
+                    });
+                auxiliary_files.push(CompileAuxiliaryFile {
+                    name: "lualatex.log".into(),
+                    bytes: log,
+                });
             }
             std::fs::read(&output_path).map_err(|e| format!("read rendered output: {e}"))?
         };
@@ -743,6 +822,7 @@ impl PandocRenderer {
             media_type: format.media_type(),
             bytes,
             source_map,
+            auxiliary_files,
         })
     }
 }
@@ -922,6 +1002,7 @@ mod tests {
         });
         let renderer = PandocRenderer::default();
         for format in [
+            CompileFormat::Latex,
             CompileFormat::Html,
             CompileFormat::Docx,
             CompileFormat::Epub,
@@ -930,6 +1011,9 @@ mod tests {
             assert!(!artifact.bytes.is_empty());
             assert_eq!(artifact.media_type, format.media_type());
             assert_eq!(artifact.source_map.len(), 1);
+            if format == CompileFormat::Latex {
+                assert!(String::from_utf8_lossy(&artifact.bytes).contains("\\documentclass"));
+            }
         }
         let docx = renderer.render(&ir, CompileFormat::Docx, None).unwrap();
         let mut archive = zip::ZipArchive::new(std::io::Cursor::new(docx.bytes)).unwrap();
@@ -947,6 +1031,13 @@ mod tests {
             let pdf = renderer.render(&ir, CompileFormat::Pdf, None).unwrap();
             assert!(pdf.bytes.starts_with(b"%PDF-"));
             assert_eq!(pdf.source_map[0].source_entity_id, "scene-uuid");
+            assert_eq!(pdf.auxiliary_files.len(), 2);
+            assert!(pdf.auxiliary_files[0].name.ends_with(".tex"));
+            assert!(
+                String::from_utf8_lossy(&pdf.auxiliary_files[0].bytes).contains("\\documentclass")
+            );
+            assert!(pdf.auxiliary_files[1].name.ends_with(".log"));
+            assert!(!pdf.auxiliary_files[1].bytes.is_empty());
         }
     }
 
@@ -979,6 +1070,11 @@ mod tests {
     #[test]
     fn book_designs_are_typed_and_publication_diagnostics_are_read_only() {
         assert_eq!(BookDesign::parse("trade"), Some(BookDesign::TradePaperback));
+        assert_eq!(BookDesign::parse("hardback"), Some(BookDesign::Hardback));
+        assert_eq!(
+            BookDesign::parse("technical-academic"),
+            Some(BookDesign::TechnicalAcademic)
+        );
         assert_eq!(
             BookDesign::parse("manuscript"),
             Some(BookDesign::Manuscript)
@@ -988,6 +1084,16 @@ mod tests {
             BookDesign::Manuscript
                 .pandoc_variables()
                 .contains(&"linestretch=2")
+        );
+        assert!(
+            BookDesign::Hardback
+                .pandoc_variables()
+                .contains(&"classoption=twoside")
+        );
+        assert!(
+            BookDesign::TechnicalAcademic
+                .pandoc_variables()
+                .contains(&"documentclass=report")
         );
         let mut ir = CompileIr::new(" ");
         ir.push(CompileUnit {

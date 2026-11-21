@@ -1010,6 +1010,24 @@ impl WriterApp {
         }
         Ok(result)
     }
+    pub fn merge_docx_review(
+        &mut self,
+        scene: SceneId,
+        base: &str,
+        review_file: impl AsRef<Path>,
+        accept_changes: bool,
+    ) -> Result<story_import::ThreeWayMerge> {
+        let reviewed = story_import::docx_review_text(review_file, accept_changes)
+            .map_err(|error| AppError::Domain(error.to_string()))?;
+        self.merge_review_text(scene, base, &reviewed)
+    }
+    pub fn inspect_docx_review(
+        &self,
+        review_file: impl AsRef<Path>,
+    ) -> Result<Vec<story_import::DocxReviewItem>> {
+        story_import::inspect_docx_review(review_file)
+            .map_err(|error| AppError::Domain(error.to_string()))
+    }
     pub fn get_reading_document(
         &self,
         id: ReadingId,
@@ -1773,6 +1791,34 @@ mod tests {
             app.load_scene_text(scene).unwrap().0,
             "One.\nTwo local.\nThree external.\n"
         );
+    }
+
+    #[test]
+    fn docx_revision_disposition_merges_without_modifying_the_review_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let base = "The old door.\n";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), base).unwrap();
+        let docx = dir.path().join("review.docx");
+        let file = std::fs::File::create(&docx).unwrap();
+        let mut archive = zip::ZipWriter::new(file);
+        archive
+            .start_file("word/document.xml", zip::write::FileOptions::default())
+            .unwrap();
+        archive
+            .write_all(b"<w:document><w:body><w:p><w:r><w:t>The </w:t></w:r><w:del w:id=\"1\"><w:r><w:delText>old</w:delText></w:r></w:del><w:ins w:id=\"2\"><w:r><w:t>new</w:t></w:r></w:ins><w:r><w:t> door.</w:t></w:r></w:p></w:body></w:document>")
+            .unwrap();
+        archive.finish().unwrap();
+        let source = std::fs::read(&docx).unwrap();
+
+        let merged = app.merge_docx_review(scene, base, &docx, true).unwrap();
+        assert_eq!(merged.merged_text.as_deref(), Some("The new door."));
+        assert_eq!(app.load_scene_text(scene).unwrap().0, "The new door.");
+        assert_eq!(std::fs::read(&docx).unwrap(), source);
     }
 
     #[test]

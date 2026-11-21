@@ -171,7 +171,7 @@ Compile IR renders structured section/chapter hierarchy, manuscript prose, and U
 
 ### Issue #21 — LuaLaTeX and book-design foundation
 
-The PDF renderer now uses a project-local temporary TeX cache, supports typed `trade-paperback`, `manuscript`, and `nonfiction` presets, and passes validated fixed Pandoc layout variables for paper size, margins, document class, font size, and line spacing. CLI and terminal compile commands accept `--design=<preset>`. The new deterministic publication diagnostics identify missing project title, empty manuscripts, and empty content units without mutating story data (`compile-check` in the CLI). Custom LuaLaTeX templates, richer typographic controls, page/chapter design, publishing diagnostics, and final production review remain incomplete.
+The PDF renderer uses a project-local temporary TeX cache and typed `trade-paperback`, `hardback`, `manuscript`, `nonfiction`, and `technical-academic` profiles with fixed Pandoc layout variables for paper size, margins, document class, font size, and line spacing. CLI and terminal compile commands accept `--design=<preset>`. `latex`/`tex` is now a direct Compile format; PDF renders retain the generated `.tex` source and LuaLaTeX log as sidecar files alongside the requested output. Renderer subprocesses run in a temporary working directory, keeping generated files out of manuscript/source directories. Deterministic publication diagnostics identify missing project title, empty manuscripts, and empty content units without mutating story data (`compile-check` in the CLI). Custom LuaLaTeX templates, richer author-configurable typographic controls, page/chapter design, expanded publishing diagnostics, and final production review remain incomplete.
 
 ### Issue #6 — Manuscript import foundation
 
@@ -179,7 +179,7 @@ The import crate now performs read-only DOCX, RTF, ODT, and EPUB inventory into 
 
 ### Issue #19 — Editorial merge foundation
 
-The review layer now inventories DOCX insertion/deletion markup and comments with author/date/comment IDs (`review-inspect`), and performs a line-oriented three-way merge from a base manuscript, current local scene, and reviewed external text. Non-overlapping edits merge automatically; overlapping edits return explicit base/local/external conflict regions and leave canonical text unchanged. CLI `review-merge <project> <scene-uuid> <base-file> <review-file>` and terminal `review-merge` use this merge through the journaled scene save. Mapping DOCX markup to anchored scene edits, side-by-side terminal conflict resolution, and one-hunk acceptance are not yet implemented.
+The review layer inventories DOCX insertion/deletion markup and comments with author/date/comment IDs (`review-inspect`), and performs a line-oriented three-way merge from a base manuscript, current local scene, and reviewed external text. `review-docx <project> <scene-uuid> <base-file> <review.docx> accept|reject` and the terminal `review-docx` command derive accepted or rejected prose from DOCX tracked changes and merge it through the normal optimistic manuscript journal. Non-overlapping edits merge automatically; overlapping edits return explicit base/local/external conflict regions and leave canonical text unchanged. Source DOCX files remain read-only. Mapping Word comment ranges to anchored personal comments, side-by-side terminal conflict resolution, and one-hunk acceptance remain incomplete.
 
 ### Issue #17 — Local browser planning and review foundation
 
