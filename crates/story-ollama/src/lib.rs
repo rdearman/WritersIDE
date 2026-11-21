@@ -14,6 +14,8 @@ pub enum OllamaError {
     MissingContent,
     #[error("invalid Ollama endpoint: {0}")]
     Endpoint(String),
+    #[error("invalid BCP 47 language tag: {0}")]
+    InvalidLanguage(String),
 }
 
 #[derive(Clone, Debug)]
@@ -46,12 +48,35 @@ impl OllamaClient {
 
     /// Request provisional structured claims grounded in exact source quotes.
     pub fn extract(&self, source_text: &str) -> Result<ExtractionResult, OllamaError> {
-        self.generate(source_text, "Extract candidate characters (including aliases), places, organisations, objects, story events with chronology, fictional-world rules, and character knowledge claims. For every claim include an exact verbatim evidence quote from the source. Return JSON with {\"claims\":[{\"kind\":string,\"name\":string,\"claim\":string,\"evidence_quote\":string,\"approximate_story_time\":string|null}]}.")
+        self.extract_in_language(source_text, None)
+    }
+
+    /// Language is explicit context for interpretation; source material remains untrusted data.
+    pub fn extract_in_language(
+        &self,
+        source_text: &str,
+        language_code: Option<&str>,
+    ) -> Result<ExtractionResult, OllamaError> {
+        let instruction = language_instruction(
+            "Extract candidate characters (including aliases), places, organisations, objects, story events with chronology, fictional-world rules, and character knowledge claims. For every claim include an exact verbatim evidence quote from the source. Return JSON with {\"claims\":[{\"kind\":string,\"name\":string,\"claim\":string,\"evidence_quote\":string,\"approximate_story_time\":string|null}]}",
+            language_code,
+        )?;
+        self.generate(source_text, &instruction)
     }
 
     pub fn summarize(&self, source_text: &str, instruction: &str) -> Result<String, OllamaError> {
         let result: serde_json::Value = self.generate(source_text, instruction)?;
         Ok(result.to_string())
+    }
+
+    pub fn summarize_in_language(
+        &self,
+        source_text: &str,
+        instruction: &str,
+        language_code: Option<&str>,
+    ) -> Result<String, OllamaError> {
+        let instruction = language_instruction(instruction, language_code)?;
+        self.summarize(source_text, &instruction)
     }
 
     pub fn study_guide(
@@ -67,6 +92,26 @@ impl OllamaClient {
         self.generate(source_text, &format!("Summarize and explain the following material for its author. {questions} Return JSON with string fields summary and explanation and a string array questions."))
     }
 
+    pub fn study_guide_in_language(
+        &self,
+        source_text: &str,
+        include_questions: bool,
+        language_code: Option<&str>,
+    ) -> Result<StudyGuide, OllamaError> {
+        let questions = if include_questions {
+            "Include up to five optional comprehension questions."
+        } else {
+            "Return an empty questions array."
+        };
+        let instruction = language_instruction(
+            &format!(
+                "Summarize and explain the following material for its author. {questions} Return JSON with string fields summary and explanation and a string array questions."
+            ),
+            language_code,
+        )?;
+        self.generate(source_text, &instruction)
+    }
+
     fn generate<T: for<'de> Deserialize<'de>>(
         &self,
         source_text: &str,
@@ -80,6 +125,21 @@ impl OllamaClient {
             .send()?.error_for_status()?.json()?;
         let text = response.response.ok_or(OllamaError::MissingContent)?;
         Ok(serde_json::from_str(&text)?)
+    }
+}
+
+fn language_instruction(
+    instruction: &str,
+    language_code: Option<&str>,
+) -> Result<String, OllamaError> {
+    match language_code {
+        Some(language) if !story_core::is_valid_language_tag(language) => {
+            Err(OllamaError::InvalidLanguage(language.into()))
+        }
+        Some(language) => Ok(format!(
+            "The declared source language is {language}. Interpret text in this language, preserve names and quotations exactly, and return generated explanatory text in this language. {instruction}"
+        )),
+        None => Ok(instruction.to_owned()),
     }
 }
 
@@ -265,11 +325,19 @@ mod tests {
                     .unwrap()
                     .contains("Mara crossed the bridge.")
             );
+            assert!(
+                body["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("declared source language is it-IT")
+            );
             let response = r#"{"response":"{\"claims\":[{\"kind\":\"character\",\"name\":\"Mara\",\"claim\":\"Mara crosses the bridge\",\"evidence_quote\":\"Mara crossed the bridge.\",\"approximate_story_time\":null}]}"}"#;
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
         });
         let client = OllamaClient::new(&format!("http://{address}"), "test-model").unwrap();
-        let result = client.extract("Mara crossed the bridge.").unwrap();
+        let result = client
+            .extract_in_language("Mara crossed the bridge.", Some("it-IT"))
+            .unwrap();
         assert_eq!(result.claims.len(), 1);
         assert_eq!(result.claims[0].name, "Mara");
         assert_eq!(result.claims[0].evidence_quote, "Mara crossed the bridge.");

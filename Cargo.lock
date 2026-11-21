@@ -1632,6 +1632,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "story-core",
  "thiserror",
 ]
 
@@ -1656,6 +1657,7 @@ version = "0.1.0"
 dependencies = [
  "epub",
  "sha2",
+ "story-core",
  "tempfile",
  "thiserror",
  "zip",

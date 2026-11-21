@@ -52,6 +52,7 @@ const MIGRATION_35: &str = include_str!("../migrations/0035_scene_language.sql")
 const MIGRATION_36: &str = include_str!("../migrations/0036_passage_language_tags.sql");
 const MIGRATION_37: &str = include_str!("../migrations/0037_scene_word_count_policy.sql");
 const MIGRATION_38: &str = include_str!("../migrations/0038_content_unit_language.sql");
+const MIGRATION_39: &str = include_str!("../migrations/0039_reading_language.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -786,6 +787,7 @@ pub struct ReadingDocumentRecord {
     pub source_identifier: String,
     pub source_sha256: String,
     pub extracted_text: String,
+    pub language_code: Option<String>,
 }
 #[derive(Clone, Debug)]
 pub struct ReadingAnnotationRecord {
@@ -1025,6 +1027,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_36}\nINSERT INTO schema_migrations(version,applied_at) VALUES(36,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_37}\nINSERT INTO schema_migrations(version,applied_at) VALUES(37,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_38}\nINSERT INTO schema_migrations(version,applied_at) VALUES(38,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_39}\nINSERT INTO schema_migrations(version,applied_at) VALUES(39,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1067,7 +1070,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 38 {
+        if version > 39 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1220,6 +1223,10 @@ impl ProjectStore {
         }
         if current_version == 37 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_38}\nINSERT INTO schema_migrations(version,applied_at) VALUES(38,'{}');\nCOMMIT;", now()))?;
+            current_version = 38;
+        }
+        if current_version == 38 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_39}\nINSERT INTO schema_migrations(version,applied_at) VALUES(39,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -6392,7 +6399,17 @@ impl ProjectStore {
         let target = self.safe_path(Path::new(&relative))?;
         atomic_write(&target, &document.source_bytes)?;
         let stamp = now();
-        let result=self.conn.execute("INSERT INTO reading_document(id,title,media_type,relative_path,source_identifier,source_sha256,extracted_text,imported_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8)",params![id.to_string(),document.title,document.media_type,relative,source_identifier,expected,document.extracted_text,stamp]);
+        if document
+            .language_code
+            .as_deref()
+            .is_some_and(|tag| !is_valid_language_tag(tag))
+        {
+            let _ = fs::remove_file(&target);
+            return Err(StorageError::Invalid(
+                "invalid reading document language tag".into(),
+            ));
+        }
+        let result=self.conn.execute("INSERT INTO reading_document(id,title,media_type,relative_path,source_identifier,source_sha256,extracted_text,imported_at,updated_at,language_code) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?8,?9)",params![id.to_string(),document.title,document.media_type,relative,source_identifier,expected,document.extracted_text,stamp,document.language_code]);
         if let Err(error) = result {
             let _ = fs::remove_file(&target);
             return Err(error.into());
@@ -6400,7 +6417,7 @@ impl ProjectStore {
         Ok(id)
     }
     pub fn get_reading_document(&self, id: ReadingId) -> Result<ReadingDocumentRecord> {
-        let row:(String,String,String,String,String,String)=self.conn.query_row("SELECT title,media_type,relative_path,source_identifier,source_sha256,extracted_text FROM reading_document WHERE id=?1",[id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?))).optional()?.ok_or_else(||StorageError::NotFound(id.to_string()))?;
+        let row:(String,String,String,String,String,String,Option<String>)=self.conn.query_row("SELECT title,media_type,relative_path,source_identifier,source_sha256,extracted_text,language_code FROM reading_document WHERE id=?1",[id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?.ok_or_else(||StorageError::NotFound(id.to_string()))?;
         let source = fs::read(self.safe_path(Path::new(&row.2))?)?;
         if format!("{:x}", Sha256::digest(&source)) != row.4 {
             return Err(StorageError::Conflict(format!(
@@ -6415,7 +6432,27 @@ impl ProjectStore {
             source_identifier: row.3,
             source_sha256: row.4,
             extracted_text: row.5,
+            language_code: row.6,
         })
+    }
+    pub fn set_reading_document_language(
+        &mut self,
+        id: ReadingId,
+        language_code: Option<&str>,
+    ) -> Result<()> {
+        if language_code.is_some_and(|tag| !is_valid_language_tag(tag)) {
+            return Err(StorageError::Invalid(
+                "invalid reading document language tag".into(),
+            ));
+        }
+        let changed = self.conn.execute(
+            "UPDATE reading_document SET language_code=?2,updated_at=?3 WHERE id=?1",
+            params![id.to_string(), language_code, now()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        Ok(())
     }
     pub fn list_reading_documents(&self) -> Result<Vec<ReadingDocumentRecord>> {
         let ids: Vec<String> = {
@@ -6464,7 +6501,7 @@ impl ProjectStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute("UPDATE reading_document SET title=?2,media_type=?3,relative_path=?4,source_sha256=?5,extracted_text=?6,updated_at=?7 WHERE id=?1",params![id.to_string(),document.title,document.media_type,relative,expected,document.extracted_text,now()])?;
+        tx.execute("UPDATE reading_document SET title=?2,media_type=?3,relative_path=?4,source_sha256=?5,extracted_text=?6,language_code=?7,updated_at=?8 WHERE id=?1",params![id.to_string(),document.title,document.media_type,relative,expected,document.extracted_text,document.language_code,now()])?;
         if existing.source_sha256 != expected {
             let annotations: Vec<(String, String, String, String)> = {
                 let mut q =
@@ -9949,10 +9986,30 @@ mod tests {
             sha256: format!("{:x}", Sha256::digest(&source_bytes)),
             extracted_text: "A field guide to obsidian doors.".into(),
             source_bytes,
+            language_code: Some("en-GB".into()),
         };
         let reading_id = st
             .import_reading_document(&reading_doc, "fixture:field-guide")
             .unwrap();
+        let imported = st.get_reading_document(reading_id).unwrap();
+        assert_eq!(imported.language_code.as_deref(), Some("en-GB"));
+        st.set_reading_document_language(reading_id, Some("it-IT"))
+            .unwrap();
+        assert_eq!(
+            st.get_reading_document(reading_id)
+                .unwrap()
+                .language_code
+                .as_deref(),
+            Some("it-IT")
+        );
+        assert!(
+            st.set_reading_document_language(reading_id, Some("en--US"))
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(st.root.join(imported.relative_path)).unwrap(),
+            reading_doc.source_bytes.as_slice()
+        );
         st.create_story_link(&StoryLink {
             id: LinkId::new(),
             source: EntityRef::Scene(a),
@@ -10790,7 +10847,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 38))
+            .map(|version| assert_eq!(version, 39))
             .unwrap();
     }
 
@@ -11069,7 +11126,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
+        conn.execute_batch("DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code; DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
         conn.execute_batch("DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
@@ -11081,7 +11138,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 38);
+        assert_eq!(version, 39);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -11110,7 +11167,8 @@ mod tests {
 
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch(
-            "DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
+            "DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code;
+             DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
              DROP TRIGGER story_link_source_exists_insert;
              DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update;
              DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update;
@@ -11182,6 +11240,7 @@ mod tests {
             extracted_text: String::from_utf8(bytes.clone()).unwrap(),
             sha256: format!("{:x}", Sha256::digest(&bytes)),
             source_bytes: bytes,
+            language_code: None,
         };
         let reading_id = migrated
             .import_reading_document(&reading, "fixture:migration")

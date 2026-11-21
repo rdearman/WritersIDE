@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+story-core = { path = "../story-core" }
 sha2.workspace = true
 thiserror.workspace = true
 epub = "1.2.4"

@@ -21,6 +21,8 @@ pub struct ReferenceDocument {
     pub source_bytes: Vec<u8>,
     pub extracted_text: String,
     pub sha256: String,
+    /// Language declared by the source when available. Users may override it per document.
+    pub language_code: Option<String>,
 }
 
 pub fn import_reference(path: impl AsRef<Path>) -> Result<ReferenceDocument, ReadingError> {
@@ -40,6 +42,7 @@ pub fn import_reference(path: impl AsRef<Path>) -> Result<ReferenceDocument, Rea
                 .map_err(|_| ReadingError::Utf8)?,
             source_bytes,
             sha256,
+            language_code: None,
         }),
         "md" | "markdown" => Ok(ReferenceDocument {
             title: title(path),
@@ -48,6 +51,7 @@ pub fn import_reference(path: impl AsRef<Path>) -> Result<ReferenceDocument, Rea
                 .map_err(|_| ReadingError::Utf8)?,
             source_bytes,
             sha256,
+            language_code: None,
         }),
         "epub" => parse_epub(path, source_bytes, sha256),
         _ => Err(ReadingError::Unsupported(extension)),
@@ -61,6 +65,9 @@ fn parse_epub(
 ) -> Result<ReferenceDocument, ReadingError> {
     let mut epub = epub::doc::EpubDoc::new(path).map_err(|e| ReadingError::Epub(e.to_string()))?;
     let title = epub.mdata("title").unwrap_or_else(|| title(path));
+    let language_code = epub
+        .mdata("language")
+        .filter(|tag| story_core::is_valid_language_tag(tag));
     let mut chapters = Vec::new();
     for page in 0..epub.spine.len() {
         if page > 0 {
@@ -78,6 +85,7 @@ fn parse_epub(
         source_bytes,
         extracted_text: chapters.join("\n\n"),
         sha256,
+        language_code,
     })
 }
 
@@ -206,6 +214,7 @@ mod tests {
         let before = fs::read(&path).unwrap();
         let doc = import_reference(&path).unwrap();
         assert_eq!(doc.title, "Fixture Reader");
+        assert_eq!(doc.language_code.as_deref(), Some("en"));
         assert!(doc.extracted_text.contains("Elinor & Tomas entered."));
         assert_eq!(fs::read(path).unwrap(), before);
     }

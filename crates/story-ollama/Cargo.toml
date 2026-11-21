@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+story-core = { path = "../story-core" }
 serde.workspace = true
 serde_json.workspace = true
 reqwest.workspace = true

@@ -854,22 +854,30 @@ impl WriterApp {
         model: &str,
         endpoint: &str,
     ) -> Result<story_ollama::ProvisionalExtraction> {
-        let source = match source_kind {
+        let project = self.get_project()?;
+        let (source, language_code) = match source_kind {
             "scene" => {
-                self.load_scene_text(SceneId(
+                let scene_id = SceneId(
                     source_id
                         .parse::<uuid::Uuid>()
                         .map_err(|e| AppError::Domain(e.to_string()))?,
-                ))?
-                .0
+                );
+                let scene = self.get_scene(scene_id)?;
+                (
+                    self.load_scene_text(scene_id)?.0,
+                    scene.scene.effective_language_code(&project).to_owned(),
+                )
             }
             "reading" => {
-                self.get_reading_document(ReadingId(
+                let document = self.get_reading_document(ReadingId(
                     source_id
                         .parse::<uuid::Uuid>()
                         .map_err(|e| AppError::Domain(e.to_string()))?,
-                ))?
-                .extracted_text
+                ))?;
+                (
+                    document.extracted_text,
+                    document.language_code.unwrap_or(project.language_code),
+                )
             }
             _ => {
                 return Err(AppError::Domain(
@@ -879,7 +887,7 @@ impl WriterApp {
         };
         let result = story_ollama::OllamaClient::new(endpoint, model)
             .map_err(|e| AppError::Domain(e.to_string()))?
-            .extract(&source)
+            .extract_in_language(&source, Some(&language_code))
             .map_err(|e| AppError::Domain(e.to_string()))?;
         Ok(story_ollama::attach_provenance(
             source_kind,
@@ -1362,6 +1370,15 @@ impl WriterApp {
         source: &str,
     ) -> Result<ReadingId> {
         Ok(self.store.import_reading_document(document, source)?)
+    }
+    pub fn set_reading_document_language(
+        &mut self,
+        id: ReadingId,
+        language_code: Option<&str>,
+    ) -> Result<()> {
+        Ok(self
+            .store
+            .set_reading_document_language(id, language_code)?)
     }
     /// Applies a previously inspected manuscript staging object to a new project.
     /// Callers should import into a fresh destination so any failed write can
@@ -2826,6 +2843,7 @@ mod tests {
             sha256: format!("{:x}", Sha256::digest(&source_bytes)),
             extracted_text: "Reference body is read-only.".into(),
             source_bytes,
+            language_code: None,
         };
         let reading = app
             .import_reading_document(&reference, "fixture:read-only")
