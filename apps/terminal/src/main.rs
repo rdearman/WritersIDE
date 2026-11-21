@@ -1588,6 +1588,38 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "view.reference-outline",
+            "Open Outline Reference",
+            "Show the manuscript hierarchy in a read-only reference pane",
+            "View",
+            "reference-outline",
+            false,
+        ),
+        legacy_command(
+            "view.reference-timeline",
+            "Open Timeline Reference",
+            "Show chronological scenes and events in a reference pane",
+            "View",
+            "reference-timeline",
+            false,
+        ),
+        legacy_command(
+            "view.reference-search",
+            "Open Search Results Reference",
+            "Show project search results in a reference pane",
+            "View",
+            "reference-search",
+            true,
+        ),
+        legacy_command(
+            "view.reference-diagnostics",
+            "Open Compile Diagnostics Reference",
+            "Show current compile diagnostics in a read-only reference pane",
+            "View",
+            "reference-diagnostics",
+            false,
+        ),
+        legacy_command(
             "scratchpad.create",
             "Quick Capture",
             "Capture a note without leaving the current scene",
@@ -3467,6 +3499,24 @@ impl AppState {
                         let row = self.app.get_scene(id).ok()?;
                         Some((Some(id), row.scene.title.clone(), format_scene_card(&row)))
                     }),
+                "outline" if source_id == "project" => outline_reference_text(&self.app)
+                    .ok()
+                    .map(|content| (None, "Outline".into(), content)),
+                "timeline" if source_id == "project" => Some((
+                    None,
+                    "Story Timeline".into(),
+                    timeline_reference_text(&self.app),
+                )),
+                "diagnostics" if source_id == "project" => {
+                    compile_diagnostics_reference_text(&self.app)
+                        .ok()
+                        .map(|content| (None, "Compile Diagnostics".into(), content))
+                }
+                "search" => decode_hex(source_id).and_then(|terms| {
+                    search_reference_text(&self.app, &terms)
+                        .ok()
+                        .map(|content| (None, format!("Search: {terms}"), content))
+                }),
                 "research" => source_id
                     .parse::<uuid::Uuid>()
                     .ok()
@@ -7951,6 +8001,42 @@ impl AppState {
                 "Object reference opened in buffer {}",
                 self.active_reference + 1
             );
+        } else if cmd == "reference-outline" {
+            self.open_reference_buffer(
+                "outline:project".into(),
+                None,
+                "Outline".into(),
+                outline_reference_text(&self.app)?,
+            );
+            self.reference_focused = true;
+        } else if cmd == "reference-timeline" {
+            self.open_reference_buffer(
+                "timeline:project".into(),
+                None,
+                "Story Timeline".into(),
+                timeline_reference_text(&self.app),
+            );
+            self.reference_focused = true;
+        } else if cmd == "reference-diagnostics" {
+            self.open_reference_buffer(
+                "diagnostics:project".into(),
+                None,
+                "Compile Diagnostics".into(),
+                compile_diagnostics_reference_text(&self.app)?,
+            );
+            self.reference_focused = true;
+        } else if let Some(terms) = cmd.strip_prefix("reference-search ") {
+            let terms = terms.trim();
+            if terms.is_empty() {
+                return Err("search terms cannot be empty".into());
+            }
+            self.open_reference_buffer(
+                format!("search:{}", encode_hex(terms)),
+                None,
+                format!("Search: {terms}"),
+                search_reference_text(&self.app, terms)?,
+            );
+            self.reference_focused = true;
         } else if cmd == "reference-follow-card" {
             self.follow_active_scene_card()?;
             self.message =
@@ -10962,6 +11048,142 @@ fn format_scene_card(record: &story_storage::SceneRecord) -> String {
         record.scene.goal,
         record.scene.outcome,
     )
+}
+
+fn outline_reference_text(app: &WriterApp) -> Result<String, Box<dyn std::error::Error>> {
+    let nodes = app.list_structural_nodes()?;
+    let scenes = app.list_scenes(false)?;
+    let mut output = String::new();
+    for node in nodes.iter().filter(|node| node.kind == "section") {
+        output.push_str(&format!("{}\n", node.title));
+        for chapter in nodes
+            .iter()
+            .filter(|chapter| chapter.parent_id == Some(node.id))
+        {
+            output.push_str(&format!("  {}\n", chapter.title));
+            for scene in scenes
+                .iter()
+                .filter(|scene| scene.chapter_id == Some(chapter.id))
+            {
+                output.push_str(&format!(
+                    "    {}  [{}]\n",
+                    scene.scene.title, scene.scene.id
+                ));
+            }
+        }
+    }
+    for chapter in nodes
+        .iter()
+        .filter(|node| node.kind == "chapter" && node.parent_id.is_none())
+    {
+        output.push_str(&format!("{}\n", chapter.title));
+        for scene in scenes
+            .iter()
+            .filter(|scene| scene.chapter_id == Some(chapter.id))
+        {
+            output.push_str(&format!("  {}  [{}]\n", scene.scene.title, scene.scene.id));
+        }
+    }
+    if output.is_empty() {
+        output.push_str("No structural outline entries yet.\n");
+    }
+    Ok(output)
+}
+
+fn timeline_reference_text(app: &WriterApp) -> String {
+    timeline_items(app)
+        .into_iter()
+        .map(|item| match item {
+            TimelineItem::Scene(scene) => format!(
+                "Scene · {} → {} · {}  [{}]",
+                format_story_interval(scene.scene.start_time),
+                format_story_interval(scene.scene.end_time),
+                scene.scene.title,
+                scene.scene.id
+            ),
+            TimelineItem::Event(event) => format!(
+                "Event · {} → {} · {} · {}  [{}]",
+                format_story_interval(event.start),
+                format_story_interval(event.end),
+                event.title,
+                event.source_time,
+                event.id
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn search_reference_text(
+    app: &WriterApp,
+    terms: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let hits = app.search_project(terms, 200)?;
+    if hits.is_empty() {
+        return Ok(format!("No project matches for {terms:?}."));
+    }
+    Ok(hits
+        .into_iter()
+        .map(|hit| {
+            format!(
+                "{} · {}  [{}:{}]\n{}",
+                hit.entity_kind, hit.title, hit.entity_kind, hit.entity_id, hit.excerpt
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n"))
+}
+
+fn compile_diagnostics_reference_text(
+    app: &WriterApp,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let diagnostics = app.compile_diagnostics()?;
+    if diagnostics.is_empty() {
+        return Ok("No current compile diagnostics.".into());
+    }
+    Ok(diagnostics
+        .into_iter()
+        .map(|item| {
+            format!(
+                "{} · {:?} · {}{}",
+                item.code,
+                item.severity,
+                item.message,
+                item.source_entity_id
+                    .map(|id| format!(" · source {id}"))
+                    .unwrap_or_default()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
+fn encode_hex(value: &str) -> String {
+    value
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn decode_hex(value: &str) -> Option<String> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    let bytes = value
+        .as_bytes()
+        .chunks(2)
+        .map(|pair| {
+            let digit = |byte: u8| match byte {
+                b'0'..=b'9' => Some(byte - b'0'),
+                b'a'..=b'f' => Some(byte - b'a' + 10),
+                b'A'..=b'F' => Some(byte - b'A' + 10),
+                _ => None,
+            };
+            Some(digit(pair[0])? * 16 + digit(pair[1])?)
+        })
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
 }
 
 fn format_location_reference(location: &story_core::Location) -> String {
@@ -16881,6 +17103,65 @@ mod tests {
             Direction::Horizontal
         );
         assert_eq!(ReferenceLayout::Auto.direction(80), Direction::Vertical);
+    }
+
+    #[test]
+    fn outline_timeline_search_and_diagnostics_can_open_and_restore_as_buffers() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Moonstone discovery", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Mira finds the Moonstone.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+
+        for command in [
+            "reference-outline".to_owned(),
+            "reference-timeline".to_owned(),
+            "reference-search Moonstone".to_owned(),
+            "reference-diagnostics".to_owned(),
+        ] {
+            state.execute_legacy_palette_command(&command).unwrap();
+        }
+        assert_eq!(state.reference_panes.len(), 4);
+        assert!(state.reference_panes[0].content.contains("Chapter One"));
+        assert!(
+            state.reference_panes[0]
+                .content
+                .contains("Moonstone discovery")
+        );
+        assert!(
+            state.reference_panes[1]
+                .content
+                .contains("Moonstone discovery")
+        );
+        assert!(state.reference_panes[2].content.contains("Moonstone"));
+        assert_eq!(
+            state.reference_panes[3].content,
+            "No current compile diagnostics."
+        );
+        state.save_session().unwrap();
+
+        let mut reopened = AppState::new(
+            WriterApp::open_project(&project).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        assert_eq!(reopened.reference_panes.len(), 4);
+        assert!(reopened.reference_panes[0].content.contains("Chapter One"));
+        assert!(
+            reopened.reference_panes[1]
+                .content
+                .contains("Moonstone discovery")
+        );
+        assert!(reopened.reference_panes[2].content.contains("Moonstone"));
+        assert_eq!(
+            reopened.reference_panes[3].content,
+            "No current compile diagnostics."
+        );
     }
 
     #[test]
