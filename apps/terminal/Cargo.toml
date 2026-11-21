@@ -12,6 +12,7 @@ story-import = { path = "../../crates/story-import" }
 story-storage = { path = "../../crates/story-storage" }
 story-analysis = { path = "../../crates/story-analysis" }
 story-pipeline = { path = "../../crates/story-pipeline" }
+story-series = { path = "../../crates/story-series" }
 toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true

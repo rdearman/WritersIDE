@@ -47,9 +47,10 @@ enum Workspace {
     Revisions,
     PlanningBoards,
     Assemblies,
+    Series,
 }
 impl Workspace {
-    const ALL: [Self; 16] = [
+    const ALL: [Self; 17] = [
         Self::Dashboard,
         Self::Outline,
         Self::Cards,
@@ -66,6 +67,7 @@ impl Workspace {
         Self::Revisions,
         Self::PlanningBoards,
         Self::Assemblies,
+        Self::Series,
     ];
     fn title(self) -> &'static str {
         match self {
@@ -85,6 +87,7 @@ impl Workspace {
             Self::Revisions => "Revisions",
             Self::PlanningBoards => "Planning Boards",
             Self::Assemblies => "Manuscript Assemblies",
+            Self::Series => "Series Books",
         }
     }
 }
@@ -675,6 +678,7 @@ fn command_registry() -> Vec<CommandSpec> {
                 Workspace::Revisions => "view.revisions",
                 Workspace::PlanningBoards => "view.planning-boards",
                 Workspace::Assemblies => "view.assemblies",
+                Workspace::Series => "view.series",
             },
             label: workspace.title(),
             description: "Switch to this workspace",
@@ -3860,6 +3864,38 @@ impl AppState {
         if !self.scenes.is_empty() {
             self.selected = self.selected.min(self.scenes.len() - 1);
         }
+        Ok(())
+    }
+    fn open_series_book(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err(
+                "save the current manuscript buffer before opening another series book".into(),
+            );
+        }
+        if self.active_challenge.is_some() {
+            return Err("finish or quit the active writing challenge before changing books".into());
+        }
+        let books = current_series_books(&self.app)?;
+        let (book, path) = books
+            .get(self.selected)
+            .cloned()
+            .ok_or("no series book selected")?;
+        if book.project_id == self.app.get_project()?.id {
+            self.message = format!("{} is already open", book.title);
+            return Ok(());
+        }
+
+        self.save_session()?;
+        let function_bindings = load_bindings(&path)?;
+        let command_bindings = load_command_bindings(&path)?;
+        let mut app = WriterApp::open_project(&path)?;
+        app.recover_interrupted_writing_challenges()?;
+        let mut next = Self::new(app, function_bindings);
+        next.command_bindings = command_bindings;
+        next.restore_session()?;
+        next.refresh()?;
+        next.message = format!("Opened series book: {}", book.title);
+        *self = next;
         Ok(())
     }
     fn active_scene(&self) -> Option<SceneId> {
@@ -12850,6 +12886,32 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 format!("{} · {} content items", assembly.title, count)
             })
             .collect(),
+        Workspace::Series => {
+            let current_project = s.app.get_project().ok().map(|project| project.id);
+            match current_series_books(&s.app) {
+                Ok(books) if books.is_empty() => {
+                    vec!["This series has no registered books".into()]
+                }
+                Ok(books) => books
+                    .into_iter()
+                    .map(|(book, path)| {
+                        let current = if Some(book.project_id) == current_project {
+                            " · open"
+                        } else {
+                            ""
+                        };
+                        format!(
+                            "{} · {}{} · {}",
+                            book.title,
+                            book.id,
+                            current,
+                            path.display()
+                        )
+                    })
+                    .collect(),
+                Err(_) => vec!["This book is not linked to an available series".into()],
+            }
+        }
         Workspace::PlanningBoards => {
             if let Some(board) = s.planning_board_id {
                 s.app
@@ -12873,6 +12935,21 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             }
         }
     }
+}
+
+fn current_series_books(
+    app: &WriterApp,
+) -> Result<Vec<(story_series::SeriesBook, PathBuf)>, Box<dyn std::error::Error>> {
+    let (series, _) = story_series::SeriesStore::open_for_book(app.project_root())?;
+    let root = series.root().to_owned();
+    series
+        .list_books()?
+        .into_iter()
+        .map(|book| {
+            let path = root.join(&book.relative_path);
+            Ok((book, path))
+        })
+        .collect()
 }
 
 fn writing_goal_graph_rows(app: &WriterApp) -> Vec<String> {
@@ -14628,6 +14705,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.message = "No manuscript assembly selected".into();
             }
         }
+        KeyCode::Enter if s.workspace == Workspace::Series => match s.open_series_book() {
+            Ok(()) => {}
+            Err(error) => s.message = error.to_string(),
+        },
         KeyCode::Enter if s.workspace == Workspace::Timeline => {
             let timeline = timeline_items(&s.app);
             let item = timeline
@@ -14667,6 +14748,47 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn series_workspace_lists_member_books_and_enter_opens_the_selected_book() {
+        let root = tempfile::tempdir().unwrap();
+        let series_root = root.path().join("The North Books");
+        let mut series =
+            story_series::SeriesStore::create(&series_root, "The North Books").unwrap();
+        let first_path = series_root.join("Book One");
+        let second_path = series_root.join("Book Two");
+        let first = WriterApp::create_project(&first_path, "Book One").unwrap();
+        let first_id = first.get_project().unwrap().id;
+        drop(first);
+        let second = WriterApp::create_project(&second_path, "Book Two").unwrap();
+        let second_id = second.get_project().unwrap().id;
+        drop(second);
+        series
+            .add_book(first_id, &first_path, "Book One", None)
+            .unwrap();
+        series
+            .add_book(second_id, &second_path, "Book Two", None)
+            .unwrap();
+        drop(series);
+
+        let first = WriterApp::open_project(&first_path).unwrap();
+        let mut state = AppState::new(first, default_bindings());
+        state.workspace = Workspace::Series;
+        let rows = workspace_items(&state);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].contains("Book One"));
+        assert!(rows[0].contains("open"));
+        assert!(rows[1].contains("Book Two"));
+        state.selected = 1;
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.app.get_project().unwrap().id, second_id);
+        assert!(state.message.contains("Book Two"));
+    }
 
     #[test]
     fn mention_highlighting_uses_utf8_byte_ranges_and_does_not_mark_adjacent_text() {
