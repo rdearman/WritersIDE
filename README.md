@@ -2,7 +2,7 @@
 
 Writer's IDE is an early Rust implementation of the scene-centred novel planning and writing environment described in the supplied SRS v0.1 and [active engineering design](docs/engineering-design-v0.47.md).
 
-The current workspace contains a reusable story core, SQLite and manuscript storage, application services, a synthetic import inventory/mapping interface, a CLI and a full-screen terminal prototype. Real Scrivener/Ranperen adapters are not present.
+The current workspace contains a reusable story core, SQLite and manuscript storage, application services, a synthetic import inventory/mapping interface, a CLI and a full-screen terminal prototype. An experimental, read-only Scrivener manifest inventory command is available, with synthetic parser tests only. There is no verified real-project importer, and Scrivener/Ranperen compatibility is not claimed because legally usable reference fixtures are not present in the repository.
 
 The WYSIWYM parser and renderer-neutral Compile IR are documented as a prototype in [the Issue #21 contract](docs/wysiwym-contract-v0.1.md); the contract is not frozen until it is checked against a real formatted chapter.
 

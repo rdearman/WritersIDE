@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -78,6 +79,56 @@ pub struct ManuscriptStaging {
     pub units: Vec<ManuscriptUnit>,
     pub warnings: Vec<String>,
     pub unsupported: Vec<String>,
+}
+
+/// Read-only inventory of a Scrivener package. This records what the detected
+/// manifest says; a version string alone is not a compatibility guarantee.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScrivenerProjectInventory {
+    pub source_path: String,
+    pub source_fingerprint: String,
+    pub title: String,
+    pub format_version: Option<String>,
+    pub items: Vec<ScrivenerBinderItem>,
+    pub warnings: Vec<String>,
+    pub unsupported: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScrivenerBinderItem {
+    pub source_document_id: String,
+    pub parent_source_id: Option<String>,
+    pub position: u32,
+    pub title: String,
+    pub type_code: Option<String>,
+    pub area: String,
+    pub include_in_compile: Option<bool>,
+    pub synopsis: Option<String>,
+    pub notes_markdown: Option<String>,
+    pub content_markdown: Option<String>,
+    pub fields: BTreeMap<String, String>,
+    pub unsupported: Vec<String>,
+}
+
+impl ScrivenerProjectInventory {
+    pub fn validate(&self) -> Result<(), ImportError> {
+        let mut ids = BTreeSet::new();
+        for item in &self.items {
+            if !ids.insert(item.source_document_id.as_str()) {
+                return Err(ImportError::DuplicateSourceId(
+                    item.source_document_id.clone(),
+                ));
+            }
+        }
+        for item in &self.items {
+            if let Some(parent) = &item.parent_source_id
+                && !ids.contains(parent.as_str())
+            {
+                return Err(ImportError::MissingParent(parent.clone()));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -720,6 +771,474 @@ pub fn inspect_manuscript(path: impl AsRef<Path>) -> Result<ManuscriptStaging, I
     Ok(staging)
 }
 
+#[derive(Clone, Debug, Default)]
+struct ScrivenerXmlNode {
+    name: String,
+    attributes: BTreeMap<String, String>,
+    text: String,
+    children: Vec<ScrivenerXmlNode>,
+}
+
+/// Scans a Scrivener `.scriv` directory or its `.scrivx` manifest without
+/// writing to the source. The result is an inventory/preview; callers must not
+/// advertise format compatibility until it has passed real-project fixtures.
+pub fn inspect_scrivener_project(
+    path: impl AsRef<Path>,
+) -> Result<ScrivenerProjectInventory, ImportError> {
+    let input = path.as_ref();
+    let (project_root, manifest_path) = locate_scrivener_manifest(input)?;
+    let fingerprint = fingerprint_source_tree(&project_root)?;
+    let xml =
+        fs::read_to_string(&manifest_path).map_err(|error| ImportError::Io(error.to_string()))?;
+    let root = parse_scrivener_xml(&xml)?;
+    let version = root.attributes.get("Version").cloned();
+    let mut inventory = ScrivenerProjectInventory {
+        source_path: project_root.to_string_lossy().into_owned(),
+        source_fingerprint: fingerprint,
+        title: project_root
+            .file_stem()
+            .or_else(|| project_root.file_name())
+            .and_then(|name| name.to_str())
+            .unwrap_or("Scrivener Project")
+            .to_owned(),
+        format_version: version.clone(),
+        items: Vec::new(),
+        warnings: Vec::new(),
+        unsupported: Vec::new(),
+    };
+
+    if version.as_deref() != Some("2.0") {
+        inventory.unsupported.push(format!(
+            "Scrivener manifest revision {} has no inspected content adapter",
+            version.as_deref().unwrap_or("(missing)")
+        ));
+    } else {
+        inventory.warnings.push(
+            "Manifest revision 2.0 was detected, but real Scrivener projects are still required to establish version and platform compatibility".into(),
+        );
+    }
+
+    let binder = find_scrivener_node(&root, "Binder")
+        .ok_or_else(|| ImportError::Archive("Scrivener manifest has no Binder element".into()))?;
+    let top_level = scrivener_child_items(binder);
+    let mut counts = BTreeMap::<Option<String>, u32>::new();
+    for node in top_level {
+        let parent_area = "unknown".to_owned();
+        collect_scrivener_item(
+            node,
+            None,
+            parent_area,
+            &project_root,
+            version.as_deref() == Some("2.0"),
+            &mut counts,
+            &mut inventory.items,
+        )?;
+    }
+
+    inventory.validate()?;
+    if inventory.items.is_empty() {
+        inventory
+            .warnings
+            .push("Binder manifest contains no readable BinderItem records".into());
+    }
+    inventory.unsupported.sort();
+    inventory.unsupported.dedup();
+    Ok(inventory)
+}
+
+fn locate_scrivener_manifest(input: &Path) -> Result<(PathBuf, PathBuf), ImportError> {
+    if input.is_file()
+        && input
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("scrivx"))
+    {
+        let root = input
+            .parent()
+            .ok_or_else(|| ImportError::Io("manifest has no parent directory".into()))?;
+        return Ok((root.to_path_buf(), input.to_path_buf()));
+    }
+    if !input.is_dir() {
+        return Err(ImportError::UnsupportedFormat(
+            input
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or("unknown")
+                .to_owned(),
+        ));
+    }
+    let mut manifests = fs::read_dir(input)
+        .map_err(|error| ImportError::Io(error.to_string()))?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let is_manifest = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("scrivx"));
+            (is_manifest && entry.file_type().ok()?.is_file()).then_some(path)
+        })
+        .collect::<Vec<_>>();
+    manifests.sort();
+    match manifests.as_slice() {
+        [manifest] => Ok((input.to_path_buf(), manifest.clone())),
+        [] => Err(ImportError::Archive(
+            "Scrivener project directory contains no .scrivx manifest".into(),
+        )),
+        _ => Err(ImportError::Archive(
+            "Scrivener project directory contains multiple .scrivx manifests".into(),
+        )),
+    }
+}
+
+fn fingerprint_source_tree(root: &Path) -> Result<String, ImportError> {
+    fn collect(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<(), ImportError> {
+        let entries =
+            fs::read_dir(directory).map_err(|error| ImportError::Io(error.to_string()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| ImportError::Io(error.to_string()))?;
+            let path = entry.path();
+            let kind = entry
+                .file_type()
+                .map_err(|error| ImportError::Io(error.to_string()))?;
+            if kind.is_symlink() {
+                return Err(ImportError::Archive(format!(
+                    "Scrivener source contains a symlink that cannot be fingerprinted safely: {}",
+                    path.strip_prefix(root).unwrap_or(&path).display()
+                )));
+            }
+            if kind.is_dir() {
+                collect(root, &path, files)?;
+            } else if kind.is_file() {
+                files.push(path);
+            }
+        }
+        Ok(())
+    }
+
+    let mut paths = Vec::new();
+    collect(root, root, &mut paths)?;
+    paths.sort_by(|left, right| {
+        left.strip_prefix(root)
+            .unwrap_or(left)
+            .cmp(right.strip_prefix(root).unwrap_or(right))
+    });
+    let mut hasher = Sha256::new();
+    for path in paths {
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|error| ImportError::Io(error.to_string()))?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let contents = fs::read(&path).map_err(|error| ImportError::Io(error.to_string()))?;
+        hasher.update((relative.len() as u64).to_be_bytes());
+        hasher.update(relative.as_bytes());
+        hasher.update((contents.len() as u64).to_be_bytes());
+        hasher.update(contents);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn parse_scrivener_xml(xml: &str) -> Result<ScrivenerXmlNode, ImportError> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut stack = Vec::<ScrivenerXmlNode>::new();
+    let mut root = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(event)) => {
+                let mut node = ScrivenerXmlNode {
+                    name: String::from_utf8_lossy(event.local_name().as_ref()).into_owned(),
+                    ..ScrivenerXmlNode::default()
+                };
+                for attribute in event.attributes().flatten() {
+                    let key =
+                        String::from_utf8_lossy(attribute.key.local_name().as_ref()).into_owned();
+                    let value = attribute
+                        .decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )
+                        .map_err(|error| ImportError::Archive(error.to_string()))?;
+                    node.attributes.insert(key, value.into_owned());
+                }
+                stack.push(node);
+            }
+            Ok(Event::Empty(event)) => {
+                let mut node = ScrivenerXmlNode {
+                    name: String::from_utf8_lossy(event.local_name().as_ref()).into_owned(),
+                    ..ScrivenerXmlNode::default()
+                };
+                for attribute in event.attributes().flatten() {
+                    let key =
+                        String::from_utf8_lossy(attribute.key.local_name().as_ref()).into_owned();
+                    let value = attribute
+                        .decoded_and_normalized_value(
+                            quick_xml::XmlVersion::Implicit1_0,
+                            reader.decoder(),
+                        )
+                        .map_err(|error| ImportError::Archive(error.to_string()))?;
+                    node.attributes.insert(key, value.into_owned());
+                }
+                attach_scrivener_node(node, &mut stack, &mut root);
+            }
+            Ok(Event::Text(event)) => {
+                if let Some(node) = stack.last_mut() {
+                    let decoded = event
+                        .xml_content(quick_xml::XmlVersion::Implicit1_0)
+                        .map_err(|error| ImportError::Archive(error.to_string()))?;
+                    node.text.push_str(
+                        &quick_xml::escape::unescape(&decoded)
+                            .map_err(|error| ImportError::Archive(error.to_string()))?,
+                    );
+                }
+            }
+            Ok(Event::CData(event)) => {
+                if let Some(node) = stack.last_mut() {
+                    node.text.push_str(
+                        &event
+                            .decode()
+                            .map_err(|error| ImportError::Archive(error.to_string()))?,
+                    );
+                }
+            }
+            Ok(Event::End(_)) => {
+                let node = stack
+                    .pop()
+                    .ok_or_else(|| ImportError::Archive("unbalanced XML end element".into()))?;
+                attach_scrivener_node(node, &mut stack, &mut root);
+            }
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(ImportError::Archive(error.to_string())),
+        }
+    }
+    if !stack.is_empty() {
+        return Err(ImportError::Archive(
+            "Scrivener manifest ended with unclosed XML elements".into(),
+        ));
+    }
+    root.ok_or_else(|| ImportError::Archive("Scrivener manifest is empty".into()))
+}
+
+fn attach_scrivener_node(
+    node: ScrivenerXmlNode,
+    stack: &mut [ScrivenerXmlNode],
+    root: &mut Option<ScrivenerXmlNode>,
+) {
+    if let Some(parent) = stack.last_mut() {
+        parent.children.push(node);
+    } else if root.is_none() {
+        *root = Some(node);
+    }
+}
+
+fn find_scrivener_node<'a>(node: &'a ScrivenerXmlNode, name: &str) -> Option<&'a ScrivenerXmlNode> {
+    if node.name.eq_ignore_ascii_case(name) {
+        return Some(node);
+    }
+    node.children
+        .iter()
+        .find_map(|child| find_scrivener_node(child, name))
+}
+
+fn scrivener_child_items(node: &ScrivenerXmlNode) -> Vec<&ScrivenerXmlNode> {
+    let container = node
+        .children
+        .iter()
+        .find(|child| child.name.eq_ignore_ascii_case("Children"));
+    container.map_or_else(
+        || {
+            node.children
+                .iter()
+                .filter(|child| child.name.eq_ignore_ascii_case("BinderItem"))
+                .collect()
+        },
+        |children| {
+            children
+                .children
+                .iter()
+                .filter(|child| child.name.eq_ignore_ascii_case("BinderItem"))
+                .collect()
+        },
+    )
+}
+
+fn scrivener_field_values(node: &ScrivenerXmlNode, values: &mut BTreeMap<String, String>) {
+    for child in &node.children {
+        if child.children.is_empty() && !child.text.trim().is_empty() {
+            values.insert(child.name.clone(), child.text.trim().to_owned());
+        } else {
+            scrivener_field_values(child, values);
+        }
+    }
+}
+
+fn scrivener_named_value(node: &ScrivenerXmlNode, name: &str) -> Option<String> {
+    node.children
+        .iter()
+        .find(|child| child.name.eq_ignore_ascii_case(name))
+        .map(|child| child.text.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn classify_scrivener_area(title: &str, type_code: Option<&str>, inherited: &str) -> String {
+    let label = format!(
+        "{} {}",
+        title.to_ascii_lowercase(),
+        type_code.unwrap_or_default()
+    )
+    .to_ascii_lowercase();
+    if label.contains("research") {
+        "research".into()
+    } else if label.contains("trash") || label.contains("recycle") {
+        "trash".into()
+    } else if label.contains("draft") || label.contains("manuscript") {
+        "manuscript".into()
+    } else {
+        inherited.to_owned()
+    }
+}
+
+fn collect_scrivener_item(
+    node: &ScrivenerXmlNode,
+    parent_source_id: Option<String>,
+    parent_area: String,
+    project_root: &Path,
+    read_candidate_content: bool,
+    counts: &mut BTreeMap<Option<String>, u32>,
+    output: &mut Vec<ScrivenerBinderItem>,
+) -> Result<(), ImportError> {
+    let source_document_id = node
+        .attributes
+        .get("UUID")
+        .cloned()
+        .or_else(|| scrivener_named_value(node, "UUID"))
+        .ok_or_else(|| ImportError::Archive("BinderItem is missing its UUID".into()))?;
+    let position = counts.entry(parent_source_id.clone()).or_default();
+    let this_position = *position;
+    *position = position.saturating_add(1);
+    let title = scrivener_named_value(node, "Title").unwrap_or_default();
+    let type_code = node
+        .attributes
+        .get("Type")
+        .cloned()
+        .or_else(|| scrivener_named_value(node, "Type"));
+    let area = classify_scrivener_area(&title, type_code.as_deref(), &parent_area);
+    let mut fields = BTreeMap::new();
+    scrivener_field_values(node, &mut fields);
+    let include_in_compile = fields
+        .iter()
+        .find(|(key, _)| {
+            key.eq_ignore_ascii_case("IncludeInCompile")
+                || key.eq_ignore_ascii_case("IncludeInCompilation")
+        })
+        .map(|(_, value)| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "yes" | "true" | "1" | "include"
+            )
+        });
+    let mut unsupported = Vec::new();
+    let mut synopsis = None;
+    let mut notes_markdown = None;
+    let mut content_markdown = None;
+    if read_candidate_content {
+        if let Some(data_dir) =
+            find_case_insensitive_child(&project_root.join("Files"), "Data", true)?
+            && let Some(item_dir) =
+                find_case_insensitive_child(&data_dir, &source_document_id, true)?
+        {
+            if let Some(file) = find_case_insensitive_child(&item_dir, "content.rtf", false)? {
+                let bytes = fs::read(&file).map_err(|error| ImportError::Io(error.to_string()))?;
+                let rtf = String::from_utf8_lossy(&bytes);
+                content_markdown = Some(extract_rtf_markdown(&rtf));
+                unsupported.push(
+                    "Scrivener RTF font, colour, layout and embedded-object fidelity needs review"
+                        .into(),
+                );
+            }
+            if let Some(file) = find_case_insensitive_child(&item_dir, "synopsis.txt", false)? {
+                synopsis = Some(
+                    fs::read_to_string(file).map_err(|error| ImportError::Io(error.to_string()))?,
+                );
+            }
+            if let Some(file) = find_case_insensitive_child(&item_dir, "notes.rtf", false)? {
+                let bytes = fs::read(file).map_err(|error| ImportError::Io(error.to_string()))?;
+                notes_markdown = Some(extract_rtf_markdown(&String::from_utf8_lossy(&bytes)));
+            }
+        }
+        if content_markdown.is_none()
+            && area == "manuscript"
+            && !scrivener_child_items(node).is_empty()
+        {
+            unsupported.push(
+                "Container item has no readable content.rtf; folder-group prose may be stored separately".into(),
+            );
+        }
+    }
+    output.push(ScrivenerBinderItem {
+        source_document_id: source_document_id.clone(),
+        parent_source_id: parent_source_id.clone(),
+        position: this_position,
+        title,
+        type_code,
+        area: area.clone(),
+        include_in_compile,
+        synopsis,
+        notes_markdown,
+        content_markdown,
+        fields,
+        unsupported,
+    });
+    for child in scrivener_child_items(node) {
+        collect_scrivener_item(
+            child,
+            Some(source_document_id.clone()),
+            area.clone(),
+            project_root,
+            read_candidate_content,
+            counts,
+            output,
+        )?;
+    }
+    Ok(())
+}
+
+fn find_case_insensitive_child(
+    directory: &Path,
+    name: &str,
+    want_directory: bool,
+) -> Result<Option<PathBuf>, ImportError> {
+    if !directory.is_dir() {
+        return Ok(None);
+    }
+    let entries = fs::read_dir(directory).map_err(|error| ImportError::Io(error.to_string()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| ImportError::Io(error.to_string()))?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(name)
+        {
+            let kind = entry
+                .file_type()
+                .map_err(|error| ImportError::Io(error.to_string()))?;
+            if kind.is_symlink() {
+                return Err(ImportError::Archive(format!(
+                    "Scrivener content path is a symlink: {}",
+                    entry.path().display()
+                )));
+            }
+            if (want_directory && kind.is_dir()) || (!want_directory && kind.is_file()) {
+                return Ok(Some(entry.path()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn read_zip_text(bytes: &[u8], member: &str) -> Result<String, ImportError> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|error| ImportError::Archive(error.to_string()))?;
@@ -1169,6 +1688,150 @@ fn extract_rtf_text(source: &str) -> String {
         .join("\n\n")
 }
 
+/// Converts the subset of RTF inline formatting supported by the importer to
+/// Markdown. Unsupported document-level formatting is reported by the caller.
+/// This intentionally preserves bold, italic and strike runs without trying
+/// to reproduce page layout or embedded objects.
+fn extract_rtf_markdown(source: &str) -> String {
+    #[derive(Clone, Copy, Default, Eq, PartialEq)]
+    struct Style {
+        bold: bool,
+        italic: bool,
+        strike: bool,
+        skip: bool,
+    }
+
+    let mut chars = source.chars().peekable();
+    let mut style = Style::default();
+    let mut stack = Vec::new();
+    let mut runs = Vec::<(char, Style)>::new();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '{' => {
+                stack.push(style);
+                if chars.peek() == Some(&'\\') {
+                    let mut probe = chars.clone();
+                    probe.next();
+                    if probe.peek() == Some(&'*') {
+                        style.skip = true;
+                    }
+                }
+            }
+            '}' => style = stack.pop().unwrap_or_default(),
+            '\\' => {
+                let Some(next) = chars.next() else { break };
+                if matches!(next, '\\' | '{' | '}') {
+                    if !style.skip {
+                        runs.push((next, style));
+                    }
+                    continue;
+                }
+                if next == '\'' {
+                    let a = chars.next().and_then(|c| c.to_digit(16));
+                    let b = chars.next().and_then(|c| c.to_digit(16));
+                    if !style.skip
+                        && let (Some(a), Some(b)) = (a, b)
+                    {
+                        runs.push((char::from_u32(a * 16 + b).unwrap_or('�'), style));
+                    }
+                    continue;
+                }
+                if !next.is_ascii_alphabetic() {
+                    if !style.skip && next == '~' {
+                        runs.push((' ', style));
+                    }
+                    continue;
+                }
+                let mut word = String::from(next);
+                while chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+                    word.push(chars.next().unwrap());
+                }
+                let mut number = String::new();
+                if chars
+                    .peek()
+                    .is_some_and(|c| *c == '-' || c.is_ascii_digit())
+                {
+                    if chars.peek() == Some(&'-') {
+                        number.push(chars.next().unwrap());
+                    }
+                    while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                        number.push(chars.next().unwrap());
+                    }
+                }
+                if chars.peek() == Some(&' ') {
+                    chars.next();
+                }
+                match word.as_str() {
+                    "fonttbl" | "colortbl" | "stylesheet" | "info" | "pict" | "object"
+                    | "header" | "footer" | "xmlnstbl" | "listtable" | "listoverridetable" => {
+                        style.skip = true
+                    }
+                    "b" => style.bold = number != "0",
+                    "i" => style.italic = number != "0",
+                    "strike" | "strikethrough" => style.strike = number != "0",
+                    "par" | "line" if !style.skip => runs.push(('\n', Style::default())),
+                    "tab" if !style.skip => runs.push(('\t', Style::default())),
+                    "u" if !style.skip => {
+                        if let Ok(code) = number.parse::<i32>() {
+                            runs.push((char::from_u32(code as u16 as u32).unwrap_or('�'), style));
+                            // RTF Unicode escapes may be followed by one ANSI fallback char.
+                            let _ = chars.next();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ if !style.skip && !ch.is_control() => runs.push((ch, style)),
+            _ => {}
+        }
+    }
+
+    let mut output = String::new();
+    let mut current = Style::default();
+    let mut text = String::new();
+    let flush = |output: &mut String, text: &mut String, style: Style| {
+        if text.is_empty() {
+            return;
+        }
+        let escaped = text
+            .replace('\\', "\\\\")
+            .replace('*', "\\*")
+            .replace('_', "\\_");
+        let value = match (style.bold, style.italic, style.strike) {
+            (true, true, true) => format!("~~***{escaped}***~~"),
+            (true, true, false) => format!("***{escaped}***"),
+            (true, false, true) => format!("~~**{escaped}**~~"),
+            (false, true, true) => format!("~~*{escaped}*~~"),
+            (true, false, false) => format!("**{escaped}**"),
+            (false, true, false) => format!("*{escaped}*"),
+            (false, false, true) => format!("~~{escaped}~~"),
+            _ => escaped,
+        };
+        output.push_str(&value);
+        text.clear();
+    };
+    for (ch, next_style) in runs {
+        if ch == '\n' {
+            flush(&mut output, &mut text, current);
+            while output.ends_with(' ') {
+                output.pop();
+            }
+            if !output.ends_with("\n\n") {
+                output.push_str("\n\n");
+            }
+            current = Style::default();
+        } else if next_style != current {
+            flush(&mut output, &mut text, current);
+            current = next_style;
+            text.push(ch);
+        } else {
+            text.push(ch);
+        }
+    }
+    flush(&mut output, &mut text, current);
+    output.trim().to_owned()
+}
+
 impl ImportInventory {
     /// Validates identity and hierarchy before any destination project is mutated.
     pub fn validate(&self) -> Result<(), ImportError> {
@@ -1397,6 +2060,118 @@ mod tests {
         assert!(staged.units[0].body_markdown.contains("— world"));
         assert!(!staged.units[0].body_markdown.contains("Times"));
         assert!(!staged.unsupported.is_empty());
+    }
+
+    #[test]
+    fn synthetic_scrivener_layout_inventory_preserves_hierarchy_and_source() {
+        // Synthetic parser fixture only. This exercises the inventory contract
+        // and is not evidence of compatibility with real Scrivener projects.
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Synthetic.scriv");
+        let manifest_dir = project.join("Files");
+        let data_dir = manifest_dir.join("Data");
+        let document_dir = data_dir.join("scene-uuid");
+        std::fs::create_dir_all(&document_dir).unwrap();
+        let manifest = r#"<?xml version="1.0" encoding="UTF-8"?>
+            <ScrivenerProject Version="2.0"><Binder>
+              <BinderItem UUID="chapter-uuid" Type="Folder"><Title>Chapter One</Title><Children>
+                <BinderItem UUID="scene-uuid" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
+              </Children></BinderItem>
+              <BinderItem UUID="research-uuid" Type="Folder"><Title>Research</Title><Children/></BinderItem>
+            </Binder></ScrivenerProject>"#;
+        std::fs::write(project.join("Synthetic.scrivx"), manifest).unwrap();
+        std::fs::write(
+            document_dir.join("content.rtf"),
+            r"{\rtf1\ansi Hello {\i italic} world\par \u8212? continuation}",
+        )
+        .unwrap();
+        std::fs::write(document_dir.join("synopsis.txt"), "A test synopsis").unwrap();
+        let before_manifest = std::fs::read(project.join("Synthetic.scrivx")).unwrap();
+        let before_content = std::fs::read(document_dir.join("content.rtf")).unwrap();
+
+        let inventory = inspect_scrivener_project(&project).unwrap();
+        inventory.validate().unwrap();
+        assert_eq!(inventory.items.len(), 3);
+        assert_eq!(
+            inventory.items[1].parent_source_id.as_deref(),
+            Some("chapter-uuid")
+        );
+        assert_eq!(inventory.items[1].position, 0);
+        assert_eq!(inventory.items[1].include_in_compile, Some(true));
+        assert_eq!(inventory.items[1].synopsis, Some("A test synopsis".into()));
+        let prose = inventory.items[1].content_markdown.as_deref().unwrap();
+        assert!(prose.contains("*italic*"), "{prose}");
+        assert!(prose.contains("— continuation"), "{prose}");
+        assert_eq!(inventory.items[2].area, "research");
+        assert_eq!(
+            std::fs::read(project.join("Synthetic.scrivx")).unwrap(),
+            before_manifest
+        );
+        assert_eq!(
+            std::fs::read(document_dir.join("content.rtf")).unwrap(),
+            before_content
+        );
+        assert!(
+            inventory
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("real Scrivener"))
+        );
+    }
+
+    #[test]
+    fn scrivener_inventory_rejects_malformed_and_duplicate_binder_items() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Broken.scriv");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("Broken.scrivx"), "<broken").unwrap();
+        assert!(matches!(
+            inspect_scrivener_project(&project),
+            Err(ImportError::Archive(_))
+        ));
+
+        let duplicate = ScrivenerProjectInventory {
+            source_path: String::new(),
+            source_fingerprint: String::new(),
+            title: String::new(),
+            format_version: None,
+            items: vec![
+                ScrivenerBinderItem {
+                    source_document_id: "same".into(),
+                    parent_source_id: None,
+                    position: 0,
+                    title: String::new(),
+                    type_code: None,
+                    area: "unknown".into(),
+                    include_in_compile: None,
+                    synopsis: None,
+                    notes_markdown: None,
+                    content_markdown: None,
+                    fields: BTreeMap::new(),
+                    unsupported: Vec::new(),
+                },
+                ScrivenerBinderItem {
+                    source_document_id: "same".into(),
+                    parent_source_id: None,
+                    position: 1,
+                    title: String::new(),
+                    type_code: None,
+                    area: "unknown".into(),
+                    include_in_compile: None,
+                    synopsis: None,
+                    notes_markdown: None,
+                    content_markdown: None,
+                    fields: BTreeMap::new(),
+                    unsupported: Vec::new(),
+                },
+            ],
+            warnings: Vec::new(),
+            unsupported: Vec::new(),
+        };
+        assert!(matches!(
+            duplicate.validate(),
+            Err(ImportError::DuplicateSourceId(_))
+        ));
     }
 
     #[test]

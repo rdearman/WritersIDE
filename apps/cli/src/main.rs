@@ -1902,6 +1902,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let staging = story_import::inspect_manuscript(&source)?;
             println!("{}", serde_json::to_string_pretty(&staging)?);
         }
+        "inspect-scrivener" => {
+            let source = args
+                .next()
+                .ok_or("missing .scriv project directory or .scrivx manifest")?;
+            let inventory = story_import::inspect_scrivener_project(&source)?;
+            println!("{}", serde_json::to_string_pretty(&inventory)?);
+        }
         "review-inspect" => {
             let source = args.next().ok_or("missing DOCX file")?;
             println!(
@@ -2723,6 +2730,9 @@ fn usage() {
         "writers-ide git-auto-snapshot-check <project> (one-shot; suitable for cron/systemd timers)"
     );
     eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");
+    eprintln!(
+        "writers-ide inspect-scrivener <.scriv-project-directory|.scrivx-manifest> (experimental inventory only)"
+    );
     eprintln!(
         "writers-ide event-time-set <project> <event-uuid> <start-tick|?|~nominal,lower,upper|lower..upper> <end-tick|?|~nominal,lower,upper|lower..upper> [source-time-text]"
     );
