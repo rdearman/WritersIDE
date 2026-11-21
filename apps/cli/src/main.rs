@@ -1,7 +1,10 @@
+use sha2::{Digest, Sha256};
 use std::{
     env, fs,
     path::{Path, PathBuf},
     process::ExitCode,
+    thread,
+    time::Duration,
 };
 use story_app::WriterApp;
 use story_core::{
@@ -646,6 +649,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{scene}");
             }
         }
+        "query-assert" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = QueryId(args.next().ok_or("missing query ID")?.parse()?);
+            let rule = args
+                .next()
+                .ok_or("missing assertion: non-empty|empty|at-least:N|at-most:N|exactly:N")?;
+            let assertion = match rule.as_str() {
+                "non-empty" => story_analysis::QueryAssertion::NonEmpty,
+                "empty" => story_analysis::QueryAssertion::Empty,
+                _ => {
+                    let (kind, number) = rule
+                        .split_once(':')
+                        .ok_or("assertion requires a numeric value")?;
+                    let number = number.parse::<usize>()?;
+                    match kind {
+                        "at-least" => story_analysis::QueryAssertion::AtLeast(number),
+                        "at-most" => story_analysis::QueryAssertion::AtMost(number),
+                        "exactly" => story_analysis::QueryAssertion::Exactly(number),
+                        _ => return Err("unknown assertion kind".into()),
+                    }
+                }
+            };
+            let app = WriterApp::open_project(path)?;
+            let count = app.run_scene_query(id)?.len();
+            let report = story_analysis::evaluate_query_assertion(count, &assertion);
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.passed {
+                return Err("saved query assertion failed".into());
+            }
+        }
         "query-list" => {
             let path = args.next().ok_or("missing project path")?;
             let app = WriterApp::open_project(path)?;
@@ -952,6 +985,81 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 serde_json::to_string_pretty(&app.compile_diagnostics()?)?
             );
         }
+        "challenge-start" => {
+            let path = args.next().ok_or("missing project path")?;
+            let target = args
+                .next()
+                .ok_or("missing target word count")?
+                .parse::<u32>()?;
+            let seconds = args
+                .next()
+                .ok_or("missing duration seconds")?
+                .parse::<u32>()?;
+            let mode = args.next().unwrap_or_else(|| "steady".into());
+            let mut app = WriterApp::open_project(path)?;
+            println!("{}", app.start_writing_challenge(target, seconds, &mode)?);
+        }
+        "challenge-finish" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = args.next().ok_or("missing challenge ID")?;
+            let words = args.next().ok_or("missing words written")?.parse::<u32>()?;
+            let abandoned = args.next().as_deref() == Some("abandoned");
+            let mut app = WriterApp::open_project(path)?;
+            app.finish_writing_challenge(&id, words, abandoned)?;
+            println!("Challenge {id} recorded.");
+        }
+        "challenge-list" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app.list_writing_challenges()?)?
+            );
+        }
+        "compile-watch" => {
+            let project = PathBuf::from(args.next().ok_or("missing project path")?);
+            let format_name = args.next().ok_or("missing format")?;
+            let format = story_document::CompileFormat::parse(&format_name)
+                .ok_or("format must be markdown, html, epub, docx, or pdf")?;
+            let output = PathBuf::from(args.next().ok_or("missing output path")?);
+            let poll_ms = args
+                .next()
+                .map(|v| v.parse::<u64>())
+                .transpose()?
+                .unwrap_or(1000)
+                .clamp(250, 60_000);
+            let mut previous = String::new();
+            println!("Watching project for changes; Ctrl-C stops the watcher.");
+            loop {
+                let fingerprint = watch_fingerprint(&project)?;
+                if fingerprint != previous {
+                    previous = fingerprint;
+                    match WriterApp::open_project(&project)
+                        .and_then(|app| app.compile_artifact(format, false))
+                    {
+                        Ok(artifact) => {
+                            atomic_write(&output, &artifact.bytes)?;
+                            let map = serde_json::to_vec_pretty(
+                                &serde_json::json!({"schema_version":1,"entries":artifact.source_map}),
+                            )?;
+                            atomic_write(
+                                &PathBuf::from(format!("{}.source-map.json", output.display())),
+                                &map,
+                            )?;
+                            println!(
+                                "Compiled {} bytes to {}",
+                                artifact.bytes.len(),
+                                output.display()
+                            );
+                        }
+                        Err(error) => {
+                            eprintln!("Compile failed; previous output preserved: {error}")
+                        }
+                    }
+                }
+                thread::sleep(Duration::from_millis(poll_ms));
+            }
+        }
         "inspect-manuscript" => {
             let source = args
                 .next()
@@ -1245,6 +1353,42 @@ fn usage() {
     eprintln!(
         "writers-ide scratchpad-create <path> <title> [body]\nwriters-ide scratchpad-list <path>\nwriters-ide scratchpad-promote <path> <note-uuid> <scene|character|location|object|research> <entity-uuid>\nwriters-ide mentions <path> <scene-uuid>\nwriters-ide mention-confirm <path> <mention-uuid> <character|location|object> <entity-uuid>\nwriters-ide mention-dismiss <path> <mention-uuid>\nwriters-ide object-create <path> <name> [description]\nwriters-ide assembly-draft-create <path> <assembly-uuid>\nwriters-ide assembly-draft-list <path>\nwriters-ide assembly-draft-set <path> <draft-uuid> <scene-uuid> <text.md>\nwriters-ide assembly-draft-commit <path> <draft-uuid>\nwriters-ide board-create <path> <title>\nwriters-ide board-add-scene <path> <board-uuid> <scene-uuid> <x> <y> [note]\nwriters-ide board-list <path> <board-uuid>\nwriters-ide backup-archive <project-path> <archive.zip>\nwriters-ide restore-archive <archive.zip> <new-project-directory>"
     );
+    eprintln!(
+        "writers-ide compile-watch <path> <format> <output> [poll-ms]\nwriters-ide query-assert <path> <query-uuid> <empty|non-empty|at-least:N|at-most:N|exactly:N>\nwriters-ide challenge-start <path> <target-words> <duration-seconds> [steady|kamikaze]\nwriters-ide challenge-finish <path> <challenge-id> <words-written> [abandoned]\nwriters-ide challenge-list <path>"
+    );
+}
+
+fn watch_fingerprint(project: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    fn visit(
+        path: &Path,
+        manuscript_root: &Path,
+        files: &mut Vec<PathBuf>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if path.is_dir() {
+            for entry in fs::read_dir(path)? {
+                let entry = entry?;
+                if entry.file_name() == "exports" || entry.file_name() == ".writers-ide" {
+                    continue;
+                }
+                visit(&entry.path(), manuscript_root, files)?;
+            }
+        } else if path.file_name().is_some_and(|name| {
+            name == "project.toml" || name.to_string_lossy().starts_with("story.db")
+        }) || path.starts_with(manuscript_root)
+        {
+            files.push(path.to_path_buf());
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    visit(project, &project.join("manuscript"), &mut files)?;
+    files.sort();
+    let mut hash = Sha256::new();
+    for path in files {
+        hash.update(path.strip_prefix(project)?.to_string_lossy().as_bytes());
+        hash.update(fs::read(path)?);
+    }
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
@@ -1315,5 +1459,29 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod watch_tests {
+    use super::watch_fingerprint;
+    use std::fs;
+    #[test]
+    fn watch_fingerprint_tracks_manuscript_and_ignores_generated_exports() {
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("manuscript")).unwrap();
+        fs::create_dir_all(root.path().join("exports")).unwrap();
+        fs::write(root.path().join("project.toml"), "title='A'").unwrap();
+        fs::write(root.path().join("story.db"), "db").unwrap();
+        let scene = root.path().join("manuscript/scene.md");
+        fs::write(&scene, "first").unwrap();
+        let first = watch_fingerprint(root.path()).unwrap();
+        fs::write(root.path().join("exports/generated.md"), "ignored").unwrap();
+        assert_eq!(first, watch_fingerprint(root.path()).unwrap());
+        fs::write(root.path().join("story.db-wal"), "pending transaction").unwrap();
+        assert_ne!(first, watch_fingerprint(root.path()).unwrap());
+        let with_wal = watch_fingerprint(root.path()).unwrap();
+        fs::write(scene, "second").unwrap();
+        assert_ne!(with_wal, watch_fingerprint(root.path()).unwrap());
     }
 }

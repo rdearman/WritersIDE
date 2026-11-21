@@ -126,10 +126,23 @@ struct AppState {
     undo_stack: Vec<EditorSnapshot>,
     redo_stack: Vec<EditorSnapshot>,
     clipboard: String,
+    snippets: BTreeMap<String, String>,
+    registers: BTreeMap<String, String>,
+    active_challenge: Option<ActiveWritingChallenge>,
     menu: Option<MenuState>,
     reference_panes: Vec<ReferencePane>,
     active_reference: usize,
     reference_focused: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ActiveWritingChallenge {
+    id: String,
+    initial_words: u32,
+    target_words: u32,
+    deadline: Instant,
+    mode: String,
+    last_activity: Instant,
 }
 
 #[derive(Clone, Debug)]
@@ -1172,6 +1185,14 @@ fn command_registry() -> Vec<CommandSpec> {
             "writing-stats",
             true,
         ),
+        legacy_command("edit.snippet-save", "Define Session Snippet", "Store a reusable snippet with an optional ${cursor} marker", "Insert", "snippet", true),
+        legacy_command("edit.snippet-insert", "Insert Session Snippet", "Expand and insert a named session snippet", "Insert", "snippet-insert", true),
+        legacy_command("edit.register-save", "Save Editor Register", "Save the selection or current line in a named register", "Edit", "register-save", true),
+        legacy_command("edit.register-insert", "Insert Editor Register", "Insert a named editor register", "Edit", "register-insert", true),
+        legacy_command("edit.multi-insert", "Multi-cursor Insert", "Insert text at multiple original UTF-8 byte offsets", "Edit", "multi-insert", true),
+        legacy_command("edit.macro", "Run Edit Macro", "Apply an undoable selection or line edit macro", "Edit", "macro", true),
+        legacy_command("challenge.start", "Start Writing Challenge", "Start a timed word target; opt-in Kamikaze mode reacts to inactivity", "Tools", "challenge-start", true),
+        legacy_command("challenge.finish", "Finish Writing Challenge", "Record words written and finish the active timed challenge", "Tools", "challenge-finish", false),
         legacy_command(
             "story-template-list",
             "List Story Bible Templates",
@@ -1433,6 +1454,9 @@ impl AppState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,
@@ -2348,7 +2372,157 @@ impl AppState {
         &mut self,
         cmd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if cmd == "story-template-list" {
+        if let Some(rest) = cmd.strip_prefix("challenge-start ") {
+            let mut parts = rest.split_whitespace();
+            let target = parts
+                .next()
+                .ok_or("use challenge-start TARGET_WORDS DURATION_SECONDS [steady|kamikaze]")?
+                .parse::<u32>()?;
+            let seconds = parts
+                .next()
+                .ok_or("missing duration seconds")?
+                .parse::<u32>()?;
+            let mode = parts.next().unwrap_or("steady");
+            if parts.next().is_some() || !matches!(mode, "steady" | "kamikaze") {
+                return Err("mode must be steady or kamikaze".into());
+            }
+            let id = self.app.start_writing_challenge(target, seconds, mode)?;
+            let initial_words = story_core::count_words(&self.editor.join("\n"));
+            let now = Instant::now();
+            self.active_challenge = Some(ActiveWritingChallenge {
+                id,
+                initial_words,
+                target_words: target,
+                deadline: now + Duration::from_secs(u64::from(seconds)),
+                mode: mode.into(),
+                last_activity: now,
+            });
+            self.message = if mode == "kamikaze" {
+                format!(
+                    "Kamikaze challenge armed: {target} words; one word is removed after 10 seconds without typing. Undo remains available."
+                )
+            } else {
+                format!("Timed challenge: {target} words in {seconds} seconds")
+            };
+        } else if cmd == "challenge-finish" {
+            self.finish_active_challenge(false)?;
+        } else if let Some(rest) = cmd.strip_prefix("snippet ") {
+            let (name, body) = rest.split_once(' ').ok_or("use snippet NAME TEXT")?;
+            self.snippets.insert(name.to_owned(), body.to_owned());
+            self.message = format!("Snippet {name} stored for this editor session");
+        } else if let Some(name) = cmd.strip_prefix("snippet-insert ") {
+            let mut parts = name.split_whitespace();
+            let snippet_name = parts
+                .next()
+                .ok_or("use snippet-insert NAME [key=value ...]")?;
+            let values = parts
+                .map(|item| {
+                    let (key, value) = item
+                        .split_once('=')
+                        .ok_or("snippet values must use key=value")?;
+                    Ok((key.to_owned(), value.to_owned()))
+                })
+                .collect::<Result<BTreeMap<_, _>, Box<dyn std::error::Error>>>()?;
+            let source = self
+                .snippets
+                .get(snippet_name)
+                .ok_or("unknown session snippet")?
+                .clone();
+            let expansion = story_core::expand_snippet(&source, &values)?;
+            self.insert_text_at_cursor(&expansion.text)?;
+            let text = self.editor.join("\n");
+            if let Some((row, column)) = editor_position_from_byte(
+                &text,
+                editor_position_byte(&self.editor, self.cursor.0, self.cursor.1)
+                    .saturating_sub(expansion.text.len())
+                    .saturating_add(expansion.cursor_byte),
+            ) {
+                self.cursor = (row, column);
+            }
+            self.message = format!("Inserted snippet {snippet_name}");
+        } else if let Some(name) = cmd.strip_prefix("register-save ") {
+            let value = if let Some(start) = self.editor_selection {
+                let a = editor_position_byte(&self.editor, start.0, start.1);
+                let b = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+                self.editor
+                    .join("\n")
+                    .get(a.min(b)..a.max(b))
+                    .unwrap_or("")
+                    .to_owned()
+            } else {
+                self.editor[self.cursor.0].clone()
+            };
+            self.registers.insert(name.trim().to_owned(), value);
+            self.message = format!("Saved register {}", name.trim());
+        } else if let Some(name) = cmd.strip_prefix("register-insert ") {
+            let value = self
+                .registers
+                .get(name.trim())
+                .ok_or("unknown session register")?
+                .clone();
+            self.insert_text_at_cursor(&value)?;
+            self.message = format!("Inserted register {}", name.trim());
+        } else if let Some(rest) = cmd.strip_prefix("multi-insert ") {
+            let (positions, text) = rest
+                .split_once(' ')
+                .ok_or("use multi-insert BYTE,BYTE,... TEXT")?;
+            let anchors = positions
+                .split(',')
+                .map(str::parse::<usize>)
+                .collect::<Result<Vec<_>, _>>()?;
+            self.push_undo();
+            let original = self.editor.join("\n");
+            let updated = story_core::insert_at_anchors(&original, &anchors, text)?;
+            self.editor = updated.lines().map(str::to_owned).collect();
+            if self.editor.is_empty() {
+                self.editor.push(String::new());
+            }
+            self.dirty = true;
+            self.message = format!(
+                "Inserted at {} distinct UTF-8 cursor anchors",
+                anchors.iter().collect::<BTreeSet<_>>().len()
+            );
+        } else if let Some(rest) = cmd.strip_prefix("macro ") {
+            let selection = self
+                .editor_selection
+                .map(|a| {
+                    editor_position_byte(&self.editor, a.0, a.1)
+                        ..editor_position_byte(&self.editor, self.cursor.0, self.cursor.1)
+                })
+                .unwrap_or_else(|| {
+                    let start = editor_position_byte(&self.editor, self.cursor.0, 0);
+                    start
+                        ..editor_position_byte(
+                            &self.editor,
+                            self.cursor.0,
+                            grapheme_count(&self.editor[self.cursor.0]),
+                        )
+                });
+            let operation = if let Some(text) = rest.strip_prefix("insert ") {
+                story_core::EditMacroOp::Insert(text.to_owned())
+            } else if rest == "upper" {
+                story_core::EditMacroOp::UppercaseSelection
+            } else if rest == "lower" {
+                story_core::EditMacroOp::LowercaseSelection
+            } else if let Some(pair) = rest.strip_prefix("replace ") {
+                let (from, to) = pair.split_once("=>").ok_or("use macro replace FROM=>TO")?;
+                story_core::EditMacroOp::Replace {
+                    from: from.to_owned(),
+                    to: to.to_owned(),
+                }
+            } else {
+                return Err("use macro insert TEXT|upper|lower|replace FROM=>TO".into());
+            };
+            self.push_undo();
+            let (updated, _) =
+                story_core::run_edit_macro(&self.editor.join("\n"), selection, &[operation])?;
+            self.editor = updated.lines().map(str::to_owned).collect();
+            if self.editor.is_empty() {
+                self.editor.push(String::new());
+            }
+            self.dirty = true;
+            self.message = "Edit macro applied (undo available)".into();
+        } else if cmd == "story-template-list" {
             self.message = self
                 .app
                 .list_story_bible_templates()?
@@ -3971,8 +4145,40 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | TEXT | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | plotline-shares SCENE PLOTLINE=BPS... | issue TITLE | issue-link SCENE ISSUE | issue-status ISSUE STATUS | event TITLE | TIME | event-time TITLE | START | END | SOURCE-TIME | event-link SCENE EVENT [KIND] | research TITLE | BODY | subchapter SECTION-ID TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | project-language TAG | reference-scene UUID | reference-next | reference-prev | reference-close | narrow CHAPTER-UUID | widen | proofread [all] | query UUID | query-list | query-clear | query-save NAME filters... | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | anchor-move UUID START END | transclude SCENE-ID | process | process-expand | process-only STAGE,STAGE | process-expand-only STAGE,STAGE | extract scene|reading UUID MODEL | proposals | approve PROPOSAL-PATH CLAIM-INDEX | dismiss PROPOSAL-PATH CLAIM-INDEX | knowledge | read-import PATH | read UUID | highlight start:end quote | note start:end quote | body | bookmark TITLE | bookmarks | annotations | annotation-jump INDEX | bookmark-jump INDEX | terms | jump BYTE | checkpoint | term KIND NAME | entity-link KIND UUID | reading-links | reading-follow INDEX | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert via CLI | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | multi-insert BYTE,BYTE,... TEXT | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [steady|kamikaze] | challenge-finish | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
+        Ok(())
+    }
+    fn finish_active_challenge(
+        &mut self,
+        abandoned: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let challenge = self
+            .active_challenge
+            .clone()
+            .ok_or("no active writing challenge")?;
+        let current = story_core::count_words(&self.editor.join("\n"));
+        let written = current.saturating_sub(challenge.initial_words);
+        self.app
+            .finish_writing_challenge(&challenge.id, written, abandoned)?;
+        self.active_challenge = None;
+        let elapsed = challenge.deadline.saturating_duration_since(Instant::now());
+        self.message = format!(
+            "Challenge {}: {written}/{} new words recorded{}",
+            if abandoned {
+                "abandoned"
+            } else if elapsed.is_zero() {
+                "time expired"
+            } else {
+                "complete"
+            },
+            challenge.target_words,
+            if abandoned {
+                String::new()
+            } else {
+                format!(" · {} seconds remaining", elapsed.as_secs())
+            }
+        );
         Ok(())
     }
     fn jump_reading(&mut self, offset: u64) -> Result<(), Box<dyn std::error::Error>> {
@@ -3992,6 +4198,75 @@ impl AppState {
             self.typed_characters = self.typed_characters.saturating_add(1);
         }
         self.insert_text_char(ch);
+        if let Some(challenge) = &mut self.active_challenge {
+            challenge.last_activity = Instant::now();
+        }
+    }
+    fn tick_challenge(&mut self) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(challenge) = self.active_challenge.as_ref() else {
+            return Ok(false);
+        };
+        let now = Instant::now();
+        if now >= challenge.deadline {
+            self.finish_active_challenge(false)?;
+            return Ok(false);
+        }
+        if challenge.mode != "kamikaze"
+            || now.duration_since(challenge.last_activity) < Duration::from_secs(10)
+        {
+            return Ok(false);
+        }
+        let challenge = self
+            .active_challenge
+            .as_mut()
+            .expect("challenge remains active");
+        challenge.last_activity = now;
+        self.push_undo();
+        let row = self.cursor.0;
+        while self.cursor.1 > 0
+            && self.editor[row]
+                .graphemes(true)
+                .nth(self.cursor.1 - 1)
+                .is_some_and(|g| g.chars().all(char::is_whitespace))
+        {
+            self.backspace();
+        }
+        let before = self.cursor.1;
+        while self.cursor.1 > 0
+            && self.editor[row]
+                .graphemes(true)
+                .nth(self.cursor.1 - 1)
+                .is_some_and(|g| !g.chars().all(char::is_whitespace))
+        {
+            self.backspace();
+        }
+        if before > self.cursor.1 {
+            self.message =
+                "Kamikaze: removed the last word after 10 seconds of inactivity; Undo restores it"
+                    .into();
+        } else {
+            self.message = "Kamikaze is armed; keep drafting to avoid word loss".into();
+        }
+        Ok(self.dirty)
+    }
+    fn insert_text_at_cursor(&mut self, insertion: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let original = self.editor.join("\n");
+        let at = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+        let mut updated = original;
+        if !updated.is_char_boundary(at) {
+            return Err("cursor is not at a UTF-8 boundary".into());
+        }
+        self.push_undo();
+        updated.insert_str(at, insertion);
+        self.editor = updated.lines().map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        if let Some((row, column)) = editor_position_from_byte(&updated, at + insertion.len()) {
+            self.cursor = (row, column);
+        }
+        self.dirty = true;
+        Ok(())
     }
     fn insert_text_char(&mut self, ch: char) {
         self.delete_selection();
@@ -4003,6 +4278,9 @@ impl AppState {
         self.dirty = true;
     }
     fn backspace(&mut self) {
+        if let Some(challenge) = &mut self.active_challenge {
+            challenge.last_activity = Instant::now();
+        }
         if self.delete_selection() {
             return;
         }
@@ -4023,6 +4301,9 @@ impl AppState {
         }
     }
     fn delete_forward(&mut self) {
+        if let Some(challenge) = &mut self.active_challenge {
+            challenge.last_activity = Instant::now();
+        }
         if self.delete_selection() {
             return;
         }
@@ -4057,6 +4338,9 @@ impl AppState {
         }
     }
     fn enter(&mut self) {
+        if let Some(challenge) = &mut self.active_challenge {
+            challenge.last_activity = Instant::now();
+        }
         self.delete_selection();
         let (row, col) = self.cursor;
         let line = &mut self.editor[row];
@@ -4065,6 +4349,9 @@ impl AppState {
         self.editor.insert(row + 1, tail);
         self.cursor = (row + 1, 0);
         self.dirty = true;
+        if let Some(challenge) = &mut self.active_challenge {
+            challenge.last_activity = Instant::now();
+        }
     }
     fn selection_bounds(&self) -> Option<((usize, usize), (usize, usize))> {
         let anchor = self.editor_selection?;
@@ -4307,6 +4594,9 @@ fn run(
                 _ => {}
             }
         }
+        if s.tick_challenge()? && s.dirty {
+            autosave_deadline = Some(Instant::now() + Duration::from_secs(2));
+        }
         if autosave_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             autosave_deadline = None;
             s.save()?;
@@ -4320,6 +4610,9 @@ fn run(
                 }
             }
         }
+    }
+    if s.active_challenge.is_some() {
+        s.finish_active_challenge(true)?;
     }
     Ok(())
 }
@@ -4656,9 +4949,25 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     let footer = if let Some(mode) = s.mode {
         format!(" {mode} {}_", s.prompt)
     } else {
+        let challenge = s
+            .active_challenge
+            .as_ref()
+            .map(|challenge| {
+                format!(
+                    "Challenge {}s · target {} words · {} mode",
+                    challenge
+                        .deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_secs(),
+                    challenge.target_words,
+                    challenge.mode
+                )
+            })
+            .unwrap_or_default();
         format!(
-            " {}   Enter open | j/k or ↑/↓ select | Tab next | Backspace back | {}",
+            " {}   {}   Enter open | j/k or ↑/↓ select | Tab next | Backspace back | {}",
             s.message,
+            challenge,
             if s.dirty { "modified" } else { "clean" }
         )
     };
@@ -6250,6 +6559,18 @@ mod tests {
                 .id,
             "git.snapshot"
         );
+        for (invocation, expected) in [
+            ("snippet greet ${cursor}", "edit.snippet-save"),
+            ("snippet-insert greet", "edit.snippet-insert"),
+            ("register-save a", "edit.register-save"),
+            ("multi-insert 0,4 x", "edit.multi-insert"),
+            ("macro upper", "edit.macro"),
+        ] {
+            assert_eq!(
+                command_palette_invocation(invocation).unwrap().0.id,
+                expected
+            );
+        }
         assert_eq!(
             command_palette_invocation("process-only").unwrap().0.action,
             CommandAction::ProcessSelected {
@@ -6281,6 +6602,43 @@ mod tests {
         let (dismiss, dismiss_args) = command_palette_invocation("dismiss review.json 2").unwrap();
         assert_eq!(dismiss.id, "extract.dismiss");
         assert_eq!(dismiss_args, Some("review.json 2"));
+    }
+
+    #[test]
+    fn terminal_timed_challenge_records_session_and_never_deletes_steady_prose() {
+        let root = tempfile::tempdir().unwrap();
+        let mut project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let chapter = project.create_chapter(None, "Chapter", 0).unwrap();
+        project.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.editor = vec!["one two".into()];
+        state.prompt = "challenge-start 10 60 steady".into();
+        state.command().unwrap();
+        assert_eq!(state.active_challenge.as_ref().unwrap().mode, "steady");
+        state.editor[0].push_str(" three four");
+        state.prompt = "challenge-finish".into();
+        state.command().unwrap();
+        assert_eq!(state.editor[0], "one two three four");
+        let challenges = state.app.list_writing_challenges().unwrap();
+        assert_eq!(challenges[0].words_written, Some(2));
+        assert_eq!(challenges[0].status, "completed");
+    }
+
+    #[test]
+    fn kamikaze_only_removes_a_word_after_opt_in_idle_period_and_undo_restores_it() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.editor = vec!["one two".into()];
+        state.cursor = (0, 7);
+        state.prompt = "challenge-start 10 60 kamikaze".into();
+        state.command().unwrap();
+        state.active_challenge.as_mut().unwrap().last_activity =
+            Instant::now() - Duration::from_secs(11);
+        assert!(state.tick_challenge().unwrap());
+        assert_eq!(state.editor[0], "one ");
+        state.undo_edit();
+        assert_eq!(state.editor[0], "one two");
     }
 
     #[test]
@@ -6435,6 +6793,9 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,
@@ -6522,7 +6883,9 @@ mod tests {
                 "scene.create",
                 "scene.subchapter",
                 "structure.section",
-                "structure.chapter"
+                "structure.chapter",
+                "edit.snippet-save",
+                "edit.snippet-insert"
             ]
         );
         handle(
@@ -6887,6 +7250,9 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,
@@ -6965,6 +7331,9 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,
@@ -7035,6 +7404,9 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,
@@ -7117,6 +7489,9 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,
@@ -7313,6 +7688,9 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,
@@ -7395,6 +7773,9 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,
@@ -7494,6 +7875,9 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,
@@ -7711,6 +8095,9 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,
@@ -8032,6 +8419,9 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,
@@ -8125,6 +8515,9 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,
@@ -8270,6 +8663,9 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            snippets: BTreeMap::new(),
+            registers: BTreeMap::new(),
+            active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
             active_reference: 0,

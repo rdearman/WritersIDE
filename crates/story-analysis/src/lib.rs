@@ -320,6 +320,133 @@ pub struct BudgetPreview {
     pub suggested_scene_targets: BTreeMap<String, u64>,
 }
 
+/// Explicit, read-only coverage expectations for story-planning reviews.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverageRequirement {
+    pub id: String,
+    pub label: String,
+    pub entity_id: String,
+    pub dimension: CoverageDimension,
+    pub minimum_scenes: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoverageDimension {
+    Character,
+    Plotline,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoverageResult {
+    pub requirement_id: String,
+    pub label: String,
+    pub matching_scene_ids: Vec<String>,
+    pub minimum_scenes: usize,
+    pub coverage_met: bool,
+}
+
+/// Evaluate author-defined coverage requirements without changing the manuscript.
+pub fn evaluate_coverage(
+    scenes: &[SceneAnalysisInput],
+    requirements: &[CoverageRequirement],
+) -> Vec<CoverageResult> {
+    requirements
+        .iter()
+        .map(|requirement| {
+            let matching = scenes
+                .iter()
+                .filter(|scene| match requirement.dimension {
+                    CoverageDimension::Character => scene
+                        .characters
+                        .iter()
+                        .any(|item| item.id == requirement.entity_id),
+                    CoverageDimension::Plotline => scene
+                        .plotlines
+                        .iter()
+                        .any(|item| item.id == requirement.entity_id),
+                })
+                .map(|scene| scene.scene_id.clone())
+                .collect::<BTreeSet<_>>();
+            CoverageResult {
+                requirement_id: requirement.id.clone(),
+                label: requirement.label.clone(),
+                matching_scene_ids: matching.iter().cloned().collect(),
+                minimum_scenes: requirement.minimum_scenes,
+                coverage_met: matching.len() >= requirement.minimum_scenes,
+            }
+        })
+        .collect()
+}
+
+/// A saved-query assertion is a declarative expectation over the current result set.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryAssertion {
+    AtLeast(usize),
+    AtMost(usize),
+    Exactly(usize),
+    NonEmpty,
+    Empty,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AssertionResult {
+    pub passed: bool,
+    pub actual: usize,
+    pub expectation: String,
+}
+
+pub fn evaluate_query_assertion(actual: usize, assertion: &QueryAssertion) -> AssertionResult {
+    let (passed, expectation) = match assertion {
+        QueryAssertion::AtLeast(n) => (actual >= *n, format!("at least {n}")),
+        QueryAssertion::AtMost(n) => (actual <= *n, format!("at most {n}")),
+        QueryAssertion::Exactly(n) => (actual == *n, format!("exactly {n}")),
+        QueryAssertion::NonEmpty => (actual > 0, "non-empty".into()),
+        QueryAssertion::Empty => (actual == 0, "empty".into()),
+    };
+    AssertionResult {
+        passed,
+        actual,
+        expectation,
+    }
+}
+
+#[cfg(test)]
+mod inspection_tests {
+    use super::*;
+
+    #[test]
+    fn coverage_and_query_assertions_are_read_only_and_report_gaps() {
+        let mut scenes = vec![SceneAnalysisInput {
+            scene_id: "s1".into(),
+            title: "One".into(),
+            chapter_id: None,
+            actual_words: 0,
+            target_words: None,
+            start_time: story_core::StoryTime::unknown(),
+            end_time: story_core::StoryTime::unknown(),
+            characters: vec![],
+            plotlines: vec![],
+        }];
+        scenes[0].characters.push(CharacterOnScene {
+            id: "c1".into(),
+            name: "Ada".into(),
+            role: ParticipationRole::Major,
+        });
+        let requirement = CoverageRequirement {
+            id: "arc-a".into(),
+            label: "Arc A appears".into(),
+            entity_id: "c1".into(),
+            dimension: CoverageDimension::Character,
+            minimum_scenes: 2,
+        };
+        let coverage = evaluate_coverage(&scenes, &[requirement]);
+        assert_eq!(coverage[0].matching_scene_ids, ["s1"]);
+        assert!(!coverage[0].coverage_met);
+        assert!(evaluate_query_assertion(1, &QueryAssertion::Exactly(1)).passed);
+        assert!(!evaluate_query_assertion(0, &QueryAssertion::NonEmpty).passed);
+    }
+}
+
 pub fn character_heatmap(scenes: &[SceneAnalysisInput]) -> Vec<HeatmapRow> {
     scenes
         .iter()

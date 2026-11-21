@@ -828,6 +828,29 @@ impl WriterApp {
     pub fn list_issues(&self) -> Result<Vec<story_storage::IssueSummary>> {
         Ok(self.store.list_issues()?)
     }
+    pub fn start_writing_challenge(
+        &mut self,
+        target_words: u32,
+        duration_seconds: u32,
+        mode: &str,
+    ) -> Result<String> {
+        Ok(self
+            .store
+            .start_writing_challenge(target_words, duration_seconds, mode)?)
+    }
+    pub fn finish_writing_challenge(
+        &mut self,
+        id: &str,
+        words_written: u32,
+        abandoned: bool,
+    ) -> Result<()> {
+        Ok(self
+            .store
+            .finish_writing_challenge(id, words_written, abandoned)?)
+    }
+    pub fn list_writing_challenges(&self) -> Result<Vec<story_storage::WritingChallengeRecord>> {
+        Ok(self.store.list_writing_challenges()?)
+    }
     pub fn list_characters(&self) -> Result<Vec<story_storage::CharacterSummary>> {
         Ok(self.store.list_characters()?)
     }

@@ -2,6 +2,139 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use thiserror::Error;
 use unicode_segmentation::UnicodeSegmentation;
+
+/// Expands a `${cursor}` marker while preserving its UTF-8 byte position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnippetExpansion {
+    pub text: String,
+    pub cursor_byte: usize,
+}
+
+pub fn expand_snippet(
+    source: &str,
+    values: &BTreeMap<String, String>,
+) -> Result<SnippetExpansion, String> {
+    let mut text = String::new();
+    let mut cursor_byte = None;
+    let mut rest = source;
+    while let Some(open) = rest.find("${") {
+        text.push_str(&rest[..open]);
+        rest = &rest[open + 2..];
+        let close = rest.find('}').ok_or("unterminated snippet placeholder")?;
+        let name = &rest[..close];
+        if name == "cursor" {
+            if cursor_byte.replace(text.len()).is_some() {
+                return Err("snippet has more than one cursor marker".into());
+            }
+        } else {
+            text.push_str(
+                values
+                    .get(name)
+                    .ok_or_else(|| format!("missing snippet value: {name}"))?,
+            );
+        }
+        rest = &rest[close + 1..];
+    }
+    text.push_str(rest);
+    let cursor_byte = cursor_byte.unwrap_or(text.len());
+    Ok(SnippetExpansion { text, cursor_byte })
+}
+
+/// Apply one insertion at each UTF-8 byte anchor. Anchors are interpreted against the original
+/// source and applied right-to-left, so earlier insertions cannot shift later anchors.
+pub fn insert_at_anchors(
+    source: &str,
+    anchors: &[usize],
+    insertion: &str,
+) -> Result<String, String> {
+    let mut ordered = anchors.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+    if ordered
+        .iter()
+        .any(|offset| !source.is_char_boundary(*offset))
+    {
+        return Err("multi-cursor anchor is not a UTF-8 boundary".into());
+    }
+    let mut result = source.to_owned();
+    for offset in ordered.into_iter().rev() {
+        result.insert_str(offset, insertion);
+    }
+    Ok(result)
+}
+
+/// A small replayable edit macro. Operations are intentionally data-only and can be recorded,
+/// persisted or dispatched by any frontend without depending on a terminal UI.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum EditMacroOp {
+    Insert(String),
+    Replace { from: String, to: String },
+    UppercaseSelection,
+    LowercaseSelection,
+}
+
+pub fn run_edit_macro(
+    source: &str,
+    selection: std::ops::Range<usize>,
+    operations: &[EditMacroOp],
+) -> Result<(String, std::ops::Range<usize>), String> {
+    if selection.start > selection.end
+        || selection.end > source.len()
+        || !source.is_char_boundary(selection.start)
+        || !source.is_char_boundary(selection.end)
+    {
+        return Err("invalid UTF-8 selection range".into());
+    }
+    let mut before = source[..selection.start].to_owned();
+    let mut selected = source[selection.clone()].to_owned();
+    let after = source[selection.end..].to_owned();
+    for operation in operations {
+        match operation {
+            EditMacroOp::Insert(text) => selected.push_str(text),
+            EditMacroOp::Replace { from, to } => selected = selected.replace(from, to),
+            EditMacroOp::UppercaseSelection => selected = selected.to_uppercase(),
+            EditMacroOp::LowercaseSelection => selected = selected.to_lowercase(),
+        }
+    }
+    let start = before.len();
+    before.push_str(&selected);
+    before.push_str(&after);
+    Ok((before, start..start + selected.len()))
+}
+
+#[cfg(test)]
+mod editor_tool_tests {
+    use super::*;
+    #[test]
+    fn snippets_support_unicode_fields_and_cursor_markers() {
+        let values = [("name".to_owned(), "Élodie".to_owned())]
+            .into_iter()
+            .collect();
+        let expanded = expand_snippet("Hello ${name}.${cursor}", &values).unwrap();
+        assert_eq!(expanded.text, "Hello Élodie.");
+        assert_eq!(&expanded.text[..expanded.cursor_byte], "Hello Élodie.");
+        assert!(expand_snippet("${missing}", &BTreeMap::new()).is_err());
+    }
+    #[test]
+    fn multi_cursor_insert_applies_right_to_left_at_utf8_boundaries() {
+        assert_eq!(insert_at_anchors("é ab", &[3, 0], "X").unwrap(), "Xé Xab");
+        assert!(insert_at_anchors("é", &[1], "x").is_err());
+    }
+    #[test]
+    fn edit_macros_transform_selection_without_touching_surrounding_text() {
+        let (text, range) = run_edit_macro(
+            "Say hello!",
+            4..9,
+            &[
+                EditMacroOp::UppercaseSelection,
+                EditMacroOp::Insert(" friend".into()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(text, "Say HELLO friend!");
+        assert_eq!(&text[range], "HELLO friend");
+    }
+}
 use uuid::Uuid;
 
 /// Counts Unicode word-boundary segments, independent of the operating system locale.

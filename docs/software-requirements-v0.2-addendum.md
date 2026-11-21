@@ -198,3 +198,15 @@ Existing stable-ID links, passage anchors, backlinks, broken-link checks, typed 
 ### Issue #9 — Chronology and structured relationships status
 
 Scenes and events use optional signed-integer `StoryTime` values with unknown/approximate/bounded precision, source labels, start/end values, and checked duration arithmetic. Character participation, scene-event links, locations, plotlines, and story links are separate relationships from manuscript placement. Timeline views and deterministic uncertainty-aware diagnostics distinguish definite overlaps, possible overlaps, unknown time, and adjacency. Full fictional-calendar display/entry tools and interactive multi-entity timeline editing remain open.
+
+## Phase 5 issue implementation notes
+
+Issue #14 now has UTF-8 safe snippet expansion, macro transforms, register save/insert, and multi-cursor insertion commands. Session snippets/registers are not persistent, and interactive cursor placement/recording remains outstanding.
+
+Issue #5 adds persisted challenge start/deadline/target/mode/results, terminal countdown and word-delta recording, and CLI controls. Challenge history supplies a basic session ledger; progress graphs and project-wide target reports remain open.
+
+Issue #15 adds read-only character/plotline scene coverage projections and saved-query count assertions exposed through `query-assert`. Coverage/assertion authoring UI and persistent assertion definitions remain outstanding.
+
+Issue #16 adds `compile-watch`, which recompiles on changes to project metadata, database or manuscript source while preserving the last successful output on failure. Assemblies support alternate editions; edition dictionaries and declarative build recipes remain outstanding.
+
+Issue #3 adds an in-editor timer and opt-in Kamikaze inactivity behavior. Kamikaze removes the previous word after ten seconds without typing; Undo restores it. Configuration and richer challenge modes remain open. Phase 5 is a partial implementation milestone, not full closure of the listed issues.

@@ -223,3 +223,27 @@ This is not full browser planning parity. Browser-side editing of characters, pl
 ## Issue #1 and Issue #9 status
 
 Stable-ID typed links, anchors, backlinks, broken-link scans, cycle-safe inclusions, Reading annotations/indexes, approved evidence-linked knowledge, signed integer chronology, uncertain event and scene ranges, and structured character/plot/location/event relationships are implemented in the preceding versioned design sections and existing migrations. Current acceptance is primarily exercised in `story-storage`, `story-app`, and terminal regression tests. This design revision does not replace those storage contracts.
+
+## Phase 5 — Optional enhancements implementation status
+
+### Issue #14 — Editing power tools foundation
+
+`story-core` now provides UTF-8-safe snippet expansion with named value substitution and a cursor marker, multi-cursor insertion at stable original byte offsets, and data-only edit macro operations for insertion, replacement and case conversion. The terminal command registry exposes `snippet`, `snippet-insert`, `register-save`, `register-insert`, `multi-insert`, and `macro`; macro changes are undoable. Session snippets and registers currently live only for the active terminal process. Interactive cursor-set management, persisted snippets/macros, recording macros from key events, and register rotation are not implemented.
+
+### Issue #5 — Writing challenges foundation
+
+Migration 0018 adds durable writing challenge records with target words, start/deadline, `steady` or explicitly requested `kamikaze` mode, completion status, and words written. App services validate and record start/completion; CLI commands are `challenge-start`, `challenge-finish`, and `challenge-list`. The terminal command palette provides an integrated countdown, records the open editor's word delta on finish or timeout, and can abandon a session. Explicit Kamikaze mode deletes the previous word after ten seconds without typing; the deletion is undoable and the normal journaled save remains in effect. Challenge history acts as a basic event ledger. Project-wide progress graphs and chapter/scene target progress views remain open.
+
+### Issue #15 — Advanced inspection foundation
+
+The analysis crate evaluates saved-query count assertions (`empty`, `non-empty`, `at-least`, `at-most`, and `exactly`) and read-only character/plotline scene-coverage requirements. CLI `query-assert` evaluates a saved query against the current project snapshot and returns a failing exit status when the assertion is unmet. Coverage results identify matching scene IDs, required minimum coverage and whether the requirement is met. Persistent assertion documents, coverage UI, arbitrary query expression evaluation and broader assertion operators remain open.
+
+### Issue #16 — Compile automation foundation
+
+CLI `compile-watch <project> <format> <output> [poll-ms]` fingerprints project metadata, SQLite database and manuscript files, compiling on initial launch and after changes. It excludes generated exports and application caches, preserves prior output if compilation fails, and writes the source map sidecar. Polling is local and dependency-free; the process stops through the normal interrupt signal. Existing manuscript assemblies provide alternate edition membership/order. Edition-specific dictionaries, configurable automation recipes, debounce tuning, and integrated terminal controls remain incomplete.
+
+### Issue #3 — Timed drafting status
+
+The terminal supports timed word-target sessions with steady mode and an explicit Kamikaze option. The countdown is visible in the footer; expiry records the word delta. Kamikaze deletes the previous word after ten seconds without typed input, supports Undo, and never runs unless selected when starting the session. The mode is stored durably. Configuration of inactivity threshold and richer challenge modes remains open.
+
+Phase 5 has not completed every feature in the issue roadmap. Interactive multi-cursor placement, durable editing-tool definitions, live writing graphs, coverage configuration UI, full dictionary support, and compile automation recipes remain deferred. The shipped APIs and schema are foundations, not substitutes for those remaining acceptance criteria.

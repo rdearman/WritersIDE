@@ -2309,6 +2309,7 @@ name = "writers-ide"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sha2",
  "story-analysis",
  "story-app",
  "story-core",

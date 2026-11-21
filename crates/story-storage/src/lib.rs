@@ -29,6 +29,7 @@ const MIGRATION_14: &str = include_str!("../migrations/0014_editorial_comments.s
 const MIGRATION_15: &str = include_str!("../migrations/0015_manuscript_assemblies.sql");
 const MIGRATION_16: &str = include_str!("../migrations/0016_planning_boards.sql");
 const MIGRATION_17: &str = include_str!("../migrations/0017_project_language.sql");
+const MIGRATION_18: &str = include_str!("../migrations/0018_writing_challenges.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -311,6 +312,17 @@ pub struct IssueSummary {
     pub status: String,
     pub scene_count: u32,
 }
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WritingChallengeRecord {
+    pub id: String,
+    pub started_at: i64,
+    pub deadline_at: i64,
+    pub target_words: u32,
+    pub mode: String,
+    pub ended_at: Option<i64>,
+    pub words_written: Option<u32>,
+    pub status: String,
+}
 #[derive(Clone, Debug)]
 pub struct ReadingDocumentRecord {
     pub id: ReadingId,
@@ -514,6 +526,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_15}\nINSERT INTO schema_migrations(version,applied_at) VALUES(15,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_16}\nINSERT INTO schema_migrations(version,applied_at) VALUES(16,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_17}\nINSERT INTO schema_migrations(version,applied_at) VALUES(17,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
@@ -556,7 +569,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 17 {
+        if version > 18 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -625,6 +638,10 @@ impl ProjectStore {
         }
         if current_version == 16 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_17}\nINSERT INTO schema_migrations(version,applied_at) VALUES(17,'{}');\nCOMMIT;", now()))?;
+            current_version = 17;
+        }
+        if current_version == 17 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -4487,6 +4504,61 @@ impl ProjectStore {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
     }
+    pub fn start_writing_challenge(
+        &mut self,
+        target_words: u32,
+        duration_seconds: u32,
+        mode: &str,
+    ) -> Result<String> {
+        if target_words == 0 || duration_seconds == 0 || !matches!(mode, "steady" | "kamikaze") {
+            return Err(StorageError::Invalid(
+                "challenge requires positive target and duration and mode steady|kamikaze".into(),
+            ));
+        }
+        let started = unix_now();
+        let deadline = started
+            .checked_add(i64::from(duration_seconds))
+            .ok_or_else(|| StorageError::Invalid("challenge deadline overflow".into()))?;
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "UPDATE writing_challenge SET status='abandoned' WHERE status='active'",
+            [],
+        )?;
+        self.conn.execute("INSERT INTO writing_challenge(id,started_at,deadline_at,target_words,mode,status) VALUES(?1,?2,?3,?4,?5,'active')", params![id,started,deadline,target_words,mode])?;
+        Ok(id)
+    }
+    pub fn finish_writing_challenge(
+        &mut self,
+        id: &str,
+        words_written: u32,
+        abandoned: bool,
+    ) -> Result<()> {
+        let status = if abandoned { "abandoned" } else { "completed" };
+        let changed = self.conn.execute("UPDATE writing_challenge SET ended_at=?2,words_written=?3,status=?4 WHERE id=?1 AND status='active'", params![id,unix_now(),words_written,status])?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!(
+                "active writing challenge {id}"
+            )));
+        }
+        Ok(())
+    }
+    pub fn list_writing_challenges(&self) -> Result<Vec<WritingChallengeRecord>> {
+        let mut query = self.conn.prepare("SELECT id,started_at,deadline_at,target_words,mode,ended_at,words_written,status FROM writing_challenge ORDER BY started_at DESC")?;
+        let rows = query.query_map([], |row| {
+            Ok(WritingChallengeRecord {
+                id: row.get(0)?,
+                started_at: row.get(1)?,
+                deadline_at: row.get(2)?,
+                target_words: row.get(3)?,
+                mode: row.get(4)?,
+                ended_at: row.get(5)?,
+                words_written: row.get(6)?,
+                status: row.get(7)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
     pub fn create_issue(&mut self, title: &str) -> Result<IssueId> {
         let id = IssueId::new();
         self.conn.execute(
@@ -5983,6 +6055,13 @@ fn now() -> String {
             .as_secs()
     )
 }
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .min(i64::MAX as u64) as i64
+}
 fn hash_bytes(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
 }
@@ -6648,6 +6727,32 @@ fn query_ref_ids(conn: &Connection, field: FieldId, value: &str) -> Result<Vec<S
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn writing_challenges_are_validated_persisted_and_completed_once() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        assert!(store.start_writing_challenge(0, 60, "steady").is_err());
+        assert!(store.start_writing_challenge(100, 0, "steady").is_err());
+        let id = store
+            .start_writing_challenge(500, 3600, "kamikaze")
+            .unwrap();
+        let row = store.list_writing_challenges().unwrap().remove(0);
+        assert_eq!(row.target_words, 500);
+        assert_eq!(row.status, "active");
+        store.finish_writing_challenge(&id, 120, false).unwrap();
+        assert_eq!(
+            store.list_writing_challenges().unwrap()[0].words_written,
+            Some(120)
+        );
+        assert!(store.finish_writing_challenge(&id, 120, false).is_err());
+        drop(store);
+        let reopened = ProjectStore::open(project).unwrap();
+        assert_eq!(
+            reopened.list_writing_challenges().unwrap()[0].status,
+            "completed"
+        );
+    }
     #[test]
     fn spatial_planning_board_keeps_positions_separate_from_manuscript_order() {
         let d = tempdir().unwrap();
@@ -7669,7 +7774,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -7679,7 +7784,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 17);
+        assert_eq!(version, 18);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -7708,7 +7813,7 @@ mod tests {
 
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch(
-            "DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
+            "DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
              DROP TRIGGER story_link_source_exists_insert;
              DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update;
              DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update;
