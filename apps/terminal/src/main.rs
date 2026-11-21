@@ -182,6 +182,10 @@ struct AppState {
     reference_layout: ReferenceLayout,
     reference_panes_hidden: bool,
     reference_swapped: bool,
+    selected_series_root: Option<PathBuf>,
+    series_reference_view: bool,
+    series_references: Vec<SeriesReferenceRow>,
+    scrivener_import: Option<ScrivenerImportWizard>,
 }
 
 #[derive(Clone, Debug)]
@@ -246,6 +250,23 @@ struct ReferencePane {
     cursor: (usize, usize),
 }
 
+#[derive(Clone, Debug)]
+struct SeriesReferenceRow {
+    book_title: String,
+    document_title: String,
+    source_key: String,
+    content: String,
+}
+
+#[derive(Clone, Debug)]
+struct ScrivenerImportWizard {
+    series_root: PathBuf,
+    folder_name: String,
+    book_title: String,
+    inventory: story_import::ScrivenerProjectInventory,
+    plan: story_import::ScrivenerImportPlan,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 enum ReferenceLayout {
     #[default]
@@ -288,8 +309,8 @@ struct MenuState {
     selected: usize,
 }
 
-const MENU_CATEGORIES: [&str; 9] = [
-    "File", "Edit", "Insert", "Scene", "Plot", "View", "Compile", "Tools", "Help",
+const MENU_CATEGORIES: [&str; 10] = [
+    "File", "Edit", "Insert", "Scene", "Plot", "Series", "View", "Compile", "Tools", "Help",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2085,6 +2106,62 @@ fn command_registry() -> Vec<CommandSpec> {
             "story-profile-import",
             true,
         ),
+        legacy_command(
+            "series.open",
+            "Open Series Books",
+            "Show books in the selected or current series; Enter opens a book",
+            "Series",
+            "series-open",
+            false,
+        ),
+        legacy_command(
+            "series.create",
+            "Create Series",
+            "Create a portable series: series-create <directory> | <title>",
+            "Series",
+            "series-create",
+            true,
+        ),
+        legacy_command(
+            "series.select",
+            "Select Series",
+            "Open a series by directory: series-select <series-directory>",
+            "Series",
+            "series-select",
+            true,
+        ),
+        legacy_command(
+            "series.add-current",
+            "Add Current Book to Series",
+            "Register this project in the selected series with a book title",
+            "Series",
+            "series-add-current",
+            true,
+        ),
+        legacy_command(
+            "series.import-scrivener",
+            "Import Scrivener Book into Series",
+            "Preview and map a read-only Scrivener source: series-import <source> | <folder> | <title>",
+            "Series",
+            "series-import",
+            true,
+        ),
+        legacy_command(
+            "series.new-book",
+            "New Book in Series",
+            "Create and open a separate book: series-new-book <folder> | <title>",
+            "Series",
+            "series-new-book",
+            true,
+        ),
+        legacy_command(
+            "series.references",
+            "Read Series References",
+            "Browse imported research and notes from all member books as read-only references",
+            "Series",
+            "series-references",
+            false,
+        ),
     ]);
     commands
 }
@@ -2152,6 +2229,7 @@ fn menu_category(category: &str) -> &'static str {
         "Insert" => "Insert",
         "Scene" => "Scene",
         "Plot" => "Plot",
+        "Series" => "Series",
         "View" => "View",
         "Compile" => "Compile",
         "Help" => "Help",
@@ -3082,6 +3160,10 @@ impl AppState {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings,
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -3875,7 +3957,7 @@ impl AppState {
         if self.active_challenge.is_some() {
             return Err("finish or quit the active writing challenge before changing books".into());
         }
-        let books = current_series_books(&self.app)?;
+        let books = self.series_books()?;
         let (book, path) = books
             .get(self.selected)
             .cloned()
@@ -3885,6 +3967,35 @@ impl AppState {
             return Ok(());
         }
 
+        self.switch_to_project(path, format!("Opened series book: {}", book.title))
+    }
+    fn series_root(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        if let Some(root) = self.selected_series_root.as_ref() {
+            story_series::SeriesStore::open(root)?;
+            return Ok(root.clone());
+        }
+        let (series, _) = story_series::SeriesStore::open_for_book(self.app.project_root())?;
+        Ok(series.root().to_owned())
+    }
+    fn series_books(
+        &self,
+    ) -> Result<Vec<(story_series::SeriesBook, PathBuf)>, Box<dyn std::error::Error>> {
+        if let Some(root) = self.selected_series_root.as_deref() {
+            return series_books_at(root);
+        }
+        current_series_books(&self.app)
+    }
+    fn switch_to_project(
+        &mut self,
+        path: PathBuf,
+        notice: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err("save the current manuscript buffer before changing books".into());
+        }
+        if self.active_challenge.is_some() {
+            return Err("finish or quit the active writing challenge before changing books".into());
+        }
         self.save_session()?;
         let function_bindings = load_bindings(&path)?;
         let command_bindings = load_command_bindings(&path)?;
@@ -3892,10 +4003,244 @@ impl AppState {
         app.recover_interrupted_writing_challenges()?;
         let mut next = Self::new(app, function_bindings);
         next.command_bindings = command_bindings;
+        next.selected_series_root = story_series::SeriesStore::open_for_book(&path)
+            .ok()
+            .map(|(series, _)| series.root().to_owned());
         next.restore_session()?;
         next.refresh()?;
-        next.message = format!("Opened series book: {}", book.title);
+        next.message = notice;
         *self = next;
+        Ok(())
+    }
+    fn start_scrivener_import(
+        &mut self,
+        source: PathBuf,
+        folder_name: String,
+        book_title: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let series_root = self.series_root()?;
+        validate_series_folder_name(&folder_name)?;
+        let destination = series_root.join(&folder_name);
+        if destination.exists() {
+            return Err("book folder already exists in this series".into());
+        }
+        let inventory = story_import::inspect_scrivener_project(&source)?;
+        let plan = story_import::ScrivenerImportPlan::proposed(&inventory);
+        let item_count = inventory.items.len();
+        self.scrivener_import = Some(ScrivenerImportWizard {
+            series_root,
+            folder_name,
+            book_title,
+            inventory,
+            plan,
+        });
+        self.series_reference_view = false;
+        self.selected = 0;
+        self.workspace = Workspace::Series;
+        self.message = format!(
+            "Scrivener preview: {item_count} binder items · ←/→ map selected item · Space include/skip · Ctrl-Enter import · Esc cancel"
+        );
+        Ok(())
+    }
+    fn cycle_scrivener_mapping(&mut self, direction: i8) -> Result<(), Box<dyn std::error::Error>> {
+        use story_import::ScrivenerDestinationKind as Kind;
+        let kinds = [
+            Kind::Unmapped,
+            Kind::Section,
+            Kind::Chapter,
+            Kind::Scene,
+            Kind::Research,
+            Kind::Skip,
+        ];
+        let Some(wizard) = self.scrivener_import.as_mut() else {
+            return Ok(());
+        };
+        let Some(item) = wizard.inventory.items.get(self.selected) else {
+            return Ok(());
+        };
+        let decision = wizard
+            .plan
+            .decisions
+            .iter_mut()
+            .find(|decision| decision.source_document_id == item.source_document_id)
+            .ok_or("selected binder item has no mapping decision")?;
+        let index = kinds
+            .iter()
+            .position(|kind| *kind == decision.destination_kind)
+            .ok_or("unknown Scrivener destination mapping")? as i8;
+        let next = (index + direction).rem_euclid(kinds.len() as i8) as usize;
+        decision.destination_kind = kinds[next];
+        decision.include_in_import = kinds[next] != Kind::Skip;
+        self.message = format!(
+            "Mapped selected binder item to {:?}; review the preview and any parent/child mapping warnings",
+            kinds[next]
+        );
+        Ok(())
+    }
+    fn toggle_scrivener_inclusion(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(wizard) = self.scrivener_import.as_mut() else {
+            return Ok(());
+        };
+        let Some(item) = wizard.inventory.items.get(self.selected) else {
+            return Ok(());
+        };
+        let decision = wizard
+            .plan
+            .decisions
+            .iter_mut()
+            .find(|decision| decision.source_document_id == item.source_document_id)
+            .ok_or("selected binder item has no mapping decision")?;
+        decision.include_in_import = !decision.include_in_import;
+        self.message = if decision.include_in_import {
+            "Selected binder item will be imported; its destination mapping still applies".into()
+        } else {
+            "Selected binder item will be excluded from the editable import; Both mode retains the source".into()
+        };
+        Ok(())
+    }
+    fn commit_scrivener_import(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err(
+                "save the current manuscript buffer before importing or opening another book"
+                    .into(),
+            );
+        }
+        if self.active_challenge.is_some() {
+            return Err(
+                "finish or quit the active writing challenge before importing a book".into(),
+            );
+        }
+        let wizard = self
+            .scrivener_import
+            .as_ref()
+            .ok_or("no Scrivener import preview is open")?;
+        wizard.plan.validate_for_import(&wizard.inventory)?;
+        let preview = wizard.plan.preview(&wizard.inventory)?;
+        if !preview.unresolved_source_ids.is_empty() {
+            return Err(format!(
+                "{} binder item(s) remain unmapped; adjust the preview before importing",
+                preview.unresolved_source_ids.len()
+            )
+            .into());
+        }
+        let series_root = wizard.series_root.clone();
+        let source_fingerprint = wizard.inventory.source_fingerprint.clone();
+        let folder_name = wizard.folder_name.clone();
+        let title = wizard.book_title.clone();
+        let inventory = wizard.inventory.clone();
+        let plan = wizard.plan.clone();
+        let destination = series_root.join(&folder_name);
+        if destination.exists() {
+            return Err(
+                "book folder appeared after preview; import cancelled without overwriting it"
+                    .into(),
+            );
+        }
+        let staging = tempfile::tempdir_in(&series_root)?;
+        let staging_project = staging.path().join("book");
+        let mut app = WriterApp::create_project(&staging_project, &title)?;
+        let (run, scenes) = app.import_scrivener_inventory(
+            &inventory,
+            &plan,
+            story_import::ScrivenerImportMode::Both,
+        )?;
+        app.validate_project()?;
+        let report = serde_json::json!({
+            "inventory": inventory,
+            "plan": plan,
+            "import_run": app.get_import_run_summary(run)?,
+            "imported_scene_ids": scenes,
+            "reference_mode": "both"
+        });
+        write_json_atomically(
+            &staging_project.join("exports/scrivener-import-report.json"),
+            &report,
+        )?;
+        let project_id = app.get_project()?.id;
+        drop(app);
+        fs::rename(&staging_project, &destination)?;
+        let mut series = story_series::SeriesStore::open(&series_root)?;
+        if let Err(error) =
+            series.add_book(project_id, &destination, &title, Some(&source_fingerprint))
+        {
+            if series.book_for_project(project_id)?.is_none() {
+                let _ = fs::remove_dir_all(&destination);
+            }
+            return Err(error.into());
+        }
+        self.scrivener_import = None;
+        self.selected_series_root = Some(series_root);
+        self.switch_to_project(
+            destination,
+            format!("Imported {title} into the selected series"),
+        )
+    }
+    fn create_series_book(
+        &mut self,
+        folder_name: &str,
+        title: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err(
+                "save the current manuscript buffer before creating or opening another book".into(),
+            );
+        }
+        if self.active_challenge.is_some() {
+            return Err(
+                "finish or quit the active writing challenge before creating a book".into(),
+            );
+        }
+        let series_root = self.series_root()?;
+        validate_series_folder_name(folder_name)?;
+        let destination = series_root.join(folder_name);
+        if destination.exists() {
+            return Err("book folder already exists in this series".into());
+        }
+        let mut series = story_series::SeriesStore::open(&series_root)?;
+        let app = WriterApp::create_project(&destination, title)?;
+        let project_id = app.get_project()?.id;
+        drop(app);
+        match series.add_book(project_id, &destination, title, None) {
+            Ok(book) => self.switch_to_project(
+                destination,
+                format!("Created and opened {} in the selected series", book.title),
+            ),
+            Err(error) => {
+                if series.book_for_project(project_id)?.is_none() {
+                    let _ = fs::remove_dir_all(&destination);
+                }
+                Err(error.into())
+            }
+        }
+    }
+    fn list_series_references(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let root = self.series_root()?;
+        let series = story_series::SeriesStore::open(&root)?;
+        let mut references = Vec::new();
+        for book in series.list_books()? {
+            let book_root = root.join(&book.relative_path);
+            if !book_root.is_dir() {
+                continue;
+            }
+            let app = WriterApp::open_project(&book_root)?;
+            for document in app.list_reading_documents()? {
+                references.push(SeriesReferenceRow {
+                    book_title: book.title.clone(),
+                    document_title: document.title,
+                    source_key: format!("series-reference:{}:{}", book.id, document.id),
+                    content: document.extracted_text,
+                });
+            }
+        }
+        self.series_references = references;
+        self.series_reference_view = true;
+        self.scrivener_import = None;
+        self.selected = 0;
+        self.workspace = Workspace::Series;
+        self.message = format!(
+            "{} read-only references across series books · Enter opens the selected reference · series-open returns to books",
+            self.series_references.len()
+        );
         Ok(())
     }
     fn active_scene(&self) -> Option<SceneId> {
@@ -5484,6 +5829,80 @@ impl AppState {
         &mut self,
         cmd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if cmd == "series-open" {
+            self.scrivener_import = None;
+            self.series_reference_view = false;
+            self.selected = 0;
+            self.switch(Workspace::Series);
+            self.message = "Series Books · Enter opens a book · Ctrl+/ → Series for create/import/reference actions".into();
+            return Ok(());
+        }
+        if let Some(arguments) = cmd.strip_prefix("series-create ") {
+            let fields =
+                parse_pipe_fields(arguments, 2, "use series-create <directory> | <title>")?;
+            let root = PathBuf::from(fields[0]);
+            let series = story_series::SeriesStore::create(&root, fields[1])?;
+            self.selected_series_root = Some(series.root().to_owned());
+            self.series_reference_view = false;
+            self.scrivener_import = None;
+            self.selected = 0;
+            self.switch(Workspace::Series);
+            self.message = format!(
+                "Created series '{}' · import books or create Book 3 from the Series menu",
+                series.title()
+            );
+            return Ok(());
+        }
+        if let Some(root) = cmd.strip_prefix("series-select ") {
+            let root = PathBuf::from(root.trim());
+            let series = story_series::SeriesStore::open(&root)?;
+            self.selected_series_root = Some(series.root().to_owned());
+            self.series_reference_view = false;
+            self.scrivener_import = None;
+            self.selected = 0;
+            self.switch(Workspace::Series);
+            self.message = format!("Selected series '{}' · Enter opens a book", series.title());
+            return Ok(());
+        }
+        if let Some(title) = cmd.strip_prefix("series-add-current ") {
+            let root = self.series_root()?;
+            let project_id = self.app.get_project()?.id;
+            let mut series = story_series::SeriesStore::open(&root)?;
+            let book = series.add_book(project_id, self.app.project_root(), title.trim(), None)?;
+            self.selected_series_root = Some(root);
+            self.series_reference_view = false;
+            self.scrivener_import = None;
+            self.selected = 0;
+            self.switch(Workspace::Series);
+            self.message = format!("Added current project as '{}'", book.title);
+            return Ok(());
+        }
+        if let Some(arguments) = cmd.strip_prefix("series-import ") {
+            let fields = parse_pipe_fields(
+                arguments,
+                3,
+                "use series-import <.scriv path> | <book folder> | <book title>",
+            )?;
+            self.start_scrivener_import(
+                PathBuf::from(fields[0]),
+                fields[1].to_owned(),
+                fields[2].to_owned(),
+            )?;
+            return Ok(());
+        }
+        if let Some(arguments) = cmd.strip_prefix("series-new-book ") {
+            let fields = parse_pipe_fields(
+                arguments,
+                2,
+                "use series-new-book <book folder> | <book title>",
+            )?;
+            self.create_series_book(fields[0], fields[1])?;
+            return Ok(());
+        }
+        if cmd == "series-references" {
+            self.list_series_references()?;
+            return Ok(());
+        }
         if cmd == "tags-export" {
             let path = self.app.export_emacs_tags()?;
             self.message = format!(
@@ -12600,6 +13019,101 @@ fn outline_rows(s: &AppState) -> Vec<OutlineRow> {
 }
 
 fn workspace_items(s: &AppState) -> Vec<String> {
+    if s.workspace == Workspace::Series {
+        if let Some(wizard) = s.scrivener_import.as_ref() {
+            return wizard
+                .inventory
+                .items
+                .iter()
+                .map(|item| {
+                    let parent = item
+                        .parent_source_id
+                        .as_deref()
+                        .and_then(|id| {
+                            wizard
+                                .inventory
+                                .items
+                                .iter()
+                                .find(|candidate| candidate.source_document_id == id)
+                        })
+                        .map(|item| format!("{} / ", item.title))
+                        .unwrap_or_default();
+                    let decision =
+                        wizard.plan.decisions.iter().find(|decision| {
+                            decision.source_document_id == item.source_document_id
+                        });
+                    let mapping = decision.map_or("unmapped", |decision| {
+                        if !decision.include_in_import {
+                            "excluded"
+                        } else {
+                            match decision.destination_kind {
+                                story_import::ScrivenerDestinationKind::Unmapped => "unmapped",
+                                story_import::ScrivenerDestinationKind::Section => "section",
+                                story_import::ScrivenerDestinationKind::Chapter => "chapter",
+                                story_import::ScrivenerDestinationKind::Scene => "scene",
+                                story_import::ScrivenerDestinationKind::Research => "research",
+                                story_import::ScrivenerDestinationKind::Skip => "skip",
+                            }
+                        }
+                    });
+                    format!(
+                        "{}{} · {} · {} · {} chars · {}",
+                        parent,
+                        if item.title.is_empty() {
+                            "(untitled binder item)"
+                        } else {
+                            &item.title
+                        },
+                        item.type_code.as_deref().unwrap_or("unknown type"),
+                        mapping,
+                        item.content_markdown
+                            .as_ref()
+                            .map_or(0, |text| text.chars().count()),
+                        if item.unsupported.is_empty() {
+                            "no item-level warnings".to_owned()
+                        } else {
+                            format!("{} fidelity warning(s)", item.unsupported.len())
+                        }
+                    )
+                })
+                .collect();
+        }
+        if s.series_reference_view {
+            return s
+                .series_references
+                .iter()
+                .map(|reference| {
+                    format!(
+                        "{} · {} · {} characters · read-only",
+                        reference.book_title,
+                        reference.document_title,
+                        reference.content.chars().count()
+                    )
+                })
+                .collect();
+        }
+        let current_project = s.app.get_project().ok().map(|project| project.id);
+        return match s.series_books() {
+            Ok(books) if books.is_empty() => vec![
+                "No books in this series · use Ctrl+/ → Series → Import Scrivener Book or New Book"
+                    .into(),
+            ],
+            Ok(books) => books
+                .into_iter()
+                .map(|(book, path)| {
+                    let current = if Some(book.project_id) == current_project {
+                        " · open"
+                    } else {
+                        ""
+                    };
+                    format!("{}{} · {}", book.title, current, path.display())
+                })
+                .collect(),
+            Err(_) => vec![
+                "No series selected · use Ctrl+/ → Series → Select Series or Create Series".into(),
+            ],
+        };
+    }
     match s.workspace {
         Workspace::Dashboard => vec![
             format!("{} scenes", s.scenes.len()),
@@ -12886,32 +13400,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 format!("{} · {} content items", assembly.title, count)
             })
             .collect(),
-        Workspace::Series => {
-            let current_project = s.app.get_project().ok().map(|project| project.id);
-            match current_series_books(&s.app) {
-                Ok(books) if books.is_empty() => {
-                    vec!["This series has no registered books".into()]
-                }
-                Ok(books) => books
-                    .into_iter()
-                    .map(|(book, path)| {
-                        let current = if Some(book.project_id) == current_project {
-                            " · open"
-                        } else {
-                            ""
-                        };
-                        format!(
-                            "{} · {}{} · {}",
-                            book.title,
-                            book.id,
-                            current,
-                            path.display()
-                        )
-                    })
-                    .collect(),
-                Err(_) => vec!["This book is not linked to an available series".into()],
-            }
-        }
+        Workspace::Series => unreachable!("series workspace rows are rendered above"),
         Workspace::PlanningBoards => {
             if let Some(board) = s.planning_board_id {
                 s.app
@@ -12941,6 +13430,13 @@ fn current_series_books(
     app: &WriterApp,
 ) -> Result<Vec<(story_series::SeriesBook, PathBuf)>, Box<dyn std::error::Error>> {
     let (series, _) = story_series::SeriesStore::open_for_book(app.project_root())?;
+    series_books_at(series.root())
+}
+
+fn series_books_at(
+    root: &Path,
+) -> Result<Vec<(story_series::SeriesBook, PathBuf)>, Box<dyn std::error::Error>> {
+    let series = story_series::SeriesStore::open(root)?;
     let root = series.root().to_owned();
     series
         .list_books()?
@@ -12950,6 +13446,46 @@ fn current_series_books(
             Ok((book, path))
         })
         .collect()
+}
+
+fn validate_series_folder_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(name);
+    if name.is_empty()
+        || path.components().count() != 1
+        || !path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err("book folder must be a single normal path name".into());
+    }
+    Ok(())
+}
+
+fn parse_pipe_fields<'a>(
+    input: &'a str,
+    expected: usize,
+    usage: &str,
+) -> Result<Vec<&'a str>, Box<dyn std::error::Error>> {
+    let values = input.split('|').map(str::trim).collect::<Vec<_>>();
+    if values.len() != expected || values.iter().any(|value| value.is_empty()) {
+        return Err(usage.into());
+    }
+    Ok(values)
+}
+
+fn write_json_atomically(
+    path: &Path,
+    value: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let parent = path.parent().ok_or("JSON output path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    temporary.write_all(&serde_json::to_vec_pretty(value)?)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 fn writing_goal_graph_rows(app: &WriterApp) -> Vec<String> {
@@ -14578,6 +15114,43 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         return Ok(false);
     }
+    if s.workspace == Workspace::Series && s.scrivener_import.is_some() {
+        match k.code {
+            KeyCode::Esc => {
+                s.scrivener_import = None;
+                s.selected = 0;
+                s.message =
+                    "Scrivener import preview cancelled; the source and series were not changed"
+                        .into();
+                return Ok(false);
+            }
+            KeyCode::Left => {
+                if let Err(error) = s.cycle_scrivener_mapping(-1) {
+                    s.message = error.to_string();
+                }
+                return Ok(false);
+            }
+            KeyCode::Right => {
+                if let Err(error) = s.cycle_scrivener_mapping(1) {
+                    s.message = error.to_string();
+                }
+                return Ok(false);
+            }
+            KeyCode::Char(' ') if k.modifiers.is_empty() => {
+                if let Err(error) = s.toggle_scrivener_inclusion() {
+                    s.message = error.to_string();
+                }
+                return Ok(false);
+            }
+            KeyCode::Enter if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Err(error) = s.commit_scrivener_import() {
+                    s.message = error.to_string();
+                }
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
     match k.code {
         KeyCode::F(n) if (1..=14).contains(&n) => {
             if let Some((_, workspace)) =
@@ -14705,6 +15278,23 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.message = "No manuscript assembly selected".into();
             }
         }
+        KeyCode::Enter if s.workspace == Workspace::Series && s.scrivener_import.is_some() => {}
+        KeyCode::Enter if s.workspace == Workspace::Series && s.series_reference_view => {
+            if let Some(reference) = s.series_references.get(s.selected).cloned() {
+                s.open_reference_buffer(
+                    reference.source_key,
+                    None,
+                    format!(
+                        "{} · {} (read-only series reference)",
+                        reference.book_title, reference.document_title
+                    ),
+                    reference.content,
+                );
+                s.reference_focused = true;
+            } else {
+                s.message = "No series reference selected".into();
+            }
+        }
         KeyCode::Enter if s.workspace == Workspace::Series => match s.open_series_book() {
             Ok(()) => {}
             Err(error) => s.message = error.to_string(),
@@ -14748,6 +15338,151 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn series_commands_are_registered_in_the_shared_dispatcher() {
+        let commands = command_registry();
+        for id in [
+            "series.open",
+            "series.create",
+            "series.select",
+            "series.add-current",
+            "series.import-scrivener",
+            "series.new-book",
+            "series.references",
+        ] {
+            let command = commands.iter().find(|command| command.id == id).unwrap();
+            assert_eq!(command.category, "Series");
+            assert!(matches!(command.action, CommandAction::LegacyPalette));
+        }
+    }
+
+    #[test]
+    fn series_menu_commands_create_select_and_open_a_new_book() {
+        let root = tempfile::tempdir().unwrap();
+        let initial = WriterApp::create_project(root.path().join("Initial"), "Initial").unwrap();
+        let mut state = AppState::new(initial, default_bindings());
+        let series_path = root.path().join("Series");
+        state
+            .execute_legacy_palette_command(&format!(
+                "series-create {} | The Example Series",
+                series_path.display()
+            ))
+            .unwrap();
+        assert!(series_path.join("series.db").is_file());
+        state
+            .execute_legacy_palette_command("series-new-book Book-03 | Book 3")
+            .unwrap();
+        assert_eq!(state.app.get_project().unwrap().title, "Book 3");
+        assert_eq!(state.app.project_root(), series_path.join("Book-03"));
+        state.workspace = Workspace::Series;
+        let rows = workspace_items(&state);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("Book 3"));
+    }
+
+    #[test]
+    fn sanitized_scrivener_series_wizard_previews_maps_and_imports_without_touching_source() {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../cli/tests/fixtures/scrivener-windows-311/Windows Regression.scriv");
+        let root = tempfile::tempdir().unwrap();
+        let series_root = root.path().join("Series");
+        story_series::SeriesStore::create(&series_root, "Series").unwrap();
+        let initial = WriterApp::create_project(root.path().join("Initial"), "Initial").unwrap();
+        let mut state = AppState::new(initial, default_bindings());
+        state.selected_series_root = Some(series_root.clone());
+        let source_before = story_import::inspect_scrivener_project(&fixture)
+            .unwrap()
+            .source_fingerprint;
+        state
+            .start_scrivener_import(fixture.clone(), "Book-01".into(), "Book One".into())
+            .unwrap();
+        assert_eq!(state.workspace, Workspace::Series);
+        assert!(!workspace_items(&state).is_empty());
+
+        use story_import::ScrivenerDestinationKind as Kind;
+        let mapping_items = state
+            .scrivener_import
+            .as_ref()
+            .unwrap()
+            .inventory
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.source_document_id.clone(),
+                    item.type_code.clone(),
+                    item.area.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (source_document_id, type_code, area) in mapping_items {
+            let decision = state
+                .scrivener_import
+                .as_mut()
+                .unwrap()
+                .plan
+                .decisions
+                .iter_mut()
+                .find(|decision| decision.source_document_id == source_document_id)
+                .unwrap();
+            match type_code.as_deref() {
+                Some("DraftFolder") => decision.destination_kind = Kind::Unmapped,
+                Some("Text") if area == "manuscript" => {
+                    decision.destination_kind = Kind::Scene;
+                }
+                Some("ResearchFolder") => decision.destination_kind = Kind::Research,
+                _ => {
+                    decision.destination_kind = Kind::Skip;
+                    decision.include_in_import = false;
+                }
+            }
+        }
+        let draft_index = state
+            .scrivener_import
+            .as_ref()
+            .unwrap()
+            .inventory
+            .items
+            .iter()
+            .position(|item| item.type_code.as_deref() == Some("DraftFolder"))
+            .unwrap();
+        state.selected = draft_index;
+        while state.scrivener_import.as_ref().unwrap().plan.decisions[draft_index].destination_kind
+            != Kind::Chapter
+        {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(state.scrivener_import.is_none());
+        assert_eq!(state.app.get_project().unwrap().title, "Book One");
+        assert_eq!(state.app.list_scenes(false).unwrap().len(), 1);
+        let scene = state.app.list_scenes(false).unwrap().remove(0).scene.id;
+        let text = state.app.load_scene_text(scene).unwrap().0;
+        assert!(text.contains("**bold**"));
+        assert!(text.contains("*italic*"));
+        assert_eq!(
+            story_import::inspect_scrivener_project(&fixture)
+                .unwrap()
+                .source_fingerprint,
+            source_before
+        );
+        let report = state
+            .app
+            .project_root()
+            .join("exports/scrivener-import-report.json");
+        assert!(report.is_file());
+        let series = story_series::SeriesStore::open(&series_root).unwrap();
+        assert_eq!(series.list_books().unwrap().len(), 1);
+    }
 
     #[test]
     fn series_workspace_lists_member_books_and_enter_opens_the_selected_book() {
@@ -16562,6 +17297,10 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -16661,7 +17400,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
         )
         .unwrap();
-        assert_eq!(state.menu.unwrap().top, 5);
+        assert_eq!(state.menu.unwrap().top, 6);
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -18675,6 +19414,10 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -18782,6 +19525,10 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -18881,6 +19628,10 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -18992,6 +19743,10 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -19253,6 +20008,10 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -19364,6 +20123,10 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -19492,6 +20255,10 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -19738,6 +20505,10 @@ mod tests {
             reading_offset: 0,
             reading_focus: true,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -20115,6 +20886,10 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -20237,6 +21012,10 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -20411,6 +21190,10 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            selected_series_root: None,
+            series_reference_view: false,
+            series_references: Vec::new(),
+            scrivener_import: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,

@@ -97,3 +97,7 @@ The actual Windows 3.1.1.0 project passes the tested read-only discovery,
 explicit mapping, staged `Both` import, source immutability, editable scene
 save/reopen, search, and EPUB smoke path. Compatibility remains experimental
 and bounded to the tested project structure and preserved formatting subset.
+
+## Terminal workflow follow-up
+
+The terminal Series menu now exposes series creation and selection, current-book registration, Scrivener import, new-book creation, and read-only series references through the central command registry. The mapping screen lets the author inspect each binder item and adjust its destination or inclusion before import. Commit validates the mapping and refuses unsaved manuscript buffers or active writing challenges before creating staging data. A sanitized-fixture terminal integration test covers preview, mapping, import, series registration, imported emphasis, and source fingerprint preservation. The actual author-provided project remains covered by the separate read-only importer integration test described above; it is not copied into terminal regression fixtures or Git.
