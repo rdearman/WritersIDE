@@ -1215,6 +1215,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.snippet-insert", "Insert Session Snippet", "Expand and insert a named session snippet", "Insert", "snippet-insert", true),
         legacy_command("edit.register-save", "Save Editor Register", "Save the selection or current line in a named register", "Edit", "register-save", true),
         legacy_command("edit.register-insert", "Insert Editor Register", "Insert a named editor register", "Edit", "register-insert", true),
+        legacy_command("edit.register-rotate", "Rotate Editor Registers", "Rotate values through two or more named registers", "Edit", "register-rotate", true),
         legacy_command("edit.multi-insert", "Multi-cursor Insert", "Insert text at multiple original UTF-8 byte offsets", "Edit", "multi-insert", true),
         legacy_command("edit.macro", "Run Edit Macro", "Apply an undoable selection or line edit macro", "Edit", "macro", true),
         legacy_command("edit.macro-define", "Define Edit Macro", "Save a reusable, data-only edit macro", "Edit", "macro-define", true),
@@ -2603,6 +2604,25 @@ impl AppState {
                 .clone();
             self.insert_text_at_cursor(&value)?;
             self.message = format!("Inserted register {}", name.trim());
+        } else if let Some(names) = cmd.strip_prefix("register-rotate ") {
+            let names = names.split_whitespace().collect::<Vec<_>>();
+            if names.len() < 2 {
+                return Err("use register-rotate NAME NAME [NAME...]".into());
+            }
+            let unique = names.iter().copied().collect::<BTreeSet<_>>();
+            if unique.len() != names.len() {
+                return Err("register names must be unique".into());
+            }
+            let mut values = names
+                .iter()
+                .map(|name| self.registers.get(*name).cloned().ok_or("unknown register"))
+                .collect::<Result<Vec<_>, _>>()?;
+            values.rotate_right(1);
+            for (name, value) in names.iter().zip(values) {
+                self.registers.insert((*name).to_owned(), value);
+            }
+            self.persist_editor_tools()?;
+            self.message = format!("Rotated {} registers (right)", names.len());
         } else if let Some(rest) = cmd.strip_prefix("cursor-add ") {
             let (row, column) = rest
                 .split_once(' ')
@@ -4341,7 +4361,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [steady|kamikaze] | challenge-finish | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [steady|kamikaze] | challenge-finish | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -7140,6 +7160,30 @@ mod tests {
         let reopened = WriterApp::open_project(root.path().join("Book")).unwrap();
         let state = AppState::new(reopened, default_bindings());
         assert_eq!(state.macros["punctuate"].len(), 3);
+    }
+
+    #[test]
+    fn named_registers_rotate_transactionally_and_persist() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.registers.extend([
+            ("a".into(), "one".into()),
+            ("b".into(), "two".into()),
+            ("c".into(), "three".into()),
+        ]);
+        state.prompt = "register-rotate a b c".into();
+        state.command().unwrap();
+        assert_eq!(state.registers["a"], "three");
+        assert_eq!(state.registers["b"], "one");
+        assert_eq!(state.registers["c"], "two");
+        state.prompt = "register-rotate a a".into();
+        assert!(state.command().is_err());
+        let reopened = WriterApp::open_project(root.path().join("Book")).unwrap();
+        let state = AppState::new(reopened, default_bindings());
+        assert_eq!(state.registers["a"], "three");
+        assert_eq!(state.registers["b"], "one");
+        assert_eq!(state.registers["c"], "two");
     }
 
     #[test]
