@@ -60,6 +60,8 @@ pub enum ImportError {
     Io(String),
     #[error("invalid manuscript archive: {0}")]
     Archive(String),
+    #[error("invalid Scrivener import mapping: {0}")]
+    InvalidMapping(String),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -108,6 +110,219 @@ pub struct ScrivenerBinderItem {
     pub content_markdown: Option<String>,
     pub fields: BTreeMap<String, String>,
     pub unsupported: Vec<String>,
+}
+
+/// Explicit destination choice shown in a Scrivener import preview. `Unmapped`
+/// is intentional: folder names and binder roles are not sufficient evidence
+/// to invent chapter/scene boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScrivenerDestinationKind {
+    Unmapped,
+    Section,
+    Chapter,
+    Scene,
+    Research,
+    Skip,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ScrivenerImportMode {
+    Editable,
+    #[default]
+    Both,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScrivenerMappingDecision {
+    pub source_document_id: String,
+    pub destination_kind: ScrivenerDestinationKind,
+    pub title_override: Option<String>,
+    pub include_in_import: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScrivenerImportPreview {
+    pub total_items: usize,
+    pub manuscript_items: usize,
+    pub research_items: usize,
+    pub skipped_items: usize,
+    pub unresolved_source_ids: Vec<String>,
+    pub unsupported: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScrivenerImportPlan {
+    pub decisions: Vec<ScrivenerMappingDecision>,
+}
+
+impl ScrivenerImportPlan {
+    pub fn proposed(inventory: &ScrivenerProjectInventory) -> Self {
+        let decisions = inventory
+            .items
+            .iter()
+            .map(|item| {
+                let destination_kind = match item.area.as_str() {
+                    "research" => ScrivenerDestinationKind::Research,
+                    "trash" => ScrivenerDestinationKind::Skip,
+                    _ if item.include_in_compile == Some(false) => ScrivenerDestinationKind::Skip,
+                    // Binder folder roles vary by project; make the author
+                    // choose section vs chapter in the preview.
+                    _ if item.type_code.as_deref().is_some_and(|value| {
+                        value.eq_ignore_ascii_case("folder") || value.eq_ignore_ascii_case("draft")
+                    }) =>
+                    {
+                        ScrivenerDestinationKind::Unmapped
+                    }
+                    _ if item.content_markdown.is_some() => ScrivenerDestinationKind::Scene,
+                    _ => ScrivenerDestinationKind::Unmapped,
+                };
+                ScrivenerMappingDecision {
+                    source_document_id: item.source_document_id.clone(),
+                    destination_kind,
+                    title_override: None,
+                    include_in_import: destination_kind != ScrivenerDestinationKind::Skip,
+                }
+            })
+            .collect();
+        Self { decisions }
+    }
+
+    pub fn preview(
+        &self,
+        inventory: &ScrivenerProjectInventory,
+    ) -> Result<ScrivenerImportPreview, ImportError> {
+        inventory.validate()?;
+        let mut source_ids = BTreeSet::new();
+        let mut preview = ScrivenerImportPreview {
+            total_items: inventory.items.len(),
+            manuscript_items: 0,
+            research_items: 0,
+            skipped_items: 0,
+            unresolved_source_ids: Vec::new(),
+            unsupported: inventory.unsupported.clone(),
+        };
+        for decision in &self.decisions {
+            if !source_ids.insert(decision.source_document_id.as_str()) {
+                return Err(ImportError::DuplicateSourceId(
+                    decision.source_document_id.clone(),
+                ));
+            }
+            let Some(item) = inventory
+                .items
+                .iter()
+                .find(|item| item.source_document_id == decision.source_document_id)
+            else {
+                return Err(ImportError::MissingParent(
+                    decision.source_document_id.clone(),
+                ));
+            };
+            if !decision.include_in_import
+                || decision.destination_kind == ScrivenerDestinationKind::Skip
+            {
+                preview.skipped_items += 1;
+                continue;
+            }
+            match decision.destination_kind {
+                ScrivenerDestinationKind::Unmapped => {
+                    preview
+                        .unresolved_source_ids
+                        .push(decision.source_document_id.clone());
+                }
+                ScrivenerDestinationKind::Section | ScrivenerDestinationKind::Chapter => {
+                    preview.manuscript_items += 1;
+                }
+                ScrivenerDestinationKind::Scene => {
+                    preview.manuscript_items += 1;
+                    if item.content_markdown.is_none() {
+                        preview.unsupported.push(format!(
+                            "{} is mapped to a scene but has no readable prose file",
+                            item.source_document_id
+                        ));
+                    }
+                }
+                ScrivenerDestinationKind::Research => preview.research_items += 1,
+                ScrivenerDestinationKind::Skip => unreachable!(),
+            }
+        }
+        for item in &inventory.items {
+            if !source_ids.contains(item.source_document_id.as_str()) {
+                preview
+                    .unresolved_source_ids
+                    .push(item.source_document_id.clone());
+            }
+            preview.unsupported.extend(item.unsupported.iter().cloned());
+        }
+        preview.unresolved_source_ids.sort();
+        preview.unresolved_source_ids.dedup();
+        preview.unsupported.sort();
+        preview.unsupported.dedup();
+        Ok(preview)
+    }
+
+    pub fn validate_for_import(
+        &self,
+        inventory: &ScrivenerProjectInventory,
+    ) -> Result<(), ImportError> {
+        let preview = self.preview(inventory)?;
+        if !preview.unresolved_source_ids.is_empty() {
+            return Err(ImportError::InvalidMapping(format!(
+                "unmapped binder items: {}",
+                preview.unresolved_source_ids.join(", ")
+            )));
+        }
+        let decisions = self
+            .decisions
+            .iter()
+            .map(|decision| (decision.source_document_id.as_str(), decision))
+            .collect::<BTreeMap<_, _>>();
+        for item in &inventory.items {
+            let decision = decisions[item.source_document_id.as_str()];
+            if !decision.include_in_import
+                || decision.destination_kind == ScrivenerDestinationKind::Skip
+            {
+                continue;
+            }
+            if let Some(parent_id) = item.parent_source_id.as_deref() {
+                let parent = decisions.get(parent_id).ok_or_else(|| {
+                    ImportError::InvalidMapping(format!("missing parent mapping: {parent_id}"))
+                })?;
+                if !parent.include_in_import
+                    || parent.destination_kind == ScrivenerDestinationKind::Skip
+                {
+                    return Err(ImportError::InvalidMapping(format!(
+                        "selected item {} is beneath skipped parent {parent_id}",
+                        item.source_document_id
+                    )));
+                }
+                let valid_parent = match decision.destination_kind {
+                    ScrivenerDestinationKind::Section | ScrivenerDestinationKind::Chapter => {
+                        parent.destination_kind == ScrivenerDestinationKind::Section
+                    }
+                    ScrivenerDestinationKind::Scene => {
+                        parent.destination_kind == ScrivenerDestinationKind::Chapter
+                    }
+                    ScrivenerDestinationKind::Research => {
+                        parent.destination_kind == ScrivenerDestinationKind::Research
+                            || parent.destination_kind == ScrivenerDestinationKind::Section
+                            || parent.destination_kind == ScrivenerDestinationKind::Chapter
+                    }
+                    ScrivenerDestinationKind::Unmapped | ScrivenerDestinationKind::Skip => true,
+                };
+                if !valid_parent {
+                    return Err(ImportError::InvalidMapping(format!(
+                        "binder item {} has an incompatible mapped parent {parent_id}",
+                        item.source_document_id
+                    )));
+                }
+            } else if decision.destination_kind == ScrivenerDestinationKind::Scene {
+                return Err(ImportError::InvalidMapping(format!(
+                    "scene {} needs an explicitly mapped chapter parent",
+                    item.source_document_id
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl ScrivenerProjectInventory {
@@ -2117,6 +2332,25 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("real Scrivener"))
         );
+
+        let mut plan = ScrivenerImportPlan::proposed(&inventory);
+        let preview = plan.preview(&inventory).unwrap();
+        assert_eq!(preview.total_items, 3);
+        assert_eq!(preview.research_items, 1);
+        assert!(
+            preview
+                .unresolved_source_ids
+                .contains(&"chapter-uuid".into())
+        );
+        assert!(!preview.unresolved_source_ids.contains(&"scene-uuid".into()));
+        plan.decisions
+            .iter_mut()
+            .find(|decision| decision.source_document_id == "chapter-uuid")
+            .unwrap()
+            .destination_kind = ScrivenerDestinationKind::Chapter;
+        let preview = plan.preview(&inventory).unwrap();
+        assert!(preview.unresolved_source_ids.is_empty());
+        plan.validate_for_import(&inventory).unwrap();
     }
 
     #[test]

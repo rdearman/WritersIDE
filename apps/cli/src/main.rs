@@ -1907,7 +1907,86 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .next()
                 .ok_or("missing .scriv project directory or .scrivx manifest")?;
             let inventory = story_import::inspect_scrivener_project(&source)?;
-            println!("{}", serde_json::to_string_pretty(&inventory)?);
+            let plan = story_import::ScrivenerImportPlan::proposed(&inventory);
+            let preview = plan.preview(&inventory)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "inventory": inventory,
+                    "proposed_plan": plan,
+                    "preview": preview,
+                    "compatibility": "unverified; synthetic parser fixtures only"
+                }))?
+            );
+        }
+        "import-scrivener" => {
+            let source = args
+                .next()
+                .ok_or("missing .scriv project directory or .scrivx manifest")?;
+            let destination = PathBuf::from(args.next().ok_or("missing new project directory")?);
+            let mapping_path = args.next().map(PathBuf::from);
+            let requested_title = args.next();
+            let mode = match args.next().as_deref() {
+                None => story_import::ScrivenerImportMode::Both,
+                Some("--editable") => story_import::ScrivenerImportMode::Editable,
+                Some(value) => {
+                    return Err(format!("unknown Scrivener import option: {value}").into());
+                }
+            };
+            if destination.exists() {
+                return Err(
+                    "Scrivener import requires a new project directory that does not already exist"
+                        .into(),
+                );
+            }
+            let inventory = story_import::inspect_scrivener_project(&source)?;
+            let plan = if let Some(path) = mapping_path.as_ref() {
+                serde_json::from_slice::<story_import::ScrivenerImportPlan>(&fs::read(path)?)?
+            } else {
+                story_import::ScrivenerImportPlan::proposed(&inventory)
+            };
+            let preview = plan.preview(&inventory)?;
+            if mapping_path.is_none() || !preview.unresolved_source_ids.is_empty() {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "inventory": inventory,
+                        "plan": plan,
+                        "preview": preview,
+                        "action": "review the plan, set each selected binder item's destination_kind, save it as JSON, and rerun import-scrivener",
+                        "compatibility": "unverified; synthetic parser fixtures only"
+                    }))?
+                );
+                if mapping_path.is_some() {
+                    return Err("Scrivener import plan still contains unmapped binder items".into());
+                }
+            } else {
+                let parent = destination
+                    .parent()
+                    .filter(|path| !path.as_os_str().is_empty())
+                    .unwrap_or_else(|| Path::new("."));
+                fs::create_dir_all(parent)?;
+                let staging_parent = tempfile::tempdir_in(parent)?;
+                let staging_project = staging_parent.path().join("book");
+                let title = requested_title.as_deref().unwrap_or(&inventory.title);
+                let mut app = WriterApp::create_project(&staging_project, title)?;
+                let (run, scenes) = app.import_scrivener_inventory(&inventory, &plan, mode)?;
+                app.validate_project()?;
+                let report = serde_json::json!({
+                    "inventory": inventory,
+                    "plan": plan,
+                    "import_run": app.get_import_run_summary(run)?,
+                    "imported_scene_ids": scenes,
+                    "reference_mode": format!("{mode:?}").to_ascii_lowercase()
+                });
+                atomic_write(
+                    &staging_project.join("exports/scrivener-import-report.json"),
+                    &serde_json::to_vec_pretty(&report)?,
+                )?;
+                drop(app);
+                fs::rename(&staging_project, &destination)?;
+                println!("Imported Scrivener project into {}", destination.display());
+            }
         }
         "review-inspect" => {
             let source = args.next().ok_or("missing DOCX file")?;
@@ -2732,6 +2811,9 @@ fn usage() {
     eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");
     eprintln!(
         "writers-ide inspect-scrivener <.scriv-project-directory|.scrivx-manifest> (experimental inventory only)"
+    );
+    eprintln!(
+        "writers-ide import-scrivener <source> <new-project-directory> [mapping.json] [title] [--editable]"
     );
     eprintln!(
         "writers-ide event-time-set <project> <event-uuid> <start-tick|?|~nominal,lower,upper|lower..upper> <end-tick|?|~nominal,lower,upper|lower..upper> [source-time-text]"

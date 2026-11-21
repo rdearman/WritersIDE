@@ -62,6 +62,72 @@ fn write_project_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+fn copy_scrivener_source_tree(source: &Path, destination: &Path) -> Result<()> {
+    fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
+        fs::create_dir(destination).map_err(|error| {
+            AppError::Domain(format!("create Scrivener source snapshot: {error}"))
+        })?;
+        let mut entries = fs::read_dir(source)
+            .map_err(|error| AppError::Domain(format!("read Scrivener source: {error}")))?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| AppError::Domain(format!("read Scrivener source entry: {error}")))?;
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let source_path = entry.path();
+            let target_path = destination.join(entry.file_name());
+            let kind = entry.file_type().map_err(|error| {
+                AppError::Domain(format!("inspect Scrivener source entry: {error}"))
+            })?;
+            if kind.is_symlink() {
+                return Err(AppError::Domain(format!(
+                    "Scrivener source snapshots do not copy symlinks: {}",
+                    source_path.display()
+                )));
+            }
+            if kind.is_dir() {
+                copy_tree(&source_path, &target_path)?;
+            } else if kind.is_file() {
+                fs::copy(&source_path, &target_path).map_err(|error| {
+                    AppError::Domain(format!("copy Scrivener source file: {error}"))
+                })?;
+                fs::File::open(&target_path)
+                    .and_then(|file| file.sync_all())
+                    .map_err(|error| {
+                        AppError::Domain(format!("sync Scrivener source snapshot: {error}"))
+                    })?;
+            } else {
+                return Err(AppError::Domain(format!(
+                    "unsupported Scrivener source entry: {}",
+                    source_path.display()
+                )));
+            }
+        }
+        fs::File::open(destination)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| {
+                AppError::Domain(format!("sync Scrivener snapshot directory: {error}"))
+            })?;
+        Ok(())
+    }
+
+    if destination.exists() {
+        return Err(AppError::Domain(format!(
+            "Scrivener snapshot destination already exists: {}",
+            destination.display()
+        )));
+    }
+    let parent = destination
+        .parent()
+        .ok_or_else(|| AppError::Domain("Scrivener snapshot has no parent directory".into()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| AppError::Domain(format!("create import reference directory: {error}")))?;
+    if let Err(error) = copy_tree(source, destination) {
+        let _ = fs::remove_dir_all(destination);
+        return Err(error);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct UserPreferences {
@@ -1677,6 +1743,7 @@ impl WriterApp {
         staging: &story_import::ManuscriptStaging,
     ) -> Result<(ImportRunId, Vec<SceneId>)> {
         let source_type = match &staging.source_type {
+            story_import::SourceType::Scrivener => "scrivener",
             story_import::SourceType::Docx => "docx",
             story_import::SourceType::Rtf => "rtf",
             story_import::SourceType::Odt => "odt",
@@ -1750,6 +1817,300 @@ impl WriterApp {
                 .map_err(|error| AppError::Domain(error.to_string()))?,
         )?;
         Ok((run, imported))
+    }
+
+    /// Imports a previously inventoried Scrivener binder using explicit
+    /// preview decisions. This does not imply format compatibility: callers
+    /// must validate a real source fixture before presenting the operation as
+    /// supported. The destination must be a fresh project.
+    pub fn import_scrivener_inventory(
+        &mut self,
+        inventory: &story_import::ScrivenerProjectInventory,
+        plan: &story_import::ScrivenerImportPlan,
+        mode: story_import::ScrivenerImportMode,
+    ) -> Result<(ImportRunId, Vec<SceneId>)> {
+        use story_import::ScrivenerDestinationKind as Target;
+
+        inventory
+            .validate()
+            .map_err(|error| AppError::Domain(error.to_string()))?;
+        plan.validate_for_import(inventory)
+            .map_err(|error| AppError::Domain(error.to_string()))?;
+        let preview = plan
+            .preview(inventory)
+            .map_err(|error| AppError::Domain(error.to_string()))?;
+        let decisions = plan
+            .decisions
+            .iter()
+            .map(|decision| (decision.source_document_id.as_str(), decision))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for item in &inventory.items {
+            let decision = decisions
+                .get(item.source_document_id.as_str())
+                .ok_or_else(|| AppError::Domain("Scrivener import plan is incomplete".into()))?;
+            if let Some(parent) = item.parent_source_id.as_deref() {
+                let parent_decision = decisions.get(parent).ok_or_else(|| {
+                    AppError::Domain(format!("missing mapping for binder parent {parent}"))
+                })?;
+                if parent_decision.destination_kind == Target::Skip
+                    && decision.destination_kind != Target::Skip
+                {
+                    return Err(AppError::Domain(format!(
+                        "binder item {} is selected under a skipped parent",
+                        item.source_document_id
+                    )));
+                }
+            }
+        }
+
+        let run = ImportRunId::new();
+        let mut provenance_source = inventory.source_path.clone();
+        if mode == story_import::ScrivenerImportMode::Both {
+            let source = Path::new(&inventory.source_path);
+            let current_source = story_import::inspect_scrivener_project(source)
+                .map_err(|error| AppError::Domain(error.to_string()))?;
+            if current_source.source_fingerprint != inventory.source_fingerprint {
+                return Err(AppError::Domain(
+                    "Scrivener source changed after preview; inspect it again before importing"
+                        .into(),
+                ));
+            }
+            let snapshot = self
+                .project_root()
+                .join("research/imported_sources")
+                .join(format!("{run}.scriv"));
+            copy_scrivener_source_tree(source, &snapshot)?;
+            let copied = story_import::inspect_scrivener_project(&snapshot)
+                .map_err(|error| AppError::Domain(error.to_string()))?;
+            if copied.source_fingerprint != inventory.source_fingerprint {
+                let _ = fs::remove_dir_all(&snapshot);
+                return Err(AppError::Domain(
+                    "Scrivener source snapshot failed fingerprint verification".into(),
+                ));
+            }
+            provenance_source = format!("research/imported_sources/{run}.scriv");
+        }
+        self.store.record_import_run(
+            run,
+            "scrivener",
+            &provenance_source,
+            &inventory.source_fingerprint,
+        )?;
+        let mut structural_ids = std::collections::BTreeMap::<String, (NodeId, Target)>::new();
+        let mut structural_positions = std::collections::BTreeMap::<Option<NodeId>, u32>::new();
+        let mut scene_positions = std::collections::BTreeMap::<NodeId, u32>::new();
+        let mut imported_scenes = Vec::new();
+        let mut unsupported = preview.unsupported.clone();
+
+        for item in &inventory.items {
+            let decision = decisions[item.source_document_id.as_str()];
+            let title = decision
+                .title_override
+                .as_deref()
+                .unwrap_or(item.title.as_str());
+            let mut destinations = Vec::new();
+            match decision.destination_kind {
+                Target::Skip => {}
+                Target::Unmapped => unreachable!("preview rejected unresolved mappings"),
+                Target::Section => {
+                    let parent = match item.parent_source_id.as_deref() {
+                        None => None,
+                        Some(source_parent) => Some(
+                            structural_ids
+                                .get(source_parent)
+                                .filter(|(_, kind)| *kind == Target::Section)
+                                .map(|(id, _)| *id)
+                                .ok_or_else(|| {
+                                    AppError::Domain(format!(
+                                        "section {} must be nested under a mapped section",
+                                        item.source_document_id
+                                    ))
+                                })?,
+                        ),
+                    };
+                    let position = *structural_positions.get(&parent).unwrap_or(&0);
+                    let node =
+                        self.store
+                            .create_node(parent, NodeKind::Section, title, position)?;
+                    structural_positions.insert(parent, position.saturating_add(1));
+                    structural_ids.insert(item.source_document_id.clone(), (node, Target::Section));
+                    destinations.push(("structural_node", node.to_string(), "section"));
+                    if let Some(text) = item.content_markdown.as_deref()
+                        && !text.is_empty()
+                    {
+                        let unit = self.create_content_unit(
+                            ContentUnitKind::SectionBody,
+                            title,
+                            Some(node),
+                            0,
+                            None,
+                        )?;
+                        self.save_content_unit_text(unit, None, text)?;
+                        destinations.push(("content_unit", unit.to_string(), "content_markdown"));
+                    }
+                }
+                Target::Chapter => {
+                    let parent = match item.parent_source_id.as_deref() {
+                        None => None,
+                        Some(source_parent) => Some(
+                            structural_ids
+                                .get(source_parent)
+                                .filter(|(_, kind)| *kind == Target::Section)
+                                .map(|(id, _)| *id)
+                                .ok_or_else(|| {
+                                    AppError::Domain(format!(
+                                        "chapter {} must be nested under a mapped section",
+                                        item.source_document_id
+                                    ))
+                                })?,
+                        ),
+                    };
+                    let position = *structural_positions.get(&parent).unwrap_or(&0);
+                    let node = self.create_chapter(parent, title, position)?;
+                    structural_positions.insert(parent, position.saturating_add(1));
+                    structural_ids.insert(item.source_document_id.clone(), (node, Target::Chapter));
+                    if let Some(text) = item.content_markdown.as_deref()
+                        && !text.is_empty()
+                    {
+                        let unit = self.create_content_unit(
+                            ContentUnitKind::ChapterBody,
+                            title,
+                            Some(node),
+                            0,
+                            None,
+                        )?;
+                        self.save_content_unit_text(unit, None, text)?;
+                        destinations.push(("content_unit", unit.to_string(), "content_markdown"));
+                    }
+                    destinations.push(("structural_node", node.to_string(), "chapter"));
+                }
+                Target::Scene => {
+                    let chapter = item
+                        .parent_source_id
+                        .as_deref()
+                        .and_then(|parent| structural_ids.get(parent))
+                        .filter(|(_, kind)| *kind == Target::Chapter)
+                        .map(|(id, _)| *id)
+                        .ok_or_else(|| {
+                            AppError::Domain(format!(
+                                "scene {} must have an explicitly mapped chapter parent",
+                                item.source_document_id
+                            ))
+                        })?;
+                    let position = *scene_positions.get(&chapter).unwrap_or(&0);
+                    let scene = self.create_scene(chapter, title, position)?;
+                    scene_positions.insert(chapter, position.saturating_add(1));
+                    let mut metadata = self.get_scene(scene)?.scene;
+                    metadata.synopsis = item.synopsis.clone().unwrap_or_default();
+                    self.update_scene_metadata(&metadata)?;
+                    if let Some(text) = item.content_markdown.as_deref() {
+                        let (_, expected) = self.load_scene_text(scene)?;
+                        self.save_scene_text(scene, Some(&expected), text)?;
+                    }
+                    if let Some(notes) = item.notes_markdown.as_deref()
+                        && !notes.is_empty()
+                    {
+                        let bytes = notes.as_bytes().to_vec();
+                        let reference = story_reading::ReferenceDocument {
+                            title: format!("{} — Scrivener notes", title),
+                            media_type: "text/markdown".into(),
+                            sha256: format!("{:x}", Sha256::digest(&bytes)),
+                            source_bytes: bytes,
+                            extracted_text: notes.to_owned(),
+                            language_code: None,
+                        };
+                        let reading = self.import_reading_document(
+                            &reference,
+                            &format!(
+                                "{}#{}:notes",
+                                inventory.source_path, item.source_document_id
+                            ),
+                        )?;
+                        destinations.push(("reading", reading.to_string(), "notes"));
+                    }
+                    imported_scenes.push(scene);
+                    destinations.push(("scene", scene.to_string(), "scene"));
+                }
+                Target::Research => {
+                    let source_text = item
+                        .content_markdown
+                        .as_deref()
+                        .or(item.notes_markdown.as_deref())
+                        .or(item.synopsis.as_deref())
+                        .unwrap_or_default();
+                    let bytes = source_text.as_bytes().to_vec();
+                    let reference = story_reading::ReferenceDocument {
+                        title: title.to_owned(),
+                        media_type: "text/markdown".into(),
+                        sha256: format!("{:x}", Sha256::digest(&bytes)),
+                        source_bytes: bytes,
+                        extracted_text: source_text.to_owned(),
+                        language_code: None,
+                    };
+                    let id = self.import_reading_document(
+                        &reference,
+                        &format!("{}#{}", inventory.source_path, item.source_document_id),
+                    )?;
+                    destinations.push(("reading", id.to_string(), "research"));
+                }
+            }
+
+            let source_item = SourceItemId::new();
+            let raw_fields = serde_json::to_string(&serde_json::json!({
+                "binder_item": item,
+                "mapping_decision": decision
+            }))
+            .map_err(|error| AppError::Domain(error.to_string()))?;
+            let fingerprint = format!("{:x}", Sha256::digest(raw_fields.as_bytes()));
+            self.store
+                .record_source_item(story_storage::ImportSourceItemRecord {
+                    id: source_item,
+                    run,
+                    source_document_id: &item.source_document_id,
+                    source_sheet: None,
+                    source_row: Some(item.position.saturating_add(1)),
+                    fingerprint: &fingerprint,
+                    inventory_type: item.type_code.as_deref().unwrap_or("binder-item"),
+                    raw_fields: &raw_fields,
+                })?;
+            for (destination_type, destination_id, mapped_type) in destinations {
+                self.store
+                    .record_provenance(story_storage::EntityProvenanceRecord {
+                        id: ProvenanceId::new(),
+                        source_item,
+                        destination_type,
+                        destination_id: &destination_id,
+                        source_field: None,
+                        destination_field: Some(mapped_type),
+                        mapping: "scrivener-preview-v1",
+                    })?;
+            }
+            unsupported.extend(item.unsupported.iter().cloned());
+        }
+
+        // Keep imports deterministic and preserve binder order separately from
+        // fictional chronology.
+        unsupported.sort();
+        unsupported.dedup();
+        let status = if unsupported.is_empty() && inventory.warnings.is_empty() {
+            "completed"
+        } else {
+            "incomplete"
+        };
+        self.store.finish_import_run(
+            run,
+            status,
+            &format!(
+                "{} binder items; {} manuscript entries; {} research references; {} skipped; warnings: {}",
+                inventory.items.len(),
+                preview.manuscript_items,
+                preview.research_items,
+                preview.skipped_items,
+                inventory.warnings.join("; ")
+            ),
+            &unsupported.join("; "),
+        )?;
+        Ok((run, imported_scenes))
     }
     pub fn get_import_run_summary(
         &self,
@@ -3051,6 +3412,74 @@ mod tests {
         assert_eq!(summary.source_items, 1);
         assert_eq!(summary.provenance_records, 2);
         assert_eq!(summary.status, "incomplete");
+    }
+
+    #[test]
+    fn scrivener_preview_import_preserves_hierarchy_prose_research_and_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("SeriesBook.scriv");
+        let scene_files = source.join("Files/Data/scene-1");
+        fs::create_dir_all(&scene_files).unwrap();
+        fs::write(
+            source.join("SeriesBook.scrivx"),
+            r#"<ScrivenerProject Version="2.0"><Binder>
+              <BinderItem UUID="chapter-1" Type="Folder"><Title>Chapter One</Title><Children>
+                <BinderItem UUID="scene-1" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
+              </Children></BinderItem>
+              <BinderItem UUID="research-1" Type="Folder"><Title>Research</Title><Children/></BinderItem>
+            </Binder></ScrivenerProject>"#,
+        )
+        .unwrap();
+        fs::write(
+            scene_files.join("content.rtf"),
+            r"{\rtf1\ansi Élodie entered.}",
+        )
+        .unwrap();
+        fs::write(scene_files.join("synopsis.txt"), "The door opens").unwrap();
+        let source_before = story_import::inspect_scrivener_project(&source).unwrap();
+        let source_fingerprint = source_before.source_fingerprint.clone();
+        let mut app = WriterApp::create_project(dir.path().join("Imported"), "Imported").unwrap();
+        let inventory = story_import::inspect_scrivener_project(&source).unwrap();
+        let mut plan = story_import::ScrivenerImportPlan::proposed(&inventory);
+        plan.decisions
+            .iter_mut()
+            .find(|decision| decision.source_document_id == "chapter-1")
+            .unwrap()
+            .destination_kind = story_import::ScrivenerDestinationKind::Chapter;
+        assert!(
+            plan.preview(&inventory)
+                .unwrap()
+                .unresolved_source_ids
+                .is_empty()
+        );
+
+        let (run, scenes) = app
+            .import_scrivener_inventory(&inventory, &plan, story_import::ScrivenerImportMode::Both)
+            .unwrap();
+        assert_eq!(scenes.len(), 1);
+        assert_eq!(app.load_scene_text(scenes[0]).unwrap().0, "Élodie entered.");
+        let scene = app.get_scene(scenes[0]).unwrap();
+        assert_eq!(scene.scene.synopsis, "The door opens");
+        assert_eq!(app.list_structural_nodes().unwrap().len(), 1);
+        assert_eq!(app.list_reading_documents().unwrap().len(), 1);
+        assert_eq!(
+            story_import::inspect_scrivener_project(&source)
+                .unwrap()
+                .source_fingerprint,
+            source_fingerprint
+        );
+        let snapshot_root = app.project_root().join("research/imported_sources");
+        let snapshots = fs::read_dir(snapshot_root).unwrap().count();
+        assert_eq!(snapshots, 1);
+        let summary = app.get_import_run_summary(run).unwrap();
+        assert_eq!(summary.source_items, 3);
+        assert_eq!(summary.provenance_records, 3);
+        assert_eq!(summary.status, "incomplete");
+        assert!(
+            summary
+                .source_identifier
+                .starts_with("research/imported_sources/")
+        );
     }
 
     #[test]
