@@ -978,6 +978,36 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("processing pipeline incomplete; inspect failed/skipped stages".into());
             }
         }
+        "process-recipe" => {
+            let project = PathBuf::from(args.next().ok_or("missing project path")?);
+            let recipe = PathBuf::from(args.next().ok_or("missing processing recipe TOML")?);
+            run_processing_recipe(&project, &recipe)?;
+        }
+        "watch-process" => {
+            let project = PathBuf::from(args.next().ok_or("missing project path")?);
+            let recipe = PathBuf::from(args.next().ok_or("missing processing recipe TOML")?);
+            let poll_ms = args
+                .next()
+                .map(|value| value.parse::<u64>())
+                .transpose()?
+                .unwrap_or(1000)
+                .clamp(250, 60_000);
+            let mut previous = String::new();
+            println!("Watching processing recipe; Ctrl-C stops the watcher.");
+            loop {
+                let mut fingerprint = Sha256::new();
+                fingerprint.update(watch_fingerprint(&project)?);
+                fingerprint.update(fs::read(&recipe)?);
+                let current = format!("{:x}", fingerprint.finalize());
+                if current != previous {
+                    previous = current;
+                    if let Err(error) = run_processing_recipe(&project, &recipe) {
+                        eprintln!("Processing run incomplete; inspect stage failures: {error}");
+                    }
+                }
+                thread::sleep(Duration::from_millis(poll_ms));
+            }
+        }
         "compile" => {
             let project = args.next().ok_or("missing project path")?;
             let format_name = args
@@ -1490,8 +1520,34 @@ fn usage() {
         "writers-ide scratchpad-create <path> <title> [body]\nwriters-ide scratchpad-list <path>\nwriters-ide scratchpad-promote <path> <note-uuid> <scene|character|location|object|research> <entity-uuid>\nwriters-ide mentions <path> <scene-uuid>\nwriters-ide mention-confirm <path> <mention-uuid> <character|location|object> <entity-uuid>\nwriters-ide mention-dismiss <path> <mention-uuid>\nwriters-ide object-create <path> <name> [description]\nwriters-ide assembly-draft-create <path> <assembly-uuid>\nwriters-ide assembly-draft-list <path>\nwriters-ide assembly-draft-set <path> <draft-uuid> <scene-uuid> <text.md>\nwriters-ide assembly-draft-commit <path> <draft-uuid>\nwriters-ide board-create <path> <title>\nwriters-ide board-add-scene <path> <board-uuid> <scene-uuid> <x> <y> [note]\nwriters-ide board-list <path> <board-uuid>\nwriters-ide backup-archive <project-path> <archive.zip>\nwriters-ide restore-archive <archive.zip> <new-project-directory>"
     );
     eprintln!(
-        "writers-ide compile-watch <path> <format> <output> [poll-ms]\nwriters-ide query-assert <path> <query-uuid> <empty|non-empty|at-least:N|at-most:N|exactly:N>\nwriters-ide coverage <path> <character|plotline> <entity-uuid> <minimum-scenes>\nwriters-ide challenge-start <path> <target-words> <duration-seconds> [steady|kamikaze]\nwriters-ide challenge-finish <path> <challenge-id> <words-written> [abandoned]\nwriters-ide challenge-list <path>"
+        "writers-ide compile-watch <path> <format> <output> [poll-ms]\nwriters-ide process-recipe <project> <recipe.toml>\nwriters-ide watch-process <project> <recipe.toml> [poll-ms]\nwriters-ide query-assert <path> <query-uuid> <empty|non-empty|at-least:N|at-most:N|exactly:N>\nwriters-ide coverage <path> <character|plotline> <entity-uuid> <minimum-scenes>\nwriters-ide challenge-start <path> <target-words> <duration-seconds> [steady|kamikaze]\nwriters-ide challenge-finish <path> <challenge-id> <words-written> [abandoned]\nwriters-ide challenge-list <path>"
     );
+}
+
+fn run_processing_recipe(
+    project: &Path,
+    recipe_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let source = fs::read_to_string(recipe_path)?;
+    let recipe = story_pipeline::ProcessingRecipe::from_toml(&source)?;
+    let app = WriterApp::open_project(project)?;
+    let reports = app.run_processing_stages(&recipe.stages, recipe.expand_transclusions)?;
+    let incomplete = reports.iter().any(|report| {
+        matches!(
+            report.status,
+            story_pipeline::StageStatus::Failed | story_pipeline::StageStatus::Skipped
+        )
+    });
+    for report in reports {
+        println!(
+            "{:?}\t{:?}\t{}",
+            report.stage, report.status, report.message
+        );
+    }
+    if incomplete {
+        return Err("processing recipe incomplete; inspect failed/skipped stages".into());
+    }
+    Ok(())
 }
 
 fn watch_fingerprint(project: &Path) -> Result<String, Box<dyn std::error::Error>> {
@@ -1780,7 +1836,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod watch_tests {
     use super::{
-        compile_edition, compile_edition_with_aspell, spellcheck_project, watch_fingerprint,
+        compile_edition, compile_edition_with_aspell, run_processing_recipe, spellcheck_project,
+        watch_fingerprint,
     };
     use std::fs;
     use story_app::WriterApp;
@@ -1848,6 +1905,21 @@ mod watch_tests {
         .unwrap();
         assert_eq!(report[0]["candidates"]["baad"], 1);
         assert!(report[0]["candidates"].get("known").is_none());
+    }
+
+    #[test]
+    fn processing_recipe_runs_selected_dependency_aware_stages() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("Novel");
+        drop(WriterApp::create_project(&project, "Novel").unwrap());
+        let recipe_path = root.path().join("pipeline.toml");
+        fs::write(
+            &recipe_path,
+            "version = 1\nstages = [\"word-count\"]\nexpand_transclusions = false\n",
+        )
+        .unwrap();
+        run_processing_recipe(&project, &recipe_path).unwrap();
+        assert!(project.join(".writers-ide/pipeline-cache.json").is_file());
     }
 
     #[cfg(unix)]

@@ -1631,6 +1631,7 @@ dependencies = [
  "story-document",
  "tempfile",
  "thiserror",
+ "toml",
 ]
 
 [[package]]

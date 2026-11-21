@@ -78,6 +78,7 @@ pub struct PipelineInput {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Stage {
     Compile,
     WordCount,
@@ -131,6 +132,45 @@ impl Stage {
             WordCount | Export => &[Compile],
             PlotlineAnalysis | CharacterAnalysis | Continuity | RevisionReport => &[],
         }
+    }
+}
+
+/// Portable project-local selection of processing stages for repeatable automation.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProcessingRecipe {
+    pub version: u16,
+    pub stages: Vec<Stage>,
+    #[serde(default)]
+    pub expand_transclusions: bool,
+}
+
+impl ProcessingRecipe {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 {
+            return Err(format!(
+                "unsupported processing recipe version {}",
+                self.version
+            ));
+        }
+        if self.stages.is_empty() {
+            return Err("processing recipe must select at least one stage".into());
+        }
+        let mut stages = self.stages.clone();
+        stages.sort_unstable();
+        stages.dedup();
+        if stages.len() != self.stages.len() {
+            return Err("processing recipe contains duplicate stages".into());
+        }
+        Ok(())
+    }
+    pub fn from_toml(source: &str) -> Result<Self, String> {
+        let recipe: Self = toml::from_str(source).map_err(|error| error.to_string())?;
+        recipe.validate()?;
+        Ok(recipe)
+    }
+    pub fn to_toml(&self) -> Result<String, String> {
+        self.validate()?;
+        toml::to_string_pretty(self).map_err(|error| error.to_string())
     }
 }
 
@@ -864,5 +904,33 @@ mod tests {
             assert_eq!(Stage::parse_name(stage.name()), Some(stage));
         }
         assert_eq!(Stage::parse_name("unknown"), None);
+    }
+
+    #[test]
+    fn processing_recipes_validate_unique_stages_and_round_trip() {
+        let recipe = ProcessingRecipe {
+            version: 1,
+            stages: vec![Stage::WordCount, Stage::Continuity],
+            expand_transclusions: true,
+        };
+        let source = recipe.to_toml().unwrap();
+        assert!(source.contains("\"word-count\""));
+        assert_eq!(ProcessingRecipe::from_toml(&source).unwrap(), recipe);
+        assert!(
+            ProcessingRecipe {
+                stages: vec![Stage::Compile, Stage::Compile],
+                ..recipe.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ProcessingRecipe {
+                stages: vec![],
+                ..recipe
+            }
+            .validate()
+            .is_err()
+        );
     }
 }
