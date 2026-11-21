@@ -2297,12 +2297,18 @@ fn read_keymap(project: &Path) -> Result<KeymapFile, Box<dyn std::error::Error>>
 }
 impl AppState {
     fn new(app: WriterApp, function_bindings: Vec<(u8, Workspace)>) -> Self {
-        let draft_notice = list_challenge_drafts(
-            app.project_root(),
-            app.get_project()
-                .map(|project| project.word_count_policy)
-                .unwrap_or_default(),
-        )
+        let draft_notice = list_challenge_drafts(app.project_root(), |scene_id| {
+            let project = app.get_project().ok();
+            scene_id
+                .and_then(|scene| app.get_scene(scene).ok())
+                .and_then(|record| {
+                    project
+                        .as_ref()
+                        .map(|project| record.scene.effective_word_count_policy(project))
+                })
+                .or_else(|| project.map(|project| project.word_count_policy))
+                .unwrap_or_default()
+        })
         .ok()
         .filter(|notice| notice != "No recoverable challenge drafts")
         .map(|_| {
@@ -4087,10 +4093,9 @@ impl AppState {
         } else if cmd == "challenge-finish" {
             self.finish_active_challenge("quit")?;
         } else if cmd == "challenge-list-drafts" {
-            self.message = list_challenge_drafts(
-                self.app.project_root(),
-                self.app.get_project()?.word_count_policy,
-            )?;
+            self.message = list_challenge_drafts(self.app.project_root(), |scene_id| {
+                self.word_count_policy_for_scene(scene_id)
+            })?;
         } else if let Some(rest) = cmd.strip_prefix("challenge-save-new ") {
             let (draft_id, rest) = rest
                 .split_once(' ')
@@ -10716,7 +10721,7 @@ fn read_challenge_draft(
 
 fn list_challenge_drafts(
     root: &Path,
-    policy: story_core::WordCountPolicy,
+    policy_for_scene: impl Fn(Option<SceneId>) -> story_core::WordCountPolicy,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let directory = root.join(".writers-ide/recovery");
     let entries = match fs::read_dir(directory) {
@@ -10740,7 +10745,10 @@ fn list_challenge_drafts(
             Ok(draft) => drafts.push(format!(
                 "{} · {} words · {} · {} lost · {} pauses · use challenge-save-new {} CHAPTER-UUID TITLE or challenge-discard {}",
                 draft.challenge_id,
-                story_core::count_words_with_policy(&draft.text, policy),
+                story_core::count_words_with_policy(
+                    &draft.text,
+                    policy_for_scene(draft.destination_scene),
+                ),
                 draft.mode,
                 draft.words_deleted,
                 draft.pauses_consumed,
@@ -11894,10 +11902,11 @@ mod tests {
         assert_eq!(ledger[0].real_delta, 0);
         let draft_id = &challenges[0].id;
         assert!(
-            list_challenge_drafts(
-                state.app.project_root(),
-                state.app.get_project().unwrap().word_count_policy,
-            )
+            list_challenge_drafts(state.app.project_root(), |_| state
+                .app
+                .get_project()
+                .unwrap()
+                .word_count_policy,)
             .unwrap()
             .contains(draft_id)
         );
@@ -12114,11 +12123,16 @@ mod tests {
     fn isolated_challenge_draft_is_recoverable_after_project_reopen() {
         let root = tempfile::tempdir().unwrap();
         let project_path = root.path().join("Book");
-        let project = WriterApp::create_project(&project_path, "Book").unwrap();
+        let mut project = WriterApp::create_project(&project_path, "Book").unwrap();
+        let chapter = project.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = project.create_scene(chapter, "Korean", 0).unwrap();
+        let mut metadata = project.get_scene(scene).unwrap().scene;
+        metadata.word_count_policy = Some(story_core::WordCountPolicy::UnspacedScriptGraphemes);
+        project.update_scene_metadata(&metadata).unwrap();
         let mut state = AppState::new(project, default_bindings());
-        state.prompt = "challenge-start 100 600 pressure".into();
+        state.prompt = format!("challenge-start 100 600 pressure scene={scene}");
         state.command().unwrap();
-        state.editor = vec!["surviving challenge text".into()];
+        state.editor = vec!["한국어".into()];
         state.persist_challenge_draft().unwrap();
         let challenge_id = state.active_challenge.as_ref().unwrap().id.clone();
         drop(state);
@@ -12126,7 +12140,7 @@ mod tests {
         let mut reopened = WriterApp::open_project(&project_path).unwrap();
         reopened.recover_interrupted_writing_challenges().unwrap();
         let recovered = read_challenge_draft(reopened.project_root(), &challenge_id).unwrap();
-        assert_eq!(recovered.text, "surviving challenge text");
+        assert_eq!(recovered.text, "한국어");
         let interrupted = reopened
             .list_writing_challenges()
             .unwrap()
@@ -12136,12 +12150,16 @@ mod tests {
         assert_eq!(interrupted.status, "abandoned");
         assert_eq!(interrupted.outcome, "quit");
         assert!(
-            list_challenge_drafts(
-                reopened.project_root(),
-                reopened.get_project().unwrap().word_count_policy,
-            )
+            list_challenge_drafts(reopened.project_root(), |scene_id| scene_id
+                .and_then(|scene| reopened.get_scene(scene).ok())
+                .map(|record| {
+                    record
+                        .scene
+                        .effective_word_count_policy(&reopened.get_project().unwrap())
+                })
+                .unwrap_or_else(|| reopened.get_project().unwrap().word_count_policy),)
             .unwrap()
-            .contains(&challenge_id)
+            .contains(&format!("{challenge_id} · 3 words"))
         );
     }
 
@@ -12187,10 +12205,11 @@ mod tests {
             .unwrap();
         assert_eq!(quit_record.outcome, "quit");
         assert_eq!(
-            list_challenge_drafts(
-                state.app.project_root(),
-                state.app.get_project().unwrap().word_count_policy,
-            )
+            list_challenge_drafts(state.app.project_root(), |_| state
+                .app
+                .get_project()
+                .unwrap()
+                .word_count_policy,)
             .unwrap(),
             "No recoverable challenge drafts"
         );
