@@ -45,6 +45,7 @@ const MIGRATION_30: &str =
     include_str!("../migrations/0030_uncertainty_aware_time_query_filters.sql");
 const MIGRATION_31: &str = include_str!("../migrations/0031_location_incompatibility_rules.sql");
 const MIGRATION_32: &str = include_str!("../migrations/0032_location_profiles.sql");
+const MIGRATION_33: &str = include_str!("../migrations/0033_custom_metadata_query_operands.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -140,6 +141,83 @@ fn validate_query_expression(expression: &QueryExpression) -> Result<()> {
         }
     }
     walk(expression, 1, &mut 0)
+}
+
+fn validate_custom_metadata_filter(conn: &Connection, filter: &SceneQueryFilter) -> Result<()> {
+    let (field_id, expected) = match filter {
+        SceneQueryFilter::CustomMetadataExists { field_id } => (*field_id, None),
+        SceneQueryFilter::CustomMetadataTextContains { field_id, text } => {
+            if text.trim().is_empty() {
+                return Err(StorageError::Invalid(
+                    "custom metadata text query cannot be empty".into(),
+                ));
+            }
+            (*field_id, Some("text"))
+        }
+        SceneQueryFilter::CustomMetadataNumberCompare {
+            field_id,
+            value: FieldValue::Integer(_),
+            ..
+        } => (*field_id, Some("integer")),
+        SceneQueryFilter::CustomMetadataNumberCompare {
+            field_id,
+            value: FieldValue::Decimal(value),
+            ..
+        } => {
+            if !matches!(value.parse::<f64>(), Ok(number) if number.is_finite()) {
+                return Err(StorageError::Invalid(
+                    "custom metadata decimal comparison is not finite".into(),
+                ));
+            }
+            (*field_id, Some("decimal"))
+        }
+        SceneQueryFilter::CustomMetadataNumberCompare { .. } => {
+            return Err(StorageError::Invalid(
+                "numeric metadata comparisons require an integer or decimal value".into(),
+            ));
+        }
+        _ => return Ok(()),
+    };
+    let field_type: String = conn
+        .query_row(
+            "SELECT field_type FROM custom_field_definition WHERE id=?1",
+            [field_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::NotFound(field_id.to_string()))?;
+    if let Some(expected) = expected {
+        let compatible = match expected {
+            "text" => matches!(
+                field_type.as_str(),
+                "text" | "long_text" | "enum" | "date_time"
+            ),
+            "integer" | "decimal" => field_type == expected,
+            _ => false,
+        };
+        if !compatible {
+            return Err(StorageError::Invalid(format!(
+                "custom metadata query requires a {expected}-compatible field, found {field_type}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_custom_metadata_expression(
+    conn: &Connection,
+    expression: &QueryExpression,
+) -> Result<()> {
+    match expression {
+        QueryExpression::Filter(filter) => validate_custom_metadata_filter(conn, filter),
+        QueryExpression::All(children) | QueryExpression::Any(children) => {
+            for child in children {
+                validate_custom_metadata_expression(conn, child)?;
+            }
+            Ok(())
+        }
+        QueryExpression::Not(child) => validate_custom_metadata_expression(conn, child),
+    }
 }
 
 fn positive_text_query_terms(expression: &QueryExpression, negated: bool, terms: &mut Vec<String>) {
@@ -286,6 +364,32 @@ fn compile_query_expression(
                 }
                 values.extend([field_id.to_string(), target_kind.clone(), target_id.clone()]);
                 "EXISTS(SELECT 1 FROM custom_field_entity_ref r WHERE r.scene_id=s.id AND r.field_id=? AND r.target_kind=? AND r.target_id=?)".into()
+            }
+            SceneQueryFilter::CustomMetadataExists { field_id } => {
+                values.push(field_id.to_string());
+                "EXISTS(SELECT 1 FROM custom_field_value cv WHERE cv.scene_id=s.id AND cv.field_id=?)".into()
+            }
+            SceneQueryFilter::CustomMetadataTextContains { field_id, text } => {
+                if text.trim().is_empty() {
+                    return Err(StorageError::Invalid("custom metadata text query cannot be empty".into()));
+                }
+                let pattern = format!("%{}%", text.replace('%', "\\%").replace('_', "\\_"));
+                values.extend([field_id.to_string(), pattern]);
+                "EXISTS(SELECT 1 FROM custom_field_value cv JOIN custom_field_definition d ON d.id=cv.field_id WHERE cv.scene_id=s.id AND cv.field_id=? AND d.field_type IN('text','long_text','enum','date_time') AND cv.text_value LIKE ? ESCAPE '\\')".into()
+            }
+            SceneQueryFilter::CustomMetadataNumberCompare { field_id, comparison, value } => {
+                let operator = comparison.sql_operator();
+                match value {
+                    FieldValue::Integer(value) => {
+                        values.extend([field_id.to_string(), value.to_string()]);
+                        format!("EXISTS(SELECT 1 FROM custom_field_value cv JOIN custom_field_definition d ON d.id=cv.field_id WHERE cv.scene_id=s.id AND cv.field_id=? AND d.field_type='integer' AND cv.integer_value {operator} CAST(? AS INTEGER))")
+                    }
+                    FieldValue::Decimal(value) if matches!(value.parse::<f64>(), Ok(number) if number.is_finite()) => {
+                        values.extend([field_id.to_string(), value.clone()]);
+                        format!("EXISTS(SELECT 1 FROM custom_field_value cv JOIN custom_field_definition d ON d.id=cv.field_id WHERE cv.scene_id=s.id AND cv.field_id=? AND d.field_type='decimal' AND CAST(cv.decimal_value AS REAL) {operator} CAST(? AS REAL))")
+                    }
+                    _ => return Err(StorageError::Invalid("numeric metadata comparisons require a finite decimal or integer operand".into())),
+                }
             }
             SceneQueryFilter::TimeBefore(tick) => {
                 values.push(tick.to_string());
@@ -886,6 +990,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_19}\nINSERT INTO schema_migrations(version,applied_at) VALUES(19,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_20}\nINSERT INTO schema_migrations(version,applied_at) VALUES(20,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\n{MIGRATION_25}\nINSERT INTO schema_migrations(version,applied_at) VALUES(25,'{}');\n{MIGRATION_26}\nINSERT INTO schema_migrations(version,applied_at) VALUES(26,'{}');\n{MIGRATION_27}\nINSERT INTO schema_migrations(version,applied_at) VALUES(27,'{}');\n{MIGRATION_28}\nINSERT INTO schema_migrations(version,applied_at) VALUES(28,'{}');\n{MIGRATION_29}\nINSERT INTO schema_migrations(version,applied_at) VALUES(29,'{}');\n{MIGRATION_30}\nINSERT INTO schema_migrations(version,applied_at) VALUES(30,'{}');\n{MIGRATION_31}\nINSERT INTO schema_migrations(version,applied_at) VALUES(31,'{}');\n{MIGRATION_32}\nINSERT INTO schema_migrations(version,applied_at) VALUES(32,'{}');\nCOMMIT;", now(), now(), now(), now(), now(), now(), now(), now(), now(), now(), now(), now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_33}\nINSERT INTO schema_migrations(version,applied_at) VALUES(33,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
@@ -928,7 +1033,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 32 {
+        if version > 33 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1057,6 +1162,10 @@ impl ProjectStore {
         }
         if current_version == 31 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_32}\nINSERT INTO schema_migrations(version,applied_at) VALUES(32,'{}');\nCOMMIT;", now()))?;
+            current_version = 32;
+        }
+        if current_version == 32 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_33}\nINSERT INTO schema_migrations(version,applied_at) VALUES(33,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -6563,6 +6672,7 @@ impl ProjectStore {
             ));
         }
         for filter in &query.filters {
+            validate_custom_metadata_filter(&self.conn, filter)?;
             if let SceneQueryFilter::CustomMetadataContainsEntity {
                 field_id,
                 target_kind,
@@ -6689,6 +6799,23 @@ impl ProjectStore {
                     serde_json::to_string(&(field_id, target_kind, target_id))
                         .map_err(|error| StorageError::Invalid(error.to_string()))?,
                 ),
+                SceneQueryFilter::CustomMetadataExists { field_id } => {
+                    ("custom_metadata_exists", field_id.to_string())
+                }
+                SceneQueryFilter::CustomMetadataTextContains { field_id, text } => (
+                    "custom_metadata_text_contains",
+                    serde_json::to_string(&(field_id, text))
+                        .map_err(|error| StorageError::Invalid(error.to_string()))?,
+                ),
+                SceneQueryFilter::CustomMetadataNumberCompare {
+                    field_id,
+                    comparison,
+                    value,
+                } => (
+                    "custom_metadata_number_compare",
+                    serde_json::to_string(&(field_id, comparison, value))
+                        .map_err(|error| StorageError::Invalid(error.to_string()))?,
+                ),
                 SceneQueryFilter::TimeBefore(tick) => ("time_before", tick.to_string()),
                 SceneQueryFilter::TimeAfter(tick) => ("time_after", tick.to_string()),
                 SceneQueryFilter::TimeBeforeDefinitely(tick) => {
@@ -6717,6 +6844,7 @@ impl ProjectStore {
     ) -> Result<()> {
         if let Some(expression) = expression {
             validate_query_expression(expression)?;
+            validate_custom_metadata_expression(&self.conn, expression)?;
         }
         let exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM saved_query WHERE id=?1)",
@@ -6921,6 +7049,27 @@ impl ProjectStore {
                     let (field_id, target_kind, target_id) = serde_json::from_str(&value)
                         .map_err(|error| StorageError::Invalid(format!("invalid custom entity query: {error}")))?;
                     let expression = QueryExpression::Filter(SceneQueryFilter::CustomMetadataContainsEntity { field_id, target_kind, target_id });
+                    sql.push_str(" AND ");
+                    sql.push_str(&compile_query_expression(&expression, &mut values)?);
+                }
+                "custom_metadata_exists" => {
+                    let field_id = FieldId(Uuid::parse_str(&value)
+                        .map_err(|error| StorageError::Invalid(format!("invalid custom field id: {error}")))?);
+                    let expression = QueryExpression::Filter(SceneQueryFilter::CustomMetadataExists { field_id });
+                    sql.push_str(" AND ");
+                    sql.push_str(&compile_query_expression(&expression, &mut values)?);
+                }
+                "custom_metadata_text_contains" => {
+                    let (field_id, text): (FieldId, String) = serde_json::from_str(&value)
+                        .map_err(|error| StorageError::Invalid(format!("invalid custom metadata text query: {error}")))?;
+                    let expression = QueryExpression::Filter(SceneQueryFilter::CustomMetadataTextContains { field_id, text });
+                    sql.push_str(" AND ");
+                    sql.push_str(&compile_query_expression(&expression, &mut values)?);
+                }
+                "custom_metadata_number_compare" => {
+                    let (field_id, comparison, value): (FieldId, MetadataComparison, FieldValue) = serde_json::from_str(&value)
+                        .map_err(|error| StorageError::Invalid(format!("invalid custom metadata numeric query: {error}")))?;
+                    let expression = QueryExpression::Filter(SceneQueryFilter::CustomMetadataNumberCompare { field_id, comparison, value });
                     sql.push_str(" AND ");
                     sql.push_str(&compile_query_expression(&expression, &mut values)?);
                 }
@@ -9896,6 +10045,81 @@ mod tests {
         };
         store.save_scene_query(&metadata).unwrap();
         assert_eq!(store.run_scene_query(metadata.id).unwrap(), vec![present]);
+        let notes = FieldId::new();
+        store
+            .define_custom_field(&CustomFieldDefinition {
+                id: notes,
+                name: "Author notes".into(),
+                field_type: FieldType::LongText,
+                required: false,
+                default_value: None,
+                enum_values: vec![],
+                reference_kind: None,
+            })
+            .unwrap();
+        store
+            .set_custom_field(
+                present,
+                notes,
+                &FieldValue::Text("A red key appears".into()),
+            )
+            .unwrap();
+        let priority = FieldId::new();
+        store
+            .define_custom_field(&CustomFieldDefinition {
+                id: priority,
+                name: "Priority".into(),
+                field_type: FieldType::Integer,
+                required: false,
+                default_value: None,
+                enum_values: vec![],
+                reference_kind: None,
+            })
+            .unwrap();
+        store
+            .set_custom_field(present, priority, &FieldValue::Integer(7))
+            .unwrap();
+        for (name, filter) in [
+            (
+                "metadata exists",
+                SceneQueryFilter::CustomMetadataExists { field_id: notes },
+            ),
+            (
+                "metadata text",
+                SceneQueryFilter::CustomMetadataTextContains {
+                    field_id: notes,
+                    text: "red key".into(),
+                },
+            ),
+            (
+                "metadata numeric",
+                SceneQueryFilter::CustomMetadataNumberCompare {
+                    field_id: priority,
+                    comparison: MetadataComparison::GreaterThanOrEqual,
+                    value: FieldValue::Integer(7),
+                },
+            ),
+        ] {
+            let query = SavedSceneQuery {
+                id: QueryId::new(),
+                name: name.into(),
+                description: String::new(),
+                filters: vec![filter],
+            };
+            store.save_scene_query(&query).unwrap();
+            assert_eq!(store.run_scene_query(query.id).unwrap(), vec![present]);
+        }
+        let bad_numeric = SavedSceneQuery {
+            id: QueryId::new(),
+            name: "invalid numeric metadata".into(),
+            description: String::new(),
+            filters: vec![SceneQueryFilter::CustomMetadataNumberCompare {
+                field_id: notes,
+                comparison: MetadataComparison::Equal,
+                value: FieldValue::Integer(1),
+            }],
+        };
+        assert!(store.save_scene_query(&bad_numeric).is_err());
         let absence = SavedSceneQuery {
             id: QueryId::new(),
             name: "explicit absence only".into(),
@@ -10279,7 +10503,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 32))
+            .map(|version| assert_eq!(version, 33))
             .unwrap();
     }
 
@@ -10547,7 +10771,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 32);
+        assert_eq!(version, 33);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }

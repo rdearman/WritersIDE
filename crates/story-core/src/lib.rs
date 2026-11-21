@@ -725,6 +725,18 @@ pub enum SceneQueryFilter {
         target_kind: String,
         target_id: String,
     },
+    CustomMetadataExists {
+        field_id: FieldId,
+    },
+    CustomMetadataTextContains {
+        field_id: FieldId,
+        text: String,
+    },
+    CustomMetadataNumberCompare {
+        field_id: FieldId,
+        comparison: MetadataComparison,
+        value: FieldValue,
+    },
     TimeBefore(i64),
     TimeAfter(i64),
     /// Matches only when the complete known start interval is before the cutoff.
@@ -736,6 +748,29 @@ pub enum SceneQueryFilter {
     /// Matches when the known start interval permits a time after the cutoff.
     TimeAfterPossibly(i64),
     UnresolvedIssue,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetadataComparison {
+    LessThan,
+    LessThanOrEqual,
+    Equal,
+    NotEqual,
+    GreaterThanOrEqual,
+    GreaterThan,
+}
+impl MetadataComparison {
+    pub fn sql_operator(self) -> &'static str {
+        match self {
+            Self::LessThan => "<",
+            Self::LessThanOrEqual => "<=",
+            Self::Equal => "=",
+            Self::NotEqual => "<>",
+            Self::GreaterThanOrEqual => ">=",
+            Self::GreaterThan => ">",
+        }
+    }
 }
 
 /// A composable, saved-query predicate. Empty `All`/`Any` groups are invalid.
