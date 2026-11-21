@@ -39,6 +39,7 @@ pub struct PipelineScene {
     /// Ordered source documents used to build an inclusion-aware semantic IR.
     pub expanded_passages: Option<Vec<PipelinePassage>>,
     pub target_words: Option<u64>,
+    pub word_count_policy: Option<story_core::WordCountPolicy>,
     pub characters: Vec<PipelineCharacter>,
     pub plotlines: Vec<String>,
     pub start: story_core::StoryTime,
@@ -747,7 +748,16 @@ fn stage_fingerprint(
     let extra = if stage == Stage::Compile {
         format!("expand_transclusions={}", input.expand_transclusions)
     } else if stage == Stage::WordCount {
-        format!("{:?}:{:?}", input.target_words, input.word_count_policy)
+        format!(
+            "{:?}:{:?}:{:?}",
+            input.target_words,
+            input.word_count_policy,
+            input
+                .scenes
+                .iter()
+                .map(|scene| (&scene.id, scene.word_count_policy))
+                .collect::<Vec<_>>()
+        )
     } else if stage == Stage::Export {
         format!("{:?}", input.target_words)
     } else {
@@ -776,7 +786,20 @@ fn render_stage(
             let text = outputs
                 .get(&Stage::Compile)
                 .ok_or("compiled manuscript unavailable")?;
-            let words = story_core::count_words_with_policy(text, input.word_count_policy) as usize;
+            let mut words = i64::from(story_core::count_words_with_policy(
+                text,
+                input.word_count_policy,
+            ));
+            for scene in &input.scenes {
+                if let Some(policy) = scene.word_count_policy {
+                    words += i64::from(story_core::count_words_with_policy(&scene.text, policy))
+                        - i64::from(story_core::count_words_with_policy(
+                            &scene.text,
+                            input.word_count_policy,
+                        ));
+                }
+            }
+            let words = words.max(0) as usize;
             let mut output = format!(
                 "{} words\nTarget: {}\n",
                 words,
@@ -1065,7 +1088,10 @@ fn analysis_input(input: &PipelineInput) -> Vec<SceneAnalysisInput> {
             scene_id: scene.id.clone(),
             title: scene.title.clone(),
             chapter_id: None,
-            actual_words: story_core::count_words_with_policy(&scene.text, input.word_count_policy),
+            actual_words: story_core::count_words_with_policy(
+                &scene.text,
+                scene.word_count_policy.unwrap_or(input.word_count_policy),
+            ),
             target_words: scene.target_words,
             start_time: scene.start,
             end_time: scene.end,
@@ -1141,6 +1167,7 @@ mod tests {
                 expanded_text: None,
                 expanded_passages: None,
                 target_words: Some(100),
+                word_count_policy: None,
                 characters: vec![PipelineCharacter {
                     id: "character-1".into(),
                     name: "Mara".into(),
@@ -1211,6 +1238,23 @@ mod tests {
             fs::read_to_string(dir.path().join(".writers-ide/processing/word-count.txt")).unwrap();
         assert!(report.contains("3 words"), "{report}");
         assert_eq!(analysis_input(&manuscript)[0].actual_words, 1);
+        manuscript.scenes[0].word_count_policy =
+            Some(story_core::WordCountPolicy::UnspacedScriptGraphemes);
+        let scene_override = runner
+            .run_selected(&manuscript, &[Stage::WordCount])
+            .unwrap();
+        assert_eq!(
+            scene_override
+                .iter()
+                .find(|report| report.stage == Stage::WordCount)
+                .unwrap()
+                .status,
+            StageStatus::Complete
+        );
+        let report =
+            fs::read_to_string(dir.path().join(".writers-ide/processing/word-count.txt")).unwrap();
+        assert!(report.contains("5 words"), "{report}");
+        assert_eq!(analysis_input(&manuscript)[0].actual_words, 3);
     }
 
     #[test]

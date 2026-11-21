@@ -50,6 +50,7 @@ const MIGRATION_33: &str = include_str!("../migrations/0033_custom_metadata_quer
 const MIGRATION_34: &str = include_str!("../migrations/0034_word_count_policy.sql");
 const MIGRATION_35: &str = include_str!("../migrations/0035_scene_language.sql");
 const MIGRATION_36: &str = include_str!("../migrations/0036_passage_language_tags.sql");
+const MIGRATION_37: &str = include_str!("../migrations/0037_scene_word_count_policy.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -1013,6 +1014,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_34}\nINSERT INTO schema_migrations(version,applied_at) VALUES(34,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_35}\nINSERT INTO schema_migrations(version,applied_at) VALUES(35,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_36}\nINSERT INTO schema_migrations(version,applied_at) VALUES(36,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_37}\nINSERT INTO schema_migrations(version,applied_at) VALUES(37,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1055,7 +1057,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 36 {
+        if version > 37 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1200,6 +1202,10 @@ impl ProjectStore {
         }
         if current_version == 35 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_36}\nINSERT INTO schema_migrations(version,applied_at) VALUES(36,'{}');\nCOMMIT;", now()))?;
+            current_version = 36;
+        }
+        if current_version == 36 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_37}\nINSERT INTO schema_migrations(version,applied_at) VALUES(37,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -2279,7 +2285,7 @@ impl ProjectStore {
         Ok(())
     }
     pub fn get_scene(&self, id: SceneId) -> Result<SceneRecord> {
-        let row=self.conn.query_row("SELECT s.title,s.synopsis,s.status,s.target_words,s.purpose,s.goal,s.outcome,s.start_nominal,s.start_lower,s.start_upper,s.start_precision,s.end_nominal,s.end_lower,s.end_upper,s.end_precision,s.pov_character_id,s.start_location_id,s.end_location_id,s.archived,p.chapter_id,p.position,c.sha256,c.byte_length,s.language_code FROM scene s LEFT JOIN scene_placement p ON p.scene_id=s.id JOIN scene_content c ON c.scene_id=s.id WHERE s.id=?1",[id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<u64>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,Option<i64>>(7)?,r.get::<_,Option<i64>>(8)?,r.get::<_,Option<i64>>(9)?,r.get::<_,String>(10)?,r.get::<_,Option<i64>>(11)?,r.get::<_,Option<i64>>(12)?,r.get::<_,Option<i64>>(13)?,r.get::<_,String>(14)?,r.get::<_,Option<String>>(15)?,r.get::<_,Option<String>>(16)?,r.get::<_,Option<String>>(17)?,r.get::<_,bool>(18)?,r.get::<_,Option<String>>(19)?,r.get::<_,Option<u32>>(20)?,r.get::<_,String>(21)?,r.get::<_,u64>(22)?,r.get::<_,Option<String>>(23)?))).map_err(|_|StorageError::NotFound(id.to_string()))?;
+        let row=self.conn.query_row("SELECT s.title,s.synopsis,s.status,s.target_words,s.purpose,s.goal,s.outcome,s.start_nominal,s.start_lower,s.start_upper,s.start_precision,s.end_nominal,s.end_lower,s.end_upper,s.end_precision,s.pov_character_id,s.start_location_id,s.end_location_id,s.archived,p.chapter_id,p.position,c.sha256,c.byte_length,s.language_code,s.word_count_policy FROM scene s LEFT JOIN scene_placement p ON p.scene_id=s.id JOIN scene_content c ON c.scene_id=s.id WHERE s.id=?1",[id.to_string()],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<u64>>(3)?,r.get::<_,String>(4)?,r.get::<_,String>(5)?,r.get::<_,String>(6)?,r.get::<_,Option<i64>>(7)?,r.get::<_,Option<i64>>(8)?,r.get::<_,Option<i64>>(9)?,r.get::<_,String>(10)?,r.get::<_,Option<i64>>(11)?,r.get::<_,Option<i64>>(12)?,r.get::<_,Option<i64>>(13)?,r.get::<_,String>(14)?,r.get::<_,Option<String>>(15)?,r.get::<_,Option<String>>(16)?,r.get::<_,Option<String>>(17)?,r.get::<_,bool>(18)?,r.get::<_,Option<String>>(19)?,r.get::<_,Option<u32>>(20)?,r.get::<_,String>(21)?,r.get::<_,u64>(22)?,r.get::<_,Option<String>>(23)?,r.get::<_,Option<String>>(24)?))).map_err(|_|StorageError::NotFound(id.to_string()))?;
         let st = read_time(row.7, row.8, row.9, &row.10)?;
         let et = read_time(row.11, row.12, row.13, &row.14)?;
         let content = fs::read(self.safe_path(&self.content_path(id)?)?)?;
@@ -2289,7 +2295,18 @@ impl ProjectStore {
             )));
         }
         let text = String::from_utf8_lossy(&content);
-        let actual = count_words_with_policy(&text, self.get_project()?.word_count_policy);
+        let project = self.get_project()?;
+        let scene_policy = row
+            .24
+            .as_deref()
+            .map(|value| {
+                WordCountPolicy::parse(value).ok_or_else(|| {
+                    StorageError::Config(format!("invalid scene word-count policy {value}"))
+                })
+            })
+            .transpose()?;
+        let actual =
+            count_words_with_policy(&text, scene_policy.unwrap_or(project.word_count_policy));
         Ok(SceneRecord {
             scene: Scene {
                 id,
@@ -2315,6 +2332,7 @@ impl ProjectStore {
                     .and_then(|x| Uuid::parse_str(&x).ok())
                     .map(LocationId),
                 language_code: row.23,
+                word_count_policy: scene_policy,
                 archived: row.18,
             },
             chapter_id: row.19.and_then(|x| Uuid::parse_str(&x).ok()).map(NodeId),
@@ -2509,7 +2527,7 @@ impl ProjectStore {
         )
         .map_err(|e| StorageError::Invalid(e.to_string()))?;
         let now = now();
-        self.conn.execute("UPDATE scene SET title=?2,synopsis=?3,status=?4,target_words=?5,purpose=?6,goal=?7,outcome=?8,start_nominal=?9,start_lower=?10,start_upper=?11,start_precision=?12,end_nominal=?13,end_lower=?14,end_upper=?15,end_precision=?16,pov_character_id=?17,start_location_id=?18,end_location_id=?19,archived=?20,updated_at=?21,language_code=?22 WHERE id=?1",params![scene.id.to_string(),scene.title,scene.synopsis,scene.status.as_str(),scene.target_words,scene.purpose,scene.goal,scene.outcome,scene.start_time.nominal,scene.start_time.lower,scene.start_time.upper,precision(scene.start_time.precision),scene.end_time.nominal,scene.end_time.lower,scene.end_time.upper,precision(scene.end_time.precision),scene.pov_character.map(|x|x.to_string()),scene.start_location.map(|x|x.to_string()),scene.end_location.map(|x|x.to_string()),scene.archived,now,scene.language_code])?;
+        self.conn.execute("UPDATE scene SET title=?2,synopsis=?3,status=?4,target_words=?5,purpose=?6,goal=?7,outcome=?8,start_nominal=?9,start_lower=?10,start_upper=?11,start_precision=?12,end_nominal=?13,end_lower=?14,end_upper=?15,end_precision=?16,pov_character_id=?17,start_location_id=?18,end_location_id=?19,archived=?20,updated_at=?21,language_code=?22,word_count_policy=?23 WHERE id=?1",params![scene.id.to_string(),scene.title,scene.synopsis,scene.status.as_str(),scene.target_words,scene.purpose,scene.goal,scene.outcome,scene.start_time.nominal,scene.start_time.lower,scene.start_time.upper,precision(scene.start_time.precision),scene.end_time.nominal,scene.end_time.lower,scene.end_time.upper,precision(scene.end_time.precision),scene.pov_character.map(|x|x.to_string()),scene.start_location.map(|x|x.to_string()),scene.end_location.map(|x|x.to_string()),scene.archived,now,scene.language_code,scene.word_count_policy.map(|policy| policy.as_str())])?;
         Ok(())
     }
     pub fn move_scene(&mut self, id: SceneId, dest: NodeId, position: u32) -> Result<()> {
@@ -10735,7 +10753,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 36))
+            .map(|version| assert_eq!(version, 37))
             .unwrap();
     }
 
@@ -10993,7 +11011,7 @@ mod tests {
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch("DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
-        conn.execute_batch("DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -11003,7 +11021,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 36);
+        assert_eq!(version, 37);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -11083,6 +11101,7 @@ mod tests {
              ALTER TABLE project DROP COLUMN language_code;
              ALTER TABLE project DROP COLUMN word_count_policy;
              DROP TABLE passage_language_tag;
+             ALTER TABLE scene DROP COLUMN word_count_policy;
              ALTER TABLE scene DROP COLUMN language_code;
              DROP TABLE saved_query_expression;
              DROP TABLE location_incompatibility_rule;
@@ -11218,6 +11237,7 @@ mod tests {
             start_location: None,
             end_location: None,
             language_code: None,
+            word_count_policy: None,
             archived: false,
         })
         .unwrap();
@@ -11482,6 +11502,48 @@ mod tests {
         store.remove_passage_language_tag(anchor).unwrap();
         assert!(store.list_passage_language_tags(scene).unwrap().is_empty());
         assert_eq!(store.list_scene_anchors(scene).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scene_word_count_policy_overrides_project_counts_and_persists() {
+        let directory = tempdir().unwrap();
+        let root = directory.path().join("Korean Counts");
+        let mut store = ProjectStore::create(&root, "Korean Counts").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Scene").unwrap();
+        let (_, hash) = store.load_text(scene).unwrap();
+        store.save_text(scene, Some(&hash), "한국어").unwrap();
+        assert_eq!(store.get_scene(scene).unwrap().actual_words, 1);
+
+        let mut metadata = store.get_scene(scene).unwrap().scene;
+        metadata.word_count_policy = Some(WordCountPolicy::UnspacedScriptGraphemes);
+        store.update_scene(&metadata).unwrap();
+        assert_eq!(store.get_scene(scene).unwrap().actual_words, 3);
+        assert_eq!(
+            store.get_project().unwrap().word_count_policy,
+            WordCountPolicy::UnicodeWords
+        );
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE scene SET word_count_policy='invented' WHERE id=?1",
+                    [scene.to_string()],
+                )
+                .is_err()
+        );
+
+        drop(store);
+        let reopened = ProjectStore::open(root).unwrap();
+        let record = reopened.get_scene(scene).unwrap();
+        assert_eq!(record.actual_words, 3);
+        assert_eq!(
+            record.scene.word_count_policy,
+            Some(WordCountPolicy::UnspacedScriptGraphemes)
+        );
+        assert_eq!(reopened.load_text(scene).unwrap().0, "한국어");
     }
     #[test]
     fn backup_contains_consistent_database_and_manuscript() {

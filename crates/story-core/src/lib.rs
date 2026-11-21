@@ -1286,6 +1286,9 @@ pub struct Scene {
     /// Optional BCP 47 language override; `None` inherits the project default.
     #[serde(default)]
     pub language_code: Option<String>,
+    /// Optional counting convention; `None` inherits the project policy.
+    #[serde(default)]
+    pub word_count_policy: Option<WordCountPolicy>,
     pub archived: bool,
 }
 impl Scene {
@@ -1293,6 +1296,10 @@ impl Scene {
         self.language_code
             .as_deref()
             .unwrap_or(&project.language_code)
+    }
+
+    pub fn effective_word_count_policy(&self, project: &Project) -> WordCountPolicy {
+        self.word_count_policy.unwrap_or(project.word_count_policy)
     }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]

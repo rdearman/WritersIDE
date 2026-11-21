@@ -472,6 +472,7 @@ impl WriterApp {
                 expanded_text,
                 expanded_passages,
                 target_words: row.scene.target_words,
+                word_count_policy: row.scene.word_count_policy,
                 characters,
                 plotlines,
                 start: row.scene.start_time,

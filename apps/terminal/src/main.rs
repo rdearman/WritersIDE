@@ -1473,6 +1473,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "scene.word-count-policy",
+            "Set Scene Word-count Policy",
+            "Override the project word-count policy for a scene or restore inheritance",
+            "Scene",
+            "scene-word-count-policy",
+            true,
+        ),
+        legacy_command(
             "scene.passage-language",
             "Tag Passage Language",
             "Attach a language tag to a stable UTF-8 passage range",
@@ -3033,7 +3041,7 @@ impl AppState {
             } else {
                 self.app.load_scene_text(scene_id)?.0
             };
-            return Ok(self.count_words_for_project(&text));
+            return Ok(self.count_words_for_scene(&text, Some(scene_id)));
         }
         let mut total = self.scenes.iter().map(|row| u64::from(row.3)).sum::<u64>();
         if let Some(scene_id) = self.editing_scene
@@ -3047,12 +3055,27 @@ impl AppState {
         Ok(total.min(u64::from(u32::MAX)) as u32)
     }
     fn count_words_for_project(&self, text: &str) -> u32 {
-        let policy = self
-            .app
-            .get_project()
-            .map(|project| project.word_count_policy)
-            .unwrap_or_default();
-        story_core::count_words_with_policy(text, policy)
+        self.count_words_for_scene(text, self.editing_scene)
+    }
+    fn count_words_for_scene(&self, text: &str, scene_id: Option<SceneId>) -> u32 {
+        story_core::count_words_with_policy(text, self.word_count_policy_for_scene(scene_id))
+    }
+    fn word_count_policy_for_scene(
+        &self,
+        scene_id: Option<SceneId>,
+    ) -> story_core::WordCountPolicy {
+        let project = self.app.get_project().ok();
+        self.editing_scene
+            .filter(|editing| Some(*editing) == scene_id)
+            .or(scene_id)
+            .and_then(|scene| self.app.get_scene(scene).ok())
+            .and_then(|record| {
+                project
+                    .as_ref()
+                    .map(|project| record.scene.effective_word_count_policy(project))
+            })
+            .or_else(|| project.map(|project| project.word_count_policy))
+            .unwrap_or_default()
     }
     fn scenes_for_scope(
         &self,
@@ -6267,6 +6290,27 @@ impl AppState {
                     " (inherited)"
                 }
             );
+        } else if let Some(rest) = cmd.strip_prefix("scene-word-count-policy ") {
+            let (id, value) = rest
+                .split_once(' ')
+                .ok_or("usage: scene-word-count-policy <scene-uuid> <policy|inherit>")?;
+            let scene = SceneId(id.parse()?);
+            let mut record = self.app.get_scene(scene)?;
+            record.scene.word_count_policy = if value.trim() == "inherit" {
+                None
+            } else {
+                Some(
+                    story_core::WordCountPolicy::parse(value.trim())
+                        .ok_or("policy must be unicode-words, script-graphemes, or inherit")?,
+                )
+            };
+            self.app.update_scene_metadata(&record.scene)?;
+            self.refresh()?;
+            let project = self.app.get_project()?;
+            self.message = format!(
+                "Scene word-count policy: {}",
+                record.scene.effective_word_count_policy(&project).as_str()
+            );
         } else if let Some(rest) = cmd.strip_prefix("passage-language ") {
             let mut parts = rest.split_whitespace();
             let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
@@ -7607,7 +7651,11 @@ impl AppState {
             return Ok(false);
         }
         let before = self.editor.join("\n");
-        let after = remove_last_words(&before, deleted, self.app.get_project()?.word_count_policy);
+        let after = remove_last_words(
+            &before,
+            deleted,
+            self.word_count_policy_for_scene(self.editing_scene),
+        );
         if after != before {
             let before_count = self.count_words_for_project(&before);
             let after_count = self.count_words_for_project(&after);
@@ -12526,6 +12574,25 @@ mod tests {
             .execute_legacy_palette_command(&format!("passage-languages {scene}"))
             .unwrap();
         assert!(state.message.contains("Bonjour"), "{}", state.message);
+        let (text, hash) = state.app.load_scene_text(scene).unwrap();
+        assert_eq!(text, "Dialog: Bonjour");
+        state
+            .app
+            .save_scene_text(scene, Some(&hash), "한국어")
+            .unwrap();
+        state
+            .execute_legacy_palette_command(&format!(
+                "scene-word-count-policy {scene} script-graphemes"
+            ))
+            .unwrap();
+        assert_eq!(state.app.get_scene(scene).unwrap().actual_words, 3);
+        state.open_scene(scene).unwrap();
+        assert_eq!(state.count_words_for_project("한국어"), 3);
+        state
+            .execute_legacy_palette_command(&format!("scene-word-count-policy {scene} inherit"))
+            .unwrap();
+        assert_eq!(state.app.get_scene(scene).unwrap().actual_words, 1);
+        assert_eq!(state.count_words_for_project("한국어"), 1);
     }
 
     #[test]

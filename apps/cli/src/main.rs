@@ -166,6 +166,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let record = app.get_scene(scene)?;
             println!("{}", record.scene.effective_language_code(&project));
         }
+        "scene-word-count-policy" => {
+            let path = args.next().ok_or("missing project path")?;
+            let scene = SceneId(args.next().ok_or("missing scene id")?.parse()?);
+            let requested = args.next();
+            let mut app = WriterApp::open_project(path)?;
+            if let Some(value) = requested.as_deref() {
+                let mut record = app.get_scene(scene)?;
+                record.scene.word_count_policy = if value == "inherit" {
+                    None
+                } else {
+                    Some(
+                        story_core::WordCountPolicy::parse(value)
+                            .ok_or("policy must be unicode-words, script-graphemes, or inherit")?,
+                    )
+                };
+                app.update_scene_metadata(&record.scene)?;
+            }
+            let project = app.get_project()?;
+            println!(
+                "{}",
+                app.get_scene(scene)?
+                    .scene
+                    .effective_word_count_policy(&project)
+                    .as_str()
+            );
+        }
         "passage-language" => {
             let path = args.next().ok_or("missing project path")?;
             let scene = SceneId(args.next().ok_or("missing scene id")?.parse()?);
@@ -2185,6 +2211,9 @@ fn usage() {
     eprintln!("writers-ide compile-check <project>");
     eprintln!("writers-ide word-count-policy <project> [unicode-words|script-graphemes]");
     eprintln!("writers-ide scene-language <project> <scene-uuid> [language-tag|inherit]");
+    eprintln!(
+        "writers-ide scene-word-count-policy <project> <scene-uuid> [unicode-words|script-graphemes|inherit]"
+    );
     eprintln!(
         "writers-ide passage-language <project> <scene-uuid> <start-byte> <end-byte> <language-tag>"
     );
