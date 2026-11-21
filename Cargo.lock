@@ -1555,6 +1555,7 @@ dependencies = [
 name = "story-app"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "sha2",
  "story-analysis",
@@ -1568,6 +1569,7 @@ dependencies = [
  "story-storage",
  "tempfile",
  "thiserror",
+ "toml",
  "uuid",
  "zip",
 ]

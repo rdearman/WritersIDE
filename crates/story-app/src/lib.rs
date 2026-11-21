@@ -1,6 +1,10 @@
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use story_core::*;
 use story_storage::{
     ApprovedKnowledgeClaim, ConflictResolution, ProjectStore, Result as StorageResult, SceneRecord,
@@ -18,8 +22,85 @@ pub enum AppError {
     Pipeline(#[from] story_pipeline::PipelineError),
     #[error(transparent)]
     Git(#[from] story_git::GitError),
+    #[error("user preferences error: {0}")]
+    Preferences(String),
 }
 pub type Result<T> = std::result::Result<T, AppError>;
+
+#[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
+#[serde(default)]
+pub struct UserPreferences {
+    /// Interface language is independent of manuscript language.
+    pub ui_language: String,
+    /// Applied to projects created through the default project creation flow.
+    pub default_writing_language: String,
+}
+
+impl Default for UserPreferences {
+    fn default() -> Self {
+        Self {
+            ui_language: "en".into(),
+            default_writing_language: default_language_code(),
+        }
+    }
+}
+
+fn user_preferences_path() -> Option<PathBuf> {
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        return Some(PathBuf::from(config_home).join("writers-ide/preferences.toml"));
+    }
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".config/writers-ide/preferences.toml"))
+}
+
+fn read_user_preferences_at(path: &Path) -> Result<UserPreferences> {
+    let preferences = match fs::read_to_string(path) {
+        Ok(text) => toml::from_str(&text)
+            .map_err(|error| AppError::Preferences(format!("{}: {error}", path.display())))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => UserPreferences::default(),
+        Err(error) => {
+            return Err(AppError::Preferences(format!(
+                "{}: {error}",
+                path.display()
+            )));
+        }
+    };
+    if !is_valid_language_tag(&preferences.ui_language)
+        || !is_valid_language_tag(&preferences.default_writing_language)
+    {
+        return Err(AppError::Preferences(format!(
+            "{} contains an invalid BCP 47 language tag",
+            path.display()
+        )));
+    }
+    Ok(preferences)
+}
+
+fn write_user_preferences_at(path: &Path, preferences: &UserPreferences) -> Result<()> {
+    if !is_valid_language_tag(&preferences.ui_language)
+        || !is_valid_language_tag(&preferences.default_writing_language)
+    {
+        return Err(AppError::Domain(
+            "preferences require valid BCP 47 language tags".into(),
+        ));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Preferences("preferences path has no parent".into()))?;
+    fs::create_dir_all(parent).map_err(|error| AppError::Preferences(error.to_string()))?;
+    let temporary = path.with_extension("toml.tmp");
+    let bytes = toml::to_string_pretty(preferences)
+        .map_err(|error| AppError::Preferences(error.to_string()))?;
+    use std::io::Write;
+    let mut file =
+        fs::File::create(&temporary).map_err(|error| AppError::Preferences(error.to_string()))?;
+    file.write_all(bytes.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| AppError::Preferences(error.to_string()))?;
+    fs::rename(&temporary, path).map_err(|error| AppError::Preferences(error.to_string()))?;
+    Ok(())
+}
 
 fn escape_svg_text(value: &str) -> String {
     value
@@ -53,13 +134,55 @@ pub struct WriterApp {
     store: ProjectStore,
 }
 impl WriterApp {
+    pub fn user_preferences() -> Result<UserPreferences> {
+        match user_preferences_path() {
+            Some(path) => read_user_preferences_at(&path),
+            None => Ok(UserPreferences::default()),
+        }
+    }
+    pub fn save_user_preferences(preferences: &UserPreferences) -> Result<()> {
+        let path = user_preferences_path().ok_or_else(|| {
+            AppError::Preferences("HOME and XDG_CONFIG_HOME are both unset".into())
+        })?;
+        write_user_preferences_at(&path, preferences)
+    }
+    pub fn set_default_writing_language(language_code: &str) -> Result<()> {
+        let mut preferences = Self::user_preferences()?;
+        preferences.default_writing_language = language_code.into();
+        Self::save_user_preferences(&preferences)
+    }
     pub fn project_root(&self) -> &Path {
         self.store.project_root()
     }
     pub fn create_project(path: impl AsRef<Path>, title: &str) -> Result<Self> {
-        Ok(Self {
-            store: ProjectStore::create(path, title)?,
-        })
+        let preferences = Self::user_preferences()?;
+        Self::create_project_with_preferences(path, title, &preferences)
+    }
+    pub fn create_project_with_preferences(
+        path: impl AsRef<Path>,
+        title: &str,
+        preferences: &UserPreferences,
+    ) -> Result<Self> {
+        if !is_valid_language_tag(&preferences.default_writing_language) {
+            return Err(AppError::Domain(
+                "default writing language must be a valid BCP 47 language tag".into(),
+            ));
+        }
+        let project = Project {
+            id: ProjectId::new(),
+            title: title.into(),
+            author: String::new(),
+            genre: String::new(),
+            synopsis: String::new(),
+            book_type: BookType::Fiction,
+            template_id: None,
+            target_words: None,
+            story_epoch_label: "Day 0".into(),
+            story_calendar_id: None,
+            language_code: preferences.default_writing_language.clone(),
+            word_count_policy: WordCountPolicy::default(),
+        };
+        Self::create_project_with_metadata(path, &project)
     }
     pub fn create_project_with_type(
         path: impl AsRef<Path>,
@@ -77,7 +200,7 @@ impl WriterApp {
             target_words: None,
             story_epoch_label: "Day 0".into(),
             story_calendar_id: None,
-            language_code: default_language_code(),
+            language_code: Self::user_preferences()?.default_writing_language,
             word_count_policy: WordCountPolicy::default(),
         };
         Self::create_project_with_metadata(path, &project)
@@ -98,7 +221,7 @@ impl WriterApp {
             target_words: None,
             story_epoch_label: "Day 0".into(),
             story_calendar_id: None,
-            language_code: default_language_code(),
+            language_code: Self::user_preferences()?.default_writing_language,
             word_count_policy: WordCountPolicy::default(),
         };
         Self::create_project_with_metadata(path, &project)
@@ -2150,6 +2273,41 @@ fn _storage_result(_: StorageResult<()>) {}
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn user_writing_language_is_independent_and_seeds_new_projects() {
+        let dir = tempfile::tempdir().unwrap();
+        let preferences_path = dir.path().join("config/preferences.toml");
+        let preferences = UserPreferences {
+            ui_language: "en-GB".into(),
+            default_writing_language: "it-IT".into(),
+        };
+        write_user_preferences_at(&preferences_path, &preferences).unwrap();
+        assert_eq!(
+            read_user_preferences_at(&preferences_path).unwrap(),
+            preferences
+        );
+        let app = WriterApp::create_project_with_preferences(
+            dir.path().join("Novel"),
+            "Novel",
+            &preferences,
+        )
+        .unwrap();
+        assert_eq!(app.get_project().unwrap().language_code, "it-IT");
+        assert_eq!(preferences.ui_language, "en-GB");
+    }
+
+    #[test]
+    fn invalid_user_language_preferences_are_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("preferences.toml");
+        fs::write(
+            &path,
+            "ui_language = 'en'\ndefault_writing_language = 'not a tag'\n",
+        )
+        .unwrap();
+        assert!(read_user_preferences_at(&path).is_err());
+    }
 
     #[test]
     fn event_dependency_review_uses_uncertain_story_intervals() {

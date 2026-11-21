@@ -20,6 +20,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     };
     match cmd.as_str() {
+        "writing-language-default" => {
+            if let Some(language) = args.next() {
+                story_app::WriterApp::set_default_writing_language(&language)?;
+            }
+            println!(
+                "{}",
+                story_app::WriterApp::user_preferences()?.default_writing_language
+            );
+        }
         "create" => {
             let path = args.next().ok_or("missing project path")?;
             let title = args.next().unwrap_or_else(|| "Untitled Novel".into());
@@ -2205,6 +2214,7 @@ fn parse_merge_choices(
 }
 
 fn usage() {
+    eprintln!("writers-ide writing-language-default [BCP-47-TAG]");
     eprintln!(
         "writers-ide compile <project> <text|markdown|latex|html|epub|docx|pdf> [output] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"
     );
