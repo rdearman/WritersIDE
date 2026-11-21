@@ -3,6 +3,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env, fs, io,
     path::Path,
+    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -963,6 +964,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("analysis.coverage-check", "Check Coverage Rules", "Evaluate saved coverage requirements without changing story data", "Plot", "coverage-check", false),
         legacy_command("analysis.coverage-list", "List Coverage Rules", "List project-local coverage requirements", "Plot", "coverage-list", false),
         legacy_command("analysis.coverage-remove", "Remove Coverage Rule", "Remove a coverage requirement by ID", "Plot", "coverage-remove", true),
+        legacy_command("analysis.spellcheck", "Spellcheck Manuscript", "Run local Aspell without changing prose", "Tools", "spellcheck", true),
         legacy_command(
             "link.create",
             "Create Story Link",
@@ -5384,6 +5386,35 @@ impl AppState {
             } else {
                 rows.join(" | ")
             };
+        } else if cmd == "spellcheck" || cmd.starts_with("spellcheck ") {
+            let mut parts = cmd.split_whitespace().skip(1);
+            let language = parts.next().unwrap_or("en");
+            let dictionary = parts.next();
+            let executable = parts.next().unwrap_or("aspell");
+            let findings =
+                spellcheck_terminal_project(&self.app, language, dictionary, executable)?;
+            self.message = if findings.is_empty() {
+                "No spelling candidates found; manuscript unchanged".into()
+            } else {
+                findings
+                    .iter()
+                    .take(8)
+                    .map(|finding| {
+                        format!(
+                            "{} {}: {}",
+                            finding.entity_kind,
+                            finding.title,
+                            finding
+                                .candidates
+                                .iter()
+                                .map(|(word, count)| format!("{word}×{count}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            };
         } else if cmd == "query-list" {
             self.message = self
                 .app
@@ -6075,7 +6106,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -7348,6 +7379,87 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.menu.is_some() {
         draw_menu_overlay(f, s);
     }
+}
+
+struct TerminalSpellingFinding {
+    entity_kind: String,
+    title: String,
+    candidates: BTreeMap<String, u32>,
+}
+
+fn spellcheck_terminal_project(
+    app: &WriterApp,
+    language: &str,
+    dictionary: Option<&str>,
+    executable: &str,
+) -> Result<Vec<TerminalSpellingFinding>, Box<dyn std::error::Error>> {
+    if language.trim().is_empty() {
+        return Err("spellcheck language tag cannot be empty".into());
+    }
+    let root = app.project_root().canonicalize()?;
+    let allowed = if let Some(relative) = dictionary {
+        let path = root.join(relative).canonicalize()?;
+        if !path.starts_with(&root) || !path.is_file() {
+            return Err("personal dictionary must be a regular project-local file".into());
+        }
+        story_document::parse_personal_dictionary(&fs::read_to_string(path)?)?
+    } else {
+        std::collections::BTreeSet::new()
+    };
+    let input = app.processing_input()?;
+    let prose = input
+        .scenes
+        .into_iter()
+        .map(|scene| ("scene".to_owned(), scene.title, scene.text))
+        .chain(
+            input
+                .content_units
+                .into_iter()
+                .map(|unit| ("content-unit".to_owned(), unit.title, unit.text)),
+        );
+    let mut findings = Vec::new();
+    for (kind, title, text) in prose {
+        let mut child = Command::new(executable)
+            .arg(format!("--lang={language}"))
+            .arg("list")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .ok_or("Aspell stdin unavailable")?
+            .write_all(text.as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(format!(
+                "Aspell failed for {kind} {title}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+            .into());
+        }
+        let mut candidates = BTreeMap::new();
+        for word in String::from_utf8(output.stdout)?
+            .lines()
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+        {
+            let normalized = word.to_lowercase();
+            if !allowed.contains(&normalized) {
+                *candidates.entry(normalized).or_insert(0) += 1;
+            }
+        }
+        if !candidates.is_empty() {
+            findings.push(TerminalSpellingFinding {
+                entity_kind: kind,
+                title,
+                candidates,
+            });
+        }
+    }
+    Ok(findings)
 }
 
 fn planning_board_bounds(items: &[story_storage::PlanningBoardItemRecord]) -> ([f64; 2], [f64; 2]) {
@@ -11010,6 +11122,51 @@ mod tests {
             state.app.git_history(10).unwrap()[0]
                 .subject
                 .contains("Before restoring scene Opening")
+        );
+    }
+
+    #[test]
+    fn terminal_spellcheck_uses_local_wordlist_without_changing_prose() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Book");
+        let mut project = WriterApp::create_project(&project_path, "Book").unwrap();
+        let chapter = project.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = project.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = project.load_scene_text(scene).unwrap();
+        project
+            .save_scene_text(scene, Some(&hash), "Baad word.")
+            .unwrap();
+        fs::create_dir_all(project_path.join("dictionaries")).unwrap();
+        fs::write(project_path.join("dictionaries/en.txt"), "known\n").unwrap();
+        let fake_aspell = root.path().join("aspell-mock");
+        fs::write(
+            &fake_aspell,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'Baad\\nKnown\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_aspell, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut state = AppState::new(project, default_bindings());
+
+        state
+            .execute_legacy_palette_command(&format!(
+                "spellcheck en dictionaries/en.txt {}",
+                fake_aspell.display()
+            ))
+            .unwrap();
+
+        assert!(state.message.contains("baad×1"));
+        assert!(!state.message.contains("known"));
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, "Baad word.");
+        assert!(
+            spellcheck_terminal_project(
+                &state.app,
+                "en",
+                Some("../outside.txt"),
+                fake_aspell.to_str().unwrap()
+            )
+            .is_err()
         );
     }
 
