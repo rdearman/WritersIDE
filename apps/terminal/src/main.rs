@@ -132,6 +132,7 @@ struct AppState {
     macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
     recording_macro: Option<(String, Vec<story_core::EditMacroOp>)>,
     text_expansion: TextExpansionConfig,
+    editor_preferences: EditorPreferences,
     bookmarks: BTreeMap<String, EditorBookmark>,
     kill_ring: Vec<String>,
     kill_ring_index: usize,
@@ -331,11 +332,34 @@ struct TextExpansionFile {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+struct EditorPreferencesFile {
+    editor: EditorPreferences,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 struct TextExpansionConfig {
     enabled: bool,
     triggers: Vec<String>,
     mappings: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+struct EditorPreferences {
+    line_ending: String,
+    indentation: String,
+    indent_width: usize,
+}
+
+impl Default for EditorPreferences {
+    fn default() -> Self {
+        Self {
+            line_ending: "lf".into(),
+            indentation: "tabs".into(),
+            indent_width: 4,
+        }
+    }
 }
 
 impl Default for TextExpansionConfig {
@@ -1421,6 +1445,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.text-expansion-set", "Set Text Expansion", "Add a literal abbreviation and replacement to the project dictionary", "Insert", "text-expansion-set", true),
         legacy_command("edit.text-expansion", "Text Expansion Settings", "Enable, disable, or list project text expansions", "Insert", "text-expansion", true),
         legacy_command("edit.text-expand", "Expand Abbreviation", "Expand the abbreviation immediately before the editor cursor", "Insert", "text-expand", false),
+        legacy_command("edit.preferences", "Editor Preferences", "Set project-local line endings and indentation without rewriting until save", "Edit", "editor-preferences", true),
         legacy_command("edit.bookmark-save", "Save Passage Bookmark", "Save a named stable-ID bookmark for the current passage", "Navigate", "manuscript-bookmark-save", true),
         legacy_command("edit.bookmark-list", "List Passage Bookmarks", "List saved manuscript passage bookmarks", "Navigate", "manuscript-bookmark-list", false),
         legacy_command("edit.bookmark-jump", "Jump to Passage Bookmark", "Navigate to a saved passage, following stable scene identity", "Navigate", "manuscript-bookmark-jump", true),
@@ -1663,6 +1688,51 @@ fn save_text_expansion(
     Ok(())
 }
 
+fn load_editor_preferences(root: &Path) -> Result<EditorPreferences, Box<dyn std::error::Error>> {
+    let path = root.join(".writers-ide/editor-preferences.toml");
+    match fs::read_to_string(path) {
+        Ok(text) => {
+            let file: EditorPreferencesFile = toml::from_str(&text)?;
+            validate_editor_preferences(&file.editor)?;
+            Ok(file.editor)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(EditorPreferences::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn save_editor_preferences(
+    root: &Path,
+    preferences: &EditorPreferences,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_editor_preferences(preferences)?;
+    let directory = root.join(".writers-ide");
+    fs::create_dir_all(&directory)?;
+    let path = directory.join("editor-preferences.toml");
+    let text = toml::to_string_pretty(&EditorPreferencesFile {
+        editor: preferences.clone(),
+    })?;
+    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    use std::io::Write;
+    temporary.write_all(text.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path)?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn validate_editor_preferences(
+    preferences: &EditorPreferences,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !matches!(preferences.line_ending.as_str(), "lf" | "crlf")
+        || !matches!(preferences.indentation.as_str(), "tabs" | "spaces")
+        || !(1..=8).contains(&preferences.indent_width)
+    {
+        return Err("editor preferences require line_ending=lf|crlf, indentation=tabs|spaces, and indent_width=1..8".into());
+    }
+    Ok(())
+}
+
 fn parse_macro_recipe(
     recipe: &str,
 ) -> Result<Vec<story_core::EditMacroOp>, Box<dyn std::error::Error>> {
@@ -1834,6 +1904,14 @@ impl AppState {
                 format!("Text expansions not loaded: {error}"),
             ),
         };
+        let (editor_preferences, preferences_error) =
+            match load_editor_preferences(app.project_root()) {
+                Ok(preferences) => (preferences, String::new()),
+                Err(error) => (
+                    EditorPreferences::default(),
+                    format!("Editor preferences not loaded: {error}"),
+                ),
+            };
         let writing_session = app
             .list_writing_sessions()
             .ok()
@@ -1861,7 +1939,11 @@ impl AppState {
             prompt: String::new(),
             message: draft_notice.unwrap_or({
                 if tools_error.is_empty() {
-                    expansion_error
+                    if expansion_error.is_empty() {
+                        preferences_error
+                    } else {
+                        expansion_error
+                    }
                 } else {
                     tools_error
                 }
@@ -1906,6 +1988,7 @@ impl AppState {
             macros: tools.macros,
             recording_macro: None,
             text_expansion,
+            editor_preferences,
             bookmarks: tools.bookmarks,
             kill_ring: tools.kill_ring,
             kill_ring_index: 0,
@@ -2638,7 +2721,12 @@ impl AppState {
             return Ok(());
         }
         if let Some(id) = self.editing_scene {
-            let text = self.editor.join("\n");
+            let canonical_text = self.editor.join("\n");
+            let text = if self.editor_preferences.line_ending == "crlf" {
+                canonical_text.replace('\n', "\r\n")
+            } else {
+                canonical_text
+            };
             match self.app.save_scene_text(id, Some(&self.saved_hash), &text) {
                 Ok(hash) => {
                     self.saved_hash = hash;
@@ -3387,10 +3475,49 @@ impl AppState {
                 _ => return Err("use text-expansion on|off|list".into()),
             }
         } else if cmd == "text-expand" {
-            if self.expand_text_before_cursor("", true) {
+            if self.expand_text_before_cursor("", "", true) {
                 self.message = "Expanded abbreviation (undo available)".into();
             } else {
                 self.message = "No matching abbreviation before the cursor".into();
+            }
+        } else if let Some(value) = cmd.strip_prefix("editor-preferences ") {
+            let mut parts = value.split_whitespace();
+            match parts
+                .next()
+                .ok_or("use editor-preferences show|line-ending|indentation|indent-width")?
+            {
+                "show" if parts.next().is_none() => {
+                    self.message = format!(
+                        "line-ending={} · indentation={} · indent-width={}",
+                        self.editor_preferences.line_ending,
+                        self.editor_preferences.indentation,
+                        self.editor_preferences.indent_width
+                    );
+                }
+                "line-ending" => {
+                    self.editor_preferences.line_ending =
+                        parts.next().ok_or("choose lf or crlf")?.to_owned();
+                }
+                "indentation" => {
+                    self.editor_preferences.indentation =
+                        parts.next().ok_or("choose tabs or spaces")?.to_owned();
+                }
+                "indent-width" => {
+                    self.editor_preferences.indent_width =
+                        parts.next().ok_or("choose a width from 1 to 8")?.parse()?;
+                }
+                _ => {
+                    return Err(
+                        "use editor-preferences show|line-ending|indentation|indent-width".into(),
+                    );
+                }
+            }
+            if parts.next().is_some() {
+                return Err("editor-preferences accepts one value per setting".into());
+            }
+            save_editor_preferences(self.app.project_root(), &self.editor_preferences)?;
+            if !value.starts_with("show") {
+                self.message = "Saved project editor preferences; existing text changes on the next scene save".into();
             }
         } else if let Some(name) = cmd.strip_prefix("manuscript-bookmark-save ") {
             let name = name.trim();
@@ -5356,7 +5483,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -5496,13 +5623,24 @@ impl AppState {
     }
     fn insert(&mut self, ch: char) {
         self.last_yank = None;
-        self.record_macro_op(story_core::EditMacroOp::Insert(ch.to_string()));
+        let insertion = if ch == '\t' && self.editor_preferences.indentation == "spaces" {
+            " ".repeat(self.editor_preferences.indent_width)
+        } else {
+            ch.to_string()
+        };
+        self.record_macro_op(story_core::EditMacroOp::Insert(insertion.clone()));
         if self.writing_stats_enabled {
-            self.typed_characters = self.typed_characters.saturating_add(1);
+            self.typed_characters = self
+                .typed_characters
+                .saturating_add(insertion.chars().count() as u64);
         }
-        self.insert_text_char(ch);
-        if matches!(ch, ' ' | '\t') {
-            self.expand_text_before_cursor(&ch.to_string(), false);
+        for character in insertion.chars() {
+            self.insert_text_char(character);
+        }
+        if ch == ' ' {
+            self.expand_text_before_cursor("space", &insertion, false);
+        } else if ch == '\t' {
+            self.expand_text_before_cursor("tab", &insertion, false);
         }
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
@@ -5595,7 +5733,12 @@ impl AppState {
             challenge.last_activity = Instant::now();
         }
     }
-    fn expand_text_before_cursor(&mut self, delimiter: &str, record_undo: bool) -> bool {
+    fn expand_text_before_cursor(
+        &mut self,
+        trigger: &str,
+        delimiter: &str,
+        record_undo: bool,
+    ) -> bool {
         if !self.text_expansion.enabled || !self.extra_cursors.is_empty() {
             return false;
         }
@@ -5605,12 +5748,12 @@ impl AppState {
         let trigger_bytes = delimiter.len();
         if trigger_bytes > before_cursor.len()
             || !before_cursor.ends_with(delimiter)
-            || (!delimiter.is_empty()
-                && !self.text_expansion.triggers.iter().any(|trigger| {
-                    (trigger == "space" && delimiter == " ")
-                        || (trigger == "enter" && delimiter == "\n")
-                        || (trigger == "tab" && delimiter == "\t")
-                }))
+            || (!trigger.is_empty()
+                && !self
+                    .text_expansion
+                    .triggers
+                    .iter()
+                    .any(|configured| configured == trigger))
         {
             return false;
         }
@@ -5814,7 +5957,7 @@ impl AppState {
             challenge.last_activity = Instant::now();
         }
         self.split_line();
-        self.expand_text_before_cursor("\n", false);
+        self.expand_text_before_cursor("enter", "\n", false);
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
         }
@@ -9442,7 +9585,7 @@ mod tests {
 
         state.editor = vec!["%D%".into()];
         state.cursor = (0, 3);
-        assert!(state.expand_text_before_cursor("", true));
+        assert!(state.expand_text_before_cursor("", "", true));
         assert_eq!(state.editor, ["short"]);
 
         state.editor = vec!["%DWAP%".into()];
@@ -9517,6 +9660,44 @@ mod tests {
             default_bindings(),
         );
         assert_eq!(reopened.kill_ring, ["second passage", "first passage"]);
+    }
+
+    #[test]
+    fn project_editor_preferences_apply_line_endings_and_tab_indentation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app =
+            WriterApp::create_project(root.path().join("Preferences"), "Preferences").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command("editor-preferences line-ending crlf")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("editor-preferences indentation spaces")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("editor-preferences indent-width 2")
+            .unwrap();
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["first".into(), "second".into()];
+        state.dirty = true;
+        state.save().unwrap();
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "first\r\nsecond"
+        );
+        state.editor = vec![String::new()];
+        state.cursor = (0, 0);
+        state.insert('\t');
+        assert_eq!(state.editor, ["  "]);
+        let reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        assert_eq!(reopened.editor_preferences.line_ending, "crlf");
+        assert_eq!(reopened.editor_preferences.indentation, "spaces");
+        assert_eq!(reopened.editor_preferences.indent_width, 2);
     }
 
     #[test]
@@ -10052,6 +10233,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
@@ -10522,6 +10704,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
@@ -10613,6 +10796,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
@@ -10696,6 +10880,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
@@ -10791,6 +10976,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
@@ -11036,6 +11222,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
@@ -11131,6 +11318,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
@@ -11243,6 +11431,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
@@ -11473,6 +11662,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
@@ -11830,6 +12020,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
@@ -11936,6 +12127,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
@@ -12094,6 +12286,7 @@ mod tests {
             macros: BTreeMap::new(),
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
