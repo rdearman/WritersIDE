@@ -44,9 +44,10 @@ enum Workspace {
     Reading,
     Revisions,
     PlanningBoards,
+    Assemblies,
 }
 impl Workspace {
-    const ALL: [Self; 15] = [
+    const ALL: [Self; 16] = [
         Self::Dashboard,
         Self::Outline,
         Self::Cards,
@@ -62,6 +63,7 @@ impl Workspace {
         Self::Reading,
         Self::Revisions,
         Self::PlanningBoards,
+        Self::Assemblies,
     ];
     fn title(self) -> &'static str {
         match self {
@@ -80,6 +82,7 @@ impl Workspace {
             Self::Reading => "Reading",
             Self::Revisions => "Revisions",
             Self::PlanningBoards => "Planning Boards",
+            Self::Assemblies => "Manuscript Assemblies",
         }
     }
 }
@@ -507,6 +510,7 @@ fn command_registry() -> Vec<CommandSpec> {
                 Workspace::Reading => "view.reading",
                 Workspace::Revisions => "view.revisions",
                 Workspace::PlanningBoards => "view.planning-boards",
+                Workspace::Assemblies => "view.assemblies",
             },
             label: workspace.title(),
             description: "Switch to this workspace",
@@ -1949,7 +1953,7 @@ fn default_bindings() -> Vec<(u8, Workspace)> {
         .copied()
         .enumerate()
         .filter_map(|(index, workspace)| {
-            if index == 9 {
+            if index == 9 || index >= 14 {
                 None
             } else {
                 let function_key = (index + 1) as u8;
@@ -9596,6 +9600,19 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 )
             })
             .collect(),
+        Workspace::Assemblies => s
+            .app
+            .list_assemblies()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|assembly| {
+                let count = s
+                    .app
+                    .list_assembly_items(assembly.id)
+                    .map_or(0, |items| items.len());
+                format!("{} · {} content items", assembly.title, count)
+            })
+            .collect(),
         Workspace::PlanningBoards => {
             if let Some(board) = s.planning_board_id {
                 s.app
@@ -10981,6 +10998,18 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.revision_hunk = 0;
                 s.scroll = 0;
                 s.message = format!("Diff for {}", snapshot.label);
+            }
+        }
+        KeyCode::Enter if s.workspace == Workspace::Assemblies => {
+            if let Some(assembly) = s.app.list_assemblies()?.get(s.selected).cloned() {
+                let draft = s.app.create_assembly_draft(assembly.id)?;
+                s.open_assembly_draft(draft.id)?;
+                s.message = format!(
+                    "Opened assembly {} · edit scene text and save with Ctrl-S",
+                    assembly.title
+                );
+            } else {
+                s.message = "No manuscript assembly selected".into();
             }
         }
         KeyCode::Enter if s.workspace == Workspace::Timeline => {
@@ -13057,6 +13086,27 @@ mod tests {
         );
         assert!(!state.dirty);
         assert_ne!(saved, state.editor.join("\n"));
+    }
+
+    #[test]
+    fn assembly_workspace_lists_assemblies_and_enter_opens_editable_draft() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Editions"), "Editions").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let assembly = app.create_assembly("Alternate edition").unwrap();
+        app.add_assembly_scene(assembly, scene, 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.switch(Workspace::Assemblies);
+        assert!(workspace_items(&state)[0].contains("Alternate edition"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert!(state.assembly_draft.is_some());
+        assert!(state.editor.join("\n").contains(&scene.to_string()));
     }
 
     #[test]
