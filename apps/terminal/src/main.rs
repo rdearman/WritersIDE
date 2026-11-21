@@ -136,6 +136,7 @@ struct AppState {
     kill_ring: Vec<String>,
     kill_ring_index: usize,
     last_yank: Option<LastYank>,
+    macro_preview: Option<MacroPreview>,
     extra_cursors: Vec<(usize, usize)>,
     active_challenge: Option<ActiveWritingChallenge>,
     menu: Option<MenuState>,
@@ -308,6 +309,13 @@ struct LastYank {
     scene_id: Option<SceneId>,
     range: std::ops::Range<usize>,
     text: String,
+}
+
+#[derive(Clone, Debug)]
+struct MacroPreview {
+    name: String,
+    repetitions: usize,
+    source: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1406,7 +1414,8 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.multi-insert", "Multi-cursor Insert", "Insert text at multiple original UTF-8 byte offsets", "Edit", "multi-insert", true),
         legacy_command("edit.macro", "Run Edit Macro", "Apply an undoable selection or line edit macro", "Edit", "macro", true),
         legacy_command("edit.macro-define", "Define Edit Macro", "Save a reusable, data-only edit macro", "Edit", "macro-define", true),
-        legacy_command("edit.macro-run", "Run Named Edit Macro", "Apply a saved macro to the selection or current line", "Edit", "macro-run", true),
+        legacy_command("edit.macro-run", "Run Named Edit Macro", "Apply a saved macro once or a bounded number of times", "Edit", "macro-run", true),
+        legacy_command("edit.macro-preview", "Preview Named Edit Macro", "Preview a macro and repetition count without changing manuscript text", "Edit", "macro-preview", true),
         legacy_command("edit.macro-record", "Record Edit Macro", "Record editor insertions, deletions, cursor movement, and selection changes", "Edit", "macro-record", true),
         legacy_command("edit.macro-stop", "Stop Macro Recording", "Save the currently recorded edit macro", "Edit", "macro-stop", false),
         legacy_command("edit.text-expansion-set", "Set Text Expansion", "Add a literal abbreviation and replacement to the project dictionary", "Insert", "text-expansion-set", true),
@@ -1688,6 +1697,44 @@ fn parse_macro_recipe(
         .collect()
 }
 
+fn parse_macro_run_arguments(input: &str) -> Result<(&str, usize), String> {
+    let mut parts = input.split_whitespace();
+    let name = parts.next().ok_or("use macro-run NAME [REPETITIONS]")?;
+    let repetitions = parts
+        .next()
+        .map(str::parse::<usize>)
+        .transpose()
+        .map_err(|_| "macro repetitions must be a positive integer")?
+        .unwrap_or(1);
+    if parts.next().is_some() || !(1..=100).contains(&repetitions) {
+        return Err("use macro-run NAME [REPETITIONS], with repetitions from 1 to 100".into());
+    }
+    Ok((name, repetitions))
+}
+
+fn repeated_macro_operations(
+    operations: &[story_core::EditMacroOp],
+    repetitions: usize,
+) -> Result<Vec<story_core::EditMacroOp>, String> {
+    if operations.is_empty() || !(1..=100).contains(&repetitions) {
+        return Err("macro must contain operations and repetitions must be from 1 to 100".into());
+    }
+    Ok((0..repetitions)
+        .flat_map(|_| operations.iter().cloned())
+        .collect())
+}
+
+fn is_destructive_macro_op(operation: &story_core::EditMacroOp) -> bool {
+    matches!(
+        operation,
+        story_core::EditMacroOp::Backspace
+            | story_core::EditMacroOp::DeleteForward
+            | story_core::EditMacroOp::Replace { .. }
+            | story_core::EditMacroOp::UppercaseSelection
+            | story_core::EditMacroOp::LowercaseSelection
+    )
+}
+
 fn parse_terminal_query_assertion(
     value: &str,
 ) -> Result<story_core::QueryAssertion, Box<dyn std::error::Error>> {
@@ -1863,6 +1910,7 @@ impl AppState {
             kill_ring: tools.kill_ring,
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -3226,14 +3274,51 @@ impl AppState {
                 self.persist_editor_tools()?;
                 self.message = format!("Saved recorded macro {name}");
             }
-        } else if let Some(name) = cmd.strip_prefix("macro-run ") {
-            let operations = self
-                .macros
-                .get(name.trim())
-                .ok_or("unknown saved macro")?
-                .clone();
-            self.apply_edit_macro(&operations)?;
-            self.message = format!("Applied saved macro {} (undo available)", name.trim());
+        } else if let Some(arguments) = cmd.strip_prefix("macro-preview ") {
+            let (name, repetitions) = parse_macro_run_arguments(arguments)?;
+            let operations = self.macros.get(name).ok_or("unknown saved macro")?;
+            let repeated = repeated_macro_operations(operations, repetitions)?;
+            let source = self.editor.join("\n");
+            let output = self.preview_edit_macro(&repeated)?;
+            self.macro_preview = Some(MacroPreview {
+                name: name.to_owned(),
+                repetitions,
+                source: source.clone(),
+            });
+            self.message = format!(
+                "Macro preview · {name} × {repetitions} · {} → {} bytes · run macro-run {name} {repetitions} to apply",
+                source.len(),
+                output.len()
+            );
+        } else if let Some(arguments) = cmd.strip_prefix("macro-run ") {
+            let (name, repetitions) = parse_macro_run_arguments(arguments)?;
+            let operations = self.macros.get(name).ok_or("unknown saved macro")?.clone();
+            let repeated = repeated_macro_operations(&operations, repetitions)?;
+            let source = self.editor.join("\n");
+            let needs_preview = repetitions > 1 && repeated.iter().any(is_destructive_macro_op);
+            let preview_is_current = self.macro_preview.as_ref().is_some_and(|preview| {
+                preview.name == name
+                    && preview.repetitions == repetitions
+                    && preview.source == source
+            });
+            if needs_preview && !preview_is_current {
+                let output = self.preview_edit_macro(&repeated)?;
+                self.macro_preview = Some(MacroPreview {
+                    name: name.to_owned(),
+                    repetitions,
+                    source: source.clone(),
+                });
+                self.message = format!(
+                    "Destructive macro preview · {} → {} bytes · repeat macro-run {name} {repetitions} to confirm",
+                    source.len(),
+                    output.len()
+                );
+            } else {
+                self.macro_preview = None;
+                self.apply_edit_macro(&repeated)?;
+                self.message =
+                    format!("Applied saved macro {name} × {repetitions} (undo available)");
+            }
         } else if let Some(value) = cmd.strip_prefix("text-expansion-set ") {
             let (abbreviation, replacement) = value
                 .split_once("=>")
@@ -5255,7 +5340,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -5325,8 +5410,22 @@ impl AppState {
         &mut self,
         operations: &[story_core::EditMacroOp],
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let selection = self
-            .editor_selection
+        let selection = self.macro_selection();
+        self.push_undo();
+        let (updated, selection) =
+            story_core::run_edit_macro(&self.editor.join("\n"), selection, operations)?;
+        self.editor = updated.split('\n').map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        if let Some((row, column)) = editor_position_from_byte(&updated, selection.end) {
+            self.cursor = (row, column);
+        }
+        self.dirty = true;
+        Ok(())
+    }
+    fn macro_selection(&self) -> std::ops::Range<usize> {
+        self.editor_selection
             .map(|anchor| {
                 let a = editor_position_byte(&self.editor, anchor.0, anchor.1);
                 let b = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
@@ -5340,19 +5439,18 @@ impl AppState {
                         self.cursor.0,
                         grapheme_count(&self.editor[self.cursor.0]),
                     )
-            });
-        self.push_undo();
-        let (updated, selection) =
-            story_core::run_edit_macro(&self.editor.join("\n"), selection, operations)?;
-        self.editor = updated.split('\n').map(str::to_owned).collect();
-        if self.editor.is_empty() {
-            self.editor.push(String::new());
-        }
-        if let Some((row, column)) = editor_position_from_byte(&updated, selection.end) {
-            self.cursor = (row, column);
-        }
-        self.dirty = true;
-        Ok(())
+            })
+    }
+    fn preview_edit_macro(
+        &self,
+        operations: &[story_core::EditMacroOp],
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let (updated, _) = story_core::run_edit_macro(
+            &self.editor.join("\n"),
+            self.macro_selection(),
+            operations,
+        )?;
+        Ok(updated)
     }
     fn record_macro_op(&mut self, operation: story_core::EditMacroOp) {
         if let Some((_, operations)) = &mut self.recording_macro {
@@ -9252,6 +9350,30 @@ mod tests {
     }
 
     #[test]
+    fn destructive_repeated_macros_preview_then_apply_as_one_undoable_edit() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Macro"), "Macro").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.editor = vec!["word".into()];
+        state
+            .macros
+            .insert("trim".into(), vec![story_core::EditMacroOp::Backspace]);
+        state.prompt = "macro-run trim 2".into();
+        state.command().unwrap();
+        assert_eq!(state.editor, ["word"]);
+        assert!(state.message.contains("repeat macro-run trim 2 to confirm"));
+        state.prompt = "macro-run trim 2".into();
+        state.command().unwrap();
+        assert_eq!(state.editor, ["wo"]);
+        state.undo_edit();
+        assert_eq!(state.editor, ["word"]);
+        assert_eq!(
+            parse_macro_run_arguments("trim 101"),
+            Err("use macro-run NAME [REPETITIONS], with repetitions from 1 to 100".into())
+        );
+    }
+
+    #[test]
     fn text_expansion_is_configurable_undoable_contextual_and_not_applied_to_paste() {
         let root = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(root.path().join("Text Expansion"), "Text Expansion")
@@ -9906,6 +10028,7 @@ mod tests {
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10375,6 +10498,7 @@ mod tests {
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10465,6 +10589,7 @@ mod tests {
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10547,6 +10672,7 @@ mod tests {
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10641,6 +10767,7 @@ mod tests {
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10885,6 +11012,7 @@ mod tests {
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10979,6 +11107,7 @@ mod tests {
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11090,6 +11219,7 @@ mod tests {
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11319,6 +11449,7 @@ mod tests {
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11675,6 +11806,7 @@ mod tests {
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11780,6 +11912,7 @@ mod tests {
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11937,6 +12070,7 @@ mod tests {
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
+            macro_preview: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
