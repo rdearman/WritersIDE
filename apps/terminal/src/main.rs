@@ -5383,6 +5383,11 @@ impl AppState {
                     let range = fact
                         .passage_bytes
                         .map(|(start, end)| format!(" [{start}..{end} bytes]"))
+                        .or_else(|| {
+                            fact.field_bytes.as_ref().map(|(field, start, end)| {
+                                format!(" [{field} {start}..{end} bytes]")
+                            })
+                        })
                         .unwrap_or_default();
                     format!(
                         "{} {}{} · {}",

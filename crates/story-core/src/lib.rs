@@ -764,6 +764,9 @@ pub struct QueryEvidence {
     /// UTF-8 byte range in the canonical manuscript file, when the fact comes
     /// from a specific passage rather than scene-level structured metadata.
     pub passage_bytes: Option<(u64, u64)>,
+    /// UTF-8 byte range within a metadata field, when evidence comes from a
+    /// scene title or synopsis rather than its canonical manuscript file.
+    pub field_bytes: Option<(String, u64, u64)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

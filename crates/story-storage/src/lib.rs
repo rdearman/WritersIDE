@@ -6891,6 +6891,7 @@ impl ProjectStore {
                 source_id: row.get(1)?,
                 detail: row.get(2)?,
                 passage_bytes: None,
+                field_bytes: None,
             })
         })?;
         let mut evidence = rows.collect::<std::result::Result<Vec<_>, _>>()?;
@@ -6908,13 +6909,30 @@ impl ProjectStore {
         terms.sort();
         terms.dedup();
         if !terms.is_empty() {
+            let (title, synopsis) = self.conn.query_row(
+                "SELECT title,synopsis FROM scene WHERE id=?1",
+                [scene.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )?;
             for term in terms {
+                for (field_name, field_text) in [("title", &title), ("synopsis", &synopsis)] {
+                    for (start, end) in find_ascii_case_insensitive(field_text, &term) {
+                        evidence.push(QueryEvidence {
+                            source_kind: "scene-field".into(),
+                            source_id: scene.to_string(),
+                            detail: format!("matched literal query text {term:?}"),
+                            passage_bytes: None,
+                            field_bytes: Some((field_name.to_owned(), start, end)),
+                        });
+                    }
+                }
                 for passage_bytes in find_ascii_case_insensitive(&prose, &term) {
                     evidence.push(QueryEvidence {
                         source_kind: "scene-passage".into(),
                         source_id: scene.to_string(),
                         detail: format!("matched literal query text {term:?}"),
                         passage_bytes: Some(passage_bytes),
+                        field_bytes: None,
                     });
                 }
             }
@@ -10889,7 +10907,13 @@ mod tests {
         let p = d.path().join("N");
         let mut s = ProjectStore::create(&p, "N").unwrap();
         let ch = s.create_node(None, NodeKind::Chapter, "C", 0).unwrap();
-        let sc = s.create_scene(ch, 0, "S").unwrap();
+        let sc = s.create_scene(ch, 0, "Mara Arrival").unwrap();
+        s.conn
+            .execute(
+                "UPDATE scene SET synopsis='Mara enters the old station' WHERE id=?1",
+                [sc.to_string()],
+            )
+            .unwrap();
         let char = CharacterId::new();
         s.add_character(char, "Mara").unwrap();
         s.link_character(sc, char, ParticipationRole::Pov).unwrap();
@@ -11017,6 +11041,12 @@ mod tests {
         let passage_evidence = s.explain_scene_query_match(text_query.id, sc).unwrap();
         assert!(passage_evidence.iter().any(|item| {
             item.source_kind == "scene-passage" && item.passage_bytes == Some((0, 4))
+        }));
+        assert!(passage_evidence.iter().any(|item| {
+            item.source_kind == "scene-field" && item.field_bytes == Some(("title".into(), 0, 4))
+        }));
+        assert!(passage_evidence.iter().any(|item| {
+            item.source_kind == "scene-field" && item.field_bytes == Some(("synopsis".into(), 0, 4))
         }));
         s.validate().unwrap();
         let ev1 = EventId::new();
