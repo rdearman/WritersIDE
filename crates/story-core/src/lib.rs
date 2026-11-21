@@ -76,6 +76,12 @@ pub enum EditMacroOp {
     MoveDown,
     MoveLineStart,
     MoveLineEnd,
+    SelectLeft,
+    SelectRight,
+    SelectUp,
+    SelectDown,
+    SelectLineStart,
+    SelectLineEnd,
     Replace { from: String, to: String },
     UppercaseSelection,
     LowercaseSelection,
@@ -97,14 +103,26 @@ pub fn run_edit_macro(
     let mut selected = source[selection.clone()].to_owned();
     let after = source[selection.end..].to_owned();
     let mut cursor = selected.len();
+    let mut anchor: Option<usize> = None;
     for operation in operations {
         match operation {
             EditMacroOp::Insert(text) => {
+                if let Some(selection_anchor) = anchor.take() {
+                    let start = selection_anchor.min(cursor);
+                    let end = selection_anchor.max(cursor);
+                    selected.replace_range(start..end, "");
+                    cursor = start;
+                }
                 selected.insert_str(cursor, text);
                 cursor += text.len();
             }
             EditMacroOp::Backspace => {
-                if let Some(previous) = selected[..cursor]
+                if let Some(selection_anchor) = anchor.take() {
+                    let start = selection_anchor.min(cursor);
+                    let end = selection_anchor.max(cursor);
+                    selected.replace_range(start..end, "");
+                    cursor = start;
+                } else if let Some(previous) = selected[..cursor]
                     .grapheme_indices(true)
                     .next_back()
                     .map(|(i, _)| i)
@@ -114,32 +132,58 @@ pub fn run_edit_macro(
                 }
             }
             EditMacroOp::DeleteForward => {
-                if let Some((offset, grapheme)) = selected[cursor..].grapheme_indices(true).next() {
+                if let Some(selection_anchor) = anchor.take() {
+                    let start = selection_anchor.min(cursor);
+                    let end = selection_anchor.max(cursor);
+                    selected.replace_range(start..end, "");
+                    cursor = start;
+                } else if let Some((offset, grapheme)) =
+                    selected[cursor..].grapheme_indices(true).next()
+                {
                     let start = cursor + offset;
                     selected.replace_range(start..start + grapheme.len(), "");
                 }
             }
-            EditMacroOp::MoveLeft => {
+            EditMacroOp::MoveLeft | EditMacroOp::SelectLeft => {
+                if matches!(operation, EditMacroOp::SelectLeft) {
+                    anchor.get_or_insert(cursor);
+                } else {
+                    anchor = None;
+                }
                 cursor = selected[..cursor]
                     .grapheme_indices(true)
                     .next_back()
                     .map_or(0, |(i, _)| i);
             }
-            EditMacroOp::MoveRight => {
+            EditMacroOp::MoveRight | EditMacroOp::SelectRight => {
+                if matches!(operation, EditMacroOp::SelectRight) {
+                    anchor.get_or_insert(cursor);
+                } else {
+                    anchor = None;
+                }
                 if let Some((offset, grapheme)) = selected[cursor..].grapheme_indices(true).next() {
                     cursor += offset + grapheme.len();
                 }
             }
-            EditMacroOp::MoveUp | EditMacroOp::MoveDown => {
+            EditMacroOp::MoveUp
+            | EditMacroOp::MoveDown
+            | EditMacroOp::SelectUp
+            | EditMacroOp::SelectDown => {
+                if matches!(operation, EditMacroOp::SelectUp | EditMacroOp::SelectDown) {
+                    anchor.get_or_insert(cursor);
+                } else {
+                    anchor = None;
+                }
                 let prior_lines = selected[..cursor].matches('\n').count();
                 let lines = selected.split('\n').collect::<Vec<_>>();
                 let current_line_start = selected[..cursor].rfind('\n').map_or(0, |i| i + 1);
                 let column = selected[current_line_start..cursor].graphemes(true).count();
-                let target_line = if matches!(operation, EditMacroOp::MoveUp) {
-                    prior_lines.saturating_sub(1)
-                } else {
-                    (prior_lines + 1).min(lines.len().saturating_sub(1))
-                };
+                let target_line =
+                    if matches!(operation, EditMacroOp::MoveUp | EditMacroOp::SelectUp) {
+                        prior_lines.saturating_sub(1)
+                    } else {
+                        (prior_lines + 1).min(lines.len().saturating_sub(1))
+                    };
                 let line_start = lines
                     .iter()
                     .take(target_line)
@@ -152,25 +196,52 @@ pub fn run_edit_macro(
                     .map_or(target.len(), |(offset, _)| offset);
                 cursor = line_start + target_column;
             }
-            EditMacroOp::MoveLineStart => {
+            EditMacroOp::MoveLineStart | EditMacroOp::SelectLineStart => {
+                if matches!(operation, EditMacroOp::SelectLineStart) {
+                    anchor.get_or_insert(cursor);
+                } else {
+                    anchor = None;
+                }
                 cursor = selected[..cursor].rfind('\n').map_or(0, |i| i + 1);
             }
-            EditMacroOp::MoveLineEnd => {
+            EditMacroOp::MoveLineEnd | EditMacroOp::SelectLineEnd => {
+                if matches!(operation, EditMacroOp::SelectLineEnd) {
+                    anchor.get_or_insert(cursor);
+                } else {
+                    anchor = None;
+                }
                 cursor += selected[cursor..]
                     .find('\n')
                     .unwrap_or(selected.len() - cursor);
             }
             EditMacroOp::Replace { from, to } => {
+                anchor = None;
                 selected = selected.replace(from, to);
                 cursor = selected.len();
             }
             EditMacroOp::UppercaseSelection => {
-                selected = selected.to_uppercase();
-                cursor = selected.len();
+                if let Some(selection_anchor) = anchor.take() {
+                    let start = selection_anchor.min(cursor);
+                    let end = selection_anchor.max(cursor);
+                    let replacement = selected[start..end].to_uppercase();
+                    selected.replace_range(start..end, &replacement);
+                    cursor = start + replacement.len();
+                } else {
+                    selected = selected.to_uppercase();
+                    cursor = selected.len();
+                }
             }
             EditMacroOp::LowercaseSelection => {
-                selected = selected.to_lowercase();
-                cursor = selected.len();
+                if let Some(selection_anchor) = anchor.take() {
+                    let start = selection_anchor.min(cursor);
+                    let end = selection_anchor.max(cursor);
+                    let replacement = selected[start..end].to_lowercase();
+                    selected.replace_range(start..end, &replacement);
+                    cursor = start + replacement.len();
+                } else {
+                    selected = selected.to_lowercase();
+                    cursor = selected.len();
+                }
             }
         }
     }
@@ -224,6 +295,14 @@ mod editor_tool_tests {
         let (text, range) = run_edit_macro("aé", 0..3, &operations).unwrap();
         assert_eq!(text, "a!");
         assert_eq!(&text[range], "a!");
+    }
+
+    #[test]
+    fn recorded_selection_operations_replace_graphemes_without_touching_neighbors() {
+        let operations = [EditMacroOp::SelectLeft, EditMacroOp::Insert("X".into())];
+        let (text, range) = run_edit_macro("aéz", 0..4, &operations).unwrap();
+        assert_eq!(text, "aéX");
+        assert_eq!(&text[range], "aéX");
     }
 
     #[test]

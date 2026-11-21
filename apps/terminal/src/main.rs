@@ -1353,7 +1353,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.macro", "Run Edit Macro", "Apply an undoable selection or line edit macro", "Edit", "macro", true),
         legacy_command("edit.macro-define", "Define Edit Macro", "Save a reusable, data-only edit macro", "Edit", "macro-define", true),
         legacy_command("edit.macro-run", "Run Named Edit Macro", "Apply a saved macro to the selection or current line", "Edit", "macro-run", true),
-        legacy_command("edit.macro-record", "Record Edit Macro", "Record editor insertions, deletions, and horizontal movement", "Edit", "macro-record", true),
+        legacy_command("edit.macro-record", "Record Edit Macro", "Record editor insertions, deletions, cursor movement, and selection changes", "Edit", "macro-record", true),
         legacy_command("edit.macro-stop", "Stop Macro Recording", "Save the currently recorded edit macro", "Edit", "macro-stop", false),
         legacy_command("edit.cursor-add", "Add Multi-cursor", "Add an editing cursor at grapheme row and column", "Edit", "cursor-add", true),
         legacy_command("edit.cursor-clear", "Clear Multi-cursors", "Return to the primary editor cursor", "Edit", "cursor-clear", false),
@@ -8038,15 +8038,19 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             KeyCode::Backspace => s.backspace(),
             KeyCode::Delete => s.delete_forward(),
             KeyCode::Home => {
-                if !selecting {
-                    s.record_macro_op(story_core::EditMacroOp::MoveLineStart);
-                }
+                s.record_macro_op(if selecting {
+                    story_core::EditMacroOp::SelectLineStart
+                } else {
+                    story_core::EditMacroOp::MoveLineStart
+                });
                 s.move_editor_cursors(CursorMotion::Home, selecting)
             }
             KeyCode::End => {
-                if !selecting {
-                    s.record_macro_op(story_core::EditMacroOp::MoveLineEnd);
-                }
+                s.record_macro_op(if selecting {
+                    story_core::EditMacroOp::SelectLineEnd
+                } else {
+                    story_core::EditMacroOp::MoveLineEnd
+                });
                 s.move_editor_cursors(CursorMotion::End, selecting)
             }
             KeyCode::Char('w') if k.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -8069,27 +8073,35 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 }
             }
             KeyCode::Left => {
-                if !selecting {
-                    s.record_macro_op(story_core::EditMacroOp::MoveLeft);
-                }
+                s.record_macro_op(if selecting {
+                    story_core::EditMacroOp::SelectLeft
+                } else {
+                    story_core::EditMacroOp::MoveLeft
+                });
                 s.move_editor_cursors(CursorMotion::Left, selecting)
             }
             KeyCode::Right => {
-                if !selecting {
-                    s.record_macro_op(story_core::EditMacroOp::MoveRight);
-                }
+                s.record_macro_op(if selecting {
+                    story_core::EditMacroOp::SelectRight
+                } else {
+                    story_core::EditMacroOp::MoveRight
+                });
                 s.move_editor_cursors(CursorMotion::Right, selecting)
             }
             KeyCode::Up => {
-                if !selecting {
-                    s.record_macro_op(story_core::EditMacroOp::MoveUp);
-                }
+                s.record_macro_op(if selecting {
+                    story_core::EditMacroOp::SelectUp
+                } else {
+                    story_core::EditMacroOp::MoveUp
+                });
                 s.move_editor_cursors(CursorMotion::Up, selecting)
             }
             KeyCode::Down => {
-                if !selecting {
-                    s.record_macro_op(story_core::EditMacroOp::MoveDown);
-                }
+                s.record_macro_op(if selecting {
+                    story_core::EditMacroOp::SelectDown
+                } else {
+                    story_core::EditMacroOp::MoveDown
+                });
                 s.move_editor_cursors(CursorMotion::Down, selecting)
             }
             KeyCode::Char(c)
@@ -8727,6 +8739,41 @@ mod tests {
         let reopened = WriterApp::open_project(root.path().join("Book")).unwrap();
         let state = AppState::new(reopened, default_bindings());
         assert_eq!(state.macros["punctuate"].len(), 3);
+    }
+
+    #[test]
+    fn recorded_shift_selection_replays_as_a_text_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.switch(Workspace::Editor);
+        state.editor = vec!["abc".into()];
+        state.cursor = (0, 3);
+        state.prompt = "macro-record replace-last".into();
+        state.command().unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Left, KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        state.insert('X');
+        state.prompt = "macro-stop".into();
+        state.command().unwrap();
+        assert_eq!(
+            state.macros["replace-last"],
+            [
+                story_core::EditMacroOp::SelectLeft,
+                story_core::EditMacroOp::Insert("X".into())
+            ]
+        );
+
+        state.editor = vec!["def".into()];
+        state.cursor = (0, 3);
+        state.editor_selection = None;
+        state
+            .apply_edit_macro(&state.macros["replace-last"].clone())
+            .unwrap();
+        assert_eq!(state.editor, ["deX"]);
     }
 
     #[test]

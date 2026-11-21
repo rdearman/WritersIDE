@@ -201,7 +201,7 @@ Scenes and events use optional signed-integer `StoryTime` values with unknown/ap
 
 ## Phase 5 issue implementation notes
 
-Issue #14 now has UTF-8 safe snippet expansion, saved macros, persistent snippets/registers, and terminal multi-cursor placement, movement, insertion and deletion. `macro-record NAME` / `macro-stop` record typed/pasted text, Enter, deletion and horizontal/vertical/Home/End cursor motion into reusable, persistent macros. `register-rotate A B [C...]` rotates existing values to the right and saves the change. Selection-change recording and arbitrary command recording remain outstanding.
+Issue #14 now has UTF-8 safe snippet expansion, saved macros, persistent snippets/registers, and terminal multi-cursor placement, movement, insertion and deletion. `macro-record NAME` / `macro-stop` record typed/pasted text, Enter, deletion, cursor motion and Shift-based selection changes into reusable, persistent macros. Selection replacement during replay is grapheme-aware. `register-rotate A B [C...]` rotates existing values to the right and saves the change. Arbitrary command recording remains outstanding.
 
 Issue #5 adds persisted challenge records and general drafting sessions, terminal countdown and word-delta recording, and bounded progress bars for project, chapter and challenge targets in Analytics. General sessions store start/end counts, net deltas and optional scene IDs without storing prose; Analytics displays daily/cumulative writing-session bars, per-scene net word totals and current/best positive-writing streaks. Streaks count distinct UTC days with completed sessions and positive net word deltas; abandoned sessions do not count. Per-scene duration/productivity history remains open.
 
