@@ -129,6 +129,7 @@ struct AppState {
     snippets: BTreeMap<String, String>,
     registers: BTreeMap<String, String>,
     macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
+    recording_macro: Option<(String, Vec<story_core::EditMacroOp>)>,
     extra_cursors: Vec<(usize, usize)>,
     active_challenge: Option<ActiveWritingChallenge>,
     menu: Option<MenuState>,
@@ -1218,6 +1219,8 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.macro", "Run Edit Macro", "Apply an undoable selection or line edit macro", "Edit", "macro", true),
         legacy_command("edit.macro-define", "Define Edit Macro", "Save a reusable, data-only edit macro", "Edit", "macro-define", true),
         legacy_command("edit.macro-run", "Run Named Edit Macro", "Apply a saved macro to the selection or current line", "Edit", "macro-run", true),
+        legacy_command("edit.macro-record", "Record Edit Macro", "Record editor insertions, deletions, and horizontal movement", "Edit", "macro-record", true),
+        legacy_command("edit.macro-stop", "Stop Macro Recording", "Save the currently recorded edit macro", "Edit", "macro-stop", false),
         legacy_command("edit.cursor-add", "Add Multi-cursor", "Add an editing cursor at grapheme row and column", "Edit", "cursor-add", true),
         legacy_command("edit.cursor-clear", "Clear Multi-cursors", "Return to the primary editor cursor", "Edit", "cursor-clear", false),
         legacy_command("challenge.start", "Start Writing Challenge", "Start a timed word target; opt-in Kamikaze mode reacts to inactivity", "Tools", "challenge-start", true),
@@ -1572,6 +1575,7 @@ impl AppState {
             snippets: tools.snippets,
             registers: tools.registers,
             macros: tools.macros,
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -2644,6 +2648,28 @@ impl AppState {
             self.macros.insert(name.to_owned(), operations);
             self.persist_editor_tools()?;
             self.message = format!("Saved macro {name}");
+        } else if let Some(name) = cmd.strip_prefix("macro-record ") {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("macro name cannot be empty".into());
+            }
+            if self.recording_macro.is_some() {
+                return Err("stop the current macro recording first".into());
+            }
+            self.recording_macro = Some((name.to_owned(), Vec::new()));
+            self.message = format!("Recording macro {name}; edit text, then run macro-stop");
+        } else if cmd == "macro-stop" {
+            let (name, operations) = self
+                .recording_macro
+                .take()
+                .ok_or("no macro is being recorded")?;
+            if operations.is_empty() {
+                self.message = format!("Discarded empty macro {name}");
+            } else {
+                self.macros.insert(name.clone(), operations);
+                self.persist_editor_tools()?;
+                self.message = format!("Saved recorded macro {name}");
+            }
         } else if let Some(name) = cmd.strip_prefix("macro-run ") {
             let operations = self
                 .macros
@@ -4315,7 +4341,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | multi-insert BYTE,BYTE,... TEXT | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [steady|kamikaze] | challenge-finish | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [steady|kamikaze] | challenge-finish | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -4384,6 +4410,20 @@ impl AppState {
         self.dirty = true;
         Ok(())
     }
+    fn record_macro_op(&mut self, operation: story_core::EditMacroOp) {
+        if let Some((_, operations)) = &mut self.recording_macro {
+            match operation {
+                story_core::EditMacroOp::Insert(text) => {
+                    if let Some(story_core::EditMacroOp::Insert(previous)) = operations.last_mut() {
+                        previous.push_str(&text);
+                    } else {
+                        operations.push(story_core::EditMacroOp::Insert(text));
+                    }
+                }
+                other => operations.push(other),
+            }
+        }
+    }
     fn jump_reading(&mut self, offset: u64) -> Result<(), Box<dyn std::error::Error>> {
         let byte = usize::try_from(offset)?;
         let prefix = self
@@ -4397,6 +4437,7 @@ impl AppState {
         Ok(())
     }
     fn insert(&mut self, ch: char) {
+        self.record_macro_op(story_core::EditMacroOp::Insert(ch.to_string()));
         if self.writing_stats_enabled {
             self.typed_characters = self.typed_characters.saturating_add(1);
         }
@@ -4515,6 +4556,7 @@ impl AppState {
         self.dirty = true;
     }
     fn backspace(&mut self) {
+        self.record_macro_op(story_core::EditMacroOp::Backspace);
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
         }
@@ -4541,6 +4583,7 @@ impl AppState {
         }
     }
     fn delete_forward(&mut self) {
+        self.record_macro_op(story_core::EditMacroOp::DeleteForward);
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
         }
@@ -4581,6 +4624,7 @@ impl AppState {
         }
     }
     fn enter(&mut self) {
+        self.record_macro_op(story_core::EditMacroOp::Insert("\n".into()));
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
         }
@@ -6712,8 +6756,18 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             KeyCode::Enter => s.enter(),
             KeyCode::Backspace => s.backspace(),
             KeyCode::Delete => s.delete_forward(),
-            KeyCode::Home => s.move_editor_cursors(CursorMotion::Home, selecting),
-            KeyCode::End => s.move_editor_cursors(CursorMotion::End, selecting),
+            KeyCode::Home => {
+                if !selecting {
+                    s.record_macro_op(story_core::EditMacroOp::MoveLineStart);
+                }
+                s.move_editor_cursors(CursorMotion::Home, selecting)
+            }
+            KeyCode::End => {
+                if !selecting {
+                    s.record_macro_op(story_core::EditMacroOp::MoveLineEnd);
+                }
+                s.move_editor_cursors(CursorMotion::End, selecting)
+            }
             KeyCode::Char('w') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 let row = s.cursor.0;
                 while s.cursor.1 > 0
@@ -6733,8 +6787,18 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     s.backspace();
                 }
             }
-            KeyCode::Left => s.move_editor_cursors(CursorMotion::Left, selecting),
-            KeyCode::Right => s.move_editor_cursors(CursorMotion::Right, selecting),
+            KeyCode::Left => {
+                if !selecting {
+                    s.record_macro_op(story_core::EditMacroOp::MoveLeft);
+                }
+                s.move_editor_cursors(CursorMotion::Left, selecting)
+            }
+            KeyCode::Right => {
+                if !selecting {
+                    s.record_macro_op(story_core::EditMacroOp::MoveRight);
+                }
+                s.move_editor_cursors(CursorMotion::Right, selecting)
+            }
             KeyCode::Up => s.move_editor_cursors(CursorMotion::Up, selecting),
             KeyCode::Down => s.move_editor_cursors(CursorMotion::Down, selecting),
             KeyCode::Char(c)
@@ -7054,6 +7118,31 @@ mod tests {
     }
 
     #[test]
+    fn recorded_edit_macro_persists_insertions_and_cursor_edits() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.prompt = "macro-record punctuate".into();
+        state.command().unwrap();
+        state.insert('!');
+        state.record_macro_op(story_core::EditMacroOp::MoveLeft);
+        state.backspace();
+        state.prompt = "macro-stop".into();
+        state.command().unwrap();
+        assert_eq!(
+            state.macros["punctuate"],
+            [
+                story_core::EditMacroOp::Insert("!".into()),
+                story_core::EditMacroOp::MoveLeft,
+                story_core::EditMacroOp::Backspace,
+            ]
+        );
+        let reopened = WriterApp::open_project(root.path().join("Book")).unwrap();
+        let state = AppState::new(reopened, default_bindings());
+        assert_eq!(state.macros["punctuate"].len(), 3);
+    }
+
+    #[test]
     fn multi_cursors_move_and_delete_graphemes_across_lines_together() {
         let root = tempfile::tempdir().unwrap();
         let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
@@ -7284,6 +7373,7 @@ mod tests {
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -7743,6 +7833,7 @@ mod tests {
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -7826,6 +7917,7 @@ mod tests {
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -7901,6 +7993,7 @@ mod tests {
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -7988,6 +8081,7 @@ mod tests {
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -8189,6 +8283,7 @@ mod tests {
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -8276,6 +8371,7 @@ mod tests {
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -8380,6 +8476,7 @@ mod tests {
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -8602,6 +8699,7 @@ mod tests {
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -8951,6 +9049,7 @@ mod tests {
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -9049,6 +9148,7 @@ mod tests {
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -9199,6 +9299,7 @@ mod tests {
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
+            recording_macro: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,

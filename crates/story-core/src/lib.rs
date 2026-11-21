@@ -68,6 +68,12 @@ pub fn insert_at_anchors(
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EditMacroOp {
     Insert(String),
+    Backspace,
+    DeleteForward,
+    MoveLeft,
+    MoveRight,
+    MoveLineStart,
+    MoveLineEnd,
     Replace { from: String, to: String },
     UppercaseSelection,
     LowercaseSelection,
@@ -88,12 +94,60 @@ pub fn run_edit_macro(
     let mut before = source[..selection.start].to_owned();
     let mut selected = source[selection.clone()].to_owned();
     let after = source[selection.end..].to_owned();
+    let mut cursor = selected.len();
     for operation in operations {
         match operation {
-            EditMacroOp::Insert(text) => selected.push_str(text),
-            EditMacroOp::Replace { from, to } => selected = selected.replace(from, to),
-            EditMacroOp::UppercaseSelection => selected = selected.to_uppercase(),
-            EditMacroOp::LowercaseSelection => selected = selected.to_lowercase(),
+            EditMacroOp::Insert(text) => {
+                selected.insert_str(cursor, text);
+                cursor += text.len();
+            }
+            EditMacroOp::Backspace => {
+                if let Some(previous) = selected[..cursor]
+                    .grapheme_indices(true)
+                    .next_back()
+                    .map(|(i, _)| i)
+                {
+                    selected.replace_range(previous..cursor, "");
+                    cursor = previous;
+                }
+            }
+            EditMacroOp::DeleteForward => {
+                if let Some((offset, grapheme)) = selected[cursor..].grapheme_indices(true).next() {
+                    let start = cursor + offset;
+                    selected.replace_range(start..start + grapheme.len(), "");
+                }
+            }
+            EditMacroOp::MoveLeft => {
+                cursor = selected[..cursor]
+                    .grapheme_indices(true)
+                    .next_back()
+                    .map_or(0, |(i, _)| i);
+            }
+            EditMacroOp::MoveRight => {
+                if let Some((offset, grapheme)) = selected[cursor..].grapheme_indices(true).next() {
+                    cursor += offset + grapheme.len();
+                }
+            }
+            EditMacroOp::MoveLineStart => {
+                cursor = selected[..cursor].rfind('\n').map_or(0, |i| i + 1);
+            }
+            EditMacroOp::MoveLineEnd => {
+                cursor += selected[cursor..]
+                    .find('\n')
+                    .unwrap_or(selected.len() - cursor);
+            }
+            EditMacroOp::Replace { from, to } => {
+                selected = selected.replace(from, to);
+                cursor = selected.len();
+            }
+            EditMacroOp::UppercaseSelection => {
+                selected = selected.to_uppercase();
+                cursor = selected.len();
+            }
+            EditMacroOp::LowercaseSelection => {
+                selected = selected.to_lowercase();
+                cursor = selected.len();
+            }
         }
     }
     let start = before.len();
@@ -133,6 +187,19 @@ mod editor_tool_tests {
         .unwrap();
         assert_eq!(text, "Say HELLO friend!");
         assert_eq!(&text[range], "HELLO friend");
+    }
+
+    #[test]
+    fn recorded_cursor_operations_replay_grapheme_safe_edits() {
+        let operations = [
+            EditMacroOp::MoveLineEnd,
+            EditMacroOp::Insert("!".into()),
+            EditMacroOp::MoveLeft,
+            EditMacroOp::Backspace,
+        ];
+        let (text, range) = run_edit_macro("aé", 0..3, &operations).unwrap();
+        assert_eq!(text, "a!");
+        assert_eq!(&text[range], "a!");
     }
 }
 use uuid::Uuid;

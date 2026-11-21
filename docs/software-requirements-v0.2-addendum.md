@@ -201,7 +201,7 @@ Scenes and events use optional signed-integer `StoryTime` values with unknown/ap
 
 ## Phase 5 issue implementation notes
 
-Issue #14 now has UTF-8 safe snippet expansion, saved macros, persistent snippets/registers, and terminal multi-cursor placement, movement, insertion and deletion. Macro recording from key events and register rotation remain outstanding.
+Issue #14 now has UTF-8 safe snippet expansion, saved macros, persistent snippets/registers, and terminal multi-cursor placement, movement, insertion and deletion. `macro-record NAME` / `macro-stop` record typed characters, Enter, deletion and horizontal/Home/End cursor motion into reusable, persistent macros. Register rotation, selection and vertical-navigation recording, paste recording, and arbitrary command recording remain outstanding.
 
 Issue #5 adds persisted challenge start/deadline/target/mode/results, terminal countdown and word-delta recording, CLI controls, and bounded progress bars for project, chapter and challenge targets in Analytics. Challenge history supplies a basic session ledger; daily aggregation and per-scene time-series graphs remain open.
 
