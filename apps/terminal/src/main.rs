@@ -13887,6 +13887,21 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if s.workspace == Workspace::Editor
+        && s.reference_focused
+        && s.active_reference_shares_open_scene()
+        && matches!(k.code, KeyCode::PageUp | KeyCode::PageDown)
+    {
+        let max_scroll = s.editor.len().saturating_sub(1);
+        if let Some(pane) = s.active_reference_pane_mut() {
+            pane.scroll = if k.code == KeyCode::PageUp {
+                pane.scroll.saturating_sub(10)
+            } else {
+                pane.scroll.saturating_add(10).min(max_scroll)
+            };
+        }
+        return Ok(false);
+    }
+    if s.workspace == Workspace::Editor
         && k.modifiers.contains(KeyModifiers::CONTROL)
         && k.code == KeyCode::Char('g')
     {
@@ -14030,6 +14045,16 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     _ => {}
                 }
             }
+            return Ok(false);
+        }
+        if !s.reference_focused && matches!(k.code, KeyCode::PageUp | KeyCode::PageDown) {
+            s.scroll = if k.code == KeyCode::PageUp {
+                s.scroll.saturating_sub(10)
+            } else {
+                s.scroll
+                    .saturating_add(10)
+                    .min(s.editor.len().saturating_sub(1))
+            };
             return Ok(false);
         }
         if k.modifiers.contains(KeyModifiers::CONTROL)
@@ -17143,6 +17168,53 @@ mod tests {
         reopened.focus_main_editor();
         assert_eq!(reopened.cursor, (0, 5));
         assert_eq!(reopened.editor.join("\n"), "aXbcdef");
+    }
+
+    #[test]
+    fn same_scene_views_scroll_independently_and_restore_both_offsets() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Long scene", 0).unwrap();
+        let text = (0..40)
+            .map(|line| format!("Paragraph {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), &text).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state
+            .execute_legacy_palette_command(&format!("reference-scene {scene}"))
+            .unwrap();
+        state.scroll = 3;
+        state.reference_panes[0].scroll = 14;
+        state.toggle_reference_focus();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.reference_panes[0].scroll, 24);
+        assert_eq!(state.scroll, 3);
+        state.save_session().unwrap();
+
+        let mut reopened = AppState::new(
+            WriterApp::open_project(&project).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        assert!(reopened.reference_focused);
+        assert_eq!(reopened.scroll, 3);
+        assert_eq!(reopened.reference_panes[0].scroll, 24);
+        handle(
+            &mut reopened,
+            KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(reopened.reference_panes[0].scroll, 14);
+        assert_eq!(reopened.scroll, 3);
     }
 
     #[test]
