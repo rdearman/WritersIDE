@@ -1762,7 +1762,7 @@ fn usage() {
         "writers-ide find <path> <normal|extended|regex> <all|scene-uuid> <pattern>\nwriters-ide replace <path> <normal|extended|regex> <all|scene-uuid> <pattern> => <replacement>\nwriters-ide language <path> [language-tag]"
     );
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide create-kind <path> <fiction|nonfiction|custom> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide compile <path> <markdown|html|epub|docx|pdf> [output-path] [--expand-transclusions]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|present=UUID|mentioned=UUID|absent=UUID|location=UUID|event=UUID|chapter=UUID|text=TERM|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide character-absence <path> <scene-uuid> <character-uuid> [notes]\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
+        "writers-ide create <path> [title]\nwriters-ide create-kind <path> <fiction|nonfiction|custom> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide compile <path> <markdown|html|epub|docx|pdf> [output-path] [--expand-transclusions]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|present=UUID|mentioned=UUID|absent=UUID|location=UUID|event=UUID|chapter=UUID|text=TERM|plotline=UUID|assembly=UUID|issue-status=STATUS|meta=FIELD:VALUE|meta-contains=FIELD:KIND:ENTITY|before-definitely=TICK|before-possibly=TICK|after-definitely=TICK|after-possibly=TICK|before=TICK|after=TICK]...\nwriters-ide character-absence <path> <scene-uuid> <character-uuid> [notes]\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
     );
     eprintln!(
         "writers-ide anchors <path> <scene-uuid>\nwriters-ide anchor-move <path> <anchor-uuid> <start-byte> <end-byte>"
@@ -2105,6 +2105,10 @@ fn parse_scene_query_filter(
         "event" => SceneQueryFilter::Event(story_core::EventId(value.parse()?)),
         "assembly" => SceneQueryFilter::Assembly(story_core::AssemblyId(value.parse()?)),
         "issue-status" => SceneQueryFilter::IssueStatus(value.to_owned()),
+        "before-definitely" => SceneQueryFilter::TimeBeforeDefinitely(value.parse()?),
+        "before-possibly" => SceneQueryFilter::TimeBeforePossibly(value.parse()?),
+        "after-definitely" => SceneQueryFilter::TimeAfterDefinitely(value.parse()?),
+        "after-possibly" => SceneQueryFilter::TimeAfterPossibly(value.parse()?),
         "chapter" => SceneQueryFilter::Chapter(value.to_owned()),
         "text" => SceneQueryFilter::TextContains(value.to_owned()),
         "meta" => {
@@ -2227,6 +2231,17 @@ mod watch_tests {
                 target_kind: "character".into(),
                 target_id: entity.to_string(),
             }
+        );
+    }
+    #[test]
+    fn uncertainty_aware_query_filters_parse_signed_ticks() {
+        assert_eq!(
+            parse_scene_query_filter("before-definitely=-86400").unwrap(),
+            story_core::SceneQueryFilter::TimeBeforeDefinitely(-86400)
+        );
+        assert_eq!(
+            parse_scene_query_filter("after-possibly=12").unwrap(),
+            story_core::SceneQueryFilter::TimeAfterPossibly(12)
         );
     }
     #[test]

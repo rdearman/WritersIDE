@@ -726,6 +726,14 @@ pub enum SceneQueryFilter {
     },
     TimeBefore(i64),
     TimeAfter(i64),
+    /// Matches only when the complete known start interval is before the cutoff.
+    TimeBeforeDefinitely(i64),
+    /// Matches when the known start interval permits a time before the cutoff.
+    TimeBeforePossibly(i64),
+    /// Matches only when the complete known start interval is after the cutoff.
+    TimeAfterDefinitely(i64),
+    /// Matches when the known start interval permits a time after the cutoff.
+    TimeAfterPossibly(i64),
     UnresolvedIssue,
 }
 

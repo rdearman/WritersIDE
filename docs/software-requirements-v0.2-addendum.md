@@ -227,3 +227,5 @@ Events can now have explicit `precedes` and `requires` dependency edges with not
 Inspection queries now filter scenes by included membership in a named assembly and by any issue status. Coverage requirements now include POV, location and event, using stable entity relationships; mention-only character records remain excluded from presence coverage. These analytical projections do not reorder or mutate manuscript content.
 
 Entity-reference-list custom fields can now participate in saved scene queries through `meta-contains=FIELD-UUID:KIND:ENTITY-UUID`. The field's declared type/reference kind and the referenced entity are validated before saving; query results remain dynamic and read-only.
+
+Chronology queries now offer explicit definitely/possibly before/after predicates over bounded scene start-time intervals. They use interval bounds, retain strict cutoff semantics, and exclude unknown or insufficiently bounded times rather than guessing. The original nominal-time filters remain for compatibility.

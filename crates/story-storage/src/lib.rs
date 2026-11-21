@@ -41,6 +41,8 @@ const MIGRATION_26: &str = include_str!("../migrations/0026_explicit_scene_absen
 const MIGRATION_27: &str = include_str!("../migrations/0027_event_dependencies.sql");
 const MIGRATION_28: &str = include_str!("../migrations/0028_assembly_issue_query_filters.sql");
 const MIGRATION_29: &str = include_str!("../migrations/0029_entity_ref_query_filters.sql");
+const MIGRATION_30: &str =
+    include_str!("../migrations/0030_uncertainty_aware_time_query_filters.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -256,6 +258,22 @@ fn compile_query_expression(
             SceneQueryFilter::TimeAfter(tick) => {
                 values.push(tick.to_string());
                 "s.start_nominal IS NOT NULL AND s.start_nominal>?".into()
+            }
+            SceneQueryFilter::TimeBeforeDefinitely(tick) => {
+                values.push(tick.to_string());
+                "s.start_upper IS NOT NULL AND s.start_upper<?".into()
+            }
+            SceneQueryFilter::TimeBeforePossibly(tick) => {
+                values.push(tick.to_string());
+                "s.start_lower IS NOT NULL AND s.start_lower<?".into()
+            }
+            SceneQueryFilter::TimeAfterDefinitely(tick) => {
+                values.push(tick.to_string());
+                "s.start_lower IS NOT NULL AND s.start_lower>?".into()
+            }
+            SceneQueryFilter::TimeAfterPossibly(tick) => {
+                values.push(tick.to_string());
+                "s.start_upper IS NOT NULL AND s.start_upper>?".into()
             }
             SceneQueryFilter::UnresolvedIssue => "EXISTS(SELECT 1 FROM scene_issue si JOIN story_issue i ON i.id=si.issue_id WHERE si.scene_id=s.id AND i.status IN('open','in_progress'))".into(),
         },
@@ -831,7 +849,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_19}\nINSERT INTO schema_migrations(version,applied_at) VALUES(19,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_20}\nINSERT INTO schema_migrations(version,applied_at) VALUES(20,'{}');\nCOMMIT;", now()))?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\n{MIGRATION_25}\nINSERT INTO schema_migrations(version,applied_at) VALUES(25,'{}');\n{MIGRATION_26}\nINSERT INTO schema_migrations(version,applied_at) VALUES(26,'{}');\n{MIGRATION_27}\nINSERT INTO schema_migrations(version,applied_at) VALUES(27,'{}');\n{MIGRATION_28}\nINSERT INTO schema_migrations(version,applied_at) VALUES(28,'{}');\n{MIGRATION_29}\nINSERT INTO schema_migrations(version,applied_at) VALUES(29,'{}');\nCOMMIT;", now(), now(), now(), now(), now(), now(), now(), now(), now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\n{MIGRATION_25}\nINSERT INTO schema_migrations(version,applied_at) VALUES(25,'{}');\n{MIGRATION_26}\nINSERT INTO schema_migrations(version,applied_at) VALUES(26,'{}');\n{MIGRATION_27}\nINSERT INTO schema_migrations(version,applied_at) VALUES(27,'{}');\n{MIGRATION_28}\nINSERT INTO schema_migrations(version,applied_at) VALUES(28,'{}');\n{MIGRATION_29}\nINSERT INTO schema_migrations(version,applied_at) VALUES(29,'{}');\n{MIGRATION_30}\nINSERT INTO schema_migrations(version,applied_at) VALUES(30,'{}');\nCOMMIT;", now(), now(), now(), now(), now(), now(), now(), now(), now(), now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
@@ -874,7 +892,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 29 {
+        if version > 30 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -991,6 +1009,10 @@ impl ProjectStore {
         }
         if current_version == 28 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_29}\nINSERT INTO schema_migrations(version,applied_at) VALUES(29,'{}');\nCOMMIT;", now()))?;
+            current_version = 29;
+        }
+        if current_version == 29 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_30}\nINSERT INTO schema_migrations(version,applied_at) VALUES(30,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -6392,6 +6414,18 @@ impl ProjectStore {
                 ),
                 SceneQueryFilter::TimeBefore(tick) => ("time_before", tick.to_string()),
                 SceneQueryFilter::TimeAfter(tick) => ("time_after", tick.to_string()),
+                SceneQueryFilter::TimeBeforeDefinitely(tick) => {
+                    ("time_before_definitely", tick.to_string())
+                }
+                SceneQueryFilter::TimeBeforePossibly(tick) => {
+                    ("time_before_possibly", tick.to_string())
+                }
+                SceneQueryFilter::TimeAfterDefinitely(tick) => {
+                    ("time_after_definitely", tick.to_string())
+                }
+                SceneQueryFilter::TimeAfterPossibly(tick) => {
+                    ("time_after_possibly", tick.to_string())
+                }
                 SceneQueryFilter::UnresolvedIssue => ("unresolved_issue", "1".into()),
             };
             tx.execute("INSERT INTO saved_query_filter(query_id,ordinal,filter_kind,value) VALUES(?1,?2,?3,?4)",params![query.id.to_string(),index as i64,kind,value])?;
@@ -6621,6 +6655,10 @@ impl ProjectStore {
                 }
                 "time_before" => { sql.push_str(" AND s.start_nominal IS NOT NULL AND s.start_nominal<?"); values.push(value); }
                 "time_after" => { sql.push_str(" AND s.start_nominal IS NOT NULL AND s.start_nominal>?"); values.push(value); }
+                "time_before_definitely" => { sql.push_str(" AND s.start_upper IS NOT NULL AND s.start_upper<?"); values.push(value); }
+                "time_before_possibly" => { sql.push_str(" AND s.start_lower IS NOT NULL AND s.start_lower<?"); values.push(value); }
+                "time_after_definitely" => { sql.push_str(" AND s.start_lower IS NOT NULL AND s.start_lower>?"); values.push(value); }
+                "time_after_possibly" => { sql.push_str(" AND s.start_upper IS NOT NULL AND s.start_upper>?"); values.push(value); }
                 "unresolved_issue" => sql.push_str(" AND EXISTS(SELECT 1 FROM scene_issue si JOIN story_issue i ON i.id=si.issue_id WHERE si.scene_id=s.id AND i.status IN('open','in_progress'))"),
                 _ => return Err(StorageError::Invalid(format!("unknown saved query filter: {kind}"))),
             }
@@ -9597,6 +9635,76 @@ mod tests {
     }
 
     #[test]
+    fn uncertainty_aware_time_query_filters_only_assert_supported_relations() {
+        let directory = tempdir().unwrap();
+        let mut store =
+            ProjectStore::create(directory.path().join("Chronology"), "Chronology").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let exact_before = store.create_scene(chapter, 0, "Exact before").unwrap();
+        let bounded = store.create_scene(chapter, 1, "Possibly before").unwrap();
+        let unknown = store.create_scene(chapter, 2, "Unknown").unwrap();
+        let mut scene = store.get_scene(exact_before).unwrap().scene;
+        scene.start_time = StoryTime::exact(-5);
+        store.update_scene(&scene).unwrap();
+        let mut scene = store.get_scene(bounded).unwrap().scene;
+        scene.start_time =
+            StoryTime::new(Some(10), Some(4), Some(16), TimePrecision::Bounded).unwrap();
+        store.update_scene(&scene).unwrap();
+        let cutoff = 10;
+        let make_query = |name: &str, filter| SavedSceneQuery {
+            id: QueryId::new(),
+            name: name.into(),
+            description: String::new(),
+            filters: vec![filter],
+        };
+        let before_definite = make_query(
+            "before definitely",
+            SceneQueryFilter::TimeBeforeDefinitely(cutoff),
+        );
+        let before_possible = make_query(
+            "before possibly",
+            SceneQueryFilter::TimeBeforePossibly(cutoff),
+        );
+        let after_definite = make_query(
+            "after definitely",
+            SceneQueryFilter::TimeAfterDefinitely(cutoff),
+        );
+        let after_possible = make_query(
+            "after possibly",
+            SceneQueryFilter::TimeAfterPossibly(cutoff),
+        );
+        for query in [
+            &before_definite,
+            &before_possible,
+            &after_definite,
+            &after_possible,
+        ] {
+            store.save_scene_query(query).unwrap();
+        }
+        assert_eq!(
+            store.run_scene_query(before_definite.id).unwrap(),
+            vec![exact_before]
+        );
+        assert_eq!(
+            store.run_scene_query(before_possible.id).unwrap(),
+            vec![exact_before, bounded]
+        );
+        assert!(store.run_scene_query(after_definite.id).unwrap().is_empty());
+        assert_eq!(
+            store.run_scene_query(after_possible.id).unwrap(),
+            vec![bounded]
+        );
+        assert!(
+            !store
+                .run_scene_query(before_possible.id)
+                .unwrap()
+                .contains(&unknown)
+        );
+    }
+
+    #[test]
     fn nested_saved_query_expressions_are_validated_persistent_and_dynamic() {
         let directory = tempdir().unwrap();
         let mut store = ProjectStore::create(directory.path().join("Novel"), "Novel").unwrap();
@@ -9672,7 +9780,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 29))
+            .map(|version| assert_eq!(version, 30))
             .unwrap();
     }
 
@@ -9936,7 +10044,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 29);
+        assert_eq!(version, 30);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
