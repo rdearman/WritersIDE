@@ -1574,6 +1574,14 @@ impl WriterApp {
     ) -> Result<()> {
         Ok(self.store.move_planning_board_item(item, x, y)?)
     }
+    pub fn resize_planning_board_item(
+        &mut self,
+        item: PlanningBoardItemId,
+        width: f64,
+        height: f64,
+    ) -> Result<()> {
+        Ok(self.store.resize_planning_board_item(item, width, height)?)
+    }
 
     pub fn connect_planning_board_items(
         &mut self,

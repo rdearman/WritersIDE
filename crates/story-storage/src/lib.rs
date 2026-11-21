@@ -3779,6 +3779,26 @@ impl ProjectStore {
         }
         Ok(())
     }
+    pub fn resize_planning_board_item(
+        &mut self,
+        item: PlanningBoardItemId,
+        width: f64,
+        height: f64,
+    ) -> Result<()> {
+        if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            return Err(StorageError::Invalid(
+                "planning card width and height must be finite positive values".into(),
+            ));
+        }
+        if self.conn.execute(
+            "UPDATE planning_board_item SET width=?2,height=?3 WHERE id=?1",
+            params![item.to_string(), width, height],
+        )? == 0
+        {
+            return Err(StorageError::NotFound(item.to_string()));
+        }
+        Ok(())
+    }
 
     pub fn connect_planning_board_items(
         &mut self,
@@ -8868,6 +8888,12 @@ mod tests {
             .unwrap();
         store.move_planning_board_item(first, 8.0, -1.25).unwrap();
         assert_eq!(store.list_planning_board_items(board).unwrap()[0].x, 8.0);
+        store.resize_planning_board_item(first, 32.0, 10.0).unwrap();
+        assert_eq!(
+            store.list_planning_board_items(board).unwrap()[0].width,
+            32.0
+        );
+        assert!(store.resize_planning_board_item(first, 0.0, 10.0).is_err());
         assert_eq!(store.get_scene(scene).unwrap().position, Some(0));
         assert!(
             store

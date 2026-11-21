@@ -17,7 +17,10 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{
+        Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+        canvas::{Canvas, Rectangle},
+    },
 };
 use story_app::WriterApp;
 use story_core::{SceneId, SceneStatus};
@@ -1417,11 +1420,27 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "board.export",
+            "Export Planning Board",
+            "Render a portable Markdown table of this board's cards",
+            "Plan",
+            "board-export",
+            true,
+        ),
+        legacy_command(
             "board.move",
             "Move Planning Card",
             "Change a card's canvas coordinates without affecting story order",
             "Plan",
             "board-move",
+            true,
+        ),
+        legacy_command(
+            "board.resize",
+            "Resize Planning Card",
+            "Change a planning card's canvas width and height",
+            "Plan",
+            "board-resize",
             true,
         ),
         legacy_command(
@@ -3968,6 +3987,17 @@ impl AppState {
                 })
                 .collect::<Vec<_>>()
                 .join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("board-export ") {
+            let board = story_core::PlanningBoardId(rest.trim().parse()?);
+            let title = self
+                .app
+                .list_planning_boards()?
+                .into_iter()
+                .find(|candidate| candidate.id == board)
+                .ok_or("planning board not found")?
+                .title;
+            self.message =
+                format_planning_board_markdown(&title, &self.app.list_planning_board_items(board)?);
         } else if let Some(rest) = cmd.strip_prefix("board-move ") {
             let mut parts = rest.split_whitespace();
             let item = story_core::PlanningBoardItemId(
@@ -3977,6 +4007,15 @@ impl AppState {
             let y = parts.next().ok_or("missing y coordinate")?.parse()?;
             self.app.move_planning_board_item(item, x, y)?;
             self.message = format!("Moved planning card to ({x}, {y})");
+        } else if let Some(rest) = cmd.strip_prefix("board-resize ") {
+            let mut parts = rest.split_whitespace();
+            let item = story_core::PlanningBoardItemId(
+                parts.next().ok_or("missing board item UUID")?.parse()?,
+            );
+            let width = parts.next().ok_or("missing width")?.parse()?;
+            let height = parts.next().ok_or("missing height")?.parse()?;
+            self.app.resize_planning_board_item(item, width, height)?;
+            self.message = format!("Resized planning card to {width:.1}×{height:.1}");
         } else if let Some(rest) = cmd.strip_prefix("board-connect ") {
             let mut parts = rest.split_whitespace();
             let board =
@@ -7200,6 +7239,52 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     body[1],
                 );
             }
+        } else if s.workspace == Workspace::PlanningBoards
+            && let Some(board) = s.planning_board_id
+        {
+            let items = s.app.list_planning_board_items(board).unwrap_or_default();
+            let (x_bounds, y_bounds) = planning_board_bounds(&items);
+            let selected = s.selected;
+            let canvas = Canvas::default()
+                .x_bounds(x_bounds)
+                .y_bounds(y_bounds)
+                .paint(|context| {
+                    for (index, item) in items.iter().enumerate() {
+                        let short_id = item.entity_id.chars().take(6).collect::<String>();
+                        let label = if item.note.trim().is_empty() {
+                            format!("{}:{short_id}", item.entity_kind)
+                        } else {
+                            format!(
+                                "{}:{}",
+                                item.entity_kind,
+                                item.note.chars().take(12).collect::<String>()
+                            )
+                        };
+                        let color = if index == selected {
+                            Color::Yellow
+                        } else {
+                            Color::Cyan
+                        };
+                        context.draw(&Rectangle {
+                            x: item.x,
+                            y: item.y,
+                            width: item.width,
+                            height: item.height,
+                            color,
+                        });
+                        context.print(
+                            item.x,
+                            item.y,
+                            Span::styled(label, Style::default().fg(color)),
+                        );
+                    }
+                })
+                .block(
+                    Block::default()
+                        .title("Planning Board · Ctrl+arrows move selected card")
+                        .borders(Borders::ALL),
+                );
+            f.render_widget(canvas, body[1]);
         } else {
             let detail = if s.workspace == Workspace::Research && s.proposal_review_active {
                 format!(
@@ -7263,6 +7348,46 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.menu.is_some() {
         draw_menu_overlay(f, s);
     }
+}
+
+fn planning_board_bounds(items: &[story_storage::PlanningBoardItemRecord]) -> ([f64; 2], [f64; 2]) {
+    fn bounds(values: impl Iterator<Item = f64>) -> [f64; 2] {
+        let values = values.collect::<Vec<_>>();
+        let Some(minimum) = values.iter().copied().reduce(f64::min) else {
+            return [0.0, 10.0];
+        };
+        let maximum = values.iter().copied().reduce(f64::max).unwrap_or(minimum);
+        let padding = ((maximum - minimum) * 0.1).max(1.0);
+        [minimum - padding, maximum + padding]
+    }
+    (
+        bounds(items.iter().flat_map(|item| [item.x, item.x + item.width])),
+        bounds(items.iter().map(|item| item.y + item.height)),
+    )
+}
+
+fn format_planning_board_markdown(
+    title: &str,
+    items: &[story_storage::PlanningBoardItemRecord],
+) -> String {
+    let escape = |value: &str| value.replace('|', "\\|").replace('\n', " ");
+    let mut output = format!(
+        "# {}\n\n| Entity | ID | X | Y | Width | Height | Note |\n|---|---|---:|---:|---:|---:|---|\n",
+        escape(title)
+    );
+    for item in items {
+        output.push_str(&format!(
+            "| {} | {} | {} | {} | {} | {} | {} |\n",
+            escape(&item.entity_kind),
+            item.entity_id,
+            item.x,
+            item.y,
+            item.width,
+            item.height,
+            escape(&item.note),
+        ));
+    }
+    output
 }
 
 fn challenge_footer(challenge: &ActiveWritingChallenge, editor: &[String]) -> String {
@@ -9320,6 +9445,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     if s.workspace == Workspace::PlanningBoards
         && let Some(board) = s.planning_board_id
         && k.modifiers.contains(KeyModifiers::CONTROL)
+        && !k.modifiers.contains(KeyModifiers::SHIFT)
     {
         let delta = match k.code {
             KeyCode::Left => Some((-1.0, 0.0)),
@@ -9349,6 +9475,29 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     item.y + dy
                 );
             }
+            return Ok(false);
+        }
+    }
+    if s.workspace == Workspace::PlanningBoards
+        && let Some(board) = s.planning_board_id
+        && k.modifiers
+            .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+    {
+        let resize = match k.code {
+            KeyCode::Left => Some((-1.0, 0.0)),
+            KeyCode::Right => Some((1.0, 0.0)),
+            KeyCode::Up => Some((0.0, 1.0)),
+            KeyCode::Down => Some((0.0, -1.0)),
+            _ => None,
+        };
+        if let Some((dw, dh)) = resize
+            && let Some(item) = s.app.list_planning_board_items(board)?.get(s.selected)
+        {
+            let item_id = item.id;
+            let width = (item.width + dw).max(1.0);
+            let height = (item.height + dh).max(1.0);
+            s.app.resize_planning_board_item(item_id, width, height)?;
+            s.message = format!("Resized planning card to {width:.1}×{height:.1}");
             return Ok(false);
         }
     }
@@ -11283,6 +11432,25 @@ mod tests {
             .find(|item| item.id == card)
             .unwrap();
         assert_eq!((moved.x, moved.y), (4.0, 4.0));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        let resized = state
+            .app
+            .list_planning_board_items(board)
+            .unwrap()
+            .into_iter()
+            .find(|item| item.id == card)
+            .unwrap();
+        assert_eq!(resized.width, 25.0);
+        let export = format_planning_board_markdown(
+            "Canvas",
+            &state.app.list_planning_board_items(board).unwrap(),
+        );
+        assert!(export.contains("# Canvas"));
+        assert!(export.contains("| scene |"));
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
