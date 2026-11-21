@@ -538,11 +538,25 @@ pub fn inspect_manuscript(path: impl AsRef<Path>) -> Result<ManuscriptStaging, I
                     .unsupported
                     .push("Embedded images and drawings are not imported".into());
             }
-            if xml.contains("<w:rPr") || xml.contains("<w:hyperlink") {
-                staging.unsupported.push(
-                    "Inline DOCX formatting and hyperlink semantics are flattened to plain text"
-                        .into(),
-                );
+            for (tag, description) in [
+                ("w:u", "underline"),
+                ("w:color", "font color"),
+                ("w:highlight", "highlight"),
+                ("w:rFonts", "run font"),
+                ("w:caps", "capitalization"),
+                ("w:smallCaps", "small-capitalization"),
+                ("w:vanish", "hidden text"),
+            ] {
+                if xml.contains(&format!("<{tag}")) {
+                    staging
+                        .unsupported
+                        .push(format!("DOCX {description} formatting is not preserved"));
+                }
+            }
+            if xml.contains("<w:hyperlink") {
+                staging
+                    .unsupported
+                    .push("DOCX hyperlink destinations are flattened to their anchor text".into());
             }
             for feature in [
                 "<w:ins",
@@ -658,6 +672,55 @@ fn read_zip_text(bytes: &[u8], member: &str) -> Result<String, ImportError> {
     Ok(text)
 }
 
+fn docx_toggle_enabled(
+    event: &quick_xml::events::BytesStart<'_>,
+    decoder: quick_xml::encoding::Decoder,
+) -> Result<bool, ImportError> {
+    for attribute in event.attributes().flatten() {
+        if attribute.key.local_name().as_ref() == b"val" {
+            let value = attribute
+                .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+                .map_err(|error| ImportError::Archive(error.to_string()))?;
+            return Ok(!matches!(value.as_ref(), "0" | "false" | "off"));
+        }
+    }
+    Ok(true)
+}
+
+fn docx_inline_markdown(text: &str, bold: bool, italic: bool, strike: bool) -> String {
+    if !(bold || italic || strike) {
+        return text.into();
+    }
+    let escaped = text
+        .replace('\\', "\\\\")
+        .replace('*', "\\*")
+        .replace('_', "\\_")
+        .replace('~', "\\~")
+        .replace('`', "\\`");
+    let styled = match (bold, italic) {
+        (true, true) => format!("***{escaped}***"),
+        (true, false) => format!("**{escaped}**"),
+        (false, true) => format!("*{escaped}*"),
+        (false, false) => escaped,
+    };
+    if strike {
+        format!("~~{styled}~~")
+    } else {
+        styled
+    }
+}
+
+fn flush_docx_run(
+    paragraph: &mut String,
+    run_text: &mut String,
+    bold: bool,
+    italic: bool,
+    strike: bool,
+) {
+    paragraph.push_str(&docx_inline_markdown(run_text, bold, italic, strike));
+    run_text.clear();
+}
+
 fn extract_docx_blocks(xml: &str) -> Result<Vec<(String, bool)>, ImportError> {
     let mut blocks = Vec::new();
     let mut reader = quick_xml::Reader::from_str(xml);
@@ -665,13 +728,20 @@ fn extract_docx_blocks(xml: &str) -> Result<Vec<(String, bool)>, ImportError> {
     let mut in_paragraph = false;
     let mut is_heading = false;
     let mut paragraph = String::new();
+    let mut run_text = String::new();
+    let (mut bold, mut italic, mut strike) = (false, false, false);
     loop {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(event)) => match event.local_name().as_ref() {
+                b"r" => {
+                    flush_docx_run(&mut paragraph, &mut run_text, bold, italic, strike);
+                    (bold, italic, strike) = (false, false, false);
+                }
                 b"p" => {
                     in_paragraph = true;
                     is_heading = false;
                     paragraph.clear();
+                    run_text.clear();
                 }
                 b"pStyle" if in_paragraph => {
                     for attribute in event.attributes().flatten() {
@@ -687,14 +757,36 @@ fn extract_docx_blocks(xml: &str) -> Result<Vec<(String, bool)>, ImportError> {
                         }
                     }
                 }
-                b"tab" if in_paragraph => paragraph.push('\t'),
-                b"br" | b"cr" if in_paragraph => paragraph.push('\n'),
+                b"b" if in_paragraph => bold = docx_toggle_enabled(&event, reader.decoder())?,
+                b"i" if in_paragraph => italic = docx_toggle_enabled(&event, reader.decoder())?,
+                b"strike" | b"dstrike" if in_paragraph => {
+                    strike = docx_toggle_enabled(&event, reader.decoder())?
+                }
+                b"tab" if in_paragraph => {
+                    flush_docx_run(&mut paragraph, &mut run_text, bold, italic, strike);
+                    paragraph.push('\t');
+                }
+                b"br" | b"cr" if in_paragraph => {
+                    flush_docx_run(&mut paragraph, &mut run_text, bold, italic, strike);
+                    paragraph.push('\n');
+                }
                 _ => {}
             },
             Ok(quick_xml::events::Event::Empty(event)) if in_paragraph => {
                 match event.local_name().as_ref() {
-                    b"tab" => paragraph.push('\t'),
-                    b"br" | b"cr" => paragraph.push('\n'),
+                    b"b" => bold = docx_toggle_enabled(&event, reader.decoder())?,
+                    b"i" => italic = docx_toggle_enabled(&event, reader.decoder())?,
+                    b"strike" | b"dstrike" => {
+                        strike = docx_toggle_enabled(&event, reader.decoder())?
+                    }
+                    b"tab" => {
+                        flush_docx_run(&mut paragraph, &mut run_text, bold, italic, strike);
+                        paragraph.push('\t');
+                    }
+                    b"br" | b"cr" => {
+                        flush_docx_run(&mut paragraph, &mut run_text, bold, italic, strike);
+                        paragraph.push('\n');
+                    }
                     b"pStyle" => {
                         for attribute in event.attributes().flatten() {
                             if attribute.key.local_name().as_ref() == b"val" {
@@ -716,7 +808,7 @@ fn extract_docx_blocks(xml: &str) -> Result<Vec<(String, bool)>, ImportError> {
                 let decoded = event
                     .xml_content(quick_xml::XmlVersion::Implicit1_0)
                     .map_err(|error| ImportError::Archive(error.to_string()))?;
-                paragraph.push_str(&decoded);
+                run_text.push_str(&decoded);
             }
             Ok(quick_xml::events::Event::GeneralRef(event)) if in_paragraph => {
                 let reference = event
@@ -726,9 +818,9 @@ fn extract_docx_blocks(xml: &str) -> Result<Vec<(String, bool)>, ImportError> {
                     .resolve_char_ref()
                     .map_err(|error| ImportError::Archive(error.to_string()))?
                 {
-                    paragraph.push(character);
+                    run_text.push(character);
                 } else {
-                    paragraph.push_str(match reference.as_ref() {
+                    run_text.push_str(match reference.as_ref() {
                         "amp" => "&",
                         "lt" => "<",
                         "gt" => ">",
@@ -742,11 +834,19 @@ fn extract_docx_blocks(xml: &str) -> Result<Vec<(String, bool)>, ImportError> {
                     });
                 }
             }
+            Ok(quick_xml::events::Event::End(event)) if event.local_name().as_ref() == b"r" => {
+                flush_docx_run(&mut paragraph, &mut run_text, bold, italic, strike);
+                (bold, italic, strike) = (false, false, false);
+            }
             Ok(quick_xml::events::Event::End(event)) if event.local_name().as_ref() == b"p" => {
+                flush_docx_run(&mut paragraph, &mut run_text, bold, italic, strike);
                 if !paragraph.trim().is_empty() {
                     blocks.push((paragraph.clone(), is_heading));
                 }
                 in_paragraph = false;
+                bold = false;
+                italic = false;
+                strike = false;
             }
             Ok(quick_xml::events::Event::Eof) if in_paragraph => {
                 return Err(ImportError::Archive(
@@ -1165,24 +1265,30 @@ mod tests {
         archive(
             &docx,
             "word/document.xml",
-            "<w:document><w:body><w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:r><w:t>Chapter One</w:t></w:r></w:p><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Élodie &amp; Sam.</w:t><w:tab/><w:t>Still here.</w:t><w:br/><w:t>New line.</w:t></w:r></w:p></w:body></w:document>",
+            "<w:document><w:body><w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:r><w:t>Chapter One</w:t></w:r></w:p><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Élodie &amp; Sam.</w:t><w:tab/><w:t>Still here.</w:t><w:br/><w:t>New line.</w:t></w:r><w:r><w:rPr><w:i/></w:rPr><w:t>italic text</w:t></w:r><w:r><w:rPr><w:strike/></w:rPr><w:t>struck text</w:t></w:r><w:r><w:rPr><w:u w:val=\"single\"/></w:rPr><w:t>underlined text</w:t></w:r></w:p></w:body></w:document>",
         );
         let source_before = std::fs::read(&docx).unwrap();
         let staged = inspect_manuscript(&docx).unwrap();
         assert_eq!(staged.source_type, SourceType::Docx);
         assert_eq!(staged.units.len(), 1);
         assert_eq!(staged.units[0].title, "Chapter One");
-        assert!(staged.units[0].body_markdown.contains("Élodie & Sam."));
+        assert!(
+            staged.units[0].body_markdown.contains("**Élodie & Sam.**"),
+            "{}",
+            staged.units[0].body_markdown
+        );
         assert!(
             staged.units[0]
                 .body_markdown
-                .contains("\tStill here.\nNew line.")
+                .contains("\t**Still here.**\n**New line.**")
         );
+        assert!(staged.units[0].body_markdown.contains("*italic text*"));
+        assert!(staged.units[0].body_markdown.contains("~~struck text~~"));
         assert!(
             staged
                 .unsupported
                 .iter()
-                .any(|item| item.contains("Inline DOCX"))
+                .any(|item| item.contains("underline formatting"))
         );
         assert_eq!(
             staged.source_fingerprint,
