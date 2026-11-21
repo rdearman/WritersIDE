@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/story-core", "crates/story-storage", "crates/story-app", "crates/story-import", "crates/story-reading", "crates/story-analysis", "crates/story-ollama", "crates/story-pipeline", "apps/cli", "apps/terminal"]
+members = ["crates/story-core", "crates/story-storage", "crates/story-app", "crates/story-import", "crates/story-reading", "crates/story-analysis", "crates/story-ollama", "crates/story-pipeline", "crates/story-document", "apps/cli", "apps/terminal"]
 
 [workspace.package]
 edition = "2024"
@@ -18,4 +18,5 @@ tempfile = "3.23"
 ratatui = "0.29"
 crossterm = "0.28"
 serde_json = "1.0"
+pulldown-cmark = "0.9.6"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }

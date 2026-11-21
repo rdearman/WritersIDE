@@ -28,10 +28,13 @@ pub struct PipelineCharacter {
 #[derive(Clone, Debug)]
 pub struct PipelineScene {
     pub id: String,
+    pub chapter_id: Option<String>,
     pub title: String,
     pub text: String,
     /// Resolved inclusion text. This is a derived compilation view; `text` remains canonical.
     pub expanded_text: Option<String>,
+    /// Ordered source documents used to build an inclusion-aware semantic IR.
+    pub expanded_passages: Option<Vec<PipelinePassage>>,
     pub target_words: Option<u64>,
     pub characters: Vec<PipelineCharacter>,
     pub plotlines: Vec<String>,
@@ -40,10 +43,25 @@ pub struct PipelineScene {
 }
 
 #[derive(Clone, Debug)]
+pub struct PipelineGroup {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub kind: story_document::StructuralKind,
+    pub title: String,
+}
+
+#[derive(Clone, Debug)]
+pub struct PipelinePassage {
+    pub source_entity_id: String,
+    pub text: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct PipelineInput {
     pub title: String,
     pub target_words: Option<u64>,
     pub expand_transclusions: bool,
+    pub groups: Vec<PipelineGroup>,
     /// Ordered in manuscript order; chronology remains on each scene independently.
     pub scenes: Vec<PipelineScene>,
     pub revision_summary: String,
@@ -296,22 +314,11 @@ fn stage_fingerprint(
     outputs: &BTreeMap<Stage, String>,
 ) -> String {
     let source = match stage {
-        Stage::Compile => input
-            .scenes
-            .iter()
-            .map(|s| {
-                format!(
-                    "{}\0{}\0{}",
-                    s.id,
-                    s.title,
-                    if input.expand_transclusions {
-                        s.expanded_text.as_deref().unwrap_or(&s.text)
-                    } else {
-                        &s.text
-                    }
-                )
-            })
-            .collect::<String>(),
+        Stage::Compile => format!(
+            "semantic-schema={}\ncompile-ir={:?}",
+            story_document::SEMANTIC_SCHEMA_VERSION,
+            compile_ir(input)
+        ),
         Stage::WordCount | Stage::Export => {
             outputs.get(&Stage::Compile).cloned().unwrap_or_default()
         }
@@ -348,18 +355,15 @@ fn render_stage(
     outputs: &BTreeMap<Stage, String>,
 ) -> Result<String, String> {
     match stage {
-        Stage::Compile => Ok(input
-            .scenes
-            .iter()
-            .map(|scene| {
-                let body = if input.expand_transclusions {
-                    scene.expanded_text.as_deref().unwrap_or(&scene.text)
-                } else {
-                    &scene.text
-                };
-                format!("## {}\n\n{}\n\n", scene.title, body)
-            })
-            .collect()),
+        Stage::Compile => {
+            let ir = compile_ir(input);
+            if !ir.validate() {
+                return Err(
+                    "compile IR contains duplicate IDs, missing parents, or a cycle".into(),
+                );
+            }
+            Ok(ir.render_markdown().0)
+        }
         Stage::WordCount => {
             let text = outputs
                 .get(&Stage::Compile)
@@ -446,6 +450,58 @@ fn render_stage(
     }
 }
 
+pub fn compile_ir(input: &PipelineInput) -> story_document::CompileIr {
+    let mut ir = story_document::CompileIr::new(input.title.clone());
+    for group in &input.groups {
+        ir.push_group(story_document::CompileGroup {
+            id: group.id.clone(),
+            parent_id: group.parent_id.clone(),
+            kind: group.kind,
+            title: group.title.clone(),
+        });
+    }
+    for scene in &input.scenes {
+        let segments = if input.expand_transclusions {
+            scene
+                .expanded_passages
+                .as_ref()
+                .map(|passages| {
+                    passages
+                        .iter()
+                        .map(|passage| {
+                            story_document::CompileSegment::new(
+                                passage.source_entity_id.clone(),
+                                passage.text.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    vec![story_document::CompileSegment::new(
+                        scene.id.clone(),
+                        scene
+                            .expanded_text
+                            .as_deref()
+                            .unwrap_or(scene.text.as_str()),
+                    )]
+                })
+        } else {
+            vec![story_document::CompileSegment::new(
+                scene.id.clone(),
+                scene.text.clone(),
+            )]
+        };
+        ir.push(story_document::CompileUnit {
+            id: scene.id.clone(),
+            parent_id: scene.chapter_id.clone(),
+            kind: story_document::ContentUnitKind::Scene,
+            title: scene.title.clone(),
+            segments,
+        });
+    }
+    ir
+}
+
 fn analysis_input(input: &PipelineInput) -> Vec<SceneAnalysisInput> {
     input
         .scenes
@@ -512,11 +568,19 @@ mod tests {
             title: "Novel".into(),
             target_words: Some(100),
             expand_transclusions: false,
+            groups: vec![PipelineGroup {
+                id: "chapter-1".into(),
+                parent_id: None,
+                kind: story_document::StructuralKind::Chapter,
+                title: "Opening".into(),
+            }],
             scenes: vec![PipelineScene {
                 id: "scene-1".into(),
+                chapter_id: Some("chapter-1".into()),
                 title: "Opening".into(),
                 text: text.into(),
                 expanded_text: None,
+                expanded_passages: None,
                 target_words: Some(100),
                 characters: vec![PipelineCharacter {
                     id: "character-1".into(),
@@ -588,6 +652,22 @@ mod tests {
         source.expand_transclusions = true;
         source.scenes[0].expanded_text =
             Some("Canonical source.\n\n---\n\nIncluded canonical target.".into());
+        source.scenes[0].expanded_passages = Some(vec![
+            PipelinePassage {
+                source_entity_id: "scene:scene-1".into(),
+                text: "Canonical source.".into(),
+            },
+            PipelinePassage {
+                source_entity_id: "research:reference-2".into(),
+                text: "Included canonical target.".into(),
+            },
+        ]);
+        let ir = compile_ir(&source);
+        let (_, map) = ir.render_markdown();
+        assert!(ir.validate());
+        assert_eq!(ir.units[0].id, "scene-1");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[1].source_entity_id, "research:reference-2");
         runner.run(&source).unwrap();
         let compiled = fs::read_to_string(dir.path().join("exports/compiled.md")).unwrap();
         assert!(compiled.contains("Canonical source.\n\n---\n\nIncluded canonical target."));

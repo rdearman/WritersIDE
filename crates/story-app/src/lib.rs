@@ -127,22 +127,50 @@ impl WriterApp {
     ) -> Result<story_pipeline::PipelineInput> {
         let project = self.get_project()?;
         let analytics = self.analytics_dataset()?;
+        let groups = self
+            .store
+            .list_structural_nodes()?
+            .into_iter()
+            .map(|node| story_pipeline::PipelineGroup {
+                id: node.id.to_string(),
+                parent_id: node.parent_id.map(|id| id.to_string()),
+                kind: match node.kind.as_str() {
+                    "section" => story_document::StructuralKind::Section,
+                    "chapter" => story_document::StructuralKind::Chapter,
+                    _ => story_document::StructuralKind::Group,
+                },
+                title: node.title,
+            })
+            .collect();
         let mut scenes = Vec::new();
         let mut snapshots = 0usize;
         for row in self.store.list_scenes(false)? {
             let (text, _) = self.store.load_text(row.scene.id)?;
-            let expanded_text = if expand_transclusions {
+            let expanded_passages = if expand_transclusions {
                 Some(
                     self.store
                         .expand_document_inclusions(EntityRef::Scene(row.scene.id))?
                         .into_iter()
-                        .map(|passage| passage.text)
-                        .collect::<Vec<_>>()
-                        .join("\n\n---\n\n"),
+                        .map(|passage| story_pipeline::PipelinePassage {
+                            source_entity_id: format!(
+                                "{}:{}",
+                                passage.source.kind(),
+                                passage.source.id()
+                            ),
+                            text: passage.text,
+                        })
+                        .collect::<Vec<_>>(),
                 )
             } else {
                 None
             };
+            let expanded_text = expanded_passages.as_ref().map(|passages| {
+                passages
+                    .iter()
+                    .map(|passage| passage.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n\n---\n\n")
+            });
             let linked = analytics
                 .iter()
                 .find(|data| data.scene_id == row.scene.id.to_string());
@@ -163,9 +191,11 @@ impl WriterApp {
             snapshots += self.store.list_snapshots(row.scene.id)?.len();
             scenes.push(story_pipeline::PipelineScene {
                 id: row.scene.id.to_string(),
+                chapter_id: row.chapter_id.map(|id| id.to_string()),
                 title: row.scene.title,
                 text,
                 expanded_text,
+                expanded_passages,
                 target_words: row.scene.target_words,
                 characters,
                 plotlines,
@@ -177,6 +207,7 @@ impl WriterApp {
             title: project.title,
             target_words: project.target_words,
             expand_transclusions,
+            groups,
             scenes,
             revision_summary: format!(
                 "{} scenes; {snapshots} stored snapshots",

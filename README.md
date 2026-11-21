@@ -1,10 +1,12 @@
 # Writer's IDE
 
-Writer's IDE is an early Rust implementation of the scene-centred novel planning and writing environment described in the supplied SRS v0.1 and [active engineering design](docs/engineering-design-v0.44.md).
+Writer's IDE is an early Rust implementation of the scene-centred novel planning and writing environment described in the supplied SRS v0.1 and [active engineering design](docs/engineering-design-v0.45.md).
 
 The current workspace contains a reusable story core, SQLite and manuscript storage, application services, a synthetic import inventory/mapping interface, a CLI and a full-screen terminal prototype. Real Scrivener/Ranperen adapters are not present.
 
-The current implementation adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked inclusion of scenes, research documents, and imported Reading references, live saved scene queries, project-wide FTS5 search, a full-screen terminal shell, reference reading and annotations, snapshot revision history with interactive hunk restoration, read-only narrative analytics, optional local Ollama assistance with evidence-linked proposal review and dismissal, and an incremental processing pipeline with uncertainty-aware character chronology diagnostics. The terminal registry now covers parameterized palette commands as well as workspace, save, help, and Compile actions. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.44](docs/engineering-design-v0.44.md).
+The WYSIWYM parser and renderer-neutral Compile IR are documented as a prototype in [the Issue #21 contract](docs/wysiwym-contract-v0.1.md); the contract is not frozen until it is checked against a real formatted chapter.
+
+The current implementation adds stable typed story links, passage anchors, backlink and integrity checks, cycle-checked inclusion of scenes, research documents, and imported Reading references, live saved scene queries, project-wide FTS5 search, a full-screen terminal shell, reference reading and annotations, snapshot revision history with interactive hunk restoration, read-only narrative analytics, optional local Ollama assistance with evidence-linked proposal review and dismissal, and an incremental processing pipeline with uncertainty-aware character chronology diagnostics. The terminal registry now covers parameterized palette commands as well as workspace, save, help, and Compile actions. See [SRS v0.2 addendum](docs/software-requirements-v0.2-addendum.md) and [Engineering Design v0.45](docs/engineering-design-v0.45.md).
 
 ## Build and verify
 
