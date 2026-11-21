@@ -163,6 +163,7 @@ struct AppState {
     last_yank: Option<LastYank>,
     macro_preview: Option<MacroPreview>,
     pending_replace: Option<Vec<ReplaceTarget>>,
+    find_panel: Option<FindPanel>,
     extra_cursors: Vec<(usize, usize)>,
     active_challenge: Option<ActiveWritingChallenge>,
     menu: Option<MenuState>,
@@ -374,6 +375,25 @@ struct ReplaceTarget {
     original: String,
     proposed: String,
     replacements: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FindPanelField {
+    Pattern,
+    Replacement,
+    Scope,
+}
+
+#[derive(Clone, Debug)]
+struct FindPanel {
+    replacing: bool,
+    mode: story_core::FindMode,
+    case_sensitive: bool,
+    whole_word: bool,
+    scope: String,
+    pattern: String,
+    replacement: String,
+    field: FindPanelField,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -729,6 +749,22 @@ fn command_registry() -> Vec<CommandSpec> {
             "Edit",
             "scene-field",
             true,
+        ),
+        legacy_command(
+            "search.find-panel",
+            "Find in Manuscript",
+            "Open the bottom Find panel",
+            "Edit",
+            "find-panel",
+            false,
+        ),
+        legacy_command(
+            "search.replace-panel",
+            "Find and Replace",
+            "Open the bottom Find and Replace panel",
+            "Edit",
+            "replace-panel",
+            false,
         ),
         legacy_command(
             "search.replace-preview",
@@ -2466,6 +2502,7 @@ impl AppState {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -3178,6 +3215,124 @@ impl AppState {
             .into_iter()
             .filter(|record| record.scene.id == id)
             .collect())
+    }
+    fn run_find_panel_search(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let panel = self
+            .find_panel
+            .as_ref()
+            .ok_or("find panel is closed")?
+            .clone();
+        if panel.pattern.is_empty() {
+            return Err("enter a search pattern first".into());
+        }
+        let scenes = self.scenes_for_scope(&panel.scope)?;
+        let mut found = Vec::new();
+        self.search_locations.clear();
+        for record in scenes {
+            let text = if self.editing_scene == Some(record.scene.id) {
+                self.editor.join("\n")
+            } else {
+                self.app.load_scene_text(record.scene.id)?.0
+            };
+            let matches = story_core::find_matches_with_options(
+                &text,
+                &panel.pattern,
+                story_core::FindOptions {
+                    mode: panel.mode,
+                    case_sensitive: panel.case_sensitive,
+                    whole_word: panel.whole_word,
+                },
+            )?;
+            if !matches.is_empty() {
+                self.search_locations.extend(
+                    matches
+                        .iter()
+                        .map(|matched| (record.scene.id, matched.start, matched.end)),
+                );
+                found.push((record.scene.id, record.scene.title));
+            }
+        }
+        if found.is_empty() {
+            self.message = "No matches".into();
+            return Ok(());
+        }
+        self.search_location_index = self.search_locations.len().saturating_sub(1);
+        let (scene, title) = &found[0];
+        if self.dirty && self.editing_scene != Some(*scene) {
+            self.message = format!(
+                "{} matches found; save the current scene before navigating to {title}",
+                self.search_locations.len()
+            );
+        } else {
+            self.navigate_search_match(true)?;
+            self.message = format!(
+                "{} match(es) in {} scene(s); F3/Shift-F3 navigates · first in {title}",
+                self.search_locations.len(),
+                found.len()
+            );
+        }
+        Ok(())
+    }
+    fn stage_replace_preview(
+        &mut self,
+        mode: story_core::FindMode,
+        scope: &str,
+        pattern: &str,
+        replacement: &str,
+        case_sensitive: bool,
+        whole_word: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let options = story_core::FindOptions {
+            mode,
+            case_sensitive,
+            whole_word,
+        };
+        let scenes = self.scenes_for_scope(scope)?;
+        let mut output = Vec::new();
+        let mut targets = Vec::new();
+        let mut total = 0usize;
+        for record in scenes {
+            let (source, expected_hash) = if self.editing_scene == Some(record.scene.id) {
+                (self.editor.join("\n"), self.saved_hash.clone())
+            } else {
+                self.app.load_scene_text(record.scene.id)?
+            };
+            let (updated, count) =
+                story_core::replace_matches_with_options(&source, pattern, replacement, options)?;
+            if count > 0 {
+                total += count;
+                targets.push(ReplaceTarget {
+                    scene: record.scene.id,
+                    title: record.scene.title.clone(),
+                    expected_hash,
+                    original: source.clone(),
+                    proposed: updated.clone(),
+                    replacements: count,
+                });
+                output.push(format!(
+                    "## {} — {count} replacement(s)\n--- current ---\n{}\n--- proposed ---\n{}",
+                    record.scene.title, source, updated
+                ));
+            }
+        }
+        if output.is_empty() {
+            self.pending_replace = None;
+            self.message = "Preview: no replacements found; manuscript unchanged".into();
+        } else {
+            self.pending_replace = Some(targets);
+            let preview = output.join("\n\n");
+            let clipped = preview.chars().take(12_000).collect::<String>();
+            let suffix = if preview.chars().count() > 12_000 {
+                "\n\n[Preview truncated at 12,000 characters]"
+            } else {
+                ""
+            };
+            self.message = format!(
+                "Read-only preview staged: {total} replacement(s) in {} scene(s). Use F5 to apply.\n\n{clipped}{suffix}",
+                output.len()
+            );
+        }
+        Ok(())
     }
     fn active_reference_pane(&self) -> Option<&ReferencePane> {
         self.reference_panes.get(self.active_reference)
@@ -3966,6 +4121,10 @@ impl AppState {
                     .collect::<Vec<_>>()
                     .join(" · ")
             };
+            return Ok(());
+        }
+        if cmd == "find-panel" || cmd == "replace-panel" {
+            open_find_panel(self, cmd == "replace-panel");
             return Ok(());
         }
         if let Some(rest) = cmd.strip_prefix("keybinding-set ") {
@@ -7452,54 +7611,7 @@ impl AppState {
             let mode = parse_find_mode(parts.next().ok_or("missing replace mode")?)?;
             let scope = parts.next().ok_or("missing replace scope")?;
             let pattern = parts.next().ok_or("missing replace pattern")?;
-            let scenes = self.scenes_for_scope(scope)?;
-            let mut output = Vec::new();
-            let mut targets = Vec::new();
-            let mut total = 0usize;
-            for record in scenes {
-                let (source, expected_hash) = if self.editing_scene == Some(record.scene.id) {
-                    (self.editor.join("\n"), self.saved_hash.clone())
-                } else {
-                    self.app.load_scene_text(record.scene.id)?
-                };
-                let (updated, count) =
-                    story_core::replace_matches(&source, pattern, replacement, mode)?;
-                if count > 0 {
-                    total += count;
-                    targets.push(ReplaceTarget {
-                        scene: record.scene.id,
-                        title: record.scene.title.clone(),
-                        expected_hash,
-                        original: source.clone(),
-                        proposed: updated.clone(),
-                        replacements: count,
-                    });
-                    output.push(format!(
-                        "## {} — {count} replacement(s)\n--- current ---\n{}\n--- proposed ---\n{}",
-                        record.scene.title, source, updated
-                    ));
-                }
-            }
-            if output.is_empty() {
-                self.pending_replace = None;
-                self.message = "Preview: no replacements found; manuscript unchanged".into();
-            } else {
-                self.pending_replace = Some(targets);
-                let preview = output.join("\n\n");
-                let mut clipped = String::new();
-                for ch in preview.chars().take(12_000) {
-                    clipped.push(ch);
-                }
-                let suffix = if preview.chars().count() > 12_000 {
-                    "\n\n[Preview truncated at 12,000 characters; use CLI replace-preview for complete JSON.]"
-                } else {
-                    ""
-                };
-                self.message = format!(
-                    "Read-only preview staged: {total} replacement(s) in {} scene(s). Use replace-apply to commit or replace-cancel to discard.\n\n{clipped}{suffix}",
-                    output.len()
-                );
-            }
+            self.stage_replace_preview(mode, scope, pattern, replacement, true, false)?;
         } else if cmd == "replace-cancel" {
             if self.pending_replace.take().is_some() {
                 self.message = "Replacement preview discarded; manuscript unchanged".into();
@@ -8599,7 +8711,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(2),
+            Constraint::Length(if s.find_panel.is_some() { 6 } else { 2 }),
         ])
         .split(area);
     s.width = area.width as usize;
@@ -9012,32 +9124,86 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             );
         }
     }
-    let footer = if let Some(mode) = s.mode {
-        format!(" {mode} {}_", s.prompt)
+    if let Some(panel) = &s.find_panel {
+        let focused = |field| {
+            if panel.field == field {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            }
+        };
+        let mode = match panel.mode {
+            story_core::FindMode::Normal => "Normal",
+            story_core::FindMode::Extended => "Extended",
+            story_core::FindMode::Regex => "Regex",
+        };
+        let replace_text = if panel.replacing {
+            panel.replacement.as_str()
+        } else {
+            "(Ctrl+H to enable replacement)"
+        };
+        let help = if panel.replacing {
+            "Enter preview · F5 apply · F3 next · F2 mode · F4 scope · F6 case · F7 word · Tab fields · Esc close"
+        } else {
+            "Enter find · F3 next · F2 mode · F4 scope · F6 case · F7 word · Tab fields · Ctrl+H replace · Esc close"
+        };
+        let options = format!(
+            "Case {} · whole word {}",
+            if panel.case_sensitive { "on" } else { "off" },
+            if panel.whole_word { "on" } else { "off" }
+        );
+        let lines = vec![
+            Line::from(vec![
+                Span::raw(format!(" Mode: {mode} · Scope: ")),
+                Span::styled(&panel.scope, focused(FindPanelField::Scope)),
+                Span::raw(format!(" · {options}")),
+            ]),
+            Line::from(format!(" Keys: {help}")),
+            Line::from(vec![
+                Span::raw(" Find: "),
+                Span::styled(&panel.pattern, focused(FindPanelField::Pattern)),
+            ]),
+            Line::from(vec![
+                Span::raw(" Replace: "),
+                Span::styled(replace_text, focused(FindPanelField::Replacement)),
+            ]),
+            Line::from(format!(" {}", s.message)),
+        ];
+        f.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::TOP)),
+            rows[2],
+        );
     } else {
-        let challenge = s
-            .active_challenge
-            .as_ref()
-            .map(|challenge| {
-                let policy = s
-                    .app
-                    .get_project()
-                    .map(|project| project.word_count_policy)
-                    .unwrap_or_default();
-                challenge_footer(challenge, &s.editor, policy)
-            })
-            .unwrap_or_default();
-        format!(
-            " {}   {}   Enter open | j/k or ↑/↓ select | Tab next | Backspace back | {}",
-            s.message,
-            challenge,
-            if s.dirty { "modified" } else { "clean" }
-        )
-    };
-    f.render_widget(
-        Paragraph::new(footer).block(Block::default().borders(Borders::TOP)),
-        rows[2],
-    );
+        let footer = if let Some(mode) = s.mode {
+            format!(" {mode} {}_", s.prompt)
+        } else {
+            let challenge = s
+                .active_challenge
+                .as_ref()
+                .map(|challenge| {
+                    let policy = s
+                        .app
+                        .get_project()
+                        .map(|project| project.word_count_policy)
+                        .unwrap_or_default();
+                    challenge_footer(challenge, &s.editor, policy)
+                })
+                .unwrap_or_default();
+            format!(
+                " {}   {}   Enter open | j/k or ↑/↓ select | Tab next | Backspace back | {}",
+                s.message,
+                challenge,
+                if s.dirty { "modified" } else { "clean" }
+            )
+        };
+        f.render_widget(
+            Paragraph::new(footer).block(Block::default().borders(Borders::TOP)),
+            rows[2],
+        );
+    }
     if s.menu.is_some() {
         draw_menu_overlay(f, s);
     }
@@ -11229,6 +11395,150 @@ fn parse_terminal_link_kind(
         _ => return Err(format!("unknown link kind: {value}").into()),
     })
 }
+fn open_find_panel(s: &mut AppState, replacing: bool) {
+    if let Some(panel) = &mut s.find_panel {
+        panel.replacing |= replacing;
+        panel.field = if replacing {
+            FindPanelField::Pattern
+        } else {
+            panel.field
+        };
+    } else {
+        s.find_panel = Some(FindPanel {
+            replacing,
+            mode: story_core::FindMode::Normal,
+            scope: "current".into(),
+            pattern: String::new(),
+            replacement: String::new(),
+            case_sensitive: true,
+            whole_word: false,
+            field: FindPanelField::Pattern,
+        });
+    }
+    s.mode = None;
+    s.prompt.clear();
+}
+
+fn handle_find_panel_key(
+    s: &mut AppState,
+    key: KeyEvent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if key.code == KeyCode::Esc {
+        s.find_panel = None;
+        s.message = "Find panel closed".into();
+        return Ok(());
+    }
+    if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('h') {
+        if let Some(panel) = &mut s.find_panel {
+            panel.replacing = true;
+            panel.field = FindPanelField::Pattern;
+        }
+        return Ok(());
+    }
+    if key.code == KeyCode::F(4) {
+        let mut scopes = vec!["current".to_owned()];
+        if let Some(scene) = s.editing_scene.or_else(|| s.active_scene())
+            && let Ok(record) = s.app.get_scene(scene)
+            && let Some(chapter) = record.chapter_id
+        {
+            scopes.push(format!("chapter:{chapter}"));
+        }
+        scopes.push("all".into());
+        scopes.extend(
+            s.app
+                .list_assemblies()?
+                .into_iter()
+                .map(|assembly| format!("assembly:{}", assembly.id)),
+        );
+        if let Some(panel) = &mut s.find_panel {
+            let index = scopes
+                .iter()
+                .position(|scope| scope == &panel.scope)
+                .unwrap_or(scopes.len() - 1);
+            panel.scope = scopes[(index + 1) % scopes.len()].clone();
+        }
+        return Ok(());
+    }
+    if key.code == KeyCode::F(3) {
+        s.navigate_search_match(!key.modifiers.contains(KeyModifiers::SHIFT))?;
+        return Ok(());
+    }
+    if key.code == KeyCode::F(5) && s.find_panel.as_ref().is_some_and(|panel| panel.replacing) {
+        if let Err(error) = s.execute_legacy_palette_command("replace-apply") {
+            s.message = error.to_string();
+        }
+        return Ok(());
+    }
+    if key.code == KeyCode::Enter {
+        let panel = s.find_panel.as_ref().ok_or("find panel is closed")?.clone();
+        if panel.replacing {
+            if let Err(error) = s.stage_replace_preview(
+                panel.mode,
+                &panel.scope,
+                &panel.pattern,
+                &panel.replacement,
+                panel.case_sensitive,
+                panel.whole_word,
+            ) {
+                s.message = error.to_string();
+            }
+        } else if let Err(error) = s.run_find_panel_search() {
+            s.message = error.to_string();
+        }
+        return Ok(());
+    }
+    let panel = s.find_panel.as_mut().ok_or("find panel is closed")?;
+    match key.code {
+        KeyCode::F(2) => {
+            panel.mode = match panel.mode {
+                story_core::FindMode::Normal => story_core::FindMode::Extended,
+                story_core::FindMode::Extended => story_core::FindMode::Regex,
+                story_core::FindMode::Regex => story_core::FindMode::Normal,
+            };
+        }
+        KeyCode::F(6) => panel.case_sensitive = !panel.case_sensitive,
+        KeyCode::F(7) => panel.whole_word = !panel.whole_word,
+        KeyCode::Tab | KeyCode::BackTab => {
+            let forward = key.code == KeyCode::Tab;
+            panel.field = match (panel.replacing, forward, panel.field) {
+                (true, true, FindPanelField::Pattern) => FindPanelField::Replacement,
+                (true, true, FindPanelField::Replacement) => FindPanelField::Scope,
+                (true, true, FindPanelField::Scope) => FindPanelField::Pattern,
+                (true, false, FindPanelField::Pattern) => FindPanelField::Scope,
+                (true, false, FindPanelField::Scope) => FindPanelField::Replacement,
+                (true, false, FindPanelField::Replacement) => FindPanelField::Pattern,
+                (false, true, FindPanelField::Pattern) => FindPanelField::Scope,
+                (false, true, FindPanelField::Scope) => FindPanelField::Pattern,
+                (false, false, FindPanelField::Pattern) => FindPanelField::Scope,
+                (false, false, FindPanelField::Scope) => FindPanelField::Pattern,
+                (false, _, FindPanelField::Replacement) => FindPanelField::Pattern,
+            };
+        }
+        KeyCode::Backspace => match panel.field {
+            FindPanelField::Pattern => {
+                panel.pattern.pop();
+            }
+            FindPanelField::Replacement => {
+                panel.replacement.pop();
+            }
+            FindPanelField::Scope => {
+                panel.scope.pop();
+            }
+        },
+        KeyCode::Char(character)
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            match panel.field {
+                FindPanelField::Pattern => panel.pattern.push(character),
+                FindPanelField::Replacement => panel.replacement.push(character),
+                FindPanelField::Scope => panel.scope.push(character),
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
     if s.menu.is_some() {
         if is_menu_shortcut(k) || k.code == KeyCode::F(10) {
@@ -11248,6 +11558,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         if let Some(spec) = command_by_id("menu.main") {
             s.dispatch_registered(spec.action)?;
         }
+        return Ok(false);
+    }
+    if s.find_panel.is_some() {
+        handle_find_panel_key(s, k)?;
         return Ok(false);
     }
     if s.mode.is_some() {
@@ -11298,6 +11612,12 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         return Ok(false);
     }
+    if k.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(k.code, KeyCode::Char('f' | 'F' | 'h' | 'H'))
+    {
+        open_find_panel(s, matches!(k.code, KeyCode::Char('h' | 'H')));
+        return Ok(false);
+    }
     if let Some((_, id)) = s
         .command_bindings
         .iter()
@@ -11306,6 +11626,8 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         if let Some(command) = command_by_id(id) {
             if let Some(reason) = s.command_disabled_reason(command) {
                 s.message = reason.into();
+            } else if command.action == CommandAction::LegacyPalette {
+                s.dispatch_registered_with_args(command.action, command.palette_prefix)?;
             } else {
                 s.dispatch_registered(command.action)?;
             }
@@ -13646,6 +13968,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -14127,7 +14450,7 @@ mod tests {
         let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
         let scene = app.create_scene(chapter, "Cats", 0).unwrap();
         let (saved, hash) = app.load_scene_text(scene).unwrap();
-        app.save_scene_text(scene, Some(&hash), "A cat waits.")
+        app.save_scene_text(scene, Some(&hash), "A CAT catfish waits.")
             .unwrap();
         let saved_hash = app.load_scene_text(scene).unwrap().1;
         let mut state = AppState::new(app, default_bindings());
@@ -14706,6 +15029,94 @@ mod tests {
     }
 
     #[test]
+    fn bottom_find_panel_defaults_to_normal_and_runs_scoped_search() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "A cat waits.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(
+            state.find_panel.as_ref().unwrap().mode,
+            story_core::FindMode::Normal
+        );
+        for character in "cat".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(&mut state, KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)).unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.search_locations.len(), 1);
+        assert_eq!(state.search_locations[0].0, scene);
+        assert!(state.find_panel.is_some());
+    }
+
+    #[test]
+    fn bottom_replace_panel_requires_enter_preview_then_f5_apply() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "A CAT catalog waits.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        for character in "cat".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        for character in "fox".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(&mut state, KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)).unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "A CAT catalog waits."
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "A fox catalog waits."
+        );
+    }
+
+    #[test]
     fn proofread_scopes_to_a_chapter_and_rejects_non_chapters() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -14798,6 +15209,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -14895,6 +15307,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -14984,6 +15397,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -15085,6 +15499,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -15336,6 +15751,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -15437,6 +15853,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -15555,6 +15972,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -15791,6 +16209,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -16158,6 +16577,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -16270,6 +16690,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -16434,6 +16855,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             pending_replace: None,
+            find_panel: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,

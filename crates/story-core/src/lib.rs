@@ -408,20 +408,58 @@ pub enum FindMode {
     Regex,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FindOptions {
+    pub mode: FindMode,
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+}
+
+impl Default for FindOptions {
+    fn default() -> Self {
+        Self {
+            mode: FindMode::Normal,
+            case_sensitive: true,
+            whole_word: false,
+        }
+    }
+}
+
 pub fn find_matches(
     text: &str,
     pattern: &str,
     mode: FindMode,
 ) -> Result<Vec<std::ops::Range<usize>>, String> {
+    find_matches_with_options(
+        text,
+        pattern,
+        FindOptions {
+            mode,
+            ..FindOptions::default()
+        },
+    )
+}
+
+pub fn find_matches_with_options(
+    text: &str,
+    pattern: &str,
+    options: FindOptions,
+) -> Result<Vec<std::ops::Range<usize>>, String> {
     if pattern.is_empty() {
         return Err("search pattern cannot be empty".into());
     }
-    let source = match mode {
+    let mut source = match options.mode {
         FindMode::Normal => regex::escape(pattern),
         FindMode::Extended => regex::escape(&decode_extended(pattern)?),
         FindMode::Regex => pattern.to_owned(),
     };
-    let re = regex::Regex::new(&source).map_err(|e| format!("invalid regular expression: {e}"))?;
+    if options.whole_word {
+        source = format!(r"\b(?:{source})\b");
+    }
+    let re = regex::RegexBuilder::new(&source)
+        .case_insensitive(!options.case_sensitive)
+        .build()
+        .map_err(|e| format!("invalid regular expression: {e}"))?;
     Ok(re.find_iter(text).map(|m| m.start()..m.end()).collect())
 }
 
@@ -431,10 +469,27 @@ pub fn replace_matches(
     replacement: &str,
     mode: FindMode,
 ) -> Result<(String, usize), String> {
+    replace_matches_with_options(
+        text,
+        pattern,
+        replacement,
+        FindOptions {
+            mode,
+            ..FindOptions::default()
+        },
+    )
+}
+
+pub fn replace_matches_with_options(
+    text: &str,
+    pattern: &str,
+    replacement: &str,
+    options: FindOptions,
+) -> Result<(String, usize), String> {
     if pattern.is_empty() {
         return Err("search pattern cannot be empty".into());
     }
-    let (source, replacement) = match mode {
+    let (mut source, replacement) = match options.mode {
         FindMode::Normal => (regex::escape(pattern), replacement.to_owned()),
         FindMode::Extended => (
             regex::escape(&decode_extended(pattern)?),
@@ -442,7 +497,13 @@ pub fn replace_matches(
         ),
         FindMode::Regex => (pattern.to_owned(), replacement.to_owned()),
     };
-    let re = regex::Regex::new(&source).map_err(|e| format!("invalid regular expression: {e}"))?;
+    if options.whole_word {
+        source = format!(r"\b(?:{source})\b");
+    }
+    let re = regex::RegexBuilder::new(&source)
+        .case_insensitive(!options.case_sensitive)
+        .build()
+        .map_err(|e| format!("invalid regular expression: {e}"))?;
     let count = re.find_iter(text).count();
     Ok((
         re.replace_all(text, replacement.as_str()).into_owned(),
@@ -548,6 +609,31 @@ mod multilingual_tests {
             ("one\n22 two".to_owned(), 1)
         );
         assert!(find_matches(source, "[", FindMode::Regex).is_err());
+    }
+
+    #[test]
+    fn find_options_support_case_insensitive_and_unicode_word_boundaries() {
+        use super::{
+            FindMode, FindOptions, find_matches_with_options, replace_matches_with_options,
+        };
+        let options = FindOptions {
+            mode: FindMode::Normal,
+            case_sensitive: false,
+            whole_word: true,
+        };
+        let source = "CAT catalog cat café";
+        let found = find_matches_with_options(source, "cat", options).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|range| &source[range.clone()])
+                .collect::<Vec<_>>(),
+            ["CAT", "cat"]
+        );
+        assert_eq!(
+            replace_matches_with_options(source, "cat", "fox", options).unwrap(),
+            ("fox catalog fox café".to_owned(), 2)
+        );
     }
 }
 
