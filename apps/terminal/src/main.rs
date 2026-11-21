@@ -3694,6 +3694,194 @@ impl AppState {
                 }
                 _ => return Err("use writing-stats on|off|report|reset".into()),
             }
+        } else if let Some(rest) = cmd.strip_prefix("goal-create ") {
+            let mut parts = rest
+                .splitn(8, char::is_whitespace)
+                .filter(|part| !part.is_empty());
+            let start = parts.next().ok_or("goal-create requires start date")?;
+            let end = parts.next().ok_or("goal-create requires end date")?;
+            let target = parts
+                .next()
+                .ok_or("goal-create requires target words")?
+                .parse::<i64>()?;
+            let baseline = parts
+                .next()
+                .ok_or("goal-create requires baseline words")?
+                .parse::<i64>()?;
+            let time_zone = parts
+                .next()
+                .ok_or("goal-create requires UTC or a fixed offset")?;
+            let success_metric = parts.next().ok_or("goal-create requires raw or real")?;
+            let scope = parts
+                .next()
+                .ok_or("goal-create requires project or a scene UUID")?;
+            let title = parts.next().ok_or("goal-create requires a title")?.trim();
+            if title.is_empty() {
+                return Err("goal title cannot be empty".into());
+            }
+            let scope_scene_id = if scope == "project" {
+                None
+            } else {
+                Some(SceneId(scope.parse()?))
+            };
+            let id = self
+                .app
+                .create_writing_goal(&story_storage::NewWritingGoal {
+                    title: title.into(),
+                    scope_scene_id,
+                    start_date: start.into(),
+                    end_date: end.into(),
+                    target_words: target,
+                    baseline_words: baseline,
+                    time_zone: time_zone.into(),
+                    word_count_policy: "unicode-word-boundaries".into(),
+                    success_metric: success_metric.into(),
+                })?;
+            self.message = format!("Created writing goal {id}");
+        } else if cmd == "goal-list" {
+            self.message = self
+                .app
+                .list_writing_goals(false)?
+                .into_iter()
+                .map(|goal| {
+                    format!(
+                        "{} · {} · {}–{} · target {} · baseline {} · {} metric",
+                        goal.id,
+                        goal.title,
+                        goal.start_date,
+                        goal.end_date,
+                        goal.target_words,
+                        goal.baseline_words,
+                        goal.success_metric
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("goal-events ") {
+            let goal_id = rest.trim();
+            self.message = self
+                .app
+                .list_writing_goal_events(goal_id)?
+                .into_iter()
+                .map(|event| {
+                    format!(
+                        "{} · {} · source {} · fingerprint {} · raw {} · real {} · {} · {}",
+                        event.id,
+                        event.origin,
+                        event.source_identifier,
+                        event.source_fingerprint,
+                        event.raw_delta,
+                        event.real_delta,
+                        event.reconciliation_state,
+                        event.detail
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("goal-record ") {
+            let mut parts = rest
+                .splitn(9, char::is_whitespace)
+                .filter(|part| !part.is_empty());
+            let goal_id = parts.next().ok_or("goal-record requires a goal UUID")?;
+            let occurred_at = parts
+                .next()
+                .ok_or("goal-record requires a Unix timestamp")?
+                .parse::<i64>()?;
+            let origin = parts.next().ok_or("goal-record requires an origin")?;
+            let source_identifier = parts
+                .next()
+                .ok_or("goal-record requires a source identifier")?;
+            let source_fingerprint = parts.next().ok_or("goal-record requires a fingerprint")?;
+            let scene = parts
+                .next()
+                .ok_or("goal-record requires a scene UUID or none")?;
+            let scene_id = if scene == "none" {
+                None
+            } else {
+                Some(SceneId(scene.parse()?))
+            };
+            let raw_delta = parts
+                .next()
+                .ok_or("goal-record requires a raw word delta")?
+                .parse::<i64>()?;
+            let real_delta = parts
+                .next()
+                .ok_or("goal-record requires a real word delta")?
+                .parse::<i64>()?;
+            let detail = parts.next().unwrap_or("").trim();
+            let id = self
+                .app
+                .record_writing_goal_event(&story_storage::NewWritingGoalEvent {
+                    goal_id: goal_id.into(),
+                    occurred_at,
+                    origin: origin.into(),
+                    source_identifier: source_identifier.into(),
+                    source_fingerprint: source_fingerprint.into(),
+                    scene_id,
+                    raw_delta,
+                    real_delta,
+                    detail: detail.into(),
+                })?;
+            self.message = format!("Recorded writing event {id}");
+        } else if let Some(rest) = cmd.strip_prefix("goal-progress ") {
+            let goal_id = rest.trim();
+            let as_of = time::OffsetDateTime::now_utc().unix_timestamp();
+            self.message = self
+                .app
+                .writing_goal_progress(goal_id, as_of)?
+                .into_iter()
+                .map(|point| {
+                    format!(
+                        "{} target={} raw={} real={}{}",
+                        point.date,
+                        point.target_words,
+                        point
+                            .raw_words
+                            .map_or_else(|| "future".into(), |value| value.to_string()),
+                        point
+                            .real_words
+                            .map_or_else(|| "future".into(), |value| value.to_string()),
+                        if point.projected { " projected" } else { "" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("goal-weekly ") {
+            let goal_id = rest.trim();
+            self.message = writing_goal_weekly_rows(&self.app, goal_id)?.join(" | ");
+        } else if let Some(rest) = cmd.strip_prefix("goal-archive ") {
+            self.app.archive_writing_goal(rest.trim())?;
+            self.message = format!("Archived writing goal {}", rest.trim());
+        } else if let Some(rest) = cmd.strip_prefix("goal-reconcile ") {
+            let mut parts = rest
+                .splitn(5, char::is_whitespace)
+                .filter(|part| !part.is_empty());
+            let event_id = parts
+                .next()
+                .ok_or("goal-reconcile requires an event UUID")?;
+            let expected_hash = parts
+                .next()
+                .ok_or("goal-reconcile requires the inspected fingerprint")?;
+            let raw = parts
+                .next()
+                .ok_or("goal-reconcile requires corrected raw words")?
+                .parse::<i64>()?;
+            let real = parts
+                .next()
+                .ok_or("goal-reconcile requires corrected real words")?
+                .parse::<i64>()?;
+            let reason = parts
+                .next()
+                .ok_or("goal-reconcile requires a reason")?
+                .trim();
+            let new_id = self.app.reconcile_writing_goal_event(
+                event_id,
+                expected_hash,
+                raw,
+                real,
+                reason,
+            )?;
+            self.message = format!("Recorded correction as event {new_id}");
         } else if let Some(value) = cmd.strip_prefix("assembly-resume ") {
             let id = story_core::AssemblyDraftId(value.trim().parse()?);
             self.open_assembly_draft(id)?;
@@ -5483,7 +5671,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -5503,12 +5691,13 @@ impl AppState {
         } else {
             requested_outcome
         };
-        self.app.finish_writing_challenge_detailed(
+        self.app.finish_writing_challenge_with_activity(
             &challenge.id,
             written,
             challenge.words_deleted,
             challenge.pauses_consumed,
             outcome,
+            challenge.destination_scene,
         )?;
         self.active_challenge = None;
         self.editor = challenge.previous_editor;
@@ -7671,6 +7860,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             let data = s.app.analytics_dataset().unwrap_or_default();
             let target = s.app.get_project().ok().and_then(|p| p.target_words);
             let mut rows = analytics_report_rows(&data, target, total, draft);
+            rows.extend(writing_goal_graph_rows(&s.app));
             rows.extend(challenge_progress_rows(
                 &s.app.list_writing_challenges().unwrap_or_default(),
             ));
@@ -7765,6 +7955,111 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             }
         }
     }
+}
+
+fn writing_goal_graph_rows(app: &WriterApp) -> Vec<String> {
+    let as_of = time::OffsetDateTime::now_utc().unix_timestamp();
+    let goals = match app.list_writing_goals(false) {
+        Ok(goals) => goals,
+        Err(error) => return vec![format!("Writing goal ledger unavailable: {error}")],
+    };
+    if goals.is_empty() {
+        return vec!["No custom writing goals recorded".into()];
+    }
+    let mut rows = Vec::new();
+    for goal in goals {
+        rows.push(format!(
+            "Writing goal · {} · target {} · baseline {} · success metric {}",
+            goal.title, goal.target_words, goal.baseline_words, goal.success_metric
+        ));
+        match app.writing_goal_progress(&goal.id, as_of) {
+            Ok(points) => {
+                let split = points
+                    .iter()
+                    .position(|point| point.projected)
+                    .unwrap_or(points.len());
+                let start = split.saturating_sub(7);
+                let end = (split + 7).min(points.len());
+                rows.extend(
+                    points
+                        .into_iter()
+                        .skip(start)
+                        .take(end - start)
+                        .map(|point| {
+                            let actual = if goal.success_metric == "raw" {
+                                point.raw_words
+                            } else {
+                                point.real_words
+                            };
+                            let scale = goal.target_words.max(1) as f64;
+                            let target_bar = ((point.target_words.max(0) as f64 / scale) * 12.0)
+                                .round()
+                                .clamp(0.0, 12.0)
+                                as usize;
+                            let actual_bar = actual.map(|value| {
+                                ((value.max(0) as f64 / scale) * 12.0)
+                                    .round()
+                                    .clamp(0.0, 12.0) as usize
+                            });
+                            format!(
+                                "  {} target {:>7} {} actual {:>7} {}{}",
+                                point.date,
+                                point.target_words,
+                                "─".repeat(target_bar),
+                                actual.map_or_else(|| "future".into(), |value| value.to_string()),
+                                actual_bar.map_or_else(String::new, |count| "█".repeat(count)),
+                                if point.projected { " projected" } else { "" }
+                            )
+                        }),
+                );
+            }
+            Err(error) => rows.push(format!("  Progress unavailable: {error}")),
+        }
+    }
+    rows
+}
+
+fn writing_goal_weekly_rows(
+    app: &WriterApp,
+    goal_id: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let goal = app
+        .list_writing_goals(true)?
+        .into_iter()
+        .find(|goal| goal.id == goal_id)
+        .ok_or("writing goal not found")?;
+    let points =
+        app.writing_goal_progress(goal_id, time::OffsetDateTime::now_utc().unix_timestamp())?;
+    let mut prior_target = goal.baseline_words;
+    let mut prior_raw = goal.baseline_words;
+    let mut prior_real = goal.baseline_words;
+    Ok(points
+        .chunks(7)
+        .map(|week| {
+            let last = week.last().expect("week chunks are non-empty");
+            let target_delta = last.target_words.saturating_sub(prior_target);
+            prior_target = last.target_words;
+            let raw_delta = last.raw_words.map(|raw| {
+                let delta = raw.saturating_sub(prior_raw);
+                prior_raw = raw;
+                delta
+            });
+            let real_delta = last.real_words.map(|real| {
+                let delta = real.saturating_sub(prior_real);
+                prior_real = real;
+                delta
+            });
+            format!(
+                "{}–{} target pace +{} words · raw {} · real {}{}",
+                week.first().map_or("?", |point| point.date.as_str()),
+                last.date,
+                target_delta,
+                raw_delta.map_or_else(|| "future".into(), |value| format!("+{value}")),
+                real_delta.map_or_else(|| "future".into(), |value| format!("+{value}")),
+                if last.projected { " (projected)" } else { "" }
+            )
+        })
+        .collect())
 }
 
 fn challenge_progress_rows(challenges: &[story_storage::WritingChallengeRecord]) -> Vec<String> {
@@ -9130,9 +9425,33 @@ mod tests {
         project
             .save_scene_text(scene, Some(&original_hash), "existing manuscript prose")
             .unwrap();
+        let today = time::OffsetDateTime::now_utc().date();
+        project
+            .create_writing_goal(&story_storage::NewWritingGoal {
+                title: "Challenge ledger".into(),
+                scope_scene_id: Some(scene),
+                start_date: format!(
+                    "{:04}-{:02}-{:02}",
+                    today.year(),
+                    u8::from(today.month()),
+                    today.day()
+                ),
+                end_date: format!(
+                    "{:04}-{:02}-{:02}",
+                    today.year(),
+                    u8::from(today.month()),
+                    today.day()
+                ),
+                target_words: 100,
+                baseline_words: 0,
+                time_zone: "UTC".into(),
+                word_count_policy: "unicode-word-boundaries".into(),
+                success_metric: "raw".into(),
+            })
+            .unwrap();
         let mut state = AppState::new(project, default_bindings());
         state.open_scene(scene).unwrap();
-        state.prompt = "challenge-start 10 60 steady".into();
+        state.prompt = format!("challenge-start 10 60 steady scene={scene}");
         state.command().unwrap();
         assert_eq!(state.active_challenge.as_ref().unwrap().mode, "steady");
         state.editor[0] = "three four".into();
@@ -9147,6 +9466,12 @@ mod tests {
         assert_eq!(challenges[0].words_written, Some(2));
         assert_eq!(challenges[0].status, "abandoned");
         assert_eq!(challenges[0].outcome, "quit");
+        let goal = state.app.list_writing_goals(false).unwrap().remove(0);
+        let ledger = state.app.list_writing_goal_events(&goal.id).unwrap();
+        assert_eq!(ledger.len(), 1);
+        assert_eq!(ledger[0].origin, "write-or-die");
+        assert_eq!(ledger[0].raw_delta, 2);
+        assert_eq!(ledger[0].real_delta, 0);
         let draft_id = &challenges[0].id;
         assert!(
             list_challenge_drafts(state.app.project_root())
@@ -9922,6 +10247,43 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("cumulative"))
         );
+    }
+
+    #[test]
+    fn custom_goal_commands_create_events_and_show_daily_progress() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let today = time::OffsetDateTime::now_utc().date();
+        let date = format!(
+            "{:04}-{:02}-{:02}",
+            today.year(),
+            u8::from(today.month()),
+            today.day()
+        );
+        state
+            .execute_legacy_palette_command(&format!(
+                "goal-create {date} {date} 500 100 UTC real project Drafting sprint"
+            ))
+            .unwrap();
+        let goal = state.app.list_writing_goals(false).unwrap().remove(0);
+        assert_eq!(goal.title, "Drafting sprint");
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        state
+            .execute_legacy_palette_command(&format!(
+                "goal-record {} {now} manual fixture-source abc123 none 90 75 Hand-entered count",
+                goal.id
+            ))
+            .unwrap();
+        assert_eq!(
+            state.app.list_writing_goal_events(&goal.id).unwrap().len(),
+            1
+        );
+        state
+            .execute_legacy_palette_command(&format!("goal-progress {}", goal.id))
+            .unwrap();
+        assert!(state.message.contains("target=500"));
+        assert!(state.message.contains("real=175"));
     }
 
     #[test]

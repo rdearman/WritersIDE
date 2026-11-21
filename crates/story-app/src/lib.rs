@@ -874,8 +874,95 @@ impl WriterApp {
             outcome,
         )?)
     }
+    pub fn finish_writing_challenge_with_activity(
+        &mut self,
+        id: &str,
+        words_written: u32,
+        words_deleted: u32,
+        pauses_consumed: u32,
+        outcome: &str,
+        scene_id: Option<SceneId>,
+    ) -> Result<()> {
+        Ok(self.store.finish_writing_challenge_with_activity(
+            id,
+            words_written,
+            words_deleted,
+            pauses_consumed,
+            outcome,
+            scene_id,
+        )?)
+    }
     pub fn list_writing_challenges(&self) -> Result<Vec<story_storage::WritingChallengeRecord>> {
         Ok(self.store.list_writing_challenges()?)
+    }
+    pub fn create_writing_goal(&mut self, goal: &story_storage::NewWritingGoal) -> Result<String> {
+        Ok(self.store.create_writing_goal(goal)?)
+    }
+    pub fn update_writing_goal(
+        &mut self,
+        id: &str,
+        title: &str,
+        target_words: i64,
+        baseline_words: i64,
+        success_metric: &str,
+    ) -> Result<()> {
+        Ok(self.store.update_writing_goal(
+            id,
+            title,
+            target_words,
+            baseline_words,
+            success_metric,
+        )?)
+    }
+    pub fn archive_writing_goal(&mut self, id: &str) -> Result<()> {
+        Ok(self.store.archive_writing_goal(id)?)
+    }
+    pub fn list_writing_goals(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<story_storage::WritingGoalRecord>> {
+        Ok(self.store.list_writing_goals(include_archived)?)
+    }
+    pub fn record_writing_goal_event(
+        &mut self,
+        event: &story_storage::NewWritingGoalEvent,
+    ) -> Result<String> {
+        Ok(self.store.record_writing_goal_event(event)?)
+    }
+    pub fn record_writing_activity_for_goals(
+        &mut self,
+        activity: &story_storage::NewWritingActivity,
+    ) -> Result<usize> {
+        Ok(self.store.record_writing_activity_for_goals(activity)?)
+    }
+    pub fn list_writing_goal_events(
+        &self,
+        goal_id: &str,
+    ) -> Result<Vec<story_storage::WritingGoalEventRecord>> {
+        Ok(self.store.list_writing_goal_events(goal_id)?)
+    }
+    pub fn reconcile_writing_goal_event(
+        &mut self,
+        event_id: &str,
+        expected_fingerprint: &str,
+        corrected_raw_delta: i64,
+        corrected_real_delta: i64,
+        reason: &str,
+    ) -> Result<String> {
+        Ok(self.store.reconcile_writing_goal_event(
+            event_id,
+            expected_fingerprint,
+            corrected_raw_delta,
+            corrected_real_delta,
+            reason,
+        )?)
+    }
+    pub fn writing_goal_progress(
+        &self,
+        goal_id: &str,
+        as_of_timestamp: i64,
+    ) -> Result<Vec<story_storage::WritingGoalProgressPoint>> {
+        Ok(self.store.writing_goal_progress(goal_id, as_of_timestamp)?)
     }
     pub fn recover_interrupted_writing_challenges(&mut self) -> Result<u64> {
         Ok(self.store.recover_interrupted_writing_challenges()?)

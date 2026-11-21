@@ -1117,7 +1117,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let words = args.next().ok_or("missing words written")?.parse::<u32>()?;
             let abandoned = args.next().as_deref() == Some("abandoned");
             let mut app = WriterApp::open_project(path)?;
-            app.finish_writing_challenge(&id, words, abandoned)?;
+            app.finish_writing_challenge_with_activity(
+                &id,
+                words,
+                0,
+                0,
+                if abandoned { "quit" } else { "timeout" },
+                None,
+            )?;
             println!("Challenge {id} recorded.");
         }
         "challenge-list" => {
@@ -1126,6 +1133,152 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&app.list_writing_challenges()?)?
+            );
+        }
+        "goal-create" => {
+            let path = args.next().ok_or("missing project path")?;
+            let start_date = args.next().ok_or("missing start date YYYY-MM-DD")?;
+            let end_date = args.next().ok_or("missing inclusive end date YYYY-MM-DD")?;
+            let target_words = args
+                .next()
+                .ok_or("missing target word count")?
+                .parse::<i64>()?;
+            let baseline_words = args
+                .next()
+                .ok_or("missing starting word count")?
+                .parse::<i64>()?;
+            let time_zone = args
+                .next()
+                .ok_or("missing timezone (UTC or fixed offset)")?;
+            let success_metric = args.next().ok_or("missing raw|real success metric")?;
+            let scope = args.next().ok_or("missing project or scene scope")?;
+            let scope_scene_id = if scope == "project" {
+                None
+            } else {
+                Some(SceneId(scope.parse()?))
+            };
+            let title = args.next().ok_or("missing goal title")?;
+            let mut app = WriterApp::open_project(path)?;
+            let id = app.create_writing_goal(&story_storage::NewWritingGoal {
+                title,
+                scope_scene_id,
+                start_date,
+                end_date,
+                target_words,
+                baseline_words,
+                time_zone,
+                word_count_policy: "unicode-word-boundaries".into(),
+                success_metric,
+            })?;
+            println!("{id}");
+        }
+        "goal-list" => {
+            let path = args.next().ok_or("missing project path")?;
+            let include_archived = args.next().as_deref() == Some("--all");
+            let app = WriterApp::open_project(path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app.list_writing_goals(include_archived)?)?
+            );
+        }
+        "goal-record" => {
+            let path = args.next().ok_or("missing project path")?;
+            let goal_id = args.next().ok_or("missing goal ID")?;
+            let occurred_at = args
+                .next()
+                .ok_or("missing Unix timestamp")?
+                .parse::<i64>()?;
+            let origin = args.next().ok_or("missing event origin")?;
+            let source_identifier = args.next().ok_or("missing source identifier")?;
+            let source_fingerprint = args.next().ok_or("missing source fingerprint")?;
+            let scene = args.next().ok_or("missing scene UUID or none")?;
+            let scene_id = if scene == "none" {
+                None
+            } else {
+                Some(SceneId(scene.parse()?))
+            };
+            let raw_delta = args
+                .next()
+                .ok_or("missing raw word delta")?
+                .parse::<i64>()?;
+            let real_delta = args
+                .next()
+                .ok_or("missing real word delta")?
+                .parse::<i64>()?;
+            let detail = args.next().unwrap_or_default();
+            let mut app = WriterApp::open_project(path)?;
+            let id = app.record_writing_goal_event(&story_storage::NewWritingGoalEvent {
+                goal_id,
+                occurred_at,
+                origin,
+                source_identifier,
+                source_fingerprint,
+                scene_id,
+                raw_delta,
+                real_delta,
+                detail,
+            })?;
+            println!("{id}");
+        }
+        "goal-events" => {
+            let path = args.next().ok_or("missing project path")?;
+            let goal_id = args.next().ok_or("missing goal ID")?;
+            let app = WriterApp::open_project(path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app.list_writing_goal_events(&goal_id)?)?
+            );
+        }
+        "goal-progress" | "goal-weekly" => {
+            let path = args.next().ok_or("missing project path")?;
+            let goal_id = args.next().ok_or("missing goal ID")?;
+            let app = WriterApp::open_project(path)?;
+            let as_of = time::OffsetDateTime::now_utc().unix_timestamp();
+            let points = app.writing_goal_progress(&goal_id, as_of)?;
+            if cmd == "goal-progress" {
+                println!("{}", serde_json::to_string_pretty(&points)?);
+            } else {
+                let goal = app
+                    .list_writing_goals(true)?
+                    .into_iter()
+                    .find(|goal| goal.id == goal_id)
+                    .ok_or("writing goal not found")?;
+                let mut prior_target = goal.baseline_words;
+                let mut prior_raw = goal.baseline_words;
+                let mut prior_real = goal.baseline_words;
+                let rows = points.chunks(7).map(|week| {
+                    let last = week.last().expect("week chunks are non-empty");
+                    let target_delta = last.target_words.saturating_sub(prior_target);
+                    prior_target = last.target_words;
+                    let raw_delta = last.raw_words.map(|raw| { let delta = raw.saturating_sub(prior_raw); prior_raw = raw; delta });
+                    let real_delta = last.real_words.map(|real| { let delta = real.saturating_sub(prior_real); prior_real = real; delta });
+                    serde_json::json!({"start":week[0].date,"end":last.date,"target_pace":target_delta,"raw":raw_delta,"real":real_delta,"projected":last.projected})
+                }).collect::<Vec<_>>();
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+            }
+        }
+        "goal-archive" => {
+            let path = args.next().ok_or("missing project path")?;
+            let goal_id = args.next().ok_or("missing goal ID")?;
+            WriterApp::open_project(path)?.archive_writing_goal(&goal_id)?;
+        }
+        "goal-reconcile" => {
+            let path = args.next().ok_or("missing project path")?;
+            let event_id = args.next().ok_or("missing event ID")?;
+            let fingerprint = args.next().ok_or("missing expected fingerprint")?;
+            let raw = args
+                .next()
+                .ok_or("missing corrected raw count")?
+                .parse::<i64>()?;
+            let real = args
+                .next()
+                .ok_or("missing corrected real count")?
+                .parse::<i64>()?;
+            let reason = args.next().ok_or("missing correction reason")?;
+            let mut app = WriterApp::open_project(path)?;
+            println!(
+                "{}",
+                app.reconcile_writing_goal_event(&event_id, &fingerprint, raw, real, &reason)?
             );
         }
         "compile-watch" => {
@@ -1577,7 +1730,7 @@ fn usage() {
         "writers-ide scratchpad-create <path> <title> [body]\nwriters-ide scratchpad-list <path>\nwriters-ide scratchpad-promote <path> <note-uuid> <scene|character|location|object|research> <entity-uuid>\nwriters-ide mentions <path> <scene-uuid>\nwriters-ide mention-confirm <path> <mention-uuid> <character|location|object> <entity-uuid>\nwriters-ide mention-dismiss <path> <mention-uuid>\nwriters-ide object-create <path> <name> [description]\nwriters-ide assembly-draft-create <path> <assembly-uuid>\nwriters-ide assembly-draft-list <path>\nwriters-ide assembly-draft-set <path> <draft-uuid> <scene-uuid> <text.md>\nwriters-ide assembly-draft-commit <path> <draft-uuid>\nwriters-ide board-create <path> <title>\nwriters-ide board-add-scene <path> <board-uuid> <scene-uuid> <x> <y> [note]\nwriters-ide board-list <path> <board-uuid>\nwriters-ide backup-archive <project-path> <archive.zip>\nwriters-ide restore-archive <archive.zip> <new-project-directory>"
     );
     eprintln!(
-        "writers-ide compile-watch <path> <format> <output> [poll-ms]\nwriters-ide process-recipe <project> <recipe.toml>\nwriters-ide watch-process <project> <recipe.toml> [poll-ms]\nwriters-ide query-assert <path> <query-uuid> <empty|non-empty|at-least:N|at-most:N|exactly:N>\nwriters-ide coverage <path> <character|plotline> <entity-uuid> <minimum-scenes>\nwriters-ide challenge-start <path> <target-words> <duration-seconds> [steady|kamikaze]\nwriters-ide challenge-finish <path> <challenge-id> <words-written> [abandoned]\nwriters-ide challenge-list <path>"
+        "writers-ide compile-watch <path> <format> <output> [poll-ms]\nwriters-ide process-recipe <project> <recipe.toml>\nwriters-ide watch-process <project> <recipe.toml> [poll-ms]\nwriters-ide query-assert <path> <query-uuid> <empty|non-empty|at-least:N|at-most:N|exactly:N>\nwriters-ide coverage <path> <character|plotline> <entity-uuid> <minimum-scenes>\nwriters-ide challenge-start <path> <target-words> <duration-seconds> [steady|kamikaze]\nwriters-ide challenge-finish <path> <challenge-id> <words-written> [abandoned]\nwriters-ide challenge-list <path>\nwriters-ide goal-create <project> <start> <end> <target> <baseline> <UTC|±HH:MM> <raw|real> <project|scene-uuid> <title>\nwriters-ide goal-list <project> [--all]\nwriters-ide goal-record <project> <goal> <unix-time> <origin> <source-id> <fingerprint> <scene-uuid|none> <raw> <real> [detail]\nwriters-ide goal-events <project> <goal>\nwriters-ide goal-progress <project> <goal>\nwriters-ide goal-weekly <project> <goal>\nwriters-ide goal-archive <project> <goal>\nwriters-ide goal-reconcile <project> <event> <fingerprint> <raw> <real> <reason>"
     );
 }
 

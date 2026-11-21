@@ -35,6 +35,7 @@ const MIGRATION_20: &str = include_str!("../migrations/0020_writing_sessions.sql
 const MIGRATION_21: &str = include_str!("../migrations/0021_query_boolean_filters.sql");
 const MIGRATION_22: &str = include_str!("../migrations/0022_challenge_outcomes.sql");
 const MIGRATION_23: &str = include_str!("../migrations/0023_query_expressions.sql");
+const MIGRATION_24: &str = include_str!("../migrations/0024_writing_goal_ledger.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -439,6 +440,78 @@ pub struct WritingSessionRecord {
     pub words_delta: Option<i64>,
     pub status: String,
 }
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WritingGoalRecord {
+    pub id: String,
+    pub title: String,
+    pub scope_type: String,
+    pub scope_scene_id: Option<SceneId>,
+    pub start_date: String,
+    pub end_date: String,
+    pub target_words: i64,
+    pub baseline_words: i64,
+    pub time_zone: String,
+    pub word_count_policy: String,
+    pub success_metric: String,
+    pub archived: bool,
+}
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NewWritingGoal {
+    pub title: String,
+    pub scope_scene_id: Option<SceneId>,
+    pub start_date: String,
+    pub end_date: String,
+    pub target_words: i64,
+    pub baseline_words: i64,
+    pub time_zone: String,
+    pub word_count_policy: String,
+    pub success_metric: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NewWritingGoalEvent {
+    pub goal_id: String,
+    pub occurred_at: i64,
+    pub origin: String,
+    pub source_identifier: String,
+    pub source_fingerprint: String,
+    pub scene_id: Option<SceneId>,
+    pub raw_delta: i64,
+    pub real_delta: i64,
+    pub detail: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NewWritingActivity {
+    pub occurred_at: i64,
+    pub origin: String,
+    pub source_identifier: String,
+    pub source_fingerprint: String,
+    pub scene_id: Option<SceneId>,
+    pub raw_delta: i64,
+    pub real_delta: i64,
+    pub detail: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WritingGoalEventRecord {
+    pub id: String,
+    pub goal_id: String,
+    pub occurred_at: i64,
+    pub origin: String,
+    pub source_identifier: String,
+    pub source_fingerprint: String,
+    pub scene_id: Option<SceneId>,
+    pub raw_delta: i64,
+    pub real_delta: i64,
+    pub reconciliation_state: String,
+    pub detail: String,
+}
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct WritingGoalProgressPoint {
+    pub date: String,
+    pub target_words: i64,
+    pub raw_words: Option<i64>,
+    pub real_words: Option<i64>,
+    pub projected: bool,
+}
 #[derive(Clone, Debug)]
 pub struct ReadingDocumentRecord {
     pub id: ReadingId,
@@ -679,7 +752,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_19}\nINSERT INTO schema_migrations(version,applied_at) VALUES(19,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_20}\nINSERT INTO schema_migrations(version,applied_at) VALUES(20,'{}');\nCOMMIT;", now()))?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\nCOMMIT;", now(), now(), now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\nCOMMIT;", now(), now(), now(), now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
@@ -722,7 +795,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 23 {
+        if version > 24 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -815,6 +888,10 @@ impl ProjectStore {
         }
         if current_version == 22 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_23}\nINSERT INTO schema_migrations(version,applied_at) VALUES(23,'{}');\nCOMMIT;", now()))?;
+            current_version = 23;
+        }
+        if current_version == 23 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_24}\nINSERT INTO schema_migrations(version,applied_at) VALUES(24,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -4677,6 +4754,327 @@ impl ProjectStore {
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(StorageError::from)
     }
+    pub fn create_writing_goal(&mut self, goal: &NewWritingGoal) -> Result<String> {
+        let start = parse_goal_date(&goal.start_date)?;
+        let end = parse_goal_date(&goal.end_date)?;
+        if goal.title.trim().is_empty()
+            || goal.target_words <= 0
+            || goal.baseline_words < 0
+            || start > end
+            || goal.word_count_policy.trim().is_empty()
+            || !matches!(goal.success_metric.as_str(), "raw" | "real")
+        {
+            return Err(StorageError::Invalid(
+                "invalid writing goal configuration".into(),
+            ));
+        }
+        let offset = parse_goal_timezone_offset(&goal.time_zone)?;
+        let _ = offset;
+        if let Some(scene_id) = goal.scope_scene_id {
+            self.conn
+                .query_row(
+                    "SELECT 1 FROM scene WHERE id=?1",
+                    [scene_id.to_string()],
+                    |_| Ok(()),
+                )
+                .optional()?
+                .ok_or_else(|| StorageError::NotFound(format!("scene {scene_id}")))?;
+        }
+        let id = Uuid::new_v4().to_string();
+        self.conn.execute(
+            "INSERT INTO writing_goal(id,title,scope_type,scope_scene_id,start_date,end_date,target_words,baseline_words,time_zone,word_count_policy,success_metric,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+            params![
+                id,
+                goal.title.trim(),
+                if goal.scope_scene_id.is_some() { "scene" } else { "project" },
+                goal.scope_scene_id.map(|scene| scene.to_string()),
+                goal.start_date,
+                goal.end_date,
+                goal.target_words,
+                goal.baseline_words,
+                goal.time_zone,
+                goal.word_count_policy,
+                goal.success_metric,
+                now()
+            ],
+        )?;
+        let record = WritingGoalRecord {
+            id: id.clone(),
+            title: goal.title.trim().into(),
+            scope_type: if goal.scope_scene_id.is_some() {
+                "scene"
+            } else {
+                "project"
+            }
+            .into(),
+            scope_scene_id: goal.scope_scene_id,
+            start_date: goal.start_date.clone(),
+            end_date: goal.end_date.clone(),
+            target_words: goal.target_words,
+            baseline_words: goal.baseline_words,
+            time_zone: goal.time_zone.clone(),
+            word_count_policy: goal.word_count_policy.clone(),
+            success_metric: goal.success_metric.clone(),
+            archived: false,
+        };
+        refresh_writing_goal_snapshots(&self.conn, &record, unix_now())?;
+        Ok(id)
+    }
+    pub fn update_writing_goal(
+        &mut self,
+        id: &str,
+        title: &str,
+        target_words: i64,
+        baseline_words: i64,
+        success_metric: &str,
+    ) -> Result<()> {
+        if title.trim().is_empty()
+            || target_words <= 0
+            || baseline_words < 0
+            || !matches!(success_metric, "raw" | "real")
+        {
+            return Err(StorageError::Invalid(
+                "invalid writing goal settings".into(),
+            ));
+        }
+        let changed = self.conn.execute(
+            "UPDATE writing_goal SET title=?2,target_words=?3,baseline_words=?4,success_metric=?5 WHERE id=?1 AND archived=0",
+            params![id, title.trim(), target_words, baseline_words, success_metric],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!("active writing goal {id}")));
+        }
+        let goal = self.get_writing_goal(id)?;
+        refresh_writing_goal_snapshots(&self.conn, &goal, unix_now())?;
+        Ok(())
+    }
+    pub fn archive_writing_goal(&mut self, id: &str) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE writing_goal SET archived=1 WHERE id=?1 AND archived=0",
+            [id],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!("active writing goal {id}")));
+        }
+        Ok(())
+    }
+    pub fn list_writing_goals(&self, include_archived: bool) -> Result<Vec<WritingGoalRecord>> {
+        let mut query = self.conn.prepare("SELECT id,title,scope_type,scope_scene_id,start_date,end_date,target_words,baseline_words,time_zone,word_count_policy,success_metric,archived FROM writing_goal WHERE (?1=1 OR archived=0) ORDER BY start_date,id")?;
+        let rows = query.query_map([include_archived], writing_goal_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+    pub fn record_writing_goal_event(&mut self, event: &NewWritingGoalEvent) -> Result<String> {
+        if !matches!(
+            event.origin.as_str(),
+            "editor" | "write-or-die" | "dictation" | "import" | "manual" | "reconciliation"
+        ) || event.source_identifier.trim().is_empty()
+            || event.source_fingerprint.trim().is_empty()
+            || event.raw_delta < 0
+        {
+            return Err(StorageError::Invalid("invalid writing goal event".into()));
+        }
+        let goal = self.get_writing_goal(&event.goal_id)?;
+        if goal.archived {
+            return Err(StorageError::Invalid(
+                "cannot add activity to an archived writing goal".into(),
+            ));
+        }
+        if let Some(required_scene) = goal.scope_scene_id
+            && event.scene_id != Some(required_scene)
+        {
+            return Err(StorageError::Invalid(
+                "event scene is outside the writing goal scope".into(),
+            ));
+        }
+        let offset = parse_goal_timezone_offset(&goal.time_zone)?;
+        let local_date = goal_timestamp_date(event.occurred_at, offset)?;
+        if local_date < goal.start_date || local_date > goal.end_date {
+            return Err(StorageError::Invalid(
+                "event timestamp falls outside the inclusive writing goal dates".into(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let id = insert_writing_goal_event(&tx, &goal, event)?;
+        tx.commit()?;
+        Ok(id)
+    }
+    pub fn record_writing_activity_for_goals(
+        &mut self,
+        activity: &NewWritingActivity,
+    ) -> Result<usize> {
+        let goals = self.list_writing_goals(false)?;
+        let mut recorded = 0;
+        for goal in goals {
+            if goal
+                .scope_scene_id
+                .is_some_and(|required| Some(required) != activity.scene_id)
+            {
+                continue;
+            }
+            let offset = parse_goal_timezone_offset(&goal.time_zone)?;
+            let local_date = goal_timestamp_date(activity.occurred_at, offset)?;
+            if local_date < goal.start_date || local_date > goal.end_date {
+                continue;
+            }
+            self.record_writing_goal_event(&NewWritingGoalEvent {
+                goal_id: goal.id,
+                occurred_at: activity.occurred_at,
+                origin: activity.origin.clone(),
+                source_identifier: activity.source_identifier.clone(),
+                source_fingerprint: activity.source_fingerprint.clone(),
+                scene_id: activity.scene_id,
+                raw_delta: activity.raw_delta,
+                real_delta: activity.real_delta,
+                detail: activity.detail.clone(),
+            })?;
+            recorded += 1;
+        }
+        Ok(recorded)
+    }
+    pub fn list_writing_goal_events(&self, goal_id: &str) -> Result<Vec<WritingGoalEventRecord>> {
+        let mut query = self.conn.prepare("SELECT id,goal_id,occurred_at,origin,source_identifier,source_fingerprint,scene_id,raw_delta,real_delta,reconciliation_state,detail FROM writing_goal_event WHERE goal_id=?1 ORDER BY occurred_at,id")?;
+        let rows = query.query_map([goal_id], writing_goal_event_from_row)?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+    pub fn reconcile_writing_goal_event(
+        &mut self,
+        event_id: &str,
+        expected_fingerprint: &str,
+        corrected_raw_delta: i64,
+        corrected_real_delta: i64,
+        reason: &str,
+    ) -> Result<String> {
+        if expected_fingerprint.trim().is_empty()
+            || corrected_raw_delta < 0
+            || reason.trim().is_empty()
+        {
+            return Err(StorageError::Invalid(
+                "event reconciliation requires an expected fingerprint, non-negative raw count, and reason".into(),
+            ));
+        }
+        let original: WritingGoalEventRecord = self.conn.query_row(
+            "SELECT id,goal_id,occurred_at,origin,source_identifier,source_fingerprint,scene_id,raw_delta,real_delta,reconciliation_state,detail FROM writing_goal_event WHERE id=?1",
+            [event_id], writing_goal_event_from_row,
+        ).optional()?.ok_or_else(|| StorageError::NotFound(format!("writing goal event {event_id}")))?;
+        if original.source_fingerprint != expected_fingerprint
+            || original.reconciliation_state != "current"
+        {
+            return Err(StorageError::Conflict(
+                "writing goal event changed since it was inspected; reload before reconciliation"
+                    .into(),
+            ));
+        }
+        let goal = self.get_writing_goal(&original.goal_id)?;
+        let corrected_fingerprint = hash_bytes(
+            format!(
+                "{}:{}:{}:{}:{}",
+                original.source_fingerprint,
+                corrected_raw_delta,
+                corrected_real_delta,
+                reason,
+                original.id
+            )
+            .as_bytes(),
+        );
+        let replacement_id = Uuid::new_v4().to_string();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE writing_goal_event SET reconciliation_state='superseded' WHERE id=?1 AND source_fingerprint=?2 AND reconciliation_state='current'",
+            params![event_id, expected_fingerprint],
+        )?;
+        if changed != 1 {
+            return Err(StorageError::Conflict(
+                "writing goal event changed during reconciliation".into(),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO writing_goal_event(id,goal_id,occurred_at,origin,source_identifier,source_fingerprint,scene_id,raw_delta,real_delta,reconciliation_state,detail,created_at) VALUES(?1,?2,?3,'reconciliation',?4,?5,?6,?7,?8,'current',?9,?10)",
+            params![replacement_id,original.goal_id,original.occurred_at,original.id,corrected_fingerprint,original.scene_id.map(|scene| scene.to_string()),corrected_raw_delta,corrected_real_delta,reason.trim(),now()],
+        )?;
+        refresh_writing_goal_snapshots(&tx, &goal, original.occurred_at)?;
+        tx.commit()?;
+        Ok(replacement_id)
+    }
+    pub fn writing_goal_progress(
+        &self,
+        goal_id: &str,
+        as_of_timestamp: i64,
+    ) -> Result<Vec<WritingGoalProgressPoint>> {
+        let goal = self.get_writing_goal(goal_id)?;
+        let offset = parse_goal_timezone_offset(&goal.time_zone)?;
+        let as_of = goal_timestamp_date(as_of_timestamp, offset)?;
+        let start = parse_goal_date(&goal.start_date)?;
+        let end = parse_goal_date(&goal.end_date)?;
+        let total_days = i64::from(end.to_julian_day() - start.to_julian_day() + 1);
+        let mut points = Vec::new();
+        let mut date = start;
+        loop {
+            let date_text = format_goal_date(date);
+            let elapsed_days = i64::from(date.to_julian_day() - start.to_julian_day() + 1);
+            let target_range = goal
+                .target_words
+                .checked_sub(goal.baseline_words)
+                .ok_or_else(|| {
+                    StorageError::Invalid("writing goal target range overflow".into())
+                })?;
+            let target = goal
+                .baseline_words
+                .checked_add(
+                    target_range.checked_mul(elapsed_days).ok_or_else(|| {
+                        StorageError::Invalid("writing goal target overflow".into())
+                    })? / total_days,
+                )
+                .ok_or_else(|| StorageError::Invalid("writing goal baseline overflow".into()))?;
+            let projected = date_text > as_of;
+            let (raw_words, real_words) = if projected {
+                (None, None)
+            } else {
+                let end_timestamp = goal_day_start(date, offset)?
+                    .checked_add(86_400)
+                    .ok_or_else(|| StorageError::Invalid("writing goal day overflow".into()))?;
+                let (raw, real): (i64, i64) = self.conn.query_row(
+                    "SELECT COALESCE(SUM(raw_delta),0),COALESCE(SUM(real_delta),0) FROM writing_goal_event WHERE goal_id=?1 AND occurred_at < ?2 AND reconciliation_state='current'",
+                    params![goal_id,end_timestamp],
+                    |row| Ok((row.get(0)?,row.get(1)?)),
+                )?;
+                (
+                    Some(goal.baseline_words.checked_add(raw).ok_or_else(|| {
+                        StorageError::Invalid("writing goal raw count overflow".into())
+                    })?),
+                    Some(goal.baseline_words.checked_add(real).ok_or_else(|| {
+                        StorageError::Invalid("writing goal real count overflow".into())
+                    })?),
+                )
+            };
+            points.push(WritingGoalProgressPoint {
+                date: date_text,
+                target_words: target,
+                raw_words,
+                real_words,
+                projected,
+            });
+            if date >= end {
+                break;
+            }
+            date = date
+                .next_day()
+                .ok_or_else(|| StorageError::Invalid("writing goal date overflow".into()))?;
+        }
+        Ok(points)
+    }
+    fn get_writing_goal(&self, id: &str) -> Result<WritingGoalRecord> {
+        self.conn.query_row(
+            "SELECT id,title,scope_type,scope_scene_id,start_date,end_date,target_words,baseline_words,time_zone,word_count_policy,success_metric,archived FROM writing_goal WHERE id=?1",
+            [id],
+            writing_goal_from_row,
+        ).optional()?.ok_or_else(|| StorageError::NotFound(format!("writing goal {id}")))
+    }
     pub fn start_writing_challenge(
         &mut self,
         target_words: u32,
@@ -4730,20 +5128,81 @@ impl ProjectStore {
         pauses_consumed: u32,
         outcome: &str,
     ) -> Result<()> {
+        self.finish_writing_challenge_with_activity(
+            id,
+            words_written,
+            words_deleted,
+            pauses_consumed,
+            outcome,
+            None,
+        )
+    }
+    pub fn finish_writing_challenge_with_activity(
+        &mut self,
+        id: &str,
+        words_written: u32,
+        words_deleted: u32,
+        pauses_consumed: u32,
+        outcome: &str,
+        scene_id: Option<SceneId>,
+    ) -> Result<()> {
         if !matches!(outcome, "success" | "timeout" | "quit") {
             return Err(StorageError::Invalid("invalid challenge outcome".into()));
         }
+        let ended_at = unix_now();
         let status = if outcome == "quit" {
             "abandoned"
         } else {
             "completed"
         };
-        let changed = self.conn.execute("UPDATE writing_challenge SET ended_at=?2,words_written=?3,words_deleted=?4,pauses_consumed=?5,outcome=?6,status=?7 WHERE id=?1 AND status='active'", params![id,unix_now(),words_written,words_deleted,pauses_consumed,outcome,status])?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE writing_challenge SET ended_at=?2,words_written=?3,words_deleted=?4,pauses_consumed=?5,outcome=?6,status=?7 WHERE id=?1 AND status='active'",
+            params![id, ended_at, words_written, words_deleted, pauses_consumed, outcome, status],
+        )?;
         if changed == 0 {
             return Err(StorageError::NotFound(format!(
                 "active writing challenge {id}"
             )));
         }
+        let goals = {
+            let mut query = tx.prepare("SELECT id,title,scope_type,scope_scene_id,start_date,end_date,target_words,baseline_words,time_zone,word_count_policy,success_metric,archived FROM writing_goal WHERE archived=0 ORDER BY start_date,id")?;
+            query
+                .query_map([], writing_goal_from_row)?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let fingerprint = hash_bytes(
+            format!("{id}:{ended_at}:{words_written}:{words_deleted}:{pauses_consumed}:{outcome}")
+                .as_bytes(),
+        );
+        for goal in goals {
+            if goal
+                .scope_scene_id
+                .is_some_and(|required| Some(required) != scene_id)
+            {
+                continue;
+            }
+            let offset = parse_goal_timezone_offset(&goal.time_zone)?;
+            let date = goal_timestamp_date(ended_at, offset)?;
+            if date < goal.start_date || date > goal.end_date {
+                continue;
+            }
+            let event = NewWritingGoalEvent {
+                goal_id: goal.id.clone(),
+                occurred_at: ended_at,
+                origin: "write-or-die".into(),
+                source_identifier: id.into(),
+                source_fingerprint: fingerprint.clone(),
+                scene_id,
+                raw_delta: i64::from(words_written) + i64::from(words_deleted),
+                real_delta: 0,
+                detail: format!("Isolated timed draft finished ({outcome})"),
+            };
+            let _ = insert_writing_goal_event(&tx, &goal, &event)?;
+        }
+        tx.commit()?;
         Ok(())
     }
     pub fn recover_interrupted_writing_challenges(&mut self) -> Result<u64> {
@@ -4801,15 +5260,68 @@ impl ProjectStore {
         abandoned: bool,
     ) -> Result<()> {
         let status = if abandoned { "abandoned" } else { "completed" };
-        let changed = self.conn.execute(
+        let ended_at = unix_now();
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (started_at, scene_text, start_words): (i64, Option<String>, u32) = tx
+            .query_row(
+                "SELECT started_at,scene_id,start_words FROM writing_session WHERE id=?1 AND status='active'",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(format!("active writing session {id}")))?;
+        let scene_id = scene_text
+            .map(|value| value.parse::<Uuid>().map(SceneId))
+            .transpose()
+            .map_err(|error| {
+                StorageError::Invalid(format!("invalid writing session scene: {error}"))
+            })?;
+        let delta = i64::from(end_words) - i64::from(start_words);
+        tx.execute(
             "UPDATE writing_session SET ended_at=?2,end_words=?3,words_delta=?3-start_words,status=?4 WHERE id=?1 AND status='active'",
-            params![id, unix_now(), end_words, status],
+            params![id, ended_at, end_words, status],
         )?;
-        if changed == 0 {
-            return Err(StorageError::NotFound(format!(
-                "active writing session {id}"
-            )));
+        if !abandoned {
+            let raw_delta = delta.max(0);
+            if raw_delta != 0 || delta != 0 {
+                let goals = {
+                    let mut query = tx.prepare("SELECT id,title,scope_type,scope_scene_id,start_date,end_date,target_words,baseline_words,time_zone,word_count_policy,success_metric,archived FROM writing_goal WHERE archived=0 ORDER BY start_date,id")?;
+                    query
+                        .query_map([], writing_goal_from_row)?
+                        .collect::<std::result::Result<Vec<_>, _>>()?
+                };
+                let fingerprint =
+                    hash_bytes(format!("{id}:{started_at}:{ended_at}:{delta}").as_bytes());
+                for goal in goals {
+                    if goal
+                        .scope_scene_id
+                        .is_some_and(|required| Some(required) != scene_id)
+                    {
+                        continue;
+                    }
+                    let offset = parse_goal_timezone_offset(&goal.time_zone)?;
+                    let date = goal_timestamp_date(ended_at, offset)?;
+                    if date < goal.start_date || date > goal.end_date {
+                        continue;
+                    }
+                    let event = NewWritingGoalEvent {
+                        goal_id: goal.id.clone(),
+                        occurred_at: ended_at,
+                        origin: "editor".into(),
+                        source_identifier: id.into(),
+                        source_fingerprint: fingerprint.clone(),
+                        scene_id,
+                        raw_delta,
+                        real_delta: delta,
+                        detail: "Completed editor writing session".into(),
+                    };
+                    let _ = insert_writing_goal_event(&tx, &goal, &event)?;
+                }
+            }
         }
+        tx.commit()?;
         Ok(())
     }
     pub fn list_writing_sessions(&self) -> Result<Vec<WritingSessionRecord>> {
@@ -6533,6 +7045,248 @@ fn hash_bytes(b: &[u8]) -> String {
     format!("{:x}", Sha256::digest(b))
 }
 
+fn writing_goal_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WritingGoalRecord> {
+    let scene_id: Option<String> = row.get(3)?;
+    Ok(WritingGoalRecord {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        scope_type: row.get(2)?,
+        scope_scene_id: scene_id
+            .map(|value| value.parse::<Uuid>().map(SceneId))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        start_date: row.get(4)?,
+        end_date: row.get(5)?,
+        target_words: row.get(6)?,
+        baseline_words: row.get(7)?,
+        time_zone: row.get(8)?,
+        word_count_policy: row.get(9)?,
+        success_metric: row.get(10)?,
+        archived: row.get::<_, i64>(11)? != 0,
+    })
+}
+
+fn writing_goal_event_from_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<WritingGoalEventRecord> {
+    let scene_id: Option<String> = row.get(6)?;
+    Ok(WritingGoalEventRecord {
+        id: row.get(0)?,
+        goal_id: row.get(1)?,
+        occurred_at: row.get(2)?,
+        origin: row.get(3)?,
+        source_identifier: row.get(4)?,
+        source_fingerprint: row.get(5)?,
+        scene_id: scene_id
+            .map(|value| value.parse::<Uuid>().map(SceneId))
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        raw_delta: row.get(7)?,
+        real_delta: row.get(8)?,
+        reconciliation_state: row.get(9)?,
+        detail: row.get(10)?,
+    })
+}
+
+fn parse_goal_date(value: &str) -> Result<time::Date> {
+    let mut parts = value.split('-');
+    let year = parts
+        .next()
+        .and_then(|part| part.parse::<i32>().ok())
+        .ok_or_else(|| StorageError::Invalid("dates must use YYYY-MM-DD".into()))?;
+    let month = parts
+        .next()
+        .and_then(|part| part.parse::<u8>().ok())
+        .and_then(|month| time::Month::try_from(month).ok())
+        .ok_or_else(|| StorageError::Invalid("invalid month in date".into()))?;
+    let day = parts
+        .next()
+        .and_then(|part| part.parse::<u8>().ok())
+        .ok_or_else(|| StorageError::Invalid("invalid day in date".into()))?;
+    if parts.next().is_some() {
+        return Err(StorageError::Invalid("dates must use YYYY-MM-DD".into()));
+    }
+    let date = time::Date::from_calendar_date(year, month, day)
+        .map_err(|error| StorageError::Invalid(error.to_string()))?;
+    if format_goal_date(date) != value {
+        return Err(StorageError::Invalid(
+            "dates must use zero-padded YYYY-MM-DD".into(),
+        ));
+    }
+    Ok(date)
+}
+
+fn format_goal_date(date: time::Date) -> String {
+    format!(
+        "{:04}-{:02}-{:02}",
+        date.year(),
+        u8::from(date.month()),
+        date.day()
+    )
+}
+
+fn parse_goal_timezone_offset(value: &str) -> Result<i64> {
+    if matches!(value, "UTC" | "Z") {
+        return Ok(0);
+    }
+    let (sign, value) = if let Some(rest) = value.strip_prefix('+') {
+        (1i64, rest)
+    } else if let Some(rest) = value.strip_prefix('-') {
+        (-1i64, rest)
+    } else {
+        return Err(StorageError::Invalid(
+            "time zone must be UTC or a fixed offset such as +01:30".into(),
+        ));
+    };
+    let (hours, minutes) = value
+        .split_once(':')
+        .ok_or_else(|| StorageError::Invalid("fixed time zone offsets use ±HH:MM".into()))?;
+    let hours = hours
+        .parse::<i64>()
+        .map_err(|_| StorageError::Invalid("invalid time zone hours".into()))?;
+    let minutes = minutes
+        .parse::<i64>()
+        .map_err(|_| StorageError::Invalid("invalid time zone minutes".into()))?;
+    if hours > 14 || minutes > 59 || (hours == 14 && minutes != 0) {
+        return Err(StorageError::Invalid(
+            "time zone offset is out of range".into(),
+        ));
+    }
+    Ok(sign * (hours * 3600 + minutes * 60))
+}
+
+fn goal_timestamp_date(timestamp: i64, offset: i64) -> Result<String> {
+    let local = timestamp
+        .checked_add(offset)
+        .and_then(|timestamp| time::OffsetDateTime::from_unix_timestamp(timestamp).ok())
+        .ok_or_else(|| StorageError::Invalid("writing goal timestamp overflow".into()))?;
+    Ok(format_goal_date(local.date()))
+}
+
+fn goal_day_start(date: time::Date, offset: i64) -> Result<i64> {
+    date.midnight()
+        .assume_utc()
+        .unix_timestamp()
+        .checked_sub(offset)
+        .ok_or_else(|| StorageError::Invalid("writing goal day boundary overflow".into()))
+}
+
+fn insert_writing_goal_event(
+    conn: &Connection,
+    goal: &WritingGoalRecord,
+    event: &NewWritingGoalEvent,
+) -> Result<String> {
+    if let Some((existing_id, existing_fingerprint)) = conn
+        .query_row(
+            "SELECT id,source_fingerprint FROM writing_goal_event WHERE goal_id=?1 AND origin=?2 AND source_identifier=?3",
+            params![event.goal_id, event.origin, event.source_identifier],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?
+    {
+        if existing_fingerprint == event.source_fingerprint {
+            return Ok(existing_id);
+        }
+        return Err(StorageError::Conflict(format!(
+            "source {:?} changed fingerprint; reconcile it explicitly",
+            event.source_identifier
+        )));
+    }
+    let id = Uuid::new_v4().to_string();
+    conn.execute(
+        "INSERT INTO writing_goal_event(id,goal_id,occurred_at,origin,source_identifier,source_fingerprint,scene_id,raw_delta,real_delta,detail,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![id,event.goal_id,event.occurred_at,event.origin,event.source_identifier,event.source_fingerprint,event.scene_id.map(|scene| scene.to_string()),event.raw_delta,event.real_delta,event.detail,now()],
+    )?;
+    refresh_writing_goal_snapshots(conn, goal, event.occurred_at)?;
+    Ok(id)
+}
+
+fn refresh_writing_goal_snapshots(
+    conn: &Connection,
+    goal: &WritingGoalRecord,
+    recorded_at: i64,
+) -> Result<()> {
+    let offset = parse_goal_timezone_offset(&goal.time_zone)?;
+    let timestamps = {
+        let mut query = conn.prepare(
+            "SELECT occurred_at FROM writing_goal_event WHERE goal_id=?1 AND reconciliation_state='current' ORDER BY occurred_at",
+        )?;
+        query
+            .query_map([&goal.id], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    let mut dates = timestamps
+        .into_iter()
+        .map(|timestamp| goal_timestamp_date(timestamp, offset))
+        .collect::<Result<std::collections::BTreeSet<_>>>()?;
+    if dates.is_empty() {
+        dates.insert(goal.start_date.clone());
+    }
+    conn.execute(
+        "DELETE FROM writing_goal_snapshot WHERE goal_id=?1",
+        [&goal.id],
+    )?;
+    for date in dates {
+        upsert_writing_goal_snapshot(conn, goal, &date, recorded_at)?;
+    }
+    Ok(())
+}
+
+fn upsert_writing_goal_snapshot(
+    conn: &Connection,
+    goal: &WritingGoalRecord,
+    snapshot_date: &str,
+    recorded_at: i64,
+) -> Result<()> {
+    let offset = parse_goal_timezone_offset(&goal.time_zone)?;
+    let start = parse_goal_date(&goal.start_date)?;
+    let end = parse_goal_date(&goal.end_date)?;
+    let date = parse_goal_date(snapshot_date)?;
+    if date < start || date > end {
+        return Ok(());
+    }
+    let total_days = i64::from(end.to_julian_day() - start.to_julian_day() + 1);
+    let day_index = i64::from(date.to_julian_day() - start.to_julian_day() + 1);
+    let target_range = goal
+        .target_words
+        .checked_sub(goal.baseline_words)
+        .ok_or_else(|| StorageError::Invalid("writing goal target range overflow".into()))?;
+    let target = goal
+        .baseline_words
+        .checked_add(
+            target_range
+                .checked_mul(day_index)
+                .ok_or_else(|| StorageError::Invalid("writing goal target overflow".into()))?
+                / total_days,
+        )
+        .ok_or_else(|| StorageError::Invalid("writing goal baseline overflow".into()))?;
+    let boundary = goal_day_start(date, offset)?
+        .checked_add(86_400)
+        .ok_or_else(|| StorageError::Invalid("writing goal day boundary overflow".into()))?;
+    let (raw, real): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(raw_delta),0),COALESCE(SUM(real_delta),0) FROM writing_goal_event WHERE goal_id=?1 AND occurred_at < ?2 AND reconciliation_state='current'",
+        params![goal.id,boundary],
+        |row| Ok((row.get(0)?,row.get(1)?)),
+    )?;
+    conn.execute(
+        "INSERT INTO writing_goal_snapshot(id,goal_id,snapshot_date,recorded_at,target_words,raw_words,real_words,success_metric) VALUES(?1,?2,?3,?4,?5,?6,?7,?8) ON CONFLICT(goal_id,snapshot_date) DO UPDATE SET recorded_at=excluded.recorded_at,target_words=excluded.target_words,raw_words=excluded.raw_words,real_words=excluded.real_words,success_metric=excluded.success_metric",
+        params![Uuid::new_v4().to_string(),goal.id,format_goal_date(date),recorded_at,target,goal.baseline_words.checked_add(raw).ok_or_else(|| StorageError::Invalid("writing goal raw count overflow".into()))?,goal.baseline_words.checked_add(real).ok_or_else(|| StorageError::Invalid("writing goal real count overflow".into()))?,goal.success_metric],
+    )?;
+    Ok(())
+}
+
 fn validate_story_bible_template(template: &StoryBibleTemplate) -> Result<()> {
     if template.name.trim().is_empty() || template.fields.is_empty() {
         return Err(StorageError::Invalid(
@@ -7225,6 +7979,216 @@ mod tests {
             .unwrap();
         assert_eq!(interrupted_record.mode, "pressure");
         assert_eq!(interrupted_record.outcome, "quit");
+    }
+
+    #[test]
+    fn timed_challenge_completion_and_goal_activity_commit_atomically() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ProjectStore::create(root.path().join("Book"), "Book").unwrap();
+        let today = goal_timestamp_date(unix_now(), 0).unwrap();
+        let goal = store
+            .create_writing_goal(&NewWritingGoal {
+                title: "Timed draft day".into(),
+                scope_scene_id: None,
+                start_date: today.clone(),
+                end_date: today,
+                target_words: 100,
+                baseline_words: 0,
+                time_zone: "UTC".into(),
+                word_count_policy: "unicode-word-boundaries".into(),
+                success_metric: "raw".into(),
+            })
+            .unwrap();
+        let challenge = store.start_writing_challenge(10, 60, "steady").unwrap();
+        assert!(
+            store
+                .finish_writing_challenge_with_activity(
+                    &challenge,
+                    5,
+                    2,
+                    0,
+                    "timeout",
+                    Some(SceneId(Uuid::new_v4())),
+                )
+                .is_err()
+        );
+        assert_eq!(store.list_writing_challenges().unwrap()[0].status, "active");
+        assert!(store.list_writing_goal_events(&goal).unwrap().is_empty());
+        store
+            .finish_writing_challenge_with_activity(&challenge, 5, 2, 0, "timeout", None)
+            .unwrap();
+        assert_eq!(
+            store.list_writing_challenges().unwrap()[0].status,
+            "completed"
+        );
+        let events = store.list_writing_goal_events(&goal).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].raw_delta, 7);
+        assert_eq!(events[0].real_delta, 0);
+    }
+
+    #[test]
+    fn writing_goal_ledger_is_idempotent_scoped_and_projects_daily_pace() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Scene").unwrap();
+        let goal = store
+            .create_writing_goal(&NewWritingGoal {
+                title: "January draft".into(),
+                scope_scene_id: None,
+                start_date: "2025-01-01".into(),
+                end_date: "2025-01-03".into(),
+                target_words: 900,
+                baseline_words: 100,
+                time_zone: "UTC".into(),
+                word_count_policy: "unicode-word-boundaries".into(),
+                success_metric: "real".into(),
+            })
+            .unwrap();
+        assert!(
+            store
+                .create_writing_goal(&NewWritingGoal {
+                    title: "Invalid range".into(),
+                    scope_scene_id: None,
+                    start_date: "2025-01-03".into(),
+                    end_date: "2025-01-01".into(),
+                    target_words: 900,
+                    baseline_words: 0,
+                    time_zone: "UTC".into(),
+                    word_count_policy: "unicode-word-boundaries".into(),
+                    success_metric: "real".into(),
+                })
+                .is_err()
+        );
+
+        // 2025-01-01 12:00 UTC.
+        let day_one = 1_735_732_800;
+        let event_value = NewWritingGoalEvent {
+            goal_id: goal.clone(),
+            occurred_at: day_one,
+            origin: "editor".into(),
+            source_identifier: "session-1".into(),
+            source_fingerprint: "fingerprint-1".into(),
+            scene_id: Some(scene),
+            raw_delta: 60,
+            real_delta: 55,
+            detail: "First writing session".into(),
+        };
+        let original_event_id = store.record_writing_goal_event(&event_value).unwrap();
+        assert_eq!(
+            store.record_writing_goal_event(&event_value).unwrap(),
+            original_event_id
+        );
+        let mut changed = event_value.clone();
+        changed.source_fingerprint = "changed-fingerprint".into();
+        assert!(store.record_writing_goal_event(&changed).is_err());
+        let series = store.writing_goal_progress(&goal, day_one).unwrap();
+        assert_eq!(series.len(), 3);
+        assert_eq!(series[0].target_words, 366);
+        assert_eq!(series[0].raw_words, Some(160));
+        assert_eq!(series[0].real_words, Some(155));
+        assert_eq!(series[1].target_words, 633);
+        assert!(series[1].projected);
+        let scoped_goal = NewWritingGoal {
+            title: "Scene goal".into(),
+            scope_scene_id: Some(scene),
+            start_date: "2025-01-01".into(),
+            end_date: "2025-01-03".into(),
+            target_words: 100,
+            baseline_words: 0,
+            time_zone: "UTC".into(),
+            word_count_policy: "unicode-word-boundaries".into(),
+            success_metric: "real".into(),
+        };
+        let scene_goal = store.create_writing_goal(&scoped_goal).unwrap();
+        let wrong_scene = NewWritingGoalEvent {
+            goal_id: scene_goal,
+            occurred_at: day_one,
+            origin: "manual".into(),
+            source_identifier: "wrong-scene".into(),
+            source_fingerprint: "fingerprint".into(),
+            scene_id: None,
+            raw_delta: 1,
+            real_delta: 1,
+            detail: "wrong scope".into(),
+        };
+        assert!(store.record_writing_goal_event(&wrong_scene).is_err());
+        let replacement_id = store
+            .reconcile_writing_goal_event(
+                &original_event_id,
+                "fingerprint-1",
+                62,
+                54,
+                "corrected totals",
+            )
+            .unwrap();
+        assert_ne!(replacement_id, original_event_id);
+        let ledger = store.list_writing_goal_events(&goal).unwrap();
+        assert_eq!(ledger.len(), 2);
+        let superseded = ledger
+            .iter()
+            .find(|ledger_event| ledger_event.id == original_event_id)
+            .expect("original source event remains traceable");
+        let current = ledger
+            .iter()
+            .find(|ledger_event| ledger_event.id == replacement_id)
+            .expect("replacement event is recorded");
+        assert_eq!(superseded.reconciliation_state, "superseded");
+        assert_eq!(current.reconciliation_state, "current");
+        assert_eq!(current.raw_delta, 62);
+        assert_eq!(current.real_delta, 54);
+        let snapshot: (i64, i64, i64) = store
+            .conn
+            .query_row(
+                "SELECT target_words,raw_words,real_words FROM writing_goal_snapshot WHERE goal_id=?1 AND snapshot_date='2025-01-01'",
+                [&goal],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(snapshot, (366, 162, 154));
+        drop(store);
+        let reopened = ProjectStore::open(project).unwrap();
+        assert_eq!(reopened.list_writing_goal_events(&goal).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn completed_editor_sessions_feed_matching_goal_ledger_once() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = ProjectStore::create(root.path().join("Book"), "Book").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Scene").unwrap();
+        let today = goal_timestamp_date(unix_now(), 0).unwrap();
+        let goal = store
+            .create_writing_goal(&NewWritingGoal {
+                title: "Current work".into(),
+                scope_scene_id: Some(scene),
+                start_date: today.clone(),
+                end_date: today,
+                target_words: 500,
+                baseline_words: 200,
+                time_zone: "UTC".into(),
+                word_count_policy: "unicode-word-boundaries".into(),
+                success_metric: "real".into(),
+            })
+            .unwrap();
+        let session = store.start_writing_session(Some(scene), 200).unwrap();
+        store.finish_writing_session(&session, 215, false).unwrap();
+        let events = store.list_writing_goal_events(&goal).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].origin, "editor");
+        assert_eq!(events[0].source_identifier, session);
+        assert_eq!(events[0].raw_delta, 15);
+        assert_eq!(events[0].real_delta, 15);
+        store
+            .finish_writing_session(&session, 215, false)
+            .unwrap_err();
+        assert_eq!(store.list_writing_goal_events(&goal).unwrap().len(), 1);
     }
 
     #[test]
@@ -8170,7 +9134,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 23))
+            .map(|version| assert_eq!(version, 24))
             .unwrap();
     }
 
@@ -8422,7 +9386,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TABLE saved_query_expression")
+        conn.execute_batch("DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
         conn.execute_batch("DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
@@ -8434,7 +9398,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 23);
+        assert_eq!(version, 24);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -8463,7 +9427,7 @@ mod tests {
 
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch(
-            "DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
+            "DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
              DROP TRIGGER story_link_source_exists_insert;
              DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update;
              DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update;
