@@ -2095,6 +2095,28 @@ fn parse_scene_query_filter(
         "event" => SceneQueryFilter::Event(story_core::EventId(value.parse()?)),
         "chapter" => SceneQueryFilter::Chapter(value.to_owned()),
         "text" => SceneQueryFilter::TextContains(value.to_owned()),
+        "meta" => {
+            let (field_id, raw_value) = value
+                .split_once(':')
+                .ok_or("meta filter uses meta=FIELD-UUID:VALUE")?;
+            let field_id = story_core::FieldId(field_id.parse()?);
+            let value = if let Some(value) = raw_value.strip_prefix("int:") {
+                story_core::FieldValue::Integer(value.parse()?)
+            } else if let Some(value) = raw_value.strip_prefix("decimal:") {
+                story_core::FieldValue::Decimal(value.into())
+            } else if let Some(value) = raw_value.strip_prefix("bool:") {
+                story_core::FieldValue::Boolean(value.parse()?)
+            } else if let Some(value) = raw_value.strip_prefix("datetime:") {
+                story_core::FieldValue::DateTime(value.into())
+            } else if let Some(value) = raw_value.strip_prefix("enum:") {
+                story_core::FieldValue::Enum(value.into())
+            } else if let Some(value) = raw_value.strip_prefix("entity:") {
+                story_core::FieldValue::EntityRef(value.into())
+            } else {
+                story_core::FieldValue::Text(raw_value.into())
+            };
+            SceneQueryFilter::CustomMetadataEquals { field_id, value }
+        }
         "plotline-any" => SceneQueryFilter::AnyPlotline(
             parse_ids(value)?
                 .into_iter()

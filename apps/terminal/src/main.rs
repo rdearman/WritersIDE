@@ -5541,6 +5541,28 @@ impl AppState {
                     }
                     "chapter" => story_core::SceneQueryFilter::Chapter(value.into()),
                     "text" => story_core::SceneQueryFilter::TextContains(value.into()),
+                    "meta" => {
+                        let (field_id, raw_value) = value
+                            .split_once(':')
+                            .ok_or("meta filter uses meta=FIELD-UUID:VALUE")?;
+                        let field_id = story_core::FieldId(field_id.parse()?);
+                        let value = if let Some(value) = raw_value.strip_prefix("int:") {
+                            story_core::FieldValue::Integer(value.parse()?)
+                        } else if let Some(value) = raw_value.strip_prefix("decimal:") {
+                            story_core::FieldValue::Decimal(value.into())
+                        } else if let Some(value) = raw_value.strip_prefix("bool:") {
+                            story_core::FieldValue::Boolean(value.parse()?)
+                        } else if let Some(value) = raw_value.strip_prefix("datetime:") {
+                            story_core::FieldValue::DateTime(value.into())
+                        } else if let Some(value) = raw_value.strip_prefix("enum:") {
+                            story_core::FieldValue::Enum(value.into())
+                        } else if let Some(value) = raw_value.strip_prefix("entity:") {
+                            story_core::FieldValue::EntityRef(value.into())
+                        } else {
+                            story_core::FieldValue::Text(raw_value.into())
+                        };
+                        story_core::SceneQueryFilter::CustomMetadataEquals { field_id, value }
+                    }
                     "character-any" => story_core::SceneQueryFilter::AnyCharacter(
                         value
                             .split(',')

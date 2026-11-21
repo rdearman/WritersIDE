@@ -711,6 +711,10 @@ pub enum SceneQueryFilter {
     Event(EventId),
     Chapter(String),
     TextContains(String),
+    CustomMetadataEquals {
+        field_id: FieldId,
+        value: FieldValue,
+    },
     TimeBefore(i64),
     TimeAfter(i64),
     UnresolvedIssue,
@@ -1275,7 +1279,7 @@ pub enum FieldType {
     EntityRef,
     EntityRefs,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FieldValue {
     Text(String),
     Integer(i64),

@@ -203,6 +203,19 @@ fn compile_query_expression(
                 values.extend([pattern.clone(), pattern.clone(), pattern]);
                 "(s.title LIKE ? ESCAPE '\\' OR s.synopsis LIKE ? ESCAPE '\\' OR EXISTS(SELECT 1 FROM scene_search_content sc WHERE sc.scene_id=s.id AND sc.content LIKE ? ESCAPE '\\'))".into()
             }
+            SceneQueryFilter::CustomMetadataEquals { field_id, value } => {
+                let (column, encoded) = match value {
+                    FieldValue::Text(value) | FieldValue::DateTime(value) | FieldValue::Enum(value) => ("text_value", value.clone()),
+                    FieldValue::Integer(value) => ("integer_value", value.to_string()),
+                    FieldValue::Decimal(value) => ("decimal_value", value.clone()),
+                    FieldValue::Boolean(value) => ("boolean_value", i64::from(*value).to_string()),
+                    FieldValue::EntityRef(value) => ("entity_ref", value.clone()),
+                    FieldValue::EntityRefs(_) => return Err(StorageError::Invalid("querying entity-reference lists for equality is unsupported; use a related-entity filter".into())),
+                };
+                values.push(field_id.to_string());
+                values.push(encoded);
+                format!("EXISTS(SELECT 1 FROM custom_field_value cv WHERE cv.scene_id=s.id AND cv.field_id=? AND CAST(cv.{column} AS TEXT)=?)")
+            }
             SceneQueryFilter::TimeBefore(tick) => {
                 values.push(tick.to_string());
                 "s.start_nominal IS NOT NULL AND s.start_nominal<?".into()
@@ -6154,6 +6167,32 @@ impl ProjectStore {
                 "saved query name cannot be empty".into(),
             ));
         }
+        for filter in &query.filters {
+            if let SceneQueryFilter::CustomMetadataEquals { field_id, value } = filter {
+                if matches!(value, FieldValue::EntityRefs(_)) {
+                    return Err(StorageError::Invalid(
+                        "entity-reference lists cannot be compared for equality".into(),
+                    ));
+                }
+                let (field_type, enum_values, reference_kind): (String, String, Option<String>) = self.conn.query_row(
+                    "SELECT field_type,enum_values,reference_kind FROM custom_field_definition WHERE id=?1",
+                    [field_id.to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                ).map_err(|_| StorageError::NotFound(field_id.to_string()))?;
+                let definition = CustomFieldDefinition {
+                    id: *field_id,
+                    name: String::new(),
+                    field_type: parse_field_type(&field_type)?,
+                    required: false,
+                    default_value: None,
+                    enum_values: enum_values.lines().map(str::to_owned).collect(),
+                    reference_kind,
+                };
+                definition
+                    .validate(value)
+                    .map_err(|error| StorageError::Invalid(error.to_string()))?;
+            }
+        }
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -6210,6 +6249,11 @@ impl ProjectStore {
                     }
                     ("text_contains", text.clone())
                 }
+                SceneQueryFilter::CustomMetadataEquals { field_id, value } => (
+                    "custom_metadata_equals",
+                    serde_json::to_string(&(field_id, value))
+                        .map_err(|error| StorageError::Invalid(error.to_string()))?,
+                ),
                 SceneQueryFilter::TimeBefore(tick) => ("time_before", tick.to_string()),
                 SceneQueryFilter::TimeAfter(tick) => ("time_after", tick.to_string()),
                 SceneQueryFilter::UnresolvedIssue => ("unresolved_issue", "1".into()),
@@ -6413,6 +6457,13 @@ impl ProjectStore {
                     let pattern = format!("%{}%", value.replace('%', "\\%").replace('_', "\\_"));
                     sql.push_str(" AND (s.title LIKE ? ESCAPE '\\' OR s.synopsis LIKE ? ESCAPE '\\' OR EXISTS(SELECT 1 FROM scene_search_content sc WHERE sc.scene_id=s.id AND sc.content LIKE ? ESCAPE '\\'))");
                     values.extend([pattern.clone(), pattern.clone(), pattern]);
+                }
+                "custom_metadata_equals" => {
+                    let (field_id, value): (FieldId, FieldValue) = serde_json::from_str(&value)
+                        .map_err(|error| StorageError::Invalid(format!("invalid custom metadata query: {error}")))?;
+                    let expression = QueryExpression::Filter(SceneQueryFilter::CustomMetadataEquals { field_id, value });
+                    sql.push_str(" AND ");
+                    sql.push_str(&compile_query_expression(&expression, &mut values)?);
                 }
                 "plotline_any" => {
                     let ids = value.split(',').filter(|id| !id.is_empty()).collect::<Vec<_>>();
@@ -9198,6 +9249,21 @@ mod tests {
             .unwrap();
         let location = LocationId::new();
         store.add_location(location, "Station").unwrap();
+        let field = FieldId::new();
+        store
+            .define_custom_field(&CustomFieldDefinition {
+                id: field,
+                name: "Weather".into(),
+                field_type: FieldType::Enum,
+                required: false,
+                default_value: None,
+                enum_values: vec!["Rain".into(), "Clear".into()],
+                reference_kind: None,
+            })
+            .unwrap();
+        store
+            .set_custom_field(present, field, &FieldValue::Enum("Rain".into()))
+            .unwrap();
         let mut scene = store.get_scene(present).unwrap().scene;
         scene.start_location = Some(location);
         store.update_scene(&scene).unwrap();
@@ -9243,6 +9309,17 @@ mod tests {
         };
         store.save_scene_query(&direct).unwrap();
         assert_eq!(store.run_scene_query(direct.id).unwrap(), vec![present]);
+        let metadata = SavedSceneQuery {
+            id: QueryId::new(),
+            name: "rain scenes".into(),
+            description: String::new(),
+            filters: vec![SceneQueryFilter::CustomMetadataEquals {
+                field_id: field,
+                value: FieldValue::Enum("Rain".into()),
+            }],
+        };
+        store.save_scene_query(&metadata).unwrap();
+        assert_eq!(store.run_scene_query(metadata.id).unwrap(), vec![present]);
         let absence = SavedSceneQuery {
             id: QueryId::new(),
             name: "explicit absence only".into(),
