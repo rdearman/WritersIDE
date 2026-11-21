@@ -42,6 +42,13 @@ fn escape_svg_text(value: &str) -> String {
 }
 
 /// Application façade: frontends use use cases here and never issue domain SQL.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntityMentionAppearance {
+    pub scene_id: SceneId,
+    pub scene_title: String,
+    pub mention: story_storage::DetectedMentionRecord,
+}
+
 pub struct WriterApp {
     store: ProjectStore,
 }
@@ -1531,6 +1538,29 @@ impl WriterApp {
     ) -> Result<Vec<story_storage::DetectedMentionRecord>> {
         Ok(self.store.list_scene_mentions(scene)?)
     }
+    pub fn confirmed_entity_mention_appearances(
+        &self,
+        kind: MentionEntityKind,
+        entity_id: &str,
+    ) -> Result<Vec<EntityMentionAppearance>> {
+        let mut appearances = Vec::new();
+        for scene in self.store.list_scenes(false)? {
+            for mention in self.store.list_scene_mentions(scene.scene.id)? {
+                if mention.state == "confirmed"
+                    && mention.entity_kind.as_deref() == Some(kind.as_str())
+                    && mention.entity_id.as_deref() == Some(entity_id)
+                {
+                    appearances.push(EntityMentionAppearance {
+                        scene_id: scene.scene.id,
+                        scene_title: scene.scene.title.clone(),
+                        mention,
+                    });
+                }
+            }
+        }
+        Ok(appearances)
+    }
+
     pub fn reindex_scene_mentions(&mut self, scene: SceneId, text: &str, hash: &str) -> Result<()> {
         Ok(self.store.reindex_scene_mentions(scene, text, hash)?)
     }
@@ -2895,6 +2925,49 @@ mod tests {
         assert!(svg.contains("A &amp; B"));
         assert!(svg.contains("&lt;leads&gt;"));
         assert!(svg.contains("marker-end=\"url(#arrow)\""));
+    }
+
+    #[test]
+    fn confirmed_mention_appearances_are_cross_scene_and_do_not_create_presence() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Mentions"), "Mentions").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let object = app
+            .create_story_object("Silver Key", "A small key.")
+            .unwrap();
+        for (scene, text) in [
+            (first, "Mara found the Silver Key."),
+            (second, "The Silver Key was missing."),
+        ] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), text).unwrap();
+            let records = app.list_scene_mentions(scene).unwrap();
+            let mention = records
+                .iter()
+                .find(|mention| mention.quote == "Silver Key")
+                .unwrap();
+            app.confirm_scene_mention(mention.id, MentionEntityKind::Object, &object.to_string())
+                .unwrap();
+        }
+        let appearances = app
+            .confirmed_entity_mention_appearances(MentionEntityKind::Object, &object.to_string())
+            .unwrap();
+        assert_eq!(
+            appearances
+                .iter()
+                .map(|item| item.scene_id)
+                .collect::<Vec<_>>(),
+            [first, second]
+        );
+        let first_analysis = app
+            .analytics_dataset()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.scene_id == first.to_string())
+            .unwrap();
+        assert!(first_analysis.characters.is_empty());
     }
 
     #[test]

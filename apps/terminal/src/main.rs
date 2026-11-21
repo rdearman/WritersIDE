@@ -5076,6 +5076,36 @@ impl AppState {
             self.app.promote_scratchpad_note(id, kind, destination)?;
             self.message =
                 format!("Promoted note {id} to {kind} {destination}; source text retained");
+        } else if let Some(rest) = cmd.strip_prefix("entity-mentions ") {
+            let mut parts = rest.split_whitespace();
+            let kind = match parts
+                .next()
+                .ok_or("use entity-mentions character|location|object UUID")?
+            {
+                "character" => story_core::MentionEntityKind::Character,
+                "location" => story_core::MentionEntityKind::Location,
+                "object" => story_core::MentionEntityKind::Object,
+                _ => return Err("kind must be character, location, or object".into()),
+            };
+            let id = parts.next().ok_or("missing entity UUID")?;
+            let rows = self.app.confirmed_entity_mention_appearances(kind, id)?;
+            self.message = rows
+                .into_iter()
+                .map(|row| {
+                    format!(
+                        "{} · {} · bytes {}..{} · {}",
+                        row.scene_title,
+                        row.scene_id,
+                        row.mention.start_byte,
+                        row.mention.end_byte,
+                        row.mention.quote
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            if self.message.is_empty() {
+                self.message = "No confirmed prose mentions for this entity".into();
+            }
         } else if cmd == "mentions" {
             let scene = self
                 .editing_scene
@@ -13287,6 +13317,45 @@ mod tests {
         std::os::unix::fs::symlink(&external, project.project_root().join("exports")).unwrap();
         assert!(write_board_svg_export(project.project_root(), "board.svg", b"<svg/>").is_err());
         assert!(!external.join("board.svg").exists());
+    }
+
+    #[test]
+    fn entity_mention_command_lists_confirmed_cross_scene_appearances() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Mentions"), "Mentions").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let object = app
+            .create_story_object("Silver Key", "A small key.")
+            .unwrap();
+        for (scene, text) in [
+            (first, "Mara found the Silver Key."),
+            (second, "The Silver Key was missing."),
+        ] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), text).unwrap();
+            let mention = app
+                .list_scene_mentions(scene)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.quote == "Silver Key")
+                .unwrap();
+            app.confirm_scene_mention(
+                mention.id,
+                story_core::MentionEntityKind::Object,
+                &object.to_string(),
+            )
+            .unwrap();
+        }
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command(&format!("entity-mentions object {object}"))
+            .unwrap();
+        assert!(state.message.contains("First"));
+        assert!(state.message.contains("Second"));
+        assert!(state.message.contains("Silver Key"));
+        assert!(!state.message.contains("presence"));
     }
 
     #[test]
