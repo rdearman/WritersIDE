@@ -128,6 +128,8 @@ struct AppState {
     clipboard: String,
     snippets: BTreeMap<String, String>,
     registers: BTreeMap<String, String>,
+    macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
+    extra_cursors: Vec<(usize, usize)>,
     active_challenge: Option<ActiveWritingChallenge>,
     menu: Option<MenuState>,
     reference_panes: Vec<ReferencePane>,
@@ -227,6 +229,17 @@ struct RevisionHunk {
 #[derive(Deserialize)]
 struct KeymapFile {
     bindings: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct EditorToolsFile {
+    version: u16,
+    #[serde(default)]
+    snippets: BTreeMap<String, String>,
+    #[serde(default)]
+    registers: BTreeMap<String, String>,
+    #[serde(default)]
+    macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1191,6 +1204,10 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.register-insert", "Insert Editor Register", "Insert a named editor register", "Edit", "register-insert", true),
         legacy_command("edit.multi-insert", "Multi-cursor Insert", "Insert text at multiple original UTF-8 byte offsets", "Edit", "multi-insert", true),
         legacy_command("edit.macro", "Run Edit Macro", "Apply an undoable selection or line edit macro", "Edit", "macro", true),
+        legacy_command("edit.macro-define", "Define Edit Macro", "Save a reusable, data-only edit macro", "Edit", "macro-define", true),
+        legacy_command("edit.macro-run", "Run Named Edit Macro", "Apply a saved macro to the selection or current line", "Edit", "macro-run", true),
+        legacy_command("edit.cursor-add", "Add Multi-cursor", "Add an editing cursor at grapheme row and column", "Edit", "cursor-add", true),
+        legacy_command("edit.cursor-clear", "Clear Multi-cursors", "Return to the primary editor cursor", "Edit", "cursor-clear", false),
         legacy_command("challenge.start", "Start Writing Challenge", "Start a timed word target; opt-in Kamikaze mode reacts to inactivity", "Tools", "challenge-start", true),
         legacy_command("challenge.finish", "Finish Writing Challenge", "Record words written and finish the active timed challenge", "Tools", "challenge-finish", false),
         legacy_command(
@@ -1355,6 +1372,59 @@ fn parse_find_mode(value: &str) -> Result<story_core::FindMode, String> {
     }
 }
 
+fn load_editor_tools(root: &Path) -> Result<EditorToolsFile, Box<dyn std::error::Error>> {
+    let path = root.join(".writers-ide/editor-tools.json");
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(EditorToolsFile {
+                version: 1,
+                ..EditorToolsFile::default()
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let tools: EditorToolsFile = serde_json::from_slice(&bytes)?;
+    if tools.version != 1 {
+        return Err(format!("unsupported editor-tools version {}", tools.version).into());
+    }
+    Ok(tools)
+}
+
+fn parse_macro_recipe(
+    recipe: &str,
+) -> Result<Vec<story_core::EditMacroOp>, Box<dyn std::error::Error>> {
+    recipe
+        .split('|')
+        .map(|part| {
+            let part = part.trim();
+            if part == "upper" {
+                Ok(story_core::EditMacroOp::UppercaseSelection)
+            } else if part == "lower" {
+                Ok(story_core::EditMacroOp::LowercaseSelection)
+            } else if let Some(text) = part
+                .strip_prefix("insert:")
+                .or_else(|| part.strip_prefix("insert "))
+            {
+                Ok(story_core::EditMacroOp::Insert(text.to_owned()))
+            } else if let Some(pair) = part
+                .strip_prefix("replace:")
+                .or_else(|| part.strip_prefix("replace "))
+            {
+                let (from, to) = pair
+                    .split_once("=>")
+                    .ok_or("macro replace must use FROM=>TO")?;
+                Ok(story_core::EditMacroOp::Replace {
+                    from: from.to_owned(),
+                    to: to.to_owned(),
+                })
+            } else {
+                Err(format!("unknown edit macro operation: {part}").into())
+            }
+        })
+        .collect()
+}
+
 fn default_bindings() -> Vec<(u8, Workspace)> {
     Workspace::ALL
         .iter()
@@ -1407,6 +1477,13 @@ fn load_bindings(project: &Path) -> Result<Vec<(u8, Workspace)>, Box<dyn std::er
 }
 impl AppState {
     fn new(app: WriterApp, function_bindings: Vec<(u8, Workspace)>) -> Self {
+        let (tools, tools_error) = match load_editor_tools(app.project_root()) {
+            Ok(tools) => (tools, String::new()),
+            Err(error) => (
+                EditorToolsFile::default(),
+                format!("Editor tools not loaded: {error}"),
+            ),
+        };
         Self {
             app,
             workspace: Workspace::Dashboard,
@@ -1419,7 +1496,7 @@ impl AppState {
             dirty: false,
             mode: None,
             prompt: String::new(),
-            message: String::new(),
+            message: tools_error,
             history: vec![Workspace::Dashboard],
             history_index: 0,
             width: 80,
@@ -1454,8 +1531,10 @@ impl AppState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
-            snippets: BTreeMap::new(),
-            registers: BTreeMap::new(),
+            snippets: tools.snippets,
+            registers: tools.registers,
+            macros: tools.macros,
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
@@ -1465,6 +1544,24 @@ impl AppState {
     }
     fn session_path(&self) -> std::path::PathBuf {
         self.app.project_root().join(".writers-ide/session.json")
+    }
+    fn persist_editor_tools(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let directory = self.app.project_root().join(".writers-ide");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join("editor-tools.json");
+        let bytes = serde_json::to_vec_pretty(&EditorToolsFile {
+            version: 1,
+            snippets: self.snippets.clone(),
+            registers: self.registers.clone(),
+            macros: self.macros.clone(),
+        })?;
+        let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+        use std::io::Write;
+        temporary.write_all(&bytes)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(&path)?;
+        fs::File::open(directory)?.sync_all()?;
+        Ok(())
     }
     fn save_session(&self) -> Result<(), Box<dyn std::error::Error>> {
         let path = self.session_path();
@@ -2409,7 +2506,8 @@ impl AppState {
         } else if let Some(rest) = cmd.strip_prefix("snippet ") {
             let (name, body) = rest.split_once(' ').ok_or("use snippet NAME TEXT")?;
             self.snippets.insert(name.to_owned(), body.to_owned());
-            self.message = format!("Snippet {name} stored for this editor session");
+            self.persist_editor_tools()?;
+            self.message = format!("Snippet {name} saved in this project");
         } else if let Some(name) = cmd.strip_prefix("snippet-insert ") {
             let mut parts = name.split_whitespace();
             let snippet_name = parts
@@ -2453,6 +2551,7 @@ impl AppState {
                 self.editor[self.cursor.0].clone()
             };
             self.registers.insert(name.trim().to_owned(), value);
+            self.persist_editor_tools()?;
             self.message = format!("Saved register {}", name.trim());
         } else if let Some(name) = cmd.strip_prefix("register-insert ") {
             let value = self
@@ -2462,6 +2561,23 @@ impl AppState {
                 .clone();
             self.insert_text_at_cursor(&value)?;
             self.message = format!("Inserted register {}", name.trim());
+        } else if let Some(rest) = cmd.strip_prefix("cursor-add ") {
+            let (row, column) = rest
+                .split_once(' ')
+                .ok_or("use cursor-add ROW COLUMN (zero based grapheme positions)")?;
+            let row = row.parse::<usize>()?;
+            let column = column.parse::<usize>()?;
+            if row >= self.editor.len() || column > grapheme_count(&self.editor[row]) {
+                return Err("multi-cursor position is outside the editor buffer".into());
+            }
+            let cursor = (row, column);
+            if cursor != self.cursor && !self.extra_cursors.contains(&cursor) {
+                self.extra_cursors.push(cursor);
+            }
+            self.message = format!("{} additional cursor(s) active", self.extra_cursors.len());
+        } else if cmd == "cursor-clear" {
+            self.extra_cursors.clear();
+            self.message = "Additional cursors cleared".into();
         } else if let Some(rest) = cmd.strip_prefix("multi-insert ") {
             let (positions, text) = rest
                 .split_once(' ')
@@ -2482,45 +2598,25 @@ impl AppState {
                 "Inserted at {} distinct UTF-8 cursor anchors",
                 anchors.iter().collect::<BTreeSet<_>>().len()
             );
+        } else if let Some(rest) = cmd.strip_prefix("macro-define ") {
+            let (name, recipe) = rest
+                .split_once(' ')
+                .ok_or("use macro-define NAME OP|OP...")?;
+            let operations = parse_macro_recipe(recipe)?;
+            self.macros.insert(name.to_owned(), operations);
+            self.persist_editor_tools()?;
+            self.message = format!("Saved macro {name}");
+        } else if let Some(name) = cmd.strip_prefix("macro-run ") {
+            let operations = self
+                .macros
+                .get(name.trim())
+                .ok_or("unknown saved macro")?
+                .clone();
+            self.apply_edit_macro(&operations)?;
+            self.message = format!("Applied saved macro {} (undo available)", name.trim());
         } else if let Some(rest) = cmd.strip_prefix("macro ") {
-            let selection = self
-                .editor_selection
-                .map(|a| {
-                    editor_position_byte(&self.editor, a.0, a.1)
-                        ..editor_position_byte(&self.editor, self.cursor.0, self.cursor.1)
-                })
-                .unwrap_or_else(|| {
-                    let start = editor_position_byte(&self.editor, self.cursor.0, 0);
-                    start
-                        ..editor_position_byte(
-                            &self.editor,
-                            self.cursor.0,
-                            grapheme_count(&self.editor[self.cursor.0]),
-                        )
-                });
-            let operation = if let Some(text) = rest.strip_prefix("insert ") {
-                story_core::EditMacroOp::Insert(text.to_owned())
-            } else if rest == "upper" {
-                story_core::EditMacroOp::UppercaseSelection
-            } else if rest == "lower" {
-                story_core::EditMacroOp::LowercaseSelection
-            } else if let Some(pair) = rest.strip_prefix("replace ") {
-                let (from, to) = pair.split_once("=>").ok_or("use macro replace FROM=>TO")?;
-                story_core::EditMacroOp::Replace {
-                    from: from.to_owned(),
-                    to: to.to_owned(),
-                }
-            } else {
-                return Err("use macro insert TEXT|upper|lower|replace FROM=>TO".into());
-            };
-            self.push_undo();
-            let (updated, _) =
-                story_core::run_edit_macro(&self.editor.join("\n"), selection, &[operation])?;
-            self.editor = updated.lines().map(str::to_owned).collect();
-            if self.editor.is_empty() {
-                self.editor.push(String::new());
-            }
-            self.dirty = true;
+            let operations = parse_macro_recipe(rest)?;
+            self.apply_edit_macro(&operations)?;
             self.message = "Edit macro applied (undo available)".into();
         } else if cmd == "story-template-list" {
             self.message = self
@@ -4181,6 +4277,39 @@ impl AppState {
         );
         Ok(())
     }
+    fn apply_edit_macro(
+        &mut self,
+        operations: &[story_core::EditMacroOp],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let selection = self
+            .editor_selection
+            .map(|anchor| {
+                let a = editor_position_byte(&self.editor, anchor.0, anchor.1);
+                let b = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+                a.min(b)..a.max(b)
+            })
+            .unwrap_or_else(|| {
+                let start = editor_position_byte(&self.editor, self.cursor.0, 0);
+                start
+                    ..editor_position_byte(
+                        &self.editor,
+                        self.cursor.0,
+                        grapheme_count(&self.editor[self.cursor.0]),
+                    )
+            });
+        self.push_undo();
+        let (updated, selection) =
+            story_core::run_edit_macro(&self.editor.join("\n"), selection, operations)?;
+        self.editor = updated.lines().map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        if let Some((row, column)) = editor_position_from_byte(&updated, selection.end) {
+            self.cursor = (row, column);
+        }
+        self.dirty = true;
+        Ok(())
+    }
     fn jump_reading(&mut self, offset: u64) -> Result<(), Box<dyn std::error::Error>> {
         let byte = usize::try_from(offset)?;
         let prefix = self
@@ -4269,6 +4398,40 @@ impl AppState {
         Ok(())
     }
     fn insert_text_char(&mut self, ch: char) {
+        if self.editor_selection.is_none() && !self.extra_cursors.is_empty() {
+            let original = self.editor.join("\n");
+            let mut cursors = vec![self.cursor];
+            cursors.extend(self.extra_cursors.iter().copied());
+            let anchors = cursors
+                .iter()
+                .map(|(row, column)| editor_position_byte(&self.editor, *row, *column))
+                .collect::<Vec<_>>();
+            let insertion = ch.to_string();
+            let unique = anchors.iter().copied().collect::<BTreeSet<_>>();
+            let Ok(updated) = story_core::insert_at_anchors(&original, &anchors, &insertion) else {
+                return;
+            };
+            let mapped = cursors
+                .iter()
+                .zip(anchors.iter())
+                .map(|(_, anchor)| {
+                    let shift = unique
+                        .range(..*anchor)
+                        .count()
+                        .saturating_mul(insertion.len());
+                    editor_position_from_byte(&updated, anchor + shift + insertion.len())
+                        .unwrap_or((0, 0))
+                })
+                .collect::<Vec<_>>();
+            self.editor = updated.lines().map(str::to_owned).collect();
+            if self.editor.is_empty() {
+                self.editor.push(String::new());
+            }
+            self.cursor = mapped[0];
+            self.extra_cursors = mapped.into_iter().skip(1).collect();
+            self.dirty = true;
+            return;
+        }
         self.delete_selection();
         let (row, col) = self.cursor;
         let line = &mut self.editor[row];
@@ -6642,6 +6805,36 @@ mod tests {
     }
 
     #[test]
+    fn editor_tools_persist_and_native_extra_cursors_edit_together() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.editor = vec!["ab".into(), "cd".into()];
+        state.cursor = (0, 1);
+        state.prompt = "cursor-add 1 1".into();
+        state.command().unwrap();
+        state.insert('X');
+        assert_eq!(state.editor, ["aXb", "cXd"]);
+        state.prompt = "snippet greeting Hello ${name}.${cursor}".into();
+        state.command().unwrap();
+        state.prompt = "macro-define shout upper|insert:!".into();
+        state.command().unwrap();
+        state.registers.insert("a".into(), "Saved text".into());
+        state.persist_editor_tools().unwrap();
+        let reopened = WriterApp::open_project(root.path().join("Book")).unwrap();
+        let loaded = AppState::new(reopened, default_bindings());
+        assert!(loaded.snippets.contains_key("greeting"));
+        assert_eq!(
+            loaded.macros["shout"],
+            [
+                story_core::EditMacroOp::UppercaseSelection,
+                story_core::EditMacroOp::Insert("!".into())
+            ]
+        );
+        assert_eq!(loaded.registers["a"], "Saved text");
+    }
+
+    #[test]
     fn terminal_palette_compiles_markdown_and_source_map_without_external_tools() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("Novel");
@@ -6795,6 +6988,8 @@ mod tests {
             clipboard: String::new(),
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
@@ -7252,6 +7447,8 @@ mod tests {
             clipboard: String::new(),
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
@@ -7333,6 +7530,8 @@ mod tests {
             clipboard: String::new(),
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
@@ -7406,6 +7605,8 @@ mod tests {
             clipboard: String::new(),
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
@@ -7491,6 +7692,8 @@ mod tests {
             clipboard: String::new(),
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
@@ -7690,6 +7893,8 @@ mod tests {
             clipboard: String::new(),
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
@@ -7775,6 +7980,8 @@ mod tests {
             clipboard: String::new(),
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
@@ -7877,6 +8084,8 @@ mod tests {
             clipboard: String::new(),
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
@@ -8097,6 +8306,8 @@ mod tests {
             clipboard: String::new(),
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
@@ -8421,6 +8632,8 @@ mod tests {
             clipboard: String::new(),
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
@@ -8517,6 +8730,8 @@ mod tests {
             clipboard: String::new(),
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),
@@ -8665,6 +8880,8 @@ mod tests {
             clipboard: String::new(),
             snippets: BTreeMap::new(),
             registers: BTreeMap::new(),
+            macros: BTreeMap::new(),
+            extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
             reference_panes: Vec::new(),

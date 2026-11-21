@@ -679,6 +679,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("saved query assertion failed".into());
             }
         }
+        "coverage" => {
+            let path = args.next().ok_or("missing project path")?;
+            let dimension = match args
+                .next()
+                .as_deref()
+                .ok_or("missing character|plotline dimension")?
+            {
+                "character" => story_analysis::CoverageDimension::Character,
+                "plotline" => story_analysis::CoverageDimension::Plotline,
+                _ => return Err("coverage dimension must be character or plotline".into()),
+            };
+            let entity_id = args.next().ok_or("missing entity UUID")?;
+            let minimum_scenes = args
+                .next()
+                .ok_or("missing minimum scene count")?
+                .parse::<usize>()?;
+            let app = WriterApp::open_project(path)?;
+            let report = story_analysis::evaluate_coverage(
+                &app.analytics_dataset()?,
+                &[story_analysis::CoverageRequirement {
+                    id: "cli-coverage".into(),
+                    label: format!(
+                        "{} appears in at least {minimum_scenes} scenes",
+                        dimension_label(dimension)
+                    ),
+                    entity_id,
+                    dimension,
+                    minimum_scenes,
+                }],
+            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report[0].coverage_met {
+                return Err("coverage requirement not met".into());
+            }
+        }
         "query-list" => {
             let path = args.next().ok_or("missing project path")?;
             let app = WriterApp::open_project(path)?;
@@ -1304,6 +1339,13 @@ fn parse_find_mode(value: &str) -> Result<story_core::FindMode, Box<dyn std::err
     })
 }
 
+fn dimension_label(dimension: story_analysis::CoverageDimension) -> &'static str {
+    match dimension {
+        story_analysis::CoverageDimension::Character => "character",
+        story_analysis::CoverageDimension::Plotline => "plotline",
+    }
+}
+
 fn validate_scene_scope(scope: &str) -> Result<(), Box<dyn std::error::Error>> {
     if scope == "all" {
         return Ok(());
@@ -1354,7 +1396,7 @@ fn usage() {
         "writers-ide scratchpad-create <path> <title> [body]\nwriters-ide scratchpad-list <path>\nwriters-ide scratchpad-promote <path> <note-uuid> <scene|character|location|object|research> <entity-uuid>\nwriters-ide mentions <path> <scene-uuid>\nwriters-ide mention-confirm <path> <mention-uuid> <character|location|object> <entity-uuid>\nwriters-ide mention-dismiss <path> <mention-uuid>\nwriters-ide object-create <path> <name> [description]\nwriters-ide assembly-draft-create <path> <assembly-uuid>\nwriters-ide assembly-draft-list <path>\nwriters-ide assembly-draft-set <path> <draft-uuid> <scene-uuid> <text.md>\nwriters-ide assembly-draft-commit <path> <draft-uuid>\nwriters-ide board-create <path> <title>\nwriters-ide board-add-scene <path> <board-uuid> <scene-uuid> <x> <y> [note]\nwriters-ide board-list <path> <board-uuid>\nwriters-ide backup-archive <project-path> <archive.zip>\nwriters-ide restore-archive <archive.zip> <new-project-directory>"
     );
     eprintln!(
-        "writers-ide compile-watch <path> <format> <output> [poll-ms]\nwriters-ide query-assert <path> <query-uuid> <empty|non-empty|at-least:N|at-most:N|exactly:N>\nwriters-ide challenge-start <path> <target-words> <duration-seconds> [steady|kamikaze]\nwriters-ide challenge-finish <path> <challenge-id> <words-written> [abandoned]\nwriters-ide challenge-list <path>"
+        "writers-ide compile-watch <path> <format> <output> [poll-ms]\nwriters-ide query-assert <path> <query-uuid> <empty|non-empty|at-least:N|at-most:N|exactly:N>\nwriters-ide coverage <path> <character|plotline> <entity-uuid> <minimum-scenes>\nwriters-ide challenge-start <path> <target-words> <duration-seconds> [steady|kamikaze]\nwriters-ide challenge-finish <path> <challenge-id> <words-written> [abandoned]\nwriters-ide challenge-list <path>"
     );
 }
 

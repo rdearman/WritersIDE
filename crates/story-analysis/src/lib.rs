@@ -336,7 +336,7 @@ pub enum CoverageDimension {
     Plotline,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CoverageResult {
     pub requirement_id: String,
     pub label: String,

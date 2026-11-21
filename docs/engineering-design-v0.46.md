@@ -228,7 +228,7 @@ Stable-ID typed links, anchors, backlinks, broken-link scans, cycle-safe inclusi
 
 ### Issue #14 — Editing power tools foundation
 
-`story-core` now provides UTF-8-safe snippet expansion with named value substitution and a cursor marker, multi-cursor insertion at stable original byte offsets, and data-only edit macro operations for insertion, replacement and case conversion. The terminal command registry exposes `snippet`, `snippet-insert`, `register-save`, `register-insert`, `multi-insert`, and `macro`; macro changes are undoable. Session snippets and registers currently live only for the active terminal process. Interactive cursor-set management, persisted snippets/macros, recording macros from key events, and register rotation are not implemented.
+`story-core` now provides UTF-8-safe snippet expansion with named value substitution and a cursor marker, multi-cursor insertion at stable original byte offsets, and data-only edit macro operations for insertion, replacement and case conversion. The terminal command registry exposes `snippet`, `snippet-insert`, `register-save`, `register-insert`, `cursor-add`, `cursor-clear`, `multi-insert`, `macro`, `macro-define`, and `macro-run`; macro changes are undoable. Named snippets, macros and registers persist in `.writers-ide/editor-tools.json`; native extra cursors can be positioned by zero-based grapheme row/column and receive typed text simultaneously. Recording macros from arbitrary key events, multi-cursor deletion/navigation, and register rotation are not implemented.
 
 ### Issue #5 — Writing challenges foundation
 
@@ -236,7 +236,7 @@ Migration 0018 adds durable writing challenge records with target words, start/d
 
 ### Issue #15 — Advanced inspection foundation
 
-The analysis crate evaluates saved-query count assertions (`empty`, `non-empty`, `at-least`, `at-most`, and `exactly`) and read-only character/plotline scene-coverage requirements. CLI `query-assert` evaluates a saved query against the current project snapshot and returns a failing exit status when the assertion is unmet. Coverage results identify matching scene IDs, required minimum coverage and whether the requirement is met. Persistent assertion documents, coverage UI, arbitrary query expression evaluation and broader assertion operators remain open.
+The analysis crate evaluates saved-query count assertions (`empty`, `non-empty`, `at-least`, `at-most`, and `exactly`) and read-only character/plotline scene-coverage requirements. CLI `query-assert` evaluates a saved query against the current project snapshot; `coverage` checks minimum scene appearances for a character or plotline. Both return a failing exit status when the requirement is unmet. Coverage results identify matching scene IDs, required minimum coverage and whether the requirement is met. Persistent assertion documents, coverage UI, arbitrary query expression evaluation and broader assertion operators remain open.
 
 ### Issue #16 — Compile automation foundation
 
