@@ -6993,6 +6993,12 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             ));
             let sessions = s.app.list_writing_sessions().unwrap_or_default();
             rows.extend(daily_session_rows(&sessions));
+            rows.extend(writing_streak_rows(
+                &sessions,
+                time::OffsetDateTime::now_utc()
+                    .unix_timestamp()
+                    .div_euclid(86_400),
+            ));
             rows.extend(scene_writing_rows(&sessions, &data));
             rows.extend(coverage_report_rows(s.app.project_root(), &data));
             rows
@@ -7211,6 +7217,49 @@ fn daily_session_rows(sessions: &[story_storage::WritingSessionRecord]) -> Vec<S
             )
         })
         .collect()
+}
+
+fn writing_streak_rows(
+    sessions: &[story_storage::WritingSessionRecord],
+    today_utc_day: i64,
+) -> Vec<String> {
+    let active_days = sessions
+        .iter()
+        .filter(|session| session.status == "completed")
+        .filter(|session| session.words_delta.is_some_and(|delta| delta > 0))
+        .map(|session| session.started_at.div_euclid(86_400))
+        .collect::<BTreeSet<_>>();
+    if active_days.is_empty() {
+        return vec!["Writing streak · no completed positive-word days yet".into()];
+    }
+
+    let mut best = 0usize;
+    let mut run = 0usize;
+    let mut previous = None;
+    for day in &active_days {
+        run = if previous.is_some_and(|prior| prior + 1 == *day) {
+            run + 1
+        } else {
+            1
+        };
+        best = best.max(run);
+        previous = Some(*day);
+    }
+    let latest = *active_days.last().expect("non-empty active days");
+    let mut current = 0usize;
+    if latest >= today_utc_day.saturating_sub(1) {
+        let mut day = latest;
+        while active_days.contains(&day) {
+            current += 1;
+            let Some(previous_day) = day.checked_sub(1) else {
+                break;
+            };
+            day = previous_day;
+        }
+    }
+    vec![format!(
+        "Writing streak · current {current} days · best {best} days · based on completed sessions with positive word deltas"
+    )]
 }
 
 fn scene_writing_rows(
@@ -8835,6 +8884,42 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("cumulative"))
         );
+    }
+
+    #[test]
+    fn writing_streaks_count_distinct_positive_completed_days() {
+        let today = 20_000i64;
+        let sessions = [today - 6, today - 5, today - 4, today - 1, today]
+            .into_iter()
+            .enumerate()
+            .map(|(index, day)| story_storage::WritingSessionRecord {
+                id: format!("session-{index}"),
+                started_at: day * 86_400,
+                ended_at: Some(day * 86_400 + 60),
+                scene_id: None,
+                start_words: 0,
+                end_words: Some(10),
+                words_delta: Some(10),
+                status: "completed".into(),
+            })
+            .chain(std::iter::once(story_storage::WritingSessionRecord {
+                id: "abandoned".into(),
+                started_at: (today - 2) * 86_400,
+                ended_at: Some((today - 2) * 86_400 + 60),
+                scene_id: None,
+                start_words: 0,
+                end_words: Some(50),
+                words_delta: Some(50),
+                status: "abandoned".into(),
+            }))
+            .collect::<Vec<_>>();
+
+        let rows = writing_streak_rows(&sessions, today);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].contains("current 2 days"));
+        assert!(rows[0].contains("best 3 days"));
+        assert!(writing_streak_rows(&[], today)[0].contains("no completed"));
+        assert!(writing_streak_rows(&sessions, today + 3)[0].contains("current 0 days"));
     }
 
     #[test]
