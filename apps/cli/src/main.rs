@@ -1321,9 +1321,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let project = args.next().ok_or("missing project path")?;
             let format_name = args
                 .next()
-                .ok_or("missing format (markdown, latex, html, epub, docx, pdf)")?;
+                .ok_or("missing format (text, markdown, latex, html, epub, docx, pdf)")?;
             let format = story_document::CompileFormat::parse(&format_name)
-                .ok_or("format must be markdown, latex, html, epub, docx, or pdf")?;
+                .ok_or("format must be text, markdown, latex, html, epub, docx, or pdf")?;
             let remaining = args.collect::<Vec<_>>();
             let expand = remaining
                 .iter()
@@ -1576,7 +1576,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let project = PathBuf::from(args.next().ok_or("missing project path")?);
             let format_name = args.next().ok_or("missing format")?;
             let format = story_document::CompileFormat::parse(&format_name)
-                .ok_or("format must be markdown, latex, html, epub, docx, or pdf")?;
+                .ok_or("format must be text, markdown, latex, html, epub, docx, or pdf")?;
             let output = PathBuf::from(args.next().ok_or("missing output path")?);
             let poll_ms = args
                 .next()
@@ -2050,7 +2050,7 @@ fn parse_merge_choices(
 
 fn usage() {
     eprintln!(
-        "writers-ide compile <project> <markdown|latex|html|epub|docx|pdf> [output] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"
+        "writers-ide compile <project> <text|markdown|latex|html|epub|docx|pdf> [output] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"
     );
     eprintln!("writers-ide compile-check <project>");
     eprintln!("writers-ide git-auto-snapshot <project> <interval-minutes|off> (1–10080 minutes)");

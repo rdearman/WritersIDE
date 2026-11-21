@@ -404,6 +404,7 @@ impl CompileIr {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CompileFormat {
+    PlainText,
     Markdown,
     Latex,
     Html,
@@ -415,6 +416,7 @@ pub enum CompileFormat {
 impl CompileFormat {
     pub fn parse(value: &str) -> Option<Self> {
         match value.to_ascii_lowercase().as_str() {
+            "txt" | "text" | "plain-text" => Some(Self::PlainText),
             "md" | "markdown" => Some(Self::Markdown),
             "tex" | "latex" => Some(Self::Latex),
             "html" | "html5" => Some(Self::Html),
@@ -426,6 +428,7 @@ impl CompileFormat {
     }
     pub fn extension(self) -> &'static str {
         match self {
+            Self::PlainText => "txt",
             Self::Markdown => "md",
             Self::Latex => "tex",
             Self::Html => "html",
@@ -436,6 +439,7 @@ impl CompileFormat {
     }
     pub fn media_type(self) -> &'static str {
         match self {
+            Self::PlainText => "text/plain; charset=utf-8",
             Self::Markdown => "text/markdown; charset=utf-8",
             Self::Latex => "application/x-tex; charset=utf-8",
             Self::Html => "text/html; charset=utf-8",
@@ -895,7 +899,9 @@ impl PandocRenderer {
         };
         let (markdown, source_map) = ir.render_markdown();
         let mut auxiliary_files = Vec::new();
-        let bytes = if format == CompileFormat::Markdown {
+        let bytes = if format == CompileFormat::PlainText {
+            markdown_to_plain_text(&markdown).into_bytes()
+        } else if format == CompileFormat::Markdown {
             markdown.into_bytes()
         } else {
             let temporary =
@@ -915,6 +921,7 @@ impl PandocRenderer {
                     "--from=markdown+footnotes+pipe_tables+task_lists+strikeout+fenced_code_blocks",
                 )
                 .arg(match format {
+                    CompileFormat::PlainText => unreachable!(),
                     CompileFormat::Html => "--to=html5",
                     CompileFormat::Latex => "--to=latex",
                     CompileFormat::Epub => "--to=epub3",
@@ -1022,6 +1029,104 @@ impl PandocRenderer {
             auxiliary_files,
         })
     }
+}
+
+fn markdown_to_plain_text(markdown: &str) -> String {
+    let mut text = String::new();
+    let mut list_stack: Vec<Option<u64>> = Vec::new();
+    let parser = Parser::new_ext(markdown, markdown_options());
+    for event in parser {
+        match event {
+            Event::Start(Tag::Heading(..)) | Event::Start(Tag::Paragraph) => {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+            }
+            Event::Start(Tag::List(start)) => {
+                list_stack.push(start.map(|value| value.saturating_sub(1)));
+            }
+            Event::Start(Tag::Item) => {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                match list_stack.last_mut() {
+                    Some(Some(number)) => {
+                        *number = number.saturating_add(1);
+                        text.push_str(&format!("{number}. "));
+                    }
+                    _ => text.push_str("• "),
+                }
+            }
+            Event::Start(Tag::CodeBlock(_)) => {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+            }
+            Event::Start(Tag::TableCell) => {
+                if !text.is_empty() && !text.ends_with(['\n', '\t']) {
+                    text.push('\t');
+                }
+            }
+            Event::End(Tag::Heading(..)) | Event::End(Tag::Paragraph) => {
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push('\n');
+            }
+            Event::End(Tag::Item) => {
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+            }
+            Event::End(Tag::List(_)) => {
+                list_stack.pop();
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+            }
+            Event::End(Tag::CodeBlock(_)) => {
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                text.push('\n');
+            }
+            Event::End(Tag::TableCell) => text.push('\t'),
+            Event::End(Tag::TableRow) | Event::End(Tag::TableHead) => {
+                if !text.ends_with('\n') {
+                    text.push('\n');
+                }
+            }
+            Event::End(Tag::Table(_)) => text.push('\n'),
+            Event::Text(value) | Event::Code(value) => text.push_str(&value),
+            Event::FootnoteReference(value) => {
+                text.push('[');
+                text.push_str(&value);
+                text.push(']');
+            }
+            Event::SoftBreak => text.push(' '),
+            Event::HardBreak => text.push('\n'),
+            Event::Rule => text.push_str("\n---\n\n"),
+            Event::Html(_) => {}
+            Event::TaskListMarker(checked) => text.push_str(if checked { "[x] " } else { "[ ] " }),
+            Event::Start(_) | Event::End(_) => {}
+        }
+    }
+    let mut output = String::new();
+    let mut blank = false;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() {
+            if !blank && !output.is_empty() {
+                output.push('\n');
+            }
+            blank = true;
+        } else {
+            output.push_str(line);
+            output.push('\n');
+            blank = false;
+        }
+    }
+    output
 }
 
 pub fn source_fingerprint(source: &str) -> String {
@@ -1158,6 +1263,42 @@ mod tests {
         let json = serde_json::to_vec(&ir).unwrap();
         assert_eq!(serde_json::from_slice::<CompileIr>(&json).unwrap(), ir);
         assert!(ir.validate());
+    }
+
+    #[test]
+    fn plain_text_compile_uses_the_compile_ir_without_external_tools() {
+        let mut ir = CompileIr::new("Novel");
+        ir.push_group(CompileGroup {
+            id: "chapter".into(),
+            parent_id: None,
+            kind: StructuralKind::Chapter,
+            title: "Chapter One".into(),
+        });
+        ir.push(CompileUnit {
+            id: "scene".into(),
+            parent_id: Some("chapter".into()),
+            kind: ContentUnitKind::Scene,
+            title: "Harbour Lights".into(),
+            segments: vec![CompileSegment::new(
+                "scene",
+                "Mara *waited* by the harbour.\n\n- A lantern\n- A signal\n\n1. First clue\n2. Second clue",
+            )],
+        });
+        let renderer = PandocRenderer::with_program("unavailable-pandoc");
+        let artifact = renderer
+            .render(&ir, CompileFormat::PlainText, None)
+            .unwrap();
+        let text = String::from_utf8(artifact.bytes).unwrap();
+        assert!(text.contains("Chapter One"));
+        assert!(text.contains("Harbour Lights"));
+        assert!(text.contains("Mara waited by the harbour."));
+        assert!(text.contains("• A lantern"));
+        assert!(text.contains("• A signal"));
+        assert!(text.contains("1. First clue"));
+        assert!(text.contains("2. Second clue"));
+        assert!(!text.contains("**") && !text.contains('*'));
+        assert_eq!(artifact.media_type, "text/plain; charset=utf-8");
+        assert_eq!(artifact.format.extension(), "txt");
     }
 
     #[test]
