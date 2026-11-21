@@ -16,6 +16,8 @@ pub enum OllamaError {
     Endpoint(String),
     #[error("invalid BCP 47 language tag: {0}")]
     InvalidLanguage(String),
+    #[error("invalid or overlapping UTF-8 language span {start}..{end}")]
+    InvalidLanguageSpan { start: usize, end: usize },
 }
 
 #[derive(Clone, Debug)]
@@ -57,10 +59,46 @@ impl OllamaClient {
         source_text: &str,
         language_code: Option<&str>,
     ) -> Result<ExtractionResult, OllamaError> {
-        let instruction = language_instruction(
+        self.extract_with_language_context(source_text, language_code, &[])
+    }
+
+    pub fn extract_with_language_context(
+        &self,
+        source_text: &str,
+        language_code: Option<&str>,
+        passage_languages: &[LanguageContextSpan],
+    ) -> Result<ExtractionResult, OllamaError> {
+        let mut instruction = language_instruction(
             "Extract candidate characters (including aliases), places, organisations, objects, story events with chronology, fictional-world rules, and character knowledge claims. For every claim include an exact verbatim evidence quote from the source. Return JSON with {\"claims\":[{\"kind\":string,\"name\":string,\"claim\":string,\"evidence_quote\":string,\"approximate_story_time\":string|null}]}",
             language_code,
         )?;
+        let mut sorted = passage_languages.iter().collect::<Vec<_>>();
+        sorted.sort_by_key(|span| (span.start_byte, span.end_byte));
+        let mut previous_end = 0usize;
+        for span in sorted {
+            let start = span.start_byte;
+            let end = span.end_byte;
+            if start >= end
+                || start < previous_end
+                || end > source_text.len()
+                || !source_text.is_char_boundary(start)
+                || !source_text.is_char_boundary(end)
+            {
+                return Err(OllamaError::InvalidLanguageSpan { start, end });
+            }
+            if !story_core::is_valid_language_tag(&span.language_code) {
+                return Err(OllamaError::InvalidLanguage(span.language_code.clone()));
+            }
+            instruction.push_str(&format!(
+                " Interpret UTF-8 source bytes {start}..{end} as language {}.",
+                span.language_code
+            ));
+            previous_end = end;
+        }
+        if !passage_languages.is_empty() {
+            instruction
+                .push_str(" These byte ranges are metadata and are not part of the source text.");
+        }
         self.generate(source_text, &instruction)
     }
 
@@ -126,6 +164,13 @@ impl OllamaClient {
         let text = response.response.ok_or(OllamaError::MissingContent)?;
         Ok(serde_json::from_str(&text)?)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LanguageContextSpan {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub language_code: String,
 }
 
 fn language_instruction(
@@ -329,18 +374,44 @@ mod tests {
                 body["prompt"]
                     .as_str()
                     .unwrap()
-                    .contains("declared source language is it-IT")
+                    .contains("declared source language is en-GB")
+            );
+            assert!(
+                body["prompt"]
+                    .as_str()
+                    .unwrap()
+                    .contains("UTF-8 source bytes 0..4 as language it-IT")
             );
             let response = r#"{"response":"{\"claims\":[{\"kind\":\"character\",\"name\":\"Mara\",\"claim\":\"Mara crosses the bridge\",\"evidence_quote\":\"Mara crossed the bridge.\",\"approximate_story_time\":null}]}"}"#;
             write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
         });
         let client = OllamaClient::new(&format!("http://{address}"), "test-model").unwrap();
         let result = client
-            .extract_in_language("Mara crossed the bridge.", Some("it-IT"))
+            .extract_with_language_context(
+                "Mara crossed the bridge.",
+                Some("en-GB"),
+                &[LanguageContextSpan {
+                    start_byte: 0,
+                    end_byte: 4,
+                    language_code: "it-IT".into(),
+                }],
+            )
             .unwrap();
         assert_eq!(result.claims.len(), 1);
         assert_eq!(result.claims[0].name, "Mara");
         assert_eq!(result.claims[0].evidence_quote, "Mara crossed the bridge.");
+        assert!(matches!(
+            client.extract_with_language_context(
+                "é",
+                Some("en-GB"),
+                &[LanguageContextSpan {
+                    start_byte: 1,
+                    end_byte: 2,
+                    language_code: "fr-FR".into(),
+                }]
+            ),
+            Err(OllamaError::InvalidLanguageSpan { .. })
+        ));
         server.join().unwrap();
     }
 }

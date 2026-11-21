@@ -867,7 +867,7 @@ impl WriterApp {
         endpoint: &str,
     ) -> Result<story_ollama::ProvisionalExtraction> {
         let project = self.get_project()?;
-        let (source, language_code) = match source_kind {
+        let (source, language_code, passage_languages) = match source_kind {
             "scene" => {
                 let scene_id = SceneId(
                     source_id
@@ -875,9 +875,25 @@ impl WriterApp {
                         .map_err(|e| AppError::Domain(e.to_string()))?,
                 );
                 let scene = self.get_scene(scene_id)?;
+                let passage_languages = self
+                    .store
+                    .list_passage_language_tags(scene_id)?
+                    .into_iter()
+                    .filter(|tag| tag.anchor.state == "current")
+                    .map(|tag| {
+                        Ok(story_ollama::LanguageContextSpan {
+                            start_byte: usize::try_from(tag.anchor.start_byte)
+                                .map_err(|error| AppError::Domain(error.to_string()))?,
+                            end_byte: usize::try_from(tag.anchor.end_byte)
+                                .map_err(|error| AppError::Domain(error.to_string()))?,
+                            language_code: tag.language_code,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
                 (
                     self.load_scene_text(scene_id)?.0,
                     scene.scene.effective_language_code(&project).to_owned(),
+                    passage_languages,
                 )
             }
             "reading" => {
@@ -889,6 +905,7 @@ impl WriterApp {
                 (
                     document.extracted_text,
                     document.language_code.unwrap_or(project.language_code),
+                    Vec::new(),
                 )
             }
             _ => {
@@ -899,7 +916,7 @@ impl WriterApp {
         };
         let result = story_ollama::OllamaClient::new(endpoint, model)
             .map_err(|e| AppError::Domain(e.to_string()))?
-            .extract_in_language(&source, Some(&language_code))
+            .extract_with_language_context(&source, Some(&language_code), &passage_languages)
             .map_err(|e| AppError::Domain(e.to_string()))?;
         Ok(story_ollama::attach_provenance(
             source_kind,
