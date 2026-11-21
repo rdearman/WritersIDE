@@ -30,6 +30,12 @@ struct PlanningUpdateRequest {
     synopsis: Option<String>,
     status: Option<String>,
 }
+#[derive(Deserialize)]
+struct EventTimeUpdateRequest {
+    start: String,
+    end: String,
+    source_time: String,
+}
 
 const PAGE: &str = r#"<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -41,14 +47,17 @@ body{font:16px system-ui;margin:0;color:#20242a;background:#f3f5f7}header{paddin
 <section><h2>Characters</h2><div id="characters"></div></section><section><h2>Plotlines</h2><div id="plotlines"></div></section><section><h2>Locations and events</h2><div id="world"></div></section><section><h2>Research and issues</h2><div id="work"></div></section><section><h2>Story structure and graph</h2><div id="structure"></div><div class="graph"><svg id="graph" role="img" aria-label="Story relationship graph"></svg></div><div id="edges"></div></section></main>
 <script>
 let plan,selected;async function api(path,method='GET',data){const r=await fetch(path,{method,headers:data?{'Content-Type':'application/json'}:{},body:data?JSON.stringify(data):undefined});const j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.error||r.statusText);return j}
-async function load(){plan=await api('/api/plan');document.querySelector('#title').textContent=plan.project.title;document.querySelector('#scenes').innerHTML=plan.scenes.map(s=>`<button class="scene" data-id="${s.id}"><b>${esc(s.title)}</b><br><small>${esc(s.chapter||'Unplaced')} · ${s.actual_words} words · ${esc(s.status)}</small><p>${esc(s.synopsis||'')}</p></button>`).join('')||'No scenes yet';document.querySelector('#characters').innerHTML=plan.characters.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No characters';document.querySelector('#plotlines').innerHTML=plan.plotlines.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No plotlines';document.querySelector('#world').innerHTML=[...plan.locations.map(x=>`<p>Location · ${esc(x.name)}</p>`),...plan.events.map(x=>`<p>Event · ${esc(x.title)} <small>${esc(x.source_time)}</small></p>`)].join('')||'No locations or events';document.querySelector('#work').innerHTML=[...plan.research.map(x=>`<p>Research · ${esc(x.title)}</p>`),...plan.issues.map(x=>`<p>Issue · ${esc(x.title)} <small>${esc(x.status)}</small></p>`)].join('')||'No research or issues';document.querySelector('#structure').innerHTML=plan.groups.map(x=>`<p>${'　'.repeat(x.depth)}${esc(x.title)} <small>${esc(x.kind)}</small></p>`).join('')||'No structure';drawGraph();document.querySelector('#edges').innerHTML=`<small>${plan.edges.length} stable-ID relationships in the project graph</small>`;const chapters=plan.groups.filter(x=>x.kind==='chapter');for(const id of ['new-chapter','move-chapter'])document.querySelector('#'+id).innerHTML=chapters.map(c=>`<option value="${c.id}">${esc(c.title)}</option>`).join('');document.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>openScene(b.dataset.id))}
+async function load(){plan=await api('/api/plan');document.querySelector('#title').textContent=plan.project.title;document.querySelector('#scenes').innerHTML=plan.scenes.map(s=>`<button class="scene" data-id="${s.id}"><b>${esc(s.title)}</b><br><small>${esc(s.chapter||'Unplaced')} · ${s.actual_words} words · ${esc(s.status)}</small><p>${esc(s.synopsis||'')}</p></button>`).join('')||'No scenes yet';document.querySelector('#characters').innerHTML=plan.characters.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No characters';document.querySelector('#plotlines').innerHTML=plan.plotlines.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No plotlines';document.querySelector('#world').innerHTML=[...plan.locations.map(x=>`<p>Location · ${esc(x.name)}</p>`),...plan.events.map(x=>`<p><button data-event="${esc(x.id)}" data-start="${esc(timeLabel(x.start))}" data-end="${esc(timeLabel(x.end))}" data-source="${esc(x.source_time)}">Edit time · ${esc(x.title)}</button> <small>${esc(x.source_time)} · ${esc(timeLabel(x.start))} → ${esc(timeLabel(x.end))}</small></p>`)].join('')||'No locations or events';document.querySelector('#work').innerHTML=[...plan.research.map(x=>`<p>Research · ${esc(x.title)}</p>`),...plan.issues.map(x=>`<p>Issue · ${esc(x.title)} <small>${esc(x.status)}</small></p>`)].join('')||'No research or issues';document.querySelector('#structure').innerHTML=plan.groups.map(x=>`<p>${'　'.repeat(x.depth)}${esc(x.title)} <small>${esc(x.kind)}</small></p>`).join('')||'No structure';drawGraph();document.querySelector('#edges').innerHTML=`<small>${plan.edges.length} stable-ID relationships in the project graph</small>`;const chapters=plan.groups.filter(x=>x.kind==='chapter');for(const id of ['new-chapter','move-chapter'])document.querySelector('#'+id).innerHTML=chapters.map(c=>`<option value="${c.id}">${esc(c.title)}</option>`).join('');document.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>openScene(b.dataset.id))}
 function drawGraph(){const columns=[['group',plan.groups.map(n=>({...n,label:n.title}))],['scene',plan.scenes.map(n=>({...n,label:n.title}))],['character',plan.characters.map(n=>({...n,label:n.name}))],['plotline',plan.plotlines.map(n=>({...n,label:n.name}))],['world',[...plan.locations.map(n=>({...n,label:'Location · '+n.name})),...plan.events.map(n=>({...n,label:'Event · '+n.title}))]]];const nodes=[],positions=new Map();let height=180;columns.forEach(([kind,items],col)=>{items.forEach((n,row)=>{const x=20+col*190,y=24+row*54;const node={id:String(n.id),kind,label:n.label,x,y};nodes.push(node);if(!positions.has(node.id))positions.set(node.id,node);height=Math.max(height,y+52)})});const lines=plan.edges.map(e=>{const a=positions.get(String(e.from)),b=positions.get(String(e.to));return a&&b?`<line x1="${a.x+160}" y1="${a.y+16}" x2="${b.x}" y2="${b.y+16}"><title>${esc(e.kind)}</title></line>`:''}).join('');const cards=nodes.map(n=>`<g class="${n.kind}" ${n.kind==='scene'?`data-scene-id="${esc(n.id)}"`:''}><rect x="${n.x}" y="${n.y}" width="160" height="32"></rect><text x="${n.x+8}" y="${n.y+21}">${esc(n.label.slice(0,22))}</text><title>${esc(n.label)}</title></g>`).join('');const svg=document.querySelector('#graph');svg.setAttribute('viewBox',`0 0 980 ${height}`);svg.setAttribute('height',height);svg.innerHTML=lines+cards;svg.querySelectorAll('[data-scene-id]').forEach(node=>node.onclick=()=>openScene(node.dataset.sceneId))}
 async function openScene(id){selected=id;const s=await api('/api/scenes/'+encodeURIComponent(id));document.querySelector('#scene-title').textContent=s.title;document.querySelector('#scene-meta').textContent=`${s.actual_words} words · ${s.status} · POV ${s.pov||'unset'}`;document.querySelector('#scene-name').value=s.title;document.querySelector('#synopsis').value=s.synopsis;document.querySelector('#status').value=s.status;document.querySelector('#prose').textContent=s.text}
 document.querySelector('#create-scene').onsubmit=async e=>{e.preventDefault();try{const chapter=document.querySelector('#new-chapter').value;const position=plan.scenes.filter(s=>s.chapter_id===chapter).length;const s=await api('/api/scenes','POST',{chapter_id:chapter,title:document.querySelector('#new-title').value,position});document.querySelector('#new-title').value='';await load();await openScene(s.id);notice('Scene created')}catch(e){notice(e.message)}};
 document.querySelector('#create-chapter').onsubmit=async e=>{e.preventDefault();try{await api('/api/chapters','POST',{title:document.querySelector('#new-chapter-title').value,position:plan.groups.filter(g=>g.kind==='chapter').length});document.querySelector('#new-chapter-title').value='';await load();notice('Chapter created')}catch(e){notice(e.message)}};
 document.querySelector('#save-planning').onclick=async()=>{if(!selected)return;try{await api('/api/scenes/'+selected+'/planning','POST',{title:document.querySelector('#scene-name').value,synopsis:document.querySelector('#synopsis').value,status:document.querySelector('#status').value});await load();await openScene(selected);notice('Planning metadata saved')}catch(e){notice(e.message)}};
 document.querySelector('#move-scene').onclick=async()=>{if(!selected)return;try{await api('/api/scenes/'+selected+'/move','POST',{chapter_id:document.querySelector('#move-chapter').value,position:Number(document.querySelector('#move-position').value)});await load();await openScene(selected);notice('Scene moved; prose and story chronology are unchanged')}catch(e){notice(e.message)}};
-function notice(s){document.querySelector('#notice').textContent=s}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}load().catch(e=>notice(e.message));
+function notice(s){document.querySelector('#notice').textContent=s}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}document.querySelector('#world').addEventListener('click',e=>{const b=e.target.closest('[data-event]');if(b)editEventTime(b)});
+function timeLabel(t){if(t.precision==='Unknown')return '?';if(t.precision==='Bounded')return `${t.lower}..${t.upper}`;if(t.precision==='Approximate')return `~${t.nominal},${t.lower},${t.upper}`;return String(t.nominal)}
+async function editEventTime(b){const start=prompt('Start: tick, ?, ~nominal,lower,upper, or lower..upper',b.dataset.start);if(start===null)return;const end=prompt('End: tick, ?, ~nominal,lower,upper, or lower..upper',b.dataset.end);if(end===null)return;const source=prompt('Source time label',b.dataset.source);if(source===null)return;try{await api(`/api/events/${encodeURIComponent(b.dataset.event)}/time`,'POST',{start,end,source_time:source});await load();notice('Event chronology saved')}catch(e){notice(e.message)}}
+load().catch(e=>notice(e.message));
 </script></html>"#;
 
 #[derive(Debug)]
@@ -236,6 +245,33 @@ fn route(app: &mut WriterApp, method: &str, path: &str, body: &str) -> (u16, &'s
             Err(error) => api_error(error),
         };
     }
+    if let Some(id) = path.strip_prefix("/api/events/") {
+        let (id, action) = id.split_once('/').unwrap_or((id, ""));
+        if method == "POST" && action == "time" {
+            let id = match uuid::Uuid::from_str(id) {
+                Ok(id) => story_core::EventId(id),
+                Err(error) => return api_error(error.to_string()),
+            };
+            return match serde_json::from_str::<EventTimeUpdateRequest>(body) {
+                Ok(request) => match parse_story_time(&request.start)
+                    .and_then(|start| parse_story_time(&request.end).map(|end| (start, end)))
+                {
+                    Ok((start, end)) => {
+                        match app.update_story_event_time(id, start, end, &request.source_time) {
+                            Ok(()) => (
+                                200,
+                                "application/json; charset=utf-8",
+                                serde_json::json!({"saved":true,"id":id}).to_string(),
+                            ),
+                            Err(error) => api_error(error.to_string()),
+                        }
+                    }
+                    Err(error) => api_error(error),
+                },
+                Err(error) => api_error(error.to_string()),
+            };
+        }
+    }
     if let Some(id) = path.strip_prefix("/api/scenes/") {
         let (id, action) = id.split_once('/').unwrap_or((id, ""));
         let id = match uuid::Uuid::from_str(id) {
@@ -310,6 +346,38 @@ fn route(app: &mut WriterApp, method: &str, path: &str, body: &str) -> (u16, &'s
         );
     }
     (404, "text/plain; charset=utf-8", "Not found".into())
+}
+
+fn parse_story_time(value: &str) -> Result<story_core::StoryTime, String> {
+    use story_core::{StoryTime, TimePrecision};
+    if value == "?" {
+        return Ok(StoryTime::unknown());
+    }
+    if let Some(value) = value.strip_prefix('~') {
+        let parts = value.split(',').collect::<Vec<_>>();
+        if parts.len() != 3 {
+            return Err("approximate time must use ~NOMINAL,LOWER,UPPER".into());
+        }
+        return StoryTime::new(
+            Some(parts[0].parse().map_err(|_| "invalid nominal tick")?),
+            Some(parts[1].parse().map_err(|_| "invalid lower tick")?),
+            Some(parts[2].parse().map_err(|_| "invalid upper tick")?),
+            TimePrecision::Approximate,
+        )
+        .map_err(|error| error.to_string());
+    }
+    if let Some((lower, upper)) = value.split_once("..") {
+        return StoryTime::new(
+            None,
+            Some(lower.parse().map_err(|_| "invalid lower tick")?),
+            Some(upper.parse().map_err(|_| "invalid upper tick")?),
+            TimePrecision::Bounded,
+        )
+        .map_err(|error| error.to_string());
+    }
+    value.parse().map(StoryTime::exact).map_err(|_| {
+        "invalid tick; use an integer, ?, ~nominal,lower,upper, or lower..upper".into()
+    })
 }
 
 fn api_error(message: String) -> (u16, &'static str, String) {
@@ -444,6 +512,16 @@ mod tests {
         let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
         let chapter_two = app.create_chapter(None, "Chapter Two", 1).unwrap();
         let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let event_id = story_core::EventId::new();
+        app.add_story_event(&story_core::StoryEvent {
+            id: event_id,
+            title: "The bridge falls".into(),
+            description: "A key turning point".into(),
+            start: story_core::StoryTime::exact(1),
+            end: story_core::StoryTime::exact(2),
+            source_time_text: "day one".into(),
+        })
+        .unwrap();
         let (_, hash) = app.load_scene_text(scene).unwrap();
         app.save_scene_text(scene, Some(&hash), "Canonical prose.")
             .unwrap();
@@ -475,6 +553,32 @@ mod tests {
         assert_eq!(row.scene.status, story_core::SceneStatus::Outlined);
         assert_eq!(row.chapter_id, Some(chapter_two));
         assert_eq!(app.load_scene_text(scene).unwrap().0, "Canonical prose.");
+        let body =
+            serde_json::json!({"start":"~6,4,8","end":"9..12","source_time":"during the storm"})
+                .to_string();
+        assert_eq!(
+            route(
+                &mut app,
+                "POST",
+                &format!("/api/events/{event_id}/time"),
+                &body
+            )
+            .0,
+            200
+        );
+        let event = app
+            .list_events()
+            .unwrap()
+            .into_iter()
+            .find(|event| event.id == event_id)
+            .unwrap();
+        assert_eq!(event.title, "The bridge falls");
+        assert_eq!(event.start.lower, Some(4));
+        assert_eq!(event.start.upper, Some(8));
+        assert_eq!(event.end.lower, Some(9));
+        assert_eq!(event.end.upper, Some(12));
+        assert_eq!(event.source_time, "during the storm");
+        assert!(PAGE.contains("data-event"));
         let body =
             serde_json::json!({"title":"Chapter Three","parent_id":null,"position":2}).to_string();
         assert_eq!(route(&mut app, "POST", "/api/chapters", &body).0, 201);
