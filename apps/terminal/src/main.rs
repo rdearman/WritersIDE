@@ -4754,6 +4754,7 @@ impl AppState {
     fn paste_text(&mut self, text: &str) {
         self.delete_selection();
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        self.record_macro_op(story_core::EditMacroOp::Insert(normalized.clone()));
         if self.writing_stats_enabled {
             self.pasted_characters = self
                 .pasted_characters
@@ -7117,8 +7118,18 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 }
                 s.move_editor_cursors(CursorMotion::Right, selecting)
             }
-            KeyCode::Up => s.move_editor_cursors(CursorMotion::Up, selecting),
-            KeyCode::Down => s.move_editor_cursors(CursorMotion::Down, selecting),
+            KeyCode::Up => {
+                if !selecting {
+                    s.record_macro_op(story_core::EditMacroOp::MoveUp);
+                }
+                s.move_editor_cursors(CursorMotion::Up, selecting)
+            }
+            KeyCode::Down => {
+                if !selecting {
+                    s.record_macro_op(story_core::EditMacroOp::MoveDown);
+                }
+                s.move_editor_cursors(CursorMotion::Down, selecting)
+            }
             KeyCode::Char(c)
                 if !k.modifiers.contains(KeyModifiers::CONTROL)
                     && !k.modifiers.contains(KeyModifiers::ALT) =>

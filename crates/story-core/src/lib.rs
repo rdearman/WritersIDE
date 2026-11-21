@@ -72,6 +72,8 @@ pub enum EditMacroOp {
     DeleteForward,
     MoveLeft,
     MoveRight,
+    MoveUp,
+    MoveDown,
     MoveLineStart,
     MoveLineEnd,
     Replace { from: String, to: String },
@@ -127,6 +129,28 @@ pub fn run_edit_macro(
                 if let Some((offset, grapheme)) = selected[cursor..].grapheme_indices(true).next() {
                     cursor += offset + grapheme.len();
                 }
+            }
+            EditMacroOp::MoveUp | EditMacroOp::MoveDown => {
+                let prior_lines = selected[..cursor].matches('\n').count();
+                let lines = selected.split('\n').collect::<Vec<_>>();
+                let current_line_start = selected[..cursor].rfind('\n').map_or(0, |i| i + 1);
+                let column = selected[current_line_start..cursor].graphemes(true).count();
+                let target_line = if matches!(operation, EditMacroOp::MoveUp) {
+                    prior_lines.saturating_sub(1)
+                } else {
+                    (prior_lines + 1).min(lines.len().saturating_sub(1))
+                };
+                let line_start = lines
+                    .iter()
+                    .take(target_line)
+                    .map(|line| line.len() + 1)
+                    .sum::<usize>();
+                let target = lines[target_line];
+                let target_column = target
+                    .grapheme_indices(true)
+                    .nth(column)
+                    .map_or(target.len(), |(offset, _)| offset);
+                cursor = line_start + target_column;
             }
             EditMacroOp::MoveLineStart => {
                 cursor = selected[..cursor].rfind('\n').map_or(0, |i| i + 1);
@@ -200,6 +224,13 @@ mod editor_tool_tests {
         let (text, range) = run_edit_macro("aé", 0..3, &operations).unwrap();
         assert_eq!(text, "a!");
         assert_eq!(&text[range], "a!");
+    }
+
+    #[test]
+    fn recorded_vertical_navigation_preserves_grapheme_column() {
+        let operations = [EditMacroOp::MoveUp, EditMacroOp::Insert("!".into())];
+        let (text, _) = run_edit_macro("abcd\nx", 0..6, &operations).unwrap();
+        assert_eq!(text, "a!bcd\nx");
     }
 }
 use uuid::Uuid;
