@@ -2664,6 +2664,60 @@ impl AppState {
                             format_location_reference(&location),
                         ))
                     }),
+                "plotline" => source_id
+                    .parse::<uuid::Uuid>()
+                    .ok()
+                    .map(story_core::PlotlineId)
+                    .and_then(|id| {
+                        let row = self
+                            .app
+                            .list_plotlines()
+                            .ok()?
+                            .into_iter()
+                            .find(|row| row.id == id)?;
+                        Some((
+                            None,
+                            row.name.clone(),
+                            format!("Plotline: {}\nScenes: {}", row.name, row.scene_count),
+                        ))
+                    }),
+                "event" => source_id
+                    .parse::<uuid::Uuid>()
+                    .ok()
+                    .map(story_core::EventId)
+                    .and_then(|id| {
+                        let row = self
+                            .app
+                            .list_events()
+                            .ok()?
+                            .into_iter()
+                            .find(|row| row.id == id)?;
+                        Some((
+                            None,
+                            row.title.clone(),
+                            format!(
+                                "Event: {}\nSource time: {}\nStart: {:?}\nEnd: {:?}",
+                                row.title, row.source_time, row.start, row.end
+                            ),
+                        ))
+                    }),
+                "object" => source_id
+                    .parse::<uuid::Uuid>()
+                    .ok()
+                    .map(story_core::StoryObjectId)
+                    .and_then(|id| {
+                        let row = self
+                            .app
+                            .list_story_objects()
+                            .ok()?
+                            .into_iter()
+                            .find(|row| row.id == id)?;
+                        Some((
+                            None,
+                            row.name.clone(),
+                            format!("Object: {}\n{}", row.name, row.description),
+                        ))
+                    }),
                 _ => None,
             };
             if let Some((scene_id, title, content)) = loaded {
@@ -5930,6 +5984,66 @@ impl AppState {
                 "Location reference opened in buffer {} of {}",
                 self.active_reference + 1,
                 self.reference_panes.len()
+            );
+        } else if let Some(id) = cmd.strip_prefix("reference-plotline ") {
+            let id = story_core::PlotlineId(id.parse()?);
+            let row = self
+                .app
+                .list_plotlines()?
+                .into_iter()
+                .find(|row| row.id == id)
+                .ok_or("plotline reference not found")?;
+            self.open_reference_buffer(
+                format!("plotline:{id}"),
+                None,
+                row.name.clone(),
+                format!("Plotline: {}\nScenes: {}", row.name, row.scene_count),
+            );
+            self.reference_focused = false;
+            self.message = format!(
+                "Plotline reference opened in buffer {}",
+                self.active_reference + 1
+            );
+        } else if let Some(id) = cmd.strip_prefix("reference-event ") {
+            let id = story_core::EventId(id.parse()?);
+            let row = self
+                .app
+                .list_events()?
+                .into_iter()
+                .find(|row| row.id == id)
+                .ok_or("event reference not found")?;
+            self.open_reference_buffer(
+                format!("event:{id}"),
+                None,
+                row.title.clone(),
+                format!(
+                    "Event: {}\nSource time: {}\nStart: {:?}\nEnd: {:?}",
+                    row.title, row.source_time, row.start, row.end
+                ),
+            );
+            self.reference_focused = false;
+            self.message = format!(
+                "Event reference opened in buffer {}",
+                self.active_reference + 1
+            );
+        } else if let Some(id) = cmd.strip_prefix("reference-object ") {
+            let id = story_core::StoryObjectId(id.parse()?);
+            let row = self
+                .app
+                .list_story_objects()?
+                .into_iter()
+                .find(|row| row.id == id)
+                .ok_or("object reference not found")?;
+            self.open_reference_buffer(
+                format!("object:{id}"),
+                None,
+                row.name.clone(),
+                format!("Object: {}\n{}", row.name, row.description),
+            );
+            self.reference_focused = false;
+            self.message = format!(
+                "Object reference opened in buffer {}",
+                self.active_reference + 1
             );
         } else if cmd == "reference-next" {
             if !self.reference_panes.is_empty() {
@@ -12841,6 +12955,55 @@ mod tests {
         assert!(!reopened.scenes.iter().any(|scene| scene.0 == first_scene));
         assert_eq!(reopened.horizontal_split_ratio, 60);
         assert_eq!(reopened.vertical_split_ratio, 40);
+    }
+
+    #[test]
+    fn plotline_event_and_object_reference_buffers_restore_by_stable_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app =
+            WriterApp::create_project(root.path().join("References"), "References").unwrap();
+        let plotline = app.create_plotline("The hidden thread").unwrap();
+        let event = app.add_event("The eclipse", "day 4").unwrap();
+        let object = app
+            .create_story_object("The brass key", "Opens the western archive.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command(&format!("reference-plotline {plotline}"))
+            .unwrap();
+        state
+            .execute_legacy_palette_command(&format!("reference-event {event}"))
+            .unwrap();
+        state
+            .execute_legacy_palette_command(&format!("reference-object {object}"))
+            .unwrap();
+        assert_eq!(state.reference_panes.len(), 3);
+        assert!(
+            state.reference_panes[0]
+                .content
+                .contains("The hidden thread")
+        );
+        assert!(state.reference_panes[1].content.contains("day 4"));
+        assert!(state.reference_panes[2].content.contains("western archive"));
+        state.save_session().unwrap();
+        let mut reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        assert_eq!(reopened.reference_panes.len(), 3);
+        assert_eq!(
+            reopened.reference_panes[0].source_key,
+            format!("plotline:{plotline}")
+        );
+        assert_eq!(
+            reopened.reference_panes[1].source_key,
+            format!("event:{event}")
+        );
+        assert_eq!(
+            reopened.reference_panes[2].source_key,
+            format!("object:{object}")
+        );
     }
 
     #[test]
