@@ -5717,19 +5717,45 @@ impl AppState {
                     scope = argument;
                 }
             }
-            let target = self
-                .editing_scene
-                .or(self.active_scene())
-                .ok_or("select a scene first")?;
-            let records = if scope == "all" {
-                self.app.list_scenes(false)?
+            let target = self.editing_scene.or(self.active_scene());
+            let records = self.app.list_scenes(false)?;
+            let chapter_id = scope
+                .strip_prefix("chapter:")
+                .map(|value| {
+                    uuid::Uuid::parse_str(value)
+                        .map(story_core::NodeId)
+                        .map_err(|_| "invalid chapter scope UUID")
+                })
+                .transpose()?;
+            let scene_id = if scope == "all" || chapter_id.is_some() {
+                None
+            } else if scope == "current" {
+                Some(target.ok_or("select a scene first")?)
             } else {
-                self.app
-                    .list_scenes(false)?
-                    .into_iter()
-                    .filter(|record| record.scene.id == target)
-                    .collect()
+                let value = scope.strip_prefix("scene:").unwrap_or(scope);
+                Some(
+                    uuid::Uuid::parse_str(value)
+                        .map(story_core::SceneId)
+                        .map_err(|_| "scope must be current, all, scene:UUID, or chapter:UUID")?,
+                )
             };
+            if let Some(chapter) = chapter_id
+                && !self
+                    .app
+                    .list_structural_nodes()?
+                    .iter()
+                    .any(|node| node.id == chapter && node.kind == "chapter")
+            {
+                return Err("chapter scope does not identify a chapter".into());
+            }
+            let records = records
+                .into_iter()
+                .filter(|record| {
+                    scope == "all"
+                        || scene_id == Some(record.scene.id)
+                        || chapter_id == record.chapter_id
+                })
+                .collect::<Vec<_>>();
             let mut rows = Vec::new();
             for record in records {
                 let (text, _) = self.app.load_scene_text(record.scene.id)?;
@@ -12674,6 +12700,32 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.search_location_index, 0);
+    }
+
+    #[test]
+    fn proofread_scopes_to_a_chapter_and_rejects_non_chapters() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let first_chapter = app.create_chapter(None, "One", 0).unwrap();
+        let second_chapter = app.create_chapter(None, "Two", 1).unwrap();
+        let first = app.create_scene(first_chapter, "Finding", 0).unwrap();
+        let second = app.create_scene(second_chapter, "Elsewhere", 0).unwrap();
+        for (scene, text) in [
+            (first, "Mara said said hello."),
+            (second, "Other said said."),
+        ] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), text).unwrap();
+        }
+        let mut state = AppState::new(app, default_bindings());
+        state.mode = Some(':');
+        state.prompt = format!("proofread chapter:{first_chapter}");
+        state.command().unwrap();
+        assert!(state.message.contains("Finding"));
+        assert!(!state.message.contains("Elsewhere"));
+        state.mode = Some(':');
+        state.prompt = format!("proofread chapter:{}", first);
+        assert!(state.command().is_err());
     }
 
     #[test]

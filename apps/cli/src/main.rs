@@ -1186,11 +1186,28 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("severity filter must contain error, warning, or information".into());
             }
             let app = WriterApp::open_project(path)?;
-            for scene in app
-                .list_scenes(false)?
-                .into_iter()
-                .filter(|scene| scope == "all" || scene.scene.id.to_string() == scope)
+            let scenes = app.list_scenes(false)?;
+            let chapter_id = scope
+                .strip_prefix("chapter:")
+                .map(|value| uuid::Uuid::parse_str(value).map(story_core::NodeId))
+                .transpose()?;
+            let scene_id = if scope == "all" || chapter_id.is_some() {
+                None
+            } else {
+                let value = scope.strip_prefix("scene:").unwrap_or(&scope);
+                Some(story_core::SceneId(uuid::Uuid::parse_str(value)?))
+            };
+            if let Some(chapter) = chapter_id
+                && !app
+                    .list_structural_nodes()?
+                    .iter()
+                    .any(|node| node.id == chapter && node.kind == "chapter")
             {
+                return Err("chapter scope does not identify a chapter".into());
+            }
+            for scene in scenes.into_iter().filter(|scene| {
+                scope == "all" || scene_id == Some(scene.scene.id) || chapter_id == scene.chapter_id
+            }) {
                 let (text, _) = app.load_scene_text(scene.scene.id)?;
                 for finding in app.proofread_text(&text)? {
                     if severities
