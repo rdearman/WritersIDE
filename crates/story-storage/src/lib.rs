@@ -33,6 +33,7 @@ const MIGRATION_18: &str = include_str!("../migrations/0018_writing_challenges.s
 const MIGRATION_19: &str = include_str!("../migrations/0019_query_assertions.sql");
 const MIGRATION_20: &str = include_str!("../migrations/0020_writing_sessions.sql");
 const MIGRATION_21: &str = include_str!("../migrations/0021_query_boolean_filters.sql");
+const MIGRATION_22: &str = include_str!("../migrations/0022_challenge_outcomes.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -325,6 +326,9 @@ pub struct WritingChallengeRecord {
     pub ended_at: Option<i64>,
     pub words_written: Option<u32>,
     pub status: String,
+    pub words_deleted: u32,
+    pub pauses_consumed: u32,
+    pub outcome: String,
 }
 #[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct WritingSessionRecord {
@@ -543,7 +547,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_18}\nINSERT INTO schema_migrations(version,applied_at) VALUES(18,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_19}\nINSERT INTO schema_migrations(version,applied_at) VALUES(19,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_20}\nINSERT INTO schema_migrations(version,applied_at) VALUES(20,'{}');\nCOMMIT;", now()))?;
-        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\nCOMMIT;", now(), now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code])?;
         Ok(Self {
@@ -586,7 +590,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 21 {
+        if version > 22 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -671,6 +675,10 @@ impl ProjectStore {
         }
         if current_version == 20 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_21}\nINSERT INTO schema_migrations(version,applied_at) VALUES(21,'{}');\nCOMMIT;", now()))?;
+            current_version = 21;
+        }
+        if current_version == 21 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_22}\nINSERT INTO schema_migrations(version,applied_at) VALUES(22,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -4539,9 +4547,12 @@ impl ProjectStore {
         duration_seconds: u32,
         mode: &str,
     ) -> Result<String> {
-        if target_words == 0 || duration_seconds == 0 || !matches!(mode, "steady" | "kamikaze") {
+        if target_words == 0
+            || duration_seconds == 0
+            || !matches!(mode, "steady" | "pressure" | "kamikaze")
+        {
             return Err(StorageError::Invalid(
-                "challenge requires positive target and duration and mode steady|kamikaze".into(),
+                "challenge requires positive target/duration and mode pressure|kamikaze".into(),
             ));
         }
         let started = unix_now();
@@ -4549,11 +4560,16 @@ impl ProjectStore {
             .checked_add(i64::from(duration_seconds))
             .ok_or_else(|| StorageError::Invalid("challenge deadline overflow".into()))?;
         let id = Uuid::new_v4().to_string();
-        self.conn.execute(
-            "UPDATE writing_challenge SET status='abandoned' WHERE status='active'",
-            [],
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE writing_challenge SET status='abandoned',outcome='quit',ended_at=?1 WHERE status='active'",
+            [started],
         )?;
-        self.conn.execute("INSERT INTO writing_challenge(id,started_at,deadline_at,target_words,mode,status) VALUES(?1,?2,?3,?4,?5,'active')", params![id,started,deadline,target_words,mode])?;
+        let stored_mode = if mode == "pressure" { "steady" } else { mode };
+        tx.execute("INSERT INTO writing_challenge(id,started_at,deadline_at,target_words,mode,status,display_mode) VALUES(?1,?2,?3,?4,?5,'active',?6)", params![id,started,deadline,target_words,stored_mode,mode])?;
+        tx.commit()?;
         Ok(id)
     }
     pub fn finish_writing_challenge(
@@ -4562,8 +4578,31 @@ impl ProjectStore {
         words_written: u32,
         abandoned: bool,
     ) -> Result<()> {
-        let status = if abandoned { "abandoned" } else { "completed" };
-        let changed = self.conn.execute("UPDATE writing_challenge SET ended_at=?2,words_written=?3,status=?4 WHERE id=?1 AND status='active'", params![id,unix_now(),words_written,status])?;
+        self.finish_writing_challenge_detailed(
+            id,
+            words_written,
+            0,
+            0,
+            if abandoned { "quit" } else { "timeout" },
+        )
+    }
+    pub fn finish_writing_challenge_detailed(
+        &mut self,
+        id: &str,
+        words_written: u32,
+        words_deleted: u32,
+        pauses_consumed: u32,
+        outcome: &str,
+    ) -> Result<()> {
+        if !matches!(outcome, "success" | "timeout" | "quit") {
+            return Err(StorageError::Invalid("invalid challenge outcome".into()));
+        }
+        let status = if outcome == "quit" {
+            "abandoned"
+        } else {
+            "completed"
+        };
+        let changed = self.conn.execute("UPDATE writing_challenge SET ended_at=?2,words_written=?3,words_deleted=?4,pauses_consumed=?5,outcome=?6,status=?7 WHERE id=?1 AND status='active'", params![id,unix_now(),words_written,words_deleted,pauses_consumed,outcome,status])?;
         if changed == 0 {
             return Err(StorageError::NotFound(format!(
                 "active writing challenge {id}"
@@ -4571,8 +4610,15 @@ impl ProjectStore {
         }
         Ok(())
     }
+    pub fn recover_interrupted_writing_challenges(&mut self) -> Result<u64> {
+        let changed = self.conn.execute(
+            "UPDATE writing_challenge SET status='abandoned',ended_at=?1,outcome='quit' WHERE status='active'",
+            [unix_now()],
+        )?;
+        Ok(changed as u64)
+    }
     pub fn list_writing_challenges(&self) -> Result<Vec<WritingChallengeRecord>> {
-        let mut query = self.conn.prepare("SELECT id,started_at,deadline_at,target_words,mode,ended_at,words_written,status FROM writing_challenge ORDER BY started_at DESC")?;
+        let mut query = self.conn.prepare("SELECT id,started_at,deadline_at,target_words,display_mode,ended_at,words_written,status,words_deleted,pauses_consumed,outcome FROM writing_challenge ORDER BY started_at DESC,id DESC")?;
         let rows = query.query_map([], |row| {
             Ok(WritingChallengeRecord {
                 id: row.get(0)?,
@@ -4583,6 +4629,9 @@ impl ProjectStore {
                 ended_at: row.get(5)?,
                 words_written: row.get(6)?,
                 status: row.get(7)?,
+                words_deleted: row.get(8)?,
+                pauses_consumed: row.get(9)?,
+                outcome: row.get(10)?,
             })
         })?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
@@ -6964,18 +7013,30 @@ mod tests {
         let row = store.list_writing_challenges().unwrap().remove(0);
         assert_eq!(row.target_words, 500);
         assert_eq!(row.status, "active");
-        store.finish_writing_challenge(&id, 120, false).unwrap();
+        store
+            .finish_writing_challenge_detailed(&id, 120, 17, 2, "success")
+            .unwrap();
         assert_eq!(
             store.list_writing_challenges().unwrap()[0].words_written,
             Some(120)
         );
+        let finished = &store.list_writing_challenges().unwrap()[0];
+        assert_eq!(finished.words_deleted, 17);
+        assert_eq!(finished.pauses_consumed, 2);
+        assert_eq!(finished.outcome, "success");
         assert!(store.finish_writing_challenge(&id, 120, false).is_err());
+        let interrupted = store.start_writing_challenge(50, 300, "pressure").unwrap();
         drop(store);
-        let reopened = ProjectStore::open(project).unwrap();
-        assert_eq!(
-            reopened.list_writing_challenges().unwrap()[0].status,
-            "completed"
-        );
+        let mut reopened = ProjectStore::open(project).unwrap();
+        reopened.recover_interrupted_writing_challenges().unwrap();
+        let interrupted_record = reopened
+            .list_writing_challenges()
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == interrupted)
+            .unwrap();
+        assert_eq!(interrupted_record.mode, "pressure");
+        assert_eq!(interrupted_record.outcome, "quit");
     }
 
     #[test]
@@ -8105,7 +8166,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 21);
+        assert_eq!(version, 22);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }

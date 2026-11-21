@@ -144,10 +144,42 @@ struct ActiveWritingChallenge {
     id: String,
     initial_words: u32,
     target_words: u32,
+    duration_seconds: u32,
     deadline: Instant,
     mode: String,
     last_activity: Instant,
     kamikaze_idle_seconds: u64,
+    previous_editor: Vec<String>,
+    previous_cursor: (usize, usize),
+    previous_dirty: bool,
+    previous_scene: Option<SceneId>,
+    previous_hash: String,
+    previous_selection: Option<(usize, usize)>,
+    previous_workspace: Workspace,
+    grace_pauses_remaining: u8,
+    penalties_applied: u32,
+    deletion_words_per_penalty: u32,
+    words_deleted: u32,
+    pauses_consumed: u32,
+    failure_taunt: String,
+    destination_scene: Option<SceneId>,
+    started_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ChallengeDraftFile {
+    version: u16,
+    challenge_id: String,
+    text: String,
+    target_words: u32,
+    mode: String,
+    duration_seconds: u32,
+    words_deleted: u32,
+    pauses_consumed: u32,
+    #[serde(default)]
+    destination_scene: Option<SceneId>,
+    started_at: i64,
+    updated_at: i64,
 }
 
 #[derive(Clone, Debug)]
@@ -283,10 +315,35 @@ struct ChallengeConfig {
     version: u16,
     #[serde(default = "default_kamikaze_idle_seconds")]
     kamikaze_idle_seconds: u64,
+    #[serde(default = "default_challenge_pauses")]
+    grace_pauses: u8,
+    #[serde(default = "default_challenge_deletion_rate")]
+    deletion_words_per_penalty: u32,
+    #[serde(default = "default_challenge_taunt")]
+    failure_taunt: String,
+}
+
+struct ChallengeStart {
+    target_words: u32,
+    duration_seconds: u32,
+    mode: String,
+    destination_scene: Option<SceneId>,
 }
 
 fn default_kamikaze_idle_seconds() -> u64 {
     10
+}
+
+fn default_challenge_pauses() -> u8 {
+    2
+}
+
+fn default_challenge_deletion_rate() -> u32 {
+    1
+}
+
+fn default_challenge_taunt() -> String {
+    "Apparently {words} words was too much to ask.".into()
 }
 
 impl Default for ChallengeConfig {
@@ -294,6 +351,9 @@ impl Default for ChallengeConfig {
         Self {
             version: 1,
             kamikaze_idle_seconds: default_kamikaze_idle_seconds(),
+            grace_pauses: default_challenge_pauses(),
+            deletion_words_per_penalty: default_challenge_deletion_rate(),
+            failure_taunt: default_challenge_taunt(),
         }
     }
 }
@@ -1569,6 +1629,13 @@ fn load_bindings(project: &Path) -> Result<Vec<(u8, Workspace)>, Box<dyn std::er
 }
 impl AppState {
     fn new(app: WriterApp, function_bindings: Vec<(u8, Workspace)>) -> Self {
+        let draft_notice = list_challenge_drafts(app.project_root())
+            .ok()
+            .filter(|notice| notice != "No recoverable challenge drafts")
+            .map(|_| {
+                "Recoverable isolated challenge draft(s) found; use challenge-list-drafts"
+                    .to_owned()
+            });
         let (tools, tools_error) = match load_editor_tools(app.project_root()) {
             Ok(tools) => (tools, String::new()),
             Err(error) => (
@@ -1601,7 +1668,7 @@ impl AppState {
             dirty: false,
             mode: None,
             prompt: String::new(),
-            message: tools_error,
+            message: draft_notice.unwrap_or(tools_error),
             history: vec![Workspace::Dashboard],
             history_index: 0,
             width: 80,
@@ -2269,6 +2336,14 @@ impl AppState {
         Ok(())
     }
     fn save(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.active_challenge.is_some() {
+            self.persist_challenge_draft()?;
+            self.dirty = false;
+            self.message =
+                "Challenge draft checkpointed separately; it has not changed manuscript prose"
+                    .into();
+            return Ok(());
+        }
         if let Some(draft_id) = self.assembly_draft {
             let draft = self.app.load_assembly_draft(draft_id)?;
             match parse_assembly_draft(&draft, &self.editor.join("\n")) {
@@ -2315,6 +2390,35 @@ impl AppState {
                 Err(e) => self.message = format!("Save conflict/error: {e}"),
             }
         }
+        Ok(())
+    }
+    fn persist_challenge_draft(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(challenge) = &self.active_challenge else {
+            return Ok(());
+        };
+        let directory = self.app.project_root().join(".writers-ide/recovery");
+        fs::create_dir_all(&directory)?;
+        let path = challenge_draft_path(&directory, &challenge.id);
+        let draft = ChallengeDraftFile {
+            version: 1,
+            challenge_id: challenge.id.clone(),
+            text: self.editor.join("\n"),
+            target_words: challenge.target_words,
+            mode: challenge.mode.clone(),
+            duration_seconds: challenge.duration_seconds,
+            words_deleted: challenge.words_deleted,
+            pauses_consumed: challenge.pauses_consumed,
+            destination_scene: challenge.destination_scene,
+            started_at: challenge.started_at,
+            updated_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+        };
+        let bytes = serde_json::to_vec_pretty(&draft)?;
+        let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+        use std::io::Write;
+        temporary.write_all(&bytes)?;
+        temporary.as_file().sync_all()?;
+        temporary.persist(path)?;
+        fs::File::open(directory)?.sync_all()?;
         Ok(())
     }
     fn switch(&mut self, w: Workspace) {
@@ -2599,56 +2703,172 @@ impl AppState {
         &mut self,
         cmd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(rest) = cmd.strip_prefix("challenge-start ") {
-            let mut parts = rest.split_whitespace();
-            let target = parts
-                .next()
-                .ok_or("use challenge-start TARGET_WORDS DURATION_SECONDS [steady|kamikaze]")?
-                .parse::<u32>()?;
-            let seconds = parts
-                .next()
-                .ok_or("missing duration seconds")?
-                .parse::<u32>()?;
-            let mode = parts.next().unwrap_or("steady");
-            if parts.next().is_some() || !matches!(mode, "steady" | "kamikaze") {
-                return Err("mode must be steady or kamikaze".into());
+        if let Some(start) = parse_challenge_command(cmd)? {
+            let target = start.target_words;
+            let seconds = start.duration_seconds;
+            let mode = start.mode;
+            let destination_scene = start.destination_scene;
+            if self.active_challenge.is_some() {
+                return Err("finish the current challenge before starting another".into());
             }
-            let id = self.app.start_writing_challenge(target, seconds, mode)?;
+            if self.dirty {
+                return Err(
+                    "save existing manuscript edits before starting an isolated challenge".into(),
+                );
+            }
             let challenge_config = load_challenge_config(self.app.project_root())?;
-            let initial_words = story_core::count_words(&self.editor.join("\n"));
+            if let Some(scene) = destination_scene {
+                self.app.load_scene_text(scene)?;
+                if self.editing_scene != Some(scene) {
+                    self.app
+                        .create_snapshot(scene, &format!("Before {} word challenge", target))?;
+                }
+            }
+            if let Some(scene) = self.editing_scene {
+                self.app
+                    .create_snapshot(scene, &format!("Before {} word challenge", target))?;
+            }
+            let id = self.app.start_writing_challenge(target, seconds, &mode)?;
+            let previous_editor = std::mem::replace(&mut self.editor, vec![String::new()]);
+            let previous_cursor = self.cursor;
+            let previous_dirty = self.dirty;
+            let previous_scene = self.editing_scene;
+            let previous_hash = self.saved_hash.clone();
+            let previous_selection = self.editor_selection;
+            let previous_workspace = self.workspace;
+            let initial_words = 0;
             let now = Instant::now();
             self.active_challenge = Some(ActiveWritingChallenge {
                 id,
                 initial_words,
                 target_words: target,
+                duration_seconds: seconds,
                 deadline: now + Duration::from_secs(u64::from(seconds)),
-                mode: mode.into(),
+                mode: mode.clone(),
                 last_activity: now,
                 kamikaze_idle_seconds: challenge_config.kamikaze_idle_seconds,
+                previous_editor,
+                previous_cursor,
+                previous_dirty,
+                previous_scene,
+                previous_hash,
+                previous_selection,
+                previous_workspace,
+                grace_pauses_remaining: challenge_config.grace_pauses,
+                penalties_applied: 0,
+                deletion_words_per_penalty: challenge_config.deletion_words_per_penalty,
+                words_deleted: 0,
+                pauses_consumed: 0,
+                failure_taunt: challenge_config.failure_taunt.clone(),
+                destination_scene,
+                started_at: time::OffsetDateTime::now_utc().unix_timestamp(),
             });
+            self.cursor = (0, 0);
+            self.editor_selection = None;
+            self.undo_stack.clear();
+            self.redo_stack.clear();
+            self.dirty = false;
+            self.workspace = Workspace::Editor;
             self.message = if mode == "kamikaze" {
                 format!(
-                    "Kamikaze challenge armed: {target} words; one word is removed after {} seconds without typing. Undo remains available.",
+                    "Isolated Kamikaze draft armed: {target} words; first {} idle intervals are grace pauses.",
                     challenge_config.kamikaze_idle_seconds
                 )
             } else {
-                format!("Timed challenge: {target} words in {seconds} seconds")
+                format!(
+                    "Isolated {} draft: {target} words in {seconds} seconds",
+                    mode
+                )
             };
+            self.persist_challenge_draft()?;
         } else if cmd == "challenge-finish" {
-            self.finish_active_challenge(false)?;
+            self.finish_active_challenge("quit")?;
+        } else if cmd == "challenge-list-drafts" {
+            self.message = list_challenge_drafts(self.app.project_root())?;
+        } else if let Some(rest) = cmd.strip_prefix("challenge-save-new ") {
+            let (draft_id, rest) = rest
+                .split_once(' ')
+                .ok_or("use challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE")?;
+            let (chapter_id, title) = rest
+                .split_once(' ')
+                .ok_or("provide a chapter UUID and scene title")?;
+            let draft_id = uuid::Uuid::parse_str(draft_id)?.to_string();
+            let draft = read_challenge_draft(self.app.project_root(), &draft_id)?;
+            let chapter = story_core::NodeId(uuid::Uuid::parse_str(chapter_id)?);
+            let scene = self.app.create_scene(chapter, title.trim(), 0)?;
+            let (_, hash) = self.app.load_scene_text(scene)?;
+            self.app.save_scene_text(scene, Some(&hash), &draft.text)?;
+            remove_challenge_draft(self.app.project_root(), &draft_id)?;
+            self.refresh()?;
+            self.message = format!(
+                "Recovered challenge draft saved as a new scene ({scene}); existing prose was untouched"
+            );
+        } else if let Some(draft_id) = cmd.strip_prefix("challenge-save-target ") {
+            let draft_id = uuid::Uuid::parse_str(draft_id.trim())?.to_string();
+            let draft = read_challenge_draft(self.app.project_root(), &draft_id)?;
+            let scene = draft
+                .destination_scene
+                .ok_or("this challenge has no destination scene; use challenge-save-new")?;
+            let (existing, expected_hash) = self.app.load_scene_text(scene)?;
+            let combined = if existing.is_empty() {
+                draft.text.clone()
+            } else if draft.text.is_empty() {
+                existing
+            } else {
+                format!("{existing}\n\n{}", draft.text)
+            };
+            self.app
+                .save_scene_text(scene, Some(&expected_hash), &combined)?;
+            remove_challenge_draft(self.app.project_root(), &draft_id)?;
+            self.refresh()?;
+            self.message = format!(
+                "Recovered challenge draft appended to scene {scene} using optimistic concurrency"
+            );
+        } else if let Some(draft_id) = cmd.strip_prefix("challenge-discard ") {
+            let draft_id = uuid::Uuid::parse_str(draft_id.trim())?.to_string();
+            remove_challenge_draft(self.app.project_root(), &draft_id)?;
+            self.message = format!("Challenge draft {draft_id} discarded");
         } else if let Some(value) = cmd.strip_prefix("challenge-idle ") {
             let seconds = value.trim().parse::<u64>()?;
             if !(1..=3600).contains(&seconds) {
                 return Err("Kamikaze idle threshold must be between 1 and 3600 seconds".into());
             }
-            save_challenge_config(
-                self.app.project_root(),
-                &ChallengeConfig {
-                    version: 1,
-                    kamikaze_idle_seconds: seconds,
-                },
-            )?;
+            let mut config = load_challenge_config(self.app.project_root())?;
+            config.kamikaze_idle_seconds = seconds;
+            save_challenge_config(self.app.project_root(), &config)?;
             self.message = format!("Saved Kamikaze idle threshold: {seconds} seconds");
+        } else if let Some(value) = cmd.strip_prefix("challenge-pauses ") {
+            let pauses = value.trim().parse::<u8>()?;
+            if pauses > 20 {
+                return Err("grace pause count must be between 0 and 20".into());
+            }
+            let mut config = load_challenge_config(self.app.project_root())?;
+            config.grace_pauses = pauses;
+            save_challenge_config(self.app.project_root(), &config)?;
+            self.message = format!("Saved challenge grace pauses: {pauses}");
+        } else if let Some(value) = cmd.strip_prefix("challenge-delete-rate ") {
+            let rate = value.trim().parse::<u32>()?;
+            if !(1..=100).contains(&rate) {
+                return Err("deletion rate must be between 1 and 100 words per penalty".into());
+            }
+            let mut config = load_challenge_config(self.app.project_root())?;
+            config.deletion_words_per_penalty = rate;
+            save_challenge_config(self.app.project_root(), &config)?;
+            self.message =
+                format!("Saved progressive deletion rate: {rate} words per penalty step");
+        } else if let Some(value) = cmd.strip_prefix("challenge-taunt ") {
+            let taunt = value.trim();
+            if taunt.is_empty()
+                || taunt.len() > 200
+                || taunt.chars().any(char::is_control)
+                || !taunt.contains("{words}")
+            {
+                return Err("taunt must be 1–200 printable characters and include {words}".into());
+            }
+            let mut config = load_challenge_config(self.app.project_root())?;
+            config.failure_taunt = taunt.to_owned();
+            save_challenge_config(self.app.project_root(), &config)?;
+            self.message = "Saved the challenge failure taunt".into();
         } else if let Some(rest) = cmd.strip_prefix("snippet ") {
             let (name, body) = rest.split_once(' ').ok_or("use snippet NAME TEXT")?;
             self.snippets.insert(name.to_owned(), body.to_owned());
@@ -4562,13 +4782,13 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [steady|kamikaze] | challenge-finish | challenge-idle SECONDS | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
     fn finish_active_challenge(
         &mut self,
-        abandoned: bool,
+        requested_outcome: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let challenge = self
             .active_challenge
@@ -4576,26 +4796,56 @@ impl AppState {
             .ok_or("no active writing challenge")?;
         let current = story_core::count_words(&self.editor.join("\n"));
         let written = current.saturating_sub(challenge.initial_words);
-        self.app
-            .finish_writing_challenge(&challenge.id, written, abandoned)?;
+        self.persist_challenge_draft()?;
+        let outcome = if written >= challenge.target_words {
+            "success"
+        } else {
+            requested_outcome
+        };
+        self.app.finish_writing_challenge_detailed(
+            &challenge.id,
+            written,
+            challenge.words_deleted,
+            challenge.pauses_consumed,
+            outcome,
+        )?;
         self.active_challenge = None;
-        let elapsed = challenge.deadline.saturating_duration_since(Instant::now());
-        self.message = format!(
-            "Challenge {}: {written}/{} new words recorded{}",
-            if abandoned {
-                "abandoned"
-            } else if elapsed.is_zero() {
-                "time expired"
-            } else {
-                "complete"
-            },
-            challenge.target_words,
-            if abandoned {
-                String::new()
-            } else {
-                format!(" · {} seconds remaining", elapsed.as_secs())
-            }
-        );
+        self.editor = challenge.previous_editor;
+        self.cursor = challenge.previous_cursor;
+        self.dirty = challenge.previous_dirty;
+        self.editing_scene = challenge.previous_scene;
+        self.saved_hash = challenge.previous_hash;
+        self.editor_selection = challenge.previous_selection;
+        self.workspace = challenge.previous_workspace;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        let success = outcome == "success";
+        let seconds_remaining = challenge
+            .deadline
+            .saturating_duration_since(Instant::now())
+            .as_secs();
+        let elapsed_seconds =
+            u64::from(challenge.duration_seconds).saturating_sub(seconds_remaining);
+        self.message = if success {
+            format!(
+                "Success: {written}/{} words in {elapsed_seconds}s; {} lost and {} pauses used. Draft kept separately; use challenge-save-new to save it.",
+                challenge.target_words, challenge.words_deleted, challenge.pauses_consumed
+            )
+        } else if outcome == "quit" {
+            format!(
+                "YOU HAVE FAILED. {} {} words lost in {elapsed_seconds}s. Your pitiful effort is recoverable; use challenge-save-new to save it or challenge-discard to remove it.",
+                render_challenge_taunt(&challenge.failure_taunt, written, challenge.words_deleted,),
+                challenge.words_deleted,
+            )
+        } else {
+            format!(
+                "YOU HAVE FAILED: {} {written}/{} words in {elapsed_seconds}s; {} lost and {} pauses used. Draft preserved separately; use challenge-save-new to save it.",
+                render_challenge_taunt(&challenge.failure_taunt, written, challenge.words_deleted,),
+                challenge.target_words,
+                challenge.words_deleted,
+                challenge.pauses_consumed,
+            )
+        };
         Ok(())
     }
     fn apply_edit_macro(
@@ -4673,7 +4923,18 @@ impl AppState {
         };
         let now = Instant::now();
         if now >= challenge.deadline {
-            self.finish_active_challenge(false)?;
+            self.finish_active_challenge("timeout")?;
+            return Ok(false);
+        }
+        if self.workspace != Workspace::Editor
+            || self.mode.is_some()
+            || self.menu.is_some()
+            || self.reference_focused
+        {
+            self.active_challenge
+                .as_mut()
+                .expect("challenge remains active")
+                .last_activity = now;
             return Ok(false);
         }
         if challenge.mode != "kamikaze"
@@ -4682,43 +4943,66 @@ impl AppState {
         {
             return Ok(false);
         }
-        let idle_seconds = self
-            .active_challenge
-            .as_ref()
-            .expect("challenge remains active")
-            .kamikaze_idle_seconds;
-        self.active_challenge
-            .as_mut()
-            .expect("challenge remains active")
-            .last_activity = now;
-        self.push_undo();
-        let row = self.cursor.0;
-        while self.cursor.1 > 0
-            && self.editor[row]
-                .graphemes(true)
-                .nth(self.cursor.1 - 1)
-                .is_some_and(|g| g.chars().all(char::is_whitespace))
-        {
-            self.backspace();
+        let (deleted, idle_seconds, previous_deleted) = {
+            let challenge = self
+                .active_challenge
+                .as_mut()
+                .expect("challenge remains active");
+            challenge.last_activity = now;
+            if challenge.grace_pauses_remaining > 0 {
+                challenge.grace_pauses_remaining -= 1;
+                challenge.pauses_consumed = challenge.pauses_consumed.saturating_add(1);
+                self.message = format!(
+                    "Kamikaze grace pause used; {} automatic pause(s) remain",
+                    challenge.grace_pauses_remaining
+                );
+                return Ok(false);
+            }
+            challenge.penalties_applied = challenge.penalties_applied.saturating_add(1);
+            (
+                challenge
+                    .penalties_applied
+                    .saturating_mul(challenge.deletion_words_per_penalty),
+                challenge.kamikaze_idle_seconds,
+                challenge.words_deleted,
+            )
+        };
+        if deleted == 0 {
+            self.message = "Kamikaze is armed; the isolated draft is empty".into();
+            return Ok(false);
         }
-        let before = self.cursor.1;
-        while self.cursor.1 > 0
-            && self.editor[row]
-                .graphemes(true)
-                .nth(self.cursor.1 - 1)
-                .is_some_and(|g| !g.chars().all(char::is_whitespace))
-        {
-            self.backspace();
-        }
-        if before > self.cursor.1 {
+        let before = self.editor.join("\n");
+        let after = remove_last_words(&before, deleted);
+        if after != before {
+            let before_count = story_core::count_words(&before);
+            let after_count = story_core::count_words(&after);
+            let removed = before_count.saturating_sub(after_count);
+            self.active_challenge
+                .as_mut()
+                .expect("challenge remains active")
+                .words_deleted = previous_deleted.saturating_add(removed);
+            self.editor = after.lines().map(str::to_owned).collect();
+            if self.editor.is_empty() {
+                self.editor.push(String::new());
+            }
+            self.cursor =
+                editor_position_from_byte(&self.editor.join("\n"), self.editor.join("\n").len())
+                    .unwrap_or((0, 0));
+            self.dirty = true;
+            self.undo_stack.clear();
+            self.redo_stack.clear();
             self.message = format!(
-                "Kamikaze: removed the last word after {} seconds of inactivity; Undo restores it",
-                idle_seconds
+                "Kamikaze removed {deleted} word(s) after {idle_seconds}s idle. Penalties cannot be undone during the challenge."
             );
         } else {
-            self.message = "Kamikaze is armed; keep drafting to avoid word loss".into();
+            self.message = "Kamikaze is armed; the isolated draft is empty".into();
         }
         Ok(self.dirty)
+    }
+    fn pause_challenge_inactivity(&mut self) {
+        if let Some(challenge) = &mut self.active_challenge {
+            challenge.last_activity = Instant::now();
+        }
     }
     fn insert_text_at_cursor(&mut self, insertion: &str) -> Result<(), Box<dyn std::error::Error>> {
         let original = self.editor.join("\n");
@@ -4740,6 +5024,9 @@ impl AppState {
         Ok(())
     }
     fn insert_text_char(&mut self, ch: char) {
+        if let Some(challenge) = &mut self.active_challenge {
+            challenge.last_activity = Instant::now();
+        }
         if self.editor_selection.is_none() && !self.extra_cursors.is_empty() {
             let original = self.editor.join("\n");
             let mut cursors = vec![self.cursor];
@@ -5148,7 +5435,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("usage: writers-ide-tui <project-path>")?;
     let project_path = std::path::PathBuf::from(path);
     let function_bindings = load_bindings(&project_path)?;
-    let app = WriterApp::open_project(&project_path)?;
+    let mut app = WriterApp::open_project(&project_path)?;
+    app.recover_interrupted_writing_challenges()?;
     let mut state = AppState::new(app, function_bindings);
     state.restore_session()?;
     state.refresh()?;
@@ -5189,6 +5477,14 @@ fn run(
             match event::read()? {
                 Event::Key(k) => {
                     let should_quit = handle(s, k)?;
+                    if s.active_challenge.as_ref().is_some_and(|challenge| {
+                        story_core::count_words(&s.editor.join("\n")) >= challenge.target_words
+                    }) {
+                        s.finish_active_challenge("success")?;
+                    }
+                    if s.active_challenge.is_some() {
+                        s.persist_challenge_draft()?;
+                    }
                     autosave_deadline = if s.dirty {
                         Some(Instant::now() + Duration::from_secs(2))
                     } else {
@@ -5204,11 +5500,20 @@ fn run(
                 Event::Paste(text) if s.workspace == Workspace::Editor => {
                     s.push_undo();
                     s.paste_text(&text);
+                    if s.active_challenge.as_ref().is_some_and(|challenge| {
+                        story_core::count_words(&s.editor.join("\n")) >= challenge.target_words
+                    }) {
+                        s.finish_active_challenge("success")?;
+                    }
+                    if s.active_challenge.is_some() {
+                        s.persist_challenge_draft()?;
+                    }
                     autosave_deadline = Some(Instant::now() + Duration::from_secs(2));
                     if let Err(error) = s.save_session() {
                         s.message = format!("Session state could not be saved: {error}");
                     }
                 }
+                Event::Resize(_, _) => s.pause_challenge_inactivity(),
                 _ => {}
             }
         }
@@ -5230,7 +5535,7 @@ fn run(
         }
     }
     if s.active_challenge.is_some() {
-        s.finish_active_challenge(true)?;
+        s.finish_active_challenge("quit")?;
     }
     Ok(())
 }
@@ -5600,8 +5905,8 @@ fn challenge_footer(challenge: &ActiveWritingChallenge, editor: &[String]) -> St
             .kamikaze_idle_seconds
             .saturating_sub(challenge.last_activity.elapsed().as_secs());
         format!(
-            "Challenge {remaining}s · {written}/{} words · kamikaze in {idle_remaining}s",
-            challenge.target_words
+            "Challenge {remaining}s · {written}/{} words · {} grace pause(s) · kamikaze in {idle_remaining}s",
+            challenge.target_words, challenge.grace_pauses_remaining
         )
     } else {
         format!(
@@ -5609,6 +5914,105 @@ fn challenge_footer(challenge: &ActiveWritingChallenge, editor: &[String]) -> St
             challenge.target_words, challenge.mode
         )
     }
+}
+
+fn remove_last_words(source: &str, count: u32) -> String {
+    let graphemes = source.graphemes(true).collect::<Vec<_>>();
+    let mut start = graphemes.len();
+    for _ in 0..count {
+        while start > 0 && graphemes[start - 1].chars().all(char::is_whitespace) {
+            start -= 1;
+        }
+        let word_end = start;
+        while start > 0 && !graphemes[start - 1].chars().all(char::is_whitespace) {
+            start -= 1;
+        }
+        if start == word_end {
+            break;
+        }
+    }
+    let byte_start = graphemes.iter().take(start).map(|g| g.len()).sum::<usize>();
+    source[..byte_start].to_owned()
+}
+
+fn render_challenge_taunt(template: &str, words: u32, deleted: u32) -> String {
+    template
+        .replace("{words}", &words.to_string())
+        .replace("{deleted}", &deleted.to_string())
+}
+
+fn parse_challenge_command(
+    command: &str,
+) -> Result<Option<ChallengeStart>, Box<dyn std::error::Error>> {
+    let parsed = if let Some(rest) = command.strip_prefix("challenge-start ") {
+        let mut parts = rest.split_whitespace();
+        let target = parts
+            .next()
+            .ok_or("use challenge-start TARGET_WORDS DURATION_SECONDS [pressure|kamikaze]")?
+            .parse::<u32>()?;
+        let seconds = parts
+            .next()
+            .ok_or("missing challenge duration")?
+            .parse::<u32>()?;
+        let tail = parts.collect::<Vec<_>>();
+        let (mode, destination) = parse_challenge_tail(&tail)?;
+        (target, seconds, mode, destination)
+    } else if let Some(rest) = command.strip_prefix("challenge-preset ") {
+        let mut parts = rest.split_whitespace();
+        let preset = parts
+            .next()
+            .ok_or("use challenge-preset short|standard|long [pressure|kamikaze]")?;
+        let tail = parts.collect::<Vec<_>>();
+        let (mode, destination) = parse_challenge_tail(&tail)?;
+        let (target, seconds) = match preset {
+            "short" => (250, 5 * 60),
+            "standard" => (500, 10 * 60),
+            "long" => (1_000, 30 * 60),
+            _ => return Err("unknown challenge preset".into()),
+        };
+        (target, seconds, mode, destination)
+    } else {
+        return Ok(None);
+    };
+    if parsed.0 == 0 || parsed.1 == 0 {
+        return Err(
+            "challenge requires positive target/duration and mode pressure|kamikaze".into(),
+        );
+    }
+    Ok(Some(ChallengeStart {
+        target_words: parsed.0,
+        duration_seconds: parsed.1,
+        mode: parsed.2,
+        destination_scene: parsed.3,
+    }))
+}
+
+fn parse_challenge_tail(
+    tail: &[&str],
+) -> Result<(String, Option<SceneId>), Box<dyn std::error::Error>> {
+    let mut index = 0;
+    let mode = if tail
+        .first()
+        .is_some_and(|mode| matches!(*mode, "pressure" | "steady" | "kamikaze"))
+    {
+        index = 1;
+        tail[0]
+    } else {
+        "pressure"
+    };
+    let destination_argument = tail.get(index);
+    if tail.len() > index + usize::from(destination_argument.is_some()) {
+        return Err("too many challenge options".into());
+    }
+    let destination = destination_argument
+        .map(|item| {
+            let id = item
+                .strip_prefix("scene=")
+                .ok_or("challenge option must use scene=UUID")?;
+            Ok::<SceneId, Box<dyn std::error::Error>>(SceneId(uuid::Uuid::parse_str(id)?))
+        })
+        .transpose()?;
+    Ok((mode.to_owned(), destination))
 }
 
 fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
@@ -6452,6 +6856,9 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             rows.extend(challenge_progress_rows(
                 &s.app.list_writing_challenges().unwrap_or_default(),
             ));
+            rows.extend(challenge_hall_rows(
+                &s.app.list_writing_challenges().unwrap_or_default(),
+            ));
             rows.extend(daily_writing_rows(
                 &s.app.list_writing_challenges().unwrap_or_default(),
             ));
@@ -6545,12 +6952,57 @@ fn challenge_progress_rows(challenges: &[story_storage::WritingChallengeRecord])
                     .min(20)) as usize
             };
             let bar = format!("{}{}", "█".repeat(filled), "░".repeat(20 - filled));
+            let elapsed = challenge
+                .ended_at
+                .unwrap_or(challenge.deadline_at)
+                .saturating_sub(challenge.started_at)
+                .max(0);
             format!(
-                "Challenge · {} · {written}/{} words · {bar} · {} · {}",
-                challenge.mode, challenge.target_words, challenge.status, challenge.started_at
+                "Challenge · {} · {written}/{} words · {bar} · {} · {} · {elapsed}s · lost {} · pauses {}",
+                challenge.mode,
+                challenge.target_words,
+                challenge.outcome,
+                challenge.started_at,
+                challenge.words_deleted,
+                challenge.pauses_consumed
             )
         })
         .collect()
+}
+
+fn challenge_hall_rows(challenges: &[story_storage::WritingChallengeRecord]) -> Vec<String> {
+    let failures = challenges
+        .iter()
+        .filter(|challenge| challenge.outcome == "timeout" || challenge.outcome == "quit")
+        .collect::<Vec<_>>();
+    let lost = failures
+        .iter()
+        .map(|challenge| u64::from(challenge.words_deleted))
+        .sum::<u64>();
+    let best = challenges
+        .iter()
+        .filter(|challenge| challenge.outcome == "success")
+        .map(|challenge| challenge.words_written.unwrap_or(0))
+        .max()
+        .unwrap_or(0);
+    let mut rows = vec![format!(
+        "Hall of Shame · {} failed/quit · {lost} words lost · personal best {best} words",
+        failures.len()
+    )];
+    rows.extend(failures.into_iter().map(|challenge| {
+        format!(
+            "Failed challenge · {} retained · {} deleted · {} pauses · {}",
+            challenge.words_written.unwrap_or(0),
+            challenge.words_deleted,
+            challenge.pauses_consumed,
+            if challenge.outcome == "quit" {
+                "YOU QUIT BEFORE THE WORDS DID"
+            } else {
+                "TIME WON THIS ROUND"
+            }
+        )
+    }));
+    rows
 }
 
 fn daily_writing_rows(challenges: &[story_storage::WritingChallengeRecord]) -> Vec<String> {
@@ -6753,11 +7205,87 @@ fn challenge_config_path(root: &Path) -> std::path::PathBuf {
     root.join(".writers-ide/challenge.toml")
 }
 
+fn challenge_draft_path(directory: &Path, id: &str) -> std::path::PathBuf {
+    directory.join(format!("challenge-{id}.json"))
+}
+
+fn remove_challenge_draft(root: &Path, id: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let directory = root.join(".writers-ide/recovery");
+    let path = challenge_draft_path(&directory, id);
+    fs::remove_file(path)?;
+    fs::File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+fn read_challenge_draft(
+    root: &Path,
+    id: &str,
+) -> Result<ChallengeDraftFile, Box<dyn std::error::Error>> {
+    let id = uuid::Uuid::parse_str(id)?.to_string();
+    let path = challenge_draft_path(&root.join(".writers-ide/recovery"), &id);
+    let draft: ChallengeDraftFile = serde_json::from_slice(&fs::read(path)?)?;
+    if draft.version != 1
+        || draft.challenge_id != id
+        || draft.target_words == 0
+        || draft.duration_seconds == 0
+        || !matches!(draft.mode.as_str(), "steady" | "pressure" | "kamikaze")
+    {
+        return Err("challenge recovery record identity or version mismatch".into());
+    }
+    Ok(draft)
+}
+
+fn list_challenge_drafts(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
+    let directory = root.join(".writers-ide/recovery");
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok("No recoverable challenge drafts".into());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut drafts = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(id) = name
+            .strip_prefix("challenge-")
+            .and_then(|name| name.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        match read_challenge_draft(root, id) {
+            Ok(draft) => drafts.push(format!(
+                "{} · {} words · {} · {} lost · {} pauses · use challenge-save-new {} CHAPTER-UUID TITLE or challenge-discard {}",
+                draft.challenge_id,
+                story_core::count_words(&draft.text),
+                draft.mode,
+                draft.words_deleted,
+                draft.pauses_consumed,
+                draft.challenge_id,
+                draft.challenge_id
+            )),
+            Err(error) => drafts.push(format!("{id} · recovery record needs inspection: {error}")),
+        }
+    }
+    drafts.sort();
+    if drafts.is_empty() {
+        Ok("No recoverable challenge drafts".into())
+    } else {
+        Ok(drafts.join("\n"))
+    }
+}
+
 fn load_challenge_config(root: &Path) -> Result<ChallengeConfig, Box<dyn std::error::Error>> {
     match fs::read_to_string(challenge_config_path(root)) {
         Ok(source) => {
             let config: ChallengeConfig = toml::from_str(&source)?;
-            if config.version != 1 || !(1..=3600).contains(&config.kamikaze_idle_seconds) {
+            if config.version != 1
+                || !(1..=3600).contains(&config.kamikaze_idle_seconds)
+                || config.grace_pauses > 20
+                || !(1..=100).contains(&config.deletion_words_per_penalty)
+                || !valid_challenge_taunt(&config.failure_taunt)
+            {
                 return Err("invalid challenge configuration version or idle threshold".into());
             }
             Ok(config)
@@ -6771,7 +7299,12 @@ fn save_challenge_config(
     root: &Path,
     config: &ChallengeConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if config.version != 1 || !(1..=3600).contains(&config.kamikaze_idle_seconds) {
+    if config.version != 1
+        || !(1..=3600).contains(&config.kamikaze_idle_seconds)
+        || config.grace_pauses > 20
+        || !(1..=100).contains(&config.deletion_words_per_penalty)
+        || !valid_challenge_taunt(&config.failure_taunt)
+    {
         return Err("invalid challenge configuration version or idle threshold".into());
     }
     let directory = root.join(".writers-ide");
@@ -6784,6 +7317,13 @@ fn save_challenge_config(
     temporary.persist(challenge_config_path(root))?;
     fs::File::open(directory)?.sync_all()?;
     Ok(())
+}
+
+fn valid_challenge_taunt(taunt: &str) -> bool {
+    !taunt.trim().is_empty()
+        && taunt.len() <= 200
+        && !taunt.chars().any(char::is_control)
+        && taunt.contains("{words}")
 }
 
 fn coverage_report_rows(root: &Path, scenes: &[story_analysis::SceneAnalysisInput]) -> Vec<String> {
@@ -7005,6 +7545,39 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if s.mode.is_some() {
+        if s.mode == Some('c') {
+            match k.code {
+                KeyCode::Esc => {
+                    s.mode = None;
+                    s.prompt.clear();
+                    s.message = "Challenge continues".into();
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    s.persist_challenge_draft()?;
+                    s.finish_active_challenge("quit")?;
+                    return Ok(true);
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    let challenge_id = s
+                        .active_challenge
+                        .as_ref()
+                        .ok_or("no active challenge")?
+                        .id
+                        .clone();
+                    s.finish_active_challenge("quit")?;
+                    let path = challenge_draft_path(
+                        &s.app.project_root().join(".writers-ide/recovery"),
+                        &challenge_id,
+                    );
+                    if path.exists() {
+                        fs::remove_file(path)?;
+                    }
+                    return Ok(true);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
         match k.code {
             KeyCode::Esc => {
                 s.mode = None;
@@ -7197,6 +7770,12 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if k.code == KeyCode::Char('q') && k.modifiers.is_empty() {
+        if s.active_challenge.is_some() {
+            s.mode = Some('c');
+            s.prompt = "Save and quit (s) · Discard and quit (d) · Esc continues".into();
+            s.message = "Choose whether to keep the isolated challenge draft".into();
+            return Ok(false);
+        }
         if s.dirty {
             s.message = "Unsaved text: Ctrl-S to save before quitting".into();
             return Ok(false);
@@ -7589,23 +8168,80 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let mut project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
         let chapter = project.create_chapter(None, "Chapter", 0).unwrap();
-        project.create_scene(chapter, "Scene", 0).unwrap();
+        let scene = project.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, original_hash) = project.load_scene_text(scene).unwrap();
+        project
+            .save_scene_text(scene, Some(&original_hash), "existing manuscript prose")
+            .unwrap();
         let mut state = AppState::new(project, default_bindings());
-        state.editor = vec!["one two".into()];
+        state.open_scene(scene).unwrap();
         state.prompt = "challenge-start 10 60 steady".into();
         state.command().unwrap();
         assert_eq!(state.active_challenge.as_ref().unwrap().mode, "steady");
-        state.editor[0].push_str(" three four");
+        state.editor[0] = "three four".into();
         state.prompt = "challenge-finish".into();
         state.command().unwrap();
-        assert_eq!(state.editor[0], "one two three four");
+        assert_eq!(state.editor[0], "existing manuscript prose");
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "existing manuscript prose"
+        );
         let challenges = state.app.list_writing_challenges().unwrap();
         assert_eq!(challenges[0].words_written, Some(2));
-        assert_eq!(challenges[0].status, "completed");
+        assert_eq!(challenges[0].status, "abandoned");
+        assert_eq!(challenges[0].outcome, "quit");
+        let draft_id = &challenges[0].id;
+        assert!(
+            list_challenge_drafts(state.app.project_root())
+                .unwrap()
+                .contains(draft_id)
+        );
+        state.prompt = format!("challenge-save-new {draft_id} {chapter} Challenge draft");
+        state.command().unwrap();
+        let saved_id = state
+            .scenes
+            .iter()
+            .find(|(_, title, _, _)| title == "Challenge draft")
+            .unwrap()
+            .0;
+        assert_eq!(state.app.load_scene_text(saved_id).unwrap().0, "three four");
     }
 
     #[test]
-    fn kamikaze_only_removes_a_word_after_opt_in_idle_period_and_undo_restores_it() {
+    fn recovered_challenge_can_be_explicitly_appended_to_associated_scene() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "existing prose")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.prompt = format!("challenge-start 10 60 pressure scene={scene}");
+        state.command().unwrap();
+        state.editor[0] = "challenge addition".into();
+        state.prompt = "challenge-finish".into();
+        state.command().unwrap();
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "existing prose"
+        );
+
+        let id = state.app.list_writing_challenges().unwrap()[0].id.clone();
+        state.prompt = format!("challenge-save-target {id}");
+        state.command().unwrap();
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "existing prose\n\nchallenge addition"
+        );
+        assert!(
+            !challenge_draft_path(&state.app.project_root().join(".writers-ide/recovery"), &id)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn kamikaze_uses_two_grace_pauses_and_penalties_are_not_undoable() {
         let root = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
         let mut state = AppState::new(app, default_bindings());
@@ -7617,24 +8253,247 @@ mod tests {
                 .kamikaze_idle_seconds,
             2
         );
-        state.editor = vec!["one two".into()];
-        state.cursor = (0, 7);
         state.prompt = "challenge-start 10 60 kamikaze".into();
         state.command().unwrap();
+        state.editor = vec!["one two three".into()];
+        state.cursor = (0, 13);
+        for remaining in [1, 0] {
+            state.active_challenge.as_mut().unwrap().last_activity =
+                Instant::now() - Duration::from_secs(3);
+            assert!(!state.tick_challenge().unwrap());
+            assert_eq!(
+                state
+                    .active_challenge
+                    .as_ref()
+                    .unwrap()
+                    .grace_pauses_remaining,
+                remaining
+            );
+            assert_eq!(state.editor[0], "one two three");
+        }
         state.active_challenge.as_mut().unwrap().last_activity =
             Instant::now() - Duration::from_secs(3);
         assert!(state.tick_challenge().unwrap());
-        assert_eq!(state.editor[0], "one ");
-        assert!(state.message.contains("after 2 seconds"));
+        assert_eq!(state.editor[0], "one two ");
+        assert!(state.message.contains("after 2s"));
         state.undo_edit();
-        assert_eq!(state.editor[0], "one two");
+        assert_eq!(state.editor[0], "one two ");
+
+        state.active_challenge.as_mut().unwrap().last_activity =
+            Instant::now() - Duration::from_secs(3);
+        state.tick_challenge().unwrap();
+        assert_eq!(state.editor[0], "");
+        assert_eq!(state.active_challenge.as_ref().unwrap().words_deleted, 3);
 
         let footer = challenge_footer(
             state.active_challenge.as_ref().unwrap(),
             &["one two three".into()],
         );
-        assert!(footer.contains("1/10 words"));
+        assert!(footer.contains("3/10 words"));
         assert!(footer.contains("kamikaze in 2s"));
+    }
+
+    #[test]
+    fn challenge_penalty_deletes_progressively_and_respects_unicode_graphemes() {
+        assert_eq!(remove_last_words("Élodie met 🌙", 1), "Élodie met ");
+        assert_eq!(remove_last_words("one two three", 2), "one ");
+        assert_eq!(remove_last_words("", 3), "");
+        let short = parse_challenge_command("challenge-preset short kamikaze")
+            .unwrap()
+            .unwrap();
+        assert_eq!((short.target_words, short.duration_seconds), (250, 300));
+        assert_eq!(short.mode, "kamikaze");
+        let custom = parse_challenge_command("challenge-start 100 120 pressure")
+            .unwrap()
+            .unwrap();
+        assert_eq!((custom.target_words, custom.duration_seconds), (100, 120));
+        assert_eq!(custom.mode, "pressure");
+        assert_eq!(custom.destination_scene, None);
+        let scene = SceneId(uuid::Uuid::nil());
+        let associated =
+            parse_challenge_command(&format!("challenge-start 100 120 kamikaze scene={scene}"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(associated.destination_scene, Some(scene));
+    }
+
+    #[test]
+    fn interface_navigation_and_resize_pause_kamikaze_inactivity_clock() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.prompt = "challenge-start 10 600 kamikaze".into();
+        state.command().unwrap();
+        state.editor[0] = "keep this draft".into();
+        state.workspace = Workspace::Dashboard;
+        state.active_challenge.as_mut().unwrap().last_activity =
+            Instant::now() - Duration::from_secs(30);
+        assert!(!state.tick_challenge().unwrap());
+        assert_eq!(state.editor[0], "keep this draft");
+        assert_eq!(
+            state
+                .active_challenge
+                .as_ref()
+                .unwrap()
+                .grace_pauses_remaining,
+            2
+        );
+
+        state.pause_challenge_inactivity();
+        assert!(
+            state
+                .active_challenge
+                .as_ref()
+                .unwrap()
+                .last_activity
+                .elapsed()
+                < Duration::from_secs(1)
+        );
+    }
+
+    #[test]
+    fn challenge_grace_and_progressive_deletion_settings_are_captured_per_session() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.prompt = "challenge-pauses 0".into();
+        state.command().unwrap();
+        state.prompt = "challenge-delete-rate 2".into();
+        state.command().unwrap();
+        state.prompt = "challenge-taunt {words} retained; {deleted} lost".into();
+        state.command().unwrap();
+        state.prompt = "challenge-start 20 600 kamikaze".into();
+        state.command().unwrap();
+        assert_eq!(
+            state
+                .active_challenge
+                .as_ref()
+                .unwrap()
+                .grace_pauses_remaining,
+            0
+        );
+        assert_eq!(
+            state
+                .active_challenge
+                .as_ref()
+                .unwrap()
+                .deletion_words_per_penalty,
+            2
+        );
+        assert_eq!(
+            state.active_challenge.as_ref().unwrap().failure_taunt,
+            "{words} retained; {deleted} lost"
+        );
+        assert_eq!(render_challenge_taunt("{words}/{deleted}", 9, 4), "9/4");
+        state.editor = vec!["one two three".into()];
+        state.active_challenge.as_mut().unwrap().last_activity =
+            Instant::now() - Duration::from_secs(11);
+        state.tick_challenge().unwrap();
+        assert_eq!(state.editor[0], "one ");
+    }
+
+    #[test]
+    fn isolated_challenge_draft_is_recoverable_after_project_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Book");
+        let project = WriterApp::create_project(&project_path, "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.prompt = "challenge-start 100 600 pressure".into();
+        state.command().unwrap();
+        state.editor = vec!["surviving challenge text".into()];
+        state.persist_challenge_draft().unwrap();
+        let challenge_id = state.active_challenge.as_ref().unwrap().id.clone();
+        drop(state);
+
+        let mut reopened = WriterApp::open_project(&project_path).unwrap();
+        reopened.recover_interrupted_writing_challenges().unwrap();
+        let recovered = read_challenge_draft(reopened.project_root(), &challenge_id).unwrap();
+        assert_eq!(recovered.text, "surviving challenge text");
+        let interrupted = reopened
+            .list_writing_challenges()
+            .unwrap()
+            .into_iter()
+            .find(|challenge| challenge.id == challenge_id)
+            .unwrap();
+        assert_eq!(interrupted.status, "abandoned");
+        assert_eq!(interrupted.outcome, "quit");
+        assert!(
+            list_challenge_drafts(reopened.project_root())
+                .unwrap()
+                .contains(&challenge_id)
+        );
+    }
+
+    #[test]
+    fn challenge_success_is_recorded_and_early_quit_offers_save_or_discard() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.prompt = "challenge-start 2 600 pressure".into();
+        state.command().unwrap();
+        state.editor[0] = "two words".into();
+        state.prompt = "challenge-finish".into();
+        state.command().unwrap();
+        let completed = state.app.list_writing_challenges().unwrap();
+        assert_eq!(completed[0].outcome, "success");
+        assert!(state.message.contains("Success: 2/2 words"));
+        state.prompt = format!("challenge-discard {}", completed[0].id);
+        state.command().unwrap();
+
+        state.prompt = "challenge-start 100 600 kamikaze".into();
+        state.command().unwrap();
+        let quit_id = state.active_challenge.as_ref().unwrap().id.clone();
+        let quit = handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!quit);
+        assert_eq!(state.mode, Some('c'));
+        assert!(state.prompt.contains("Discard and quit"));
+        let quit = handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(quit);
+        let quit_record = state
+            .app
+            .list_writing_challenges()
+            .unwrap()
+            .into_iter()
+            .find(|challenge| challenge.id == quit_id)
+            .unwrap();
+        assert_eq!(quit_record.outcome, "quit");
+        assert_eq!(
+            list_challenge_drafts(state.app.project_root()).unwrap(),
+            "No recoverable challenge drafts"
+        );
+
+        state.prompt = "challenge-start 100 600 pressure".into();
+        state.command().unwrap();
+        state.editor[0] = "save this draft".into();
+        let quit_id = state.active_challenge.as_ref().unwrap().id.clone();
+        assert!(
+            !handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+        assert!(
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            read_challenge_draft(state.app.project_root(), &quit_id)
+                .unwrap()
+                .text,
+            "save this draft"
+        );
     }
 
     #[test]
@@ -7747,6 +8606,9 @@ mod tests {
                 ended_at: Some(30),
                 words_written: Some(5),
                 status: "completed".into(),
+                words_deleted: 2,
+                pauses_consumed: 2,
+                outcome: "timeout".into(),
             },
             story_storage::WritingChallengeRecord {
                 id: "b".into(),
@@ -7757,6 +8619,9 @@ mod tests {
                 ended_at: Some(30),
                 words_written: Some(100),
                 status: "completed".into(),
+                words_deleted: 0,
+                pauses_consumed: 0,
+                outcome: "success".into(),
             },
         ]);
         assert!(rows[0].contains("5/10 words"));
@@ -7776,6 +8641,9 @@ mod tests {
                 ended_at: Some(started_at + 30),
                 words_written,
                 status: "completed".into(),
+                words_deleted: 0,
+                pauses_consumed: 0,
+                outcome: "success".into(),
             };
         let rows = daily_writing_rows(&[
             record("first", 1_700_000_000, Some(120)),

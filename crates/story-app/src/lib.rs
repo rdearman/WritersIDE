@@ -848,8 +848,27 @@ impl WriterApp {
             .store
             .finish_writing_challenge(id, words_written, abandoned)?)
     }
+    pub fn finish_writing_challenge_detailed(
+        &mut self,
+        id: &str,
+        words_written: u32,
+        words_deleted: u32,
+        pauses_consumed: u32,
+        outcome: &str,
+    ) -> Result<()> {
+        Ok(self.store.finish_writing_challenge_detailed(
+            id,
+            words_written,
+            words_deleted,
+            pauses_consumed,
+            outcome,
+        )?)
+    }
     pub fn list_writing_challenges(&self) -> Result<Vec<story_storage::WritingChallengeRecord>> {
         Ok(self.store.list_writing_challenges()?)
+    }
+    pub fn recover_interrupted_writing_challenges(&mut self) -> Result<u64> {
+        Ok(self.store.recover_interrupted_writing_challenges()?)
     }
     pub fn start_writing_session(
         &mut self,
