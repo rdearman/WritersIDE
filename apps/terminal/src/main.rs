@@ -88,6 +88,17 @@ impl Workspace {
         }
     }
 }
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum OutlineRow {
+    Chapter {
+        id: story_core::NodeId,
+        title: String,
+        scene_count: usize,
+        collapsed: bool,
+    },
+    Scene(SceneId),
+}
+
 struct AppState {
     app: WriterApp,
     workspace: Workspace,
@@ -109,6 +120,7 @@ struct AppState {
     vertical_split_ratio: u16,
     assembly_draft: Option<story_core::AssemblyDraftId>,
     planning_board_id: Option<story_core::PlanningBoardId>,
+    collapsed_outline_nodes: BTreeSet<story_core::NodeId>,
     writing_stats_enabled: bool,
     typed_characters: u64,
     pasted_characters: u64,
@@ -268,6 +280,8 @@ struct SessionSnapshot {
     assembly_draft: Option<String>,
     #[serde(default)]
     planning_board_id: Option<String>,
+    #[serde(default)]
+    collapsed_outline_nodes: Vec<String>,
     #[serde(default)]
     writing_stats_enabled: bool,
     #[serde(default)]
@@ -2316,6 +2330,7 @@ impl AppState {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: writing_session.is_some(),
             typed_characters: 0,
             pasted_characters: 0,
@@ -2561,6 +2576,11 @@ impl AppState {
             vertical_split_ratio: self.vertical_split_ratio,
             assembly_draft: self.assembly_draft.map(|id| id.to_string()),
             planning_board_id: self.planning_board_id.map(|id| id.to_string()),
+            collapsed_outline_nodes: self
+                .collapsed_outline_nodes
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
             writing_stats_enabled: self.writing_stats_enabled,
             typed_characters: self.typed_characters,
             pasted_characters: self.pasted_characters,
@@ -2647,7 +2667,7 @@ impl AppState {
                 _ => stale_reference = true,
             }
         }
-        self.selected = snapshot.selected.min(self.scenes.len().saturating_sub(1));
+        self.selected = snapshot.selected;
         if let Some(scene_id) = snapshot
             .selected_scene
             .as_deref()
@@ -2700,6 +2720,17 @@ impl AppState {
             },
             None => None,
         };
+        let structural_nodes = self.app.list_structural_nodes()?;
+        self.collapsed_outline_nodes = snapshot
+            .collapsed_outline_nodes
+            .iter()
+            .filter_map(|value| value.parse::<uuid::Uuid>().ok().map(story_core::NodeId))
+            .filter(|id| {
+                structural_nodes
+                    .iter()
+                    .any(|node| node.id == *id && node.kind == "chapter")
+            })
+            .collect();
         self.horizontal_split_ratio = snapshot.horizontal_split_ratio.clamp(20, 80);
         self.vertical_split_ratio = snapshot.vertical_split_ratio.clamp(20, 80);
         self.writing_stats_enabled =
@@ -2910,6 +2941,24 @@ impl AppState {
             .copied()
             .find(|workspace| workspace.title().eq_ignore_ascii_case(&snapshot.workspace))
             .unwrap_or(Workspace::Dashboard);
+        if self.workspace == Workspace::Outline {
+            let rows = outline_rows(self);
+            if let Some(scene) = snapshot
+                .selected_scene
+                .as_deref()
+                .and_then(|value| value.parse::<uuid::Uuid>().ok())
+                .map(SceneId)
+            {
+                self.selected = rows
+                    .iter()
+                    .position(|row| *row == OutlineRow::Scene(scene))
+                    .unwrap_or_else(|| snapshot.selected.min(rows.len().saturating_sub(1)));
+            } else {
+                self.selected = snapshot.selected.min(rows.len().saturating_sub(1));
+            }
+        } else {
+            self.selected = snapshot.selected.min(self.scenes.len().saturating_sub(1));
+        }
         if stale_reference {
             self.message =
                 "Previous session restored; one removed scene or reading reference was skipped"
@@ -2930,6 +2979,12 @@ impl AppState {
         Ok(())
     }
     fn active_scene(&self) -> Option<SceneId> {
+        if self.workspace == Workspace::Outline {
+            return match outline_rows(self).get(self.selected) {
+                Some(OutlineRow::Scene(id)) => Some(*id),
+                _ => None,
+            };
+        }
         self.scenes.get(self.selected).map(|x| x.0)
     }
     fn current_writing_words(
@@ -3073,6 +3128,20 @@ impl AppState {
         Ok(())
     }
     fn open_selected(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace == Workspace::Outline {
+            match outline_rows(self).get(self.selected).cloned() {
+                Some(OutlineRow::Chapter { id, .. }) => return self.toggle_outline_node(id),
+                Some(OutlineRow::Scene(id)) => {
+                    self.selected = self
+                        .scenes
+                        .iter()
+                        .position(|scene| scene.0 == id)
+                        .ok_or("outline scene no longer exists")?;
+                    return self.open_scene(id);
+                }
+                None => return Ok(()),
+            }
+        }
         if self.workspace == Workspace::Search && !self.search_hits.is_empty() {
             let hit = self
                 .search_hits
@@ -3417,6 +3486,19 @@ impl AppState {
             }
             self.history.push(self.workspace);
             self.history_index = self.history.len() - 1;
+            if w == Workspace::Outline {
+                let current = self
+                    .editing_scene
+                    .or_else(|| self.scenes.get(self.selected).map(|row| row.0));
+                if let Some(scene) = current {
+                    self.selected = outline_rows(self)
+                        .iter()
+                        .position(|row| *row == OutlineRow::Scene(scene))
+                        .unwrap_or(0);
+                } else {
+                    self.selected = 0;
+                }
+            }
             if w == Workspace::Revisions {
                 self.revision_index = 0;
                 self.revision_diff = None;
@@ -3432,10 +3514,42 @@ impl AppState {
         }
     }
     fn selected_scene(&self) -> String {
-        self.scenes
-            .get(self.selected)
-            .map(|s| s.0.to_string())
+        self.active_scene()
+            .map(|id| id.to_string())
             .unwrap_or_else(|| "No scene selected".into())
+    }
+    fn toggle_outline_node(
+        &mut self,
+        node: story_core::NodeId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !self
+            .app
+            .list_structural_nodes()?
+            .iter()
+            .any(|item| item.id == node && item.kind == "chapter")
+        {
+            return Err("outline toggle target must be a chapter".into());
+        }
+        let selected_scene = match outline_rows(self).get(self.selected) {
+            Some(OutlineRow::Scene(scene)) => Some(*scene),
+            _ => None,
+        };
+        if !self.collapsed_outline_nodes.insert(node) {
+            self.collapsed_outline_nodes.remove(&node);
+            self.message = format!("Expanded chapter {node}");
+        } else {
+            self.message = format!("Collapsed chapter {node}");
+        }
+        let rows = outline_rows(self);
+        self.selected = selected_scene
+            .and_then(|scene| rows.iter().position(|row| *row == OutlineRow::Scene(scene)))
+            .or_else(|| {
+                rows.iter()
+                    .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == node))
+            })
+            .unwrap_or_else(|| self.selected.min(rows.len().saturating_sub(1)));
+        self.save_session()?;
+        Ok(())
     }
     fn toggle_menu(&mut self) {
         if self.menu.take().is_some() {
@@ -6216,6 +6330,16 @@ impl AppState {
                 "Reference buffer closed"
             }
             .into();
+        } else if let Some(value) = cmd.strip_prefix("outline-collapse ") {
+            let node = story_core::NodeId(value.trim().parse()?);
+            if !self.collapsed_outline_nodes.contains(&node) {
+                self.toggle_outline_node(node)?;
+            }
+        } else if let Some(value) = cmd.strip_prefix("outline-expand ") {
+            let node = story_core::NodeId(value.trim().parse()?);
+            if self.collapsed_outline_nodes.contains(&node) {
+                self.toggle_outline_node(node)?;
+            }
         } else if let Some(node) = cmd
             .strip_prefix("narrow ")
             .or_else(|| cmd.strip_prefix("hoist "))
@@ -8457,7 +8581,16 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 );
             f.render_widget(canvas, body[1]);
         } else {
-            let detail = if s.workspace == Workspace::Research && s.proposal_review_active {
+            let detail = if s.workspace == Workspace::Outline {
+                let row = workspace_items(s)
+                    .get(s.selected)
+                    .cloned()
+                    .unwrap_or_else(|| "No outline row selected".into());
+                format!(
+                    "{row}\n\nEnter or Space toggles chapter collapse. Enter on a scene opens it.\n\n{}",
+                    s.message
+                )
+            } else if s.workspace == Workspace::Research && s.proposal_review_active {
                 format!(
                     "{}\n\n{}\n\n{}",
                     workspace_items(s)
@@ -9545,6 +9678,62 @@ fn load_proposal_review_rows(app: &WriterApp) -> Result<Vec<String>, Box<dyn std
     Ok(rows)
 }
 
+fn outline_rows(s: &AppState) -> Vec<OutlineRow> {
+    let nodes = s.app.list_structural_nodes().unwrap_or_default();
+    let scenes = s.app.list_scenes(false).unwrap_or_default();
+    let visible_ids = s
+        .scenes
+        .iter()
+        .map(|scene| scene.0)
+        .collect::<BTreeSet<_>>();
+    let all_scene_count = scenes.len();
+    let scenes = scenes
+        .into_iter()
+        .filter(|scene| visible_ids.contains(&scene.scene.id))
+        .collect::<Vec<_>>();
+    let is_hoisted = scenes.len() < all_scene_count;
+    let mut rows = Vec::new();
+    for chapter in nodes.iter().filter(|node| node.kind == "chapter") {
+        let children = scenes
+            .iter()
+            .filter(|scene| scene.chapter_id == Some(chapter.id))
+            .collect::<Vec<_>>();
+        if is_hoisted && children.is_empty() {
+            continue;
+        }
+        let mut path = vec![chapter.title.clone()];
+        let mut parent = chapter.parent_id;
+        while let Some(id) = parent {
+            let Some(node) = nodes.iter().find(|node| node.id == id) else {
+                break;
+            };
+            path.push(node.title.clone());
+            parent = node.parent_id;
+        }
+        path.reverse();
+        rows.push(OutlineRow::Chapter {
+            id: chapter.id,
+            title: path.join(" / "),
+            scene_count: children.len(),
+            collapsed: s.collapsed_outline_nodes.contains(&chapter.id),
+        });
+        if !s.collapsed_outline_nodes.contains(&chapter.id) {
+            rows.extend(
+                children
+                    .into_iter()
+                    .map(|scene| OutlineRow::Scene(scene.scene.id)),
+            );
+        }
+    }
+    rows.extend(
+        scenes
+            .iter()
+            .filter(|scene| scene.chapter_id.is_none())
+            .map(|scene| OutlineRow::Scene(scene.scene.id)),
+    );
+    rows
+}
+
 fn workspace_items(s: &AppState) -> Vec<String> {
     match s.workspace {
         Workspace::Dashboard => vec![
@@ -9558,32 +9747,26 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             ),
             format!("{} words", s.scenes.iter().map(|x| x.3).sum::<u32>()),
         ],
-        Workspace::Outline => {
-            let chapters = s
-                .app
-                .list_structural_nodes()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|node| (node.id, node.title))
-                .collect::<BTreeMap<_, _>>();
-            s.app
-                .list_scenes(false)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|scene| {
-                    let chapter = scene
-                        .chapter_id
-                        .and_then(|id| chapters.get(&id).cloned())
-                        .unwrap_or_else(|| "Unplaced".into());
-                    format!(
-                        "{chapter} / {}   {}   {} words",
-                        scene.scene.title,
-                        scene.scene.status.as_str(),
-                        scene.actual_words
-                    )
-                })
-                .collect()
-        }
+        Workspace::Outline => outline_rows(s)
+            .into_iter()
+            .map(|row| match row {
+                OutlineRow::Chapter {
+                    title,
+                    scene_count,
+                    collapsed,
+                    ..
+                } => format!(
+                    "{} {} · {} scene(s)",
+                    if collapsed { "▸" } else { "▾" },
+                    title,
+                    scene_count
+                ),
+                OutlineRow::Scene(id) => s.scenes.iter().find(|scene| scene.0 == id).map_or_else(
+                    || format!("  <missing scene {id}>"),
+                    |scene| format!("  {}   {}   {} words", scene.1, scene.2.as_str(), scene.3),
+                ),
+            })
+            .collect(),
         Workspace::Cards => s
             .scenes
             .iter()
@@ -11168,6 +11351,12 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.revision_hunk = 0;
                 s.scroll = 0;
                 s.message = format!("Diff for {}", snapshot.label);
+            }
+        }
+        KeyCode::Char(' ') if s.workspace == Workspace::Outline => {
+            if let Some(OutlineRow::Chapter { id, .. }) = outline_rows(s).get(s.selected) {
+                let id = *id;
+                s.toggle_outline_node(id)?;
             }
         }
         KeyCode::Enter if s.workspace == Workspace::Assemblies => {
@@ -12845,7 +13034,7 @@ mod tests {
             app: WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap(),
             workspace: Workspace::Editor,
             scenes: Vec::new(),
-            selected: 0,
+            selected: 1,
             editor: vec!["text".into()],
             editing_scene: None,
             cursor: (0, 4),
@@ -12862,6 +13051,7 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
             pasted_characters: 0,
@@ -13359,6 +13549,61 @@ mod tests {
     }
 
     #[test]
+    fn outline_chapters_collapse_expand_and_restore_without_changing_scene_order() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Outline"), "Outline").unwrap();
+        let first_chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let second_chapter = app.create_chapter(None, "Chapter Two", 1).unwrap();
+        let first = app.create_scene(first_chapter, "Opening", 0).unwrap();
+        let second = app.create_scene(second_chapter, "Arrival", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.switch(Workspace::Outline);
+        let initial = workspace_items(&state);
+        assert_eq!(initial.len(), 4);
+        state.selected = initial
+            .iter()
+            .position(|row| row.contains("Chapter One"))
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .unwrap();
+        let collapsed = workspace_items(&state);
+        assert_eq!(collapsed.len(), 3);
+        assert!(collapsed.iter().all(|row| !row.contains("Opening")));
+        assert!(
+            collapsed
+                .iter()
+                .any(|row| row.contains("Chapter One") && row.contains("▸"))
+        );
+        state.save_session().unwrap();
+        let mut reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        assert_eq!(workspace_items(&reopened), collapsed);
+        assert_eq!(
+            reopened
+                .app
+                .list_scenes(false)
+                .unwrap()
+                .iter()
+                .map(|scene| scene.scene.id)
+                .collect::<Vec<_>>(),
+            [first, second]
+        );
+        handle(
+            &mut reopened,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(workspace_items(&reopened).len(), 4);
+    }
+
+    #[test]
     fn assembly_workspace_lists_assemblies_and_enter_opens_editable_draft() {
         let root = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(root.path().join("Editions"), "Editions").unwrap();
@@ -13774,6 +14019,7 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
             pasted_characters: 0,
@@ -13869,6 +14115,7 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
             pasted_characters: 0,
@@ -13956,6 +14203,7 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
             pasted_characters: 0,
@@ -14038,7 +14286,7 @@ mod tests {
             app,
             workspace: Workspace::Outline,
             scenes,
-            selected: 0,
+            selected: 1,
             editor: vec![String::new()],
             editing_scene: None,
             cursor: (0, 0),
@@ -14055,6 +14303,7 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
             pasted_characters: 0,
@@ -14304,6 +14553,7 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
             pasted_characters: 0,
@@ -14386,7 +14636,7 @@ mod tests {
             app,
             workspace: Workspace::Outline,
             scenes,
-            selected: 0,
+            selected: 1,
             editor: vec![String::new()],
             editing_scene: None,
             cursor: (0, 0),
@@ -14403,6 +14653,7 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
             pasted_characters: 0,
@@ -14519,6 +14770,7 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
             pasted_characters: 0,
@@ -14753,6 +15005,7 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
             pasted_characters: 0,
@@ -15118,6 +15371,7 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
             pasted_characters: 0,
@@ -15228,6 +15482,7 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
             pasted_characters: 0,
@@ -15390,6 +15645,7 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
             pasted_characters: 0,
