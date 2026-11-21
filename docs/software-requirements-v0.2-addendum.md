@@ -153,7 +153,7 @@ Core search helpers now provide literal Normal search, Extended escapes (`\\n`, 
 
 ### Issue #13 — Split reference panes and outline narrowing foundation
 
-The terminal editor supports a read-only scene reference pane with a switchable, session-restored buffer list. `reference-scene <scene-uuid>` opens/selects a stable-ID buffer; Ctrl-Tab changes focus, arrow/Page keys scroll, `reference-next`/`reference-prev` cycle buffers and `reference-close` closes the active one. Layout adapts to terminal width. `narrow <chapter-uuid>` filters the scene list without changing manuscript placement; `widen` restores it. Simultaneously visible reference panes, non-scene references, and persisted narrowing remain open.
+The terminal editor supports read-only scene reference buffers with session-restored stable IDs and scroll offsets. `reference-scene <scene-uuid>` opens/selects a buffer; all open buffers are now rendered simultaneously in adaptive side-by-side panes on wide terminals and stacked panes on narrow terminals. Ctrl-Tab changes focus, arrow/Page keys scroll the active buffer, `reference-next`/`reference-prev` changes the selected buffer and `reference-close` closes it. `narrow <chapter-uuid>` filters the scene list without changing manuscript placement; `widen` restores it, and narrowing is persisted. Non-scene references remain open.
 
 ### Issue #18 — Professional editing and mechanical proofing foundation
 

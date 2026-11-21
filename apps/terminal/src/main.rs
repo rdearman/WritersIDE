@@ -7398,7 +7398,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         } else {
             body[1]
         };
-        if let Some(reference) = s.active_reference_pane() {
+        if !s.reference_panes.is_empty() {
             let panes = Layout::default()
                 .direction(pane_direction(s.width))
                 .constraints([
@@ -7407,31 +7407,39 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 ])
                 .split(editor_and_reference);
             f.render_widget(editor, panes[0]);
-            let reference = Paragraph::new(
-                reference
-                    .content
-                    .lines()
-                    .skip(reference.scroll)
-                    .map(Line::from)
-                    .collect::<Vec<_>>(),
-            )
-            .wrap(Wrap { trim: false })
-            .block(
-                Block::default()
-                    .title(format!(
-                        "{} · buffer {}/{}{} · Ctrl-Tab focus · :reference-next/prev · :reference-close",
-                        reference.title,
-                        s.active_reference + 1,
-                        s.reference_panes.len(),
-                        if s.reference_focused {
-                            " · active"
-                        } else {
-                            ""
-                        }
-                    ))
-                    .borders(Borders::ALL),
-            );
-            f.render_widget(reference, panes[1]);
+            let reference_areas = reference_pane_layout(panes[1], s.reference_panes.len(), s.width);
+            for (index, (reference, area)) in
+                s.reference_panes.iter().zip(reference_areas).enumerate()
+            {
+                let reference = Paragraph::new(
+                    reference
+                        .content
+                        .lines()
+                        .skip(reference.scroll)
+                        .map(Line::from)
+                        .collect::<Vec<_>>(),
+                )
+                .wrap(Wrap { trim: false })
+                .block(
+                    Block::default()
+                        .title(format!(
+                            "{} · {}{}",
+                            reference.title,
+                            index + 1,
+                            if index == s.active_reference {
+                                if s.reference_focused {
+                                    " · active · Ctrl-Tab focus"
+                                } else {
+                                    " · selected · Ctrl-Tab focus"
+                                }
+                            } else {
+                                ""
+                            }
+                        ))
+                        .borders(Borders::ALL),
+                );
+                f.render_widget(reference, area);
+            }
         } else {
             f.render_widget(editor, editor_and_reference);
         }
@@ -8080,6 +8088,19 @@ fn pane_direction(width: usize) -> Direction {
     } else {
         Direction::Horizontal
     }
+}
+
+fn reference_pane_layout(area: Rect, count: usize, terminal_width: usize) -> Vec<Rect> {
+    let count = count.max(1);
+    Layout::default()
+        .direction(if terminal_width >= 160 {
+            Direction::Horizontal
+        } else {
+            Direction::Vertical
+        })
+        .constraints(vec![Constraint::Ratio(1, count as u32); count])
+        .split(area)
+        .to_vec()
 }
 
 fn default_split_ratio() -> u16 {
@@ -12183,6 +12204,20 @@ mod tests {
         assert_eq!(pane_direction(80), Direction::Vertical);
         assert_eq!(pane_direction(99), Direction::Vertical);
         assert_eq!(pane_direction(100), Direction::Horizontal);
+    }
+
+    #[test]
+    fn multiple_reference_buffers_receive_simultaneous_adaptive_panes() {
+        let wide = reference_pane_layout(Rect::new(0, 0, 120, 30), 3, 200);
+        assert_eq!(wide.len(), 3);
+        assert!(wide.iter().all(|area| area.width > 0 && area.height == 30));
+        let narrow = reference_pane_layout(Rect::new(0, 0, 70, 30), 3, 80);
+        assert_eq!(narrow.len(), 3);
+        assert!(
+            narrow
+                .iter()
+                .all(|area| area.height > 0 && area.width == 70)
+        );
     }
     use crossterm::event::KeyModifiers;
 
