@@ -1588,7 +1588,7 @@ fn run_processing_recipe(
     let source = fs::read_to_string(recipe_path)?;
     let recipe = story_pipeline::ProcessingRecipe::from_toml(&source)?;
     let app = WriterApp::open_project(project)?;
-    let reports = app.run_processing_stages(&recipe.stages, recipe.expand_transclusions)?;
+    let reports = app.run_processing_recipe(&recipe)?;
     let incomplete = reports.iter().any(|report| {
         matches!(
             report.status,
@@ -2033,11 +2033,13 @@ mod watch_tests {
         let recipe_path = root.path().join("pipeline.toml");
         fs::write(
             &recipe_path,
-            "version = 1\nstages = [\"word-count\"]\nexpand_transclusions = false\n",
+            "version = 1\nstages = [\"word-count\"]\nexpand_transclusions = false\n[[exports]]\nformat = \"markdown\"\noutput = \"exports/reader.md\"\ndesign = \"manuscript\"\n",
         )
         .unwrap();
         run_processing_recipe(&project, &recipe_path).unwrap();
         assert!(project.join(".writers-ide/pipeline-cache.json").is_file());
+        assert!(project.join("exports/reader.md").is_file());
+        assert!(project.join("exports/reader.md.source-map.json").is_file());
     }
 
     #[test]

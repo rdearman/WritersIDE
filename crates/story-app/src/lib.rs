@@ -405,6 +405,16 @@ impl WriterApp {
                 .run_selected(&input, stages)?,
         )
     }
+    pub fn run_processing_recipe(
+        &self,
+        recipe: &story_pipeline::ProcessingRecipe,
+    ) -> Result<Vec<story_pipeline::StageReport>> {
+        let input = self.processing_input_mode(recipe.expand_transclusions)?;
+        Ok(
+            story_pipeline::PipelineRunner::new(self.store.project_root())
+                .run_recipe(&input, recipe)?,
+        )
+    }
     pub fn save_extraction_proposal(
         &self,
         filename: &str,

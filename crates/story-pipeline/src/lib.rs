@@ -17,6 +17,8 @@ pub enum PipelineError {
     Io(#[from] std::io::Error),
     #[error("processing cache: {0}")]
     Cache(#[from] serde_json::Error),
+    #[error("invalid processing recipe: {0}")]
+    Invalid(String),
 }
 
 #[derive(Clone, Debug)]
@@ -141,9 +143,20 @@ pub struct ProcessingRecipe {
     pub version: u16,
     pub stages: Vec<Stage>,
     #[serde(default)]
+    pub exports: Vec<ProcessingExport>,
+    #[serde(default)]
     pub expand_transclusions: bool,
     #[serde(default = "default_processing_debounce_ms")]
     pub debounce_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProcessingExport {
+    pub format: story_document::CompileFormat,
+    /// Project-relative destination. Processing exports are confined to `exports/`.
+    pub output: String,
+    #[serde(default)]
+    pub design: story_document::BookDesign,
 }
 
 fn default_processing_debounce_ms() -> u64 {
@@ -170,6 +183,19 @@ impl ProcessingRecipe {
         if stages.len() != self.stages.len() {
             return Err("processing recipe contains duplicate stages".into());
         }
+        if self.exports.len() > 16 {
+            return Err("processing recipe may define at most 16 exports".into());
+        }
+        let mut outputs = std::collections::BTreeSet::new();
+        for export in &self.exports {
+            validate_export_path(&export.output, export.format)?;
+            if !outputs.insert(&export.output) {
+                return Err(format!(
+                    "duplicate processing export path: {}",
+                    export.output
+                ));
+            }
+        }
         Ok(())
     }
     pub fn from_toml(source: &str) -> Result<Self, String> {
@@ -181,6 +207,29 @@ impl ProcessingRecipe {
         self.validate()?;
         toml::to_string_pretty(self).map_err(|error| error.to_string())
     }
+}
+
+fn validate_export_path(output: &str, format: story_document::CompileFormat) -> Result<(), String> {
+    let path = Path::new(output);
+    let components = path.components().collect::<Vec<_>>();
+    if path.is_absolute()
+        || output.contains('\\')
+        || components.len() < 2
+        || components
+            .first()
+            .and_then(|component| component.as_os_str().to_str())
+            != Some("exports")
+        || components
+            .iter()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        || path.extension().and_then(|extension| extension.to_str()) != Some(format.extension())
+    {
+        return Err(format!(
+            "processing export must use a safe exports/ path with .{} extension: {output}",
+            format.extension()
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -203,6 +252,8 @@ pub struct StageReport {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Cache {
     stages: BTreeMap<Stage, CacheEntry>,
+    #[serde(default)]
+    exports: BTreeMap<String, ExportCacheEntry>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -210,6 +261,15 @@ struct CacheEntry {
     fingerprint: String,
     artifact_hash: String,
     relative_path: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct ExportCacheEntry {
+    fingerprint: String,
+    relative_path: String,
+    artifact_hash: String,
+    #[serde(default)]
+    auxiliary_files: BTreeMap<String, String>,
 }
 
 pub struct PipelineRunner {
@@ -335,6 +395,234 @@ impl PipelineRunner {
         }
         Ok(reports)
     }
+
+    /// Runs a recipe's ordinary stages, then each format-specific export target. Export targets
+    /// share the semantic Compile IR but have independent fingerprints, artifacts and cache rows.
+    pub fn run_recipe(
+        &self,
+        input: &PipelineInput,
+        recipe: &ProcessingRecipe,
+    ) -> Result<Vec<StageReport>, PipelineError> {
+        recipe.validate().map_err(PipelineError::Invalid)?;
+        let mut requested = recipe.stages.clone();
+        if !recipe.exports.is_empty() && !requested.contains(&Stage::Compile) {
+            requested.push(Stage::Compile);
+        }
+        let mut reports = self.run_selected(input, &requested)?;
+        if recipe.exports.is_empty() {
+            return Ok(reports);
+        }
+        let mut cache: Cache = match fs::read(&self.cache_path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Cache::default(),
+            Err(error) => return Err(error.into()),
+        };
+        let ir = compile_ir(input);
+        for target in &recipe.exports {
+            let relative_path = target.output.clone();
+            let fingerprint = hash(
+                format!(
+                    "{:?}\0{:?}\0{:?}\0{}",
+                    ir, target.format, target.design, input.expand_transclusions
+                )
+                .as_bytes(),
+            );
+            let output_path = match safe_export_path(&self.root, &relative_path) {
+                Ok(path) => path,
+                Err(message) => {
+                    cache.exports.remove(&relative_path);
+                    reports.push(export_report(
+                        StageStatus::Failed,
+                        &relative_path,
+                        Some(fingerprint),
+                        message,
+                    ));
+                    continue;
+                }
+            };
+            let entry = cache.exports.get(&relative_path).filter(|entry| {
+                entry.fingerprint == fingerprint && entry.relative_path == relative_path
+            });
+            let cached = entry.is_some_and(|entry| {
+                fs::read(&output_path).is_ok_and(|bytes| hash(&bytes) == entry.artifact_hash)
+                    && entry.auxiliary_files.iter().all(|(path, expected)| {
+                        safe_export_path(&self.root, path)
+                            .ok()
+                            .and_then(|path| fs::read(path).ok())
+                            .is_some_and(|bytes| hash(&bytes) == *expected)
+                    })
+            });
+            if cached {
+                reports.push(export_report(
+                    StageStatus::Cached,
+                    &relative_path,
+                    Some(fingerprint),
+                    "verified cached export",
+                ));
+                continue;
+            }
+            let artifact = match story_document::PandocRenderer::default().render_with_design(
+                &ir,
+                target.format,
+                Some(&self.root),
+                target.design,
+            ) {
+                Ok(artifact) => artifact,
+                Err(message) => {
+                    cache.exports.remove(&relative_path);
+                    reports.push(export_report(
+                        StageStatus::Failed,
+                        &relative_path,
+                        Some(fingerprint),
+                        message,
+                    ));
+                    continue;
+                }
+            };
+            let mut auxiliary_files = BTreeMap::new();
+            let sidecar_path = format!("{relative_path}.source-map.json");
+            let source_map = match serde_json::to_vec_pretty(&artifact.source_map) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    reports.push(export_report(
+                        StageStatus::Failed,
+                        &relative_path,
+                        Some(fingerprint),
+                        error.to_string(),
+                    ));
+                    continue;
+                }
+            };
+            let mut files = vec![(sidecar_path, source_map)];
+            for auxiliary in artifact.auxiliary_files {
+                if auxiliary.name.contains('/') || auxiliary.name.contains('\\') {
+                    reports.push(export_report(
+                        StageStatus::Failed,
+                        &relative_path,
+                        Some(fingerprint.clone()),
+                        "renderer returned an unsafe auxiliary filename",
+                    ));
+                    files.clear();
+                    break;
+                }
+                files.push((
+                    format!("{relative_path}.{}", auxiliary.name),
+                    auxiliary.bytes,
+                ));
+            }
+            if files.is_empty() {
+                continue;
+            }
+            let mut write_error = atomic_write(&output_path, &artifact.bytes).err();
+            if write_error.is_none() {
+                for (path, bytes) in files {
+                    let destination = match safe_export_path(&self.root, &path) {
+                        Ok(path) => path,
+                        Err(message) => {
+                            write_error = Some(std::io::Error::other(message));
+                            break;
+                        }
+                    };
+                    if let Err(error) = atomic_write(&destination, &bytes) {
+                        write_error = Some(error);
+                        break;
+                    }
+                    auxiliary_files.insert(path, hash(&bytes));
+                }
+            }
+            if let Some(error) = write_error {
+                cache.exports.remove(&relative_path);
+                reports.push(export_report(
+                    StageStatus::Failed,
+                    &relative_path,
+                    Some(fingerprint),
+                    format!("could not persist export: {error}"),
+                ));
+                continue;
+            }
+            cache.exports.insert(
+                relative_path.clone(),
+                ExportCacheEntry {
+                    fingerprint: fingerprint.clone(),
+                    relative_path: relative_path.clone(),
+                    artifact_hash: hash(&artifact.bytes),
+                    auxiliary_files,
+                },
+            );
+            atomic_write(&self.cache_path, &serde_json::to_vec_pretty(&cache)?)?;
+            reports.push(export_report(
+                StageStatus::Complete,
+                &relative_path,
+                Some(fingerprint),
+                "exported format-specific Compile IR artifact and source map",
+            ));
+        }
+        Ok(reports)
+    }
+}
+
+fn export_report(
+    status: StageStatus,
+    path: &str,
+    fingerprint: Option<String>,
+    message: impl Into<String>,
+) -> StageReport {
+    StageReport {
+        stage: Stage::Export,
+        status,
+        fingerprint,
+        message: format!("{path}: {}", message.into()),
+    }
+}
+
+fn safe_export_path(root: &Path, relative: &str) -> Result<PathBuf, String> {
+    let relative_path = Path::new(relative);
+    if relative_path.is_absolute()
+        || relative.contains('\\')
+        || relative_path
+            .components()
+            .next()
+            .and_then(|component| component.as_os_str().to_str())
+            != Some("exports")
+        || relative_path
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(format!("unsafe processing export path: {relative}"));
+    }
+    let mut current = root.to_path_buf();
+    let mut components = relative_path.components().peekable();
+    while let Some(component) = components.next() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(format!("unsafe processing export path: {relative}"));
+        };
+        current.push(name);
+        let is_last = components.peek().is_none();
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "processing export path contains a symlink: {relative}"
+                ));
+            }
+            Ok(metadata) if !is_last && !metadata.is_dir() => {
+                return Err(format!(
+                    "processing export parent is not a directory: {relative}"
+                ));
+            }
+            Ok(metadata) if is_last && !metadata.is_file() => {
+                return Err(format!(
+                    "processing export destination is not a file: {relative}"
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && !is_last => {
+                fs::create_dir(&current).map_err(|error| error.to_string())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(root.join(relative_path))
 }
 
 fn dependency_closure(requested: &[Stage]) -> std::collections::BTreeSet<Stage> {
@@ -920,6 +1208,7 @@ mod tests {
         let recipe = ProcessingRecipe {
             version: 1,
             stages: vec![Stage::WordCount, Stage::Continuity],
+            exports: Vec::new(),
             expand_transclusions: true,
             debounce_ms: 150,
         };
@@ -951,6 +1240,110 @@ mod tests {
         assert!(
             ProcessingRecipe {
                 stages: vec![],
+                ..recipe
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn recipe_exports_have_independent_formats_caches_and_safe_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let runner = PipelineRunner::new(directory.path());
+        let recipe = ProcessingRecipe {
+            version: 1,
+            stages: vec![Stage::Continuity],
+            exports: vec![ProcessingExport {
+                format: story_document::CompileFormat::Markdown,
+                output: "exports/reader.md".into(),
+                design: story_document::BookDesign::Manuscript,
+            }],
+            expand_transclusions: false,
+            debounce_ms: 0,
+        };
+        recipe.validate().unwrap();
+        assert_eq!(
+            ProcessingRecipe::from_toml(&recipe.to_toml().unwrap()).unwrap(),
+            recipe
+        );
+        let reports = runner.run_recipe(&input("Reader copy."), &recipe).unwrap();
+        let export = reports
+            .iter()
+            .find(|report| report.stage == Stage::Export && report.message.contains("reader.md"))
+            .unwrap();
+        assert_eq!(export.status, StageStatus::Complete);
+        assert_eq!(
+            fs::read_to_string(directory.path().join("exports/reader.md")).unwrap(),
+            "## Opening\n\n### Opening\n\nReader copy.\n\n"
+        );
+        assert!(
+            directory
+                .path()
+                .join("exports/reader.md.source-map.json")
+                .is_file()
+        );
+        let cached = runner.run_recipe(&input("Reader copy."), &recipe).unwrap();
+        assert!(cached
+            .iter()
+            .find(|report| report.stage == Stage::Export && report.message.contains("reader.md"))
+            .unwrap()
+            .status
+            == StageStatus::Cached);
+
+        fs::write(directory.path().join("exports/reader.md"), "tampered").unwrap();
+        let repaired = runner.run_recipe(&input("Reader copy."), &recipe).unwrap();
+        assert_eq!(
+            repaired
+                .iter()
+                .find(|report| report.stage == Stage::Export && report.message.contains("reader.md"))
+                .unwrap()
+                .status,
+            StageStatus::Complete
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = directory.path().join("outside");
+            fs::create_dir_all(&outside).unwrap();
+            symlink(&outside, directory.path().join("exports/linked")).unwrap();
+            let linked_recipe = ProcessingRecipe {
+                exports: vec![ProcessingExport {
+                    format: story_document::CompileFormat::Markdown,
+                    output: "exports/linked/story.md".into(),
+                    design: story_document::BookDesign::default(),
+                }],
+                ..recipe.clone()
+            };
+            let reports = runner
+                .run_recipe(&input("Reader copy."), &linked_recipe)
+                .unwrap();
+            assert!(reports.iter().any(|report| {
+                report.stage == Stage::Export
+                    && report.status == StageStatus::Failed
+                    && report.message.contains("symlink")
+            }));
+            assert!(!outside.join("story.md").exists());
+        }
+        assert!(
+            ProcessingRecipe {
+                exports: vec![ProcessingExport {
+                    format: story_document::CompileFormat::Markdown,
+                    output: "exports/../escape.md".into(),
+                    design: story_document::BookDesign::default(),
+                }],
+                ..recipe.clone()
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
+            ProcessingRecipe {
+                exports: vec![ProcessingExport {
+                    format: story_document::CompileFormat::Html,
+                    output: "exports/reader.md".into(),
+                    design: story_document::BookDesign::default(),
+                }],
                 ..recipe
             }
             .validate()
