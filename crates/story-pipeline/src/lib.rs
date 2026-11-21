@@ -87,6 +87,7 @@ pub struct PipelinePassage {
 pub struct PipelineInput {
     pub title: String,
     pub target_words: Option<u64>,
+    pub word_count_policy: story_core::WordCountPolicy,
     pub expand_transclusions: bool,
     pub groups: Vec<PipelineGroup>,
     pub content_units: Vec<PipelineContentUnit>,
@@ -745,7 +746,9 @@ fn stage_fingerprint(
     };
     let extra = if stage == Stage::Compile {
         format!("expand_transclusions={}", input.expand_transclusions)
-    } else if matches!(stage, Stage::WordCount | Stage::Export) {
+    } else if stage == Stage::WordCount {
+        format!("{:?}:{:?}", input.target_words, input.word_count_policy)
+    } else if stage == Stage::Export {
         format!("{:?}", input.target_words)
     } else {
         String::new()
@@ -773,7 +776,7 @@ fn render_stage(
             let text = outputs
                 .get(&Stage::Compile)
                 .ok_or("compiled manuscript unavailable")?;
-            let words = story_core::count_words(text) as usize;
+            let words = story_core::count_words_with_policy(text, input.word_count_policy) as usize;
             let mut output = format!(
                 "{} words\nTarget: {}\n",
                 words,
@@ -1062,7 +1065,7 @@ fn analysis_input(input: &PipelineInput) -> Vec<SceneAnalysisInput> {
             scene_id: scene.id.clone(),
             title: scene.title.clone(),
             chapter_id: None,
-            actual_words: story_core::count_words(&scene.text),
+            actual_words: story_core::count_words_with_policy(&scene.text, input.word_count_policy),
             target_words: scene.target_words,
             start_time: scene.start,
             end_time: scene.end,
@@ -1121,6 +1124,7 @@ mod tests {
         PipelineInput {
             title: "Novel".into(),
             target_words: Some(100),
+            word_count_policy: story_core::WordCountPolicy::UnicodeWords,
             expand_transclusions: false,
             groups: vec![PipelineGroup {
                 id: "chapter-1".into(),
@@ -1169,6 +1173,44 @@ mod tests {
         assert_eq!(changed[2].status, StageStatus::Cached);
         assert_eq!(changed[3].status, StageStatus::Cached);
         assert_eq!(changed[5].status, StageStatus::Complete);
+    }
+
+    #[test]
+    fn word_count_stage_uses_policy_and_invalidates_when_policy_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = PipelineRunner::new(dir.path());
+        let mut manuscript = input("한국어");
+        manuscript.word_count_policy = story_core::WordCountPolicy::UnspacedScriptGraphemes;
+        let first = runner
+            .run_selected(&manuscript, &[Stage::WordCount])
+            .unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .find(|report| report.stage == Stage::WordCount)
+                .unwrap()
+                .status,
+            StageStatus::Complete
+        );
+        let report =
+            fs::read_to_string(dir.path().join(".writers-ide/processing/word-count.txt")).unwrap();
+        assert!(report.contains("5 words"), "{report}");
+        manuscript.word_count_policy = story_core::WordCountPolicy::UnicodeWords;
+        let changed = runner
+            .run_selected(&manuscript, &[Stage::WordCount])
+            .unwrap();
+        assert_eq!(
+            changed
+                .iter()
+                .find(|report| report.stage == Stage::WordCount)
+                .unwrap()
+                .status,
+            StageStatus::Complete
+        );
+        let report =
+            fs::read_to_string(dir.path().join(".writers-ide/processing/word-count.txt")).unwrap();
+        assert!(report.contains("3 words"), "{report}");
+        assert_eq!(analysis_input(&manuscript)[0].actual_words, 1);
     }
 
     #[test]

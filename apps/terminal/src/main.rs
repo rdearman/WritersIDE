@@ -1457,6 +1457,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "project.word-count-policy",
+            "Set Word-count Policy",
+            "Choose Unicode word boundaries or selected unspaced-script grapheme units",
+            "Project",
+            "project-word-count-policy",
+            true,
+        ),
+        legacy_command(
             "assembly.move",
             "Reorder Assembly Item",
             "Reorder content in an assembly only",
@@ -2265,13 +2273,17 @@ fn read_keymap(project: &Path) -> Result<KeymapFile, Box<dyn std::error::Error>>
 }
 impl AppState {
     fn new(app: WriterApp, function_bindings: Vec<(u8, Workspace)>) -> Self {
-        let draft_notice = list_challenge_drafts(app.project_root())
-            .ok()
-            .filter(|notice| notice != "No recoverable challenge drafts")
-            .map(|_| {
-                "Recoverable isolated challenge draft(s) found; use challenge-list-drafts"
-                    .to_owned()
-            });
+        let draft_notice = list_challenge_drafts(
+            app.project_root(),
+            app.get_project()
+                .map(|project| project.word_count_policy)
+                .unwrap_or_default(),
+        )
+        .ok()
+        .filter(|notice| notice != "No recoverable challenge drafts")
+        .map(|_| {
+            "Recoverable isolated challenge draft(s) found; use challenge-list-drafts".to_owned()
+        });
         let (tools, tools_error) = match load_editor_tools(app.project_root()) {
             Ok(tools) => (tools, String::new()),
             Err(error) => (
@@ -3005,17 +3017,26 @@ impl AppState {
             } else {
                 self.app.load_scene_text(scene_id)?.0
             };
-            return Ok(story_core::count_words(&text));
+            return Ok(self.count_words_for_project(&text));
         }
         let mut total = self.scenes.iter().map(|row| u64::from(row.3)).sum::<u64>();
         if let Some(scene_id) = self.editing_scene
             && let Some(row) = self.scenes.iter().find(|row| row.0 == scene_id)
         {
             total = total.saturating_sub(u64::from(row.3));
-            total =
-                total.saturating_add(u64::from(story_core::count_words(&self.editor.join("\n"))));
+            total = total.saturating_add(u64::from(
+                self.count_words_for_project(&self.editor.join("\n")),
+            ));
         }
         Ok(total.min(u64::from(u32::MAX)) as u32)
+    }
+    fn count_words_for_project(&self, text: &str) -> u32 {
+        let policy = self
+            .app
+            .get_project()
+            .map(|project| project.word_count_policy)
+            .unwrap_or_default();
+        story_core::count_words_with_policy(text, policy)
     }
     fn scenes_for_scope(
         &self,
@@ -4027,7 +4048,10 @@ impl AppState {
         } else if cmd == "challenge-finish" {
             self.finish_active_challenge("quit")?;
         } else if cmd == "challenge-list-drafts" {
-            self.message = list_challenge_drafts(self.app.project_root())?;
+            self.message = list_challenge_drafts(
+                self.app.project_root(),
+                self.app.get_project()?.word_count_policy,
+            )?;
         } else if let Some(rest) = cmd.strip_prefix("challenge-save-new ") {
             let (draft_id, rest) = rest
                 .split_once(' ')
@@ -6208,6 +6232,12 @@ impl AppState {
                 "Project language set to {}",
                 self.app.get_project()?.language_code
             );
+        } else if let Some(policy) = cmd.strip_prefix("project-word-count-policy ") {
+            let policy = story_core::WordCountPolicy::parse(policy.trim())
+                .ok_or("policy must be unicode-words or script-graphemes")?;
+            self.app.set_project_word_count_policy(policy)?;
+            self.refresh()?;
+            self.message = format!("Project word-count policy set to {}", policy.as_str());
         } else if let Some(id) = cmd.strip_prefix("reference-scene ") {
             let id = SceneId(id.parse()?);
             let row = self.app.get_scene(id)?;
@@ -7304,7 +7334,7 @@ impl AppState {
             .active_challenge
             .clone()
             .ok_or("no active writing challenge")?;
-        let current = story_core::count_words(&self.editor.join("\n"));
+        let current = self.count_words_for_project(&self.editor.join("\n"));
         let written = current.saturating_sub(challenge.initial_words);
         self.persist_challenge_draft()?;
         let outcome = if written >= challenge.target_words {
@@ -7511,10 +7541,10 @@ impl AppState {
             return Ok(false);
         }
         let before = self.editor.join("\n");
-        let after = remove_last_words(&before, deleted);
+        let after = remove_last_words(&before, deleted, self.app.get_project()?.word_count_policy);
         if after != before {
-            let before_count = story_core::count_words(&before);
-            let after_count = story_core::count_words(&after);
+            let before_count = self.count_words_for_project(&before);
+            let after_count = self.count_words_for_project(&after);
             let removed = before_count.saturating_sub(after_count);
             self.active_challenge
                 .as_mut()
@@ -8122,7 +8152,7 @@ fn run(
                 Event::Key(k) => {
                     let should_quit = handle(s, k)?;
                     if s.active_challenge.as_ref().is_some_and(|challenge| {
-                        story_core::count_words(&s.editor.join("\n")) >= challenge.target_words
+                        s.count_words_for_project(&s.editor.join("\n")) >= challenge.target_words
                     }) {
                         s.finish_active_challenge("success")?;
                     }
@@ -8145,7 +8175,7 @@ fn run(
                     s.push_undo();
                     s.paste_text(&text);
                     if s.active_challenge.as_ref().is_some_and(|challenge| {
-                        story_core::count_words(&s.editor.join("\n")) >= challenge.target_words
+                        s.count_words_for_project(&s.editor.join("\n")) >= challenge.target_words
                     }) {
                         s.finish_active_challenge("success")?;
                     }
@@ -8656,7 +8686,14 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         let challenge = s
             .active_challenge
             .as_ref()
-            .map(|challenge| challenge_footer(challenge, &s.editor))
+            .map(|challenge| {
+                let policy = s
+                    .app
+                    .get_project()
+                    .map(|project| project.word_count_policy)
+                    .unwrap_or_default();
+                challenge_footer(challenge, &s.editor, policy)
+            })
             .unwrap_or_default();
         format!(
             " {}   {}   Enter open | j/k or ↑/↓ select | Tab next | Backspace back | {}",
@@ -8878,8 +8915,12 @@ fn format_planning_board_markdown(
     output
 }
 
-fn challenge_footer(challenge: &ActiveWritingChallenge, editor: &[String]) -> String {
-    let current_words = story_core::count_words(&editor.join("\n"));
+fn challenge_footer(
+    challenge: &ActiveWritingChallenge,
+    editor: &[String],
+    policy: story_core::WordCountPolicy,
+) -> String {
+    let current_words = story_core::count_words_with_policy(&editor.join("\n"), policy);
     let written = current_words.saturating_sub(challenge.initial_words);
     let remaining = challenge
         .deadline
@@ -8901,23 +8942,58 @@ fn challenge_footer(challenge: &ActiveWritingChallenge, editor: &[String]) -> St
     }
 }
 
-fn remove_last_words(source: &str, count: u32) -> String {
-    let graphemes = source.graphemes(true).collect::<Vec<_>>();
-    let mut start = graphemes.len();
-    for _ in 0..count {
-        while start > 0 && graphemes[start - 1].chars().all(char::is_whitespace) {
-            start -= 1;
+fn remove_last_words(source: &str, count: u32, policy: story_core::WordCountPolicy) -> String {
+    let mut starts = Vec::new();
+    match policy {
+        story_core::WordCountPolicy::UnicodeWords => {
+            let graphemes = source.graphemes(true).collect::<Vec<_>>();
+            let mut start = graphemes.len();
+            for _ in 0..count {
+                while start > 0 && graphemes[start - 1].chars().all(char::is_whitespace) {
+                    start -= 1;
+                }
+                let end = start;
+                while start > 0 && !graphemes[start - 1].chars().all(char::is_whitespace) {
+                    start -= 1;
+                }
+                if start == end {
+                    break;
+                }
+            }
+            let byte_start = graphemes.iter().take(start).map(|g| g.len()).sum::<usize>();
+            return source[..byte_start].to_owned();
         }
-        let word_end = start;
-        while start > 0 && !graphemes[start - 1].chars().all(char::is_whitespace) {
-            start -= 1;
-        }
-        if start == word_end {
-            break;
+        story_core::WordCountPolicy::UnspacedScriptGraphemes => {
+            let mut other_run = String::new();
+            let mut other_start = 0;
+            for (byte, grapheme) in source.grapheme_indices(true) {
+                if story_core::is_unspaced_script_grapheme(grapheme) {
+                    starts.extend(
+                        other_run
+                            .unicode_word_indices()
+                            .filter(|(_, segment)| segment.chars().any(char::is_alphanumeric))
+                            .map(|(start, _)| other_start + start),
+                    );
+                    other_run.clear();
+                    starts.push(byte);
+                } else {
+                    if other_run.is_empty() {
+                        other_start = byte;
+                    }
+                    other_run.push_str(grapheme);
+                }
+            }
+            starts.extend(
+                other_run
+                    .unicode_word_indices()
+                    .filter(|(_, segment)| segment.chars().any(char::is_alphanumeric))
+                    .map(|(start, _)| other_start + start),
+            );
         }
     }
-    let byte_start = graphemes.iter().take(start).map(|g| g.len()).sum::<usize>();
-    source[..byte_start].to_owned()
+    let retained = starts.len().saturating_sub(count as usize);
+    let cut = starts.get(retained).copied().unwrap_or(source.len());
+    source[..cut].to_owned()
 }
 
 fn render_challenge_taunt(template: &str, words: u32, deleted: u32) -> String {
@@ -10524,7 +10600,10 @@ fn read_challenge_draft(
     Ok(draft)
 }
 
-fn list_challenge_drafts(root: &Path) -> Result<String, Box<dyn std::error::Error>> {
+fn list_challenge_drafts(
+    root: &Path,
+    policy: story_core::WordCountPolicy,
+) -> Result<String, Box<dyn std::error::Error>> {
     let directory = root.join(".writers-ide/recovery");
     let entries = match fs::read_dir(directory) {
         Ok(entries) => entries,
@@ -10547,7 +10626,7 @@ fn list_challenge_drafts(root: &Path) -> Result<String, Box<dyn std::error::Erro
             Ok(draft) => drafts.push(format!(
                 "{} · {} words · {} · {} lost · {} pauses · use challenge-save-new {} CHAPTER-UUID TITLE or challenge-discard {}",
                 draft.challenge_id,
-                story_core::count_words(&draft.text),
+                story_core::count_words_with_policy(&draft.text, policy),
                 draft.mode,
                 draft.words_deleted,
                 draft.pauses_consumed,
@@ -11701,9 +11780,12 @@ mod tests {
         assert_eq!(ledger[0].real_delta, 0);
         let draft_id = &challenges[0].id;
         assert!(
-            list_challenge_drafts(state.app.project_root())
-                .unwrap()
-                .contains(draft_id)
+            list_challenge_drafts(
+                state.app.project_root(),
+                state.app.get_project().unwrap().word_count_policy,
+            )
+            .unwrap()
+            .contains(draft_id)
         );
         state.prompt = format!("challenge-save-new {draft_id} {chapter} Challenge draft");
         state.command().unwrap();
@@ -11797,6 +11879,7 @@ mod tests {
         let footer = challenge_footer(
             state.active_challenge.as_ref().unwrap(),
             &["one two three".into()],
+            story_core::WordCountPolicy::default(),
         );
         assert!(footer.contains("3/10 words"));
         assert!(footer.contains("kamikaze in 2s"));
@@ -11804,9 +11887,21 @@ mod tests {
 
     #[test]
     fn challenge_penalty_deletes_progressively_and_respects_unicode_graphemes() {
-        assert_eq!(remove_last_words("Élodie met 🌙", 1), "Élodie met ");
-        assert_eq!(remove_last_words("one two three", 2), "one ");
-        assert_eq!(remove_last_words("", 3), "");
+        let unicode = story_core::WordCountPolicy::UnicodeWords;
+        assert_eq!(
+            remove_last_words("Élodie met 🌙", 1, unicode),
+            "Élodie met "
+        );
+        assert_eq!(remove_last_words("one two three", 2, unicode), "one ");
+        assert_eq!(remove_last_words("", 3, unicode), "");
+        assert_eq!(
+            remove_last_words(
+                "한국어",
+                2,
+                story_core::WordCountPolicy::UnspacedScriptGraphemes
+            ),
+            "한"
+        );
         let short = parse_challenge_command("challenge-preset short kamikaze")
             .unwrap()
             .unwrap();
@@ -11927,9 +12022,12 @@ mod tests {
         assert_eq!(interrupted.status, "abandoned");
         assert_eq!(interrupted.outcome, "quit");
         assert!(
-            list_challenge_drafts(reopened.project_root())
-                .unwrap()
-                .contains(&challenge_id)
+            list_challenge_drafts(
+                reopened.project_root(),
+                reopened.get_project().unwrap().word_count_policy,
+            )
+            .unwrap()
+            .contains(&challenge_id)
         );
     }
 
@@ -11975,7 +12073,11 @@ mod tests {
             .unwrap();
         assert_eq!(quit_record.outcome, "quit");
         assert_eq!(
-            list_challenge_drafts(state.app.project_root()).unwrap(),
+            list_challenge_drafts(
+                state.app.project_root(),
+                state.app.get_project().unwrap().word_count_policy,
+            )
+            .unwrap(),
             "No recoverable challenge drafts"
         );
 
@@ -12310,6 +12412,21 @@ mod tests {
         assert_eq!(reopened.editor_preferences.line_ending, "crlf");
         assert_eq!(reopened.editor_preferences.indentation, "spaces");
         assert_eq!(reopened.editor_preferences.indent_width, 2);
+    }
+
+    #[test]
+    fn project_word_count_policy_command_updates_counting_convention() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Language"), "Language").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command("project-word-count-policy script-graphemes")
+            .unwrap();
+        assert_eq!(
+            state.app.get_project().unwrap().word_count_policy,
+            story_core::WordCountPolicy::UnspacedScriptGraphemes
+        );
+        assert!(state.message.contains("script-graphemes"));
     }
 
     #[test]

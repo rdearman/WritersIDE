@@ -154,6 +154,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             println!("{}", app.get_project()?.language_code);
         }
+        "word-count-policy" => {
+            let path = args.next().ok_or("missing project path")?;
+            let requested = args.next();
+            let mut app = WriterApp::open_project(path)?;
+            if let Some(value) = requested {
+                let policy = story_core::WordCountPolicy::parse(&value)
+                    .ok_or("policy must be unicode-words or script-graphemes")?;
+                app.set_project_word_count_policy(policy)?;
+            }
+            println!("{}", app.get_project()?.word_count_policy.as_str());
+        }
         "find" => {
             let path = args.next().ok_or("missing project path")?;
             let mode = parse_find_mode(&args.next().ok_or("missing mode")?)?;
@@ -2135,6 +2146,7 @@ fn usage() {
         "writers-ide compile <project> <text|markdown|latex|html|epub|docx|pdf> [output] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"
     );
     eprintln!("writers-ide compile-check <project>");
+    eprintln!("writers-ide word-count-policy <project> [unicode-words|script-graphemes]");
     eprintln!("writers-ide git-auto-snapshot <project> <interval-minutes|off> (1–10080 minutes)");
     eprintln!(
         "writers-ide git-auto-snapshot-check <project> (one-shot; suitable for cron/systemd timers)"

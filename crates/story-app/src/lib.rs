@@ -78,6 +78,7 @@ impl WriterApp {
             story_epoch_label: "Day 0".into(),
             story_calendar_id: None,
             language_code: default_language_code(),
+            word_count_policy: WordCountPolicy::default(),
         };
         Self::create_project_with_metadata(path, &project)
     }
@@ -98,6 +99,7 @@ impl WriterApp {
             story_epoch_label: "Day 0".into(),
             story_calendar_id: None,
             language_code: default_language_code(),
+            word_count_policy: WordCountPolicy::default(),
         };
         Self::create_project_with_metadata(path, &project)
     }
@@ -111,6 +113,9 @@ impl WriterApp {
     }
     pub fn set_project_language(&mut self, language_code: &str) -> Result<()> {
         Ok(self.store.set_project_language(language_code)?)
+    }
+    pub fn set_project_word_count_policy(&mut self, policy: WordCountPolicy) -> Result<()> {
+        Ok(self.store.set_project_word_count_policy(policy)?)
     }
     pub fn open_project(path: impl AsRef<Path>) -> Result<Self> {
         Ok(Self {
@@ -470,6 +475,7 @@ impl WriterApp {
         Ok(story_pipeline::PipelineInput {
             title: project.title,
             target_words: project.target_words,
+            word_count_policy: project.word_count_policy,
             expand_transclusions,
             groups,
             content_units,

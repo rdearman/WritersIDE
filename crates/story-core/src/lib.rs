@@ -314,10 +314,91 @@ mod editor_tool_tests {
 }
 use uuid::Uuid;
 
-/// Counts Unicode word-boundary segments, independent of the operating system locale.
-/// This gives consistent counts for multilingual prose, including scripts without spaces.
+/// Project-wide policy for mapping multilingual prose to writing-budget units.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WordCountPolicy {
+    /// Count Unicode word-boundary segments (UAX #29), irrespective of locale.
+    #[default]
+    UnicodeWords,
+    /// Count graphemes in selected unspaced scripts individually; count other scripts by Unicode words.
+    /// This is a writing-budget convention, not linguistic tokenization.
+    UnspacedScriptGraphemes,
+}
+
+impl WordCountPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnicodeWords => "unicode-words",
+            Self::UnspacedScriptGraphemes => "script-graphemes",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "unicode-words" => Some(Self::UnicodeWords),
+            "script-graphemes" => Some(Self::UnspacedScriptGraphemes),
+            _ => None,
+        }
+    }
+}
+
+/// Counts writing-budget units using the selected, deterministic project policy.
+pub fn count_words_with_policy(text: &str, policy: WordCountPolicy) -> u32 {
+    let count = match policy {
+        WordCountPolicy::UnicodeWords => text.unicode_words().count(),
+        WordCountPolicy::UnspacedScriptGraphemes => {
+            let mut count = 0usize;
+            let mut other_script_run = String::new();
+            for grapheme in text.graphemes(true) {
+                if is_unspaced_script_grapheme(grapheme) {
+                    count += other_script_run.unicode_words().count();
+                    other_script_run.clear();
+                    count += 1;
+                } else {
+                    other_script_run.push_str(grapheme);
+                }
+            }
+            count + other_script_run.unicode_words().count()
+        }
+    };
+    count.min(u32::MAX as usize) as u32
+}
+
+/// Counts Unicode word-boundary segments, the backward-compatible default policy.
 pub fn count_words(text: &str) -> u32 {
-    text.unicode_words().count().min(u32::MAX as usize) as u32
+    count_words_with_policy(text, WordCountPolicy::UnicodeWords)
+}
+
+/// Returns whether a grapheme belongs to one of the script ranges counted individually.
+pub fn is_unspaced_script_grapheme(grapheme: &str) -> bool {
+    grapheme.chars().any(is_unspaced_script_character)
+}
+
+fn is_unspaced_script_character(character: char) -> bool {
+    character.is_alphanumeric()
+        && matches!(
+            character as u32,
+            0x1100..=0x11ff
+                | 0x2e80..=0x2eff
+                | 0x3041..=0x3096
+                | 0x309d..=0x309f
+                | 0x30a1..=0x30fa
+                | 0x30fc..=0x30ff
+                | 0x3100..=0x312f
+                | 0x3130..=0x318f
+                | 0x31a0..=0x31bf
+                | 0x31f0..=0x31ff
+                | 0x3400..=0x4dbf
+                | 0x4e00..=0x9fff
+                | 0xac00..=0xd7af
+                | 0xf900..=0xfaff
+                | 0x0e00..=0x0e7f
+                | 0x0e80..=0x0eff
+                | 0x1000..=0x109f
+                | 0x1780..=0x17ff
+                | 0x20000..=0x2fa1f
+        )
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -399,6 +480,37 @@ mod multilingual_tests {
         assert_eq!(count_words("café déjà-vu l’esprit"), 4);
         assert_eq!(count_words("你好 世界"), 4);
         assert_eq!(count_words(""), 0);
+    }
+
+    #[test]
+    fn script_grapheme_policy_is_explicit_and_mixed_script_deterministic() {
+        use super::{WordCountPolicy, count_words_with_policy};
+        assert_eq!(
+            count_words_with_policy("私は猫です", WordCountPolicy::UnspacedScriptGraphemes),
+            5
+        );
+        assert!(count_words("한국어") < 3);
+        assert_eq!(
+            count_words_with_policy("Hello世界 again", WordCountPolicy::UnspacedScriptGraphemes),
+            4
+        );
+        assert_eq!(
+            count_words_with_policy("café déjà-vu", WordCountPolicy::UnspacedScriptGraphemes),
+            3
+        );
+        assert_eq!(
+            count_words_with_policy("我👩‍🚀爱你", WordCountPolicy::UnspacedScriptGraphemes),
+            3
+        );
+        assert_eq!(
+            count_words_with_policy("「私。」", WordCountPolicy::UnspacedScriptGraphemes),
+            1
+        );
+        assert_eq!(count_words("ภาษาไทย"), 7);
+        assert_eq!(
+            count_words_with_policy("ภาษาไทย", WordCountPolicy::UnspacedScriptGraphemes),
+            7
+        );
     }
 
     #[test]
@@ -1053,6 +1165,8 @@ pub struct Project {
     pub story_calendar_id: Option<String>,
     #[serde(default = "default_language_code")]
     pub language_code: String,
+    #[serde(default)]
+    pub word_count_policy: WordCountPolicy,
 }
 
 pub fn default_language_code() -> String {
