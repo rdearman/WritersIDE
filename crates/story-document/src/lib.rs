@@ -498,6 +498,24 @@ pub struct BookDesignProfile {
     pub geometry: String,
     pub font_size_pt: u8,
     pub line_spacing_hundredths: u16,
+    #[serde(default)]
+    pub main_font: Option<String>,
+    #[serde(default)]
+    pub sans_font: Option<String>,
+    #[serde(default)]
+    pub monospace_font: Option<String>,
+    #[serde(default)]
+    pub page_style: Option<PageStyle>,
+    #[serde(default)]
+    pub number_sections: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PageStyle {
+    Plain,
+    Headings,
+    Empty,
 }
 
 impl BookDesignProfile {
@@ -538,6 +556,21 @@ impl BookDesignProfile {
         if let Some(template) = &self.template {
             validate_project_relative_path(template)?;
         }
+        for (label, font) in [
+            ("main_font", self.main_font.as_deref()),
+            ("sans_font", self.sans_font.as_deref()),
+            ("monospace_font", self.monospace_font.as_deref()),
+        ] {
+            if let Some(font) = font
+                && (font.trim().is_empty()
+                    || font.len() > 80
+                    || !font.chars().all(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, ' ' | '-' | '_')
+                    }))
+            {
+                return Err(format!("{label} contains unsupported font-name characters"));
+            }
+        }
         Ok(())
     }
 
@@ -569,6 +602,28 @@ impl BookDesignProfile {
                 self.line_spacing_hundredths % 100
             ),
         ]);
+        if let Some(font) = &self.main_font {
+            variables.push(format!("mainfont={font}"));
+        }
+        if let Some(font) = &self.sans_font {
+            variables.push(format!("sansfont={font}"));
+        }
+        if let Some(font) = &self.monospace_font {
+            variables.push(format!("monofont={font}"));
+        }
+        if let Some(style) = self.page_style {
+            variables.push(format!(
+                "pagestyle={}",
+                match style {
+                    PageStyle::Plain => "plain",
+                    PageStyle::Headings => "headings",
+                    PageStyle::Empty => "empty",
+                }
+            ));
+        }
+        if self.number_sections {
+            variables.push("numbersections=true".into());
+        }
         variables
     }
 }
@@ -772,6 +827,11 @@ impl BookDesign {
             geometry: geometry.into(),
             font_size_pt,
             line_spacing_hundredths,
+            main_font: None,
+            sans_font: None,
+            monospace_font: None,
+            page_style: None,
+            number_sections: false,
         }
     }
 }
@@ -821,6 +881,28 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
                 code: "PUB003".into(),
                 severity: DiagnosticSeverity::Information,
                 message: format!("content unit '{}' has no prose", unit.title),
+                source_entity_id: Some(unit.id.clone()),
+            });
+        }
+        let placeholder_count = unit
+            .segments
+            .iter()
+            .map(|segment| {
+                let source = segment.document.source.to_lowercase();
+                ["todo", "fixme", "[insert", "lorem ipsum"]
+                    .iter()
+                    .map(|marker| source.matches(marker).count())
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        if placeholder_count > 0 {
+            diagnostics.push(CompileDiagnostic {
+                code: "PUB004".into(),
+                severity: DiagnosticSeverity::Warning,
+                message: format!(
+                    "content unit '{}' contains {placeholder_count} likely draft placeholder(s)",
+                    unit.title
+                ),
                 source_entity_id: Some(unit.id.clone()),
             });
         }
@@ -946,6 +1028,8 @@ impl PandocRenderer {
                     .env("TEXMFVAR", &texmf_var)
                     .env("TEXMFCACHE", &texmf_var)
                     .env("TEXMFCONFIG", &texmf_config);
+            }
+            if matches!(format, CompileFormat::Latex | CompileFormat::Pdf) {
                 for variable in design.pandoc_variables() {
                     command.arg(format!("--variable={variable}"));
                 }
@@ -1457,14 +1541,33 @@ mod tests {
             title: "Empty chapter".into(),
             segments: vec![CompileSegment::new("empty-unit", "  ")],
         });
+        ir.push(CompileUnit {
+            id: "draft-scene".into(),
+            parent_id: None,
+            kind: ContentUnitKind::Scene,
+            title: "Draft scene".into(),
+            segments: vec![CompileSegment::new(
+                "draft-scene",
+                "Mara finds the key. TODO: check the lock; [INSERT FINAL CLUE].",
+            )],
+        });
         let diagnostics = publication_diagnostics(&ir);
-        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.len(), 3);
         assert_eq!(diagnostics[0].code, "PUB001");
         assert_eq!(
             diagnostics[1].source_entity_id.as_deref(),
             Some("empty-unit")
         );
         assert!(ir.units[0].segments[0].document.source.trim().is_empty());
+        assert_eq!(diagnostics[2].code, "PUB004");
+        assert_eq!(
+            diagnostics[2].source_entity_id.as_deref(),
+            Some("draft-scene")
+        );
+        assert_eq!(
+            ir.units[1].segments[0].document.source,
+            "Mara finds the key. TODO: check the lock; [INSERT FINAL CLUE]."
+        );
     }
 
     #[test]
@@ -1479,12 +1582,24 @@ mod tests {
             geometry: "margin=0.8in".into(),
             font_size_pt: 10,
             line_spacing_hundredths: 118,
+            main_font: Some("Libertinus Serif".into()),
+            sans_font: None,
+            monospace_font: Some("DejaVu Sans Mono".into()),
+            page_style: Some(PageStyle::Headings),
+            number_sections: true,
         };
         let encoded = profile.to_toml().unwrap();
         assert_eq!(BookDesignProfile::from_toml(&encoded).unwrap(), profile);
         assert!(profile.pandoc_variables().contains(&"fontsize=10pt".into()));
+        let variables = profile.pandoc_variables();
+        assert!(variables.contains(&"mainfont=Libertinus Serif".into()));
+        assert!(variables.contains(&"monofont=DejaVu Sans Mono".into()));
+        assert!(variables.contains(&"pagestyle=headings".into()));
+        assert!(variables.contains(&"numbersections=true".into()));
         let malicious = encoded.replace("margin=0.8in", "margin=0.8in\\\\input{evil}");
         assert!(BookDesignProfile::from_toml(&malicious).is_err());
+        let malicious_font = encoded.replace("Libertinus Serif", "{\\\\input{evil}}");
+        assert!(BookDesignProfile::from_toml(&malicious_font).is_err());
     }
 
     #[cfg(unix)]
@@ -1528,6 +1643,11 @@ mod tests {
             geometry: "margin=1in".into(),
             font_size_pt: 11,
             line_spacing_hundredths: 120,
+            main_font: Some("Libertinus Serif".into()),
+            sans_font: None,
+            monospace_font: None,
+            page_style: Some(PageStyle::Plain),
+            number_sections: true,
         };
         let renderer = PandocRenderer::with_program(&program);
         let artifact = renderer
@@ -1537,6 +1657,9 @@ mod tests {
         let args = std::fs::read_to_string(&arguments).unwrap();
         assert!(args.contains("--template"));
         assert!(args.contains(template.to_str().unwrap()));
+        assert!(args.contains("--variable=mainfont=Libertinus Serif"));
+        assert!(args.contains("--variable=pagestyle=plain"));
+        assert!(args.contains("--variable=numbersections=true"));
         let mut escaping = profile;
         escaping.template = Some("../outside.tex".into());
         assert!(escaping.validate().is_err());
