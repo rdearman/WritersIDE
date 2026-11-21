@@ -4,7 +4,7 @@ CREATE TABLE saved_query_filter(
   ordinal INTEGER NOT NULL CHECK(ordinal>=0),
   filter_kind TEXT NOT NULL CHECK(filter_kind IN(
     'status','exclude_status','character','character_any','character_present','character_mentioned','character_absent',
-    'plotline','plotline_any','location','event','chapter','text_contains',
+    'plotline','plotline_any','location','event','chapter','text_contains','custom_metadata_equals',
     'time_before','time_after','unresolved_issue'
   )),
   value TEXT NOT NULL,
