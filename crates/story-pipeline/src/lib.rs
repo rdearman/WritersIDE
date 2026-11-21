@@ -7,7 +7,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use story_analysis::{
-    CharacterChronologyStatus, CharacterOnScene, PlotlineOnScene, SceneAnalysisInput,
+    CharacterChronologyStatus, CharacterOnScene, PlotlineOnScene, ProofreadingConfig,
+    SceneAnalysisInput,
 };
 use thiserror::Error;
 
@@ -87,17 +88,19 @@ pub enum Stage {
     PlotlineAnalysis,
     CharacterAnalysis,
     Continuity,
+    Proofread,
     Export,
     RevisionReport,
 }
 
 impl Stage {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Compile,
         Self::WordCount,
         Self::PlotlineAnalysis,
         Self::CharacterAnalysis,
         Self::Continuity,
+        Self::Proofread,
         Self::Export,
         Self::RevisionReport,
     ];
@@ -109,6 +112,7 @@ impl Stage {
             "plotline-analysis" => Some(Self::PlotlineAnalysis),
             "character-analysis" => Some(Self::CharacterAnalysis),
             "continuity" => Some(Self::Continuity),
+            "proofread" => Some(Self::Proofread),
             "export" => Some(Self::Export),
             "revision-report" => Some(Self::RevisionReport),
             _ => None,
@@ -122,6 +126,7 @@ impl Stage {
             Self::PlotlineAnalysis => "plotline-analysis",
             Self::CharacterAnalysis => "character-analysis",
             Self::Continuity => "continuity",
+            Self::Proofread => "proofread",
             Self::Export => "export",
             Self::RevisionReport => "revision-report",
         }
@@ -133,6 +138,7 @@ impl Stage {
             Compile => &[],
             WordCount | Export => &[Compile],
             PlotlineAnalysis | CharacterAnalysis | Continuity | RevisionReport => &[],
+            Proofread => &[Compile],
         }
     }
 }
@@ -327,7 +333,35 @@ impl PipelineRunner {
                 });
                 continue;
             }
+            let proofreading_config = if stage == Stage::Proofread {
+                match read_proofreading_config(&self.root) {
+                    Ok(config) => Some(config),
+                    Err(message) => {
+                        cache.stages.remove(&stage);
+                        reports.push(StageReport {
+                            stage,
+                            status: StageStatus::Failed,
+                            fingerprint: None,
+                            message,
+                        });
+                        continue;
+                    }
+                }
+            } else {
+                None
+            };
             let fingerprint = stage_fingerprint(stage, input, &outputs);
+            let fingerprint = if let Some(config) = &proofreading_config {
+                hash(
+                    format!(
+                        "{fingerprint}\0{}",
+                        config.to_toml().map_err(PipelineError::Invalid)?
+                    )
+                    .as_bytes(),
+                )
+            } else {
+                fingerprint
+            };
             let relative_path = artifact_path(stage).to_owned();
             let output_path = self.root.join(&relative_path);
             if let Some(entry) = cache
@@ -350,7 +384,7 @@ impl PipelineRunner {
                 });
                 continue;
             }
-            match render_stage(stage, input, &outputs) {
+            match render_stage(stage, input, &outputs, proofreading_config.as_ref()) {
                 Ok(text) => {
                     let bytes = text.as_bytes();
                     if let Err(error) = atomic_write(&output_path, bytes) {
@@ -649,6 +683,7 @@ fn artifact_path(stage: Stage) -> &'static str {
             Stage::PlotlineAnalysis => ".writers-ide/processing/plotlines.txt",
             Stage::CharacterAnalysis => ".writers-ide/processing/characters.txt",
             Stage::Continuity => ".writers-ide/processing/continuity.txt",
+            Stage::Proofread => ".writers-ide/processing/proofread.json",
             Stage::RevisionReport => ".writers-ide/processing/revisions.txt",
             Stage::Export => unreachable!(),
         },
@@ -684,6 +719,7 @@ fn stage_fingerprint(
             .iter()
             .map(|s| format!("{}:{:?}:{:?}", s.id, s.start, s.end))
             .collect(),
+        Stage::Proofread => outputs.get(&Stage::Compile).cloned().unwrap_or_default(),
         Stage::RevisionReport => input.revision_summary.clone(),
     };
     let extra = if stage == Stage::Compile {
@@ -700,6 +736,7 @@ fn render_stage(
     stage: Stage,
     input: &PipelineInput,
     outputs: &BTreeMap<Stage, String>,
+    proofreading_config: Option<&ProofreadingConfig>,
 ) -> Result<String, String> {
     match stage {
         Stage::Compile => {
@@ -789,11 +826,43 @@ fn render_stage(
             }
             Ok(output)
         }
+        Stage::Proofread => {
+            let text = outputs
+                .get(&Stage::Compile)
+                .ok_or("compiled manuscript unavailable")?;
+            let config = proofreading_config.ok_or("proofreading configuration was not loaded")?;
+            let items = story_analysis::proofread_with_config(text, config)?
+                .into_iter()
+                .map(|finding| {
+                    serde_json::json!({
+                        "start_byte": finding.byte_range.start,
+                        "end_byte": finding.byte_range.end,
+                        "category": finding.category,
+                        "severity": finding.severity,
+                        "message": finding.message,
+                    })
+                })
+                .collect::<Vec<_>>();
+            serde_json::to_string_pretty(&items).map_err(|error| error.to_string())
+        }
         Stage::Export => outputs
             .get(&Stage::Compile)
             .cloned()
             .ok_or_else(|| "compiled manuscript unavailable".into()),
         Stage::RevisionReport => Ok(input.revision_summary.clone()),
+    }
+}
+
+fn read_proofreading_config(root: &Path) -> Result<ProofreadingConfig, String> {
+    let path = root.join(".writers-ide/diagnostics.toml");
+    match fs::read_to_string(path) {
+        Ok(source) => ProofreadingConfig::from_toml(&source),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ProofreadingConfig::default())
+        }
+        Err(error) => Err(format!(
+            "could not read proofreading configuration: {error}"
+        )),
     }
 }
 
@@ -1149,7 +1218,7 @@ mod tests {
         runner.run(&input("A.")).unwrap();
         fs::write(dir.path().join("exports/compiled.md"), "corrupt").unwrap();
         let result = runner.run(&input("A.")).unwrap();
-        assert_eq!(result[5].status, StageStatus::Complete);
+        assert_eq!(result[6].status, StageStatus::Complete);
     }
 
     #[test]
@@ -1174,12 +1243,13 @@ mod tests {
         assert_eq!(selected[2].status, StageStatus::NotSelected);
         assert_eq!(selected[3].status, StageStatus::NotSelected);
         assert_eq!(selected[4].status, StageStatus::NotSelected);
-        assert_eq!(selected[5].status, StageStatus::Complete);
-        assert_eq!(selected[6].status, StageStatus::NotSelected);
+        assert_eq!(selected[5].status, StageStatus::NotSelected);
+        assert_eq!(selected[6].status, StageStatus::Complete);
+        assert_eq!(selected[7].status, StageStatus::NotSelected);
 
         let cached = runner.run_selected(&input("A."), &[Stage::Export]).unwrap();
         assert_eq!(cached[0].status, StageStatus::Cached);
-        assert_eq!(cached[5].status, StageStatus::Cached);
+        assert_eq!(cached[6].status, StageStatus::Cached);
         assert_eq!(cached[1].status, StageStatus::NotSelected);
 
         let failed_dir = tempfile::tempdir().unwrap();
@@ -1193,8 +1263,41 @@ mod tests {
             .run_selected(&input("A."), &[Stage::Export])
             .unwrap();
         assert_eq!(failed[0].status, StageStatus::Failed);
-        assert_eq!(failed[5].status, StageStatus::Skipped);
-        assert!(failed[5].message.contains("dependency"));
+        assert_eq!(failed[6].status, StageStatus::Skipped);
+        assert!(failed[6].message.contains("dependency"));
+    }
+
+    #[test]
+    fn proofread_stage_uses_project_rules_and_invalid_config_fails_visibly() {
+        let dir = tempfile::tempdir().unwrap();
+        let runner = PipelineRunner::new(dir.path());
+        let report = runner
+            .run_selected(&input("A word  repeated repeated."), &[Stage::Proofread])
+            .unwrap();
+        assert_eq!(report[5].status, StageStatus::Complete);
+        let artifact = dir.path().join(".writers-ide/processing/proofread.json");
+        let default_findings = fs::read_to_string(&artifact).unwrap();
+        assert!(default_findings.contains("double-space"));
+        assert!(default_findings.contains("repeated-word"));
+
+        let config_path = dir.path().join(".writers-ide/diagnostics.toml");
+        fs::write(&config_path, "version = 1\nrules = []\n").unwrap();
+        let custom = runner
+            .run_selected(&input("A word  repeated repeated."), &[Stage::Proofread])
+            .unwrap();
+        assert_eq!(custom[5].status, StageStatus::Complete);
+        assert_eq!(fs::read_to_string(&artifact).unwrap(), "[]");
+
+        fs::write(
+            &config_path,
+            "version = 1\n[[rules]]\nid='bad'\nenabled=true\nkind='regex'\npattern='['\nseverity='warning'\nmessage='bad regex'\n",
+        )
+        .unwrap();
+        let invalid = runner
+            .run_selected(&input("A word."), &[Stage::Proofread])
+            .unwrap();
+        assert_eq!(invalid[5].status, StageStatus::Failed);
+        assert!(invalid[5].message.contains("invalid regex"));
     }
 
     #[test]
