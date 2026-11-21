@@ -6871,21 +6871,26 @@ impl AppState {
             let mut changed = 0usize;
             let mut replacements = 0usize;
             for record in scenes {
-                let (text, hash) = self.app.load_scene_text(record.scene.id)?;
+                let (text, hash) = if self.editing_scene == Some(record.scene.id) {
+                    (self.editor.join("\n"), self.saved_hash.clone())
+                } else {
+                    self.app.load_scene_text(record.scene.id)?
+                };
                 let (updated, count) =
                     story_core::replace_matches(&text, pattern, replacement, mode)?;
                 if count != 0 {
-                    self.app
-                        .save_scene_text(record.scene.id, Some(&hash), &updated)?;
+                    let saved_hash =
+                        self.app
+                            .save_scene_text(record.scene.id, Some(&hash), &updated)?;
                     changed += 1;
                     replacements += count;
                     if self.editing_scene == Some(record.scene.id) {
-                        self.editor = updated.lines().map(str::to_owned).collect();
+                        self.editor = updated.split('\n').map(str::to_owned).collect();
                         if self.editor.is_empty() {
                             self.editor.push(String::new());
                         }
                         self.dirty = false;
-                        self.saved_hash = self.app.load_scene_text(record.scene.id)?.1;
+                        self.saved_hash = saved_hash;
                     }
                 }
             }
@@ -12858,6 +12863,37 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "A cat waits.\nThe cat leaves."
         );
+    }
+
+    #[test]
+    fn replace_uses_dirty_active_editor_buffer_and_saves_with_its_expected_hash() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Replace"), "Replace").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Cats", 0).unwrap();
+        let (saved, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "A cat waits.")
+            .unwrap();
+        let saved_hash = app.load_scene_text(scene).unwrap().1;
+        let mut state = AppState::new(app, default_bindings());
+        state.editing_scene = Some(scene);
+        state.editor = vec!["A cat waits, and the new sentence remains.".into()];
+        state.saved_hash = saved_hash;
+        state.dirty = true;
+        state
+            .execute_legacy_palette_command("replace normal all cat => fox")
+            .unwrap();
+        assert!(state.message.contains("1 occurrence(s)"));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "A fox waits, and the new sentence remains."
+        );
+        assert_eq!(
+            state.editor.join("\n"),
+            "A fox waits, and the new sentence remains."
+        );
+        assert!(!state.dirty);
+        assert_ne!(saved, state.editor.join("\n"));
     }
 
     #[test]
