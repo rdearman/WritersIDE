@@ -75,6 +75,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.validate_project()?;
             println!("Project is valid.");
         }
+        "tags-export" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            println!("{}", app.export_emacs_tags()?.display());
+        }
         "backup-archive" => {
             let path = args.next().ok_or("missing project path")?;
             let archive = args.next().ok_or("missing destination archive path")?;
@@ -336,8 +341,48 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let preview_path = args.next().ok_or("missing replace-preview JSON file")?;
             let preview: Vec<CliReplaceTarget> = serde_json::from_slice(&fs::read(preview_path)?)?;
             let mut app = WriterApp::open_project(path)?;
+            let recovery = recover_cli_replace_groups(&mut app)?;
+            for notice in &recovery {
+                eprintln!("{notice}");
+            }
+            if recovery
+                .iter()
+                .any(|notice| notice.contains("conflicts with scene"))
+            {
+                return Err("resolve the pending CLI replacement recovery conflict before applying another replacement".into());
+            }
             let (scenes, count) = apply_replace_preview(&mut app, &preview)?;
             println!("Applied {count} replacement(s) to {scenes} scene(s)");
+        }
+        "replace-recover" => {
+            let path = args.next().ok_or("missing project path")?;
+            let mut app = WriterApp::open_project(path)?;
+            let notices = recover_cli_replace_groups(&mut app)?;
+            if notices.is_empty() {
+                println!("No interrupted CLI replacement groups");
+            } else {
+                for notice in notices {
+                    println!("{notice}");
+                }
+            }
+        }
+        "replace-undo" => {
+            let path = args.next().ok_or("missing project path")?;
+            let mut app = WriterApp::open_project(path)?;
+            let recovery = recover_cli_replace_groups(&mut app)?;
+            for notice in &recovery {
+                eprintln!("{notice}");
+            }
+            if recovery
+                .iter()
+                .any(|notice| notice.contains("conflicts with scene"))
+            {
+                return Err(
+                    "resolve the pending CLI replacement recovery conflict before undoing".into(),
+                );
+            }
+            let (scenes, count) = undo_cli_replace(&mut app)?;
+            println!("Undid {count} replacement(s) in {scenes} scene(s)");
         }
         "write" => {
             let path = args.next().ok_or("missing project path")?;
@@ -2190,7 +2235,7 @@ fn validate_scene_scope(scope: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[derive(serde::Deserialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 struct CliReplaceTarget {
     scene_id: SceneId,
     title: String,
@@ -2198,6 +2243,252 @@ struct CliReplaceTarget {
     replacements: usize,
     original: String,
     proposed: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct CliReplaceGroup {
+    version: u16,
+    operation_id: String,
+    entries: Vec<CliReplaceGroupEntry>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct CliReplaceGroupEntry {
+    scene_id: SceneId,
+    title: String,
+    original: String,
+    expected_hash: String,
+    proposed: String,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct CliReplaceUndo {
+    version: u16,
+    operation_id: String,
+    entries: Vec<CliReplaceUndoEntry>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
+struct CliReplaceUndoEntry {
+    scene_id: SceneId,
+    title: String,
+    replacements: usize,
+    before: String,
+    after: String,
+    after_hash: String,
+}
+
+fn cli_replace_recovery_dir(app: &WriterApp) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let root = app.project_root().canonicalize()?;
+    let metadata_dir = root.join(".writers-ide");
+    fs::create_dir_all(&metadata_dir)?;
+    let metadata = fs::symlink_metadata(&metadata_dir)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("CLI replacement metadata path must be a real project directory".into());
+    }
+    let directory = metadata_dir.join("recovery");
+    fs::create_dir_all(&directory)?;
+    let metadata = fs::symlink_metadata(&directory)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("CLI replacement recovery path must be a real project directory".into());
+    }
+    let directory = directory.canonicalize()?;
+    if !directory.starts_with(&root) {
+        return Err("CLI replacement recovery path escapes the project".into());
+    }
+    Ok(directory)
+}
+
+fn cli_replace_group_path(directory: &Path, operation_id: &str) -> PathBuf {
+    directory.join(format!("cli-replace-group-{operation_id}.json"))
+}
+
+fn cli_replace_undo_path(directory: &Path) -> PathBuf {
+    directory.join("cli-replace-undo.json")
+}
+
+fn persist_cli_replace_group(
+    directory: &Path,
+    operation: &CliReplaceGroup,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let path = cli_replace_group_path(directory, &operation.operation_id);
+    atomic_write(&path, &serde_json::to_vec_pretty(operation)?)?;
+    Ok(path)
+}
+
+fn remove_cli_recovery_file(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    match fs::remove_file(path) {
+        Ok(()) => {
+            fs::File::open(path.parent().ok_or("recovery file has no parent")?)?.sync_all()?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+fn read_cli_replace_undo(
+    directory: &Path,
+) -> Result<Option<CliReplaceUndo>, Box<dyn std::error::Error>> {
+    let path = cli_replace_undo_path(directory);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("CLI replacement undo record cannot be a symlink".into());
+    }
+    let undo: CliReplaceUndo = serde_json::from_slice(&fs::read(path)?)?;
+    if undo.version != 1 || undo.entries.is_empty() {
+        return Err("invalid CLI replacement undo record".into());
+    }
+    Ok(Some(undo))
+}
+
+fn recover_cli_replace_groups(
+    app: &mut WriterApp,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let directory = cli_replace_recovery_dir(app)?;
+    let mut paths = fs::read_dir(&directory)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with("cli-replace-group-") && name.ends_with(".json")
+                })
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut notices = Vec::new();
+    for path in paths {
+        if fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(format!("refusing symlinked recovery file {}", path.display()).into());
+        }
+        let operation: CliReplaceGroup = serde_json::from_slice(&fs::read(&path)?)?;
+        if operation.version != 1 || operation.entries.is_empty() {
+            return Err(
+                format!("invalid CLI replacement recovery record {}", path.display()).into(),
+            );
+        }
+        let mut states = Vec::new();
+        let mut conflict = None;
+        for entry in &operation.entries {
+            let (current, hash) = app.load_scene_text(entry.scene_id)?;
+            if current == entry.original && hash == entry.expected_hash {
+                states.push((entry.scene_id, hash, false));
+            } else if current == entry.proposed {
+                states.push((entry.scene_id, hash, true));
+            } else {
+                conflict = Some(format!(
+                    "CLI replacement recovery {} conflicts with scene {}; all content was preserved and the record remains at {}",
+                    operation.operation_id,
+                    entry.title,
+                    path.display()
+                ));
+                break;
+            }
+        }
+        if let Some(conflict) = conflict {
+            notices.push(conflict);
+            continue;
+        }
+        for (scene_id, hash, was_replaced) in states {
+            if was_replaced {
+                let entry = operation
+                    .entries
+                    .iter()
+                    .find(|entry| entry.scene_id == scene_id)
+                    .ok_or("CLI recovery entry disappeared")?;
+                app.save_scene_text(scene_id, Some(&hash), &entry.original)?;
+            }
+        }
+        remove_cli_recovery_file(&path)?;
+        if read_cli_replace_undo(&directory)?
+            .is_some_and(|undo| undo.operation_id == operation.operation_id)
+        {
+            remove_cli_recovery_file(&cli_replace_undo_path(&directory))?;
+        }
+        notices.push(format!(
+            "Interrupted CLI replacement {} was restored to its original text",
+            operation.operation_id
+        ));
+    }
+    Ok(notices)
+}
+
+fn undo_cli_replace(app: &mut WriterApp) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    let directory = cli_replace_recovery_dir(app)?;
+    let undo =
+        read_cli_replace_undo(&directory)?.ok_or("no CLI replacement is available to undo")?;
+    for entry in &undo.entries {
+        let (current, hash) = app.load_scene_text(entry.scene_id)?;
+        if current != entry.after || hash != entry.after_hash {
+            return Err(format!(
+                "cannot undo CLI replacement because scene {} changed after the operation",
+                entry.title
+            )
+            .into());
+        }
+    }
+    if app.project_root().join(".git").exists() {
+        app.git_snapshot(&format!(
+            "Before CLI replacement undo {}",
+            undo.operation_id
+        ))?;
+    }
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let group = CliReplaceGroup {
+        version: 1,
+        operation_id,
+        entries: undo
+            .entries
+            .iter()
+            .map(|entry| CliReplaceGroupEntry {
+                scene_id: entry.scene_id,
+                title: entry.title.clone(),
+                original: entry.after.clone(),
+                expected_hash: entry.after_hash.clone(),
+                proposed: entry.before.clone(),
+            })
+            .collect(),
+    };
+    let recovery_path = persist_cli_replace_group(&directory, &group)?;
+    let mut applied = Vec::new();
+    for entry in &undo.entries {
+        match app.save_scene_text(entry.scene_id, Some(&entry.after_hash), &entry.before) {
+            Ok(hash) => applied.push((entry, hash)),
+            Err(error) => {
+                let mut rollback_errors = Vec::new();
+                for (previous, hash) in applied.iter().rev() {
+                    if let Err(rollback) =
+                        app.save_scene_text(previous.scene_id, Some(hash), &previous.after)
+                    {
+                        rollback_errors.push(format!("{}: {rollback}", previous.title));
+                    }
+                }
+                if rollback_errors.is_empty() {
+                    remove_cli_recovery_file(&recovery_path)?;
+                    return Err(format!(
+                        "CLI replacement undo failed and was rolled back: {error}"
+                    )
+                    .into());
+                }
+                return Err(format!(
+                    "CLI replacement undo failed: {error}; recovery is required for {}",
+                    rollback_errors.join(", ")
+                )
+                .into());
+            }
+        }
+    }
+    remove_cli_recovery_file(&recovery_path)?;
+    remove_cli_recovery_file(&cli_replace_undo_path(&directory))?;
+    let scenes = undo.entries.len();
+    let replacements = undo.entries.iter().map(|entry| entry.replacements).sum();
+    Ok((scenes, replacements))
 }
 
 fn apply_replace_preview(
@@ -2219,6 +2510,29 @@ fn apply_replace_preview(
         }
     }
     let total = targets.iter().map(|target| target.replacements).sum();
+    if targets.is_empty() {
+        return Ok((0, 0));
+    }
+    if app.project_root().join(".git").exists() {
+        app.git_snapshot("Before CLI scoped replacement")?;
+    }
+    let directory = cli_replace_recovery_dir(app)?;
+    let operation_id = uuid::Uuid::new_v4().to_string();
+    let group = CliReplaceGroup {
+        version: 1,
+        operation_id: operation_id.clone(),
+        entries: targets
+            .iter()
+            .map(|target| CliReplaceGroupEntry {
+                scene_id: target.scene_id,
+                title: target.title.clone(),
+                original: target.original.clone(),
+                expected_hash: target.content_hash.clone(),
+                proposed: target.proposed.clone(),
+            })
+            .collect(),
+    };
+    let recovery_path = persist_cli_replace_group(&directory, &group)?;
     let mut applied: Vec<(&CliReplaceTarget, String)> = Vec::new();
     for target in targets {
         match app.save_scene_text(
@@ -2237,6 +2551,7 @@ fn apply_replace_preview(
                     }
                 }
                 if rollback_errors.is_empty() {
+                    remove_cli_recovery_file(&recovery_path)?;
                     return Err(format!(
                         "replacement failed and earlier files were restored: {error}"
                     )
@@ -2250,6 +2565,40 @@ fn apply_replace_preview(
             }
         }
     }
+    let undo = CliReplaceUndo {
+        version: 1,
+        operation_id,
+        entries: targets
+            .iter()
+            .map(|target| {
+                let after_hash = applied
+                    .iter()
+                    .find(|(applied_target, _)| applied_target.scene_id == target.scene_id)
+                    .map(|(_, hash)| hash.clone())
+                    .ok_or("applied CLI replacement is missing its saved hash")?;
+                Ok(CliReplaceUndoEntry {
+                    scene_id: target.scene_id,
+                    title: target.title.clone(),
+                    replacements: target.replacements,
+                    before: target.original.clone(),
+                    after: target.proposed.clone(),
+                    after_hash,
+                })
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?,
+    };
+    if let Err(error) = atomic_write(
+        &cli_replace_undo_path(&directory),
+        &serde_json::to_vec_pretty(&undo)?,
+    ) {
+        // Keep the durable group intent. The next replace-recover invocation
+        // can safely restore every changed scene from its original snapshot.
+        return Err(format!(
+            "replacement completed, but its undo record could not be saved; run replace-recover: {error}"
+        )
+        .into());
+    }
+    remove_cli_recovery_file(&recovery_path)?;
     Ok((targets.len(), total))
 }
 
@@ -2392,7 +2741,7 @@ fn usage() {
         "writers-ide proofread-config <project> (creates editable .writers-ide/diagnostics.toml)"
     );
     eprintln!(
-        "writers-ide find <path> <normal|extended|regex> <all|scene-uuid|chapter:uuid|assembly:uuid|selected:uuid,uuid> <pattern>\nwriters-ide replace-preview <path> <normal|extended|regex> <scope> <pattern> => <replacement>\nwriters-ide replace-apply <path> <preview.json>\nwriters-ide replace <path> <normal|extended|regex> <scope> <pattern> => <replacement>\nwriters-ide language <path> [language-tag]"
+        "writers-ide find <path> <normal|extended|regex> <all|scene-uuid|chapter:uuid|assembly:uuid|selected:uuid,uuid> <pattern>\nwriters-ide replace-preview <path> <normal|extended|regex> <scope> <pattern> => <replacement>\nwriters-ide replace-apply <path> <preview.json>\nwriters-ide replace-undo <path>\nwriters-ide replace-recover <path>\nwriters-ide tags-export <path>\nwriters-ide replace <path> <normal|extended|regex> <scope> <pattern> => <replacement>\nwriters-ide language <path> [language-tag]"
     );
     eprintln!(
         "writers-ide create <path> [title]\nwriters-ide create-kind <path> <fiction|nonfiction|custom> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide compile <path> <markdown|html|epub|docx|pdf> [output-path] [--expand-transclusions]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|present=UUID|mentioned=UUID|absent=UUID|location=UUID|event=UUID|chapter=UUID|text=TERM|plotline=UUID|assembly=UUID|issue-status=STATUS|meta=FIELD:VALUE|meta-contains=FIELD:KIND:ENTITY|meta-exists=FIELD|meta-text=FIELD:TEXT|meta-number=FIELD:OP:int|decimal:VALUE|before-definitely=TICK|before-possibly=TICK|after-definitely=TICK|after-possibly=TICK|before=TICK|after=TICK]...\nwriters-ide character-absence <path> <scene-uuid> <character-uuid> [notes]\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide query-explain <path> <query-uuid> <scene-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
@@ -2952,10 +3301,11 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod watch_tests {
     use super::{
-        CliReplaceTarget, WatchSuccess, apply_replace_preview, compile_edition,
-        compile_edition_with_aspell, edition_watch_fingerprint, parse_scene_query_filter,
+        CliReplaceGroup, CliReplaceGroupEntry, CliReplaceTarget, WatchSuccess,
+        apply_replace_preview, compile_edition, compile_edition_with_aspell,
+        edition_watch_fingerprint, parse_scene_query_filter, recover_cli_replace_groups,
         run_auto_snapshot_check, run_processing_recipe, scenes_for_scope, spellcheck_project,
-        watch_fingerprint,
+        undo_cli_replace, watch_fingerprint,
     };
     use std::fs;
     use story_app::WriterApp;
@@ -3274,6 +3624,102 @@ mod watch_tests {
         assert!(apply_replace_preview(&mut app, &targets).is_err());
         assert_eq!(app.load_scene_text(first).unwrap().0, "A cat waits.");
         assert_eq!(app.load_scene_text(second).unwrap().0, "Externally edited.");
+    }
+
+    #[test]
+    fn cli_scoped_replace_is_recoverable_and_has_hash_checked_undo() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let mut targets = Vec::new();
+        for scene_id in [first, second] {
+            let (_, hash) = app.load_scene_text(scene_id).unwrap();
+            app.save_scene_text(scene_id, Some(&hash), "cat cat")
+                .unwrap();
+            let (original, content_hash) = app.load_scene_text(scene_id).unwrap();
+            targets.push(CliReplaceTarget {
+                scene_id,
+                title: scene_id.to_string(),
+                content_hash,
+                replacements: 2,
+                original,
+                proposed: "fox fox".into(),
+            });
+        }
+        assert_eq!(apply_replace_preview(&mut app, &targets).unwrap(), (2, 4));
+        assert_eq!(app.load_scene_text(first).unwrap().0, "fox fox");
+        assert_eq!(app.load_scene_text(second).unwrap().0, "fox fox");
+        assert_eq!(undo_cli_replace(&mut app).unwrap(), (2, 4));
+        assert_eq!(app.load_scene_text(first).unwrap().0, "cat cat");
+        assert_eq!(app.load_scene_text(second).unwrap().0, "cat cat");
+        assert!(undo_cli_replace(&mut app).is_err());
+    }
+
+    #[test]
+    fn cli_replace_recovery_restores_unambiguous_files_and_preserves_divergence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let mut entries = Vec::new();
+        for scene_id in [first, second] {
+            let (_, hash) = app.load_scene_text(scene_id).unwrap();
+            app.save_scene_text(scene_id, Some(&hash), "original")
+                .unwrap();
+            let (original, expected_hash) = app.load_scene_text(scene_id).unwrap();
+            entries.push(CliReplaceGroupEntry {
+                scene_id,
+                title: scene_id.to_string(),
+                original,
+                expected_hash,
+                proposed: "proposed".into(),
+            });
+        }
+        let operation = CliReplaceGroup {
+            version: 1,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            entries,
+        };
+        let directory = super::cli_replace_recovery_dir(&app).unwrap();
+        super::persist_cli_replace_group(&directory, &operation).unwrap();
+        let (_, hash) = app.load_scene_text(first).unwrap();
+        app.save_scene_text(first, Some(&hash), "proposed").unwrap();
+        let notices = recover_cli_replace_groups(&mut app).unwrap();
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("restored"));
+        assert_eq!(app.load_scene_text(first).unwrap().0, "original");
+        assert_eq!(app.load_scene_text(second).unwrap().0, "original");
+
+        let operation = CliReplaceGroup {
+            version: 1,
+            operation_id: uuid::Uuid::new_v4().to_string(),
+            entries: [first, second]
+                .into_iter()
+                .map(|scene_id| {
+                    let (original, expected_hash) = app.load_scene_text(scene_id).unwrap();
+                    CliReplaceGroupEntry {
+                        scene_id,
+                        title: scene_id.to_string(),
+                        original,
+                        expected_hash,
+                        proposed: "proposed".into(),
+                    }
+                })
+                .collect(),
+        };
+        super::persist_cli_replace_group(&directory, &operation).unwrap();
+        let (_, hash) = app.load_scene_text(first).unwrap();
+        app.save_scene_text(first, Some(&hash), "proposed").unwrap();
+        let (_, hash) = app.load_scene_text(second).unwrap();
+        app.save_scene_text(second, Some(&hash), "external")
+            .unwrap();
+        let notices = recover_cli_replace_groups(&mut app).unwrap();
+        assert!(notices[0].contains("conflicts with scene"));
+        assert_eq!(app.load_scene_text(first).unwrap().0, "proposed");
+        assert_eq!(app.load_scene_text(second).unwrap().0, "external");
     }
 
     #[cfg(unix)]

@@ -27,6 +27,41 @@ pub enum AppError {
 }
 pub type Result<T> = std::result::Result<T, AppError>;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectSymbolDefinition {
+    pub entity_kind: String,
+    pub entity_id: String,
+    pub name: String,
+    pub aliases: Vec<String>,
+    pub source_path: Option<PathBuf>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmacsTagsExport {
+    pub symbols_markdown: String,
+    pub tags_file: String,
+}
+
+fn write_project_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Domain("project export path has no parent".into()))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| AppError::Domain(format!("create symbol export temporary: {error}")))?;
+    use std::io::Write;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| AppError::Domain(format!("write symbol export: {error}")))?;
+    temporary
+        .persist(path)
+        .map_err(|error| AppError::Domain(format!("publish symbol export: {}", error.error)))?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| AppError::Domain(format!("sync symbol export directory: {error}")))?;
+    Ok(())
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
 #[serde(default)]
 pub struct UserPreferences {
@@ -348,6 +383,231 @@ impl WriterApp {
     }
     pub fn list_scenes(&self, include_archived: bool) -> Result<Vec<SceneRecord>> {
         Ok(self.store.list_scenes(include_archived)?)
+    }
+    pub fn list_project_symbols(&self) -> Result<Vec<ProjectSymbolDefinition>> {
+        let mut symbols = Vec::new();
+        for scene in self.list_scenes(false)? {
+            symbols.push(ProjectSymbolDefinition {
+                entity_kind: "scene".into(),
+                entity_id: scene.scene.id.to_string(),
+                name: scene.scene.title,
+                aliases: Vec::new(),
+                source_path: Some(self.store.scene_content_relative_path(scene.scene.id)?),
+            });
+        }
+        for node in self
+            .list_structural_nodes()?
+            .into_iter()
+            .filter(|node| node.kind == "chapter")
+        {
+            symbols.push(ProjectSymbolDefinition {
+                entity_kind: "chapter".into(),
+                entity_id: node.id.to_string(),
+                name: node.title,
+                aliases: Vec::new(),
+                source_path: None,
+            });
+        }
+        for character in self.list_characters()? {
+            let record = self.get_character(character.id)?;
+            let aliases = std::iter::once(record.full_name)
+                .chain(std::iter::once(record.preferred_name))
+                .chain(record.aliases)
+                .filter(|alias| !alias.is_empty())
+                .collect::<Vec<_>>();
+            symbols.push(ProjectSymbolDefinition {
+                entity_kind: "character".into(),
+                entity_id: character.id.to_string(),
+                name: character.name,
+                aliases,
+                source_path: None,
+            });
+        }
+        for location in self.list_locations()? {
+            symbols.push(ProjectSymbolDefinition {
+                entity_kind: "location".into(),
+                entity_id: location.id.to_string(),
+                name: location.name,
+                aliases: Vec::new(),
+                source_path: None,
+            });
+        }
+        for object in self.list_story_objects()? {
+            symbols.push(ProjectSymbolDefinition {
+                entity_kind: "object".into(),
+                entity_id: object.id.to_string(),
+                name: object.name,
+                aliases: Vec::new(),
+                source_path: None,
+            });
+        }
+        for plotline in self.list_plotlines()? {
+            symbols.push(ProjectSymbolDefinition {
+                entity_kind: "plotline".into(),
+                entity_id: plotline.id.to_string(),
+                name: plotline.name,
+                aliases: Vec::new(),
+                source_path: None,
+            });
+        }
+        for event in self.list_events()? {
+            symbols.push(ProjectSymbolDefinition {
+                entity_kind: "event".into(),
+                entity_id: event.id.to_string(),
+                name: event.title,
+                aliases: Vec::new(),
+                source_path: None,
+            });
+        }
+        for research in self.list_research_items()? {
+            symbols.push(ProjectSymbolDefinition {
+                entity_kind: "research".into(),
+                entity_id: research.id.to_string(),
+                name: research.title,
+                aliases: Vec::new(),
+                source_path: None,
+            });
+        }
+        symbols.sort_by(|left, right| {
+            left.name
+                .to_lowercase()
+                .cmp(&right.name.to_lowercase())
+                .then_with(|| left.entity_kind.cmp(&right.entity_kind))
+                .then_with(|| left.entity_id.cmp(&right.entity_id))
+        });
+        Ok(symbols)
+    }
+
+    pub fn build_emacs_tags_export(&self) -> Result<EmacsTagsExport> {
+        let symbols = self.list_project_symbols()?;
+        let mut markdown = String::from(
+            "# Generated Writer's IDE symbol index\n\nGenerated from stable project entity IDs. Re-export after project changes.\n",
+        );
+        let mut entries = Vec::new();
+        for symbol in symbols {
+            let clean = |value: &str| {
+                value
+                    .chars()
+                    .map(|character| {
+                        if character.is_control() {
+                            ' '
+                        } else {
+                            character
+                        }
+                    })
+                    .collect::<String>()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            let name = clean(&symbol.name);
+            if name.is_empty() {
+                continue;
+            }
+            let heading = format!(
+                "## {}: {} [{}]",
+                clean(&symbol.entity_kind),
+                name,
+                clean(&symbol.entity_id)
+            );
+            let offset = markdown.len();
+            let line = markdown.bytes().filter(|byte| *byte == b'\n').count() + 1;
+            markdown.push_str(&heading);
+            markdown.push('\n');
+            markdown.push_str("Entity ID: `");
+            markdown.push_str(&clean(&symbol.entity_id));
+            markdown.push_str("`\n");
+            let aliases = symbol
+                .aliases
+                .iter()
+                .map(|alias| clean(alias))
+                .filter(|alias| !alias.is_empty())
+                .collect::<Vec<_>>();
+            if !aliases.is_empty() {
+                markdown.push_str("Aliases: ");
+                markdown.push_str(
+                    &aliases
+                        .iter()
+                        .map(|alias| format!("`{alias}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+                markdown.push('\n');
+            }
+            if let Some(path) = symbol.source_path {
+                markdown.push_str("Project source: `");
+                markdown.push_str(&clean(&path.to_string_lossy()));
+                markdown.push_str("`\n");
+            } else {
+                markdown.push_str("Definition: structured project record\n");
+            }
+            let mut tag_names = vec![name];
+            tag_names.extend(aliases);
+            tag_names.sort();
+            tag_names.dedup();
+            for tag_name in tag_names
+                .into_iter()
+                .filter(|tag_name| !tag_name.is_empty())
+            {
+                entries.push((heading.clone(), tag_name, line, offset));
+            }
+        }
+        let mut tags_file = format!("\u{c}\nsymbols.md,{}\n", markdown.len());
+        for (text, name, line, offset) in entries {
+            tags_file.push_str(&text);
+            tags_file.push('\u{7f}');
+            tags_file.push_str(&name);
+            tags_file.push('\u{1}');
+            tags_file.push_str(&format!("{line},{offset}\n"));
+        }
+        Ok(EmacsTagsExport {
+            symbols_markdown: markdown,
+            tags_file,
+        })
+    }
+
+    pub fn export_emacs_tags(&self) -> Result<PathBuf> {
+        let root = self
+            .project_root()
+            .canonicalize()
+            .map_err(|error| AppError::Domain(format!("open project for TAGS export: {error}")))?;
+        let control = root.join(".writers-ide");
+        fs::create_dir_all(&control).map_err(|error| {
+            AppError::Domain(format!("create symbol export directory: {error}"))
+        })?;
+        let metadata = fs::symlink_metadata(&control).map_err(|error| {
+            AppError::Domain(format!("inspect symbol export directory: {error}"))
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(AppError::Domain(
+                "symbol export directory must be a real project directory".into(),
+            ));
+        }
+        let directory = control.join("tags");
+        fs::create_dir_all(&directory)
+            .map_err(|error| AppError::Domain(format!("create TAGS directory: {error}")))?;
+        let metadata = fs::symlink_metadata(&directory)
+            .map_err(|error| AppError::Domain(format!("inspect TAGS directory: {error}")))?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(AppError::Domain(
+                "symbol TAGS directory must be a real project directory".into(),
+            ));
+        }
+        let directory = directory
+            .canonicalize()
+            .map_err(|error| AppError::Domain(format!("resolve TAGS directory: {error}")))?;
+        if !directory.starts_with(&root) {
+            return Err(AppError::Domain(
+                "symbol export path escapes the project".into(),
+            ));
+        }
+        let export = self.build_emacs_tags_export()?;
+        write_project_file_atomically(
+            &directory.join("symbols.md"),
+            export.symbols_markdown.as_bytes(),
+        )?;
+        write_project_file_atomically(&directory.join("TAGS"), export.tags_file.as_bytes())?;
+        Ok(directory.join("TAGS"))
     }
     pub fn analytics_dataset(&self) -> Result<Vec<story_analysis::SceneAnalysisInput>> {
         let mut result = Vec::new();
@@ -2348,6 +2608,53 @@ fn _storage_result(_: StorageResult<()>) {}
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn emacs_tags_export_points_to_stable_symbol_index_entries_and_keeps_utf8_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Mára arrives", 0).unwrap();
+        let character = app.create_character("Mára Venn").unwrap();
+        app.add_character_alias(character, "Mára").unwrap();
+
+        let definitions = app.list_project_symbols().unwrap();
+        assert!(definitions.iter().any(|symbol| {
+            symbol.entity_kind == "scene"
+                && symbol.entity_id == scene.to_string()
+                && symbol
+                    .source_path
+                    .as_ref()
+                    .is_some_and(|path| path.starts_with("manuscript"))
+        }));
+        let export = app.build_emacs_tags_export().unwrap();
+        assert!(
+            export
+                .symbols_markdown
+                .contains("## character: Mára Venn [")
+        );
+        assert!(export.symbols_markdown.contains("## scene: Mára arrives ["));
+        assert!(export.tags_file.starts_with("\u{c}\nsymbols.md,"));
+        assert!(export.tags_file.contains("\u{7f}Mára\u{1}"));
+        assert!(export.tags_file.contains("\u{7f}Mára Venn\u{1}"));
+
+        let record = export
+            .tags_file
+            .split('\n')
+            .find(|line| line.contains("\u{7f}Mára\u{1}"))
+            .unwrap();
+        let (_, coordinates) = record.split_once('\u{1}').unwrap();
+        let (line, offset) = coordinates.split_once(',').unwrap();
+        let line: usize = line.parse().unwrap();
+        let offset: usize = offset.parse().unwrap();
+        assert!(line > 1);
+        assert!(export.symbols_markdown.is_char_boundary(offset));
+        assert!(export.symbols_markdown[offset..].starts_with("## character: Mára Venn ["));
+
+        let path = app.export_emacs_tags().unwrap();
+        assert!(path.ends_with(".writers-ide/tags/TAGS"));
+        assert_eq!(fs::read_to_string(path).unwrap(), export.tags_file);
+    }
 
     #[test]
     fn user_writing_language_is_independent_and_seeds_new_projects() {

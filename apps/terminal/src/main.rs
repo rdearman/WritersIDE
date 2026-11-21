@@ -874,6 +874,14 @@ fn command_registry() -> Vec<CommandSpec> {
             false,
         ),
         legacy_command(
+            "search.tags-export",
+            "Export Emacs TAGS Index",
+            "Build an etags-compatible index of stable project symbols",
+            "Navigate",
+            "tags-export",
+            false,
+        ),
+        legacy_command(
             "search.history-older",
             "Previous Search Query",
             "Recall an older query in the Find panel",
@@ -1564,10 +1572,10 @@ fn command_registry() -> Vec<CommandSpec> {
         ),
         legacy_command(
             "mention.appearances",
-            "Entity Mention Appearances",
-            "List confirmed mention backlinks",
+            "Find Confirmed References",
+            "Navigate confirmed textual mentions; participation remains separate",
             "Plot",
-            "mention-appearances",
+            "entity-mentions",
             true,
         ),
         legacy_command(
@@ -3765,94 +3773,30 @@ impl AppState {
             return Err("enter a symbol name to find its definition".into());
         }
         let mut hits = Vec::new();
-        let mut push = |kind: &str, id: String, title: String, matched: &str| {
+        for symbol in self.app.list_project_symbols()? {
+            let matched_names = std::iter::once(&symbol.name)
+                .chain(symbol.aliases.iter())
+                .filter(|name| name.to_lowercase().contains(&query))
+                .cloned()
+                .collect::<Vec<_>>();
+            if matched_names.is_empty() {
+                continue;
+            }
+            let source = symbol
+                .source_path
+                .as_ref()
+                .map(|path| format!(" · {}", path.display()))
+                .unwrap_or_default();
             hits.push(story_storage::ProjectSearchHit {
-                entity_kind: kind.into(),
-                entity_id: id,
-                title,
-                excerpt: format!("definition · matched {matched}"),
+                entity_kind: symbol.entity_kind.clone(),
+                entity_id: symbol.entity_id.clone(),
+                title: format!("{} · {}", symbol.entity_kind, symbol.name),
+                excerpt: format!(
+                    "definition · matched {} · stable ID {}{source}",
+                    matched_names.join(", "),
+                    symbol.entity_id
+                ),
             });
-        };
-        for scene in self.app.list_scenes(false)? {
-            if scene.scene.title.to_lowercase().contains(&query) {
-                push(
-                    "scene",
-                    scene.scene.id.to_string(),
-                    format!("Scene · {}", scene.scene.title),
-                    &scene.scene.title,
-                );
-            }
-        }
-        for node in self
-            .app
-            .list_structural_nodes()?
-            .into_iter()
-            .filter(|node| node.kind == "chapter")
-        {
-            if node.title.to_lowercase().contains(&query) {
-                push(
-                    "chapter",
-                    node.id.to_string(),
-                    format!("{} · {}", node.kind, node.title),
-                    &node.title,
-                );
-            }
-        }
-        for character in self.app.list_characters()? {
-            let record = self.app.get_character(character.id)?;
-            let names = std::iter::once(record.preferred_name.as_str())
-                .chain(std::iter::once(record.full_name.as_str()))
-                .chain(record.aliases.iter().map(String::as_str));
-            for name in names {
-                if !name.is_empty() && name.to_lowercase().contains(&query) {
-                    push(
-                        "character",
-                        character.id.to_string(),
-                        format!("Character · {}", character.name),
-                        name,
-                    );
-                }
-            }
-        }
-        for location in self.app.list_locations()? {
-            if location.name.to_lowercase().contains(&query) {
-                push(
-                    "location",
-                    location.id.to_string(),
-                    format!("Location · {}", location.name),
-                    &location.name,
-                );
-            }
-        }
-        for object in self.app.list_story_objects()? {
-            if object.name.to_lowercase().contains(&query) {
-                push(
-                    "object",
-                    object.id.to_string(),
-                    format!("Object · {}", object.name),
-                    &object.name,
-                );
-            }
-        }
-        for plotline in self.app.list_plotlines()? {
-            if plotline.name.to_lowercase().contains(&query) {
-                push(
-                    "plotline",
-                    plotline.id.to_string(),
-                    format!("Plotline · {}", plotline.name),
-                    &plotline.name,
-                );
-            }
-        }
-        for event in self.app.list_events()? {
-            if event.title.to_lowercase().contains(&query) {
-                push(
-                    "event",
-                    event.id.to_string(),
-                    format!("Event · {}", event.title),
-                    &event.title,
-                );
-            }
         }
         hits.sort_by(|left, right| {
             left.title
@@ -5097,6 +5041,14 @@ impl AppState {
         &mut self,
         cmd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if cmd == "tags-export" {
+            let path = self.app.export_emacs_tags()?;
+            self.message = format!(
+                "Emacs TAGS export written to {} · definition lines resolve to stable symbol records",
+                path.display()
+            );
+            return Ok(());
+        }
         if cmd == "find-history-older" || cmd == "find-history-newer" {
             step_find_query_history(self, cmd == "find-history-older")?;
             return Ok(());
@@ -6528,22 +6480,60 @@ impl AppState {
             };
             let id = parts.next().ok_or("missing entity UUID")?;
             let rows = self.app.confirmed_entity_mention_appearances(kind, id)?;
-            self.message = rows
-                .into_iter()
-                .map(|row| {
-                    format!(
-                        "{} · {} · bytes {}..{} · {}",
-                        row.scene_title,
-                        row.scene_id,
-                        row.mention.start_byte,
-                        row.mention.end_byte,
-                        row.mention.quote
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(" | ");
-            if self.message.is_empty() {
-                self.message = "No confirmed prose mentions for this entity".into();
+            if self.dirty {
+                return Err(
+                    "save the current scene before navigating to confirmed mentions".into(),
+                );
+            }
+            self.search_locations.clear();
+            self.search_result_rows.clear();
+            let mut stale = 0usize;
+            let mut titles = Vec::new();
+            for row in rows {
+                let (text, _) = self.app.load_scene_text(row.scene_id)?;
+                let stored_start = usize::try_from(row.mention.start_byte)?;
+                let stored_end = usize::try_from(row.mention.end_byte)?;
+                let start = text
+                    .get(stored_start..stored_end)
+                    .filter(|quote| *quote == row.mention.quote)
+                    .map(|_| stored_start)
+                    .or_else(|| {
+                        let mut matches = text.match_indices(&row.mention.quote);
+                        let first = matches.next()?.0;
+                        matches.next().is_none().then_some(first)
+                    });
+                let Some(start) = start else {
+                    stale += 1;
+                    continue;
+                };
+                let end = start + row.mention.quote.len();
+                self.search_locations.push((row.scene_id, start, end));
+                self.search_result_rows.push(format_search_result_row(
+                    &row.scene_title,
+                    &text,
+                    start,
+                ));
+                titles.push(row.scene_title);
+            }
+            if self.search_locations.is_empty() {
+                self.message = if stale == 0 {
+                    "No confirmed prose mentions for this entity".into()
+                } else {
+                    format!("No safe jump: {stale} confirmed mention(s) are stale or ambiguous")
+                };
+            } else {
+                self.search_location_index = self.search_locations.len() - 1;
+                self.navigate_search_match(true)?;
+                self.message = format!(
+                    "{} confirmed textual mention(s) in {}; narrative participation is tracked separately{}",
+                    self.search_locations.len(),
+                    titles.join(", "),
+                    if stale == 0 {
+                        String::new()
+                    } else {
+                        format!(" · skipped {stale} stale/ambiguous mention(s)")
+                    }
+                );
             }
         } else if cmd == "mentions" {
             let scene = self
@@ -16057,8 +16047,14 @@ mod tests {
             .unwrap();
         assert!(state.message.contains("First"));
         assert!(state.message.contains("Second"));
-        assert!(state.message.contains("Silver Key"));
-        assert!(!state.message.contains("presence"));
+        assert!(
+            state
+                .message
+                .contains("narrative participation is tracked separately")
+        );
+        assert_eq!(state.search_locations.len(), 2);
+        assert_eq!(state.editing_scene, Some(first));
+        assert_eq!(state.selected_text().as_deref(), Some("Silver Key"));
     }
 
     #[test]
