@@ -7011,6 +7011,12 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             rows.extend(daily_writing_rows(
                 &s.app.list_writing_challenges().unwrap_or_default(),
             ));
+            rows.extend(challenge_streak_rows(
+                &s.app.list_writing_challenges().unwrap_or_default(),
+                time::OffsetDateTime::now_utc()
+                    .unix_timestamp()
+                    .div_euclid(86_400),
+            ));
             let sessions = s.app.list_writing_sessions().unwrap_or_default();
             rows.extend(daily_session_rows(&sessions));
             rows.extend(writing_streak_rows(
@@ -7194,6 +7200,48 @@ fn daily_writing_rows(challenges: &[story_storage::WritingChallengeRecord]) -> V
             format!("{date}  {bar}  {words} words · {sessions} {session_label} · {cumulative} cumulative")
         })
         .collect()
+}
+
+fn challenge_streak_rows(
+    challenges: &[story_storage::WritingChallengeRecord],
+    today_utc_day: i64,
+) -> Vec<String> {
+    let success_days = challenges
+        .iter()
+        .filter(|challenge| challenge.outcome == "success")
+        .filter(|challenge| challenge.words_written.is_some_and(|words| words > 0))
+        .map(|challenge| challenge.started_at.div_euclid(86_400))
+        .collect::<BTreeSet<_>>();
+    if success_days.is_empty() {
+        return vec!["Challenge streak · no successful challenge days yet".into()];
+    }
+    let mut best = 0usize;
+    let mut run = 0usize;
+    let mut previous: Option<i64> = None;
+    for day in &success_days {
+        run = if previous.is_some_and(|prior| prior.saturating_add(1) == *day) {
+            run + 1
+        } else {
+            1
+        };
+        best = best.max(run);
+        previous = Some(*day);
+    }
+    let latest = *success_days.last().expect("non-empty success days");
+    let mut current = 0usize;
+    if latest >= today_utc_day.saturating_sub(1) {
+        let mut day = latest;
+        while success_days.contains(&day) {
+            current += 1;
+            let Some(previous_day) = day.checked_sub(1) else {
+                break;
+            };
+            day = previous_day;
+        }
+    }
+    vec![format!(
+        "Challenge streak · current {current} days · best {best} days · completed positive-word challenges"
+    )]
 }
 
 fn daily_session_rows(sessions: &[story_storage::WritingSessionRecord]) -> Vec<String> {
@@ -8899,6 +8947,38 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert!(rows[0].contains("200 words · 2 sessions · 200 cumulative"));
         assert!(rows[1].contains("100 words · 1 session · 300 cumulative"));
+    }
+
+    #[test]
+    fn challenge_streaks_track_success_days_and_ignore_failures() {
+        let today = 20_000i64;
+        let record =
+            |id: &str, day: i64, outcome: &str, words| story_storage::WritingChallengeRecord {
+                id: id.into(),
+                started_at: day * 86_400,
+                deadline_at: day * 86_400 + 600,
+                target_words: 100,
+                mode: "steady".into(),
+                ended_at: Some(day * 86_400 + 300),
+                words_written: words,
+                status: "completed".into(),
+                words_deleted: 0,
+                pauses_consumed: 0,
+                outcome: outcome.into(),
+            };
+        let challenges = [
+            record("a", today - 5, "success", Some(100)),
+            record("b", today - 4, "success", Some(100)),
+            record("failure", today - 3, "timeout", Some(50)),
+            record("c", today - 1, "success", Some(100)),
+            record("d", today, "success", Some(100)),
+            record("zero", today, "success", Some(0)),
+        ];
+        let rows = challenge_streak_rows(&challenges, today);
+        assert!(rows[0].contains("current 2 days"));
+        assert!(rows[0].contains("best 2 days"));
+        assert!(challenge_streak_rows(&challenges, today + 3)[0].contains("current 0 days"));
+        assert!(challenge_streak_rows(&[], today)[0].contains("no successful"));
     }
 
     #[test]
