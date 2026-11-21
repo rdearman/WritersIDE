@@ -133,6 +133,9 @@ struct AppState {
     recording_macro: Option<(String, Vec<story_core::EditMacroOp>)>,
     text_expansion: TextExpansionConfig,
     bookmarks: BTreeMap<String, EditorBookmark>,
+    kill_ring: Vec<String>,
+    kill_ring_index: usize,
+    last_yank: Option<LastYank>,
     extra_cursors: Vec<(usize, usize)>,
     active_challenge: Option<ActiveWritingChallenge>,
     menu: Option<MenuState>,
@@ -296,6 +299,15 @@ struct EditorToolsFile {
     macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
     #[serde(default)]
     bookmarks: BTreeMap<String, EditorBookmark>,
+    #[serde(default)]
+    kill_ring: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct LastYank {
+    scene_id: Option<SceneId>,
+    range: std::ops::Range<usize>,
+    text: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1403,6 +1415,9 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.bookmark-save", "Save Passage Bookmark", "Save a named stable-ID bookmark for the current passage", "Navigate", "manuscript-bookmark-save", true),
         legacy_command("edit.bookmark-list", "List Passage Bookmarks", "List saved manuscript passage bookmarks", "Navigate", "manuscript-bookmark-list", false),
         legacy_command("edit.bookmark-jump", "Jump to Passage Bookmark", "Navigate to a saved passage, following stable scene identity", "Navigate", "manuscript-bookmark-jump", true),
+        legacy_command("edit.kill-ring-list", "List Kill Ring", "Inspect retained copied and cut manuscript text", "Edit", "kill-ring-list", false),
+        legacy_command("edit.kill-ring-insert", "Insert Kill Ring Entry", "Insert a retained text entry by its number", "Edit", "kill-ring-insert", true),
+        legacy_command("edit.yank-pop", "Cycle Previous Yank", "Replace the last yank with the next retained kill-ring entry", "Edit", "yank-pop", false),
         legacy_command("edit.cursor-add", "Add Multi-cursor", "Add an editing cursor at grapheme row and column", "Edit", "cursor-add", true),
         legacy_command("edit.cursor-clear", "Clear Multi-cursors", "Return to the primary editor cursor", "Edit", "cursor-clear", false),
         legacy_command("challenge.start", "Start Writing Challenge", "Start a timed word target; opt-in Kamikaze mode reacts to inactivity", "Tools", "challenge-start", true),
@@ -1845,6 +1860,9 @@ impl AppState {
             recording_macro: None,
             text_expansion,
             bookmarks: tools.bookmarks,
+            kill_ring: tools.kill_ring,
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -1866,6 +1884,7 @@ impl AppState {
             registers: self.registers.clone(),
             macros: self.macros.clone(),
             bookmarks: self.bookmarks.clone(),
+            kill_ring: self.kill_ring.clone(),
         })?;
         let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
         use std::io::Write;
@@ -1873,6 +1892,61 @@ impl AppState {
         temporary.as_file().sync_all()?;
         temporary.persist(&path)?;
         fs::File::open(directory)?.sync_all()?;
+        Ok(())
+    }
+    fn remember_kill(&mut self, text: String) -> Result<(), Box<dyn std::error::Error>> {
+        self.last_yank = None;
+        if text.is_empty() {
+            return Ok(());
+        }
+        if self.kill_ring.first() != Some(&text) {
+            self.kill_ring.insert(0, text);
+            self.kill_ring.truncate(32);
+        }
+        self.kill_ring_index = 0;
+        self.persist_editor_tools()
+    }
+    fn insert_kill_ring_entry(&mut self, index: usize) -> Result<(), Box<dyn std::error::Error>> {
+        let text = self
+            .kill_ring
+            .get(index)
+            .ok_or("kill-ring index is out of range")?
+            .clone();
+        self.kill_ring_index = index;
+        self.clipboard = text.clone();
+        self.push_undo();
+        self.paste_text(&text);
+        Ok(())
+    }
+    fn yank_pop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let last = self
+            .last_yank
+            .clone()
+            .ok_or("yank-pop requires a recent manuscript paste")?;
+        if last.scene_id != self.editing_scene {
+            return Err("yank-pop cannot cross a scene change".into());
+        }
+        if self.kill_ring.len() < 2 {
+            return Err("yank-pop needs at least two retained entries".into());
+        }
+        let next_index = (self.kill_ring_index + 1) % self.kill_ring.len();
+        let replacement = self.kill_ring[next_index].clone();
+        let mut text = self.editor.join("\n");
+        if text.get(last.range.clone()) != Some(last.text.as_str()) {
+            return Err("the last yanked passage changed; yank-pop was cancelled".into());
+        }
+        self.push_undo();
+        text.replace_range(last.range.clone(), &replacement);
+        self.editor = text.split('\n').map(str::to_owned).collect();
+        self.cursor = editor_position_from_byte(&text, last.range.start + replacement.len())
+            .ok_or("replacement cursor is not a valid UTF-8 position")?;
+        self.dirty = true;
+        self.kill_ring_index = next_index;
+        self.last_yank = Some(LastYank {
+            scene_id: self.editing_scene,
+            range: last.range.start..last.range.start + replacement.len(),
+            text: replacement,
+        });
         Ok(())
     }
     fn save_session(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -2431,6 +2505,7 @@ impl AppState {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.editor_selection = None;
+        self.last_yank = None;
         self.assembly_draft = None;
         self.dirty = false;
         self.workspace = Workspace::Editor;
@@ -3282,6 +3357,26 @@ impl AppState {
             self.cursor = editor_position_from_byte(&text, offset)
                 .ok_or("bookmark offset is not a valid UTF-8 position")?;
             self.message = format!("Jumped to manuscript bookmark {}", name.trim());
+        } else if cmd == "kill-ring-list" {
+            self.message = self
+                .kill_ring
+                .iter()
+                .enumerate()
+                .map(|(index, text)| format!("{}: {}", index + 1, text.replace('\n', " ↵ ")))
+                .collect::<Vec<_>>()
+                .join(" | ");
+        } else if let Some(value) = cmd.strip_prefix("kill-ring-insert ") {
+            let index = value
+                .trim()
+                .parse::<usize>()?
+                .checked_sub(1)
+                .ok_or("kill-ring entries are numbered from 1")?;
+            self.insert_kill_ring_entry(index)?;
+            self.message = format!("Inserted kill-ring entry {}", index + 1);
+        } else if cmd == "yank-pop" {
+            self.yank_pop()?;
+            self.message =
+                "Replaced the last yank with the next kill-ring entry (undo available)".into();
         } else if let Some(rest) = cmd.strip_prefix("macro ") {
             let operations = parse_macro_recipe(rest)?;
             self.apply_edit_macro(&operations)?;
@@ -5160,7 +5255,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-save NAME filters... | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | coverage-add ID character|plotline ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format FORMAT [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -5286,6 +5381,7 @@ impl AppState {
         Ok(())
     }
     fn insert(&mut self, ch: char) {
+        self.last_yank = None;
         self.record_macro_op(story_core::EditMacroOp::Insert(ch.to_string()));
         if self.writing_stats_enabled {
             self.typed_characters = self.typed_characters.saturating_add(1);
@@ -5508,6 +5604,7 @@ impl AppState {
         self.dirty = true;
     }
     fn backspace(&mut self) {
+        self.last_yank = None;
         self.record_macro_op(story_core::EditMacroOp::Backspace);
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
@@ -5535,6 +5632,7 @@ impl AppState {
         }
     }
     fn delete_forward(&mut self) {
+        self.last_yank = None;
         self.record_macro_op(story_core::EditMacroOp::DeleteForward);
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
@@ -5560,6 +5658,10 @@ impl AppState {
         }
     }
     fn paste_text(&mut self, text: &str) {
+        let range_start = self
+            .selection_bounds()
+            .map(|((row, column), _)| editor_position_byte(&self.editor, row, column))
+            .unwrap_or_else(|| editor_position_byte(&self.editor, self.cursor.0, self.cursor.1));
         self.delete_selection();
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         self.record_macro_op(story_core::EditMacroOp::Insert(normalized.clone()));
@@ -5575,8 +5677,24 @@ impl AppState {
                 self.insert_text_char(ch)
             }
         }
+        let range_end = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+        self.last_yank = Some(LastYank {
+            scene_id: self.editing_scene,
+            range: range_start..range_end,
+            text: normalized,
+        });
+        self.kill_ring_index = self
+            .kill_ring
+            .iter()
+            .position(|entry| {
+                self.last_yank
+                    .as_ref()
+                    .is_some_and(|last| entry == &last.text)
+            })
+            .unwrap_or(0);
     }
     fn enter(&mut self) {
+        self.last_yank = None;
         self.record_macro_op(story_core::EditMacroOp::Insert("\n".into()));
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
@@ -5658,6 +5776,7 @@ impl AppState {
         self.cursor = (row, col.min(grapheme_count(&self.editor[row])));
     }
     fn move_editor_cursors(&mut self, motion: CursorMotion, selecting: bool) {
+        self.last_yank = None;
         let move_position = |(row, column): (usize, usize)| -> (usize, usize) {
             match motion {
                 CursorMotion::Left if column > 0 => (row, column - 1),
@@ -8400,12 +8519,16 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 KeyCode::Char('c') => {
                     if let Some(text) = s.selected_text() {
                         s.clipboard = text;
+                        let copied = s.clipboard.clone();
+                        s.remember_kill(copied)?;
                     }
                     return Ok(false);
                 }
                 KeyCode::Char('x') => {
                     if let Some(text) = s.selected_text() {
                         s.clipboard = text;
+                        let cut = s.clipboard.clone();
+                        s.remember_kill(cut)?;
                         s.delete_selection();
                     }
                     return Ok(false);
@@ -9223,6 +9346,30 @@ mod tests {
     }
 
     #[test]
+    fn kill_ring_persists_and_yank_pop_is_undoable() {
+        let root = tempfile::tempdir().unwrap();
+        let project =
+            WriterApp::create_project(root.path().join("Kill Ring"), "Kill Ring").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.remember_kill("first passage".into()).unwrap();
+        state.remember_kill("second passage".into()).unwrap();
+        state.editor = vec!["Before: ".into()];
+        state.cursor = (0, 8);
+        state.insert_kill_ring_entry(0).unwrap();
+        assert_eq!(state.editor, ["Before: second passage"]);
+        state.yank_pop().unwrap();
+        assert_eq!(state.editor, ["Before: first passage"]);
+        state.undo_edit();
+        assert_eq!(state.editor, ["Before: second passage"]);
+
+        let reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        assert_eq!(reopened.kill_ring, ["second passage", "first passage"]);
+    }
+
+    #[test]
     fn recorded_shift_selection_replays_as_a_text_replacement() {
         let root = tempfile::tempdir().unwrap();
         let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
@@ -9756,6 +9903,9 @@ mod tests {
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
             bookmarks: BTreeMap::new(),
+            kill_ring: Vec::new(),
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10222,6 +10372,9 @@ mod tests {
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
             bookmarks: BTreeMap::new(),
+            kill_ring: Vec::new(),
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10309,6 +10462,9 @@ mod tests {
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
             bookmarks: BTreeMap::new(),
+            kill_ring: Vec::new(),
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10388,6 +10544,9 @@ mod tests {
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
             bookmarks: BTreeMap::new(),
+            kill_ring: Vec::new(),
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10479,6 +10638,9 @@ mod tests {
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
             bookmarks: BTreeMap::new(),
+            kill_ring: Vec::new(),
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10720,6 +10882,9 @@ mod tests {
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
             bookmarks: BTreeMap::new(),
+            kill_ring: Vec::new(),
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10811,6 +10976,9 @@ mod tests {
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
             bookmarks: BTreeMap::new(),
+            kill_ring: Vec::new(),
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -10919,6 +11087,9 @@ mod tests {
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
             bookmarks: BTreeMap::new(),
+            kill_ring: Vec::new(),
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11145,6 +11316,9 @@ mod tests {
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
             bookmarks: BTreeMap::new(),
+            kill_ring: Vec::new(),
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11498,6 +11672,9 @@ mod tests {
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
             bookmarks: BTreeMap::new(),
+            kill_ring: Vec::new(),
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11600,6 +11777,9 @@ mod tests {
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
             bookmarks: BTreeMap::new(),
+            kill_ring: Vec::new(),
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
@@ -11754,6 +11934,9 @@ mod tests {
             recording_macro: None,
             text_expansion: TextExpansionConfig::default(),
             bookmarks: BTreeMap::new(),
+            kill_ring: Vec::new(),
+            kill_ring_index: 0,
+            last_yank: None,
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
