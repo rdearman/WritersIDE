@@ -6078,14 +6078,21 @@ impl ProjectStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute("UPDATE reading_document SET title=?2,media_type=?3,relative_path=?4,source_sha256=?5,extracted_text=?6,updated_at=?7 WHERE id=?1",params![id.to_string(),document.title,document.media_type,relative,expected,document.extracted_text,now()])?;
         if existing.source_sha256 != expected {
-            let annotations: Vec<(String, String)> = {
+            let annotations: Vec<(String, String, String, String)> = {
                 let mut q =
-                    tx.prepare("SELECT id,quote FROM reading_annotation WHERE document_id=?1")?;
-                q.query_map([id.to_string()], |r| Ok((r.get(0)?, r.get(1)?)))?
-                    .collect::<std::result::Result<_, _>>()?
+                    tx.prepare("SELECT id,quote,prefix_context,suffix_context FROM reading_annotation WHERE document_id=?1")?;
+                q.query_map([id.to_string()], |r| {
+                    Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?
             };
-            for (annotation, quote) in annotations {
-                let found = unique_occurrence(&document.extracted_text, &quote);
+            for (annotation, quote, prefix, suffix) in annotations {
+                let found = unique_contextual_occurrence(
+                    &document.extracted_text,
+                    &quote,
+                    &prefix,
+                    &suffix,
+                );
                 if let Some((start, end)) = found {
                     tx.execute("UPDATE reading_annotation SET start_byte=?2,end_byte=?3,source_sha256=?4,state='current',updated_at=?5 WHERE id=?1",params![annotation,start,end,expected,now()])?;
                 } else {
@@ -8126,6 +8133,27 @@ fn unique_occurrence(text: &str, quote: &str) -> Option<(usize, usize)> {
     } else {
         Some((start, start + matched.len()))
     }
+}
+
+/// Reanchors a passage only when its exact quote and saved neighboring context identify one
+/// location. If context does not disambiguate duplicate text, the annotation remains reviewable.
+fn unique_contextual_occurrence(
+    text: &str,
+    quote: &str,
+    prefix: &str,
+    suffix: &str,
+) -> Option<(usize, usize)> {
+    if quote.is_empty() {
+        return None;
+    }
+    let mut matches = text.match_indices(quote).filter_map(|(start, _)| {
+        let end = start.checked_add(quote.len())?;
+        let before = &text[..start];
+        let after = &text[end..];
+        (before.ends_with(prefix) && after.starts_with(suffix)).then_some((start, end))
+    });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 fn line_diff(old: &str, new: &str) -> Vec<SnapshotDiffLine> {
     let a: Vec<&str> = old.split_inclusive('\n').collect();
@@ -10441,7 +10469,7 @@ mod tests {
                     end_byte: at + 10,
                     quote: "silver key".into(),
                     body: "important clue".into(),
-                    prefix_context: "a ".into(),
+                    prefix_context: "Mara finds a ".into(),
                     suffix_context: ".".into(),
                 },
             )
@@ -10463,7 +10491,11 @@ mod tests {
             .unwrap();
         assert_eq!(store.search_reading("silver").unwrap().len(), 1);
         let changed = d.path().join("updated.txt");
-        fs::write(&changed, "Earlier text. Mara finds a silver key.").unwrap();
+        fs::write(
+            &changed,
+            "Earlier text. Mara finds a silver key. Mara hides the silver key.",
+        )
+        .unwrap();
         let update = story_reading::import_reference(&changed).unwrap();
         store.reload_reading_document(reading, &update).unwrap();
         let annotations = store.list_reading_annotations(reading).unwrap();
