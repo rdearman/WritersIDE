@@ -21,6 +21,7 @@ ratatui.workspace = true
 crossterm.workspace = true
 unicode-segmentation.workspace = true
 tempfile.workspace = true
+time.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -6231,6 +6231,9 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             rows.extend(challenge_progress_rows(
                 &s.app.list_writing_challenges().unwrap_or_default(),
             ));
+            rows.extend(daily_writing_rows(
+                &s.app.list_writing_challenges().unwrap_or_default(),
+            ));
             rows
         }
         Workspace::Research if s.proposal_review_active => s.proposal_review_rows.clone(),
@@ -6321,6 +6324,42 @@ fn challenge_progress_rows(challenges: &[story_storage::WritingChallengeRecord])
                 "Challenge · {} · {written}/{} words · {bar} · {} · {}",
                 challenge.mode, challenge.target_words, challenge.status, challenge.started_at
             )
+        })
+        .collect()
+}
+
+fn daily_writing_rows(challenges: &[story_storage::WritingChallengeRecord]) -> Vec<String> {
+    let mut days = BTreeMap::<String, (u64, usize)>::new();
+    for challenge in challenges {
+        let Some(words) = challenge.words_written else {
+            continue;
+        };
+        let Ok(timestamp) = time::OffsetDateTime::from_unix_timestamp(challenge.started_at) else {
+            continue;
+        };
+        let date = format!(
+            "{:04}-{:02}-{:02}",
+            timestamp.year(),
+            u8::from(timestamp.month()),
+            timestamp.day()
+        );
+        let entry = days.entry(date).or_default();
+        entry.0 = entry.0.saturating_add(u64::from(words));
+        entry.1 += 1;
+    }
+    let maximum = days.values().map(|entry| entry.0).max().unwrap_or(0);
+    let mut cumulative = 0u64;
+    days.into_iter()
+        .map(|(date, (words, sessions))| {
+            cumulative = cumulative.saturating_add(words);
+            let filled = words
+                .saturating_mul(20)
+                .checked_div(maximum)
+                .unwrap_or(0)
+                .min(20) as usize;
+            let bar = "█".repeat(filled);
+            let session_label = if sessions == 1 { "session" } else { "sessions" };
+            format!("{date}  {bar}  {words} words · {sessions} {session_label} · {cumulative} cumulative")
         })
         .collect()
 }
@@ -7232,6 +7271,30 @@ mod tests {
         assert!(rows[0].contains("5/10 words"));
         assert!(rows[0].contains("██████████░░░░░░░░░░"));
         assert!(rows[1].contains("████████████████████"));
+    }
+
+    #[test]
+    fn daily_writing_graph_groups_sessions_and_accumulates_words_by_utc_date() {
+        let record =
+            |id: &str, started_at: i64, words_written| story_storage::WritingChallengeRecord {
+                id: id.into(),
+                started_at,
+                deadline_at: started_at + 60,
+                target_words: 100,
+                mode: "steady".into(),
+                ended_at: Some(started_at + 30),
+                words_written,
+                status: "completed".into(),
+            };
+        let rows = daily_writing_rows(&[
+            record("first", 1_700_000_000, Some(120)),
+            record("second", 1_700_000_500, Some(80)),
+            record("third", 1_700_086_400, Some(100)),
+            record("active", 1_700_086_500, None),
+        ]);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].contains("200 words · 2 sessions · 200 cumulative"));
+        assert!(rows[1].contains("100 words · 1 session · 300 cumulative"));
     }
 
     #[test]
