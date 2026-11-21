@@ -419,6 +419,27 @@ impl WriterApp {
                 end: row.scene.end_time,
             });
         }
+        let events = self
+            .store
+            .list_events()?
+            .into_iter()
+            .map(|event| story_pipeline::PipelineEvent {
+                id: event.id.to_string(),
+                title: event.title,
+                start: event.start,
+                end: event.end,
+            })
+            .collect();
+        let event_dependencies = self
+            .store
+            .list_event_dependencies()?
+            .into_iter()
+            .map(|dependency| story_pipeline::PipelineEventDependency {
+                predecessor: dependency.predecessor.to_string(),
+                successor: dependency.successor.to_string(),
+                kind: dependency.kind,
+            })
+            .collect();
         Ok(story_pipeline::PipelineInput {
             title: project.title,
             target_words: project.target_words,
@@ -426,6 +447,8 @@ impl WriterApp {
             groups,
             content_units,
             scenes,
+            events,
+            event_dependencies,
             revision_summary: format!(
                 "{} scenes; {snapshots} stored snapshots",
                 self.store.list_scenes(false)?.len()

@@ -63,6 +63,21 @@ pub struct PipelineContentUnit {
 }
 
 #[derive(Clone, Debug)]
+pub struct PipelineEvent {
+    pub id: String,
+    pub title: String,
+    pub start: story_core::StoryTime,
+    pub end: story_core::StoryTime,
+}
+
+#[derive(Clone, Debug)]
+pub struct PipelineEventDependency {
+    pub predecessor: String,
+    pub successor: String,
+    pub kind: String,
+}
+
+#[derive(Clone, Debug)]
 pub struct PipelinePassage {
     pub source_entity_id: String,
     pub text: String,
@@ -77,6 +92,8 @@ pub struct PipelineInput {
     pub content_units: Vec<PipelineContentUnit>,
     /// Ordered in manuscript order; chronology remains on each scene independently.
     pub scenes: Vec<PipelineScene>,
+    pub events: Vec<PipelineEvent>,
+    pub event_dependencies: Vec<PipelineEventDependency>,
     pub revision_summary: String,
 }
 
@@ -714,11 +731,15 @@ fn stage_fingerprint(
             .iter()
             .map(|s| format!("{}:{:?}", s.id, s.characters))
             .collect(),
-        Stage::Continuity => input
-            .scenes
-            .iter()
-            .map(|s| format!("{}:{:?}:{:?}", s.id, s.start, s.end))
-            .collect(),
+        Stage::Continuity => format!(
+            "{:?}\n{:?}",
+            input
+                .scenes
+                .iter()
+                .map(|s| (&s.id, s.start, s.end))
+                .collect::<Vec<_>>(),
+            (&input.events, &input.event_dependencies)
+        ),
         Stage::Proofread => outputs.get(&Stage::Compile).cloned().unwrap_or_default(),
         Stage::RevisionReport => input.revision_summary.clone(),
     };
@@ -822,6 +843,34 @@ fn render_stage(
                     finding.first_scene_id,
                     finding.second_scene_id,
                     finding.shared_character_ids.join(",")
+                ));
+            }
+            let events = input
+                .events
+                .iter()
+                .map(|event| (event.id.as_str(), event))
+                .collect::<BTreeMap<_, _>>();
+            for dependency in &input.event_dependencies {
+                let earlier = events.get(dependency.predecessor.as_str());
+                let later = events.get(dependency.successor.as_str());
+                let comparison = earlier.zip(later).map(|(a, b)| a.end.compare(b.start));
+                let finding = story_analysis::evaluate_event_precedence(
+                    &dependency.predecessor,
+                    &dependency.successor,
+                    comparison,
+                );
+                output.push_str(&format!(
+                    "event-{}\t{}\t{}\t{}\t{}\n",
+                    match finding.status {
+                        story_analysis::InspectionStatus::Pass => "pass",
+                        story_analysis::InspectionStatus::Fail => "fail",
+                        story_analysis::InspectionStatus::Unknown => "unknown",
+                        story_analysis::InspectionStatus::Skip => "skip",
+                    },
+                    dependency.kind,
+                    dependency.predecessor,
+                    dependency.successor,
+                    finding.evidence.join("; ")
                 ));
             }
             Ok(output)
@@ -1096,6 +1145,8 @@ mod tests {
                 start: StoryTime::unknown(),
                 end: StoryTime::unknown(),
             }],
+            events: vec![],
+            event_dependencies: vec![],
             revision_summary: "one snapshot".into(),
         }
     }
@@ -1168,6 +1219,39 @@ mod tests {
         assert!(report.contains("definite-overlap\tscene-1\tscene-2\tcharacter-1"));
         assert!(report.contains("unverified-overlap\tscene-1\tscene-3\tcharacter-1"));
         assert!(report.contains("unverified-overlap\tscene-2\tscene-3\tcharacter-1"));
+    }
+
+    #[test]
+    fn continuity_pipeline_evaluates_event_dependencies_with_uncertainty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut novel = input("Draft.");
+        novel.events = vec![
+            PipelineEvent {
+                id: "event-a".into(),
+                title: "Arrival".into(),
+                start: StoryTime::exact(1),
+                end: StoryTime::exact(5),
+            },
+            PipelineEvent {
+                id: "event-b".into(),
+                title: "Departure".into(),
+                start: StoryTime::new(None, Some(4), Some(8), story_core::TimePrecision::Bounded)
+                    .unwrap(),
+                end: StoryTime::exact(9),
+            },
+        ];
+        novel.event_dependencies.push(PipelineEventDependency {
+            predecessor: "event-a".into(),
+            successor: "event-b".into(),
+            kind: "precedes".into(),
+        });
+        PipelineRunner::new(&dir)
+            .run_selected(&novel, &[Stage::Continuity])
+            .unwrap();
+        let report =
+            fs::read_to_string(dir.path().join(".writers-ide/processing/continuity.txt")).unwrap();
+        assert!(report.contains("event-unknown\tprecedes\tevent-a\tevent-b"));
+        assert!(report.contains("Ambiguous"));
     }
 
     #[test]
