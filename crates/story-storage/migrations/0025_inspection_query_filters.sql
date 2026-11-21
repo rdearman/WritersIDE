@@ -3,7 +3,7 @@ CREATE TABLE saved_query_filter(
   query_id TEXT NOT NULL REFERENCES saved_query(id) ON DELETE CASCADE,
   ordinal INTEGER NOT NULL CHECK(ordinal>=0),
   filter_kind TEXT NOT NULL CHECK(filter_kind IN(
-    'status','exclude_status','character','character_any','character_present','character_mentioned',
+    'status','exclude_status','character','character_any','character_present','character_mentioned','character_absent',
     'plotline','plotline_any','location','event','chapter','text_contains',
     'time_before','time_after','unresolved_issue'
   )),

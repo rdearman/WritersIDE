@@ -1252,6 +1252,23 @@ impl WriterApp {
     pub fn run_scene_query(&self, query: QueryId) -> Result<Vec<SceneId>> {
         Ok(self.store.run_scene_query(query)?)
     }
+    pub fn record_character_absence(
+        &mut self,
+        scene: SceneId,
+        character: CharacterId,
+        notes: &str,
+    ) -> Result<()> {
+        Ok(self
+            .store
+            .record_character_absence(scene, character, notes)?)
+    }
+    pub fn clear_character_absence(
+        &mut self,
+        scene: SceneId,
+        character: CharacterId,
+    ) -> Result<()> {
+        Ok(self.store.clear_character_absence(scene, character)?)
+    }
     pub fn set_query_assertions(
         &mut self,
         query: QueryId,

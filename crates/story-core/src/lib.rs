@@ -703,6 +703,8 @@ pub enum SceneQueryFilter {
     CharacterPresent(CharacterId),
     /// Character is explicitly listed as mentioned, which is distinct from presence.
     CharacterMentioned(CharacterId),
+    /// Character absence was explicitly recorded by the author.
+    CharacterAbsent(CharacterId),
     Plotline(PlotlineId),
     AnyPlotline(Vec<PlotlineId>),
     Location(LocationId),

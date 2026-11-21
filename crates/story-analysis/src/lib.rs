@@ -356,10 +356,10 @@ pub fn evaluate_coverage(
             let matching = scenes
                 .iter()
                 .filter(|scene| match requirement.dimension {
-                    CoverageDimension::Character => scene
-                        .characters
-                        .iter()
-                        .any(|item| item.id == requirement.entity_id),
+                    CoverageDimension::Character => scene.characters.iter().any(|item| {
+                        item.id == requirement.entity_id
+                            && item.role != ParticipationRole::Mentioned
+                    }),
                     CoverageDimension::Plotline => scene
                         .plotlines
                         .iter()
@@ -516,6 +516,11 @@ mod inspection_tests {
             name: "Ada".into(),
             role: ParticipationRole::Major,
         });
+        scenes[0].characters.push(CharacterOnScene {
+            id: "c-mentioned".into(),
+            name: "Named only".into(),
+            role: ParticipationRole::Mentioned,
+        });
         let requirement = CoverageRequirement {
             id: "arc-a".into(),
             label: "Arc A appears".into(),
@@ -526,6 +531,14 @@ mod inspection_tests {
         let coverage = evaluate_coverage(&scenes, &[requirement]);
         assert_eq!(coverage[0].matching_scene_ids, ["s1"]);
         assert!(!coverage[0].coverage_met);
+        let mention_only = CoverageRequirement {
+            id: "mention-only".into(),
+            label: "Mention is not presence".into(),
+            entity_id: "c-mentioned".into(),
+            dimension: CoverageDimension::Character,
+            minimum_scenes: 1,
+        };
+        assert!(!evaluate_coverage(&scenes, &[mention_only])[0].coverage_met);
         assert!(evaluate_query_assertion(1, &story_core::QueryAssertion::Exactly(1)).passed);
         assert!(!evaluate_query_assertion(0, &story_core::QueryAssertion::NonEmpty).passed);
     }

@@ -5510,7 +5510,7 @@ impl AppState {
             let mut parts = rest.split_whitespace();
             let name = parts
                 .next()
-                .ok_or("use query-save <name> [status=...|not-status=...|character=UUID|character-any=UUID,UUID|plotline=UUID|plotline-any=UUID,UUID|before=TICK|after=TICK|issue=unresolved]")?;
+                .ok_or("use query-save <name> [status=...|character=UUID|present=UUID|mentioned=UUID|absent=UUID|location=UUID|event=UUID|chapter=UUID|text=TERM|plotline=UUID|before=TICK|after=TICK|issue=unresolved]")?;
             let mut filters = Vec::new();
             for filter in parts {
                 let (key, value) = filter
@@ -5524,6 +5524,23 @@ impl AppState {
                     "character" => story_core::SceneQueryFilter::Character(
                         story_core::CharacterId(value.parse()?),
                     ),
+                    "present" => story_core::SceneQueryFilter::CharacterPresent(
+                        story_core::CharacterId(value.parse()?),
+                    ),
+                    "mentioned" => story_core::SceneQueryFilter::CharacterMentioned(
+                        story_core::CharacterId(value.parse()?),
+                    ),
+                    "absent" => story_core::SceneQueryFilter::CharacterAbsent(
+                        story_core::CharacterId(value.parse()?),
+                    ),
+                    "location" => story_core::SceneQueryFilter::Location(story_core::LocationId(
+                        value.parse()?,
+                    )),
+                    "event" => {
+                        story_core::SceneQueryFilter::Event(story_core::EventId(value.parse()?))
+                    }
+                    "chapter" => story_core::SceneQueryFilter::Chapter(value.into()),
+                    "text" => story_core::SceneQueryFilter::TextContains(value.into()),
                     "character-any" => story_core::SceneQueryFilter::AnyCharacter(
                         value
                             .split(',')
@@ -5581,6 +5598,14 @@ impl AppState {
             self.selected = 0;
             self.workspace = Workspace::Search;
             self.message = format!("{query_name} · dynamic collection");
+        } else if let Some(rest) = cmd.strip_prefix("character-absence ") {
+            let mut parts = rest.splitn(3, ' ');
+            let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let character =
+                story_core::CharacterId(parts.next().ok_or("missing character UUID")?.parse()?);
+            let notes = parts.next().unwrap_or("");
+            self.app.record_character_absence(scene, character, notes)?;
+            self.message = "Explicit character absence recorded".into();
         } else if let Some(rest) = cmd.strip_prefix("query-expression-set ") {
             let (id, source) = rest
                 .split_once(' ')
