@@ -235,6 +235,8 @@ struct ReferencePane {
     content: String,
     scroll: usize,
     follow_context: bool,
+    shared_scene: bool,
+    cursor: (usize, usize),
 }
 
 #[derive(Clone, Debug)]
@@ -314,6 +316,10 @@ struct SessionSnapshot {
     reference_focused: bool,
     #[serde(default)]
     reference_follow_modes: Vec<bool>,
+    #[serde(default)]
+    reference_shared_scenes: Vec<bool>,
+    #[serde(default)]
+    reference_cursors: Vec<(usize, usize)>,
 }
 
 #[derive(Clone, Debug)]
@@ -3177,7 +3183,13 @@ impl AppState {
             workspace: self.workspace.title().to_owned(),
             selected_scene: self.active_scene().map(|id| id.to_string()),
             editing_scene: self.editing_scene.map(|id| id.to_string()),
-            cursor: self.cursor,
+            cursor: if self.reference_focused {
+                self.active_reference_pane()
+                    .filter(|pane| pane.shared_scene)
+                    .map_or(self.cursor, |pane| pane.cursor)
+            } else {
+                self.cursor
+            },
             scroll: self.scroll,
             selected: self.selected,
             narrowed_chapter,
@@ -3224,6 +3236,24 @@ impl AppState {
                 .reference_panes
                 .iter()
                 .map(|pane| pane.follow_context)
+                .collect(),
+            reference_shared_scenes: self
+                .reference_panes
+                .iter()
+                .map(|pane| pane.shared_scene)
+                .collect(),
+            reference_cursors: self
+                .reference_panes
+                .iter()
+                .enumerate()
+                .map(|(index, pane)| {
+                    if self.reference_focused && index == self.active_reference && pane.shared_scene
+                    {
+                        self.cursor
+                    } else {
+                        pane.cursor
+                    }
+                })
                 .collect(),
         };
         let bytes = serde_json::to_vec_pretty(&snapshot)?;
@@ -3508,6 +3538,20 @@ impl AppState {
                         .get(index)
                         .copied()
                         .unwrap_or(false),
+                    shared_scene: snapshot
+                        .reference_shared_scenes
+                        .get(index)
+                        .copied()
+                        .unwrap_or_else(|| {
+                            source_kind == "scene"
+                                && scene_id.is_some()
+                                && scene_id == self.editing_scene
+                        }),
+                    cursor: snapshot
+                        .reference_cursors
+                        .get(index)
+                        .copied()
+                        .unwrap_or((0, 0)),
                 });
             } else {
                 stale_reference = true;
@@ -3518,6 +3562,16 @@ impl AppState {
                 .active_reference
                 .min(self.reference_panes.len() - 1);
             self.reference_focused = snapshot.reference_focused;
+            if self.reference_focused && self.active_reference_shares_open_scene() {
+                let side_cursor = self.reference_panes[self.active_reference].cursor;
+                self.reference_panes[self.active_reference].cursor = self.cursor;
+                self.cursor = (
+                    side_cursor.0.min(self.editor.len().saturating_sub(1)),
+                    side_cursor.1.min(grapheme_count(
+                        &self.editor[side_cursor.0.min(self.editor.len().saturating_sub(1))],
+                    )),
+                );
+            }
         }
         if let Some(id) = snapshot
             .assembly_draft
@@ -4283,6 +4337,33 @@ impl AppState {
     fn active_reference_pane_mut(&mut self) -> Option<&mut ReferencePane> {
         self.reference_panes.get_mut(self.active_reference)
     }
+    fn active_reference_shares_open_scene(&self) -> bool {
+        self.active_reference_pane().is_some_and(|pane| {
+            pane.shared_scene && pane.scene_id.is_some() && pane.scene_id == self.editing_scene
+        })
+    }
+    fn focus_main_editor(&mut self) {
+        if self.reference_focused && self.active_reference_shares_open_scene() {
+            let index = self.active_reference;
+            if index < self.reference_panes.len() {
+                std::mem::swap(&mut self.cursor, &mut self.reference_panes[index].cursor);
+            }
+        }
+        self.reference_focused = false;
+    }
+    fn toggle_reference_focus(&mut self) {
+        if self.reference_focused {
+            self.focus_main_editor();
+            return;
+        }
+        if self.active_reference_shares_open_scene() {
+            let index = self.active_reference;
+            if index < self.reference_panes.len() {
+                std::mem::swap(&mut self.cursor, &mut self.reference_panes[index].cursor);
+            }
+        }
+        self.reference_focused = true;
+    }
     fn follow_active_scene_card(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let scene = self
             .editing_scene
@@ -4334,12 +4415,20 @@ impl AppState {
         title: String,
         content: String,
     ) {
+        let shared_scene = scene_id.is_some()
+            && scene_id == self.editing_scene
+            && !source_key.starts_with("scene-card:");
         if let Some(index) = self
             .reference_panes
             .iter()
             .position(|pane| pane.source_key == source_key)
         {
             let scroll = self.reference_panes[index].scroll;
+            let cursor = if shared_scene {
+                self.cursor
+            } else {
+                self.reference_panes[index].cursor
+            };
             self.reference_panes[index] = ReferencePane {
                 source_key,
                 scene_id,
@@ -4347,6 +4436,8 @@ impl AppState {
                 content,
                 scroll,
                 follow_context: false,
+                shared_scene,
+                cursor,
             };
             self.active_reference = index;
         } else {
@@ -4357,6 +4448,8 @@ impl AppState {
                 content,
                 scroll: 0,
                 follow_context: false,
+                shared_scene,
+                cursor: if shared_scene { self.cursor } else { (0, 0) },
             });
             self.active_reference = self.reference_panes.len() - 1;
         }
@@ -4663,6 +4756,17 @@ impl AppState {
         self.assembly_draft = None;
         self.dirty = false;
         self.workspace = Workspace::Editor;
+        for pane in &mut self.reference_panes {
+            let is_scene_document = pane.source_key.starts_with("scene:");
+            let was_shared = pane.shared_scene;
+            pane.shared_scene = is_scene_document && pane.scene_id == Some(id);
+            if pane.shared_scene {
+                pane.content = text.clone();
+                if !was_shared {
+                    pane.cursor = self.cursor;
+                }
+            }
+        }
         self.refresh_following_scene_cards()?;
         let mentions = self.app.list_scene_mentions(id)?;
         let detected = mentions
@@ -7813,17 +7917,26 @@ impl AppState {
                 self.message = "No reference pane is open".into();
             }
         } else if cmd == "reference-next" {
+            if self.reference_focused {
+                self.focus_main_editor();
+            }
             if !self.reference_panes.is_empty() {
                 self.active_reference = (self.active_reference + 1) % self.reference_panes.len();
             }
             self.message = "Next reference buffer".into();
         } else if cmd == "reference-prev" {
+            if self.reference_focused {
+                self.focus_main_editor();
+            }
             if !self.reference_panes.is_empty() {
                 self.active_reference = (self.active_reference + self.reference_panes.len() - 1)
                     % self.reference_panes.len();
             }
             self.message = "Previous reference buffer".into();
         } else if cmd == "reference-close" {
+            if self.reference_focused {
+                self.focus_main_editor();
+            }
             if !self.reference_panes.is_empty() {
                 self.reference_panes.remove(self.active_reference);
             }
@@ -10048,6 +10161,12 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             f.render_stateful_widget(list, body[0], &mut state);
         }
         let selection = s.selection_bounds();
+        let main_cursor = if s.reference_focused && s.active_reference_shares_open_scene() {
+            s.active_reference_pane()
+                .map_or(s.cursor, |pane| pane.cursor)
+        } else {
+            s.cursor
+        };
         let mention_ranges = (!s.dirty)
             .then_some(s.editing_scene)
             .flatten()
@@ -10111,7 +10230,11 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 .enumerate()
                 .skip(s.scroll)
                 .map(|(row, line)| {
-                    let prefix = if row == s.cursor.0 { "> " } else { "  " };
+                    let prefix = if !s.reference_focused && row == main_cursor.0 {
+                        "> "
+                    } else {
+                        "  "
+                    };
                     let mut spans = vec![Span::raw(prefix)];
                     let mut byte_offset = line_start_byte;
                     for (col, ch) in line.graphemes(true).enumerate() {
@@ -10178,25 +10301,51 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             for (index, (reference, area)) in
                 s.reference_panes.iter().zip(reference_areas).enumerate()
             {
+                let is_shared_scene = reference.shared_scene
+                    && reference.scene_id == s.editing_scene
+                    && s.assembly_draft.is_none();
+                let reference_cursor =
+                    if s.reference_focused && index == s.active_reference && is_shared_scene {
+                        s.cursor
+                    } else {
+                        reference.cursor
+                    };
+                let reference_lines = if is_shared_scene {
+                    s.editor.clone()
+                } else {
+                    reference.content.lines().map(str::to_owned).collect()
+                };
                 let reference = Paragraph::new(
-                    reference
-                        .content
-                        .lines()
+                    reference_lines
+                        .iter()
+                        .enumerate()
                         .skip(reference.scroll)
-                        .map(Line::from)
+                        .map(|(row, line)| {
+                            let prefix = if is_shared_scene && row == reference_cursor.0 {
+                                "> "
+                            } else {
+                                "  "
+                            };
+                            Line::from(format!("{prefix}{line}"))
+                        })
                         .collect::<Vec<_>>(),
                 )
                 .wrap(Wrap { trim: false })
                 .block(
                     Block::default()
                         .title(format!(
-                            "{} · {} · {}{}",
+                            "{} · {} · {} · {}{}",
                             reference.title,
                             index + 1,
                             if reference.follow_context {
                                 "follow"
                             } else {
                                 "pinned"
+                            },
+                            if is_shared_scene {
+                                "shared"
+                            } else {
+                                "read-only"
                             },
                             if index == s.active_reference {
                                 if s.reference_focused {
@@ -13309,7 +13458,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         && k.code == KeyCode::Tab
         && !s.reference_panes.is_empty()
     {
-        s.reference_focused = !s.reference_focused;
+        s.toggle_reference_focus();
         s.message = if s.reference_focused {
             "Reference pane focused · arrows scroll"
         } else {
@@ -13442,7 +13591,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(true);
     }
     if s.workspace == Workspace::Editor {
-        if s.reference_focused {
+        if s.reference_focused && !s.active_reference_shares_open_scene() {
             if let Some(reference) = s.active_reference_pane_mut() {
                 match k.code {
                     KeyCode::Up => reference.scroll = reference.scroll.saturating_sub(1),
@@ -16527,6 +16676,52 @@ mod tests {
                 .content
                 .contains("Scene: Arrival")
         );
+    }
+
+    #[test]
+    fn same_scene_reference_uses_shared_text_with_an_independent_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Shared", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "abcdef").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.cursor = (0, 5);
+        state
+            .execute_legacy_palette_command(&format!("reference-scene {scene}"))
+            .unwrap();
+        assert!(state.reference_panes[0].shared_scene);
+        state.reference_panes[0].cursor = (0, 1);
+
+        state.toggle_reference_focus();
+        assert_eq!(state.cursor, (0, 1));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "aXbcdef");
+        let secondary_cursor = state.cursor;
+        state.focus_main_editor();
+        assert_eq!(state.cursor, (0, 5));
+        assert_eq!(state.reference_panes[0].cursor, secondary_cursor);
+        assert!(state.dirty);
+        state.save().unwrap();
+        state.toggle_reference_focus();
+        state.save_session().unwrap();
+        let mut reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        assert!(reopened.reference_focused);
+        assert_eq!(reopened.cursor, secondary_cursor);
+        assert_eq!(reopened.reference_panes[0].cursor, (0, 5));
+        reopened.focus_main_editor();
+        assert_eq!(reopened.cursor, (0, 5));
+        assert_eq!(reopened.editor.join("\n"), "aXbcdef");
     }
 
     #[test]
