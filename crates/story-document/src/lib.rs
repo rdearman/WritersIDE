@@ -2,6 +2,11 @@
 use pulldown_cmark::{Event, Options, Parser, Tag};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::{
+    io::Write,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+};
 
 pub const SEMANTIC_SCHEMA_VERSION: u16 = 1;
 pub const COMPILE_IR_VERSION: u16 = 1;
@@ -322,12 +327,52 @@ impl CompileIr {
     pub fn render_markdown(&self) -> (String, Vec<CompileSourceMapEntry>) {
         let mut output = String::new();
         let mut source_map = Vec::new();
+        let groups = self
+            .groups
+            .iter()
+            .map(|group| (group.id.as_str(), group))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut active_group_path: Vec<&str> = Vec::new();
         for unit in &self.units {
+            let mut target_group_path = Vec::new();
+            let mut parent = unit.parent_id.as_deref();
+            while let Some(id) = parent {
+                let Some(group) = groups.get(id) else {
+                    break;
+                };
+                target_group_path.push(id);
+                parent = group.parent_id.as_deref();
+            }
+            target_group_path.reverse();
+            let shared = active_group_path
+                .iter()
+                .zip(&target_group_path)
+                .take_while(|(a, b)| a == b)
+                .count();
+            for id in target_group_path.iter().skip(shared) {
+                if let Some(group) = groups.get(id) {
+                    let level = match group.kind {
+                        StructuralKind::Section => 1,
+                        StructuralKind::Chapter => 2,
+                        StructuralKind::Group => 3,
+                    };
+                    if !output.is_empty() && !output.ends_with("\n\n") {
+                        output.push_str("\n\n");
+                    }
+                    output.push_str(&"#".repeat(level));
+                    output.push(' ');
+                    output.push_str(&group.title);
+                    output.push_str("\n\n");
+                }
+            }
+            active_group_path = target_group_path;
             if matches!(
                 unit.kind,
                 ContentUnitKind::Scene | ContentUnitKind::FrontMatter | ContentUnitKind::BackMatter
             ) {
-                output.push_str("## ");
+                let level = if active_group_path.is_empty() { 2 } else { 3 };
+                output.push_str(&"#".repeat(level));
+                output.push(' ');
                 output.push_str(&unit.title);
                 output.push_str("\n\n");
             }
@@ -356,6 +401,283 @@ impl CompileIr {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompileFormat {
+    Markdown,
+    Html,
+    Epub,
+    Docx,
+    Pdf,
+}
+
+impl CompileFormat {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "md" | "markdown" => Some(Self::Markdown),
+            "html" | "html5" => Some(Self::Html),
+            "epub" | "epub3" => Some(Self::Epub),
+            "docx" => Some(Self::Docx),
+            "pdf" => Some(Self::Pdf),
+            _ => None,
+        }
+    }
+    pub fn extension(self) -> &'static str {
+        match self {
+            Self::Markdown => "md",
+            Self::Html => "html",
+            Self::Epub => "epub",
+            Self::Docx => "docx",
+            Self::Pdf => "pdf",
+        }
+    }
+    pub fn media_type(self) -> &'static str {
+        match self {
+            Self::Markdown => "text/markdown; charset=utf-8",
+            Self::Html => "text/html; charset=utf-8",
+            Self::Epub => "application/epub+zip",
+            Self::Docx => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            Self::Pdf => "application/pdf",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompileArtifact {
+    pub format: CompileFormat,
+    pub media_type: &'static str,
+    pub bytes: Vec<u8>,
+    /// Source offsets refer to the UTF-8 Compile IR Markdown stream supplied to the renderer.
+    pub source_map: Vec<CompileSourceMapEntry>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BookDesign {
+    /// General purpose, one-sided book layout suitable for fiction.
+    #[default]
+    TradePaperback,
+    /// Double-spaced manuscript layout suitable for editorial submission.
+    Manuscript,
+    /// One-sided, roomy layout for nonfiction and reference works.
+    Nonfiction,
+}
+
+impl BookDesign {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.to_ascii_lowercase().as_str() {
+            "trade" | "trade-paperback" => Some(Self::TradePaperback),
+            "manuscript" => Some(Self::Manuscript),
+            "nonfiction" => Some(Self::Nonfiction),
+            _ => None,
+        }
+    }
+
+    fn pandoc_variables(self) -> &'static [&'static str] {
+        match self {
+            Self::TradePaperback => &[
+                "documentclass=book",
+                "classoption=oneside",
+                "classoption=openany",
+                "papersize=6in:9in",
+                "geometry=margin=0.75in",
+                "fontsize=11pt",
+                "linestretch=1.15",
+            ],
+            Self::Manuscript => &[
+                "documentclass=article",
+                "papersize=letter",
+                "geometry=margin=1in",
+                "fontsize=12pt",
+                "linestretch=2",
+            ],
+            Self::Nonfiction => &[
+                "documentclass=book",
+                "classoption=oneside",
+                "classoption=openany",
+                "papersize=letter",
+                "geometry=margin=1in",
+                "fontsize=11pt",
+                "linestretch=1.25",
+            ],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiagnosticSeverity {
+    Error,
+    Warning,
+    Information,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompileDiagnostic {
+    pub code: String,
+    pub severity: DiagnosticSeverity,
+    pub message: String,
+    pub source_entity_id: Option<String>,
+}
+
+/// Deterministic, non-mutating checks useful before publication or export.
+pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
+    let mut diagnostics = Vec::new();
+    if ir.title.trim().is_empty() {
+        diagnostics.push(CompileDiagnostic {
+            code: "PUB001".into(),
+            severity: DiagnosticSeverity::Warning,
+            message: "project title is empty".into(),
+            source_entity_id: None,
+        });
+    }
+    if ir.units.is_empty() {
+        diagnostics.push(CompileDiagnostic {
+            code: "PUB002".into(),
+            severity: DiagnosticSeverity::Warning,
+            message: "manuscript contains no content units or scenes".into(),
+            source_entity_id: None,
+        });
+    }
+    for unit in &ir.units {
+        if unit
+            .segments
+            .iter()
+            .all(|segment| segment.document.source.trim().is_empty())
+        {
+            diagnostics.push(CompileDiagnostic {
+                code: "PUB003".into(),
+                severity: DiagnosticSeverity::Information,
+                message: format!("content unit '{}' has no prose", unit.title),
+                source_entity_id: Some(unit.id.clone()),
+            });
+        }
+    }
+    diagnostics
+}
+
+#[derive(Clone, Debug)]
+pub struct PandocRenderer {
+    program: PathBuf,
+}
+
+impl Default for PandocRenderer {
+    fn default() -> Self {
+        Self {
+            program: PathBuf::from("pandoc"),
+        }
+    }
+}
+
+impl PandocRenderer {
+    pub fn with_program(program: impl Into<PathBuf>) -> Self {
+        Self {
+            program: program.into(),
+        }
+    }
+
+    pub fn render(
+        &self,
+        ir: &CompileIr,
+        format: CompileFormat,
+        resource_root: Option<&Path>,
+    ) -> Result<CompileArtifact, String> {
+        self.render_with_design(ir, format, resource_root, BookDesign::default())
+    }
+
+    pub fn render_with_design(
+        &self,
+        ir: &CompileIr,
+        format: CompileFormat,
+        resource_root: Option<&Path>,
+        design: BookDesign,
+    ) -> Result<CompileArtifact, String> {
+        if !ir.validate() {
+            return Err("refusing to render invalid Compile IR".into());
+        }
+        let (markdown, source_map) = ir.render_markdown();
+        let bytes = if format == CompileFormat::Markdown {
+            markdown.into_bytes()
+        } else {
+            let temporary =
+                tempfile::tempdir().map_err(|e| format!("create renderer workspace: {e}"))?;
+            let texmf_var = temporary.path().join("texmf-var");
+            let texmf_config = temporary.path().join("texmf-config");
+            std::fs::create_dir_all(&texmf_var)
+                .map_err(|e| format!("create writable TeX cache: {e}"))?;
+            std::fs::create_dir_all(&texmf_config)
+                .map_err(|e| format!("create writable TeX config: {e}"))?;
+            let output_path = temporary
+                .path()
+                .join(format!("output.{}", format.extension()));
+            let mut command = Command::new(&self.program);
+            command
+                .arg(
+                    "--from=markdown+footnotes+pipe_tables+task_lists+strikeout+fenced_code_blocks",
+                )
+                .arg(match format {
+                    CompileFormat::Html => "--to=html5",
+                    CompileFormat::Epub => "--to=epub3",
+                    CompileFormat::Docx => "--to=docx",
+                    CompileFormat::Pdf => "--to=pdf",
+                    CompileFormat::Markdown => unreachable!(),
+                })
+                .arg("--standalone")
+                .arg("--wrap=none")
+                .arg("--metadata")
+                .arg(format!("title={}", ir.title))
+                .arg("--output")
+                .arg(&output_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped());
+            if format == CompileFormat::Pdf {
+                command
+                    .arg("--pdf-engine=lualatex")
+                    .arg("--pdf-engine-opt=-interaction=nonstopmode")
+                    .arg("--pdf-engine-opt=-halt-on-error")
+                    .env("TEXMFVAR", &texmf_var)
+                    .env("TEXMFCACHE", &texmf_var)
+                    .env("TEXMFCONFIG", &texmf_config);
+                for variable in design.pandoc_variables() {
+                    command.arg(format!("--variable={variable}"));
+                }
+            }
+            if let Some(root) = resource_root {
+                command
+                    .current_dir(root)
+                    .arg(format!("--resource-path={}", root.display()));
+            }
+            let mut child = command
+                .spawn()
+                .map_err(|e| format!("cannot start {}: {e}", self.program.display()))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(markdown.as_bytes())
+                    .map_err(|e| format!("write renderer input: {e}"))?;
+            }
+            let result = child
+                .wait_with_output()
+                .map_err(|e| format!("wait for renderer: {e}"))?;
+            if !result.status.success() {
+                return Err(format!(
+                    "{} failed ({}): {}",
+                    self.program.display(),
+                    result.status,
+                    String::from_utf8_lossy(&result.stderr).trim()
+                ));
+            }
+            std::fs::read(&output_path).map_err(|e| format!("read rendered output: {e}"))?
+        };
+        Ok(CompileArtifact {
+            format,
+            media_type: format.media_type(),
+            bytes,
+            source_map,
+        })
+    }
+}
+
 pub fn source_fingerprint(source: &str) -> String {
     format!("{:x}", Sha256::digest(source.as_bytes()))
 }
@@ -363,6 +685,7 @@ pub fn source_fingerprint(source: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
 
     #[test]
     fn parses_markdown_semantics_with_utf8_source_ranges_without_rewriting_source() {
@@ -444,7 +767,10 @@ mod tests {
             segments: vec![CompileSegment::new("scene-1", text)],
         });
         let (markdown, map) = ir.render_markdown();
-        assert_eq!(markdown, "## Chapter One\n\nMara — then left.\n\n");
+        assert_eq!(
+            markdown,
+            "# Part One\n\n## Chapter One\n\n### Chapter One\n\nMara — then left.\n\n"
+        );
         assert_eq!(&markdown[map[0].output.start..map[0].output.end], text);
         assert_eq!(map[0].source.end, text.len());
         let json = serde_json::to_vec(&ir).unwrap();
@@ -478,5 +804,114 @@ mod tests {
             segments: Vec::new(),
         });
         assert!(!ir.validate());
+    }
+
+    #[test]
+    fn pandoc_renderer_produces_html_docx_epub_pdf_and_source_maps() {
+        if Command::new("pandoc").arg("--version").output().is_err() {
+            return;
+        }
+        let mut ir = CompileIr::new("Writer’s Novel");
+        ir.push_group(CompileGroup {
+            id: "chapter".into(),
+            parent_id: None,
+            kind: StructuralKind::Chapter,
+            title: "Chapter One".into(),
+        });
+        ir.push(CompileUnit {
+            id: "scene".into(),
+            parent_id: Some("chapter".into()),
+            kind: ContentUnitKind::Scene,
+            title: "A Door Opens".into(),
+            segments: vec![CompileSegment::new(
+                "scene-uuid",
+                "Élodie *opened* the **door**.\n\n- One\n- Two\n",
+            )],
+        });
+        let renderer = PandocRenderer::default();
+        for format in [
+            CompileFormat::Html,
+            CompileFormat::Docx,
+            CompileFormat::Epub,
+        ] {
+            let artifact = renderer.render(&ir, format, None).unwrap();
+            assert!(!artifact.bytes.is_empty());
+            assert_eq!(artifact.media_type, format.media_type());
+            assert_eq!(artifact.source_map.len(), 1);
+        }
+        let docx = renderer.render(&ir, CompileFormat::Docx, None).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(docx.bytes)).unwrap();
+        let mut document = String::new();
+        archive
+            .by_name("word/document.xml")
+            .unwrap()
+            .read_to_string(&mut document)
+            .unwrap();
+        assert!(document.contains("Élodie"));
+        let epub = renderer.render(&ir, CompileFormat::Epub, None).unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(epub.bytes)).unwrap();
+        assert!(archive.by_name("META-INF/container.xml").is_ok());
+        if Command::new("lualatex").arg("--version").output().is_ok() {
+            let pdf = renderer.render(&ir, CompileFormat::Pdf, None).unwrap();
+            assert!(pdf.bytes.starts_with(b"%PDF-"));
+            assert_eq!(pdf.source_map[0].source_entity_id, "scene-uuid");
+        }
+    }
+
+    #[test]
+    fn pandoc_backend_errors_are_explicit_and_markdown_needs_no_external_tool() {
+        let mut ir = CompileIr::new("Book");
+        ir.push(CompileUnit {
+            id: "unit".into(),
+            parent_id: None,
+            kind: ContentUnitKind::Scene,
+            title: "Scene".into(),
+            segments: vec![CompileSegment::new("scene", "Prose.")],
+        });
+        let missing = PandocRenderer::with_program("writers-ide-test-missing-pandoc");
+        assert!(
+            missing
+                .render(&ir, CompileFormat::Html, None)
+                .unwrap_err()
+                .contains("cannot start")
+        );
+        assert_eq!(
+            missing
+                .render(&ir, CompileFormat::Markdown, None)
+                .unwrap()
+                .bytes,
+            b"## Scene\n\nProse.\n\n"
+        );
+    }
+
+    #[test]
+    fn book_designs_are_typed_and_publication_diagnostics_are_read_only() {
+        assert_eq!(BookDesign::parse("trade"), Some(BookDesign::TradePaperback));
+        assert_eq!(
+            BookDesign::parse("manuscript"),
+            Some(BookDesign::Manuscript)
+        );
+        assert_eq!(BookDesign::parse("invalid"), None);
+        assert!(
+            BookDesign::Manuscript
+                .pandoc_variables()
+                .contains(&"linestretch=2")
+        );
+        let mut ir = CompileIr::new(" ");
+        ir.push(CompileUnit {
+            id: "empty-unit".into(),
+            parent_id: None,
+            kind: ContentUnitKind::ChapterBody,
+            title: "Empty chapter".into(),
+            segments: vec![CompileSegment::new("empty-unit", "  ")],
+        });
+        let diagnostics = publication_diagnostics(&ir);
+        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics[0].code, "PUB001");
+        assert_eq!(
+            diagnostics[1].source_entity_id.as_deref(),
+            Some("empty-unit")
+        );
+        assert!(ir.units[0].segments[0].document.source.trim().is_empty());
     }
 }

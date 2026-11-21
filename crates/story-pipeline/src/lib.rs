@@ -700,7 +700,7 @@ mod tests {
         assert!(first.iter().all(|r| r.status == StageStatus::Complete));
         assert_eq!(
             fs::read_to_string(dir.path().join("exports/compiled.md")).unwrap(),
-            "## Opening\n\nFirst draft.\n\n"
+            "## Opening\n\n### Opening\n\nFirst draft.\n\n"
         );
         let cached = runner.run(&input("First draft.")).unwrap();
         assert!(cached.iter().all(|r| r.status == StageStatus::Cached));
@@ -723,11 +723,13 @@ mod tests {
             text: "Chapter-level introduction.".into(),
         });
         let (compiled, _) = compile_ir(&novel).render_markdown();
-        assert!(compiled.starts_with("Chapter-level introduction.\n\n## Opening\n\nScene prose."));
+        assert!(compiled.starts_with(
+            "## Opening\n\nChapter-level introduction.\n\n### Opening\n\nScene prose."
+        ));
         let mut nonfiction = novel;
         nonfiction.scenes.clear();
         let (compiled, _) = compile_ir(&nonfiction).render_markdown();
-        assert_eq!(compiled, "Chapter-level introduction.\n\n");
+        assert_eq!(compiled, "## Opening\n\nChapter-level introduction.\n\n");
     }
 
     #[test]

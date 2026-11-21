@@ -164,3 +164,19 @@ The terminal editor now performs a two-second idle autosave through the existing
 A sustained persistence test now performs 24 successive writes of a large Unicode scene, reopens the project every six revisions, and verifies final text, stable scene identity, content hash, and Unicode word count.
 
 The manuscript editor now supports a bounded 100-step in-memory undo/redo history per open scene, including cursor and selection restoration. Ctrl-Z undoes; Ctrl-Y and Ctrl-Shift-Z redo. Undo history is session-local, while durable snapshots remain the persistent revision mechanism.
+
+### Issue #7 — Manuscript compilation formats
+
+Compile IR renders structured section/chapter hierarchy, manuscript prose, and UTF-8 source ranges. `writers-ide compile <project> <markdown|html|epub|docx|pdf> [output-path] [--expand-transclusions]` renders Markdown in-process and uses a local Pandoc installation for HTML, EPUB, and DOCX. PDF additionally requires local LuaLaTeX. The terminal command palette exposes `compile-format` with the same output choices. Each export writes an atomic JSON source-map sidecar; offsets identify entities and byte ranges in the canonical UTF-8 Compile IR Markdown stream and do not claim final layout positions or PDF page coordinates. Export generation is offline and does not change manuscript sources. Renderer templates, named book designs, PDF typography/publishing diagnostics, and visual source mapping remain Issue #21 work.
+
+### Issue #21 — LuaLaTeX and book-design foundation
+
+The PDF renderer now uses a project-local temporary TeX cache, supports typed `trade-paperback`, `manuscript`, and `nonfiction` presets, and passes validated fixed Pandoc layout variables for paper size, margins, document class, font size, and line spacing. CLI and terminal compile commands accept `--design=<preset>`. The new deterministic publication diagnostics identify missing project title, empty manuscripts, and empty content units without mutating story data (`compile-check` in the CLI). Custom LuaLaTeX templates, richer typographic controls, page/chapter design, publishing diagnostics, and final production review remain incomplete.
+
+### Issue #6 — Manuscript import foundation
+
+The import crate now performs read-only DOCX, RTF, ODT, and EPUB inventory into a staging model with stable source-item identifiers, source fingerprint, extracted text, and explicit formatting/media loss warnings. `inspect-manuscript` emits the inventory without touching the source. `import-manuscript` creates a new project directory only, stores imported units as chapter/scene manuscript files, records import runs/source items/field provenance, and emits `exports/import-report.json`. Failed application removes only the newly created destination project; source files remain untouched. Synthetic DOCX/ODT/RTF fixtures cover extraction and source immutability. Review UI, import of comments/track changes, rich formatting fidelity, multi-document staging, and field mapping decisions remain incomplete. No real editorial documents were available for compatibility claims.
+
+### Issue #19 — Editorial merge foundation
+
+The review layer now inventories DOCX insertion/deletion markup and comments with author/date/comment IDs (`review-inspect`), and performs a line-oriented three-way merge from a base manuscript, current local scene, and reviewed external text. Non-overlapping edits merge automatically; overlapping edits return explicit base/local/external conflict regions and leave canonical text unchanged. CLI `review-merge <project> <scene-uuid> <base-file> <review-file>` and terminal `review-merge` use this merge through the journaled scene save. Mapping DOCX markup to anchored scene edits, side-by-side terminal conflict resolution, and one-hunk acceptance are not yet implemented.

@@ -1,4 +1,8 @@
-use std::{env, process::ExitCode};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::ExitCode,
+};
 use story_app::WriterApp;
 use story_core::{
     EntityRef, LinkId, LinkKind, NodeId, QueryId, SavedSceneQuery, SceneId, SceneQueryFilter,
@@ -883,6 +887,127 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 return Err("processing pipeline incomplete; inspect failed/skipped stages".into());
             }
         }
+        "compile" => {
+            let project = args.next().ok_or("missing project path")?;
+            let format_name = args
+                .next()
+                .ok_or("missing format (markdown, html, epub, docx, pdf)")?;
+            let format = story_document::CompileFormat::parse(&format_name)
+                .ok_or("format must be markdown, html, epub, docx, or pdf")?;
+            let remaining = args.collect::<Vec<_>>();
+            let expand = remaining
+                .iter()
+                .any(|argument| argument == "--expand-transclusions");
+            let design = remaining
+                .iter()
+                .find_map(|argument| argument.strip_prefix("--design="))
+                .map(|name| {
+                    story_document::BookDesign::parse(name)
+                        .ok_or("design must be trade-paperback, manuscript, or nonfiction")
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let output = remaining
+                .iter()
+                .find(|argument| !argument.starts_with("--"));
+            let app = WriterApp::open_project(&project)?;
+            let artifact = app.compile_artifact_with_design(format, expand, design)?;
+            let destination = output.map(PathBuf::from).unwrap_or_else(|| {
+                app.project_root()
+                    .join("exports")
+                    .join(format!("compiled.{}", format.extension()))
+            });
+            atomic_write(&destination, &artifact.bytes)?;
+            let sidecar = PathBuf::from(format!("{}.source-map.json", destination.display()));
+            let source_map = serde_json::json!({
+                "schema_version": 1,
+                "output": destination.file_name().and_then(|name| name.to_str()).unwrap_or("compiled"),
+                "output_format": format,
+                "offset_space": "compile-ir-markdown-utf8",
+                "visual_layout_mapping": false,
+                "entries": artifact.source_map,
+            });
+            atomic_write(&sidecar, &serde_json::to_vec_pretty(&source_map)?)?;
+            println!(
+                "Compiled {} bytes to {}",
+                artifact.bytes.len(),
+                destination.display()
+            );
+            println!("Source map: {}", sidecar.display());
+        }
+        "compile-check" => {
+            let project = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(project)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app.compile_diagnostics()?)?
+            );
+        }
+        "inspect-manuscript" => {
+            let source = args
+                .next()
+                .ok_or("missing DOCX, RTF, ODT, or EPUB source path")?;
+            let staging = story_import::inspect_manuscript(&source)?;
+            println!("{}", serde_json::to_string_pretty(&staging)?);
+        }
+        "review-inspect" => {
+            let source = args.next().ok_or("missing DOCX file")?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&story_import::inspect_docx_review(source)?)?
+            );
+        }
+        "import-manuscript" => {
+            let source = args
+                .next()
+                .ok_or("missing DOCX, RTF, ODT, or EPUB source path")?;
+            let destination = PathBuf::from(args.next().ok_or("missing new project directory")?);
+            let requested_title = args.next();
+            if destination.exists() {
+                return Err("manuscript import requires a new project directory that does not already exist".into());
+            }
+            let staging = story_import::inspect_manuscript(&source)?;
+            let title = requested_title.as_deref().unwrap_or(&staging.title);
+            let mut app = WriterApp::create_project(&destination, title)?;
+            let result = (|| -> Result<(story_core::ImportRunId, Vec<SceneId>), Box<dyn std::error::Error>> {
+                let (run, scenes) = app.import_staged_manuscript(&staging)?;
+                let report = serde_json::json!({"staging": staging, "import_run": app.get_import_run_summary(run)?, "imported_scene_ids": scenes});
+                atomic_write(
+                    &destination.join("exports/import-report.json"),
+                    &serde_json::to_vec_pretty(&report)?,
+                )?;
+                Ok((run, scenes))
+            })();
+            match result {
+                Ok((_, scenes)) => println!(
+                    "Imported {} manuscript units into {}",
+                    scenes.len(),
+                    destination.display()
+                ),
+                Err(error) => {
+                    drop(app);
+                    let _ = fs::remove_dir_all(&destination);
+                    return Err(error);
+                }
+            }
+        }
+        "review-merge" => {
+            let project = args.next().ok_or("missing project path")?;
+            let scene = SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let base = fs::read_to_string(args.next().ok_or("missing base manuscript file")?)?;
+            let reviewed =
+                fs::read_to_string(args.next().ok_or("missing reviewed manuscript file")?)?;
+            let mut app = WriterApp::open_project(project)?;
+            let result = app.merge_review_text(scene, &base, &reviewed)?;
+            if result.merged_text.is_some() {
+                println!(
+                    "Editorial revision merged and saved through the manuscript write journal."
+                );
+            } else {
+                println!("{}", serde_json::to_string_pretty(&result.conflicts)?);
+                return Err("overlapping editorial changes require author resolution".into());
+            }
+        }
         "extract" => {
             let path = std::path::PathBuf::from(args.next().ok_or("missing project path")?);
             let source_kind = args.next().ok_or("missing source kind: scene|reading")?;
@@ -1071,10 +1196,16 @@ fn scene_matches_scope(scene: &story_storage::SceneRecord, scope: &str) -> bool 
 }
 fn usage() {
     eprintln!(
+        "writers-ide compile <project> <markdown|html|epub|docx|pdf> [output] [--expand-transclusions] [--design=preset]"
+    );
+    eprintln!("writers-ide compile-check <project>");
+    eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");
+    eprintln!("writers-ide import-manuscript <source-file> <new-project-directory> [title]");
+    eprintln!(
         "writers-ide find <path> <normal|extended|regex> <all|scene-uuid> <pattern>\nwriters-ide replace <path> <normal|extended|regex> <all|scene-uuid> <pattern> => <replacement>\nwriters-ide language <path> [language-tag]"
     );
     eprintln!(
-        "writers-ide create <path> [title]\nwriters-ide create-kind <path> <fiction|nonfiction|custom> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
+        "writers-ide create <path> [title]\nwriters-ide create-kind <path> <fiction|nonfiction|custom> [title]\nwriters-ide inspect <path>\nwriters-ide chapter <path> <title>\nwriters-ide scene <path> <chapter-uuid> <title>\nwriters-ide show <path> <scene-uuid>\nwriters-ide write <path> <scene-uuid> <text>\nwriters-ide search <path> <terms>\nwriters-ide analytics <path>\nwriters-ide process <path> [--expand-transclusions] [--only stage,stage]\nwriters-ide compile <path> <markdown|html|epub|docx|pdf> [output-path] [--expand-transclusions]\nwriters-ide extract <path> <scene|reading> <source-uuid> <model> [endpoint]\nwriters-ide study <path> <scene|reading> <source-uuid> <model> [endpoint] [--questions]\nwriters-ide proposals <project>\nwriters-ide approve-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide dismiss-extraction <project> <proposal-json-file> <claim-index>\nwriters-ide knowledge <project>\nwriters-ide query-save <path> <name> [status=...|character=UUID|plotline=UUID|before=TICK|after=TICK|issue=unresolved]...\nwriters-ide query-list <path>\nwriters-ide query-run <path> <query-uuid>\nwriters-ide link <path> <source-kind> <source-id> <target-kind> <target-id> <related|cites|transcludes|includes|navigates> [label]\nwriters-ide outgoing <path> <entity-kind> <entity-id>\nwriters-ide backlinks <path> <entity-kind> <entity-id>\nwriters-ide broken-links <path>\nwriters-ide snapshot <path> <scene-uuid> <label>\nwriters-ide history <path> <scene-uuid>\nwriters-ide diff <path> <scene-uuid> <snapshot-uuid>\nwriters-ide restore <path> <scene-uuid> <snapshot-uuid>\nwriters-ide resolve <path> <transaction-uuid> external|prepared\nwriters-ide backup <path> <destination>\nwriters-ide character-profile <path> <character-uuid>\nwriters-ide character-set <path> <character-uuid> <field> <value>\nwriters-ide character-alias <path> <character-uuid> <alias>\nwriters-ide character-un-alias <path> <character-uuid> <alias>"
     );
     eprintln!(
         "writers-ide anchors <path> <scene-uuid>\nwriters-ide anchor-move <path> <anchor-uuid> <start-byte> <end-byte>"
@@ -1086,6 +1217,21 @@ fn usage() {
     eprintln!(
         "writers-ide scratchpad-create <path> <title> [body]\nwriters-ide scratchpad-list <path>\nwriters-ide scratchpad-promote <path> <note-uuid> <scene|character|location|object|research> <entity-uuid>\nwriters-ide mentions <path> <scene-uuid>\nwriters-ide mention-confirm <path> <mention-uuid> <character|location|object> <entity-uuid>\nwriters-ide mention-dismiss <path> <mention-uuid>\nwriters-ide object-create <path> <name> [description]\nwriters-ide assembly-draft-create <path> <assembly-uuid>\nwriters-ide assembly-draft-list <path>\nwriters-ide assembly-draft-set <path> <draft-uuid> <scene-uuid> <text.md>\nwriters-ide assembly-draft-commit <path> <draft-uuid>\nwriters-ide board-create <path> <title>\nwriters-ide board-add-scene <path> <board-uuid> <scene-uuid> <x> <y> [note]\nwriters-ide board-list <path> <board-uuid>\nwriters-ide backup-archive <project-path> <archive.zip>\nwriters-ide restore-archive <archive.zip> <new-project-directory>"
     );
+}
+
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    use std::io::Write;
+    temporary.write_all(bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 fn parse_story_entity_kind(

@@ -373,6 +373,22 @@ fn command_registry() -> Vec<CommandSpec> {
     ]);
     commands.extend([
         legacy_command(
+            "compile.format",
+            "Compile to a Document Format",
+            "Compile the manuscript to Markdown, HTML, EPUB, DOCX, or PDF",
+            "Compile",
+            "compile-format",
+            true,
+        ),
+        legacy_command(
+            "review.merge",
+            "Merge Editorial Revision",
+            "Three-way merge a reviewed manuscript into a scene and preserve conflicts for inspection",
+            "Edit",
+            "review-merge",
+            true,
+        ),
+        legacy_command(
             "scene.create",
             "New Scene",
             "Create a scene in a chapter",
@@ -2548,6 +2564,72 @@ impl AppState {
                 .join(format!("assembly-{assembly}.md"));
             fs::write(&destination, text.as_bytes())?;
             self.message = format!("Compiled assembly to {}", destination.display());
+        } else if let Some(arguments) = cmd.strip_prefix("compile-format ") {
+            let mut parts = arguments.split_whitespace();
+            let format_name = parts.next().ok_or("usage: compile-format <markdown|html|epub|docx|pdf> [output-path] [--expand-transclusions]")?;
+            let format = story_document::CompileFormat::parse(format_name)
+                .ok_or("format must be markdown, html, epub, docx, or pdf")?;
+            let rest = parts.collect::<Vec<_>>();
+            let expand = rest.contains(&"--expand-transclusions");
+            let design = rest
+                .iter()
+                .find_map(|argument| argument.strip_prefix("--design="))
+                .map(|name| {
+                    story_document::BookDesign::parse(name)
+                        .ok_or("design must be trade-paperback, manuscript, or nonfiction")
+                })
+                .transpose()?
+                .unwrap_or_default();
+            let output = rest.iter().find(|item| !item.starts_with("--"));
+            let artifact = self
+                .app
+                .compile_artifact_with_design(format, expand, design)?;
+            let destination = output
+                .map(Path::new)
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| {
+                    self.app
+                        .project_root()
+                        .join("exports")
+                        .join(format!("compiled.{}", format.extension()))
+                });
+            atomic_export(&destination, &artifact.bytes)?;
+            let sidecar =
+                Path::new(&format!("{}.source-map.json", destination.display())).to_path_buf();
+            let source_map = serde_json::json!({
+                "schema_version": 1,
+                "output_format": format,
+                "offset_space": "compile-ir-markdown-utf8",
+                "visual_layout_mapping": false,
+                "entries": artifact.source_map,
+            });
+            atomic_export(&sidecar, &serde_json::to_vec_pretty(&source_map)?)?;
+            self.message = format!(
+                "Compiled to {} · source map {}",
+                destination.display(),
+                sidecar.display()
+            );
+        } else if let Some(arguments) = cmd.strip_prefix("review-merge ") {
+            let mut parts = arguments.split_whitespace();
+            let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let base_path = parts.next().ok_or("missing base manuscript file")?;
+            let reviewed_path = parts.next().ok_or("missing reviewed manuscript file")?;
+            let base = fs::read_to_string(base_path)?;
+            let reviewed = fs::read_to_string(reviewed_path)?;
+            let result = self.app.merge_review_text(scene, &base, &reviewed)?;
+            self.message = if let Some(merged) = result.merged_text {
+                if self.editing_scene == Some(scene) {
+                    self.editor = merged.lines().map(str::to_owned).collect();
+                    self.dirty = false;
+                    self.cursor = (0, 0);
+                }
+                "Editorial merge applied through the manuscript write journal".into()
+            } else {
+                format!(
+                    "{} overlapping review conflict(s); manuscript left unchanged",
+                    result.conflicts.len()
+                )
+            };
         } else if let Some(rest) = cmd.strip_prefix("scratchpad ") {
             let (title, body) = rest.split_once('|').unwrap_or((rest, ""));
             let id = self.app.create_scratchpad_note(title.trim(), body.trim())?;
@@ -4687,6 +4769,20 @@ fn default_split_ratio() -> u16 {
     40
 }
 
+fn atomic_export(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    io::Write::write_all(&mut temporary, bytes)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod assembly_buffer_tests {
     use super::*;
@@ -6131,6 +6227,14 @@ mod tests {
         assert_eq!(compile.category, "Compile");
         assert_eq!(command_palette_invocation("process").unwrap().0, compile);
         assert_eq!(
+            command_palette_invocation("compile-format").unwrap().0.id,
+            "compile.format"
+        );
+        assert_eq!(
+            command_palette_invocation("review-merge").unwrap().0.id,
+            "review.merge"
+        );
+        assert_eq!(
             command_by_id("compile.selected").unwrap().category,
             "Compile"
         );
@@ -6176,6 +6280,80 @@ mod tests {
         let (dismiss, dismiss_args) = command_palette_invocation("dismiss review.json 2").unwrap();
         assert_eq!(dismiss.id, "extract.dismiss");
         assert_eq!(dismiss_args, Some("review.json 2"));
+    }
+
+    #[test]
+    fn terminal_palette_compiles_markdown_and_source_map_without_external_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Plain / manuscript prose.")
+            .unwrap();
+        let output = project.join("exports/test.md");
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.mode = Some(':');
+        state.prompt = format!("compile-format markdown {}", output.display());
+        state.command().unwrap();
+        assert!(
+            fs::read_to_string(&output)
+                .unwrap()
+                .contains("Plain / manuscript prose.")
+        );
+        let map = fs::read_to_string(format!("{}.source-map.json", output.display())).unwrap();
+        assert!(map.contains(&scene.to_string()));
+        assert!(state.message.contains("Compiled to"));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Plain / manuscript prose."
+        );
+    }
+
+    #[test]
+    fn terminal_review_merge_applies_non_overlapping_changes_and_leaves_conflicts_unmodified() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let base = "One.\nTwo.\nThree.\n";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "One local.\nTwo.\nThree.\n")
+            .unwrap();
+        let base_file = directory.path().join("base.txt");
+        let review_file = directory.path().join("review.txt");
+        fs::write(&base_file, base).unwrap();
+        fs::write(&review_file, "One.\nTwo.\nThree reviewed.\n").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.mode = Some(':');
+        state.prompt = format!(
+            "review-merge {scene} {} {}",
+            base_file.display(),
+            review_file.display()
+        );
+        state.command().unwrap();
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "One local.\nTwo.\nThree reviewed.\n"
+        );
+
+        fs::write(&review_file, "One external.\nTwo.\nThree.\n").unwrap();
+        state.mode = Some(':');
+        state.prompt = format!(
+            "review-merge {scene} {} {}",
+            base_file.display(),
+            review_file.display()
+        );
+        state.command().unwrap();
+        assert!(state.message.contains("conflict"));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "One local.\nTwo.\nThree reviewed.\n"
+        );
     }
 
     #[test]

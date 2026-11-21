@@ -417,6 +417,16 @@ pub struct EntityProvenanceRecord<'a> {
     pub destination_field: Option<&'a str>,
     pub mapping: &'a str,
 }
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ImportRunSummary {
+    pub id: ImportRunId,
+    pub source_type: String,
+    pub source_identifier: String,
+    pub source_fingerprint: String,
+    pub status: String,
+    pub source_items: u64,
+    pub provenance_records: u64,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConflictResolution {
     KeepExternal,
@@ -424,6 +434,21 @@ pub enum ConflictResolution {
 }
 
 impl ProjectStore {
+    pub fn get_import_run_summary(&self, id: ImportRunId) -> Result<ImportRunSummary> {
+        self.conn.query_row(
+            "SELECT r.source_type,r.source_identifier,r.source_fingerprint,r.status,(SELECT count(*) FROM import_source_item i WHERE i.run_id=r.id),(SELECT count(*) FROM entity_provenance p JOIN import_source_item i ON i.id=p.source_item_id WHERE i.run_id=r.id) FROM import_run r WHERE r.id=?1",
+            [id.to_string()],
+            |row| Ok(ImportRunSummary {
+                id,
+                source_type: row.get(0)?,
+                source_identifier: row.get(1)?,
+                source_fingerprint: row.get(2)?,
+                status: row.get(3)?,
+                source_items: row.get::<_, i64>(4)? as u64,
+                provenance_records: row.get::<_, i64>(5)? as u64,
+            }),
+        ).map_err(Into::into)
+    }
     pub fn project_root(&self) -> &Path {
         &self.root
     }

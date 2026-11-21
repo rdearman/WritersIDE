@@ -7,6 +7,11 @@ license.workspace = true
 [dependencies]
 story-core = { path = "../story-core" }
 thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+zip.workspace = true
+epub = "1.2.4"
 
 [dev-dependencies]
-sha2.workspace = true
+tempfile.workspace = true

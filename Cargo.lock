@@ -1549,6 +1549,7 @@ dependencies = [
  "story-core",
  "story-document",
  "story-git",
+ "story-import",
  "story-ollama",
  "story-pipeline",
  "story-reading",
@@ -1577,6 +1578,8 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "zip",
 ]
 
 [[package]]
@@ -1591,9 +1594,14 @@ dependencies = [
 name = "story-import"
 version = "0.1.0"
 dependencies = [
+ "epub",
+ "serde",
+ "serde_json",
  "sha2",
  "story-core",
+ "tempfile",
  "thiserror",
+ "zip",
 ]
 
 [[package]]
@@ -2288,9 +2296,12 @@ dependencies = [
  "story-analysis",
  "story-app",
  "story-core",
+ "story-document",
+ "story-import",
  "story-ollama",
  "story-pipeline",
  "story-storage",
+ "tempfile",
  "toml",
  "uuid",
 ]
@@ -2306,6 +2317,7 @@ dependencies = [
  "story-analysis",
  "story-app",
  "story-core",
+ "story-document",
  "story-ollama",
  "story-pipeline",
  "story-reading",

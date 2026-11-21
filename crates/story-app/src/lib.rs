@@ -204,6 +204,39 @@ impl WriterApp {
     pub fn processing_input_with_transclusions(&self) -> Result<story_pipeline::PipelineInput> {
         self.processing_input_mode(true)
     }
+    /// Render the current manuscript snapshot through the shared Compile IR.
+    /// Non-Markdown formats require a local Pandoc installation; PDF also
+    /// requires LuaLaTeX. No network access or source-file mutation occurs.
+    pub fn compile_artifact(
+        &self,
+        format: story_document::CompileFormat,
+        expand_transclusions: bool,
+    ) -> Result<story_document::CompileArtifact> {
+        self.compile_artifact_with_design(
+            format,
+            expand_transclusions,
+            story_document::BookDesign::default(),
+        )
+    }
+    pub fn compile_artifact_with_design(
+        &self,
+        format: story_document::CompileFormat,
+        expand_transclusions: bool,
+        design: story_document::BookDesign,
+    ) -> Result<story_document::CompileArtifact> {
+        let input = self.processing_input_mode(expand_transclusions)?;
+        let ir = story_pipeline::compile_ir(&input);
+        let renderer = story_document::PandocRenderer::default();
+        renderer
+            .render_with_design(&ir, format, Some(self.store.project_root()), design)
+            .map_err(AppError::Domain)
+    }
+    pub fn compile_diagnostics(&self) -> Result<Vec<story_document::CompileDiagnostic>> {
+        let input = self.processing_input()?;
+        Ok(story_document::publication_diagnostics(
+            &story_pipeline::compile_ir(&input),
+        ))
+    }
     fn processing_input_mode(
         &self,
         expand_transclusions: bool,
@@ -773,6 +806,107 @@ impl WriterApp {
         source: &str,
     ) -> Result<ReadingId> {
         Ok(self.store.import_reading_document(document, source)?)
+    }
+    /// Applies a previously inspected manuscript staging object to a new project.
+    /// Callers should import into a fresh destination so any failed write can
+    /// be discarded without touching the source document.
+    pub fn import_staged_manuscript(
+        &mut self,
+        staging: &story_import::ManuscriptStaging,
+    ) -> Result<(ImportRunId, Vec<SceneId>)> {
+        let source_type = match &staging.source_type {
+            story_import::SourceType::Docx => "docx",
+            story_import::SourceType::Rtf => "rtf",
+            story_import::SourceType::Odt => "odt",
+            story_import::SourceType::Epub => "epub",
+            _ => {
+                return Err(AppError::Domain(
+                    "unsupported manuscript import source type".into(),
+                ));
+            }
+        };
+        let run = ImportRunId::new();
+        self.store.record_import_run(
+            run,
+            source_type,
+            &staging.source_path,
+            &staging.source_fingerprint,
+        )?;
+        let mut imported = Vec::new();
+        let mut unsupported = staging.unsupported.clone();
+        for (position, unit) in staging.units.iter().enumerate() {
+            let chapter_title = format!("Chapter {}", position + 1);
+            let chapter = self.create_chapter(None, &chapter_title, position as u32)?;
+            let scene = self.create_scene(chapter, &unit.title, 0)?;
+            let (_, current_hash) = self.load_scene_text(scene)?;
+            self.save_scene_text(scene, Some(&current_hash), &unit.body_markdown)?;
+            let source_item = SourceItemId::new();
+            let source_fingerprint = format!("{:x}", Sha256::digest(unit.body_markdown.as_bytes()));
+            let raw_fields =
+                serde_json::to_string(unit).map_err(|error| AppError::Domain(error.to_string()))?;
+            self.store
+                .record_source_item(story_storage::ImportSourceItemRecord {
+                    id: source_item,
+                    run,
+                    source_document_id: &unit.source_document_id,
+                    source_sheet: None,
+                    source_row: Some(position as u32 + 1),
+                    fingerprint: &source_fingerprint,
+                    inventory_type: "manuscript-unit",
+                    raw_fields: &raw_fields,
+                })?;
+            for (source_field, destination_field) in
+                [("title", "title"), ("body_markdown", "manuscript-text")]
+            {
+                self.store
+                    .record_provenance(story_storage::EntityProvenanceRecord {
+                        id: ProvenanceId::new(),
+                        source_item,
+                        destination_type: "scene",
+                        destination_id: &scene.to_string(),
+                        source_field: Some(source_field),
+                        destination_field: Some(destination_field),
+                        mapping: "manuscript-import-v1",
+                    })?;
+            }
+            unsupported.extend(unit.unsupported.iter().cloned());
+            imported.push(scene);
+        }
+        unsupported.sort();
+        unsupported.dedup();
+        let status = if unsupported.is_empty() && staging.warnings.is_empty() {
+            "completed"
+        } else {
+            "incomplete"
+        };
+        self.store.finish_import_run(
+            run,
+            status,
+            &serde_json::to_string(&staging.warnings)
+                .map_err(|error| AppError::Domain(error.to_string()))?,
+            &serde_json::to_string(&unsupported)
+                .map_err(|error| AppError::Domain(error.to_string()))?,
+        )?;
+        Ok((run, imported))
+    }
+    pub fn get_import_run_summary(
+        &self,
+        run: ImportRunId,
+    ) -> Result<story_storage::ImportRunSummary> {
+        Ok(self.store.get_import_run_summary(run)?)
+    }
+    pub fn merge_review_text(
+        &mut self,
+        scene: SceneId,
+        base: &str,
+        reviewed_text: &str,
+    ) -> Result<story_import::ThreeWayMerge> {
+        let (current, expected_hash) = self.load_scene_text(scene)?;
+        let result = story_import::three_way_merge(base, &current, reviewed_text);
+        if let Some(merged) = &result.merged_text {
+            self.save_scene_text(scene, Some(&expected_hash), merged)?;
+        }
+        Ok(result)
     }
     pub fn get_reading_document(
         &self,
@@ -1360,7 +1494,10 @@ mod tests {
         assert_eq!(input.content_units.len(), 1);
         assert!(input.content_units[0].text.contains("direct chapter prose"));
         let (compiled, _) = story_pipeline::compile_ir(&input).render_markdown();
-        assert_eq!(compiled, "This is direct chapter prose.\n\n");
+        assert_eq!(
+            compiled,
+            "## Introduction\n\nThis is direct chapter prose.\n\n"
+        );
     }
 
     #[test]
@@ -1388,6 +1525,80 @@ mod tests {
         );
         assert!(project.join("snapshots/database.sql").exists());
         assert!(app.git_diff(&first, &second, Some("story.db")).is_err());
+    }
+
+    #[test]
+    fn compile_artifact_exposes_portable_markdown_and_source_map() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "A Novel").unwrap();
+        let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+        let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+        let (_, expected) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&expected), "Élodie arrives.")
+            .unwrap();
+        let artifact = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        let markdown = String::from_utf8(artifact.bytes).unwrap();
+        assert!(markdown.contains("## Opening"));
+        assert!(markdown.contains("### Arrival"));
+        assert!(markdown.contains("Élodie arrives."));
+        assert_eq!(artifact.source_map.len(), 1);
+        assert_eq!(artifact.source_map[0].source_entity_id, scene.to_string());
+    }
+
+    #[test]
+    fn staged_manuscript_import_creates_scenes_and_provenance() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Imported"), "Imported").unwrap();
+        let staging = story_import::ManuscriptStaging {
+            source_type: story_import::SourceType::Rtf,
+            source_path: "/fixtures/source.rtf".into(),
+            source_fingerprint: "a".repeat(64),
+            title: "Source book".into(),
+            units: vec![story_import::ManuscriptUnit {
+                source_document_id: "source.rtf:unit:0".into(),
+                title: "Opening scene".into(),
+                body_markdown: "Imported prose.".into(),
+                unsupported: vec!["Formatting needs review".into()],
+            }],
+            warnings: Vec::new(),
+            unsupported: vec!["Some formatting is unsupported".into()],
+        };
+        let (run, scenes) = app.import_staged_manuscript(&staging).unwrap();
+        assert_eq!(scenes.len(), 1);
+        assert_eq!(app.load_scene_text(scenes[0]).unwrap().0, "Imported prose.");
+        let summary = app.get_import_run_summary(run).unwrap();
+        assert_eq!(summary.source_items, 1);
+        assert_eq!(summary.provenance_records, 2);
+        assert_eq!(summary.status, "incomplete");
+    }
+
+    #[test]
+    fn editorial_merge_saves_disjoint_changes_and_preserves_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let base = "One.\nTwo.\nThree.\n";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "One.\nTwo local.\nThree.\n")
+            .unwrap();
+        let merged = app
+            .merge_review_text(scene, base, "One.\nTwo.\nThree external.\n")
+            .unwrap();
+        assert_eq!(
+            merged.merged_text.as_deref(),
+            Some("One.\nTwo local.\nThree external.\n")
+        );
+        let conflict = app
+            .merge_review_text(scene, base, "One.\nTwo reviewed.\nThree.\n")
+            .unwrap();
+        assert!(conflict.merged_text.is_none());
+        assert_eq!(
+            app.load_scene_text(scene).unwrap().0,
+            "One.\nTwo local.\nThree external.\n"
+        );
     }
 
     #[test]

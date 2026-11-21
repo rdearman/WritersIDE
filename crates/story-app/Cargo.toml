@@ -13,6 +13,8 @@ story-pipeline = { path = "../story-pipeline" }
 story-document = { path = "../story-document" }
 story-ollama = { path = "../story-ollama" }
 story-git = { path = "../story-git" }
+story-import = { path = "../story-import" }
+serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 sha2.workspace = true
