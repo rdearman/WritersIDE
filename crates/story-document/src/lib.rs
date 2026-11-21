@@ -9,7 +9,7 @@ use std::{
 };
 
 pub const SEMANTIC_SCHEMA_VERSION: u16 = 1;
-pub const COMPILE_IR_VERSION: u16 = 2;
+pub const COMPILE_IR_VERSION: u16 = 3;
 
 fn valid_language_tag(tag: &str) -> bool {
     let mut parts = tag.split('-');
