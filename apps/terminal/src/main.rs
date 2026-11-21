@@ -2484,6 +2484,18 @@ impl AppState {
                             format_character_reference(&character),
                         ))
                     }),
+                "location" => source_id
+                    .parse::<uuid::Uuid>()
+                    .ok()
+                    .map(story_core::LocationId)
+                    .and_then(|id| {
+                        let location = self.app.get_location(id).ok()?;
+                        Some((
+                            None,
+                            location.name.clone(),
+                            format_location_reference(&location),
+                        ))
+                    }),
                 _ => None,
             };
             if let Some((scene_id, title, content)) = loaded {
@@ -5600,6 +5612,21 @@ impl AppState {
                 self.active_reference + 1,
                 self.reference_panes.len()
             );
+        } else if let Some(id) = cmd.strip_prefix("reference-location ") {
+            let id = story_core::LocationId(id.parse()?);
+            let location = self.app.get_location(id)?;
+            self.open_reference_buffer(
+                format!("location:{id}"),
+                None,
+                location.name.clone(),
+                format_location_reference(&location),
+            );
+            self.reference_focused = false;
+            self.message = format!(
+                "Location reference opened in buffer {} of {}",
+                self.active_reference + 1,
+                self.reference_panes.len()
+            );
         } else if cmd == "reference-next" {
             if !self.reference_panes.is_empty() {
                 self.active_reference = (self.active_reference + 1) % self.reference_panes.len();
@@ -7954,6 +7981,17 @@ fn format_character_reference(character: &story_core::Character) -> String {
         if !value.trim().is_empty() {
             lines.push(format!("\n## {label}\n{value}"));
         }
+    }
+    lines.join("\n")
+}
+
+fn format_location_reference(location: &story_core::Location) -> String {
+    let mut lines = vec![format!("# {}", location.name)];
+    if let Some(parent) = location.parent {
+        lines.push(format!("Parent location: {parent}"));
+    }
+    if !location.description.trim().is_empty() {
+        lines.push(format!("\n## Description\n{}", location.description));
     }
     lines.join("\n")
 }
@@ -12358,6 +12396,10 @@ mod tests {
             )
             .unwrap();
         let character = app.create_character("Mira Vale").unwrap();
+        let location = app.create_location("The harbour").unwrap();
+        let mut location_profile = app.get_location(location).unwrap();
+        location_profile.description = "A narrow harbour beneath the cliffs.".into();
+        app.update_location(&location_profile).unwrap();
         for (scene, prose) in [
             (first, "Main prose"),
             (second, "Reference A text"),
@@ -12400,28 +12442,36 @@ mod tests {
                 .content
                 .contains("Mira Vale")
         );
+        execute(&mut state, format!("reference-location {location}"));
+        assert!(
+            state
+                .active_reference_pane()
+                .unwrap()
+                .content
+                .contains("narrow harbour")
+        );
         execute(&mut state, "reference-next".into());
         assert_eq!(
             state.active_reference_pane().unwrap().scene_id,
             Some(second)
         );
-        assert_eq!(state.reference_panes.len(), 4);
+        assert_eq!(state.reference_panes.len(), 5);
         state.save_session().unwrap();
         let saved: SessionSnapshot =
             serde_json::from_slice(&fs::read(state.session_path()).unwrap()).unwrap();
-        assert_eq!(saved.reference_sources.len(), 4);
+        assert_eq!(saved.reference_sources.len(), 5);
         let mut restored = AppState::new(
             WriterApp::open_project(&project).unwrap(),
             default_bindings(),
         );
         restored.restore_session().unwrap();
-        assert_eq!(restored.reference_panes.len(), 4);
+        assert_eq!(restored.reference_panes.len(), 5);
         assert_eq!(
             restored.active_reference_pane().unwrap().scene_id,
             Some(second)
         );
         execute(&mut restored, "reference-close".into());
-        assert_eq!(restored.reference_panes.len(), 3);
+        assert_eq!(restored.reference_panes.len(), 4);
         assert_eq!(
             restored.active_reference_pane().unwrap().scene_id,
             Some(third)
@@ -12433,6 +12483,10 @@ mod tests {
         assert!(restored.reference_panes.iter().any(|pane| {
             pane.source_key == format!("character:{character}")
                 && pane.content.contains("Mira Vale")
+        }));
+        assert!(restored.reference_panes.iter().any(|pane| {
+            pane.source_key == format!("location:{location}")
+                && pane.content.contains("narrow harbour")
         }));
     }
 

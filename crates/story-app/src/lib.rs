@@ -810,6 +810,12 @@ impl WriterApp {
         self.store.add_location(id, name)?;
         Ok(id)
     }
+    pub fn get_location(&self, id: story_core::LocationId) -> Result<story_core::Location> {
+        Ok(self.store.get_location(id)?)
+    }
+    pub fn update_location(&mut self, location: &story_core::Location) -> Result<()> {
+        Ok(self.store.update_location(location)?)
+    }
     pub fn create_plotline(&mut self, name: &str) -> Result<PlotlineId> {
         let id = PlotlineId::new();
         self.store.add_plotline(id, name)?;
