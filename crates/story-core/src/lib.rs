@@ -796,6 +796,12 @@ pub struct PassageAnchor {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PassageLanguageTag {
+    pub anchor_id: AnchorId,
+    pub language_code: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoryLink {
     pub id: LinkId,
     pub source: EntityRef,

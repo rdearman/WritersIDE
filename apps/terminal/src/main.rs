@@ -1473,6 +1473,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "scene.passage-language",
+            "Tag Passage Language",
+            "Attach a language tag to a stable UTF-8 passage range",
+            "Scene",
+            "passage-language",
+            true,
+        ),
+        legacy_command(
             "assembly.move",
             "Reorder Assembly Item",
             "Reorder content in an assembly only",
@@ -6259,6 +6267,37 @@ impl AppState {
                     " (inherited)"
                 }
             );
+        } else if let Some(rest) = cmd.strip_prefix("passage-language ") {
+            let mut parts = rest.split_whitespace();
+            let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
+            let start: u64 = parts.next().ok_or("missing start byte")?.parse()?;
+            let end: u64 = parts.next().ok_or("missing end byte")?.parse()?;
+            let language = parts.next().ok_or("missing BCP-47 language tag")?;
+            if parts.next().is_some() {
+                return Err(
+                    "usage: passage-language <scene-uuid> <start-byte> <end-byte> <tag>".into(),
+                );
+            }
+            let anchor = self.app.tag_passage_language(scene, start, end, language)?;
+            self.message = format!("Passage tagged {language} · anchor {anchor}");
+        } else if let Some(rest) = cmd.strip_prefix("passage-languages ") {
+            let scene = SceneId(rest.trim().parse()?);
+            self.message = self
+                .app
+                .list_passage_language_tags(scene)?
+                .into_iter()
+                .map(|tag| {
+                    format!(
+                        "{} [{}..{}] {} · {}",
+                        tag.language_code,
+                        tag.anchor.start_byte,
+                        tag.anchor.end_byte,
+                        tag.anchor.state,
+                        tag.anchor.quote
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" · ");
         } else if let Some(policy) = cmd.strip_prefix("project-word-count-policy ") {
             let policy = story_core::WordCountPolicy::parse(policy.trim())
                 .ok_or("policy must be unicode-words or script-graphemes")?;
@@ -12463,6 +12502,10 @@ mod tests {
         app.set_project_language("it-IT").unwrap();
         let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
         let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (empty, hash) = app.load_scene_text(scene).unwrap();
+        assert!(empty.is_empty());
+        app.save_scene_text(scene, Some(&hash), "Dialog: Bonjour")
+            .unwrap();
         let mut state = AppState::new(app, default_bindings());
         state
             .execute_legacy_palette_command(&format!("scene-language {scene} fr-FR"))
@@ -12475,6 +12518,14 @@ mod tests {
         let record = state.app.get_scene(scene).unwrap();
         assert_eq!(record.scene.language_code, None);
         assert_eq!(state.app.get_project().unwrap().language_code, "it-IT");
+        state
+            .execute_legacy_palette_command(&format!("passage-language {scene} 8 15 fr-FR"))
+            .unwrap();
+        assert!(state.message.contains("fr-FR"));
+        state
+            .execute_legacy_palette_command(&format!("passage-languages {scene}"))
+            .unwrap();
+        assert!(state.message.contains("Bonjour"), "{}", state.message);
     }
 
     #[test]

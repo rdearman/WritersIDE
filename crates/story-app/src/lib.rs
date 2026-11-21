@@ -121,6 +121,26 @@ impl WriterApp {
     ) -> Result<()> {
         Ok(self.store.set_scene_language(scene_id, language_code)?)
     }
+    pub fn tag_passage_language(
+        &mut self,
+        scene_id: SceneId,
+        start_byte: u64,
+        end_byte: u64,
+        language_code: &str,
+    ) -> Result<AnchorId> {
+        Ok(self
+            .store
+            .tag_passage_language(scene_id, start_byte, end_byte, language_code)?)
+    }
+    pub fn list_passage_language_tags(
+        &self,
+        scene_id: SceneId,
+    ) -> Result<Vec<story_storage::PassageLanguageRecord>> {
+        Ok(self.store.list_passage_language_tags(scene_id)?)
+    }
+    pub fn remove_passage_language_tag(&mut self, anchor_id: AnchorId) -> Result<()> {
+        Ok(self.store.remove_passage_language_tag(anchor_id)?)
+    }
     pub fn set_project_word_count_policy(&mut self, policy: WordCountPolicy) -> Result<()> {
         Ok(self.store.set_project_word_count_policy(policy)?)
     }

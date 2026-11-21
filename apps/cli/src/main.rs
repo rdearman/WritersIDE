@@ -166,6 +166,31 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let record = app.get_scene(scene)?;
             println!("{}", record.scene.effective_language_code(&project));
         }
+        "passage-language" => {
+            let path = args.next().ok_or("missing project path")?;
+            let scene = SceneId(args.next().ok_or("missing scene id")?.parse()?);
+            let start = args.next().ok_or("missing start byte")?.parse()?;
+            let end = args.next().ok_or("missing end byte")?.parse()?;
+            let language = args.next().ok_or("missing language tag")?;
+            let mut app = WriterApp::open_project(path)?;
+            let anchor = app.tag_passage_language(scene, start, end, &language)?;
+            println!("{anchor}");
+        }
+        "passage-languages" => {
+            let path = args.next().ok_or("missing project path")?;
+            let scene = SceneId(args.next().ok_or("missing scene id")?.parse()?);
+            let app = WriterApp::open_project(path)?;
+            for tag in app.list_passage_language_tags(scene)? {
+                println!(
+                    "{} {}..{} {} {}",
+                    tag.anchor.id,
+                    tag.anchor.start_byte,
+                    tag.anchor.end_byte,
+                    tag.language_code,
+                    tag.anchor.state
+                );
+            }
+        }
         "word-count-policy" => {
             let path = args.next().ok_or("missing project path")?;
             let requested = args.next();
@@ -2160,6 +2185,10 @@ fn usage() {
     eprintln!("writers-ide compile-check <project>");
     eprintln!("writers-ide word-count-policy <project> [unicode-words|script-graphemes]");
     eprintln!("writers-ide scene-language <project> <scene-uuid> [language-tag|inherit]");
+    eprintln!(
+        "writers-ide passage-language <project> <scene-uuid> <start-byte> <end-byte> <language-tag>"
+    );
+    eprintln!("writers-ide passage-languages <project> <scene-uuid>");
     eprintln!("writers-ide git-auto-snapshot <project> <interval-minutes|off> (1–10080 minutes)");
     eprintln!(
         "writers-ide git-auto-snapshot-check <project> (one-shot; suitable for cron/systemd timers)"
