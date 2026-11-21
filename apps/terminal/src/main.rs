@@ -4682,11 +4682,15 @@ impl AppState {
         {
             return Ok(false);
         }
-        let challenge = self
+        let idle_seconds = self
             .active_challenge
+            .as_ref()
+            .expect("challenge remains active")
+            .kamikaze_idle_seconds;
+        self.active_challenge
             .as_mut()
-            .expect("challenge remains active");
-        challenge.last_activity = now;
+            .expect("challenge remains active")
+            .last_activity = now;
         self.push_undo();
         let row = self.cursor.0;
         while self.cursor.1 > 0
@@ -4707,9 +4711,10 @@ impl AppState {
             self.backspace();
         }
         if before > self.cursor.1 {
-            self.message =
-                "Kamikaze: removed the last word after 10 seconds of inactivity; Undo restores it"
-                    .into();
+            self.message = format!(
+                "Kamikaze: removed the last word after {} seconds of inactivity; Undo restores it",
+                idle_seconds
+            );
         } else {
             self.message = "Kamikaze is armed; keep drafting to avoid word loss".into();
         }
@@ -5565,17 +5570,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         let challenge = s
             .active_challenge
             .as_ref()
-            .map(|challenge| {
-                format!(
-                    "Challenge {}s · target {} words · {} mode",
-                    challenge
-                        .deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_secs(),
-                    challenge.target_words,
-                    challenge.mode
-                )
-            })
+            .map(|challenge| challenge_footer(challenge, &s.editor))
             .unwrap_or_default();
         format!(
             " {}   {}   Enter open | j/k or ↑/↓ select | Tab next | Backspace back | {}",
@@ -5590,6 +5585,29 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     );
     if s.menu.is_some() {
         draw_menu_overlay(f, s);
+    }
+}
+
+fn challenge_footer(challenge: &ActiveWritingChallenge, editor: &[String]) -> String {
+    let current_words = story_core::count_words(&editor.join("\n"));
+    let written = current_words.saturating_sub(challenge.initial_words);
+    let remaining = challenge
+        .deadline
+        .saturating_duration_since(Instant::now())
+        .as_secs();
+    if challenge.mode == "kamikaze" {
+        let idle_remaining = challenge
+            .kamikaze_idle_seconds
+            .saturating_sub(challenge.last_activity.elapsed().as_secs());
+        format!(
+            "Challenge {remaining}s · {written}/{} words · kamikaze in {idle_remaining}s",
+            challenge.target_words
+        )
+    } else {
+        format!(
+            "Challenge {remaining}s · {written}/{} words · {} mode",
+            challenge.target_words, challenge.mode
+        )
     }
 }
 
@@ -7607,8 +7625,16 @@ mod tests {
             Instant::now() - Duration::from_secs(3);
         assert!(state.tick_challenge().unwrap());
         assert_eq!(state.editor[0], "one ");
+        assert!(state.message.contains("after 2 seconds"));
         state.undo_edit();
         assert_eq!(state.editor[0], "one two");
+
+        let footer = challenge_footer(
+            state.active_challenge.as_ref().unwrap(),
+            &["one two three".into()],
+        );
+        assert!(footer.contains("1/10 words"));
+        assert!(footer.contains("kamikaze in 2s"));
     }
 
     #[test]
