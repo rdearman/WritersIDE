@@ -4115,9 +4115,23 @@ impl AppState {
                 .transpose()?
                 .unwrap_or_default();
             let output = rest.iter().find(|item| !item.starts_with("--"));
-            let artifact = self
-                .app
-                .compile_artifact_with_design(format, expand, design)?;
+            let artifact = if let Some(profile_path) = rest
+                .iter()
+                .find_map(|argument| argument.strip_prefix("--design-file="))
+            {
+                let root = self.app.project_root().canonicalize()?;
+                let path = root.join(profile_path).canonicalize()?;
+                if !path.starts_with(&root) || !path.is_file() {
+                    return Err("design profile must be a project-local regular file".into());
+                }
+                let profile =
+                    story_document::BookDesignProfile::from_toml(&fs::read_to_string(path)?)?;
+                self.app
+                    .compile_artifact_with_profile(format, expand, profile)?
+            } else {
+                self.app
+                    .compile_artifact_with_design(format, expand, design)?
+            };
             let destination = output
                 .map(Path::new)
                 .map(Path::to_path_buf)

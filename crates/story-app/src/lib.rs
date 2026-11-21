@@ -260,11 +260,19 @@ impl WriterApp {
         expand_transclusions: bool,
         design: story_document::BookDesign,
     ) -> Result<story_document::CompileArtifact> {
+        self.compile_artifact_with_profile(format, expand_transclusions, design.profile())
+    }
+    pub fn compile_artifact_with_profile(
+        &self,
+        format: story_document::CompileFormat,
+        expand_transclusions: bool,
+        design: story_document::BookDesignProfile,
+    ) -> Result<story_document::CompileArtifact> {
         let input = self.processing_input_mode(expand_transclusions)?;
         let ir = story_pipeline::compile_ir(&input);
         let renderer = story_document::PandocRenderer::default();
         renderer
-            .render_with_design(&ir, format, Some(self.store.project_root()), design)
+            .render_with_profile(&ir, format, Some(self.store.project_root()), &design)
             .map_err(AppError::Domain)
     }
     pub fn compile_diagnostics(&self) -> Result<Vec<story_document::CompileDiagnostic>> {

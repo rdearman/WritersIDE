@@ -1,0 +1,8 @@
+version = 1
+name = "Compact trade paperback"
+document_class = "book"
+paper_size = "6in:9in"
+class_options = ["oneside", "openany"]
+geometry = "margin=0.7in"
+font_size_pt = 10
+line_spacing_hundredths = 112

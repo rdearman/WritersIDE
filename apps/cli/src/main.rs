@@ -1283,7 +1283,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .find(|argument| !argument.starts_with("--"));
             let app = WriterApp::open_project(&project)?;
-            let artifact = app.compile_artifact_with_design(format, expand, design)?;
+            let artifact = if let Some(profile_path) = remaining
+                .iter()
+                .find_map(|argument| argument.strip_prefix("--design-file="))
+            {
+                let root = app.project_root().canonicalize()?;
+                let path = root.join(profile_path).canonicalize()?;
+                if !path.starts_with(&root) || !path.is_file() {
+                    return Err("design profile must be a project-local regular file".into());
+                }
+                let profile =
+                    story_document::BookDesignProfile::from_toml(&std::fs::read_to_string(path)?)?;
+                app.compile_artifact_with_profile(format, expand, profile)?
+            } else {
+                app.compile_artifact_with_design(format, expand, design)?
+            };
             let destination = output.map(PathBuf::from).unwrap_or_else(|| {
                 app.project_root()
                     .join("exports")
@@ -1919,7 +1933,7 @@ fn scene_matches_scope(scene: &story_storage::SceneRecord, scope: &str) -> bool 
 }
 fn usage() {
     eprintln!(
-        "writers-ide compile <project> <markdown|latex|html|epub|docx|pdf> [output] [--expand-transclusions] [--design=preset]"
+        "writers-ide compile <project> <markdown|latex|html|epub|docx|pdf> [output] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"
     );
     eprintln!("writers-ide compile-check <project>");
     eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");

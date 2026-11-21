@@ -479,6 +479,91 @@ pub enum BookDesign {
     TechnicalAcademic,
 }
 
+/// Versioned, portable print profile. Numeric dimensions are represented as
+/// integer hundredths to keep output deterministic and avoid float parsing.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct BookDesignProfile {
+    pub version: u16,
+    pub name: String,
+    pub document_class: String,
+    pub paper_size: String,
+    #[serde(default)]
+    pub class_options: Vec<String>,
+    pub geometry: String,
+    pub font_size_pt: u8,
+    pub line_spacing_hundredths: u16,
+}
+
+impl BookDesignProfile {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.version != 1 || self.name.trim().is_empty() {
+            return Err("book design profile requires version 1 and a name".into());
+        }
+        if !matches!(self.document_class.as_str(), "book" | "report" | "article") {
+            return Err("document_class must be book, report, or article".into());
+        }
+        if !matches!(
+            self.paper_size.as_str(),
+            "letter" | "a4" | "6in:9in" | "6.125in:9.25in"
+        ) {
+            return Err("paper_size must be letter, a4, 6in:9in, or 6.125in:9.25in".into());
+        }
+        if self.class_options.iter().any(|option| {
+            !matches!(
+                option.as_str(),
+                "oneside" | "twoside" | "openany" | "openright"
+            )
+        }) {
+            return Err("class_options contains an unsupported option".into());
+        }
+        if self.geometry.is_empty()
+            || !self
+                .geometry
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | ',' | '=' | ':' | '-'))
+        {
+            return Err("geometry contains unsupported characters".into());
+        }
+        if !(8..=20).contains(&self.font_size_pt)
+            || !(100..=300).contains(&self.line_spacing_hundredths)
+        {
+            return Err("book design dimensions are outside supported ranges".into());
+        }
+        Ok(())
+    }
+
+    pub fn from_toml(source: &str) -> Result<Self, String> {
+        let profile: Self = toml::from_str(source).map_err(|error| error.to_string())?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    pub fn to_toml(&self) -> Result<String, String> {
+        self.validate()?;
+        toml::to_string_pretty(self).map_err(|error| error.to_string())
+    }
+
+    fn pandoc_variables(&self) -> Vec<String> {
+        let mut variables = vec![format!("documentclass={}", self.document_class)];
+        variables.extend(
+            self.class_options
+                .iter()
+                .map(|option| format!("classoption={option}")),
+        );
+        variables.extend([
+            format!("papersize={}", self.paper_size),
+            format!("geometry={}", self.geometry),
+            format!("fontsize={}pt", self.font_size_pt),
+            format!(
+                "linestretch={}.{}",
+                self.line_spacing_hundredths / 100,
+                self.line_spacing_hundredths % 100
+            ),
+        ]);
+        variables
+    }
+}
+
 /// Portable, project-relative compile edition configuration.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EditionRecipe {
@@ -612,50 +697,71 @@ impl BookDesign {
         }
     }
 
-    fn pandoc_variables(self) -> &'static [&'static str] {
-        match self {
-            Self::TradePaperback => &[
-                "documentclass=book",
-                "classoption=oneside",
-                "classoption=openany",
-                "papersize=6in:9in",
-                "geometry=margin=0.75in",
-                "fontsize=11pt",
-                "linestretch=1.15",
-            ],
-            Self::Hardback => &[
-                "documentclass=book",
-                "classoption=twoside",
-                "classoption=openright",
-                "papersize=6.125in:9.25in",
-                "geometry=inner=0.9in,outer=0.65in,top=0.8in,bottom=0.8in",
-                "fontsize=11pt",
-                "linestretch=1.15",
-            ],
-            Self::Manuscript => &[
-                "documentclass=article",
-                "papersize=letter",
-                "geometry=margin=1in",
-                "fontsize=12pt",
-                "linestretch=2",
-            ],
-            Self::Nonfiction => &[
-                "documentclass=book",
-                "classoption=oneside",
-                "classoption=openany",
-                "papersize=letter",
-                "geometry=margin=1in",
-                "fontsize=11pt",
-                "linestretch=1.25",
-            ],
-            Self::TechnicalAcademic => &[
-                "documentclass=report",
-                "classoption=oneside",
-                "papersize=letter",
-                "geometry=margin=1in",
-                "fontsize=11pt",
-                "linestretch=1.25",
-            ],
+    pub fn profile(self) -> BookDesignProfile {
+        let (
+            name,
+            document_class,
+            paper_size,
+            class_options,
+            geometry,
+            font_size_pt,
+            line_spacing_hundredths,
+        ) = match self {
+            Self::TradePaperback => (
+                "trade-paperback",
+                "book",
+                "6in:9in",
+                vec!["oneside", "openany"],
+                "margin=0.75in",
+                11,
+                115,
+            ),
+            Self::Hardback => (
+                "hardback",
+                "book",
+                "6.125in:9.25in",
+                vec!["twoside", "openright"],
+                "inner=0.9in,outer=0.65in,top=0.8in,bottom=0.8in",
+                11,
+                115,
+            ),
+            Self::Manuscript => (
+                "manuscript",
+                "article",
+                "letter",
+                vec![],
+                "margin=1in",
+                12,
+                200,
+            ),
+            Self::Nonfiction => (
+                "nonfiction",
+                "book",
+                "letter",
+                vec!["oneside", "openany"],
+                "margin=1in",
+                11,
+                125,
+            ),
+            Self::TechnicalAcademic => (
+                "technical-academic",
+                "report",
+                "letter",
+                vec!["oneside"],
+                "margin=1in",
+                11,
+                125,
+            ),
+        };
+        BookDesignProfile {
+            version: 1,
+            name: name.into(),
+            document_class: document_class.into(),
+            paper_size: paper_size.into(),
+            class_options: class_options.into_iter().map(str::to_owned).collect(),
+            geometry: geometry.into(),
+            font_size_pt,
+            line_spacing_hundredths,
         }
     }
 }
@@ -748,9 +854,20 @@ impl PandocRenderer {
         resource_root: Option<&Path>,
         design: BookDesign,
     ) -> Result<CompileArtifact, String> {
+        self.render_with_profile(ir, format, resource_root, &design.profile())
+    }
+
+    pub fn render_with_profile(
+        &self,
+        ir: &CompileIr,
+        format: CompileFormat,
+        resource_root: Option<&Path>,
+        design: &BookDesignProfile,
+    ) -> Result<CompileArtifact, String> {
         if !ir.validate() {
             return Err("refusing to render invalid Compile IR".into());
         }
+        design.validate()?;
         let (markdown, source_map) = ir.render_markdown();
         let mut auxiliary_files = Vec::new();
         let bytes = if format == CompileFormat::Markdown {
@@ -833,7 +950,7 @@ impl PandocRenderer {
             }
             if format == CompileFormat::Pdf {
                 let tex =
-                    self.render_with_design(ir, CompileFormat::Latex, resource_root, design)?;
+                    self.render_with_profile(ir, CompileFormat::Latex, resource_root, design)?;
                 let tex_path = temporary.path().join("compiled.tex");
                 std::fs::write(&tex_path, &tex.bytes)
                     .map_err(|error| format!("preserve generated TeX source: {error}"))?;
@@ -1147,18 +1264,21 @@ mod tests {
         assert_eq!(BookDesign::parse("invalid"), None);
         assert!(
             BookDesign::Manuscript
+                .profile()
                 .pandoc_variables()
-                .contains(&"linestretch=2")
+                .contains(&"linestretch=2.0".to_owned())
         );
         assert!(
             BookDesign::Hardback
+                .profile()
                 .pandoc_variables()
-                .contains(&"classoption=twoside")
+                .contains(&"classoption=twoside".to_owned())
         );
         assert!(
             BookDesign::TechnicalAcademic
+                .profile()
                 .pandoc_variables()
-                .contains(&"documentclass=report")
+                .contains(&"documentclass=report".to_owned())
         );
         let mut ir = CompileIr::new(" ");
         ir.push(CompileUnit {
@@ -1176,5 +1296,24 @@ mod tests {
             Some("empty-unit")
         );
         assert!(ir.units[0].segments[0].document.source.trim().is_empty());
+    }
+
+    #[test]
+    fn custom_book_design_profiles_validate_and_round_trip_toml() {
+        let profile = BookDesignProfile {
+            version: 1,
+            name: "Pocket edition".into(),
+            document_class: "book".into(),
+            paper_size: "a4".into(),
+            class_options: vec!["oneside".into(), "openany".into()],
+            geometry: "margin=0.8in".into(),
+            font_size_pt: 10,
+            line_spacing_hundredths: 118,
+        };
+        let encoded = profile.to_toml().unwrap();
+        assert_eq!(BookDesignProfile::from_toml(&encoded).unwrap(), profile);
+        assert!(profile.pandoc_variables().contains(&"fontsize=10pt".into()));
+        let malicious = encoded.replace("margin=0.8in", "margin=0.8in\\\\input{evil}");
+        assert!(BookDesignProfile::from_toml(&malicious).is_err());
     }
 }
