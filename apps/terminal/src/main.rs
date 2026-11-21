@@ -4196,10 +4196,38 @@ impl AppState {
                 }
                 "Editorial merge applied through the manuscript write journal".into()
             } else {
+                if self.dirty {
+                    return Err(
+                        "save the open scene buffer before reviewing an editorial merge".into(),
+                    );
+                }
+                self.open_scene(scene)?;
+                let content = format_conflict_review(&result.conflicts, self.width);
+                if let Some(index) = self
+                    .reference_panes
+                    .iter()
+                    .position(|pane| pane.scene_id == scene)
+                {
+                    self.reference_panes[index] = ReferencePane {
+                        scene_id: scene,
+                        title: "Editorial conflict review".into(),
+                        content,
+                        scroll: 0,
+                    };
+                    self.active_reference = index;
+                } else {
+                    self.reference_panes.push(ReferencePane {
+                        scene_id: scene,
+                        title: "Editorial conflict review".into(),
+                        content,
+                        scroll: 0,
+                    });
+                    self.active_reference = self.reference_panes.len() - 1;
+                }
+                self.reference_focused = false;
                 format!(
-                    "{} overlapping review conflict(s); manuscript unchanged. Inspect JSON: {}",
-                    result.conflicts.len(),
-                    serde_json::to_string(&result.conflicts)?
+                    "{} conflict(s) shown beside the canonical scene; prose unchanged",
+                    result.conflicts.len()
                 )
             };
         } else if let Some(arguments) = cmd.strip_prefix("review-resolve ") {
@@ -7551,6 +7579,53 @@ fn planning_board_bounds(items: &[story_storage::PlanningBoardItemRecord]) -> ([
         bounds(items.iter().flat_map(|item| [item.x, item.x + item.width])),
         bounds(items.iter().map(|item| item.y + item.height)),
     )
+}
+
+fn format_conflict_review(
+    conflicts: &[story_import::MergeConflict],
+    terminal_width: usize,
+) -> String {
+    let column_width = (terminal_width / 6).clamp(10, 28);
+    let format_cell = |value: &str| {
+        let text = value
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .take(column_width.saturating_sub(1))
+            .collect::<String>();
+        format!("{text:<width$}", width = column_width)
+    };
+    let mut output = String::new();
+    for (index, conflict) in conflicts.iter().enumerate() {
+        output.push_str(&format!(
+            "Conflict {} · base lines {}–{}\n",
+            index + 1,
+            conflict.base_start_line + 1,
+            conflict.base_end_line.max(conflict.base_start_line + 1)
+        ));
+        output.push_str(&format!(
+            "{} │ {} │ {}\n",
+            format_cell("BASE"),
+            format_cell("LOCAL"),
+            format_cell("REVIEWED")
+        ));
+        let columns = [
+            conflict.base.lines().collect::<Vec<_>>(),
+            conflict.local.lines().collect::<Vec<_>>(),
+            conflict.external.lines().collect::<Vec<_>>(),
+        ];
+        let row_count = columns.iter().map(Vec::len).max().unwrap_or_default();
+        for row in 0..row_count {
+            let cells = columns
+                .iter()
+                .map(|column| format_cell(column.get(row).copied().unwrap_or("")))
+                .collect::<Vec<_>>();
+            output.push_str(&format!("{} │ {} │ {}\n", cells[0], cells[1], cells[2]));
+        }
+        output.push('\n');
+    }
+    output
 }
 
 fn format_planning_board_markdown(
@@ -11377,6 +11452,11 @@ mod tests {
         );
         state.command().unwrap();
         assert!(state.message.contains("conflict"));
+        let review = state.active_reference_pane().unwrap();
+        assert_eq!(review.title, "Editorial conflict review");
+        assert!(review.content.contains("BASE"));
+        assert!(review.content.contains("LOCAL"));
+        assert!(review.content.contains("REVIEWED"));
         assert_eq!(
             state.app.load_scene_text(scene).unwrap().0,
             "One local.\nTwo.\nThree reviewed.\n"
