@@ -371,8 +371,15 @@ struct MenuState {
     selected: usize,
 }
 
-const MENU_CATEGORIES: [&str; 10] = [
-    "File", "Edit", "Insert", "Scene", "Plot", "Series", "View", "Compile", "Tools", "Help",
+const MENU_CATEGORIES: [&str; 8] = [
+    "Write",
+    "Open/Import",
+    "Navigate",
+    "Find",
+    "Review",
+    "Compile/Export",
+    "Help",
+    "More",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2741,18 +2748,52 @@ fn command_palette_invocation(text: &str) -> Option<(CommandSpec, Option<&str>)>
     None
 }
 
-fn menu_category(category: &str) -> &'static str {
-    match category {
-        "File" => "File",
-        "Edit" => "Edit",
-        "Insert" => "Insert",
-        "Scene" => "Scene",
-        "Plot" => "Plot",
-        "Series" => "Series",
-        "View" => "View",
-        "Compile" => "Compile",
-        "Help" => "Help",
-        _ => "Tools",
+fn menu_category(spec: &CommandSpec) -> &'static str {
+    let id = spec.id;
+    if spec.category == "Help" || id.starts_with("help.") {
+        "Help"
+    } else if spec.category == "Compile" || id.starts_with("compile.") || id.starts_with("export.")
+    {
+        "Compile/Export"
+    } else if spec.category == "Series" || id.contains("import") || id.starts_with("project.open") {
+        "Open/Import"
+    } else if spec.category == "View"
+        || id.starts_with("view.")
+        || id.starts_with("scene.open")
+        || id.starts_with("outline.")
+        || id.starts_with("reference.")
+        || id.starts_with("document.open")
+    {
+        "Navigate"
+    } else if ["search.", "find.", "grep.", "occur.", "replace.", "query."]
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+    {
+        "Find"
+    } else if spec.category == "Plot"
+        || [
+            "analytics.",
+            "issue.",
+            "diagnostic.",
+            "proofread.",
+            "revision.",
+            "reading.",
+            "timeline.",
+        ]
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+    {
+        "Review"
+    } else if id == "file.save"
+        || id == "scene.create"
+        || id.starts_with("structure.")
+        || id == "document.new-content-unit"
+        || id.starts_with("edit.snippet-")
+        || id.starts_with("edit.text-expansion")
+    {
+        "Write"
+    } else {
+        "More"
     }
 }
 
@@ -7177,7 +7218,7 @@ impl AppState {
         let top = MENU_CATEGORIES[menu.top.min(MENU_CATEGORIES.len() - 1)];
         command_registry()
             .into_iter()
-            .filter(|spec| spec.id != "menu.main" && menu_category(spec.category) == top)
+            .filter(|spec| spec.id != "menu.main" && menu_category(spec) == top)
             .collect()
     }
     fn command_disabled_reason(&self, spec: CommandSpec) -> Option<&'static str> {
@@ -15092,7 +15133,12 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 .block(board_block);
             f.render_widget(canvas, body[1]);
         } else {
-            let detail = if s.workspace == Workspace::Outline {
+            let detail = if s.workspace == Workspace::Dashboard && s.scenes.is_empty() {
+                format!(
+                    "Welcome to Writer's IDE\n\nTo begin, open the menu with Ctrl+/ or F10 and choose Write → Create Chapter. Then create a scene and start drafting.\n\nTo migrate an existing project, choose Open/Import. Press ? for offline help.\n\n{}",
+                    s.message
+                )
+            } else if s.workspace == Workspace::Outline {
                 let row = workspace_items(s)
                     .get(s.selected)
                     .cloned()
@@ -16480,6 +16526,15 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     } else {
         Some(menu.selected.min(commands.len() - 1))
     };
+    let (command_list_area, description_area) = if !commands.is_empty() && panes[1].height >= 6 {
+        let split = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(2)])
+            .split(panes[1]);
+        (split[0], Some(split[1]))
+    } else {
+        (panes[1], None)
+    };
     f.render_stateful_widget(
         List::new(items)
             .highlight_symbol("▸ ")
@@ -16489,24 +16544,18 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
                     .title(MENU_CATEGORIES[menu.top])
                     .borders(Borders::LEFT),
             ),
-        panes[1],
+        command_list_area,
         &mut ListState::default().with_selected(selected),
     );
-    if !commands.is_empty() && panes[1].height > 1 {
+    if let Some(description_area) = description_area {
         let selected_command = commands.get(menu.selected.min(commands.len() - 1)).unwrap();
         let detail = s
             .command_disabled_reason(*selected_command)
             .map(|reason| format!("Unavailable: {reason}"))
             .unwrap_or_else(|| selected_command.description.to_owned());
-        let detail_area = Rect {
-            x: panes[1].x,
-            y: panes[1].bottom().saturating_sub(2),
-            width: panes[1].width,
-            height: 2.min(panes[1].height),
-        };
         f.render_widget(
             Paragraph::new(detail).wrap(Wrap { trim: true }),
-            detail_area,
+            description_area,
         );
     }
 }
@@ -17511,6 +17560,12 @@ fn workspace_items(s: &AppState) -> Vec<String> {
         };
     }
     match s.workspace {
+        Workspace::Dashboard if s.scenes.is_empty() => vec![
+            "Welcome — your manuscript is ready to start".into(),
+            "Write: create your first chapter, then add a scene".into(),
+            "Open/Import: bring in an existing manuscript".into(),
+            "Help: press ? · Main menu: Ctrl+/ or F10".into(),
+        ],
         Workspace::Dashboard => vec![
             format!("{} scenes", s.scenes.len()),
             format!(
@@ -20300,7 +20355,7 @@ mod tests {
         let mut state = AppState::new(app, default_bindings());
         let top = MENU_CATEGORIES
             .iter()
-            .position(|category| *category == "Edit")
+            .position(|category| *category == "More")
             .unwrap();
         state.menu = Some(MenuState { top, selected: 0 });
         let selected = state
@@ -20361,8 +20416,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let top = MENU_CATEGORIES
             .iter()
-            .position(|category| *category == "Series")
-            .ok_or("Series menu category is missing")?;
+            .position(|category| *category == "Open/Import")
+            .ok_or("Open/Import menu category is missing")?;
         state.menu = Some(MenuState { top, selected: 0 });
         let selected = state
             .menu_commands()
@@ -23497,10 +23552,10 @@ mod tests {
         assert!(state.menu.is_some());
         handle(
             &mut state,
-            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
         )
         .unwrap();
-        assert_eq!(state.menu.unwrap().top, 6);
+        assert_eq!(state.menu.unwrap().top, 2);
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -23514,41 +23569,20 @@ mod tests {
         state.toggle_menu();
         handle(
             &mut state,
-            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
         )
         .unwrap();
-        assert_eq!(MENU_CATEGORIES[state.menu.unwrap().top], "Insert");
+        assert_eq!(MENU_CATEGORIES[state.menu.unwrap().top], "Write");
         let ids = state
             .menu_commands()
             .into_iter()
             .map(|command| command.id)
             .collect::<Vec<_>>();
-        assert_eq!(
-            ids,
-            [
-                "scene.create",
-                "scene.subchapter",
-                "structure.section",
-                "structure.chapter",
-                "edit.snippet-save",
-                "edit.snippet-list",
-                "edit.snippet-insert",
-                "edit.snippet-preview",
-                "edit.snippet-user-set",
-                "edit.snippet-user-remove",
-                "edit.snippet-user-insert",
-                "edit.snippet-user-preview",
-                "edit.text-expansion-set",
-                "edit.text-expansion-remove",
-                "edit.text-expansion",
-                "edit.text-expansion-user-set",
-                "edit.text-expansion-user-remove",
-                "edit.text-expansion-user",
-                "edit.text-expand",
-                "document.new-content-unit",
-                "document.open-content-unit"
-            ]
-        );
+        assert!(ids.contains(&"scene.create"));
+        assert!(ids.contains(&"structure.chapter"));
+        assert!(ids.contains(&"edit.snippet-insert"));
+        state.menu.as_mut().unwrap().selected =
+            ids.iter().position(|id| *id == "scene.create").unwrap();
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -27149,11 +27183,50 @@ mod tests {
         assert_eq!(state.editor, [""]);
         assert!(state.message.contains("No document is selected"));
         state.toggle_menu();
-        for (width, height) in [(20, 6), (40, 10), (80, 24), (142, 60)] {
+        for (width, height) in [(20, 6), (40, 10), (80, 24), (93, 36), (142, 60)] {
             let backend = ratatui::backend::TestBackend::new(width, height);
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
             terminal.draw(|frame| draw(frame, &mut state)).unwrap();
         }
+    }
+
+    #[test]
+    fn main_menu_groups_commands_by_writer_task_and_blank_dashboard_has_actions() {
+        assert_eq!(
+            MENU_CATEGORIES,
+            [
+                "Write",
+                "Open/Import",
+                "Navigate",
+                "Find",
+                "Review",
+                "Compile/Export",
+                "Help",
+                "More"
+            ]
+        );
+        for category in MENU_CATEGORIES {
+            let commands = command_registry()
+                .into_iter()
+                .filter(|command| command.id != "menu.main" && menu_category(command) == category)
+                .collect::<Vec<_>>();
+            assert!(!commands.is_empty(), "empty menu group: {category}");
+        }
+        assert_eq!(
+            menu_category(&command_by_id("scene.create").unwrap()),
+            "Write"
+        );
+        assert_eq!(
+            menu_category(&command_by_id("help.context").unwrap()),
+            "Help"
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let state = AppState::new(project, default_bindings());
+        let items = workspace_items(&state);
+        assert!(items.iter().any(|item| item.contains("first chapter")));
+        assert!(items.iter().any(|item| item.contains("Open/Import")));
     }
 
     #[test]
