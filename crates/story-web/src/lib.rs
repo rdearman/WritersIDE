@@ -140,15 +140,13 @@ impl BrowserServer {
                             origin = Some(value.trim().to_owned());
                         }
                     }
-                    if !host
+                    let host_valid = host
                         .as_deref()
-                        .is_some_and(|host| valid_host(host, self.address))
-                        || origin.as_deref().is_some_and(|origin| {
-                            !host
-                                .as_deref()
-                                .is_some_and(|host| valid_origin(origin, host))
-                        })
-                    {
+                        .is_some_and(|host| valid_host(host, self.address));
+                    let origin_valid = host
+                        .as_deref()
+                        .is_some_and(|host| valid_request_origin(method, origin.as_deref(), host));
+                    if !host_valid || !origin_valid {
                         write_response(
                             &mut stream,
                             403,
@@ -229,6 +227,13 @@ fn valid_host(host: &str, address: SocketAddr) -> bool {
 
 fn valid_origin(origin: &str, host: &str) -> bool {
     origin.eq_ignore_ascii_case(&format!("http://{host}"))
+}
+
+fn valid_request_origin(method: &str, origin: Option<&str>, host: &str) -> bool {
+    match origin {
+        Some(origin) => valid_origin(origin, host),
+        None => matches!(method, "GET" | "HEAD"),
+    }
 }
 
 fn write_response(
@@ -1136,6 +1141,18 @@ mod tests {
         assert!(!valid_host("evil.example:7878", address));
         assert!(valid_origin("http://localhost:7878", "localhost:7878"));
         assert!(!valid_origin("https://evil.example", "localhost:7878"));
+        assert!(valid_request_origin("GET", None, "localhost:7878"));
+        assert!(valid_request_origin(
+            "POST",
+            Some("http://localhost:7878"),
+            "localhost:7878"
+        ));
+        assert!(!valid_request_origin("POST", None, "localhost:7878"));
+        assert!(!valid_request_origin(
+            "POST",
+            Some("http://evil.example"),
+            "localhost:7878"
+        ));
     }
 
     #[test]
