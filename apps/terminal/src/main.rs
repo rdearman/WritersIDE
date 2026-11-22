@@ -2010,6 +2010,22 @@ fn command_registry() -> Vec<CommandSpec> {
             false,
         ),
         legacy_command(
+            "window.move-reference-earlier",
+            "Move Reference Earlier",
+            "Move the selected reference pane earlier in the split order",
+            "View",
+            "reference-move-earlier",
+            false,
+        ),
+        legacy_command(
+            "window.move-reference-later",
+            "Move Reference Later",
+            "Move the selected reference pane later in the split order",
+            "View",
+            "reference-move-later",
+            false,
+        ),
+        legacy_command(
             "window.close",
             "Close Reference Window",
             "Close the selected reference buffer",
@@ -5912,6 +5928,23 @@ impl AppState {
         if keep_reference_focus {
             self.toggle_reference_focus();
         }
+    }
+    fn move_active_reference(&mut self, later: bool) -> bool {
+        let len = self.reference_panes.len();
+        if len < 2 {
+            return false;
+        }
+        let target = if later {
+            self.active_reference.saturating_add(1)
+        } else {
+            self.active_reference.saturating_sub(1)
+        };
+        if target >= len || target == self.active_reference {
+            return false;
+        }
+        self.reference_panes.swap(self.active_reference, target);
+        self.active_reference = target;
+        true
     }
     fn follow_active_scene_card(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let scene = self
@@ -11025,6 +11058,20 @@ impl AppState {
         } else if cmd == "reference-prev" {
             self.cycle_reference(false);
             self.message = "Previous reference buffer".into();
+        } else if cmd == "reference-move-earlier" {
+            self.message = if self.move_active_reference(false) {
+                "Reference pane moved earlier in the split order".into()
+            } else {
+                "Reference pane is already first".into()
+            };
+            self.save_session()?;
+        } else if cmd == "reference-move-later" {
+            self.message = if self.move_active_reference(true) {
+                "Reference pane moved later in the split order".into()
+            } else {
+                "Reference pane is already last".into()
+            };
+            self.save_session()?;
         } else if cmd == "window-swap" {
             if self.reference_panes.is_empty() {
                 return Err("open a reference pane before swapping window sides".into());
@@ -19344,6 +19391,18 @@ mod tests {
             command_by_id("search.grep").unwrap().palette_prefix,
             Some("grep")
         );
+        assert_eq!(
+            command_by_id("window.move-reference-earlier")
+                .unwrap()
+                .palette_prefix,
+            Some("reference-move-earlier")
+        );
+        assert_eq!(
+            command_by_id("window.move-reference-later")
+                .unwrap()
+                .palette_prefix,
+            Some("reference-move-later")
+        );
         let ids = registry
             .iter()
             .map(|command| command.id)
@@ -22422,6 +22481,74 @@ mod tests {
             pane.source_key == format!("location:{location}")
                 && pane.content.contains("narrow harbour")
         }));
+    }
+
+    #[test]
+    fn reference_panes_reorder_with_independent_state_and_restore_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let main = app.create_scene(chapter, "Main", 0).unwrap();
+        let first = app.create_scene(chapter, "First reference", 1).unwrap();
+        let second = app.create_scene(chapter, "Second reference", 2).unwrap();
+        for (scene, text) in [
+            (main, "Main manuscript"),
+            (first, "First\nreference\ntext"),
+            (second, "Second\nreference\ntext"),
+        ] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), text).unwrap();
+        }
+
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(main).unwrap();
+        state
+            .execute_legacy_palette_command(&format!("reference-scene {first}"))
+            .unwrap();
+        state.reference_panes[0].scroll = 1;
+        state.reference_panes[0].cursor = (1, 3);
+        state
+            .execute_legacy_palette_command(&format!("reference-scene {second}"))
+            .unwrap();
+        state.reference_panes[1].scroll = 2;
+        state.reference_panes[1].cursor = (2, 4);
+        assert_eq!(state.active_reference, 1);
+
+        state
+            .execute_legacy_palette_command("reference-move-earlier")
+            .unwrap();
+        assert_eq!(state.active_reference, 0);
+        assert_eq!(state.reference_panes[0].scene_id, Some(second));
+        assert_eq!(state.reference_panes[1].scene_id, Some(first));
+        assert_eq!(state.reference_panes[0].scroll, 2);
+        assert_eq!(state.reference_panes[0].cursor, (2, 4));
+        assert_eq!(state.reference_panes[1].scroll, 1);
+        assert_eq!(state.reference_panes[1].cursor, (1, 3));
+
+        state.save_session().unwrap();
+        let mut restored = AppState::new(
+            WriterApp::open_project(&project).unwrap(),
+            default_bindings(),
+        );
+        restored.restore_session().unwrap();
+        assert_eq!(restored.active_reference, 0);
+        assert_eq!(restored.reference_panes[0].scene_id, Some(second));
+        assert_eq!(restored.reference_panes[1].scene_id, Some(first));
+        assert_eq!(restored.reference_panes[0].scroll, 2);
+        assert_eq!(restored.reference_panes[0].cursor, (2, 4));
+
+        restored
+            .execute_legacy_palette_command("reference-move-earlier")
+            .unwrap();
+        assert_eq!(restored.active_reference, 0);
+        assert_eq!(restored.reference_panes[0].scene_id, Some(second));
+        assert!(restored.message.contains("already first"));
+        restored
+            .execute_legacy_palette_command("reference-move-later")
+            .unwrap();
+        assert_eq!(restored.active_reference, 1);
+        assert_eq!(restored.reference_panes[1].scene_id, Some(second));
     }
 
     #[test]
