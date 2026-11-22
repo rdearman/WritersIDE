@@ -3033,6 +3033,45 @@ fn command_for_effective_shortcut(state: &AppState, key: KeyEvent) -> Option<Com
     })
 }
 
+fn registered_quit_shortcut_matches(state: &AppState, key: KeyEvent) -> bool {
+    if let Some((_, command_id)) = state
+        .command_bindings
+        .iter()
+        .find(|(event, _)| same_keycode(event.code, key.code) && event.modifiers == key.modifiers)
+    {
+        return command_id == "file.quit";
+    }
+    let context = if state.menu.is_some() {
+        "menu"
+    } else if state.mode.is_some()
+        || state.find_panel.is_some()
+        || state.series_form.is_some()
+        || state.keybinding_manager.is_some()
+    {
+        "dialog"
+    } else if state.workspace == Workspace::Editor {
+        "editor"
+    } else {
+        "navigation"
+    };
+    let context_bindings = state
+        .context_command_bindings
+        .iter()
+        .filter(|binding| {
+            binding.context == context
+                && binding.sequence.first().is_some_and(|event| {
+                    same_keycode(event.code, key.code) && event.modifiers == key.modifiers
+                })
+        })
+        .collect::<Vec<_>>();
+    if !context_bindings.is_empty() {
+        return context_bindings
+            .iter()
+            .any(|binding| binding.sequence.len() == 1 && binding.command_id == "file.quit");
+    }
+    command_for_effective_shortcut(state, key).is_some_and(|command| command.id == "file.quit")
+}
+
 fn command_for_workspace(workspace: Workspace) -> Option<CommandSpec> {
     command_registry()
         .into_iter()
@@ -8640,11 +8679,23 @@ impl AppState {
     }
 
     fn request_quit(&mut self) {
+        self.help_panel = None;
+        self.command_palette = None;
+        self.find_panel = None;
+        self.menu = None;
+        self.series_form = None;
+        self.keybinding_manager = None;
+        self.macro_preview = None;
+        self.multi_replace_preview = None;
+        self.snippet_preview = None;
+        self.pending_command_sequence = None;
         if self.active_challenge.is_some() {
+            self.quit_requested = false;
             self.mode = Some('c');
             self.prompt = "Save and quit (s) · Discard and quit (d) · Esc continues".into();
             self.message = "Choose whether to keep the isolated challenge draft".into();
         } else if self.dirty {
+            self.quit_requested = false;
             self.mode = Some('q');
             self.prompt = "Save and Quit (s) · Quit Without Saving (d) · Cancel (Esc)".into();
             self.message = "Choose how to leave the current unsaved text".into();
@@ -20540,6 +20591,12 @@ fn handle_command_palette_key(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if registered_quit_shortcut_matches(s, k) {
+        if let Some(command) = command_by_id("file.quit") {
+            s.dispatch_registered(command.action)?;
+        }
+        return Ok(false);
+    }
     if s.help_panel.is_some() {
         match k.code {
             KeyCode::Esc | KeyCode::F(1) => s.close_context_help(),
@@ -25407,6 +25464,8 @@ mod tests {
             effective_shortcut_label(&clean, "file.quit", "unbound"),
             "Ctrl+Q"
         );
+        clean.toggle_menu();
+        assert!(clean.menu.is_some());
         assert!(
             !handle(
                 &mut clean,
@@ -25415,6 +25474,20 @@ mod tests {
             .unwrap()
         );
         assert!(clean.quit_requested);
+        assert!(clean.menu.is_none());
+
+        clean.quit_requested = false;
+        clean.show_context_help();
+        assert!(clean.help_panel.is_some());
+        assert!(
+            !handle(
+                &mut clean,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            )
+            .unwrap()
+        );
+        assert!(clean.quit_requested);
+        assert!(clean.help_panel.is_none());
 
         let chapter = clean.app.create_chapter(None, "Chapter", 0).unwrap();
         let scene = clean.app.create_scene(chapter, "Scene", 0).unwrap();
