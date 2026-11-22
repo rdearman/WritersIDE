@@ -214,7 +214,7 @@ The browser graph can now create and remove typed links between scene, character
 
 The loopback HTTP server now requires a same-origin `Origin` header on non-GET/HEAD requests, validates any supplied Origin against Host, continues to require the loopback Host, and sends no permissive CORS headers. Originless navigation requests remain available. This reduces cross-site request forgery risk; project ownership and revision-token synchronization across concurrently opened processes remain open.
 
-The terminal Edit menu's Create Story Link and Remove Story Link actions now use guided name-based forms, with optional kind prefixes for ambiguous names; no endpoint UUID syntax is needed for common link creation/removal. Existing CLI commands remain available for precise link operations.
+The terminal Edit menu's Create Story Link and Remove Story Link actions now use guided name-based forms, with optional kind prefixes for ambiguous names; no endpoint UUID syntax is needed for common link creation/removal. Existing CLI commands remain available for precise link operations. The browser link workspace includes imported Reading documents in its stable-ID endpoint choices and provides per-entity outgoing/backlink inspection, with direct navigation to linked scenes. The projection remains sourced from the shared project graph; passage-anchor controls and broader entity review remain open.
 
 ### Issue #10 — Configurable deterministic diagnostics foundation
 
