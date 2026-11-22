@@ -383,17 +383,31 @@ pub struct DocxReviewItem {
     pub kind: String,
     /// Zero-based source paragraph. `None` means Word supplied no usable range anchor.
     pub paragraph_index: Option<usize>,
+    /// Text enclosed by the Word comment range in its original review document.
+    /// This is independent of accept/reject interpretation of tracked changes.
+    #[serde(default)]
+    pub anchor_text: Option<String>,
+    /// False means only a point reference or an incomplete range was available.
+    #[serde(default)]
+    pub anchor_complete: Option<bool>,
     pub comment_id: Option<String>,
     pub author: Option<String>,
     pub date: Option<String>,
     pub text: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DocxCommentAnchor {
+    paragraph_index: usize,
+    text: String,
+    complete: bool,
+}
+
 /// Inventories Word insertions, deletions, and comments without applying them.
 pub fn inspect_docx_review(path: impl AsRef<Path>) -> Result<Vec<DocxReviewItem>, ImportError> {
     let bytes = std::fs::read(path).map_err(|error| ImportError::Io(error.to_string()))?;
     let document = read_zip_text(&bytes, "word/document.xml")?;
-    let comment_paragraphs = docx_comment_paragraphs(&document)?;
+    let comment_anchors = docx_comment_anchors(&document)?;
     let mut items = Vec::new();
     for (tag, kind, text_tag) in [
         ("w:ins", "insertion", "w:t"),
@@ -412,6 +426,8 @@ pub fn inspect_docx_review(path: impl AsRef<Path>) -> Result<Vec<DocxReviewItem>
             items.push(DocxReviewItem {
                 kind: kind.into(),
                 paragraph_index: Some(prefix.matches("<w:p").count().saturating_sub(1)),
+                anchor_text: None,
+                anchor_complete: None,
                 comment_id: None,
                 author: xml_attribute(block, "w:author"),
                 date: xml_attribute(block, "w:date"),
@@ -433,8 +449,16 @@ pub fn inspect_docx_review(path: impl AsRef<Path>) -> Result<Vec<DocxReviewItem>
                 kind: "comment".into(),
                 paragraph_index: comment_id
                     .as_ref()
-                    .and_then(|id| comment_paragraphs.get(id))
-                    .copied(),
+                    .and_then(|id| comment_anchors.get(id))
+                    .map(|anchor| anchor.paragraph_index),
+                anchor_text: comment_id
+                    .as_ref()
+                    .and_then(|id| comment_anchors.get(id))
+                    .map(|anchor| anchor.text.clone()),
+                anchor_complete: comment_id
+                    .as_ref()
+                    .and_then(|id| comment_anchors.get(id))
+                    .map(|anchor| anchor.complete),
                 comment_id,
                 author: xml_attribute(block, "w:author"),
                 date: xml_attribute(block, "w:date"),
@@ -447,15 +471,17 @@ pub fn inspect_docx_review(path: impl AsRef<Path>) -> Result<Vec<DocxReviewItem>
     Ok(items)
 }
 
-/// Maps Word comment range/reference markers to the first source paragraph they touch.
-/// A comment that has no marker in the main document remains unanchored (`None`).
-fn docx_comment_paragraphs(xml: &str) -> Result<BTreeMap<String, usize>, ImportError> {
+/// Maps Word comment range/reference markers to the paragraphs and original
+/// text they cover. A comment with no marker remains unanchored (`None`).
+fn docx_comment_anchors(xml: &str) -> Result<BTreeMap<String, DocxCommentAnchor>, ImportError> {
     use quick_xml::events::Event;
 
     let mut reader = quick_xml::Reader::from_str(xml);
-    let mut paragraph = None;
+    let mut paragraph = None::<usize>;
     let mut next_paragraph = 0usize;
-    let mut anchors = BTreeMap::new();
+    let mut active = BTreeMap::<String, String>::new();
+    let mut anchors = BTreeMap::<String, DocxCommentAnchor>::new();
+    let mut in_text = false;
     loop {
         match reader.read_event() {
             Ok(Event::Start(event)) if event.local_name().as_ref() == b"p" => {
@@ -463,6 +489,11 @@ fn docx_comment_paragraphs(xml: &str) -> Result<BTreeMap<String, usize>, ImportE
                 next_paragraph += 1;
             }
             Ok(Event::End(event)) if event.local_name().as_ref() == b"p" => {
+                if !active.is_empty() {
+                    for quote in active.values_mut() {
+                        quote.push('\n');
+                    }
+                }
                 paragraph = None;
             }
             Ok(Event::Start(event) | Event::Empty(event))
@@ -471,10 +502,69 @@ fn docx_comment_paragraphs(xml: &str) -> Result<BTreeMap<String, usize>, ImportE
                     b"commentRangeStart" | b"commentRangeEnd" | b"commentReference"
                 ) =>
             {
-                if let Some(index) = paragraph
-                    && let Some(id) = xml_event_attribute(&event, "id", reader.decoder())?
-                {
-                    anchors.entry(id).or_insert(index);
+                let id = xml_event_attribute(&event, "id", reader.decoder())?;
+                let Some(id) = id else { continue };
+                let Some(index) = paragraph else { continue };
+                match event.local_name().as_ref() {
+                    b"commentRangeStart" => {
+                        active.entry(id.clone()).or_default();
+                        anchors.entry(id).or_insert(DocxCommentAnchor {
+                            paragraph_index: index,
+                            text: String::new(),
+                            complete: false,
+                        });
+                    }
+                    b"commentRangeEnd" => {
+                        let text = active.remove(&id);
+                        let complete = text.is_some();
+                        let paragraph_index = anchors
+                            .get(&id)
+                            .map(|anchor| anchor.paragraph_index)
+                            .unwrap_or(index);
+                        anchors.insert(
+                            id,
+                            DocxCommentAnchor {
+                                paragraph_index,
+                                text: text.unwrap_or_default(),
+                                complete,
+                            },
+                        );
+                    }
+                    b"commentReference" => {
+                        anchors.entry(id).or_insert(DocxCommentAnchor {
+                            paragraph_index: index,
+                            text: String::new(),
+                            complete: false,
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Event::Start(event)) if matches!(event.local_name().as_ref(), b"t" | b"delText") => {
+                in_text = true;
+            }
+            Ok(Event::End(event)) if matches!(event.local_name().as_ref(), b"t" | b"delText") => {
+                in_text = false;
+            }
+            Ok(Event::Text(event)) if in_text && !active.is_empty() => {
+                let text = event
+                    .xml_content(quick_xml::XmlVersion::Implicit1_0)
+                    .map_err(|error| ImportError::Archive(error.to_string()))?;
+                for quote in active.values_mut() {
+                    quote.push_str(&text);
+                }
+            }
+            Ok(Event::GeneralRef(event)) if in_text && !active.is_empty() => {
+                let reference = event
+                    .xml_content(quick_xml::XmlVersion::Implicit1_0)
+                    .map_err(|error| ImportError::Archive(error.to_string()))?;
+                let value = event
+                    .resolve_char_ref()
+                    .map_err(|error| ImportError::Archive(error.to_string()))?
+                    .map(|character| character.to_string())
+                    .unwrap_or_else(|| decode_xml(&format!("&{reference};")));
+                for quote in active.values_mut() {
+                    quote.push_str(&value);
                 }
             }
             Ok(Event::Eof) => break,
@@ -548,6 +638,32 @@ pub fn docx_review_text(
                     .map_err(|error| ImportError::Archive(error.to_string()))?;
                 let text = quick_xml::escape::unescape(&decoded)
                     .map_err(|error| ImportError::Archive(error.to_string()))?;
+                paragraphs
+                    .last_mut()
+                    .expect("paragraph has been started")
+                    .push_str(&text);
+            }
+            Ok(quick_xml::events::Event::GeneralRef(event))
+                if in_paragraph
+                    && (if accept_changes {
+                        deleted == 0
+                    } else {
+                        inserted == 0
+                    }) =>
+            {
+                let reference = event
+                    .xml_content(quick_xml::XmlVersion::Implicit1_0)
+                    .map_err(|error| ImportError::Archive(error.to_string()))?;
+                let text = if let Some(character) = event
+                    .resolve_char_ref()
+                    .map_err(|error| ImportError::Archive(error.to_string()))?
+                {
+                    character.to_string()
+                } else {
+                    quick_xml::escape::unescape(&format!("&{reference};"))
+                        .map_err(|error| ImportError::Archive(error.to_string()))?
+                        .into_owned()
+                };
                 paragraphs
                     .last_mut()
                     .expect("paragraph has been started")
@@ -2646,7 +2762,7 @@ This is an addition to the old file.}"#;
             &[
                 (
                     "word/document.xml",
-                    "<w:document><w:body><w:p><w:r><w:t>Base </w:t></w:r><w:ins w:id=\"2\" w:author=\"Editor\" w:date=\"2026-01-01\"><w:r><w:t>change</w:t></w:r></w:ins><w:del w:id=\"3\" w:author=\"Editor\"><w:r><w:delText>old</w:delText></w:r></w:del></w:p><w:p><w:commentRangeStart w:id=\"7\"/><w:r><w:t>Second paragraph.</w:t></w:r><w:commentRangeEnd w:id=\"7\"/><w:r><w:commentReference w:id=\"7\"/></w:r></w:p></w:body></w:document>",
+                    "<w:document><w:body><w:p><w:r><w:t>Base </w:t></w:r><w:ins w:id=\"2\" w:author=\"Editor\" w:date=\"2026-01-01\"><w:r><w:t>change</w:t></w:r></w:ins><w:del w:id=\"3\" w:author=\"Editor\"><w:r><w:delText>old</w:delText></w:r></w:del></w:p><w:p><w:r><w:t>Before </w:t></w:r><w:commentRangeStart w:id=\"7\"/><w:r><w:t>Second &amp; final.</w:t></w:r><w:commentRangeEnd w:id=\"7\"/><w:r><w:t> After.</w:t></w:r><w:r><w:commentReference w:id=\"7\"/></w:r></w:p></w:body></w:document>",
                 ),
                 (
                     "word/comments.xml",
@@ -2667,19 +2783,23 @@ This is an addition to the old file.}"#;
             .unwrap();
         assert_eq!(comment.comment_id.as_deref(), Some("7"));
         assert_eq!(comment.paragraph_index, Some(1));
+        assert_eq!(comment.anchor_text.as_deref(), Some("Second & final."));
+        assert_eq!(comment.anchor_complete, Some(true));
         assert_eq!(comment.text, "Clarify this.");
         let unanchored = items
             .iter()
             .find(|item| item.comment_id.as_deref() == Some("8"))
             .unwrap();
         assert_eq!(unanchored.paragraph_index, None);
+        assert_eq!(unanchored.anchor_text, None);
+        assert_eq!(unanchored.anchor_complete, None);
         assert_eq!(
             docx_review_text(&docx, true).unwrap(),
-            "Base change\n\nSecond paragraph."
+            "Base change\n\nBefore Second & final. After."
         );
         assert_eq!(
             docx_review_text(&docx, false).unwrap(),
-            "Base old\n\nSecond paragraph."
+            "Base old\n\nBefore Second & final. After."
         );
     }
 

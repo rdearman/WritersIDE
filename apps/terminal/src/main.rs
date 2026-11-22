@@ -9286,7 +9286,19 @@ impl AppState {
                             .map(|date| format!(" · {date}"))
                             .unwrap_or_default(),
                         item.text
-                    )
+                    ) + &item
+                        .anchor_text
+                        .map(|text| {
+                            format!(
+                                " · on: {text}{}",
+                                if item.anchor_complete == Some(false) {
+                                    " (partial anchor)"
+                                } else {
+                                    ""
+                                }
+                            )
+                        })
+                        .unwrap_or_default()
                 })
                 .collect::<Vec<_>>()
                 .join(" | ");
