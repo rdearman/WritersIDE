@@ -1500,6 +1500,7 @@ impl BuiltinTemplate {
             nodes: Vec::new(),
             content_units: Vec::new(),
             scenes: Vec::new(),
+            custom_fields: Vec::new(),
         };
         match self {
             Self::BlankFiction | Self::BlankNonfiction => {}
@@ -1558,6 +1559,8 @@ pub struct ProjectTemplate {
     pub content_units: Vec<ProjectTemplateContentUnit>,
     #[serde(default)]
     pub scenes: Vec<ProjectTemplateScene>,
+    #[serde(default)]
+    pub custom_fields: Vec<ProjectTemplateCustomField>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1595,6 +1598,22 @@ pub struct ProjectTemplateScene {
     pub target_words: Option<u64>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectTemplateCustomField {
+    pub key: String,
+    pub name: String,
+    pub field_type: FieldType,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub default_value: Option<FieldValue>,
+    #[serde(default)]
+    pub enum_values: Vec<String>,
+    #[serde(default)]
+    pub reference_kind: Option<String>,
+}
+
 impl ProjectTemplate {
     pub fn validate(&self) -> Result<(), String> {
         const MAX_TEMPLATE_ITEMS: usize = 4096;
@@ -1611,7 +1630,10 @@ impl ProjectTemplate {
         if !valid_key(&self.id) || self.name.trim().is_empty() {
             return Err("project-template ID and name are required".into());
         }
-        let total = self.nodes.len() + self.content_units.len() + self.scenes.len();
+        let total = self.nodes.len()
+            + self.content_units.len()
+            + self.scenes.len()
+            + self.custom_fields.len();
         if total > MAX_TEMPLATE_ITEMS {
             return Err("project template exceeds the 4096-item limit".into());
         }
@@ -1644,6 +1666,60 @@ impl ProjectTemplate {
                 return Err(
                     "project-template scene keys and titles must be valid and unique".into(),
                 );
+            }
+        }
+        for field in &self.custom_fields {
+            if !valid_key(&field.key)
+                || field.name.trim().is_empty()
+                || !keys.insert(field.key.as_str())
+            {
+                return Err(
+                    "project-template custom-field keys and names must be valid and unique".into(),
+                );
+            }
+            if matches!(
+                field.field_type,
+                FieldType::EntityRef | FieldType::EntityRefs
+            ) && !matches!(
+                field.reference_kind.as_deref(),
+                Some("character" | "location" | "plotline" | "event" | "scene")
+            ) {
+                return Err(format!(
+                    "template field {} has an invalid entity-reference target",
+                    field.key
+                ));
+            }
+            if matches!(
+                field.default_value,
+                Some(FieldValue::EntityRef(_) | FieldValue::EntityRefs(_))
+            ) {
+                return Err(format!(
+                    "template field {} cannot use project-specific entity IDs as defaults",
+                    field.key
+                ));
+            }
+            if field.field_type == FieldType::Enum
+                && (field.enum_values.is_empty()
+                    || field.enum_values.iter().any(|value| value.contains('\n')))
+            {
+                return Err(format!(
+                    "template enum field {} needs non-empty single-line options",
+                    field.key
+                ));
+            }
+            if let Some(value) = field.default_value.as_ref() {
+                let definition = CustomFieldDefinition {
+                    id: FieldId::new(),
+                    name: field.name.clone(),
+                    field_type: field.field_type,
+                    required: field.required,
+                    default_value: None,
+                    enum_values: field.enum_values.clone(),
+                    reference_kind: field.reference_kind.clone(),
+                };
+                definition
+                    .validate(value)
+                    .map_err(|error| error.to_string())?;
             }
         }
         let nodes = self

@@ -997,6 +997,17 @@ impl WriterApp {
                 app.update_scene_metadata(&metadata)?;
             }
         }
+        for field in &template.custom_fields {
+            app.define_custom_field(&CustomFieldDefinition {
+                id: FieldId::new(),
+                name: field.name.clone(),
+                field_type: field.field_type,
+                required: field.required,
+                default_value: field.default_value.clone(),
+                enum_values: field.enum_values.clone(),
+                reference_kind: field.reference_kind.clone(),
+            })?;
+        }
         app.validate_project()?;
         drop(app);
         fs::rename(&staged, path)
@@ -1147,6 +1158,157 @@ impl WriterApp {
     }
     pub fn list_structural_nodes(&self) -> Result<Vec<story_storage::StructuralNodeSummary>> {
         Ok(self.store.list_structural_nodes()?)
+    }
+    /// Capture the current document structure as a reusable, declarative
+    /// template. Canonical prose, project identity, attachments, research and
+    /// other project-specific facts are deliberately excluded.
+    pub fn project_template_from_current(&self, id: &str, name: &str) -> Result<ProjectTemplate> {
+        let project = self.get_project()?;
+        let structural_nodes = self.list_structural_nodes()?;
+        let node_keys = structural_nodes
+            .iter()
+            .enumerate()
+            .map(|(index, node)| (node.id, format!("node-{:04}", index + 1)))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let field_definitions = self.store.list_custom_field_definitions()?;
+        if let Some(field) = field_definitions.iter().find(|field| {
+            matches!(
+                field.field_type,
+                FieldType::EntityRef | FieldType::EntityRefs
+            ) && field.default_value.is_some()
+        }) {
+            return Err(AppError::Domain(format!(
+                "cannot save template: entity-reference field {:?} has a project-specific default",
+                field.name
+            )));
+        }
+        let mut template = ProjectTemplate {
+            schema_version: 1,
+            template_revision: 1,
+            id: id.into(),
+            name: name.into(),
+            book_type: project.book_type,
+            target_words: project.target_words,
+            nodes: Vec::new(),
+            content_units: Vec::new(),
+            scenes: Vec::new(),
+            custom_fields: field_definitions
+                .into_iter()
+                .enumerate()
+                .map(|(index, field)| ProjectTemplateCustomField {
+                    key: format!("field-{:04}", index + 1),
+                    name: field.name,
+                    field_type: field.field_type,
+                    required: field.required,
+                    default_value: if matches!(
+                        field.field_type,
+                        FieldType::EntityRef | FieldType::EntityRefs
+                    ) {
+                        None
+                    } else {
+                        field.default_value
+                    },
+                    enum_values: field.enum_values,
+                    reference_kind: field.reference_kind,
+                })
+                .collect(),
+        };
+        for (index, node) in structural_nodes.iter().enumerate() {
+            let kind = match node.kind.as_str() {
+                "section" => NodeKind::Section,
+                "chapter" => NodeKind::Chapter,
+                "group" => NodeKind::Group,
+                _ => {
+                    return Err(AppError::Domain(format!(
+                        "cannot template unsupported structural node kind {}",
+                        node.kind
+                    )));
+                }
+            };
+            let parent_key = node
+                .parent_id
+                .map(|parent| {
+                    node_keys.get(&parent).cloned().ok_or_else(|| {
+                        AppError::Domain(format!(
+                            "structural node {} has a missing template parent",
+                            node.id
+                        ))
+                    })
+                })
+                .transpose()?;
+            template.nodes.push(ProjectTemplateNode {
+                key: node_keys[&node.id].clone(),
+                parent_key,
+                kind,
+                title: node.title.clone(),
+                position: node.position,
+            });
+            debug_assert_eq!(index + 1, template.nodes.len());
+        }
+        let content_keys = self
+            .list_content_units(false)?
+            .into_iter()
+            .enumerate()
+            .map(|(index, unit)| (unit, format!("content-{:04}", index + 1)))
+            .collect::<Vec<_>>();
+        for (unit, key) in content_keys {
+            let parent_key = unit
+                .parent_id
+                .map(|parent| {
+                    node_keys.get(&parent).cloned().ok_or_else(|| {
+                        AppError::Domain(format!(
+                            "content unit {} has a missing template parent",
+                            unit.id
+                        ))
+                    })
+                })
+                .transpose()?;
+            template.content_units.push(ProjectTemplateContentUnit {
+                key,
+                parent_key,
+                kind: unit.kind,
+                title: unit.title,
+                position: unit.position,
+                target_words: unit.target_words,
+            });
+        }
+        for (index, scene) in self.list_scenes(false)?.into_iter().enumerate() {
+            let chapter_id = scene.chapter_id.ok_or_else(|| {
+                AppError::Domain(format!(
+                    "cannot save template: active scene {} has no chapter placement",
+                    scene.scene.id
+                ))
+            })?;
+            let chapter_key = node_keys.get(&chapter_id).ok_or_else(|| {
+                AppError::Domain(format!(
+                    "cannot save template: scene {} refers to a missing chapter",
+                    scene.scene.id
+                ))
+            })?;
+            if !structural_nodes
+                .iter()
+                .any(|node| node.id == chapter_id && node.kind == NodeKind::Chapter.as_str())
+            {
+                return Err(AppError::Domain(format!(
+                    "cannot save template: scene {} is placed outside a chapter",
+                    scene.scene.id
+                )));
+            }
+            template.scenes.push(ProjectTemplateScene {
+                key: format!("scene-{:04}", index + 1),
+                chapter_key: chapter_key.clone(),
+                title: scene.scene.title,
+                position: scene.position.ok_or_else(|| {
+                    AppError::Domain(format!(
+                        "cannot save template: scene {} has no manuscript position",
+                        scene.scene.id
+                    ))
+                })?,
+                target_words: scene.scene.target_words,
+            });
+        }
+        template.validate().map_err(AppError::Domain)?;
+        Ok(template)
     }
     pub fn get_scene(&self, id: SceneId) -> Result<SceneRecord> {
         Ok(self.store.get_scene(id)?)
@@ -3847,6 +4009,9 @@ impl WriterApp {
     pub fn define_custom_field(&mut self, def: &CustomFieldDefinition) -> Result<()> {
         Ok(self.store.define_custom_field(def)?)
     }
+    pub fn list_custom_field_definitions(&self) -> Result<Vec<CustomFieldDefinition>> {
+        Ok(self.store.list_custom_field_definitions()?)
+    }
     pub fn set_custom_field(
         &mut self,
         scene: SceneId,
@@ -4693,6 +4858,117 @@ mod tests {
             .unwrap();
         let compiled = String::from_utf8(compiled.bytes).unwrap();
         assert!(compiled.contains("Direct chapter prose."));
+    }
+
+    #[test]
+    fn saving_project_as_template_preserves_structure_but_never_copies_prose() {
+        let directory = tempfile::tempdir().unwrap();
+        let source_path = directory.path().join("Source");
+        let mut source = WriterApp::create_project_with_type(
+            &source_path,
+            "Private Source Book",
+            BookType::Nonfiction,
+        )
+        .unwrap();
+        let part = source.create_section("Part One", 0).unwrap();
+        let subsection = source.create_section("Background", 1).unwrap();
+        source
+            .move_structural_node(subsection, Some(part), 0)
+            .unwrap();
+        let chapter = source
+            .create_chapter(Some(subsection), "Chapter One", 0)
+            .unwrap();
+        let section_body = source
+            .create_content_unit(
+                ContentUnitKind::SectionBody,
+                "Section introduction",
+                Some(subsection),
+                0,
+                Some(450),
+            )
+            .unwrap();
+        let (_, section_hash) = source.load_content_unit_text(section_body).unwrap();
+        source
+            .save_content_unit_text(
+                section_body,
+                Some(&section_hash),
+                "UNIQUE PRIVATE SECTION PROSE",
+            )
+            .unwrap();
+        let chapter_body = source
+            .create_content_unit(
+                ContentUnitKind::ChapterBody,
+                "Chapter One prose",
+                Some(chapter),
+                0,
+                Some(1200),
+            )
+            .unwrap();
+        let (_, chapter_hash) = source.load_content_unit_text(chapter_body).unwrap();
+        source
+            .save_content_unit_text(
+                chapter_body,
+                Some(&chapter_hash),
+                "UNIQUE PRIVATE CHAPTER PROSE",
+            )
+            .unwrap();
+        source
+            .create_content_unit(ContentUnitKind::FrontMatter, "Dedication", None, 0, None)
+            .unwrap();
+        source
+            .define_custom_field(&CustomFieldDefinition {
+                id: FieldId::new(),
+                name: "Review state".into(),
+                field_type: FieldType::Enum,
+                required: false,
+                default_value: Some(FieldValue::Enum("draft".into())),
+                enum_values: vec!["draft".into(), "review".into()],
+                reference_kind: None,
+            })
+            .unwrap();
+
+        let template = source
+            .project_template_from_current("field-guide", "Field Guide")
+            .unwrap();
+        let encoded = toml::to_string_pretty(&template).unwrap();
+        assert!(!encoded.contains("UNIQUE PRIVATE"));
+        assert!(!encoded.contains("Private Source Book"));
+        assert_eq!(
+            toml::from_str::<ProjectTemplate>(&encoded).unwrap(),
+            template
+        );
+        assert_eq!(template.book_type, BookType::Nonfiction);
+        assert_eq!(template.nodes.len(), 3);
+        assert_eq!(template.content_units.len(), 3);
+        assert_eq!(template.custom_fields.len(), 1);
+        assert_eq!(template.custom_fields[0].name, "Review state");
+        assert_eq!(
+            template.custom_fields[0].default_value,
+            Some(FieldValue::Enum("draft".into()))
+        );
+        assert!(template.scenes.is_empty());
+        assert!(template.nodes.iter().any(|node| node.parent_key.is_some()));
+
+        let restored_path = directory.path().join("FromTemplate");
+        let restored =
+            WriterApp::create_project_from_definition(&restored_path, "New Field Guide", &template)
+                .unwrap();
+        assert_eq!(restored.list_scenes(false).unwrap().len(), 0);
+        assert_eq!(restored.list_structural_nodes().unwrap().len(), 3);
+        let restored_units = restored.list_content_units(false).unwrap();
+        assert_eq!(restored_units.len(), 3);
+        let restored_fields = restored.list_custom_field_definitions().unwrap();
+        assert_eq!(restored_fields.len(), 1);
+        assert_eq!(restored_fields[0].name, "Review state");
+        for unit in restored_units {
+            assert!(
+                restored
+                    .load_content_unit_text(unit.id)
+                    .unwrap()
+                    .0
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

@@ -7712,6 +7712,67 @@ impl ProjectStore {
         }
         Ok(())
     }
+    pub fn list_custom_field_definitions(&self) -> Result<Vec<CustomFieldDefinition>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id,name,field_type,required,default_text,default_integer,default_decimal,default_boolean,enum_values,reference_kind FROM custom_field_definition ORDER BY name,id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<bool>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    name,
+                    raw_type,
+                    required,
+                    default_text,
+                    default_integer,
+                    default_decimal,
+                    default_boolean,
+                    enum_values,
+                    reference_kind,
+                )| {
+                    let field_type = parse_field_type(&raw_type)?;
+                    let default_value = match field_type {
+                        FieldType::Text | FieldType::LongText => default_text.map(FieldValue::Text),
+                        FieldType::Integer => default_integer.map(FieldValue::Integer),
+                        FieldType::Decimal => default_decimal.map(FieldValue::Decimal),
+                        FieldType::Boolean => default_boolean.map(FieldValue::Boolean),
+                        FieldType::DateTime => default_text.map(FieldValue::DateTime),
+                        FieldType::Enum => default_text.map(FieldValue::Enum),
+                        FieldType::EntityRef => default_text.map(FieldValue::EntityRef),
+                        FieldType::EntityRefs => None,
+                    };
+                    Ok(CustomFieldDefinition {
+                        id: FieldId(
+                            Uuid::parse_str(&id)
+                                .map_err(|error| StorageError::Invalid(error.to_string()))?,
+                        ),
+                        name,
+                        field_type,
+                        required,
+                        default_value,
+                        enum_values: enum_values.lines().map(str::to_owned).collect(),
+                        reference_kind,
+                    })
+                },
+            )
+            .collect()
+    }
     pub fn set_custom_field(
         &mut self,
         scene: SceneId,

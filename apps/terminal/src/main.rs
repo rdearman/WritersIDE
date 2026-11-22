@@ -2205,6 +2205,14 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("challenge.finish", "Finish Writing Challenge", "Record words written and finish the active timed challenge", "Tools", "challenge-finish", false),
         legacy_command("challenge.idle", "Set Kamikaze Idle Threshold", "Set the project-local inactivity threshold for Kamikaze mode", "Tools", "challenge-idle", true),
         legacy_command(
+            "project.template-save",
+            "Save Project as Template",
+            "Save the current document structure and custom-field definitions without prose",
+            "Project",
+            "project-template-save",
+            true,
+        ),
+        legacy_command(
             "story-template-list",
             "List Story Bible Templates",
             "Inspect reusable profile templates",
@@ -7285,6 +7293,26 @@ impl AppState {
             let operations = parse_macro_recipe(rest)?;
             self.apply_edit_macro(&operations)?;
             self.message = "Edit macro applied (undo available)".into();
+        } else if let Some(rest) = cmd.strip_prefix("project-template-save ") {
+            let mut parts = rest.splitn(2, char::is_whitespace);
+            let id = parts.next().unwrap_or_default();
+            let output = parts
+                .next()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or("usage: project-template-save <template-id> <new-output.toml>")?;
+            let name = id.replace('-', " ");
+            let template = self.app.project_template_from_current(id, &name)?;
+            let encoded = toml::to_string_pretty(&template)?;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(output)?;
+            io::Write::write_all(&mut file, encoded.as_bytes())?;
+            file.sync_all()?;
+            self.message = format!(
+                "Saved template {id} to {output}; manuscript prose and project-specific records were excluded"
+            );
         } else if cmd == "story-template-list" {
             self.message = self
                 .app
@@ -17130,6 +17158,12 @@ mod tests {
             Some("compile-open-directory")
         );
         assert_eq!(
+            command_by_id("project.template-save")
+                .unwrap()
+                .palette_prefix,
+            Some("project-template-save")
+        );
+        assert_eq!(
             command_palette_invocation("compile-config").unwrap().0.id,
             "compile.configuration"
         );
@@ -17240,6 +17274,42 @@ mod tests {
             root.path()
                 .join("Compile/exports/compile/plain/manuscript.md")
                 .is_file()
+        );
+    }
+
+    #[test]
+    fn terminal_saves_project_structure_as_a_new_portable_template() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Private title").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "PRIVATE MANUSCRIPT TEXT")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let output = root.path().join("novel-template.toml");
+        state
+            .execute_legacy_palette_command(&format!(
+                "project-template-save novel {}",
+                output.display()
+            ))
+            .unwrap();
+        let source = fs::read_to_string(&output).unwrap();
+        let template: story_core::ProjectTemplate = toml::from_str(&source).unwrap();
+        assert_eq!(template.id, "novel");
+        assert_eq!(template.name, "novel");
+        assert_eq!(template.nodes.len(), 1);
+        assert_eq!(template.scenes.len(), 1);
+        assert!(!source.contains("PRIVATE MANUSCRIPT TEXT"));
+        assert!(!source.contains("Private title"));
+        assert!(state.message.contains("excluded"));
+        assert!(
+            state
+                .execute_legacy_palette_command(&format!(
+                    "project-template-save novel {}",
+                    output.display()
+                ))
+                .is_err()
         );
     }
 
