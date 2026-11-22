@@ -336,7 +336,7 @@ Projects can enable an automatic local Git snapshot on orderly terminal exit wit
 
 ## Alpha usability follow-up — Issues #37–#39 (22 November 2026)
 
-Menu access is now handled before modal input for Ctrl+/ and F10, and the menu suspends and restores an active modal. Blank editor state shows a Start Writing prompt and rejects prose input without an attached manuscript document. The menu popup adapts to narrow terminal dimensions, hides unselected command descriptions, and displays the selected command explanation separately. Dirty quit offers exactly Save and Quit, Quit Without Saving, or Cancel. Quit Without Saving exits immediately without writing or requiring recovery, even when save conflicts. A separate conflict-review and recovery workflow remains outstanding. These are partial responses to alpha issues #37–#39: actual local/SSH/tmux user acceptance and first-time-writer acceptance remain outstanding.
+Menu access is now handled before modal input for Ctrl+/ and F10, and the menu suspends and restores an active modal. Blank editor state shows a Start Writing prompt and rejects prose input without an attached manuscript document. The menu popup adapts to narrow terminal dimensions, hides unselected command descriptions, and displays the selected command explanation separately. Dirty quit offers exactly Save and Quit, Quit Without Saving, or Cancel. Quit Without Saving exits immediately without writing or requiring recovery, even when save conflicts. A separate Resolve Save Conflict action is available from Review for side-by-side review, recovery-copy save, Use Saved, and confirmed Keep My Changes. These are partial responses to alpha issues #37–#39: actual local/SSH/tmux user acceptance and first-time-writer acceptance remain outstanding.
 
 ## Persistent word-processor menu bar — Issue #39 (implementation slice)
 
@@ -344,4 +344,4 @@ The terminal displays File, Edit, Insert, Navigate, Review, Publish, Tools and H
 
 ## Alpha save-conflict recovery — Issue #38
 
-When Save and Quit encounters a conflict, the same three choices remain available. Quit Without Saving terminates and leaves the on-disk manuscript unchanged. The dialogue does not force recovery or add a second confirmation. Separate side-by-side review, recovery-copy, and use-saved actions are outstanding. See [Engineering Design v1.91](engineering-design-v1.91.md).
+When Save and Quit encounters a conflict, the same three choices remain available. Quit Without Saving terminates and leaves the on-disk manuscript unchanged. The dialogue does not force recovery or add a second confirmation. The Review menu opens Resolve Save Conflict for side-by-side comparison, recovery-copy save, Use Saved, and confirmed Keep My Changes. The dialogue still needs project/document/timestamp context and real-terminal, no-document, read-only-storage and interrupted-session acceptance. See [Engineering Design v1.91](engineering-design-v1.91.md).

@@ -824,6 +824,7 @@ enum CommandAction {
     OpenMenuCategory(usize),
     Save,
     Help,
+    ResolveSaveConflict,
     RestoreRevisionHunk,
     Process { expand_transclusions: bool },
     ProcessSelected { expand_transclusions: bool },
@@ -930,6 +931,18 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::Save,
+        },
+        CommandSpec {
+            id: "edit.resolve-save-conflict",
+            label: "Resolve Save Conflict",
+            description: "Review or recover the unsaved buffer while preserving the saved copy",
+            category: "Review",
+            default_shortcuts: &[],
+            mnemonic: Some('c'),
+            palette_aliases: &[],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ResolveSaveConflict,
         },
         CommandSpec {
             id: "help.context",
@@ -2822,7 +2835,7 @@ fn menu_category(spec: &CommandSpec) -> &'static str {
             .any(|prefix| id.starts_with(prefix))
     {
         "Navigate"
-    } else if spec.category == "Plot"
+    } else if matches!(spec.category, "Plot" | "Review")
         || [
             "analytics.",
             "issue.",
@@ -7318,6 +7331,53 @@ impl AppState {
     fn close_context_help(&mut self) {
         self.help_panel = None;
     }
+    fn write_recovery_text(&self, text: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let project_root = self.app.project_root().canonicalize()?;
+        let metadata = project_root.join(".writers-ide");
+        ensure_project_managed_directory(&project_root, &metadata)?;
+        let recovery = metadata.join("recovery");
+        ensure_project_managed_directory(&project_root, &recovery)?;
+        let source_id = self
+            .editing_scene
+            .map(|id| format!("scene-{id}"))
+            .or_else(|| self.editing_content_unit.map(|id| format!("document-{id}")))
+            .unwrap_or_else(|| "buffer".into());
+        let destination =
+            recovery.join(format!("{source_id}-recovery-{}.md", uuid::Uuid::new_v4()));
+        let mut temporary = tempfile::NamedTempFile::new_in(&recovery)?;
+        use std::io::Write;
+        temporary.write_all(text.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist_noclobber(&destination)?;
+        fs::File::open(&recovery)?.sync_all()?;
+        Ok(destination)
+    }
+    fn keep_conflicted_memory_version(&mut self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let (disk_text, disk_hash, scene) = if let Some(scene) = self.editing_scene {
+            let (text, hash) = self.app.load_scene_text(scene)?;
+            (text, hash, Some(scene))
+        } else if let Some(unit) = self.editing_content_unit {
+            let (text, hash) = self.app.load_content_unit_text(unit)?;
+            (text, hash, None)
+        } else {
+            return Err("Keep My Changes requires one scene or chapter document".into());
+        };
+        let recovery = self.write_recovery_text(&disk_text)?;
+        let new_hash = if let Some(scene) = scene {
+            self.app
+                .save_scene_text(scene, Some(&disk_hash), &self.editor.join("\n"))?
+        } else if let Some(unit) = self.editing_content_unit {
+            self.app
+                .save_content_unit_text(unit, Some(&disk_hash), &self.editor.join("\n"))?
+        } else {
+            unreachable!()
+        };
+        self.saved_hash = new_hash;
+        self.dirty = false;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        Ok(recovery)
+    }
     fn open_menu_category(&mut self, index: usize) {
         self.pending_command_sequence = None;
         let top = index.min(MENU_CATEGORIES.len().saturating_sub(1));
@@ -7345,6 +7405,14 @@ impl AppState {
                     && self.assembly_draft.is_none() =>
             {
                 Some("Open a scene or assembly draft first")
+            }
+            CommandAction::ResolveSaveConflict if !self.dirty => {
+                Some("There are no unsaved manuscript changes to resolve")
+            }
+            CommandAction::ResolveSaveConflict
+                if self.editing_scene.is_none() && self.editing_content_unit.is_none() =>
+            {
+                Some("Open an unsaved scene or chapter document first")
             }
             CommandAction::RestoreRevisionHunk if self.revision_diff.is_none() => {
                 Some("Open a revision diff first")
@@ -7904,6 +7972,11 @@ impl AppState {
             CommandAction::OpenMenuCategory(index) => self.open_menu_category(index),
             CommandAction::Save => self.save()?,
             CommandAction::Help => self.show_context_help(),
+            CommandAction::ResolveSaveConflict => {
+                self.mode = Some('R');
+                self.prompt = "Review Versions (v) · Save Recovery Copy (r) · Use Saved Version (u) · Keep My Changes (k) · Cancel (Esc)".into();
+                self.message = "Your manuscript remains open and unsaved. Each choice preserves the on-disk copy unless you explicitly confirm Keep My Changes.".into();
+            }
             CommandAction::RestoreRevisionHunk => self.restore_selected_revision_hunk()?,
             CommandAction::Process {
                 expand_transclusions,
@@ -14517,6 +14590,27 @@ fn editor_grapheme_is_mentioned(byte_offset: u64, byte_len: u64, ranges: &[(u64,
         .any(|(start, finish)| *start < end && *finish > byte_offset)
 }
 
+fn ensure_project_managed_directory(
+    project_root: &Path,
+    directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !directory.starts_with(project_root) {
+        return Err("recovery directory escapes the project".into());
+    }
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("recovery path must be a real directory".into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(directory)?,
+        Err(error) => return Err(error.into()),
+    }
+    if !directory.canonicalize()?.starts_with(project_root) {
+        return Err("recovery directory resolves outside the project".into());
+    }
+    Ok(())
+}
+
 fn format_search_result_row(title: &str, text: &str, byte_offset: usize) -> String {
     if byte_offset > text.len() || !text.is_char_boundary(byte_offset) {
         return format!("{title} · unknown line");
@@ -15470,7 +15564,12 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
         );
     }
     if state.mode == Some('q') {
-        lines.push("Quit choices: save, inspect recovery options, discard changes, or Esc to continue editing".to_owned());
+        lines.push(
+            "Quit choices: Save and Quit, Quit Without Saving, or Esc to continue editing"
+                .to_owned(),
+        );
+    } else if matches!(state.mode, Some('R' | 'K')) {
+        lines.push("Conflict choices: review both versions, save a recovery copy, use the saved copy, or explicitly keep your changes".to_owned());
     }
     if let Some(menu) = state.menu {
         lines.push(
@@ -19527,7 +19626,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     } else {
         "navigation"
     };
-    if !matches!(s.mode, Some('q' | 'K')) && s.handle_context_command_key(k, context)? {
+    if !matches!(s.mode, Some('q' | 'R' | 'K')) && s.handle_context_command_key(k, context)? {
         return Ok(false);
     }
     if s.find_panel.is_some() {
@@ -19535,6 +19634,130 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if s.mode.is_some() {
+        if s.mode == Some('R') {
+            match k.code {
+                KeyCode::Esc => {
+                    s.mode = None;
+                    s.message = "Conflict review cancelled; both versions remain unchanged".into();
+                }
+                KeyCode::Char('r' | 'R') => match s.write_recovery_text(&s.editor.join("\n")) {
+                    Ok(path) => {
+                        s.mode = None;
+                        s.message = format!(
+                            "Saved an independent recovery copy to {}. The on-disk manuscript was not changed.",
+                            path.display()
+                        );
+                    }
+                    Err(error) => {
+                        s.message = format!(
+                            "Could not save the recovery copy; your editor buffer and on-disk manuscript are unchanged: {error}"
+                        )
+                    }
+                },
+                KeyCode::Char('v' | 'V') => {
+                    let loaded = if let Some(scene) = s.editing_scene {
+                        s.app.load_scene_text(scene)
+                    } else if let Some(unit) = s.editing_content_unit {
+                        s.app.load_content_unit_text(unit)
+                    } else {
+                        s.message =
+                            "Open a scene or chapter document before reviewing a save conflict"
+                                .into();
+                        return Ok(false);
+                    };
+                    match loaded {
+                        Ok((disk_text, disk_hash)) => {
+                            let content = format!(
+                                "On disk · {disk_hash}\n------------------------------\n{disk_text}\n\nIn memory · unsaved\n------------------------------\n{}",
+                                s.editor.join("\n")
+                            );
+                            let key = format!(
+                                "save-conflict:{}",
+                                s.editing_scene
+                                    .map(|id| id.to_string())
+                                    .or_else(|| s.editing_content_unit.map(|id| id.to_string()))
+                                    .unwrap_or_default()
+                            );
+                            s.open_reference_buffer(
+                                key,
+                                None,
+                                format!("Save Conflict · {}", s.selected_scene()),
+                                content,
+                            );
+                            s.reference_focused = true;
+                            s.mode = None;
+                            s.message = "Reviewing both copies. The manuscript remains unsaved; return here to choose an action.".into();
+                        }
+                        Err(error) => {
+                            s.message = format!("Could not read the on-disk manuscript: {error}")
+                        }
+                    }
+                }
+                KeyCode::Char('u' | 'U') => {
+                    let loaded = if let Some(scene) = s.editing_scene {
+                        s.app.load_scene_text(scene)
+                    } else if let Some(unit) = s.editing_content_unit {
+                        s.app.load_content_unit_text(unit)
+                    } else {
+                        s.message =
+                            "Open a scene or chapter document before using the saved version"
+                                .into();
+                        return Ok(false);
+                    };
+                    match loaded {
+                        Ok((text, hash)) => {
+                            s.editor = text.split('\n').map(str::to_owned).collect();
+                            if s.editor.is_empty() {
+                                s.editor.push(String::new());
+                            }
+                            s.saved_hash = hash;
+                            s.cursor = (0, 0);
+                            s.editor_selection = None;
+                            s.undo_stack.clear();
+                            s.redo_stack.clear();
+                            s.dirty = false;
+                            s.mode = None;
+                            s.message = "Loaded the saved copy; unsaved in-memory edits were discarded by your explicit choice".into();
+                        }
+                        Err(error) => {
+                            s.message = format!("Could not load the saved manuscript: {error}")
+                        }
+                    }
+                }
+                KeyCode::Char('k' | 'K') => {
+                    s.mode = Some('K');
+                    s.prompt = "Keep My Changes? The current on-disk copy will first be saved separately. y confirms · Esc cancels".into();
+                    s.message = "Confirm only after reviewing both versions".into();
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        if s.mode == Some('K') {
+            match k.code {
+                KeyCode::Esc => {
+                    s.mode = Some('R');
+                    s.prompt = "Review Versions (v) · Save Recovery Copy (r) · Use Saved Version (u) · Keep My Changes (k) · Cancel (Esc)".into();
+                    s.message = "Keep My Changes cancelled; neither version was replaced".into();
+                }
+                KeyCode::Char('y' | 'Y') => match s.keep_conflicted_memory_version() {
+                    Ok(recovery) => {
+                        s.mode = None;
+                        s.message = format!(
+                            "Kept your changes. The previous on-disk version is preserved at {}",
+                            recovery.display()
+                        );
+                    }
+                    Err(error) => {
+                        s.mode = Some('R');
+                        s.prompt = "Review Versions (v) · Save Recovery Copy (r) · Use Saved Version (u) · Keep My Changes (k) · Cancel (Esc)".into();
+                        s.message = format!("Could not safely keep your changes: {error}");
+                    }
+                },
+                _ => {}
+            }
+            return Ok(false);
+        }
         if s.mode == Some('q') {
             match k.code {
                 KeyCode::Esc => {
@@ -27637,6 +27860,152 @@ mod tests {
         assert_eq!(
             state.app.load_scene_text(scene).unwrap().0,
             "Newer disk copy"
+        );
+    }
+
+    #[test]
+    fn review_menu_conflict_actions_preserve_both_versions_and_are_explicit() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Saved copy")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["In-memory copy".into()];
+        state.dirty = true;
+        let (_, current_hash) = state.app.load_scene_text(scene).unwrap();
+        state
+            .app
+            .save_scene_text(scene, Some(&current_hash), "Newer disk copy")
+            .unwrap();
+
+        assert_eq!(
+            state.command_disabled_reason(command_by_id("edit.resolve-save-conflict").unwrap()),
+            None
+        );
+        state.open_menu_category(4);
+        assert!(
+            state
+                .menu_commands()
+                .iter()
+                .any(|command| command.id == "edit.resolve-save-conflict")
+        );
+        state.menu = None;
+        state
+            .dispatch_registered_command_id("edit.resolve-save-conflict")
+            .unwrap();
+        assert_eq!(state.mode, Some('R'));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, None);
+        assert!(state.dirty);
+        let recovery = project.join(".writers-ide/recovery");
+        let copies = fs::read_dir(&recovery)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(fs::read_to_string(&copies[0]).unwrap(), "In-memory copy");
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Newer disk copy"
+        );
+
+        state
+            .dispatch_registered_command_id("edit.resolve-save-conflict")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.reference_focused);
+        let review = &state.reference_panes[state.active_reference].content;
+        assert!(review.contains("Newer disk copy"));
+        assert!(review.contains("In-memory copy"));
+        assert!(state.dirty);
+
+        state.reference_focused = false;
+        state
+            .dispatch_registered_command_id("edit.resolve-save-conflict")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!state.dirty);
+        assert_eq!(state.editor.join("\n"), "Newer disk copy");
+    }
+
+    #[test]
+    fn keeping_memory_after_review_requires_confirmation_and_saves_disk_copy_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Initial saved copy")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["My confirmed version".into()];
+        state.dirty = true;
+        let mut concurrent = WriterApp::open_project(&project).unwrap();
+        let (_, current_hash) = concurrent.load_scene_text(scene).unwrap();
+        concurrent
+            .save_scene_text(scene, Some(&current_hash), "Concurrent saved copy")
+            .unwrap();
+
+        state
+            .dispatch_registered_command_id("edit.resolve-save-conflict")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, Some('K'));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Concurrent saved copy"
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.mode, Some('R'));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(state.mode, None);
+        assert!(!state.dirty);
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "My confirmed version"
+        );
+        let recovery = project.join(".writers-ide/recovery");
+        let copies = fs::read_dir(recovery)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&copies[0]).unwrap(),
+            "Concurrent saved copy"
         );
     }
 
