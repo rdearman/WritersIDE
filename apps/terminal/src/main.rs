@@ -9172,13 +9172,23 @@ impl AppState {
                 }
                 "run" | "rebuild" => {
                     let name = parts.next().ok_or("missing configuration name")?;
-                    let overwrite =
-                        action == "rebuild" || parts.any(|value| value == "--overwrite");
-                    match self.app.compile_configuration(name, overwrite) {
+                    let mut overwrite = action == "rebuild";
+                    let mut overrides = story_document::DiagnosticOverrides::default();
+                    for flag in parts {
+                        if flag == "--overwrite" {
+                            overwrite = true;
+                        } else if !overrides.parse_flag(flag)? {
+                            return Err(format!("unknown Compile option: {flag}").into());
+                        }
+                    }
+                    match self.app.compile_configuration_with_diagnostic_overrides(
+                        name, overwrite, &overrides,
+                    ) {
                         Ok(result) => {
                             self.message = format!(
-                                "Compile {} complete in {} ms · {}",
+                                "Compile {} {} in {} ms · {}",
                                 result.configuration,
+                                result.status,
                                 result.elapsed_millis,
                                 result.outputs.join(", ")
                             );
@@ -9197,16 +9207,32 @@ impl AppState {
                     }
                 }
                 "all" => {
-                    let overwrite = parts.any(|value| value == "--overwrite");
+                    let mut overwrite = false;
+                    let mut overrides = story_document::DiagnosticOverrides::default();
+                    for flag in parts {
+                        if flag == "--overwrite" {
+                            overwrite = true;
+                        } else if !overrides.parse_flag(flag)? {
+                            return Err(format!("unknown Compile option: {flag}").into());
+                        }
+                    }
                     let names = self.app.list_compile_configurations()?;
                     let mut done = Vec::new();
                     let mut failed = Vec::new();
                     let mut has_findings = false;
                     for name in names {
-                        match self.app.compile_configuration(&name, overwrite) {
+                        match self.app.compile_configuration_with_diagnostic_overrides(
+                            &name, overwrite, &overrides,
+                        ) {
                             Ok(result) => {
                                 has_findings |= !result.diagnostics.is_empty();
-                                done.push(name);
+                                if result.status == "success" {
+                                    done.push(name);
+                                } else {
+                                    failed.push(format!(
+                                        "{name}: diagnostic policy promoted findings"
+                                    ));
+                                }
                             }
                             Err(error) => failed.push(format!("{name}: {error}")),
                         }
@@ -15088,10 +15114,25 @@ fn compile_diagnostics_reference_text(
         .enumerate()
         .map(|(index, item)| {
             format!(
-                "{}. {} · {:?} · {}{}{}",
+                "{}. {} [{}] · {:?}{} · {}{}{}",
                 index + 1,
                 item.code,
+                item.category,
                 item.severity,
+                if item.effective_or_original_level()
+                    != match item.severity {
+                        story_document::DiagnosticSeverity::Error =>
+                            story_document::DiagnosticLevel::Error,
+                        story_document::DiagnosticSeverity::Warning =>
+                            story_document::DiagnosticLevel::Warning,
+                        story_document::DiagnosticSeverity::Information =>
+                            story_document::DiagnosticLevel::Information,
+                    }
+                {
+                    format!(" promoted to {:?}", item.effective_or_original_level())
+                } else {
+                    String::new()
+                },
                 item.message,
                 item.source_entity_id
                     .map(|id| format!(" · source {id}"))
@@ -15202,22 +15243,20 @@ fn compile_results_reference_text(
             "success" => record.succeeded,
             "errors" => {
                 record.error.is_some()
-                    || record
-                        .diagnostics
-                        .iter()
-                        .any(|item| item.severity == story_document::DiagnosticSeverity::Error)
+                    || record.diagnostics.iter().any(|item| {
+                        item.effective_or_original_level() == story_document::DiagnosticLevel::Error
+                    })
             }
             "warnings" => {
                 !record.warnings.is_empty()
-                    || record
-                        .diagnostics
-                        .iter()
-                        .any(|item| item.severity == story_document::DiagnosticSeverity::Warning)
+                    || record.diagnostics.iter().any(|item| {
+                        item.effective_or_original_level()
+                            == story_document::DiagnosticLevel::Warning
+                    })
             }
-            "info" => record
-                .diagnostics
-                .iter()
-                .any(|item| item.severity == story_document::DiagnosticSeverity::Information),
+            "info" => record.diagnostics.iter().any(|item| {
+                item.effective_or_original_level() == story_document::DiagnosticLevel::Information
+            }),
             _ => true,
         })
         .collect::<Vec<_>>();
@@ -15245,10 +15284,28 @@ fn compile_results_reference_text(
         }
         for diagnostic in &record.diagnostics {
             lines.push(format!(
-                "   {}{:?} {}{}{}{}: {}",
+                "   {}{:?}{} {} [{}]{}{}{}: {}",
                 if record.stale { "STALE " } else { "" },
                 diagnostic.severity,
+                if diagnostic.effective_or_original_level()
+                    != match diagnostic.severity {
+                        story_document::DiagnosticSeverity::Error =>
+                            story_document::DiagnosticLevel::Error,
+                        story_document::DiagnosticSeverity::Warning =>
+                            story_document::DiagnosticLevel::Warning,
+                        story_document::DiagnosticSeverity::Information =>
+                            story_document::DiagnosticLevel::Information,
+                    }
+                {
+                    format!(
+                        " promoted to {:?}",
+                        diagnostic.effective_or_original_level()
+                    )
+                } else {
+                    String::new()
+                },
                 diagnostic.code,
+                diagnostic.category,
                 diagnostic
                     .source_entity_id
                     .as_deref()
@@ -20080,7 +20137,7 @@ mod tests {
             root.path()
                 .join("Compile/exports/compile/plain/manuscript.md")
         );
-        assert!(state.message.contains("Compile plain complete"));
+        assert!(state.message.contains("Compile plain success"));
         state
             .execute_legacy_palette_command("compile-config results")
             .unwrap();
@@ -20090,6 +20147,21 @@ mod tests {
                 .join("Compile/exports/compile/plain/manuscript.md")
                 .is_file()
         );
+        let (_, hash) = state.app.load_scene_text(scene).unwrap();
+        state
+            .app
+            .save_scene_text(scene, Some(&hash), "Mara said said.")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("compile-config run plain -Werror=repeated-word")
+            .unwrap();
+        assert!(state.message.contains("Compile plain failed"));
+        let results = compile_results_reference_text(&state.app, "errors").unwrap();
+        assert!(results.contains("promoted to Error"));
+        state
+            .execute_legacy_palette_command("compile-config run plain -w")
+            .unwrap();
+        assert!(state.message.contains("Compile plain success"));
     }
 
     #[test]
@@ -23609,7 +23681,7 @@ mod tests {
             .execute_legacy_palette_command("reference-diagnostics")
             .unwrap();
         let content = &state.reference_panes[state.active_reference].content;
-        assert!(content.starts_with("1. PUB004 · Warning"));
+        assert!(content.starts_with("1. PUB004 [publication] · Warning"));
         assert!(content.contains(&scene.to_string()));
 
         state

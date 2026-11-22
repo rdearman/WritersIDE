@@ -1768,8 +1768,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             if args.next().is_some() {
                 return Err("proofread-config accepts at most one preset".into());
             }
-            let preset = story_analysis::ProofreadingPreset::parse(&preset_name)
-                .ok_or("unknown diagnostics preset; use drafting, copyedit, or publication")?;
+            let preset = story_analysis::ProofreadingPreset::parse(&preset_name).ok_or(
+                "unknown diagnostics preset; use quiet, drafting, copyedit, publication, thorough, extended, or pedantic",
+            )?;
             let app = WriterApp::open_project(path)?;
             println!(
                 "Created {} diagnostics configuration at {}",
@@ -1963,16 +1964,49 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 "run" | "rebuild" => {
                     let name = args.next().ok_or("missing configuration name")?;
-                    let overwrite = action == "rebuild" || args.any(|value| value == "--overwrite");
-                    let result = app.compile_configuration(&name, overwrite)?;
+                    let mut overwrite = action == "rebuild";
+                    let mut overrides = story_document::DiagnosticOverrides::default();
+                    for flag in args {
+                        if flag == "--overwrite" {
+                            overwrite = true;
+                        } else if !overrides.parse_flag(&flag)? {
+                            return Err(format!("unknown Compile option: {flag}").into());
+                        }
+                    }
+                    let result = app.compile_configuration_with_diagnostic_overrides(
+                        &name, overwrite, &overrides,
+                    )?;
                     println!("{}", serde_json::to_string_pretty(&result)?);
+                    if result.status != "success" {
+                        return Err(format!(
+                            "Compile configuration {name} failed by diagnostic policy"
+                        )
+                        .into());
+                    }
                 }
                 "all" => {
-                    let overwrite = args.any(|value| value == "--overwrite");
+                    let mut overwrite = false;
+                    let mut overrides = story_document::DiagnosticOverrides::default();
+                    for flag in args {
+                        if flag == "--overwrite" {
+                            overwrite = true;
+                        } else if !overrides.parse_flag(&flag)? {
+                            return Err(format!("unknown Compile option: {flag}").into());
+                        }
+                    }
                     let mut failures = Vec::new();
                     for name in app.list_compile_configurations()? {
-                        match app.compile_configuration(&name, overwrite) {
-                            Ok(result) => println!("{}", serde_json::to_string_pretty(&result)?),
+                        match app.compile_configuration_with_diagnostic_overrides(
+                            &name, overwrite, &overrides,
+                        ) {
+                            Ok(result) => {
+                                println!("{}", serde_json::to_string_pretty(&result)?);
+                                if result.status != "success" {
+                                    failures.push(format!(
+                                        "{name}: diagnostics promoted findings to errors"
+                                    ));
+                                }
+                            }
                             Err(error) => failures.push(format!("{name}: {error}")),
                         }
                     }
@@ -3399,7 +3433,7 @@ fn usage() {
     eprintln!("writers-ide compile-check <project>");
     eprintln!("writers-ide compile-recovery <project> [status|retry]");
     eprintln!(
-        "writers-ide compile-config <project> <list|results|create <preset> [name>|run <name> [--overwrite]|all [--overwrite]|rebuild <name>|clean <name|all> --yes>"
+        "writers-ide compile-config <project> <list|results|create <preset> [name>|run <name> [--overwrite] [-w|-Wall|-Wextra|-Wpedantic|-Werror|-Werror=RULE|-Wno-RULE]|all [flags]|rebuild <name>|clean <name|all> --yes>"
     );
     eprintln!("writers-ide word-count-policy <project> [unicode-words|script-graphemes]");
     eprintln!("writers-ide scene-language <project> <scene-uuid> [language-tag|inherit]");
@@ -3462,7 +3496,7 @@ writers-ide spellcheck-hunspell <project> <language-tag> [project-relative-wordl
         "writers-ide query-assert-save <project> <query-uuid> <non-empty|empty|at-least:N|at-most:N|exactly:N>...\nwriters-ide query-assert-check <project> <query-uuid>"
     );
     eprintln!(
-        "writers-ide proofread-config <project> [drafting|copyedit|publication] (creates editable .writers-ide/diagnostics.toml; never overwrites)"
+        "writers-ide proofread-config <project> [quiet|drafting|copyedit|publication|thorough|extended|pedantic] (creates editable .writers-ide/diagnostics.toml; never overwrites)"
     );
     eprintln!(
         "writers-ide typography-preview <project> [all|scene:SCENE-UUID] (read-only suggestions)"

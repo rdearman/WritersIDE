@@ -27,6 +27,10 @@ pub enum ProofreadingPreset {
     Drafting,
     Copyedit,
     Publication,
+    Quiet,
+    Thorough,
+    Extended,
+    Pedantic,
 }
 
 impl ProofreadingPreset {
@@ -35,6 +39,10 @@ impl ProofreadingPreset {
             "drafting" | "standard" => Some(Self::Drafting),
             "copyedit" => Some(Self::Copyedit),
             "publication" => Some(Self::Publication),
+            "quiet" => Some(Self::Quiet),
+            "thorough" => Some(Self::Thorough),
+            "extended" => Some(Self::Extended),
+            "pedantic" => Some(Self::Pedantic),
             _ => None,
         }
     }
@@ -44,6 +52,10 @@ impl ProofreadingPreset {
             Self::Drafting => "drafting",
             Self::Copyedit => "copyedit",
             Self::Publication => "publication",
+            Self::Quiet => "quiet",
+            Self::Thorough => "thorough",
+            Self::Extended => "extended",
+            Self::Pedantic => "pedantic",
         }
     }
 }
@@ -102,6 +114,21 @@ impl ProofreadingConfig {
                     .into();
                 }
             }
+            ProofreadingPreset::Quiet => {
+                for rule in &mut config.rules {
+                    rule.severity = "off".into();
+                }
+            }
+            ProofreadingPreset::Thorough | ProofreadingPreset::Extended => {
+                for rule in &mut config.rules {
+                    rule.severity = "warning".into();
+                }
+            }
+            ProofreadingPreset::Pedantic => {
+                for rule in &mut config.rules {
+                    rule.severity = "error".into();
+                }
+            }
         }
         config
     }
@@ -121,7 +148,10 @@ impl ProofreadingConfig {
                     rule.id
                 ));
             }
-            if !matches!(rule.severity.as_str(), "error" | "warning" | "information") {
+            if !matches!(
+                rule.severity.as_str(),
+                "off" | "error" | "warning" | "information" | "info"
+            ) {
                 return Err(format!("invalid severity in rule {}", rule.id));
             }
             match rule.kind.as_str() {
@@ -306,6 +336,19 @@ mod proofread_tests {
         assert!(copyedit.rules.iter().all(|rule| rule.severity == "warning"));
         assert_eq!(publication.rules[0].severity, "error");
         assert_eq!(publication.rules[1].severity, "warning");
+        let quiet = ProofreadingConfig::preset(ProofreadingPreset::Quiet);
+        assert!(quiet.rules.iter().all(|rule| rule.severity == "off"));
+        assert!(
+            proofread_with_config("word word", &quiet)
+                .unwrap()
+                .is_empty()
+        );
+        let mut info_alias = drafting.clone();
+        info_alias.rules[0].severity = "info".into();
+        assert_eq!(
+            proofread_with_config("word word", &info_alias).unwrap()[0].severity,
+            "information"
+        );
         assert_eq!(
             ProofreadingPreset::parse("standard"),
             Some(ProofreadingPreset::Drafting)
@@ -315,7 +358,7 @@ mod proofread_tests {
             "copyedit"
         );
         assert!(ProofreadingPreset::parse("unknown").is_none());
-        for config in [drafting, copyedit, publication] {
+        for config in [drafting, copyedit, publication, quiet] {
             assert_eq!(
                 ProofreadingConfig::from_toml(&config.to_toml().unwrap()).unwrap(),
                 config
@@ -379,7 +422,11 @@ pub fn proofread_with_config(
 ) -> Result<Vec<ProofreadingFinding>, String> {
     config.validate()?;
     let mut findings = Vec::new();
-    for rule in config.rules.iter().filter(|rule| rule.enabled) {
+    for rule in config
+        .rules
+        .iter()
+        .filter(|rule| rule.enabled && rule.severity != "off")
+    {
         match rule.kind.as_str() {
             "repeated-word" => {
                 let words = text.unicode_word_indices().collect::<Vec<_>>();
@@ -445,7 +492,11 @@ fn finding(
     ProofreadingFinding {
         byte_range,
         category: rule.id.clone(),
-        severity: rule.severity.clone(),
+        severity: if rule.severity == "info" {
+            "information".into()
+        } else {
+            rule.severity.clone()
+        },
         message,
     }
 }

@@ -2250,6 +2250,7 @@ impl WriterApp {
             language: None,
             dictionary: None,
             spelling_engine: story_document::SpellcheckEngine::default(),
+            diagnostics: story_document::DiagnosticPolicy::default(),
         };
         self.create_compile_configuration(name, &recipe)
     }
@@ -2259,9 +2260,22 @@ impl WriterApp {
         name: &str,
         overwrite_managed_output: bool,
     ) -> Result<CompileBuildResult> {
+        self.compile_configuration_with_diagnostic_overrides(
+            name,
+            overwrite_managed_output,
+            &story_document::DiagnosticOverrides::default(),
+        )
+    }
+
+    pub fn compile_configuration_with_diagnostic_overrides(
+        &self,
+        name: &str,
+        overwrite_managed_output: bool,
+        overrides: &story_document::DiagnosticOverrides,
+    ) -> Result<CompileBuildResult> {
         use std::time::Instant;
         let timer = Instant::now();
-        let result = self.compile_configuration_inner(name, overwrite_managed_output);
+        let result = self.compile_configuration_inner(name, overwrite_managed_output, overrides);
         let elapsed_millis = timer.elapsed().as_millis();
         let created_unix_millis = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2276,10 +2290,11 @@ impl WriterApp {
             .map(|recipe| recipe.format.extension().to_ascii_uppercase());
         let (succeeded, outputs, warnings, error, format, diagnostics) = match &result {
             Ok(build) => (
-                true,
+                build.status == "success",
                 build.outputs.clone(),
                 build.warnings.clone(),
-                None,
+                (build.status != "success")
+                    .then(|| "configured diagnostics promoted findings to errors".into()),
                 Some(build.format.clone()),
                 build.diagnostics.clone(),
             ),
@@ -2309,7 +2324,6 @@ impl WriterApp {
         let log_relative = self.persist_compile_run_record(&record)?;
         match result {
             Ok(mut build) => {
-                build.status = "success".into();
                 build.elapsed_millis = elapsed_millis;
                 build.log_path = log_relative;
                 Ok(build)
@@ -2322,6 +2336,7 @@ impl WriterApp {
         &self,
         name: &str,
         overwrite_managed_output: bool,
+        overrides: &story_document::DiagnosticOverrides,
     ) -> Result<CompileBuildResult> {
         validate_compile_configuration_name(name)?;
         let recipe_path = self
@@ -2334,13 +2349,59 @@ impl WriterApp {
         let source = fs::read_to_string(&recipe_path).map_err(|error| {
             AppError::Domain(format!("read compile configuration '{name}': {error}"))
         })?;
-        let recipe = story_document::EditionRecipe::from_toml(&source).map_err(AppError::Domain)?;
+        let mut recipe =
+            story_document::EditionRecipe::from_toml(&source).map_err(AppError::Domain)?;
+        recipe.diagnostics.apply_overrides(overrides);
         validate_managed_compile_output(name, &recipe.output)?;
         let mut manifest = self.load_managed_compile_manifest()?;
         let output = recipe.output.clone();
         let mut output_paths = vec![output.clone()];
         output_paths.push(format!("{output}.source-map.json"));
         let artifact = self.compile_artifact_for_edition(&recipe)?;
+        let mut diagnostics = if let Some(assembly_id) = recipe.assembly_id.as_deref() {
+            let assembly =
+                AssemblyId(uuid::Uuid::parse_str(assembly_id).map_err(|error| {
+                    AppError::Domain(format!("invalid assembly UUID: {error}"))
+                })?);
+            let ir = self.compile_assembly_ir(assembly)?;
+            self.compile_diagnostics_for_ir(&ir, &recipe.diagnostics)?
+        } else {
+            self.compile_diagnostics_with_policy(&recipe.diagnostics)?
+        };
+        diagnostics.extend(artifact.diagnostics.iter().cloned());
+        for diagnostic in &mut diagnostics {
+            diagnostic.effective_level = Some(recipe.diagnostics.effective_level(diagnostic));
+        }
+        diagnostics.retain(|diagnostic| {
+            diagnostic.effective_level != Some(story_document::DiagnosticLevel::Off)
+        });
+        let warnings = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                matches!(
+                    diagnostic.effective_level,
+                    Some(
+                        story_document::DiagnosticLevel::Information
+                            | story_document::DiagnosticLevel::Warning
+                    )
+                )
+            })
+            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+            .collect::<Vec<_>>();
+        if diagnostics.iter().any(|diagnostic| {
+            diagnostic.effective_level == Some(story_document::DiagnosticLevel::Error)
+        }) {
+            return Ok(CompileBuildResult {
+                configuration: name.to_owned(),
+                format: recipe.format.extension().to_ascii_uppercase(),
+                status: "failed".into(),
+                outputs: Vec::new(),
+                elapsed_millis: 0,
+                warnings,
+                diagnostics,
+                log_path: String::new(),
+            });
+        }
         for auxiliary in &artifact.auxiliary_files {
             let extension = Path::new(&auxiliary.name)
                 .extension()
@@ -2446,13 +2507,6 @@ impl WriterApp {
         }
         *self.compile_recovery_notice.borrow_mut() = None;
         publish_compile_file_set(&project_root, project.id, &publish_files)?;
-        let mut diagnostics = self.compile_diagnostics()?;
-        diagnostics.extend(artifact.diagnostics.iter().cloned());
-        let warnings = diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity != story_document::DiagnosticSeverity::Error)
-            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
-            .collect();
         Ok(CompileBuildResult {
             configuration: name.to_owned(),
             format: recipe.format.extension().to_ascii_uppercase(),
@@ -2632,10 +2686,61 @@ impl WriterApp {
         }
     }
     pub fn compile_diagnostics(&self) -> Result<Vec<story_document::CompileDiagnostic>> {
+        self.compile_diagnostics_with_policy(&story_document::DiagnosticPolicy::default())
+    }
+
+    fn compile_diagnostics_with_policy(
+        &self,
+        policy: &story_document::DiagnosticPolicy,
+    ) -> Result<Vec<story_document::CompileDiagnostic>> {
         let input = self.processing_input()?;
-        Ok(story_document::publication_diagnostics(
-            &story_pipeline::compile_ir(&input),
-        ))
+        let ir = story_pipeline::compile_ir(&input);
+        self.compile_diagnostics_for_ir(&ir, policy)
+    }
+
+    fn compile_diagnostics_for_ir(
+        &self,
+        ir: &story_document::CompileIr,
+        policy: &story_document::DiagnosticPolicy,
+    ) -> Result<Vec<story_document::CompileDiagnostic>> {
+        let mut diagnostics = story_document::deterministic_diagnostics(ir, policy);
+        let proofreading = self.proofreading_config()?;
+        for unit in &ir.units {
+            for segment in &unit.segments {
+                for finding in
+                    story_analysis::proofread_with_config(&segment.document.source, &proofreading)
+                        .map_err(AppError::Domain)?
+                {
+                    let severity = match finding.severity.as_str() {
+                        "error" => story_document::DiagnosticSeverity::Error,
+                        "warning" => story_document::DiagnosticSeverity::Warning,
+                        "information" | "info" => story_document::DiagnosticSeverity::Information,
+                        "off" => continue,
+                        other => {
+                            return Err(AppError::Domain(format!(
+                                "unsupported proofreading severity {other}"
+                            )));
+                        }
+                    };
+                    diagnostics.push(story_document::CompileDiagnostic {
+                        code: finding.category,
+                        category: "mechanical-proofreading".into(),
+                        severity,
+                        effective_level: None,
+                        message: finding.message,
+                        remediation_hint: None,
+                        source_entity_id: Some(segment.source_entity_id.clone()),
+                        source_range: Some(story_document::SourceRange {
+                            start: finding.byte_range.start,
+                            end: finding.byte_range.end,
+                        }),
+                        generated_file: None,
+                        generated_line: None,
+                    });
+                }
+            }
+        }
+        Ok(diagnostics)
     }
     fn compile_source_fingerprint(&self) -> Result<String> {
         let input = self.processing_input()?;
@@ -6329,6 +6434,7 @@ unexpected_prose = "must not be silently discarded"
             language: None,
             dictionary: None,
             spelling_engine: story_document::SpellcheckEngine::default(),
+            diagnostics: story_document::DiagnosticPolicy::default(),
         };
         app.create_compile_configuration("plain", &recipe).unwrap();
         assert!(app.create_compile_configuration("plain", &recipe).is_err());
@@ -6412,6 +6518,79 @@ unexpected_prose = "must not be silently discarded"
     }
 
     #[test]
+    fn compile_diagnostics_include_revision_mapped_proofreading_and_werror_blocks_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, original_hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&original_hash), "Mara said said.")
+            .unwrap();
+
+        let diagnostics = app.compile_diagnostics().unwrap();
+        let repeated = diagnostics
+            .iter()
+            .find(|item| item.code == "repeated-word")
+            .unwrap();
+        assert_eq!(repeated.category, "mechanical-proofreading");
+        assert_eq!(
+            repeated.source_entity_id.as_deref(),
+            Some(scene.to_string().as_str())
+        );
+        let range = repeated.source_range.as_ref().unwrap();
+        assert_eq!("Mara said said.".get(range.start..range.end), Some("said"));
+        assert_eq!(
+            repeated.severity,
+            story_document::DiagnosticSeverity::Warning
+        );
+
+        app.create_builtin_compile_configuration("strict", "plain")
+            .unwrap();
+        let config_path = project.join(".writers-ide/compile-configurations/strict.toml");
+        let mut recipe = story_document::EditionRecipe::from_toml(
+            &std::fs::read_to_string(&config_path).unwrap(),
+        )
+        .unwrap();
+        recipe.diagnostics.warnings_as_errors = true;
+        std::fs::write(&config_path, recipe.to_toml().unwrap()).unwrap();
+        let failed = app.compile_configuration("strict", false).unwrap();
+        assert_eq!(failed.status, "failed");
+        assert!(failed.outputs.is_empty());
+        let repeated = failed
+            .diagnostics
+            .iter()
+            .find(|item| item.code == "repeated-word")
+            .unwrap();
+        assert_eq!(
+            repeated.severity,
+            story_document::DiagnosticSeverity::Warning
+        );
+        assert_eq!(
+            repeated.effective_level,
+            Some(story_document::DiagnosticLevel::Error)
+        );
+        assert!(
+            !project
+                .join("exports/compile/strict/manuscript.txt")
+                .exists()
+        );
+
+        app.create_builtin_compile_configuration("quiet", "plain")
+            .unwrap();
+        let config_path = project.join(".writers-ide/compile-configurations/quiet.toml");
+        let mut recipe = story_document::EditionRecipe::from_toml(
+            &std::fs::read_to_string(&config_path).unwrap(),
+        )
+        .unwrap();
+        recipe.diagnostics.preset = story_document::DiagnosticPreset::Quiet;
+        std::fs::write(config_path, recipe.to_toml().unwrap()).unwrap();
+        let quiet = app.compile_configuration("quiet", false).unwrap();
+        assert_eq!(quiet.status, "success");
+        assert!(quiet.diagnostics.is_empty());
+    }
+
+    #[test]
     fn compile_configuration_paths_cannot_escape_managed_output_or_follow_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("Novel");
@@ -6431,6 +6610,7 @@ unexpected_prose = "must not be silently discarded"
             language: None,
             dictionary: None,
             spelling_engine: story_document::SpellcheckEngine::default(),
+            diagnostics: story_document::DiagnosticPolicy::default(),
         };
         assert!(app.create_compile_configuration("unsafe", &recipe).is_err());
 
@@ -6485,8 +6665,11 @@ unexpected_prose = "must not be silently discarded"
             .diagnostics
             .push(story_document::CompileDiagnostic {
                 code: "TESTGEN".into(),
+                category: "renderer".into(),
+                effective_level: None,
                 severity: story_document::DiagnosticSeverity::Warning,
                 message: "Generated TeX diagnostic".into(),
+                remediation_hint: None,
                 source_entity_id: None,
                 source_range: None,
                 generated_file: Some("lualatex.log".into()),
@@ -7438,6 +7621,7 @@ unexpected_prose = "must not be silently discarded"
             language: None,
             dictionary: None,
             spelling_engine: story_document::SpellcheckEngine::default(),
+            diagnostics: story_document::DiagnosticPolicy::default(),
         };
         app.create_compile_configuration("audio", &recipe).unwrap();
         app.compile_configuration("audio", false).unwrap();

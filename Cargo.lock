@@ -1596,6 +1596,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "toml",
+ "unicode-segmentation",
  "zip",
 ]
 

@@ -7,6 +7,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 pub const SEMANTIC_SCHEMA_VERSION: u16 = 1;
 pub const COMPILE_IR_VERSION: u16 = 4;
@@ -820,6 +821,8 @@ pub struct EditionRecipe {
     pub dictionary: Option<String>,
     #[serde(default)]
     pub spelling_engine: SpellcheckEngine,
+    #[serde(default)]
+    pub diagnostics: DiagnosticPolicy,
 }
 
 /// Optional local command-line spelling backends. Neither engine is required
@@ -936,6 +939,7 @@ impl EditionRecipe {
             }
             validate_project_relative_path(dictionary)?;
         }
+        self.diagnostics.validate()?;
         Ok(())
     }
     pub fn from_toml(source: &str) -> Result<Self, String> {
@@ -1059,11 +1063,176 @@ pub enum DiagnosticSeverity {
     Information,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiagnosticLevel {
+    Off,
+    #[default]
+    Information,
+    Warning,
+    Error,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DiagnosticPreset {
+    Quiet,
+    #[default]
+    Standard,
+    Thorough,
+    Extended,
+    Pedantic,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiagnosticPolicy {
+    pub preset: DiagnosticPreset,
+    pub warnings_as_errors: bool,
+    pub rules: std::collections::BTreeMap<String, DiagnosticLevel>,
+    pub short_chapter_threshold_words: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct DiagnosticOverrides {
+    pub preset: Option<DiagnosticPreset>,
+    pub warnings_as_errors: Option<bool>,
+    pub rules: std::collections::BTreeMap<String, DiagnosticLevel>,
+}
+
+impl DiagnosticOverrides {
+    /// Parse one GCC-style diagnostic flag. Returns false for unrelated options.
+    pub fn parse_flag(&mut self, flag: &str) -> Result<bool, String> {
+        let preset = match flag {
+            "-w" | "--quiet-diagnostics" => Some(DiagnosticPreset::Quiet),
+            "-Wall" | "--thorough" => Some(DiagnosticPreset::Thorough),
+            "-Wextra" | "--extended" => Some(DiagnosticPreset::Extended),
+            "-Wpedantic" | "--pedantic" => Some(DiagnosticPreset::Pedantic),
+            "-Wstandard" | "--standard" => Some(DiagnosticPreset::Standard),
+            _ => None,
+        };
+        if let Some(preset) = preset {
+            self.preset = Some(preset);
+            return Ok(true);
+        }
+        if flag == "-Werror" || flag == "--warnings-as-errors" {
+            self.warnings_as_errors = Some(true);
+            return Ok(true);
+        }
+        if flag == "-Wno-error" || flag == "--no-warnings-as-errors" {
+            self.warnings_as_errors = Some(false);
+            return Ok(true);
+        }
+        for (prefix, level) in [
+            ("-Wno-", DiagnosticLevel::Off),
+            ("-Werror=", DiagnosticLevel::Error),
+            ("-Wwarning=", DiagnosticLevel::Warning),
+            ("-Winfo=", DiagnosticLevel::Information),
+        ] {
+            if let Some(rule) = flag.strip_prefix(prefix) {
+                if rule.trim().is_empty() {
+                    return Err(format!("diagnostic flag {prefix} requires a rule ID"));
+                }
+                self.rules.insert(rule.to_owned(), level);
+                return Ok(true);
+            }
+        }
+        if let Some(value) = flag.strip_prefix("--diagnostic-preset=") {
+            self.preset = Some(match value {
+                "quiet" => DiagnosticPreset::Quiet,
+                "standard" => DiagnosticPreset::Standard,
+                "thorough" => DiagnosticPreset::Thorough,
+                "extended" => DiagnosticPreset::Extended,
+                "pedantic" => DiagnosticPreset::Pedantic,
+                _ => return Err(format!("unknown diagnostic preset: {value}")),
+            });
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+impl Default for DiagnosticPolicy {
+    fn default() -> Self {
+        Self {
+            preset: DiagnosticPreset::Standard,
+            warnings_as_errors: false,
+            rules: std::collections::BTreeMap::new(),
+            short_chapter_threshold_words: None,
+        }
+    }
+}
+
+impl DiagnosticPolicy {
+    pub fn apply_overrides(&mut self, overrides: &DiagnosticOverrides) {
+        if let Some(preset) = overrides.preset {
+            self.preset = preset;
+        }
+        if let Some(warnings_as_errors) = overrides.warnings_as_errors {
+            self.warnings_as_errors = warnings_as_errors;
+        }
+        self.rules.extend(overrides.rules.clone());
+    }
+
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .rules
+            .keys()
+            .any(|rule| rule.trim().is_empty() || rule.len() > 128)
+        {
+            return Err("diagnostic rule override has an invalid rule ID".into());
+        }
+        if self.short_chapter_threshold_words == Some(0) {
+            return Err("short chapter threshold must be greater than zero".into());
+        }
+        Ok(())
+    }
+
+    pub fn effective_level(&self, diagnostic: &CompileDiagnostic) -> DiagnosticLevel {
+        if diagnostic.category == "renderer" && diagnostic.severity == DiagnosticSeverity::Error {
+            return DiagnosticLevel::Error;
+        }
+        let base = self
+            .rules
+            .get(&diagnostic.code)
+            .or_else(|| self.rules.get(&format!("group:{}", diagnostic.category)))
+            .copied()
+            .unwrap_or(match self.preset {
+                DiagnosticPreset::Quiet => DiagnosticLevel::Off,
+                DiagnosticPreset::Standard => match diagnostic.severity {
+                    DiagnosticSeverity::Error => DiagnosticLevel::Error,
+                    DiagnosticSeverity::Warning => DiagnosticLevel::Warning,
+                    DiagnosticSeverity::Information => DiagnosticLevel::Information,
+                },
+                DiagnosticPreset::Thorough | DiagnosticPreset::Extended => {
+                    match diagnostic.severity {
+                        DiagnosticSeverity::Error => DiagnosticLevel::Error,
+                        DiagnosticSeverity::Warning | DiagnosticSeverity::Information => {
+                            DiagnosticLevel::Warning
+                        }
+                    }
+                }
+                DiagnosticPreset::Pedantic => DiagnosticLevel::Error,
+            });
+        if self.warnings_as_errors && base == DiagnosticLevel::Warning {
+            DiagnosticLevel::Error
+        } else {
+            base
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompileDiagnostic {
     pub code: String,
+    #[serde(default)]
+    pub category: String,
     pub severity: DiagnosticSeverity,
+    #[serde(default)]
+    pub effective_level: Option<DiagnosticLevel>,
     pub message: String,
+    #[serde(default)]
+    pub remediation_hint: Option<String>,
     pub source_entity_id: Option<String>,
     #[serde(default)]
     pub source_range: Option<SourceRange>,
@@ -1071,6 +1240,16 @@ pub struct CompileDiagnostic {
     pub generated_file: Option<String>,
     #[serde(default)]
     pub generated_line: Option<u32>,
+}
+
+impl CompileDiagnostic {
+    pub fn effective_or_original_level(&self) -> DiagnosticLevel {
+        self.effective_level.unwrap_or(match self.severity {
+            DiagnosticSeverity::Error => DiagnosticLevel::Error,
+            DiagnosticSeverity::Warning => DiagnosticLevel::Warning,
+            DiagnosticSeverity::Information => DiagnosticLevel::Information,
+        })
+    }
 }
 
 fn first_placeholder_range(source: &str) -> Option<SourceRange> {
@@ -1092,8 +1271,11 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
     if ir.title.trim().is_empty() {
         diagnostics.push(CompileDiagnostic {
             code: "PUB001".into(),
+            category: "publication".into(),
+            effective_level: None,
             severity: DiagnosticSeverity::Warning,
             message: "project title is empty".into(),
+            remediation_hint: None,
             source_entity_id: None,
             source_range: None,
             generated_file: None,
@@ -1103,8 +1285,11 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
     if ir.units.is_empty() {
         diagnostics.push(CompileDiagnostic {
             code: "PUB002".into(),
+            category: "publication".into(),
+            effective_level: None,
             severity: DiagnosticSeverity::Warning,
             message: "manuscript contains no content units or scenes".into(),
+            remediation_hint: None,
             source_entity_id: None,
             source_range: None,
             generated_file: None,
@@ -1119,8 +1304,11 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
         {
             diagnostics.push(CompileDiagnostic {
                 code: "PUB003".into(),
+                category: "publication".into(),
+                effective_level: None,
                 severity: DiagnosticSeverity::Information,
                 message: format!("content unit '{}' has no prose", unit.title),
+                remediation_hint: None,
                 source_entity_id: Some(unit.id.clone()),
                 source_range: None,
                 generated_file: None,
@@ -1141,17 +1329,91 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
         if placeholder_count > 0 {
             diagnostics.push(CompileDiagnostic {
                 code: "PUB004".into(),
+                category: "publication".into(),
+                effective_level: None,
                 severity: DiagnosticSeverity::Warning,
                 message: format!(
                     "content unit '{}' contains {placeholder_count} likely draft placeholder(s)",
                     unit.title
                 ),
+                remediation_hint: None,
                 source_entity_id: Some(unit.id.clone()),
                 source_range: unit
                     .segments
                     .iter()
                     .filter(|segment| segment.source_entity_id == unit.id)
                     .find_map(|segment| first_placeholder_range(&segment.document.source)),
+                generated_file: None,
+                generated_line: None,
+            });
+        }
+    }
+    diagnostics
+}
+
+pub fn deterministic_diagnostics(
+    ir: &CompileIr,
+    policy: &DiagnosticPolicy,
+) -> Vec<CompileDiagnostic> {
+    let mut diagnostics = publication_diagnostics(ir);
+    let chapter_for = |unit: &CompileUnit| {
+        let mut parent = unit.parent_id.as_deref();
+        while let Some(id) = parent {
+            let Some(group) = ir.groups.iter().find(|group| group.id == id) else {
+                break;
+            };
+            if group.kind == StructuralKind::Chapter {
+                return Some(group.id.as_str());
+            }
+            parent = group.parent_id.as_deref();
+        }
+        None
+    };
+    for chapter in ir
+        .groups
+        .iter()
+        .filter(|group| group.kind == StructuralKind::Chapter)
+    {
+        let words = ir
+            .units
+            .iter()
+            .filter(|unit| chapter_for(unit) == Some(chapter.id.as_str()))
+            .flat_map(|unit| unit.segments.iter())
+            .map(|segment| segment.document.source.unicode_word_indices().count() as u32)
+            .fold(0u32, u32::saturating_add);
+        if words == 0 {
+            diagnostics.push(CompileDiagnostic {
+                code: "empty-chapter".into(),
+                category: "structure".into(),
+                severity: DiagnosticSeverity::Information,
+                effective_level: None,
+                message: format!("chapter '{}' contains no words", chapter.title),
+                remediation_hint: None,
+                source_entity_id: Some(chapter.id.clone()),
+                source_range: None,
+                generated_file: None,
+                generated_line: None,
+            });
+        } else if policy
+            .short_chapter_threshold_words
+            .is_some_and(|threshold| words < threshold)
+        {
+            let threshold = policy.short_chapter_threshold_words.unwrap_or_default();
+            diagnostics.push(CompileDiagnostic {
+                code: "short-chapter".into(),
+                category: "structure".into(),
+                severity: DiagnosticSeverity::Information,
+                effective_level: None,
+                message: format!(
+                    "chapter '{}' has {words} words, below the configured {threshold}-word threshold",
+                    chapter.title
+                ),
+                remediation_hint: Some(
+                    "Review this informational measurement against the intended chapter structure"
+                        .into(),
+                ),
+                source_entity_id: Some(chapter.id.clone()),
+                source_range: None,
                 generated_file: None,
                 generated_line: None,
             });
@@ -1567,8 +1829,11 @@ fn parse_lualatex_log(log: &[u8]) -> Vec<CompileDiagnostic> {
         };
         findings.push(CompileDiagnostic {
             code: code.into(),
+            category: "renderer".into(),
+            effective_level: None,
             severity,
             message: format!("{description}: {normalized}"),
+            remediation_hint: None,
             source_entity_id: None,
             source_range: None,
             generated_file: Some("lualatex.log".into()),
@@ -1748,6 +2013,7 @@ mod tests {
             language: None,
             dictionary: None,
             spelling_engine: SpellcheckEngine::default(),
+            diagnostics: DiagnosticPolicy::default(),
         };
         assert_eq!(
             EditionRecipe::from_toml(&recipe.to_toml().unwrap()).unwrap(),
@@ -1772,6 +2038,141 @@ output = "exports/old.md"
         invalid.cover_image = Some("attachments/cover.png".into());
         invalid.format = CompileFormat::Markdown;
         assert!(invalid.validate().is_err());
+    }
+
+    #[test]
+    fn diagnostic_presets_overrides_and_werror_are_separate_and_deterministic() {
+        let mut diagnostic = CompileDiagnostic {
+            code: "PUB004".into(),
+            category: "publication".into(),
+            severity: DiagnosticSeverity::Warning,
+            effective_level: None,
+            message: "placeholder".into(),
+            remediation_hint: Some("review placeholder".into()),
+            source_entity_id: Some("scene-id".into()),
+            source_range: Some(SourceRange { start: 4, end: 8 }),
+            generated_file: None,
+            generated_line: None,
+        };
+        let standard = DiagnosticPolicy::default();
+        assert_eq!(
+            standard.effective_level(&diagnostic),
+            DiagnosticLevel::Warning
+        );
+        let mut thorough = DiagnosticPolicy {
+            preset: DiagnosticPreset::Thorough,
+            ..DiagnosticPolicy::default()
+        };
+        diagnostic.severity = DiagnosticSeverity::Information;
+        assert_eq!(
+            thorough.effective_level(&diagnostic),
+            DiagnosticLevel::Warning
+        );
+        thorough.preset = DiagnosticPreset::Extended;
+        assert_eq!(
+            thorough.effective_level(&diagnostic),
+            DiagnosticLevel::Warning
+        );
+        thorough.preset = DiagnosticPreset::Pedantic;
+        assert_eq!(
+            thorough.effective_level(&diagnostic),
+            DiagnosticLevel::Error
+        );
+        diagnostic.severity = DiagnosticSeverity::Warning;
+        let mut strict = DiagnosticPolicy {
+            warnings_as_errors: true,
+            ..DiagnosticPolicy::default()
+        };
+        assert_eq!(strict.effective_level(&diagnostic), DiagnosticLevel::Error);
+        strict
+            .rules
+            .insert("PUB004".into(), DiagnosticLevel::Information);
+        assert_eq!(
+            strict.effective_level(&diagnostic),
+            DiagnosticLevel::Information
+        );
+        strict.rules.insert("PUB004".into(), DiagnosticLevel::Off);
+        assert_eq!(strict.effective_level(&diagnostic), DiagnosticLevel::Off);
+        strict.rules.clear();
+        strict
+            .rules
+            .insert("group:publication".into(), DiagnosticLevel::Information);
+        assert_eq!(
+            strict.effective_level(&diagnostic),
+            DiagnosticLevel::Information
+        );
+        strict.rules.clear();
+        strict.preset = DiagnosticPreset::Quiet;
+        assert_eq!(strict.effective_level(&diagnostic), DiagnosticLevel::Off);
+        diagnostic.category = "renderer".into();
+        diagnostic.severity = DiagnosticSeverity::Error;
+        strict.rules.insert("PUB004".into(), DiagnosticLevel::Off);
+        assert_eq!(strict.effective_level(&diagnostic), DiagnosticLevel::Error);
+        diagnostic.category = "publication".into();
+        diagnostic.severity = DiagnosticSeverity::Warning;
+        diagnostic.effective_level = Some(DiagnosticLevel::Error);
+        let round_trip = serde_json::to_string(&diagnostic).unwrap();
+        assert_eq!(
+            serde_json::from_str::<CompileDiagnostic>(&round_trip).unwrap(),
+            diagnostic
+        );
+
+        let mut flags = DiagnosticOverrides::default();
+        assert!(flags.parse_flag("-Wall").unwrap());
+        assert_eq!(flags.preset, Some(DiagnosticPreset::Thorough));
+        assert!(flags.parse_flag("-Werror=PUB004").unwrap());
+        assert_eq!(flags.rules["PUB004"], DiagnosticLevel::Error);
+        assert!(flags.parse_flag("-Wno-error").unwrap());
+        assert_eq!(flags.warnings_as_errors, Some(false));
+        assert!(flags.parse_flag("-w").unwrap());
+        assert_eq!(flags.preset, Some(DiagnosticPreset::Quiet));
+        assert!(!flags.parse_flag("--overwrite").unwrap());
+    }
+
+    #[test]
+    fn deterministic_compile_diagnostics_measure_chapters_with_configured_thresholds() {
+        let mut ir = CompileIr::new("Novel");
+        ir.push_group(CompileGroup {
+            id: "chapter-one".into(),
+            parent_id: None,
+            kind: StructuralKind::Chapter,
+            title: "One".into(),
+        });
+        ir.push_group(CompileGroup {
+            id: "chapter-two".into(),
+            parent_id: None,
+            kind: StructuralKind::Chapter,
+            title: "Two".into(),
+        });
+        ir.push(CompileUnit {
+            id: "scene-one".into(),
+            parent_id: Some("chapter-one".into()),
+            kind: ContentUnitKind::Scene,
+            title: "Opening".into(),
+            language_code: None,
+            segments: vec![CompileSegment::new("scene-one", "Élodie ran swiftly.")],
+        });
+        let policy = DiagnosticPolicy {
+            short_chapter_threshold_words: Some(5),
+            ..DiagnosticPolicy::default()
+        };
+        let findings = deterministic_diagnostics(&ir, &policy);
+        assert!(findings.iter().any(|item| {
+            item.code == "short-chapter"
+                && item.source_entity_id.as_deref() == Some("chapter-one")
+                && item.message.contains("3 words")
+        }));
+        assert!(findings.iter().any(|item| {
+            item.code == "empty-chapter" && item.source_entity_id.as_deref() == Some("chapter-two")
+        }));
+        assert!(
+            DiagnosticPolicy {
+                short_chapter_threshold_words: Some(0),
+                ..DiagnosticPolicy::default()
+            }
+            .validate()
+            .is_err()
+        );
     }
     use std::io::Read;
 
