@@ -7098,6 +7098,58 @@ impl AppState {
         }
         Ok(())
     }
+    fn save_conflict_recovery_copy(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        self.write_recovery_text(&self.editor.join("\n"))
+    }
+    fn write_recovery_text(&self, text: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let project_root = self.app.project_root().canonicalize()?;
+        let metadata = project_root.join(".writers-ide");
+        ensure_project_managed_directory(&project_root, &metadata)?;
+        let recovery = metadata.join("recovery");
+        ensure_project_managed_directory(&project_root, &recovery)?;
+        let source_id = self
+            .editing_scene
+            .map(|id| format!("scene-{id}"))
+            .or_else(|| self.editing_content_unit.map(|id| format!("document-{id}")))
+            .or_else(|| self.assembly_draft.map(|id| format!("assembly-{id}")))
+            .unwrap_or_else(|| "buffer".into());
+        let destination =
+            recovery.join(format!("{source_id}-recovery-{}.md", uuid::Uuid::new_v4()));
+        let mut temporary = tempfile::NamedTempFile::new_in(&recovery)?;
+        use std::io::Write;
+        temporary.write_all(text.as_bytes())?;
+        temporary.as_file().sync_all()?;
+        temporary.persist_noclobber(&destination)?;
+        fs::File::open(&recovery)?.sync_all()?;
+        Ok(destination)
+    }
+    fn keep_conflicted_memory_version(&mut self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        let (disk_text, disk_hash, save_scene) = if let Some(scene) = self.editing_scene {
+            let (text, hash) = self.app.load_scene_text(scene)?;
+            (text, hash, Some(scene))
+        } else if let Some(unit) = self.editing_content_unit {
+            let (text, hash) = self.app.load_content_unit_text(unit)?;
+            (text, hash, None)
+        } else {
+            return Err("Keep My Changes is available for one scene or chapter document".into());
+        };
+        let recovery = self.write_recovery_text(&disk_text)?;
+        let local_text = self.editor.join("\n");
+        let new_hash = if let Some(scene) = save_scene {
+            self.app
+                .save_scene_text(scene, Some(&disk_hash), &local_text)?
+        } else if let Some(unit) = self.editing_content_unit {
+            self.app
+                .save_content_unit_text(unit, Some(&disk_hash), &local_text)?
+        } else {
+            unreachable!()
+        };
+        self.saved_hash = new_hash;
+        self.dirty = false;
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        Ok(recovery)
+    }
     fn persist_challenge_draft(&self) -> Result<(), Box<dyn std::error::Error>> {
         let Some(challenge) = &self.active_challenge else {
             return Ok(());
@@ -14416,6 +14468,28 @@ fn write_board_svg_export(
     Ok(output)
 }
 
+fn ensure_project_managed_directory(
+    project_root: &Path,
+    directory: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !directory.starts_with(project_root) {
+        return Err("recovery directory escapes the project".into());
+    }
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err("recovery path must be a real project directory".into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => fs::create_dir(directory)?,
+        Err(error) => return Err(error.into()),
+    }
+    let canonical = directory.canonicalize()?;
+    if !canonical.starts_with(project_root) {
+        return Err("recovery directory resolves outside the project".into());
+    }
+    Ok(())
+}
+
 fn editor_grapheme_is_mentioned(byte_offset: u64, byte_len: u64, ranges: &[(u64, u64)]) -> bool {
     let Some(end) = byte_offset.checked_add(byte_len) else {
         return false;
@@ -19269,7 +19343,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     } else {
         "navigation"
     };
-    if s.handle_context_command_key(k, context)? {
+    if !matches!(s.mode, Some('q' | 'K')) && s.handle_context_command_key(k, context)? {
         return Ok(false);
     }
     if s.find_panel.is_some() {
@@ -19277,6 +19351,38 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if s.mode.is_some() {
+        if s.mode == Some('K') {
+            match k.code {
+                KeyCode::Esc => {
+                    s.mode = Some('q');
+                    s.prompt = "Save conflict · r Recovery Copy and Quit · v Review Versions · u Use Saved · k Keep My Changes · d Quit Without Saving · Esc Edit".into();
+                    s.message = "Keep My Changes cancelled; neither version was replaced".into();
+                }
+                KeyCode::Char('y' | 'Y') => match s.keep_conflicted_memory_version() {
+                    Ok(recovery) => {
+                        s.mode = None;
+                        s.message = format!(
+                            "Kept your changes. The previous on-disk version is preserved at {}",
+                            recovery.display()
+                        );
+                    }
+                    Err(error) => {
+                        s.prompt =
+                            "Keep failed · d Quit Without Saving · Esc Return to choices".into();
+                        s.message = format!("Could not safely keep your changes: {error}");
+                    }
+                },
+                KeyCode::Char('d' | 'D') => {
+                    s.mode = None;
+                    s.message =
+                        "Quit without saving; both existing manuscript copies were left unchanged"
+                            .into();
+                    return Ok(true);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
         if s.mode == Some('q') {
             match k.code {
                 KeyCode::Esc => {
@@ -19286,18 +19392,111 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 }
                 KeyCode::Char('s' | 'S') => {
                     if let Err(error) = s.save() {
-                        s.message = format!("Save before quit failed: {error}");
+                        s.prompt = "Save failed · r Recovery Copy and Quit · v Review Versions · u Use Saved · k Keep My Changes · d Quit Without Saving · Esc Edit".into();
+                        s.message =
+                            format!("Save before quit failed; your buffer is still open: {error}");
                         return Ok(false);
                     }
                     if s.dirty {
+                        let reason = s.message.clone();
+                        s.prompt = "Save conflict · r Recovery Copy and Quit · v Review Versions · u Use Saved · k Keep My Changes · d Quit Without Saving · Esc Edit".into();
                         s.message = format!(
-                            "Save failed; your in-memory text is still open. Choose d to quit without saving, or Esc to continue editing. {}",
-                            s.message
+                            "Save failed; your in-memory text is still open. Choose a recovery action or Esc to return to editing. {reason}"
                         );
                         return Ok(false);
                     }
                     s.mode = None;
                     return Ok(true);
+                }
+                KeyCode::Char('r' | 'R') => match s.save_conflict_recovery_copy() {
+                    Ok(path) => {
+                        s.message = format!(
+                            "Recovery copy saved to {}; quitting without changing the on-disk manuscript",
+                            path.display()
+                        );
+                        return Ok(true);
+                    }
+                    Err(error) => {
+                        s.prompt = "Recovery copy failed · d Quit Without Saving · Esc Edit".into();
+                        s.message = format!("Could not save recovery copy: {error}");
+                    }
+                },
+                KeyCode::Char('u' | 'U') => {
+                    let loaded = if let Some(scene) = s.editing_scene {
+                        s.app.load_scene_text(scene)
+                    } else if let Some(unit) = s.editing_content_unit {
+                        s.app.load_content_unit_text(unit)
+                    } else {
+                        s.message =
+                            "Use Saved is available for a single scene or chapter document".into();
+                        return Ok(false);
+                    };
+                    match loaded {
+                        Ok((text, hash)) => {
+                            s.editor = text.split('\n').map(str::to_owned).collect();
+                            if s.editor.is_empty() {
+                                s.editor.push(String::new());
+                            }
+                            s.saved_hash = hash;
+                            s.cursor = (0, 0);
+                            s.editor_selection = None;
+                            s.undo_stack.clear();
+                            s.redo_stack.clear();
+                            s.dirty = false;
+                            s.mode = None;
+                            s.message = "Loaded the saved manuscript version; unsaved in-memory edits were discarded".into();
+                        }
+                        Err(error) => {
+                            s.message =
+                                format!("Could not load the saved manuscript version: {error}");
+                        }
+                    }
+                }
+                KeyCode::Char('v' | 'V') => {
+                    let disk = if let Some(scene) = s.editing_scene {
+                        s.app.load_scene_text(scene)
+                    } else if let Some(unit) = s.editing_content_unit {
+                        s.app.load_content_unit_text(unit)
+                    } else {
+                        s.message =
+                            "Version review is available for a single scene or chapter document"
+                                .into();
+                        return Ok(false);
+                    };
+                    match disk {
+                        Ok((disk_text, disk_hash)) => {
+                            let title = s.selected_scene();
+                            let content = format!(
+                                "On disk · content hash {disk_hash}\n------------------------------\n{disk_text}\n\nIn memory · unsaved\n------------------------------\n{}",
+                                s.editor.join("\n")
+                            );
+                            let key = format!(
+                                "save-conflict:{}",
+                                s.editing_scene
+                                    .map(|id| id.to_string())
+                                    .or_else(|| s.editing_content_unit.map(|id| id.to_string()))
+                                    .unwrap_or_default()
+                            );
+                            s.open_reference_buffer(
+                                key,
+                                None,
+                                format!("Save Conflict · {title}"),
+                                content,
+                            );
+                            s.reference_focused = true;
+                            s.mode = None;
+                            s.message = "Reviewing the on-disk and in-memory versions side by side; your manuscript remains unsaved".into();
+                        }
+                        Err(error) => {
+                            s.message =
+                                format!("Could not read the on-disk manuscript version: {error}");
+                        }
+                    }
+                }
+                KeyCode::Char('k' | 'K') => {
+                    s.mode = Some('K');
+                    s.prompt = "Keep your in-memory version? The current on-disk version will first be saved as a recovery copy. y confirm · Esc cancel".into();
+                    s.message = "Confirm replacement only after reviewing the two versions".into();
                 }
                 KeyCode::Char('d' | 'D') => {
                     s.mode = None;
@@ -19667,7 +19866,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         if s.dirty {
             s.mode = Some('q');
             s.prompt =
-                "Save and Quit (s) · Quit Without Saving (d) · Esc returns to editing".into();
+                "Save and Quit (s) · Recovery Copy and Quit (r) · Quit Without Saving (d) · Esc Edit".into();
             s.message = "Choose how to leave the current unsaved text".into();
             return Ok(false);
         }
@@ -27167,6 +27366,220 @@ mod tests {
             fs::read_to_string(project.join("manuscript").join(format!("{scene}.md"))).unwrap(),
             "Newer disk version"
         );
+    }
+
+    #[test]
+    fn quit_with_recovery_copy_preserves_memory_and_saved_manuscript_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Saved version")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["Unsaved draft that must survive".into()];
+        state.dirty = true;
+
+        assert!(
+            !handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+            )
+            .unwrap()
+        );
+        assert!(
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)
+            )
+            .unwrap()
+        );
+        assert!(state.message.contains("Recovery copy saved"));
+        let recovery = project.join(".writers-ide/recovery");
+        let copies = fs::read_dir(&recovery)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&copies[0]).unwrap(),
+            "Unsaved draft that must survive"
+        );
+        assert_eq!(
+            fs::read_to_string(project.join("manuscript").join(format!("{scene}.md"))).unwrap(),
+            "Saved version"
+        );
+    }
+
+    #[test]
+    fn save_conflict_can_review_both_versions_or_explicitly_use_the_saved_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Original saved copy")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["My in-memory edits".into()];
+        state.dirty = true;
+        let mut concurrent = WriterApp::open_project(&project).unwrap();
+        let (_, concurrent_hash) = concurrent.load_scene_text(scene).unwrap();
+        concurrent
+            .save_scene_text(scene, Some(&concurrent_hash), "Newer disk copy")
+            .unwrap();
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, None);
+        assert!(state.dirty);
+        assert!(state.reference_focused);
+        let review = &state.reference_panes[state.active_reference].content;
+        assert!(review.contains("Newer disk copy"));
+        assert!(review.contains("My in-memory edits"));
+
+        state.mode = Some('q');
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "Newer disk copy");
+        assert!(!state.dirty);
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Newer disk copy"
+        );
+    }
+
+    #[test]
+    fn keep_my_changes_requires_confirmation_and_preserves_replaced_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Initial saved copy")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["My confirmed version".into()];
+        state.dirty = true;
+        let mut concurrent = WriterApp::open_project(&project).unwrap();
+        let (_, concurrent_hash) = concurrent.load_scene_text(scene).unwrap();
+        concurrent
+            .save_scene_text(scene, Some(&concurrent_hash), "Concurrent saved copy")
+            .unwrap();
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, Some('K'));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Concurrent saved copy"
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(state.mode, None);
+        assert!(!state.dirty);
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "My confirmed version"
+        );
+        let recovery = project.join(".writers-ide/recovery");
+        let copies = fs::read_dir(recovery)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(copies.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&copies[0]).unwrap(),
+            "Concurrent saved copy"
+        );
+    }
+
+    #[test]
+    fn keep_my_changes_can_be_cancelled_without_replacing_either_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Initial saved copy")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["My in-memory version".into()];
+        state.dirty = true;
+        let mut concurrent = WriterApp::open_project(&project).unwrap();
+        let (_, concurrent_hash) = concurrent.load_scene_text(scene).unwrap();
+        concurrent
+            .save_scene_text(scene, Some(&concurrent_hash), "Concurrent saved copy")
+            .unwrap();
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+
+        assert_eq!(state.mode, Some('q'));
+        assert!(state.dirty);
+        assert_eq!(state.editor.join("\n"), "My in-memory version");
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Concurrent saved copy"
+        );
+        let recovery = project.join(".writers-ide/recovery");
+        assert_eq!(fs::read_dir(recovery).unwrap().count(), 0);
     }
 
     #[test]
