@@ -8,8 +8,8 @@ use std::{
 };
 use story_core::*;
 use story_storage::{
-    ApprovedKnowledgeClaim, ConflictResolution, ProjectStore, Result as StorageResult, SceneRecord,
-    StorageError,
+    ApprovedKnowledgeClaim, ConflictResolution, DiagnosticSuppressionRecord, ProjectStore,
+    Result as StorageResult, SceneRecord, StorageError,
 };
 use thiserror::Error;
 
@@ -58,6 +58,8 @@ pub struct CompileBuildResult {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompileRunRecord {
     pub version: u16,
+    #[serde(default)]
+    pub run_id: String,
     pub configuration: String,
     #[serde(default)]
     pub format: Option<String>,
@@ -1836,7 +1838,8 @@ impl WriterApp {
                 .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
                 .collect();
             let record = CompileRunRecord {
-                version: 5,
+                version: 6,
+                run_id: uuid::Uuid::new_v4().to_string(),
                 configuration: configuration.to_owned(),
                 format: Some(format.extension().to_ascii_uppercase()),
                 succeeded: false,
@@ -1973,7 +1976,8 @@ impl WriterApp {
             .map(|item| format!("{}: {}", item.code, item.message))
             .collect();
         let record = CompileRunRecord {
-            version: 5,
+            version: 6,
+            run_id: uuid::Uuid::new_v4().to_string(),
             configuration: "One-off Compile".into(),
             format: Some(artifact.format.extension().to_ascii_uppercase()),
             succeeded,
@@ -2308,7 +2312,8 @@ impl WriterApp {
             ),
         };
         let record = CompileRunRecord {
-            version: 5,
+            version: 6,
+            run_id: uuid::Uuid::new_v4().to_string(),
             configuration: name.to_owned(),
             format,
             succeeded,
@@ -2390,6 +2395,7 @@ impl WriterApp {
             .collect::<Vec<_>>();
         if diagnostics.iter().any(|diagnostic| {
             diagnostic.effective_level == Some(story_document::DiagnosticLevel::Error)
+                && !diagnostic.suppressed
         }) {
             return Ok(CompileBuildResult {
                 configuration: name.to_owned(),
@@ -2551,7 +2557,7 @@ impl WriterApp {
                     .map_err(|error| {
                         AppError::Domain(format!("invalid Compile result file: {error}"))
                     })?;
-                if !matches!(record.version, 1..=5) {
+                if !matches!(record.version, 1..=6) {
                     return Err(AppError::Domain(format!(
                         "unsupported Compile result version {}",
                         record.version
@@ -2689,6 +2695,86 @@ impl WriterApp {
         self.compile_diagnostics_with_policy(&story_document::DiagnosticPolicy::default())
     }
 
+    pub fn add_diagnostic_suppression(
+        &mut self,
+        diagnostic: &story_document::CompileDiagnostic,
+        scope: &str,
+        reason: &str,
+        expires_unix_ms: Option<i64>,
+    ) -> Result<String> {
+        if matches!(diagnostic.category.as_str(), "renderer" | "operational")
+            || (diagnostic.severity == story_document::DiagnosticSeverity::Error
+                && diagnostic.category == "renderer")
+        {
+            return Err(AppError::Domain(
+                "operational and renderer diagnostics cannot be suppressed".into(),
+            ));
+        }
+        let (scene_id, finding_fingerprint) = match scope {
+            "rule" => (None, None),
+            "scene" => (
+                Some(diagnostic.source_entity_id.clone().ok_or_else(|| {
+                    AppError::Domain("scene suppression requires a source entity".into())
+                })?),
+                None,
+            ),
+            "finding" => (
+                Some(diagnostic.source_entity_id.clone().ok_or_else(|| {
+                    AppError::Domain("finding suppression requires a source entity".into())
+                })?),
+                Some(diagnostic.finding_fingerprint()),
+            ),
+            _ => {
+                return Err(AppError::Domain(
+                    "suppression scope must be rule, scene, or finding".into(),
+                ));
+            }
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        if reason.trim().is_empty() || expires_unix_ms.is_some_and(|expiry| expiry <= now) {
+            return Err(AppError::Domain(
+                "suppression requires a reason and any expiry must be in the future".into(),
+            ));
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        let record = DiagnosticSuppressionRecord {
+            id: id.clone(),
+            rule_id: diagnostic.code.clone(),
+            scope: scope.to_owned(),
+            scene_id,
+            finding_fingerprint,
+            reason: reason.trim().to_owned(),
+            created_unix_ms: now,
+            expires_unix_ms,
+            triggering_fingerprint: self.compile_source_fingerprint().ok(),
+            status: "active".into(),
+            last_checked_unix_ms: now,
+        };
+        self.store.create_diagnostic_suppression(&record)?;
+        Ok(id)
+    }
+
+    pub fn diagnostic_suppressions(&self) -> Result<Vec<DiagnosticSuppressionRecord>> {
+        self.store
+            .list_diagnostic_suppressions()
+            .map_err(Into::into)
+    }
+
+    pub fn revoke_diagnostic_suppression(&self, id: &str) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        self.store
+            .update_diagnostic_suppression_state(id, "revoked", now)
+            .map_err(Into::into)
+    }
+
     fn compile_diagnostics_with_policy(
         &self,
         policy: &story_document::DiagnosticPolicy,
@@ -2736,11 +2822,79 @@ impl WriterApp {
                         }),
                         generated_file: None,
                         generated_line: None,
+                        suppressed_by: None,
+                        suppressed: false,
                     });
                 }
             }
         }
+        self.apply_diagnostic_suppressions(&mut diagnostics)?;
         Ok(diagnostics)
+    }
+
+    fn apply_diagnostic_suppressions(
+        &self,
+        diagnostics: &mut [story_document::CompileDiagnostic],
+    ) -> Result<()> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let suppressions = self.store.list_diagnostic_suppressions()?;
+        for suppression in suppressions {
+            if suppression.status == "revoked" {
+                continue;
+            }
+            let source_match = diagnostics.iter().any(|diagnostic| {
+                diagnostic.code == suppression.rule_id
+                    && match suppression.scope.as_str() {
+                        "rule" => true,
+                        "scene" => diagnostic.source_entity_id == suppression.scene_id,
+                        "finding" => {
+                            diagnostic.source_entity_id == suppression.scene_id
+                                && Some(diagnostic.finding_fingerprint())
+                                    == suppression.finding_fingerprint
+                        }
+                        _ => false,
+                    }
+            });
+            let state = if suppression
+                .expires_unix_ms
+                .is_some_and(|expiry| expiry <= now)
+            {
+                "expired"
+            } else if source_match || suppression.scope == "rule" {
+                "active"
+            } else {
+                "stale"
+            };
+            self.store
+                .update_diagnostic_suppression_state(&suppression.id, state, now)?;
+            if state != "active" {
+                continue;
+            }
+            if suppression.scope == "rule" || source_match {
+                for diagnostic in diagnostics.iter_mut().filter(|diagnostic| {
+                    diagnostic.code == suppression.rule_id
+                        && match suppression.scope.as_str() {
+                            "rule" => true,
+                            "scene" => diagnostic.source_entity_id == suppression.scene_id,
+                            "finding" => {
+                                diagnostic.source_entity_id == suppression.scene_id
+                                    && Some(diagnostic.finding_fingerprint())
+                                        == suppression.finding_fingerprint
+                            }
+                            _ => false,
+                        }
+                        && !matches!(diagnostic.category.as_str(), "renderer" | "operational")
+                }) {
+                    diagnostic.suppressed = true;
+                    diagnostic.suppressed_by = Some(suppression.id.clone());
+                }
+            }
+        }
+        Ok(())
     }
     fn compile_source_fingerprint(&self) -> Result<String> {
         let input = self.processing_input()?;
@@ -6397,6 +6551,7 @@ unexpected_prose = "must not be silently discarded"
         assert_eq!(runs[0].format.as_deref(), Some("EPUB"));
         assert!(!runs[0].succeeded);
         assert!(runs[0].outputs.is_empty());
+        assert!(uuid::Uuid::parse_str(&runs[0].run_id).is_ok());
         assert_eq!(
             runs[0].error.as_deref(),
             Some("invalid domain input: synthetic renderer failure")
@@ -6467,7 +6622,7 @@ unexpected_prose = "must not be silently discarded"
         assert!(app.list_compile_results().unwrap().iter().any(|record| {
             record.succeeded
                 && record.outputs.contains(&recipe.output)
-                && record.version == 5
+                && record.version == 6
                 && record.format.as_deref() == Some("MD")
                 && record.diagnostics.iter().any(|item| {
                     item.code == "PUB004"
@@ -6591,6 +6746,138 @@ unexpected_prose = "must not be silently discarded"
     }
 
     #[test]
+    fn finding_suppressions_are_audited_expiring_and_revalidated_against_current_findings() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Suppressions");
+        let mut app = WriterApp::create_project(&project, "Suppressions").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "TODO: resolve this clue.")
+            .unwrap();
+        let finding = app
+            .compile_diagnostics()
+            .unwrap()
+            .into_iter()
+            .find(|diagnostic| diagnostic.code == "PUB004")
+            .unwrap();
+        let id = app
+            .add_diagnostic_suppression(
+                &finding,
+                "finding",
+                "Intentional placeholder during draft",
+                None,
+            )
+            .unwrap();
+        let current = app.compile_diagnostics().unwrap();
+        let finding = current.iter().find(|item| item.code == "PUB004").unwrap();
+        assert!(finding.suppressed);
+        assert_eq!(finding.suppressed_by.as_deref(), Some(id.as_str()));
+        let record = app.diagnostic_suppressions().unwrap().remove(0);
+        assert_eq!(record.status, "active");
+        assert_eq!(record.reason, "Intentional placeholder during draft");
+        assert!(record.triggering_fingerprint.is_some());
+        app.create_builtin_compile_configuration("strict", "plain")
+            .unwrap();
+        let config_path = project.join(".writers-ide/compile-configurations/strict.toml");
+        let mut recipe =
+            story_document::EditionRecipe::from_toml(&fs::read_to_string(&config_path).unwrap())
+                .unwrap();
+        recipe.diagnostics.warnings_as_errors = true;
+        fs::write(&config_path, recipe.to_toml().unwrap()).unwrap();
+        let build = app.compile_configuration("strict", false).unwrap();
+        assert_eq!(build.status, "success");
+        let logged_finding = build
+            .diagnostics
+            .iter()
+            .find(|item| item.code == "PUB004")
+            .unwrap();
+        assert!(logged_finding.suppressed);
+        assert_eq!(
+            logged_finding.effective_level,
+            Some(story_document::DiagnosticLevel::Error)
+        );
+
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "The clue remains unresolved.")
+            .unwrap();
+        assert!(
+            app.compile_diagnostics()
+                .unwrap()
+                .iter()
+                .all(|item| item.code != "PUB004")
+        );
+        assert_eq!(app.diagnostic_suppressions().unwrap()[0].status, "stale");
+
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "TODO: resolve this clue.")
+            .unwrap();
+        let restored = app
+            .compile_diagnostics()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.code == "PUB004")
+            .unwrap();
+        assert!(restored.suppressed);
+        assert_eq!(app.diagnostic_suppressions().unwrap()[0].status, "active");
+        drop(app);
+        let reopened = WriterApp::open_project(&project).unwrap();
+        assert_eq!(reopened.diagnostic_suppressions().unwrap()[0].id, id);
+    }
+
+    #[test]
+    fn diagnostic_suppression_rejects_operational_errors_and_expires_without_hiding_a_finding() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Expiry"), "Expiry").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "TODO: review.")
+            .unwrap();
+        let finding = app
+            .compile_diagnostics()
+            .unwrap()
+            .into_iter()
+            .find(|diagnostic| diagnostic.code == "PUB004")
+            .unwrap();
+        let expiry = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 1;
+        app.add_diagnostic_suppression(&finding, "rule", "Temporary review", Some(expiry))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(3));
+        let current = app
+            .compile_diagnostics()
+            .unwrap()
+            .into_iter()
+            .find(|item| item.code == "PUB004")
+            .unwrap();
+        assert!(!current.suppressed);
+        assert_eq!(app.diagnostic_suppressions().unwrap()[0].status, "expired");
+
+        let renderer_error = story_document::CompileDiagnostic {
+            code: "TEX_FATAL".into(),
+            category: "renderer".into(),
+            severity: story_document::DiagnosticSeverity::Error,
+            effective_level: Some(story_document::DiagnosticLevel::Error),
+            message: "renderer failed".into(),
+            remediation_hint: None,
+            source_entity_id: None,
+            source_range: None,
+            generated_file: None,
+            generated_line: None,
+            suppressed_by: None,
+            suppressed: false,
+        };
+        assert!(
+            app.add_diagnostic_suppression(&renderer_error, "rule", "hide fatal", None)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn compile_configuration_paths_cannot_escape_managed_output_or_follow_symlinks() {
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join("Novel");
@@ -6674,6 +6961,8 @@ unexpected_prose = "must not be silently discarded"
                 source_range: None,
                 generated_file: Some("lualatex.log".into()),
                 generated_line: Some(2),
+                suppressed_by: None,
+                suppressed: false,
             });
         let source_path = app
             .list_project_symbols()
@@ -6699,7 +6988,7 @@ unexpected_prose = "must not be silently discarded"
             .unwrap();
         assert!(app.list_compile_results().unwrap().iter().any(|record| {
             record.succeeded
-                && record.version == 5
+                && record.version == 6
                 && record.diagnostics.iter().any(|diagnostic| {
                     diagnostic.code == "TESTGEN"
                         && diagnostic.generated_file.as_deref() == Some("lualatex.log")

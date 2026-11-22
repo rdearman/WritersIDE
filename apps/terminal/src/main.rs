@@ -958,6 +958,30 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "compile.suppressions",
+            "Diagnostic Suppressions",
+            "Review active, stale, expired, and revoked finding suppressions",
+            "Compile",
+            "compile-suppressions",
+            false,
+        ),
+        legacy_command(
+            "compile.suppress",
+            "Suppress Compile Finding",
+            "Suppress a current finding by rule, scene, or exact finding with a reason",
+            "Compile",
+            "compile-suppress",
+            true,
+        ),
+        legacy_command(
+            "compile.unsuppress",
+            "Revoke Diagnostic Suppression",
+            "Revoke a persisted diagnostic suppression by ID",
+            "Compile",
+            "compile-unsuppress",
+            true,
+        ),
+        legacy_command(
             "compile.preview-output",
             "Preview Latest Compile Output",
             "Open the latest successful Compile artifact in the system viewer",
@@ -9102,6 +9126,69 @@ impl AppState {
                 .join(format!("assembly-{assembly}.md"));
             fs::write(&destination, text.as_bytes())?;
             self.message = format!("Compiled assembly to {}", destination.display());
+        } else if cmd == "compile-suppressions" {
+            let suppressions = self.app.diagnostic_suppressions()?;
+            let content = if suppressions.is_empty() {
+                "No diagnostic suppressions are recorded.".to_owned()
+            } else {
+                suppressions
+                    .iter()
+                    .map(|entry| {
+                        format!(
+                            "{} · {} [{}] · {} · {}{}{}",
+                            entry.id,
+                            entry.rule_id,
+                            entry.scope,
+                            entry.status,
+                            entry.reason,
+                            entry
+                                .scene_id
+                                .as_deref()
+                                .map(|id| format!(" · scene {id}"))
+                                .unwrap_or_default(),
+                            entry
+                                .expires_unix_ms
+                                .map(|at| format!(" · expires {at}ms"))
+                                .unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            };
+            self.open_reference_buffer(
+                "diagnostic-suppressions:project".into(),
+                None,
+                "Diagnostic Suppressions".into(),
+                content,
+            );
+            self.reference_focused = true;
+        } else if let Some(arguments) = cmd.strip_prefix("compile-suppress ") {
+            let mut parts = arguments.splitn(3, ' ');
+            let index: usize = parts
+                .next()
+                .ok_or("usage: compile-suppress <number> <rule|scene|finding> <reason>")?
+                .parse()?;
+            let scope = parts.next().ok_or("missing suppression scope")?;
+            let reason = parts.next().ok_or("a suppression reason is required")?;
+            let findings = self.app.compile_diagnostics()?;
+            let finding = findings
+                .get(
+                    index
+                        .checked_sub(1)
+                        .ok_or("diagnostic numbers start at 1")?,
+                )
+                .ok_or("diagnostic number is out of range")?;
+            let id = self
+                .app
+                .add_diagnostic_suppression(finding, scope, reason, None)?;
+            self.message = format!("Suppressed {} by {scope} · {id}", finding.code);
+        } else if let Some(id) = cmd.strip_prefix("compile-unsuppress ") {
+            let id = id.trim();
+            if id.is_empty() || id.chars().any(char::is_whitespace) {
+                return Err("usage: compile-unsuppress <suppression-id>".into());
+            }
+            self.app.revoke_diagnostic_suppression(id)?;
+            self.message = format!("Revoked diagnostic suppression {id}");
         } else if cmd == "compile-results" || cmd.starts_with("compile-results ") {
             let filter = cmd
                 .strip_prefix("compile-results")
@@ -15114,7 +15201,7 @@ fn compile_diagnostics_reference_text(
         .enumerate()
         .map(|(index, item)| {
             format!(
-                "{}. {} [{}] · {:?}{} · {}{}{}",
+                "{}. {} [{}] · {:?}{} · {}{}{}{}",
                 index + 1,
                 item.code,
                 item.category,
@@ -15134,6 +15221,10 @@ fn compile_diagnostics_reference_text(
                     String::new()
                 },
                 item.message,
+                item.suppressed_by
+                    .as_deref()
+                    .map(|id| format!(" · suppressed by {id}"))
+                    .unwrap_or_default(),
                 item.source_entity_id
                     .map(|id| format!(" · source {id}"))
                     .unwrap_or_default(),
@@ -20162,6 +20253,65 @@ mod tests {
             .execute_legacy_palette_command("compile-config run plain -w")
             .unwrap();
         assert!(state.message.contains("Compile plain success"));
+    }
+
+    #[test]
+    fn terminal_creates_reviews_and_revokes_diagnostic_suppressions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "TODO: review.")
+            .unwrap();
+        let finding = app
+            .compile_diagnostics()
+            .unwrap()
+            .iter()
+            .position(|item| item.code == "PUB004")
+            .unwrap()
+            + 1;
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command(&format!(
+                "compile-suppress {finding} finding intentional draft marker"
+            ))
+            .unwrap();
+        assert!(state.message.contains("Suppressed PUB004 by finding"));
+        let id = state.app.diagnostic_suppressions().unwrap()[0].id.clone();
+        let diagnostics = state.app.compile_diagnostics().unwrap();
+        assert!(
+            diagnostics
+                .iter()
+                .find(|item| item.code == "PUB004")
+                .unwrap()
+                .suppressed
+        );
+        state
+            .execute_legacy_palette_command("compile-suppressions")
+            .unwrap();
+        assert!(state.reference_focused);
+        assert!(
+            state.reference_panes[state.active_reference]
+                .content
+                .contains("intentional draft marker")
+        );
+        state
+            .execute_legacy_palette_command(&format!("compile-unsuppress {id}"))
+            .unwrap();
+        assert_eq!(
+            state.app.diagnostic_suppressions().unwrap()[0].status,
+            "revoked"
+        );
+        assert!(
+            state
+                .app
+                .compile_diagnostics()
+                .unwrap()
+                .iter()
+                .find(|item| item.code == "PUB004")
+                .is_some_and(|item| !item.suppressed)
+        );
     }
 
     #[test]

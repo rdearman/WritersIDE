@@ -55,6 +55,7 @@ const MIGRATION_38: &str = include_str!("../migrations/0038_content_unit_languag
 const MIGRATION_39: &str = include_str!("../migrations/0039_reading_language.sql");
 const MIGRATION_40: &str = include_str!("../migrations/0040_story_interval_boundaries.sql");
 const MIGRATION_41: &str = include_str!("../migrations/0041_event_relationships.sql");
+const MIGRATION_42: &str = include_str!("../migrations/0042_diagnostic_suppressions.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -920,6 +921,21 @@ pub struct ImportRunSummary {
     pub source_items: u64,
     pub provenance_records: u64,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DiagnosticSuppressionRecord {
+    pub id: String,
+    pub rule_id: String,
+    pub scope: String,
+    pub scene_id: Option<String>,
+    pub finding_fingerprint: Option<String>,
+    pub reason: String,
+    pub created_unix_ms: i64,
+    pub expires_unix_ms: Option<i64>,
+    pub triggering_fingerprint: Option<String>,
+    pub status: String,
+    pub last_checked_unix_ms: i64,
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ConflictResolution {
     KeepExternal,
@@ -927,6 +943,89 @@ pub enum ConflictResolution {
 }
 
 impl ProjectStore {
+    pub fn create_diagnostic_suppression(
+        &self,
+        suppression: &DiagnosticSuppressionRecord,
+    ) -> Result<()> {
+        let valid_scope = match suppression.scope.as_str() {
+            "rule" => suppression.scene_id.is_none() && suppression.finding_fingerprint.is_none(),
+            "scene" => suppression.scene_id.is_some() && suppression.finding_fingerprint.is_none(),
+            "finding" => {
+                suppression.scene_id.is_some() && suppression.finding_fingerprint.is_some()
+            }
+            _ => false,
+        };
+        if !valid_scope
+            || suppression.rule_id.trim().is_empty()
+            || suppression.reason.trim().is_empty()
+            || suppression.created_unix_ms < 0
+            || suppression.last_checked_unix_ms < 0
+            || suppression
+                .expires_unix_ms
+                .is_some_and(|expires| expires <= suppression.created_unix_ms)
+            || suppression.status != "active"
+        {
+            return Err(StorageError::Invalid(
+                "diagnostic suppression fields are invalid".into(),
+            ));
+        }
+        self.conn.execute(
+            "INSERT INTO diagnostic_suppression(id,rule_id,scope,scene_id,finding_fingerprint,reason,created_unix_ms,expires_unix_ms,triggering_fingerprint,status,last_checked_unix_ms) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            params![suppression.id, suppression.rule_id, suppression.scope,
+                suppression.scene_id, suppression.finding_fingerprint, suppression.reason,
+                suppression.created_unix_ms, suppression.expires_unix_ms,
+                suppression.triggering_fingerprint, suppression.status,
+                suppression.last_checked_unix_ms],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_diagnostic_suppressions(&self) -> Result<Vec<DiagnosticSuppressionRecord>> {
+        let mut statement = self.conn.prepare(
+            "SELECT id,rule_id,scope,scene_id,finding_fingerprint,reason,created_unix_ms,expires_unix_ms,triggering_fingerprint,status,last_checked_unix_ms FROM diagnostic_suppression ORDER BY created_unix_ms,id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(DiagnosticSuppressionRecord {
+                id: row.get(0)?,
+                rule_id: row.get(1)?,
+                scope: row.get(2)?,
+                scene_id: row.get(3)?,
+                finding_fingerprint: row.get(4)?,
+                reason: row.get(5)?,
+                created_unix_ms: row.get(6)?,
+                expires_unix_ms: row.get(7)?,
+                triggering_fingerprint: row.get(8)?,
+                status: row.get(9)?,
+                last_checked_unix_ms: row.get(10)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(StorageError::from)
+    }
+
+    pub fn update_diagnostic_suppression_state(
+        &self,
+        id: &str,
+        status: &str,
+        checked_unix_ms: i64,
+    ) -> Result<()> {
+        if !matches!(status, "active" | "stale" | "expired" | "revoked") || checked_unix_ms < 0 {
+            return Err(StorageError::Invalid(
+                "diagnostic suppression state is invalid".into(),
+            ));
+        }
+        let changed = self.conn.execute(
+            "UPDATE diagnostic_suppression SET status=?2,last_checked_unix_ms=?3 WHERE id=?1",
+            params![id, status, checked_unix_ms],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(format!(
+                "diagnostic suppression {id}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Applies a historical set of Git-owned files as one recoverable operation.
     /// Prepared and original bytes are fsynced before the first canonical file changes.
     pub fn restore_git_files(&mut self, changes: &[GitRestoreFile]) -> Result<()> {
@@ -1344,6 +1443,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_39}\nINSERT INTO schema_migrations(version,applied_at) VALUES(39,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_40}\nINSERT INTO schema_migrations(version,applied_at) VALUES(40,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_41}\nINSERT INTO schema_migrations(version,applied_at) VALUES(41,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_42}\nINSERT INTO schema_migrations(version,applied_at) VALUES(42,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1392,7 +1492,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 41 {
+        if version > 42 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1557,6 +1657,10 @@ impl ProjectStore {
         }
         if current_version == 40 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_41}\nINSERT INTO schema_migrations(version,applied_at) VALUES(41,'{}');\nCOMMIT;", now()))?;
+            current_version = 41;
+        }
+        if current_version == 41 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_42}\nINSERT INTO schema_migrations(version,applied_at) VALUES(42,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -10034,7 +10138,7 @@ mod tests {
         let project = directory.path().join("Book");
         let store = ProjectStore::create(&project, "Book").unwrap();
         store.conn.execute_batch(
-            "DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
+            "DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
         ).unwrap();
         drop(store);
 
@@ -10060,7 +10164,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 41);
+        assert_eq!(version, 42);
     }
     #[test]
     fn event_character_and_location_relationships_are_typed_atomic_and_persistent() {
@@ -10119,7 +10223,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 41);
+        assert_eq!(schema_version, 42);
     }
     #[test]
     fn writing_challenges_are_validated_persisted_and_completed_once() {
@@ -11819,7 +11923,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 41))
+            .map(|version| assert_eq!(version, 42))
             .unwrap();
     }
 
@@ -12100,7 +12204,7 @@ mod tests {
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch("DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code; DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
-        conn.execute_batch("DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TABLE diagnostic_suppression; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -12110,7 +12214,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 41);
+        assert_eq!(version, 42);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -12199,6 +12303,7 @@ mod tests {
              DROP TABLE story_event_location;
              DROP TABLE story_event_interval_boundary;
              DROP TABLE scene_interval_boundary;
+             DROP TABLE diagnostic_suppression;
              DELETE FROM schema_migrations WHERE version>=9;",
         )
         .unwrap();
@@ -13702,5 +13807,68 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 1]
         );
+    }
+
+    #[test]
+    fn diagnostic_suppression_storage_enforces_scope_reason_and_lifecycle_states() {
+        let directory = tempdir().unwrap();
+        let store = ProjectStore::create(directory.path().join("Novel"), "Novel").unwrap();
+        let valid = DiagnosticSuppressionRecord {
+            id: Uuid::new_v4().to_string(),
+            rule_id: "PUB004".into(),
+            scope: "finding".into(),
+            scene_id: Some(Uuid::new_v4().to_string()),
+            finding_fingerprint: Some("fingerprint".into()),
+            reason: "known intentional placeholder".into(),
+            created_unix_ms: 100,
+            expires_unix_ms: Some(200),
+            triggering_fingerprint: Some("project-fingerprint".into()),
+            status: "active".into(),
+            last_checked_unix_ms: 100,
+        };
+        store.create_diagnostic_suppression(&valid).unwrap();
+        let listed = store.list_diagnostic_suppressions().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0], valid);
+        store
+            .update_diagnostic_suppression_state(&valid.id, "stale", 150)
+            .unwrap();
+        assert_eq!(
+            store.list_diagnostic_suppressions().unwrap()[0].status,
+            "stale"
+        );
+        store
+            .update_diagnostic_suppression_state(&valid.id, "active", 175)
+            .unwrap();
+        assert_eq!(
+            store.list_diagnostic_suppressions().unwrap()[0].status,
+            "active"
+        );
+
+        let invalid_scope = DiagnosticSuppressionRecord {
+            id: Uuid::new_v4().to_string(),
+            scope: "scene".into(),
+            scene_id: None,
+            finding_fingerprint: Some("orphan".into()),
+            reason: "invalid scope shape".into(),
+            ..valid.clone()
+        };
+        assert!(store.create_diagnostic_suppression(&invalid_scope).is_err());
+        let invalid_expiry = DiagnosticSuppressionRecord {
+            id: Uuid::new_v4().to_string(),
+            created_unix_ms: 100,
+            expires_unix_ms: Some(100),
+            last_checked_unix_ms: 100,
+            ..valid.clone()
+        };
+        assert!(
+            store
+                .create_diagnostic_suppression(&invalid_expiry)
+                .is_err()
+        );
+        assert!(store.conn.execute(
+            "INSERT INTO diagnostic_suppression(id,rule_id,scope,reason,created_unix_ms,last_checked_unix_ms,status) VALUES('bad','PUB004','finding','bad',1,1,'active')",
+            [],
+        ).is_err());
     }
 }

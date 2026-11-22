@@ -1778,6 +1778,63 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 app.write_proofreading_config(preset)?.display()
             );
         }
+        "diagnostic-suppressions" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app.diagnostic_suppressions()?)?
+            );
+        }
+        "diagnostic-unsuppress" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = args.next().ok_or("missing suppression ID")?;
+            if args.next().is_some() {
+                return Err("diagnostic-unsuppress accepts one suppression ID".into());
+            }
+            let app = WriterApp::open_project(path)?;
+            app.revoke_diagnostic_suppression(&id)?;
+            println!("Revoked diagnostic suppression {id}");
+        }
+        "diagnostic-suppress" => {
+            let path = args.next().ok_or("missing project path")?;
+            let code = args.next().ok_or("missing diagnostic rule ID")?;
+            let scope = args.next().ok_or("missing suppression scope")?;
+            let target = args
+                .next()
+                .ok_or("missing scene ID or '-' for rule scope")?;
+            let mut remaining = args.collect::<Vec<_>>();
+            let expires_unix_ms = remaining
+                .last()
+                .and_then(|value| value.strip_prefix("--expires="))
+                .map(str::parse::<i64>)
+                .transpose()?;
+            if expires_unix_ms.is_some() {
+                remaining.pop();
+            }
+            let reason = remaining.join(" ");
+            if reason.trim().is_empty() {
+                return Err("diagnostic-suppress requires a reason".into());
+            }
+            if scope == "rule" && target != "-" {
+                return Err("rule-scope suppression target must be '-'".into());
+            }
+            if scope != "rule" && target == "-" {
+                return Err("scene and finding suppressions require a scene ID".into());
+            }
+            let mut app = WriterApp::open_project(path)?;
+            let finding = app
+                .compile_diagnostics()?
+                .into_iter()
+                .find(|diagnostic| {
+                    diagnostic.code == code
+                        && (scope == "rule"
+                            || diagnostic.source_entity_id.as_deref() == Some(&target))
+                })
+                .ok_or("no matching current diagnostic was found")?;
+            let id = app.add_diagnostic_suppression(&finding, &scope, &reason, expires_unix_ms)?;
+            println!("Created {scope} suppression {id} for {code}");
+        }
         "process" => {
             let path = args.next().ok_or("missing project path")?;
             let mut expand_transclusions = false;
@@ -3497,6 +3554,12 @@ writers-ide spellcheck-hunspell <project> <language-tag> [project-relative-wordl
     );
     eprintln!(
         "writers-ide proofread-config <project> [quiet|drafting|copyedit|publication|thorough|extended|pedantic] (creates editable .writers-ide/diagnostics.toml; never overwrites)"
+    );
+    eprintln!(
+        "writers-ide diagnostic-suppress <project> <rule-id> <rule|scene|finding> <scene-id|-> <reason...> [--expires=UNIX_MS]"
+    );
+    eprintln!(
+        "writers-ide diagnostic-suppressions <project> | diagnostic-unsuppress <project> <suppression-id>"
     );
     eprintln!(
         "writers-ide typography-preview <project> [all|scene:SCENE-UUID] (read-only suggestions)"

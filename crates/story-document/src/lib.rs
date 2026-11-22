@@ -1240,6 +1240,10 @@ pub struct CompileDiagnostic {
     pub generated_file: Option<String>,
     #[serde(default)]
     pub generated_line: Option<u32>,
+    #[serde(default)]
+    pub suppressed_by: Option<String>,
+    #[serde(default)]
+    pub suppressed: bool,
 }
 
 impl CompileDiagnostic {
@@ -1249,6 +1253,22 @@ impl CompileDiagnostic {
             DiagnosticSeverity::Warning => DiagnosticLevel::Warning,
             DiagnosticSeverity::Information => DiagnosticLevel::Information,
         })
+    }
+
+    /// Stable identity for a finding dismissal. Any changed rule, source
+    /// entity, location, or diagnostic message requires revalidation.
+    pub fn finding_fingerprint(&self) -> String {
+        let material = format!(
+            "{:?}",
+            (
+                &self.code,
+                &self.category,
+                &self.message,
+                &self.source_entity_id,
+                &self.source_range,
+            )
+        );
+        format!("{:x}", Sha256::digest(material.as_bytes()))
     }
 }
 
@@ -1280,6 +1300,8 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
             source_range: None,
             generated_file: None,
             generated_line: None,
+            suppressed_by: None,
+            suppressed: false,
         });
     }
     if ir.units.is_empty() {
@@ -1294,6 +1316,8 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
             source_range: None,
             generated_file: None,
             generated_line: None,
+            suppressed_by: None,
+            suppressed: false,
         });
     }
     for unit in &ir.units {
@@ -1313,6 +1337,8 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
                 source_range: None,
                 generated_file: None,
                 generated_line: None,
+                suppressed_by: None,
+                suppressed: false,
             });
         }
         let placeholder_count = unit
@@ -1345,6 +1371,8 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
                     .find_map(|segment| first_placeholder_range(&segment.document.source)),
                 generated_file: None,
                 generated_line: None,
+                suppressed_by: None,
+                suppressed: false,
             });
         }
     }
@@ -1393,6 +1421,8 @@ pub fn deterministic_diagnostics(
                 source_range: None,
                 generated_file: None,
                 generated_line: None,
+                suppressed_by: None,
+                suppressed: false,
             });
         } else if policy
             .short_chapter_threshold_words
@@ -1416,6 +1446,8 @@ pub fn deterministic_diagnostics(
                 source_range: None,
                 generated_file: None,
                 generated_line: None,
+                suppressed_by: None,
+                suppressed: false,
             });
         }
     }
@@ -1838,6 +1870,8 @@ fn parse_lualatex_log(log: &[u8]) -> Vec<CompileDiagnostic> {
             source_range: None,
             generated_file: Some("lualatex.log".into()),
             generated_line: Some(index.saturating_add(1).min(u32::MAX as usize) as u32),
+            suppressed_by: None,
+            suppressed: false,
         });
     }
     findings
@@ -2053,6 +2087,8 @@ output = "exports/old.md"
             source_range: Some(SourceRange { start: 4, end: 8 }),
             generated_file: None,
             generated_line: None,
+            suppressed_by: None,
+            suppressed: false,
         };
         let standard = DiagnosticPolicy::default();
         assert_eq!(
