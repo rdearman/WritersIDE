@@ -4847,6 +4847,9 @@ impl AppState {
                 scene_id: session.scene_id,
                 initial_words: session.start_words,
             });
+        let selected_series_root = story_series::SeriesStore::open_for_book(app.project_root())
+            .ok()
+            .map(|(series, _)| series.root().to_owned());
         let existing_notice = draft_notice
             .into_iter()
             .chain([
@@ -4911,7 +4914,7 @@ impl AppState {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
-            selected_series_root: None,
+            selected_series_root,
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
@@ -8218,6 +8221,16 @@ impl AppState {
             CommandAction::RestoreRevisionHunk if self.dirty => {
                 Some("Save the manuscript buffer first")
             }
+            _ if matches!(
+                spec.id,
+                "series.add-current"
+                    | "series.import-scrivener"
+                    | "series.new-book"
+                    | "series.references"
+            ) && self.selected_series_root.is_none() =>
+            {
+                Some("Select or create a series first")
+            }
             _ => None,
         }
     }
@@ -8653,6 +8666,7 @@ impl AppState {
                     };
                     if let Some(reason) = self.command_disabled_reason(spec) {
                         self.message = format!("{} unavailable: {reason}", spec.label);
+                        self.menu = Some(menu);
                         return Ok(());
                     }
                     if spec.takes_arguments {
@@ -30580,6 +30594,37 @@ mod tests {
                 .iter()
                 .all(|entry| matches!(entry, MenuEntry::Group(_)))
         );
+    }
+
+    #[test]
+    fn series_actions_without_series_context_are_disabled_and_keep_the_menu_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        for id in [
+            "series.add-current",
+            "series.import-scrivener",
+            "series.new-book",
+            "series.references",
+        ] {
+            assert_eq!(
+                state.command_disabled_reason(command_by_id(id).unwrap()),
+                Some("Select or create a series first"),
+                "{id} should explain its missing series context"
+            );
+        }
+        assert_eq!(
+            state.command_disabled_reason(command_by_id("series.create").unwrap()),
+            None
+        );
+
+        select_series_menu_action(&mut state, "series.new-book").unwrap();
+        assert!(
+            state.menu.is_some(),
+            "an unavailable action must not close the menu"
+        );
+        assert!(state.message.contains("Select or create a series first"));
+        assert!(state.series_form.is_none());
     }
 
     #[test]
