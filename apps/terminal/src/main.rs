@@ -292,6 +292,7 @@ struct ScrivenerImportWizard {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SeriesFormKind {
+    NewProject,
     CreateSeries,
     SelectSeries,
     AddCurrentBook,
@@ -304,6 +305,7 @@ enum SeriesFormKind {
 impl SeriesFormKind {
     fn fields(self) -> &'static [&'static str] {
         match self {
+            Self::NewProject => &["New project directory", "Project title"],
             Self::CreateSeries => &["Series directory", "Series title"],
             Self::SelectSeries => &["Series directory"],
             Self::AddCurrentBook => &["Book title"],
@@ -418,13 +420,13 @@ const MENU_CATEGORY_COMMAND_IDS: [&str; 8] = [
 ];
 const MENU_COMMON_COMMANDS: [&[&str]; 8] = [
     &[
+        "file.new-project",
         "file.open-project",
         "file.save",
         "file.quit",
         "series.import-scrivener",
         "series.create",
         "series.open",
-        "series.new-book",
     ],
     &[
         "search.find-panel",
@@ -912,6 +914,7 @@ enum CommandAction {
     OpenMainMenu,
     OpenCommandPalette,
     OpenMenuCategory(usize),
+    NewProject,
     Save,
     RequestQuit,
     Help,
@@ -1039,6 +1042,21 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::OpenMainMenu,
         },
         CommandSpec {
+            id: "file.new-project",
+            label: "New Project",
+            description: "Create and open a new novel project",
+            category: "File",
+            default_shortcuts: &["Ctrl+N"],
+            mnemonic: Some('n'),
+            palette_aliases: &[],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Projects & Books",
+            menu_priority: 1,
+            advanced: false,
+            action: CommandAction::NewProject,
+        },
+        CommandSpec {
             id: "file.open-project",
             label: "Open Project",
             description: "Open a Writer's IDE project directory",
@@ -1049,7 +1067,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: Some("open-project"),
             takes_arguments: true,
             task_group: "Project & Files",
-            menu_priority: 1,
+            menu_priority: 2,
             advanced: false,
             action: CommandAction::LegacyPalette,
         },
@@ -2911,7 +2929,13 @@ fn command_registry() -> Vec<CommandSpec> {
 fn task_group_for_command(command: CommandSpec) -> &'static str {
     let id = command.id;
     match menu_category(&command) {
-        "File" if id.starts_with("series.") || id.starts_with("project.") => "Projects & Books",
+        "File"
+            if id.starts_with("series.")
+                || id.starts_with("project.")
+                || id.starts_with("file.") =>
+        {
+            "Projects & Files"
+        }
         "File" if id.starts_with("revision.") || id.starts_with("git.") => "History & Recovery",
         "File" => "Files & Imports",
         "Edit"
@@ -5861,6 +5885,7 @@ impl AppState {
     }
     fn start_series_form(&mut self, command_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let kind = match command_id {
+            "file.new-project" => SeriesFormKind::NewProject,
             "series.create" => SeriesFormKind::CreateSeries,
             "series.select" => SeriesFormKind::SelectSeries,
             "series.add-current" => SeriesFormKind::AddCurrentBook,
@@ -5872,7 +5897,8 @@ impl AppState {
         };
         if !matches!(
             kind,
-            SeriesFormKind::CreateSeries
+            SeriesFormKind::NewProject
+                | SeriesFormKind::CreateSeries
                 | SeriesFormKind::SelectSeries
                 | SeriesFormKind::CreateStoryLink
                 | SeriesFormKind::DeleteStoryLink
@@ -5934,6 +5960,50 @@ impl AppState {
         values: &[String],
     ) -> Result<(), Box<dyn std::error::Error>> {
         match kind {
+            SeriesFormKind::NewProject => {
+                let path = PathBuf::from(&values[0]);
+                if self.dirty {
+                    return Err(
+                        "save the current manuscript buffer before creating a project".into(),
+                    );
+                }
+                if self.active_challenge.is_some() {
+                    return Err(
+                        "finish or quit the active writing challenge before creating a project"
+                            .into(),
+                    );
+                }
+                if fs::symlink_metadata(&path).is_ok() {
+                    return Err("project destination already exists; choose a new directory".into());
+                }
+                let parent = path
+                    .parent()
+                    .filter(|parent| !parent.as_os_str().is_empty());
+                if let Some(parent) = parent {
+                    fs::create_dir_all(parent)?;
+                }
+                if let Err(error) = fs::create_dir(&path) {
+                    return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+                        "project destination already exists; choose a new directory".into()
+                    } else {
+                        error.into()
+                    });
+                }
+                if let Err(error) = WriterApp::create_project(&path, &values[1]) {
+                    let _ = fs::remove_dir_all(&path);
+                    return Err(error.into());
+                }
+                match self.switch_to_project(
+                    path.clone(),
+                    format!("Created and opened project: {}", values[1]),
+                ) {
+                    Ok(()) => {}
+                    Err(error) => {
+                        let _ = fs::remove_dir_all(path);
+                        return Err(error);
+                    }
+                }
+            }
             SeriesFormKind::CreateSeries => {
                 let series = story_series::SeriesStore::create(&values[0], &values[1])?;
                 self.selected_series_root = Some(series.root().to_owned());
@@ -8121,6 +8191,12 @@ impl AppState {
     }
     fn command_disabled_reason(&self, spec: CommandSpec) -> Option<&'static str> {
         match spec.action {
+            CommandAction::NewProject if self.dirty => {
+                Some("Save the manuscript buffer before creating a project")
+            }
+            CommandAction::NewProject if self.active_challenge.is_some() => {
+                Some("Finish or quit the writing challenge before creating a project")
+            }
             CommandAction::Save
                 if self.editing_scene.is_none()
                     && self.editing_content_unit.is_none()
@@ -8821,6 +8897,7 @@ impl AppState {
                 }
             }
             CommandAction::OpenMenuCategory(index) => self.open_menu_category(index),
+            CommandAction::NewProject => self.start_series_form("file.new-project")?,
             CommandAction::Save => self.save()?,
             CommandAction::RequestQuit => self.request_quit(),
             CommandAction::Help => self.show_context_help(),
@@ -18065,6 +18142,7 @@ fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let fields = form.kind.fields();
     let field = fields.get(form.values.len()).copied().unwrap_or("Value");
     let title = match form.kind {
+        SeriesFormKind::NewProject => " New Project ",
         SeriesFormKind::CreateStoryLink => " Create Story Relationship ",
         SeriesFormKind::DeleteStoryLink => " Remove Story Relationship ",
         _ => " Series setup ",
@@ -22061,12 +22139,12 @@ mod tests {
             all_commands: false,
             group: None,
         });
-        assert!(
-            state
-                .menu_commands()
-                .iter()
-                .any(|command| command.id == "file.open-project")
-        );
+        let open_project_index = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "file.open-project")
+            .expect("Open Project should be a common File action");
+        state.menu.as_mut().unwrap().selected = open_project_index;
 
         handle(
             &mut state,
@@ -22095,6 +22173,127 @@ mod tests {
         assert_eq!(state.app.get_project().unwrap().title, "Target Novel");
         assert_eq!(state.app.project_root(), target_path);
         assert!(state.message.contains("Opened project"));
+    }
+
+    #[test]
+    fn file_menu_creates_a_new_project_without_reusing_an_existing_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let file_menu = MENU_CATEGORIES
+            .iter()
+            .position(|name| *name == "File")
+            .unwrap();
+        state.menu = Some(MenuState {
+            top: file_menu,
+            selected: 0,
+            all_commands: false,
+            group: None,
+        });
+        assert_eq!(state.menu_commands()[0].id, "file.new-project");
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.series_form.as_ref().unwrap().kind,
+            SeriesFormKind::NewProject
+        );
+        for character in root.path().join("A New Project").to_string_lossy().chars() {
+            let modifiers = if character.is_ascii_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), modifiers),
+            )
+            .unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        for character in "A New Novel".chars() {
+            let modifiers = if character.is_ascii_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), modifiers),
+            )
+            .unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(state.app.get_project().unwrap().title, "A New Novel");
+        assert_eq!(state.app.project_root(), root.path().join("A New Project"));
+        assert!(state.message.contains("Created and opened project"));
+    }
+
+    #[test]
+    fn ctrl_n_opens_the_registered_new_project_form() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.series_form.as_ref().unwrap().kind,
+            SeriesFormKind::NewProject
+        );
+        assert_eq!(
+            SeriesFormKind::NewProject.fields(),
+            &["New project directory", "Project title"]
+        );
+    }
+
+    #[test]
+    fn new_project_action_rejects_an_existing_directory_without_switching() {
+        let root = tempfile::tempdir().unwrap();
+        let current = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
+        let target_path = root.path().join("Existing");
+        drop(WriterApp::create_project(&target_path, "Keep Existing").unwrap());
+        let mut state = AppState::new(current, default_bindings());
+        state.start_series_form("file.new-project").unwrap();
+        state.series_form.as_mut().unwrap().input = target_path.display().to_string();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        state.series_form.as_mut().unwrap().input = "Must Not Replace".into();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(state.app.get_project().unwrap().title, "Current");
+        assert!(state.message.contains("destination already exists"));
+        assert_eq!(
+            WriterApp::open_project(&target_path)
+                .unwrap()
+                .get_project()
+                .unwrap()
+                .title,
+            "Keep Existing"
+        );
     }
 
     #[test]
@@ -22461,21 +22660,24 @@ mod tests {
         state.menu = Some(MenuState {
             top,
             selected: 0,
-            all_commands: false,
+            all_commands: true,
             group: None,
         });
-        let selected = state
-            .menu_commands()
+        let command = command_by_id(command_id).ok_or("Series command is not registered")?;
+        let group = state
+            .menu_visible_entries()
             .iter()
-            .position(|command| command.id == command_id)
-            .ok_or("Series command is missing from the menu")?;
-        state.menu = Some(MenuState {
-            top,
-            selected,
-            all_commands: false,
-            group: None,
-        });
-        handle(state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+            .position(|entry| *entry == MenuEntry::Group(command.task_group))
+            .ok_or("Series command task group is missing from the menu")?;
+        state.menu.as_mut().unwrap().selected = group;
+        state.handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+        let selected = state
+            .menu_visible_entries()
+            .iter()
+            .position(|entry| matches!(entry, MenuEntry::Command(spec) if spec.id == command_id))
+            .ok_or("Series command is missing from its task group")?;
+        state.menu.as_mut().unwrap().selected = selected;
+        state.handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
         Ok(())
     }
 
