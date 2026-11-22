@@ -1819,6 +1819,14 @@ fn command_registry() -> Vec<CommandSpec> {
             false,
         ),
         legacy_command(
+            "mention.preview-at-cursor",
+            "Preview Mention at Cursor",
+            "Show the story-bible context for the mention under the manuscript cursor",
+            "Scene",
+            "mention-preview",
+            false,
+        ),
+        legacy_command(
             "mention.jump",
             "Jump to Story Mention",
             "Navigate to a detected passage",
@@ -7869,6 +7877,85 @@ impl AppState {
                 })
                 .collect::<Vec<_>>()
                 .join(" | ");
+        } else if cmd == "mention-preview" {
+            if self.dirty {
+                self.message =
+                    "Save the scene before previewing indexed story-bible mentions".into();
+                return Ok(());
+            }
+            let scene = self
+                .editing_scene
+                .or_else(|| self.active_scene())
+                .ok_or("open or select a scene first")?;
+            let cursor = u64::try_from(editor_position_byte(
+                &self.editor,
+                self.cursor.0,
+                self.cursor.1,
+            ))?;
+            let mentions = self.app.list_scene_mentions(scene)?;
+            let mention = mentions
+                .iter()
+                .find(|mention| mention.start_byte <= cursor && cursor < mention.end_byte)
+                .or_else(|| {
+                    mentions
+                        .iter()
+                        .find(|mention| mention.start_byte <= cursor && cursor == mention.end_byte)
+                });
+            let Some(mention) = mention else {
+                self.message = "No indexed story-bible mention at the cursor".into();
+                return Ok(());
+            };
+            let mut details = Vec::new();
+            if let (Some(kind), Some(id)) =
+                (mention.entity_kind.as_deref(), mention.entity_id.as_deref())
+            {
+                let profile = match kind {
+                    "character" => id
+                        .parse()
+                        .ok()
+                        .and_then(|id| self.app.get_character(story_core::CharacterId(id)).ok())
+                        .map(|entity| {
+                            format!("{} · {}", entity.preferred_name, entity.description)
+                        }),
+                    "location" => id
+                        .parse()
+                        .ok()
+                        .and_then(|id| self.app.get_location(story_core::LocationId(id)).ok())
+                        .map(|entity| format!("{} · {}", entity.name, entity.description)),
+                    "object" => self
+                        .app
+                        .list_story_objects()?
+                        .into_iter()
+                        .find(|entity| entity.id.to_string() == id)
+                        .map(|entity| format!("{} · {}", entity.name, entity.description)),
+                    _ => None,
+                };
+                if let Some(profile) = profile {
+                    details.push(format!("confirmed {kind}: {profile}"));
+                }
+            } else {
+                details.extend(mention.candidates.iter().map(|candidate| {
+                    format!(
+                        "{} candidate '{}' ({})",
+                        candidate.entity_kind, candidate.matched_name, candidate.entity_id
+                    )
+                }));
+            }
+            self.message = format!(
+                "{} · '{}' · {}{}",
+                mention.state,
+                mention.quote,
+                if details.is_empty() {
+                    "no current entity profile".to_owned()
+                } else {
+                    details.join("; ")
+                },
+                if mention.state == "confirmed" {
+                    " · textual reference only; participation is separate"
+                } else {
+                    " · unconfirmed candidate; no story facts changed"
+                }
+            );
         } else if let Some(value) = cmd.strip_prefix("mention-jump ") {
             let mention_id = story_core::MentionId(value.trim().parse()?);
             let scene_id = self
@@ -18675,6 +18762,47 @@ mod tests {
         assert_eq!(state.search_locations.len(), 2);
         assert_eq!(state.editing_scene, Some(first));
         assert_eq!(state.selected_text().as_deref(), Some("Silver Key"));
+    }
+
+    #[test]
+    fn mention_preview_at_cursor_shows_confirmed_profile_without_creating_participation() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Mentions"), "Mentions").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let object = app
+            .create_story_object("Silver Key", "A small brass key with a red thread.")
+            .unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Mara found the Silver Key.")
+            .unwrap();
+        let mention = app
+            .list_scene_mentions(scene)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.quote == "Silver Key")
+            .unwrap();
+        app.confirm_scene_mention(
+            mention.id,
+            story_core::MentionEntityKind::Object,
+            &object.to_string(),
+        )
+        .unwrap();
+
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        let text = state.editor.join("\n");
+        state.cursor = editor_position_from_byte(&text, text.find("Silver Key").unwrap()).unwrap();
+        state
+            .execute_legacy_palette_command("mention-preview")
+            .unwrap();
+        assert!(state.message.contains("confirmed object: Silver Key"));
+        assert!(
+            state
+                .message
+                .contains("A small brass key with a red thread")
+        );
+        assert!(state.message.contains("participation is separate"));
     }
 
     #[test]
