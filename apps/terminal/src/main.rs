@@ -149,6 +149,7 @@ struct AppState {
     search_locations: Vec<(SceneId, usize, usize)>,
     search_result_rows: Vec<String>,
     search_location_index: usize,
+    last_compile_diagnostic: Option<usize>,
     selected_scenes: BTreeSet<SceneId>,
     query_view: Option<story_core::QueryId>,
     proposal_review_active: bool,
@@ -848,6 +849,22 @@ fn command_registry() -> Vec<CommandSpec> {
             "Compile",
             "compile-results",
             true,
+        ),
+        legacy_command(
+            "compile.next-diagnostic",
+            "Next Compile Diagnostic",
+            "Navigate to the next current Compile finding",
+            "Compile",
+            "compile-next",
+            false,
+        ),
+        legacy_command(
+            "compile.previous-diagnostic",
+            "Previous Compile Diagnostic",
+            "Navigate to the previous current Compile finding",
+            "Compile",
+            "compile-previous",
+            false,
         ),
         legacy_command(
             "review.merge",
@@ -3437,6 +3454,7 @@ impl AppState {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
@@ -5424,6 +5442,62 @@ impl AppState {
         };
         self.editor_selection = Some(start);
         self.cursor = end;
+    }
+    fn navigate_to_compile_diagnostic(
+        &mut self,
+        diagnostic: story_document::CompileDiagnostic,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            self.message =
+                "Save the dirty editor buffer before navigating to Compile diagnostics".into();
+            return Ok(());
+        }
+        let Some(source) = diagnostic.source_entity_id else {
+            self.message = format!("{} has no canonical source entity", diagnostic.code);
+            return Ok(());
+        };
+        let uuid = source.parse::<uuid::Uuid>()?;
+        let source_range = diagnostic.source_range;
+        let scene = SceneId(uuid);
+        if self.app.get_scene(scene).is_ok() {
+            self.reference_focused = false;
+            self.open_scene(scene)?;
+            if let Some(range) = source_range {
+                self.select_compile_source_range(range);
+            }
+            self.message = format!("Opened Compile source scene {scene}");
+            return Ok(());
+        }
+        let content = story_core::ContentUnitId(uuid);
+        if self.app.get_content_unit(content).is_ok() {
+            self.reference_focused = false;
+            self.open_content_unit(content)?;
+            if let Some(range) = source_range {
+                self.select_compile_source_range(range);
+            }
+            self.message = format!("Opened Compile source chapter content {content}");
+            return Ok(());
+        }
+        self.message = "Compile source entity no longer exists".into();
+        Ok(())
+    }
+    fn navigate_compile_diagnostic(
+        &mut self,
+        forward: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let diagnostics = self.app.compile_diagnostics()?;
+        if diagnostics.is_empty() {
+            self.message = "No current Compile diagnostics".into();
+            return Ok(());
+        }
+        let next = match self.last_compile_diagnostic {
+            Some(current) if forward => (current + 1) % diagnostics.len(),
+            Some(current) => (current + diagnostics.len() - 1) % diagnostics.len(),
+            None if forward => 0,
+            None => diagnostics.len() - 1,
+        };
+        self.last_compile_diagnostic = Some(next);
+        self.navigate_to_compile_diagnostic(diagnostics[next].clone())
     }
     fn navigate_search_match(&mut self, forward: bool) -> Result<(), Box<dyn std::error::Error>> {
         if self.search_locations.is_empty() {
@@ -9467,6 +9541,10 @@ impl AppState {
                 compile_diagnostics_reference_text(&self.app)?,
             );
             self.reference_focused = true;
+        } else if cmd == "compile-next" {
+            self.navigate_compile_diagnostic(true)?;
+        } else if cmd == "compile-previous" {
+            self.navigate_compile_diagnostic(false)?;
         } else if let Some(index) = cmd.strip_prefix("compile-jump ") {
             let index = index
                 .trim()
@@ -9475,33 +9553,13 @@ impl AppState {
             if index == 0 {
                 return Err("compile diagnostic indices start at 1".into());
             }
-            let diagnostic = self
-                .app
-                .compile_diagnostics()?
-                .into_iter()
-                .nth(index - 1)
+            let diagnostics = self.app.compile_diagnostics()?;
+            let diagnostic = diagnostics
+                .get(index - 1)
+                .cloned()
                 .ok_or("compile diagnostic index is no longer present")?;
-            let source_range = diagnostic.source_range;
-            let source = diagnostic
-                .source_entity_id
-                .ok_or("selected compile diagnostic has no source entity")?;
-            let uuid = source.parse::<uuid::Uuid>()?;
-            let scene = SceneId(uuid);
-            if self.app.get_scene(scene).is_ok() {
-                self.reference_focused = false;
-                self.open_scene(scene)?;
-                if let Some(range) = source_range {
-                    self.select_compile_source_range(range);
-                }
-            } else {
-                let content_unit = story_core::ContentUnitId(uuid);
-                self.app.get_content_unit(content_unit)?;
-                self.reference_focused = false;
-                self.open_content_unit(content_unit)?;
-                if let Some(range) = source_range {
-                    self.select_compile_source_range(range);
-                }
-            }
+            self.last_compile_diagnostic = Some(index - 1);
+            self.navigate_to_compile_diagnostic(diagnostic)?;
         } else if let Some(terms) = cmd.strip_prefix("reference-search ") {
             let terms = terms.trim();
             if terms.is_empty() {
@@ -18650,6 +18708,7 @@ mod tests {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
@@ -20154,6 +20213,42 @@ mod tests {
     }
 
     #[test]
+    fn compile_next_previous_commands_navigate_current_findings_from_reference_or_editor() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let (_, hash) = app.load_scene_text(first).unwrap();
+        app.save_scene_text(first, Some(&hash), "TODO: first fix.")
+            .unwrap();
+        let (_, hash) = app.load_scene_text(second).unwrap();
+        app.save_scene_text(second, Some(&hash), "[INSERT second clue]")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command("reference-diagnostics")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("compile-next")
+            .unwrap();
+        assert_eq!(state.editing_scene, Some(first));
+        assert_eq!(state.selected_text().as_deref(), Some("TODO"));
+        state
+            .execute_legacy_palette_command("compile-next")
+            .unwrap();
+        assert_eq!(state.editing_scene, Some(second));
+        assert_eq!(state.selected_text().as_deref(), Some("[INSERT"));
+        state
+            .execute_legacy_palette_command("compile-previous")
+            .unwrap();
+        assert_eq!(state.editing_scene, Some(first));
+        assert_eq!(state.selected_text().as_deref(), Some("TODO"));
+        assert!(command_by_id("compile.next-diagnostic").is_some());
+        assert!(command_by_id("compile.previous-diagnostic").is_some());
+    }
+
+    #[test]
     fn compile_results_reference_shows_run_target_diagnostics_and_source() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("Compile Results Novel");
@@ -21028,6 +21123,7 @@ mod tests {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
@@ -21140,6 +21236,7 @@ mod tests {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
@@ -21244,6 +21341,7 @@ mod tests {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
@@ -21360,6 +21458,7 @@ mod tests {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
@@ -21626,6 +21725,7 @@ mod tests {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
@@ -21742,6 +21842,7 @@ mod tests {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
@@ -21875,6 +21976,7 @@ mod tests {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
@@ -22126,6 +22228,7 @@ mod tests {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
@@ -22508,6 +22611,7 @@ mod tests {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
@@ -22635,6 +22739,7 @@ mod tests {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
@@ -22814,6 +22919,7 @@ mod tests {
             search_locations: Vec::new(),
             search_result_rows: Vec::new(),
             search_location_index: 0,
+            last_compile_diagnostic: None,
             selected_scenes: BTreeSet::new(),
             query_view: None,
             proposal_review_active: false,
