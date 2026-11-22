@@ -189,6 +189,7 @@ struct AppState {
     series_reference_view: bool,
     series_references: Vec<SeriesReferenceRow>,
     scrivener_import: Option<ScrivenerImportWizard>,
+    series_form: Option<SeriesActionForm>,
 }
 
 #[derive(Clone, Debug)]
@@ -268,6 +269,36 @@ struct ScrivenerImportWizard {
     book_title: String,
     inventory: story_import::ScrivenerProjectInventory,
     plan: story_import::ScrivenerImportPlan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SeriesFormKind {
+    CreateSeries,
+    SelectSeries,
+    AddCurrentBook,
+    ImportScrivener,
+    NewBook,
+}
+
+impl SeriesFormKind {
+    fn fields(self) -> &'static [&'static str] {
+        match self {
+            Self::CreateSeries => &["Series directory", "Series title"],
+            Self::SelectSeries => &["Series directory"],
+            Self::AddCurrentBook => &["Book title"],
+            Self::ImportScrivener => {
+                &["Scrivener .scriv project path", "Book folder", "Book title"]
+            }
+            Self::NewBook => &["Book folder", "Book title"],
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct SeriesActionForm {
+    kind: SeriesFormKind,
+    values: Vec<String>,
+    input: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -2255,7 +2286,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command(
             "series.create",
             "Create Series",
-            "Create a portable series: series-create <directory> | <title>",
+            "Create a portable series with a guided directory and title form",
             "Series",
             "series-create",
             true,
@@ -2263,7 +2294,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command(
             "series.select",
             "Select Series",
-            "Open a series by directory: series-select <series-directory>",
+            "Open an existing series with a guided directory form",
             "Series",
             "series-select",
             true,
@@ -2271,7 +2302,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command(
             "series.add-current",
             "Add Current Book to Series",
-            "Register this project in the selected series with a book title",
+            "Register this project in the selected series with a guided title form",
             "Series",
             "series-add-current",
             true,
@@ -2279,7 +2310,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command(
             "series.import-scrivener",
             "Import Scrivener Book into Series",
-            "Preview and map a read-only Scrivener source: series-import <source> | <folder> | <title>",
+            "Choose a Scrivener project and book name, then preview and map its binder",
             "Series",
             "series-import",
             true,
@@ -2287,7 +2318,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command(
             "series.new-book",
             "New Book in Series",
-            "Create and open a separate book: series-new-book <folder> | <title>",
+            "Create and open a separate book with guided folder and title forms",
             "Series",
             "series-new-book",
             true,
@@ -3468,6 +3499,7 @@ impl AppState {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings,
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -4314,6 +4346,111 @@ impl AppState {
             return series_books_at(root);
         }
         current_series_books(&self.app)
+    }
+    fn start_series_form(&mut self, command_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let kind = match command_id {
+            "series.create" => SeriesFormKind::CreateSeries,
+            "series.select" => SeriesFormKind::SelectSeries,
+            "series.add-current" => SeriesFormKind::AddCurrentBook,
+            "series.import-scrivener" => SeriesFormKind::ImportScrivener,
+            "series.new-book" => SeriesFormKind::NewBook,
+            _ => return Err("unknown Series form action".into()),
+        };
+        if !matches!(
+            kind,
+            SeriesFormKind::CreateSeries | SeriesFormKind::SelectSeries
+        ) {
+            self.series_root()?;
+        }
+        self.series_form = Some(SeriesActionForm {
+            kind,
+            values: Vec::new(),
+            input: String::new(),
+        });
+        self.menu = None;
+        self.message = "Enter a value · Enter continues · Esc cancels".into();
+        Ok(())
+    }
+    fn handle_series_form_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(mut form) = self.series_form.take() else {
+            return Ok(());
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.message = "Series action cancelled; no project or source was changed".into();
+            }
+            KeyCode::Enter => {
+                if form.input.trim().is_empty() {
+                    self.message = "This field is required".into();
+                    self.series_form = Some(form);
+                    return Ok(());
+                }
+                form.values.push(form.input.trim().to_owned());
+                form.input.clear();
+                if form.values.len() == form.kind.fields().len() {
+                    if let Err(error) = self.complete_series_form(form.kind, &form.values) {
+                        self.message = format!("Series action failed: {error}");
+                    }
+                } else {
+                    self.series_form = Some(form);
+                }
+            }
+            KeyCode::Backspace => {
+                form.input.pop();
+                self.series_form = Some(form);
+            }
+            KeyCode::Char(character)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                form.input.push(character);
+                self.series_form = Some(form);
+            }
+            _ => self.series_form = Some(form),
+        }
+        Ok(())
+    }
+    fn complete_series_form(
+        &mut self,
+        kind: SeriesFormKind,
+        values: &[String],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match kind {
+            SeriesFormKind::CreateSeries => {
+                let series = story_series::SeriesStore::create(&values[0], &values[1])?;
+                self.selected_series_root = Some(series.root().to_owned());
+                self.series_reference_view = false;
+                self.selected = 0;
+                self.switch(Workspace::Series);
+                self.message = format!("Created series '{}'", series.title());
+            }
+            SeriesFormKind::SelectSeries => {
+                let series = story_series::SeriesStore::open(&values[0])?;
+                self.selected_series_root = Some(series.root().to_owned());
+                self.series_reference_view = false;
+                self.selected = 0;
+                self.switch(Workspace::Series);
+                self.message = format!("Selected series '{}'", series.title());
+            }
+            SeriesFormKind::AddCurrentBook => {
+                let root = self.series_root()?;
+                let project_id = self.app.get_project()?.id;
+                let mut series = story_series::SeriesStore::open(&root)?;
+                let book =
+                    series.add_book(project_id, self.app.project_root(), &values[0], None)?;
+                self.selected_series_root = Some(root);
+                self.series_reference_view = false;
+                self.selected = 0;
+                self.switch(Workspace::Series);
+                self.message = format!("Added current project as '{}'", book.title);
+            }
+            SeriesFormKind::ImportScrivener => self.start_scrivener_import(
+                PathBuf::from(&values[0]),
+                values[1].clone(),
+                values[2].clone(),
+            )?,
+            SeriesFormKind::NewBook => self.create_series_book(&values[0], &values[1])?,
+        }
+        Ok(())
     }
     fn switch_to_project(
         &mut self,
@@ -6174,6 +6311,10 @@ impl AppState {
                         return Ok(());
                     }
                     if spec.takes_arguments {
+                        if spec.category == "Series" {
+                            self.start_series_form(spec.id)?;
+                            return Ok(());
+                        }
                         let prefix = spec
                             .palette_prefix
                             .ok_or("menu command has no command-palette route")?;
@@ -6217,6 +6358,10 @@ impl AppState {
                         return Ok(());
                     }
                     if spec.takes_arguments {
+                        if spec.category == "Series" {
+                            self.start_series_form(spec.id)?;
+                            return Ok(());
+                        }
                         let prefix = spec
                             .palette_prefix
                             .ok_or("menu command has no command-palette route")?;
@@ -12794,6 +12939,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.menu.is_some() {
         draw_menu_overlay(f, s);
     }
+    if s.series_form.is_some() {
+        draw_series_form_overlay(f, s);
+    }
 }
 
 struct TerminalSpellingFinding {
@@ -13607,6 +13755,53 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             ),
         panes[1],
         &mut ListState::default().with_selected(selected),
+    );
+}
+
+fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(form) = s.series_form.as_ref() else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.clamp(36, 76);
+    let height = 8.min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    let fields = form.kind.fields();
+    let field = fields.get(form.values.len()).copied().unwrap_or("Value");
+    f.render_widget(Clear, popup);
+    f.render_widget(
+        Paragraph::new(vec![
+            Line::from(format!(
+                "Step {} of {} · {}",
+                form.values.len() + 1,
+                fields.len(),
+                field
+            )),
+            Line::from(""),
+            Line::from(vec![
+                Span::raw("> "),
+                Span::styled(
+                    format!("{}▏", form.input),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from("Enter continues · Esc cancels"),
+        ])
+        .block(
+            Block::default()
+                .title(" Series setup ")
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Cyan)),
+        ),
+        popup,
     );
 }
 fn pane_direction(width: usize) -> Direction {
@@ -15904,6 +16099,10 @@ fn step_find_query_history(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if s.series_form.is_some() {
+        s.handle_series_form_key(k)?;
+        return Ok(false);
+    }
     if s.menu.is_some() {
         if is_menu_shortcut(k) || k.code == KeyCode::F(10) {
             s.toggle_menu();
@@ -16787,23 +16986,91 @@ mod tests {
     }
 
     #[test]
+    fn cancelling_series_menu_form_does_not_create_any_project_files() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Initial"), "Initial").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let series_path = root.path().join("Cancelled Series");
+        select_series_menu_action(&mut state, "series.create").unwrap();
+        for character in series_path.to_string_lossy().chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.series_form.is_some());
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.series_form.is_none());
+        assert!(!series_path.exists());
+    }
+
+    fn select_series_menu_action(
+        state: &mut AppState,
+        command_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let top = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Series")
+            .ok_or("Series menu category is missing")?;
+        state.menu = Some(MenuState { top, selected: 0 });
+        let selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == command_id)
+            .ok_or("Series command is missing from the menu")?;
+        state.menu = Some(MenuState { top, selected });
+        handle(state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+        Ok(())
+    }
+
+    fn enter_series_form_values(
+        state: &mut AppState,
+        values: &[&str],
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for value in values {
+            for character in value.chars() {
+                handle(
+                    state,
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                )?;
+            }
+            handle(state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
+        }
+        Ok(())
+    }
+
+    #[test]
     fn sanitized_scrivener_series_wizard_previews_maps_and_imports_without_touching_source() {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../cli/tests/fixtures/scrivener-windows-311/Windows Regression.scriv");
         let root = tempfile::tempdir().unwrap();
         let series_root = root.path().join("Series");
-        story_series::SeriesStore::create(&series_root, "Series").unwrap();
         let initial = WriterApp::create_project(root.path().join("Initial"), "Initial").unwrap();
         let mut state = AppState::new(initial, default_bindings());
-        state.selected_series_root = Some(series_root.clone());
+        select_series_menu_action(&mut state, "series.create").unwrap();
+        enter_series_form_values(&mut state, &[series_root.to_str().unwrap(), "Series"]).unwrap();
+        assert_eq!(
+            state.selected_series_root.as_deref(),
+            Some(series_root.as_path())
+        );
         let source_before = story_import::inspect_scrivener_project(&fixture)
             .unwrap()
             .source_fingerprint;
-        state
-            .start_scrivener_import(fixture.clone(), "Book-01".into(), "Book One".into())
-            .unwrap();
+        select_series_menu_action(&mut state, "series.import-scrivener").unwrap();
+        enter_series_form_values(
+            &mut state,
+            &[fixture.to_str().unwrap(), "Book-01", "Book One"],
+        )
+        .unwrap();
         assert_eq!(state.workspace, Workspace::Series);
         assert!(!workspace_items(&state).is_empty());
+        assert!(state.scrivener_import.is_some());
 
         use story_import::ScrivenerDestinationKind as Kind;
         let mapping_items = state
@@ -16887,6 +17154,44 @@ mod tests {
         assert!(report.is_file());
         let series = story_series::SeriesStore::open(&series_root).unwrap();
         assert_eq!(series.list_books().unwrap().len(), 1);
+
+        // Book 3 is created through the same menu form and immediately accepts
+        // chapter-level prose without requiring a scene or plot metadata.
+        select_series_menu_action(&mut state, "series.new-book").unwrap();
+        enter_series_form_values(&mut state, &["Book-03", "Book Three"]).unwrap();
+        assert_eq!(state.app.get_project().unwrap().title, "Book Three");
+        let chapter = state.app.create_chapter(None, "Chapter 1", 0).unwrap();
+        let prose = state
+            .app
+            .create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "Chapter prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, hash) = state.app.load_content_unit_text(prose).unwrap();
+        state
+            .app
+            .save_content_unit_text(prose, Some(&hash), "Book Three begins here.")
+            .unwrap();
+        drop(state);
+        let reopened = WriterApp::open_project(series_root.join("Book-03")).unwrap();
+        assert_eq!(reopened.list_scenes(false).unwrap().len(), 0);
+        assert_eq!(reopened.list_content_units(false).unwrap().len(), 1);
+        assert_eq!(
+            reopened.load_content_unit_text(prose).unwrap().0,
+            "Book Three begins here."
+        );
+        assert_eq!(
+            story_series::SeriesStore::open(&series_root)
+                .unwrap()
+                .list_books()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
@@ -18880,6 +19185,7 @@ mod tests {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -21295,6 +21601,7 @@ mod tests {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -21408,6 +21715,7 @@ mod tests {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -21513,6 +21821,7 @@ mod tests {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -21630,6 +21939,7 @@ mod tests {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -21897,6 +22207,7 @@ mod tests {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -22014,6 +22325,7 @@ mod tests {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -22148,6 +22460,7 @@ mod tests {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -22400,6 +22713,7 @@ mod tests {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -22783,6 +23097,7 @@ mod tests {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -22911,6 +23226,7 @@ mod tests {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
@@ -23091,6 +23407,7 @@ mod tests {
             series_reference_view: false,
             series_references: Vec::new(),
             scrivener_import: None,
+            series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             revision_diff: None,
