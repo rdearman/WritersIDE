@@ -374,6 +374,16 @@ struct MenuState {
 const MENU_CATEGORIES: [&str; 8] = [
     "File", "Edit", "Insert", "Navigate", "Review", "Publish", "Tools", "Help",
 ];
+const MENU_CATEGORY_COMMAND_IDS: [&str; 8] = [
+    "menu.file",
+    "menu.edit",
+    "menu.insert",
+    "menu.navigate",
+    "menu.review",
+    "menu.publish",
+    "menu.tools",
+    "menu.help",
+];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SessionSnapshot {
@@ -803,6 +813,7 @@ impl Default for ChallengeConfig {
 enum CommandAction {
     Workspace(Workspace),
     OpenMainMenu,
+    OpenMenuCategory(usize),
     Save,
     Help,
     RestoreRevisionHunk,
@@ -860,6 +871,33 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::Workspace(workspace),
         })
         .collect::<Vec<_>>();
+    commands.extend(
+        MENU_CATEGORIES
+            .iter()
+            .enumerate()
+            .map(|(index, category)| CommandSpec {
+                id: MENU_CATEGORY_COMMAND_IDS[index],
+                label: match *category {
+                    "File" => "Open File Menu",
+                    "Edit" => "Open Edit Menu",
+                    "Insert" => "Open Insert Menu",
+                    "Navigate" => "Open Navigate Menu",
+                    "Review" => "Open Review Menu",
+                    "Publish" => "Open Publish Menu",
+                    "Tools" => "Open Tools Menu",
+                    "Help" => "Open Help Menu",
+                    _ => "Open Menu",
+                },
+                description: "Open this top-level menu directly",
+                category: "Menu",
+                default_shortcuts: &[],
+                mnemonic: category.chars().next(),
+                palette_aliases: &[],
+                palette_prefix: None,
+                takes_arguments: false,
+                action: CommandAction::OpenMenuCategory(index),
+            }),
+    );
     commands.extend([
         CommandSpec {
             id: "menu.main",
@@ -3692,7 +3730,11 @@ fn parse_shortcut(value: &str) -> Result<KeyEvent, Box<dyn std::error::Error>> {
     if modifiers.is_empty() {
         return Err("command shortcuts must include Ctrl, Alt, or Shift".into());
     }
-    let code = if let Some(number) = key.strip_prefix('F').or_else(|| key.strip_prefix('f')) {
+    let function_number = key
+        .strip_prefix('F')
+        .or_else(|| key.strip_prefix('f'))
+        .filter(|number| !number.is_empty());
+    let code = if let Some(number) = function_number {
         let number: u8 = number.parse()?;
         if !(1..=14).contains(&number) || number == 10 {
             return Err("function shortcut must be F1–F9 or F11–F14".into());
@@ -7313,6 +7355,15 @@ impl AppState {
             self.message = "Main menu · arrows navigate · Enter selects · Esc closes".into();
         }
     }
+    fn open_menu_category(&mut self, index: usize) {
+        self.pending_command_sequence = None;
+        let top = index.min(MENU_CATEGORIES.len().saturating_sub(1));
+        self.menu = Some(MenuState { top, selected: 0 });
+        self.message = format!(
+            "{} menu · arrows navigate · Enter selects · Esc closes",
+            MENU_CATEGORIES[top]
+        );
+    }
     fn menu_commands(&self) -> Vec<CommandSpec> {
         let Some(menu) = self.menu else {
             return Vec::new();
@@ -7320,7 +7371,7 @@ impl AppState {
         let top = MENU_CATEGORIES[menu.top.min(MENU_CATEGORIES.len() - 1)];
         command_registry()
             .into_iter()
-            .filter(|spec| spec.id != "menu.main" && menu_category(spec) == top)
+            .filter(|spec| !spec.id.starts_with("menu.") && menu_category(spec) == top)
             .collect()
     }
     fn command_disabled_reason(&self, spec: CommandSpec) -> Option<&'static str> {
@@ -7887,6 +7938,7 @@ impl AppState {
         match action {
             CommandAction::Workspace(workspace) => self.switch(workspace),
             CommandAction::OpenMainMenu => self.toggle_menu(),
+            CommandAction::OpenMenuCategory(index) => self.open_menu_category(index),
             CommandAction::Save => self.save()?,
             CommandAction::Help => {
                 self.message = command_registry()
@@ -14597,7 +14649,13 @@ fn menu_bar_line(s: &AppState, width: usize) -> Line<'static> {
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
-        spans.push(Span::styled((*category).to_owned(), style));
+        let shortcuts = effective_shortcut_label(s, MENU_CATEGORY_COMMAND_IDS[index], "");
+        let label = if shortcuts.is_empty() {
+            (*category).to_owned()
+        } else {
+            format!("{category} {shortcuts}")
+        };
+        spans.push(Span::styled(label, style));
     }
     Line::from(spans)
 }
@@ -16592,8 +16650,17 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         height,
     };
     f.render_widget(Clear, popup);
+    let direct_shortcut = effective_shortcut_label(s, MENU_CATEGORY_COMMAND_IDS[menu.top], "");
+    let title = if direct_shortcut.is_empty() {
+        format!(" {} · Esc close ", MENU_CATEGORIES[menu.top])
+    } else {
+        format!(
+            " {} · {} · Esc close ",
+            MENU_CATEGORIES[menu.top], direct_shortcut
+        )
+    };
     let block = Block::default()
-        .title(format!(" {} · Esc close ", MENU_CATEGORIES[menu.top]))
+        .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup);
@@ -19251,6 +19318,16 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if s.menu.is_some() {
+        if let Some((_, command_id)) = s
+            .command_bindings
+            .iter()
+            .find(|(event, _)| same_keycode(event.code, k.code) && event.modifiers == k.modifiers)
+            && command_id.starts_with("menu.")
+        {
+            let command_id = command_id.clone();
+            s.dispatch_registered_command_id(&command_id)?;
+            return Ok(false);
+        }
         if !s.handle_context_command_key(k, "menu")? {
             s.handle_menu_key(k)?;
         }
@@ -20960,6 +21037,7 @@ mod tests {
             r#"[commands]
 "Ctrl+Alt+A" = "view.analytics"
 "Ctrl+Alt+B" = "view.outline"
+"Alt+F" = "menu.file"
 "#,
         )
         .unwrap();
@@ -20972,7 +21050,7 @@ mod tests {
         )
         .unwrap();
         let effective = load_command_bindings_from(&user_path, project.project_root()).unwrap();
-        assert_eq!(effective.len(), 2);
+        assert_eq!(effective.len(), 3);
         assert!(
             effective
                 .iter()
@@ -20983,6 +21061,11 @@ mod tests {
                 .iter()
                 .any(|(key, id)| key.code == KeyCode::Char('b') && id == "view.outline")
         );
+        assert!(effective.iter().any(|(key, id)| {
+            key.code == KeyCode::Char('f')
+                && key.modifiers == KeyModifiers::ALT
+                && id == "menu.file"
+        }));
 
         fs::write(&user_path, "[unknown]\nvalue = true\n").unwrap();
         let (fallback, warning) =
@@ -27739,6 +27822,49 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(remapped.contains("Alt+M Menu"));
+    }
+
+    #[test]
+    fn each_top_level_menu_has_a_stable_directly_bindable_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        for (index, id) in MENU_CATEGORY_COMMAND_IDS.iter().enumerate() {
+            let command = command_by_id(id).expect("each menu root has a registered command");
+            assert_eq!(command.action, CommandAction::OpenMenuCategory(index));
+            assert_eq!(command.category, "Menu");
+        }
+        state.command_bindings = vec![(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            "menu.file".into(),
+        )];
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        )
+        .unwrap();
+        assert_eq!(state.menu.map(|menu| menu.top), Some(0));
+        let bar = menu_bar_line(&state, 80)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(bar.contains("File Alt+F"));
+
+        state.menu = Some(MenuState {
+            top: 0,
+            selected: 0,
+        });
+        state.command_bindings.push((
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT),
+            "menu.insert".into(),
+        ));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT),
+        )
+        .unwrap();
+        assert_eq!(state.menu.map(|menu| menu.top), Some(2));
     }
 
     #[test]
