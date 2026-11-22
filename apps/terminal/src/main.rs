@@ -1073,6 +1073,22 @@ fn command_registry() -> Vec<CommandSpec> {
             false,
         ),
         legacy_command(
+            "search.occur",
+            "List Current Scene Occurrences",
+            "Find a literal term in the current scene and navigate its matches",
+            "Edit",
+            "occur",
+            true,
+        ),
+        legacy_command(
+            "search.grep",
+            "Search Manuscript Text",
+            "Find a literal term across manuscript scenes",
+            "Edit",
+            "grep",
+            true,
+        ),
+        legacy_command(
             "search.tags",
             "Go to Definition",
             "Search stable story symbols and jump to a definition",
@@ -5310,6 +5326,42 @@ impl AppState {
                 "{} match(es) in {} scene(s); F3/Shift-F3 navigates · first in {title}",
                 self.search_locations.len(),
                 found.len()
+            );
+        }
+        Ok(())
+    }
+    fn run_named_text_search(
+        &mut self,
+        query: &str,
+        scope: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err("enter a literal search term".into());
+        }
+        let session = load_find_panel_session(self.app.project_root());
+        self.remember_editor_location();
+        self.find_panel = Some(FindPanel {
+            replacing: false,
+            mode: story_core::FindMode::Normal,
+            case_sensitive: false,
+            whole_word: false,
+            accent_sensitive: session.accent_sensitive,
+            scope: scope.to_owned(),
+            pattern: query.to_owned(),
+            replacement: String::new(),
+            field: FindPanelField::Pattern,
+            history_position: None,
+            history_draft: None,
+        });
+        self.run_find_panel_search()?;
+        self.search_location_index = self.search_locations.len().saturating_sub(1);
+        if !self.search_locations.is_empty() {
+            self.navigate_search_match(true)?;
+            self.message = format!(
+                "{} occurrence(s) in {} scope · F3/Shift-F3 navigates",
+                self.search_locations.len(),
+                scope
             );
         }
         Ok(())
@@ -11874,6 +11926,10 @@ impl AppState {
             self.selected = 0;
             self.switch(Workspace::Search);
             self.message = format!("{} project-wide matches", self.search_hits.len());
+        } else if let Some(query) = cmd.strip_prefix("occur ") {
+            self.run_named_text_search(query, "current")?;
+        } else if let Some(query) = cmd.strip_prefix("grep ") {
+            self.run_named_text_search(query, "all")?;
         } else if let Some(query) = cmd.strip_prefix("tags ") {
             self.search_symbol_definitions(query)?;
         } else if let Some(query) = cmd.strip_prefix("refs ") {
@@ -19280,6 +19336,14 @@ mod tests {
             command_by_id("extract.review").unwrap().palette_prefix,
             Some("proposals")
         );
+        assert_eq!(
+            command_by_id("search.occur").unwrap().palette_prefix,
+            Some("occur")
+        );
+        assert_eq!(
+            command_by_id("search.grep").unwrap().palette_prefix,
+            Some("grep")
+        );
         let ids = registry
             .iter()
             .map(|command| command.id)
@@ -23247,6 +23311,42 @@ mod tests {
         assert_eq!(
             state.app.load_scene_text(scene).unwrap().0,
             "Ankara and Iskenderun."
+        );
+    }
+
+    #[test]
+    fn grep_and_occur_aliases_share_the_scene_aware_find_panel() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        for (scene, text) in [(first, "Mara is here."), (second, "Mara is elsewhere.")] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), text).unwrap();
+        }
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(first).unwrap();
+        state.execute_legacy_palette_command("occur mara").unwrap();
+        assert_eq!(state.find_panel.as_ref().unwrap().scope, "current");
+        assert_eq!(
+            state
+                .search_locations
+                .iter()
+                .map(|(scene, _, _)| *scene)
+                .collect::<Vec<_>>(),
+            [first]
+        );
+
+        state.execute_legacy_palette_command("grep mara").unwrap();
+        assert_eq!(state.find_panel.as_ref().unwrap().scope, "all");
+        assert_eq!(
+            state
+                .search_locations
+                .iter()
+                .map(|(scene, _, _)| *scene)
+                .collect::<Vec<_>>(),
+            [first, second]
         );
     }
 
