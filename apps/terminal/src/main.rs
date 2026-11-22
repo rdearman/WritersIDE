@@ -9768,7 +9768,7 @@ impl AppState {
             self.series_reference_view = false;
             self.selected = 0;
             self.switch(Workspace::Series);
-            self.message = "Series Books · Enter opens a book · Ctrl+/ → Series for create/import/reference actions".into();
+            self.message = "Series Books · Enter opens a book · F10 Menu → Series for create/import/reference actions".into();
             return Ok(());
         }
         if let Some(path) = cmd
@@ -15103,7 +15103,7 @@ impl AppState {
             }
             self.message = format!("Replaced {replacements} occurrence(s) in {changed} scene(s)");
         } else if cmd == "help" {
-            self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu; arrows navigate; Enter opens; : commands; / searches; Ctrl-S saves; Esc leaves manuscript editing; q quits from navigation".into();
+            self.message="F1-F9, F11-F14 workspaces; hold Ctrl and press / or use F10 for the main menu; plain / remains available for writing and search; arrows navigate; Enter opens; : commands; Ctrl-S saves; Esc leaves manuscript editing; q quits from navigation".into();
         } else {
             self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... | event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... | event-relationships EVENT-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-list | snippet-insert NAME [key=value...] | snippet-preview NAME [key=value...] | snippet-user-preview NAME [key=value...] | snippet-user-set NAME TEMPLATE | snippet-user-remove NAME | snippet-user-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | multi-replace START:END[,START:END...] TEXT | multi-replace-matches TEXT => REPLACEMENT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expansion-user-set ABBREVIATION => REPLACEMENT | text-expansion-user on|off|list | text-expansion-user-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | mark-set NAME | mark-list | mark-jump NAME | mark-clear NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
@@ -16341,8 +16341,7 @@ fn format_search_result_row(title: &str, text: &str, byte_offset: usize) -> Stri
 
 fn menu_bar_line(s: &AppState, width: usize) -> Line<'static> {
     if width < 60 {
-        let menu_key =
-            effective_shortcut_label(s, "menu.main", "F10").replace("Ctrl+/", "hold Ctrl, press /");
+        let menu_key = display_shortcut_label(effective_shortcut_label(s, "menu.main", "F10"));
         let selected = s.menu.map(|menu| MENU_CATEGORIES[menu.top]);
         let status = selected.map_or_else(
             || format!("{menu_key} Menu · ? Help"),
@@ -16425,6 +16424,10 @@ fn effective_shortcut_label(state: &AppState, command_id: &str, fallback: &str) 
         .map(|command| effective_command_shortcuts(state, command).join(" or "))
         .filter(|shortcuts| !shortcuts.is_empty())
         .unwrap_or_else(|| fallback.to_owned())
+}
+
+fn display_shortcut_label(label: String) -> String {
+    label.replace("Ctrl+/", "hold Ctrl, press /")
 }
 
 fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
@@ -16553,9 +16556,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             (
                 vec![
                     Line::from("No manuscript document is open."),
-                    Line::from(
-                        "Use F10 or Ctrl+/ → Insert → Create Chapter, or choose File → Import.",
-                    ),
+                    Line::from("Use F10 Menu → Insert → Create Chapter, or choose File → Import."),
                 ],
                 "Start Writing".into(),
             )
@@ -17386,8 +17387,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 .as_ref()
                 .map(|label| format!(" · {label}"))
                 .unwrap_or_default();
-            let menu_hint = effective_shortcut_label(s, "menu.main", "F10")
-                .replace("Ctrl+/", "hold Ctrl, press /");
+            let menu_hint = display_shortcut_label(effective_shortcut_label(s, "menu.main", "F10"));
             let actions = format!(
                 " {} · Save {} · Menu {} · Help {} · {pane_hint}{}",
                 if s.message.is_empty() {
@@ -17461,8 +17461,8 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
     let mut lines = vec![
         format!("Context: {context}"),
         format!(
-                "Menu: hold Ctrl and press / when available; fallback shortcut {}",
-                effective_shortcut_label(state, "menu.main", "F10")
+                "Menu: hold Ctrl and press / when available; plain / remains available while writing; fallback shortcut {}",
+                display_shortcut_label(effective_shortcut_label(state, "menu.main", "F10"))
             ),
         format!(
             "Command Palette: {} · ':' opens it outside manuscript editing",
@@ -20034,7 +20034,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
         let current_project = s.app.get_project().ok().map(|project| project.id);
         return match s.series_books() {
             Ok(books) if books.is_empty() => vec![
-                "No books in this series · use Ctrl+/ → Series → Import Scrivener Book or New Book"
+                "No books in this series · use F10 Menu → Series → Import Scrivener Book or New Book"
                     .into(),
             ],
             Ok(books) => books
@@ -20049,7 +20049,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 })
                 .collect(),
             Err(_) => vec![
-                "No series selected · use Ctrl+/ → Series → Select Series or Create Series".into(),
+                "No series selected · use F10 Menu → Series → Select Series or Create Series".into(),
             ],
         };
     }
