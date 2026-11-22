@@ -283,3 +283,7 @@ Direct chapter and section prose is represented as a typed content unit with its
 ## Issue #11 — Recover an archived scene from Git
 
 A named project snapshot can be used to recover an archived/deleted scene into an explicitly selected existing chapter and order position. The recovery is staged through a validated historical project, assigns a fresh scene UUID, preserves its prose and core metadata, snapshots current project state, and writes through the normal durable journal. Unresolvable POV/location references are cleared; participation, plot/event/link/custom-field relationships are deliberately not copied and the CLI/TUI say so. The historical commit and source project are read-only. Full dependency-graph restoration and transactional in-place project rollback remain open.
+
+## Issue #8 — Per-user and per-project command keymaps
+
+Command registry entries declare default shortcuts. The main menu uses Ctrl+/ as its preferred shortcut and F10 as fallback, and the plain `/` character remains available in the manuscript editor. User-level shortcuts load from the XDG configuration location, with a home-directory fallback; project shortcuts in `.writers-ide/keybindings.toml` override a user shortcut only when both assign the same physical chord. Invalid keymap files produce a visible warning and do not prevent opening a project. Help and menu entries display configured effective shortcuts. Multi-key sequences, context-scoped keymaps, full conflict diagnostics, keyboard-protocol negotiation and a visual keybinding editor remain deferred.

@@ -394,6 +394,7 @@ struct RevisionHunk {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct KeymapFile {
     #[serde(default)]
     bindings: BTreeMap<String, String>,
@@ -674,6 +675,7 @@ struct CommandSpec {
     label: &'static str,
     description: &'static str,
     category: &'static str,
+    default_shortcuts: &'static [&'static str],
     mnemonic: Option<char>,
     palette_aliases: &'static [&'static str],
     palette_prefix: Option<&'static str>,
@@ -708,6 +710,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: workspace.title(),
             description: "Switch to this workspace",
             category: "View",
+            default_shortcuts: workspace_default_shortcuts(workspace),
             mnemonic: None,
             palette_aliases: &[],
             palette_prefix: None,
@@ -721,6 +724,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Main Menu",
             description: "Open the hierarchical command menu",
             category: "Menu",
+            default_shortcuts: &["Ctrl+/", "F10"],
             mnemonic: Some('m'),
             palette_aliases: &[],
             palette_prefix: None,
@@ -732,6 +736,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Save Manuscript Buffer",
             description: "Save the current scene or resumable multi-scene assembly buffer",
             category: "File",
+            default_shortcuts: &["Ctrl+S"],
             mnemonic: Some('s'),
             palette_aliases: &["save"],
             palette_prefix: None,
@@ -743,6 +748,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Context Help",
             description: "Show keyboard and command help",
             category: "Help",
+            default_shortcuts: &[],
             mnemonic: Some('h'),
             palette_aliases: &["help"],
             palette_prefix: None,
@@ -754,6 +760,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Restore Selected Revision Hunk",
             description: "Restore the highlighted snapshot diff hunk",
             category: "File",
+            default_shortcuts: &[],
             mnemonic: Some('r'),
             palette_aliases: &[],
             palette_prefix: None,
@@ -765,6 +772,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Compile",
             description: "Run the manuscript processing pipeline",
             category: "Compile",
+            default_shortcuts: &[],
             mnemonic: Some('c'),
             palette_aliases: &["process", "compile"],
             palette_prefix: None,
@@ -778,6 +786,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Compile with Transclusions",
             description: "Compile a derived view with scene inclusions expanded",
             category: "Compile",
+            default_shortcuts: &[],
             mnemonic: None,
             palette_aliases: &["process-expand", "compile-expand"],
             palette_prefix: None,
@@ -791,6 +800,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Compile Selected Stages",
             description: "Run selected processing stages and their dependencies",
             category: "Compile",
+            default_shortcuts: &[],
             mnemonic: None,
             palette_aliases: &["process-only"],
             palette_prefix: None,
@@ -804,6 +814,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Compile Selected Stages with Transclusions",
             description: "Run selected stages with scene inclusions expanded",
             category: "Compile",
+            default_shortcuts: &[],
             mnemonic: None,
             palette_aliases: &["process-expand-only"],
             palette_prefix: None,
@@ -1308,6 +1319,38 @@ fn command_registry() -> Vec<CommandSpec> {
             "Inspect project-local command shortcuts",
             "Tools",
             "keybinding-list",
+            false,
+        ),
+        legacy_command(
+            "settings.keybinding-user-set",
+            "Bind User Command Shortcut",
+            "Assign a command shortcut in the per-user keymap, overridden by project bindings",
+            "Tools",
+            "keybinding-user-set",
+            true,
+        ),
+        legacy_command(
+            "settings.keybinding-user-remove",
+            "Remove User Command Shortcut",
+            "Remove a command shortcut from the per-user keymap",
+            "Tools",
+            "keybinding-user-remove",
+            true,
+        ),
+        legacy_command(
+            "settings.keybinding-reset",
+            "Reset Project Command Shortcuts",
+            "Remove the project keymap and use per-user/default bindings",
+            "Tools",
+            "keybinding-reset",
+            false,
+        ),
+        legacy_command(
+            "settings.keybinding-user-reset",
+            "Reset User Command Shortcuts",
+            "Remove per-user key overrides and return to project/default bindings",
+            "Tools",
+            "keybinding-user-reset",
             false,
         ),
         legacy_command(
@@ -2193,6 +2236,7 @@ fn legacy_command(
         label,
         description,
         category,
+        default_shortcuts: &[],
         mnemonic: None,
         palette_aliases: &[],
         palette_prefix: Some(alias),
@@ -2211,6 +2255,26 @@ fn command_for_workspace(workspace: Workspace) -> Option<CommandSpec> {
     command_registry()
         .into_iter()
         .find(|command| command.action == CommandAction::Workspace(workspace))
+}
+
+fn workspace_default_shortcuts(workspace: Workspace) -> &'static [&'static str] {
+    match workspace {
+        Workspace::Dashboard => &["F1"],
+        Workspace::Outline => &["F2"],
+        Workspace::Cards => &["F3"],
+        Workspace::Editor => &["F4"],
+        Workspace::PlotGrid => &["F5"],
+        Workspace::Characters => &["F6"],
+        Workspace::StoryBible => &["F7"],
+        Workspace::Timeline => &["F8"],
+        Workspace::Analytics => &["F9"],
+        Workspace::Research => &[],
+        Workspace::Issues => &["F11"],
+        Workspace::Search => &["F12"],
+        Workspace::Reading => &["F13"],
+        Workspace::Revisions => &["F14"],
+        Workspace::PlanningBoards | Workspace::Assemblies | Workspace::Series => &[],
+    }
 }
 
 fn command_palette_invocation(text: &str) -> Option<(CommandSpec, Option<&str>)> {
@@ -2784,17 +2848,15 @@ fn parse_terminal_query_assertion(
 }
 
 fn default_bindings() -> Vec<(u8, Workspace)> {
-    Workspace::ALL
-        .iter()
-        .copied()
-        .enumerate()
-        .filter_map(|(index, workspace)| {
-            if index == 9 || index >= 14 {
-                None
-            } else {
-                let function_key = (index + 1) as u8;
-                Some((function_key, workspace))
-            }
+    command_registry()
+        .into_iter()
+        .filter_map(|command| match command.action {
+            CommandAction::Workspace(workspace) => command
+                .default_shortcuts
+                .iter()
+                .find_map(|shortcut| shortcut.strip_prefix('F')?.parse::<u8>().ok())
+                .map(|function_key| (function_key, workspace)),
+            _ => None,
         })
         .collect()
 }
@@ -2906,38 +2968,98 @@ fn infer_narrowed_chapter(
 }
 
 fn load_bindings(project: &Path) -> Result<Vec<(u8, Workspace)>, Box<dyn std::error::Error>> {
-    let path = project.join(".writers-ide/keybindings.toml");
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(default_bindings()),
-        Err(error) => return Err(error.into()),
-    };
-    let config: KeymapFile = toml::from_str(&text)?;
+    load_bindings_from(&user_keymap_path(), project)
+}
+
+fn load_bindings_from(
+    user_path: &Path,
+    project: &Path,
+) -> Result<Vec<(u8, Workspace)>, Box<dyn std::error::Error>> {
     let mut result = default_bindings();
-    for (key, name) in config.bindings {
-        let number: u8 = key
-            .strip_prefix('F')
-            .ok_or("keymap keys must use F1 through F14")?
-            .parse()?;
-        if !(1..=14).contains(&number) {
-            return Err(format!("unsupported function key {key}").into());
-        }
-        if number == 10 {
-            return Err("F10 is reserved for the hierarchical menu fallback".into());
-        }
-        let workspace = Workspace::ALL
-            .iter()
-            .copied()
-            .find(|w| w.title().eq_ignore_ascii_case(&name))
-            .ok_or_else(|| format!("unknown workspace in keymap: {name}"))?;
-        if let Some(binding) = result.iter_mut().find(|(function, _)| *function == number) {
-            *binding = (number, workspace);
-        } else {
-            result.push((number, workspace));
-            result.sort_by_key(|(function, _)| *function);
+    for config in load_keymap_scopes_from(user_path, project)? {
+        for (key, name) in config.bindings {
+            let number: u8 = key
+                .strip_prefix('F')
+                .ok_or("keymap keys must use F1 through F14")?
+                .parse()?;
+            if !(1..=14).contains(&number) {
+                return Err(format!("unsupported function key {key}").into());
+            }
+            if number == 10 {
+                return Err("F10 is reserved for the hierarchical menu fallback".into());
+            }
+            let workspace = Workspace::ALL
+                .iter()
+                .copied()
+                .find(|w| w.title().eq_ignore_ascii_case(&name))
+                .ok_or_else(|| format!("unknown workspace in keymap: {name}"))?;
+            if let Some(binding) = result.iter_mut().find(|(function, _)| *function == number) {
+                *binding = (number, workspace);
+            } else {
+                result.push((number, workspace));
+                result.sort_by_key(|(function, _)| *function);
+            }
         }
     }
     Ok(result)
+}
+
+fn user_keymap_path() -> PathBuf {
+    let config_root = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from(".config"));
+    config_root.join("writers-ide/keybindings.toml")
+}
+
+fn read_keymap_file(path: &Path) -> Result<Option<KeymapFile>, Box<dyn std::error::Error>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(toml::from_str(&text)?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn load_keymap_scopes(project: &Path) -> Result<Vec<KeymapFile>, Box<dyn std::error::Error>> {
+    load_keymap_scopes_from(&user_keymap_path(), project)
+}
+
+fn load_keymap_scopes_from(
+    user_path: &Path,
+    project: &Path,
+) -> Result<Vec<KeymapFile>, Box<dyn std::error::Error>> {
+    let mut configs = Vec::new();
+    if let Some(config) = read_keymap_file(user_path)? {
+        configs.push(config);
+    }
+    if let Some(config) = read_keymap_file(&project.join(".writers-ide/keybindings.toml"))? {
+        configs.push(config);
+    }
+    Ok(configs)
+}
+
+fn load_bindings_or_default(project: &Path) -> (Vec<(u8, Workspace)>, Option<String>) {
+    match load_bindings(project) {
+        Ok(bindings) => (bindings, None),
+        Err(error) => (
+            default_bindings(),
+            Some(format!("Keybinding configuration ignored: {error}")),
+        ),
+    }
+}
+
+#[cfg(test)]
+fn load_bindings_or_default_from(
+    user_path: &Path,
+    project: &Path,
+) -> (Vec<(u8, Workspace)>, Option<String>) {
+    match load_bindings_from(user_path, project) {
+        Ok(bindings) => (bindings, None),
+        Err(error) => (
+            default_bindings(),
+            Some(format!("Keybinding configuration ignored: {error}")),
+        ),
+    }
 }
 
 type CommandBindings = Vec<(KeyEvent, String)>;
@@ -3003,15 +3125,84 @@ fn same_keycode(left: KeyCode, right: KeyCode) -> bool {
     }
 }
 
+fn format_key_event(event: KeyEvent) -> String {
+    let mut parts = Vec::new();
+    if event.modifiers.contains(KeyModifiers::CONTROL) {
+        parts.push("Ctrl".to_owned());
+    }
+    if event.modifiers.contains(KeyModifiers::ALT) {
+        parts.push("Alt".to_owned());
+    }
+    if event.modifiers.contains(KeyModifiers::SHIFT) {
+        parts.push("Shift".to_owned());
+    }
+    parts.push(match event.code {
+        KeyCode::Char(ch) => ch.to_ascii_uppercase().to_string(),
+        KeyCode::F(number) => format!("F{number}"),
+        other => format!("{other:?}"),
+    });
+    parts.join("+")
+}
+
+fn effective_command_shortcuts(state: &AppState, command: CommandSpec) -> Vec<String> {
+    let configured = state
+        .command_bindings
+        .iter()
+        .filter(|(_, id)| *id == command.id)
+        .map(|(event, _)| format_key_event(*event))
+        .collect::<Vec<_>>();
+    if !configured.is_empty() {
+        return configured;
+    }
+    command
+        .default_shortcuts
+        .iter()
+        .map(|shortcut| (*shortcut).to_owned())
+        .collect()
+}
+
 fn load_command_bindings(project: &Path) -> Result<CommandBindings, Box<dyn std::error::Error>> {
-    let path = project.join(".writers-ide/keybindings.toml");
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-    let config: KeymapFile = toml::from_str(&text)?;
-    validate_command_binding_config(&config)
+    load_command_bindings_from(&user_keymap_path(), project)
+}
+
+fn load_command_bindings_from(
+    user_path: &Path,
+    project: &Path,
+) -> Result<CommandBindings, Box<dyn std::error::Error>> {
+    let mut result = Vec::new();
+    for config in load_keymap_scopes_from(user_path, project)? {
+        for (event, id) in validate_command_binding_config(&config)? {
+            result.retain(|(existing, _): &(KeyEvent, String)| {
+                existing.code != event.code || existing.modifiers != event.modifiers
+            });
+            result.push((event, id));
+        }
+    }
+    Ok(result)
+}
+
+fn load_command_bindings_or_default(project: &Path) -> (CommandBindings, Option<String>) {
+    match load_command_bindings(project) {
+        Ok(bindings) => (bindings, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!("Keybinding configuration ignored: {error}")),
+        ),
+    }
+}
+
+#[cfg(test)]
+fn load_command_bindings_or_default_from(
+    user_path: &Path,
+    project: &Path,
+) -> (CommandBindings, Option<String>) {
+    match load_command_bindings_from(user_path, project) {
+        Ok(bindings) => (bindings, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!("Keybinding configuration ignored: {error}")),
+        ),
+    }
 }
 
 fn validate_command_binding_config(
@@ -3028,28 +3219,30 @@ fn validate_command_binding_config(
         }) {
             return Err(format!("duplicate command shortcut: {chord}").into());
         }
-        let command = command_by_id(id).ok_or_else(|| format!("unknown command ID: {id}"))?;
-        if command.takes_arguments {
-            return Err(
-                format!("command {id} requires arguments and cannot be bound directly").into(),
-            );
-        }
+        let _command = command_by_id(id).ok_or_else(|| format!("unknown command ID: {id}"))?;
         result.push((event, id.clone()));
     }
     Ok(result)
 }
 
 fn save_keymap(project: &Path, config: &KeymapFile) -> Result<(), Box<dyn std::error::Error>> {
+    save_keymap_to_path(&project.join(".writers-ide/keybindings.toml"), config)
+}
+
+fn save_user_keymap(config: &KeymapFile) -> Result<(), Box<dyn std::error::Error>> {
+    save_keymap_to_path(&user_keymap_path(), config)
+}
+
+fn save_keymap_to_path(path: &Path, config: &KeymapFile) -> Result<(), Box<dyn std::error::Error>> {
     validate_command_binding_config(config)?;
-    let directory = project.join(".writers-ide");
-    fs::create_dir_all(&directory)?;
-    let path = directory.join("keybindings.toml");
+    let directory = path.parent().ok_or("keymap path has no parent")?;
+    fs::create_dir_all(directory)?;
     let bytes = toml::to_string_pretty(config)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
     use std::io::Write;
     temporary.write_all(bytes.as_bytes())?;
     temporary.as_file().sync_all()?;
-    temporary.persist(&path)?;
+    temporary.persist(path)?;
     fs::File::open(directory)?.sync_all()?;
     Ok(())
 }
@@ -3063,6 +3256,16 @@ fn read_keymap(project: &Path) -> Result<KeymapFile, Box<dyn std::error::Error>>
             commands: BTreeMap::new(),
         }),
         Err(error) => Err(error.into()),
+    }
+}
+
+fn read_user_keymap() -> Result<KeymapFile, Box<dyn std::error::Error>> {
+    match read_keymap_file(&user_keymap_path())? {
+        Some(config) => Ok(config),
+        None => Ok(KeymapFile {
+            bindings: BTreeMap::new(),
+            commands: BTreeMap::new(),
+        }),
     }
 }
 impl AppState {
@@ -4031,12 +4234,17 @@ impl AppState {
             return Err("finish or quit the active writing challenge before changing books".into());
         }
         self.save_session()?;
-        let function_bindings = load_bindings(&path)?;
-        let command_bindings = load_command_bindings(&path)?;
+        let (function_bindings, function_warning) = load_bindings_or_default(&path);
+        let (command_bindings, command_warning) = load_command_bindings_or_default(&path);
         let mut app = WriterApp::open_project(&path)?;
         app.recover_interrupted_writing_challenges()?;
         let mut next = Self::new(app, function_bindings);
         next.command_bindings = command_bindings;
+        next.message = [function_warning, command_warning]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(" · ");
         next.selected_series_root = story_series::SeriesStore::open_for_book(&path)
             .ok()
             .map(|(series, _)| series.root().to_owned());
@@ -5823,9 +6031,19 @@ impl AppState {
                             .mnemonic
                             .map(|key| format!(" [{key}]"))
                             .unwrap_or_default();
+                        let shortcuts = effective_command_shortcuts(self, command);
+                        let shortcut_text = if shortcuts.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" ({})", shortcuts.join(", "))
+                        };
                         format!(
-                            "{} > {}{} — {}",
-                            command.category, command.label, mnemonic, command.description
+                            "{} > {}{}{} — {}",
+                            command.category,
+                            command.label,
+                            mnemonic,
+                            shortcut_text,
+                            command.description
                         )
                     })
                     .collect::<Vec<_>>()
@@ -5867,6 +6085,19 @@ impl AppState {
                 )?;
             }
         }
+        Ok(())
+    }
+    fn prompt_for_registered_command(
+        &mut self,
+        command: CommandSpec,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let prefix = command
+            .palette_prefix
+            .or_else(|| command.palette_aliases.first().copied())
+            .ok_or("argument command has no command-palette invocation")?;
+        self.mode = Some(':');
+        self.prompt = format!("{prefix} ");
+        self.message = format!("Arguments for {}", command.label);
         Ok(())
     }
     fn command(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -6034,17 +6265,52 @@ impl AppState {
             return Ok(());
         }
         if cmd == "keybinding-list" {
-            let config = read_keymap(self.app.project_root())?;
-            self.message = if config.commands.is_empty() {
-                "No project command shortcuts are configured".into()
+            let scopes = load_keymap_scopes(self.app.project_root())?;
+            let mut effective = BTreeMap::new();
+            for (index, config) in scopes.iter().enumerate() {
+                for (chord, id) in &config.commands {
+                    let user_scope = user_keymap_path().is_file() && index == 0;
+                    effective.insert(
+                        chord.clone(),
+                        (id.clone(), if user_scope { "user" } else { "project" }),
+                    );
+                }
+            }
+            self.message = if effective.is_empty() {
+                "No user or project command shortcuts are configured".into()
             } else {
-                config
-                    .commands
+                effective
                     .iter()
-                    .map(|(chord, id)| format!("{chord} → {id}"))
+                    .map(|(chord, (id, scope))| format!("{chord} → {id} ({scope})"))
                     .collect::<Vec<_>>()
                     .join(" · ")
             };
+            return Ok(());
+        }
+        if cmd == "keybinding-reset" || cmd == "keybinding-user-reset" {
+            let user_scope = cmd == "keybinding-user-reset";
+            let path = if user_scope {
+                user_keymap_path()
+            } else {
+                self.app
+                    .project_root()
+                    .join(".writers-ide/keybindings.toml")
+            };
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+            self.function_bindings = load_bindings_or_default(self.app.project_root()).0;
+            let (bindings, warning) = load_command_bindings_or_default(self.app.project_root());
+            self.command_bindings = bindings;
+            self.message = warning.unwrap_or_else(|| {
+                if user_scope {
+                    "User keymap reset; project overrides remain active".into()
+                } else {
+                    "Project keymap reset; user/default bindings are active".into()
+                }
+            });
             return Ok(());
         }
         if matches!(
@@ -6080,12 +6346,6 @@ impl AppState {
             }
             let command = command_by_id(command_id)
                 .ok_or_else(|| format!("unknown command ID: {command_id}"))?;
-            if command.takes_arguments {
-                return Err(format!(
-                    "command {command_id} requires arguments and cannot be bound directly"
-                )
-                .into());
-            }
             let mut config = read_keymap(self.app.project_root())?;
             let duplicates = config
                 .commands
@@ -6106,8 +6366,65 @@ impl AppState {
                 .commands
                 .insert(chord.to_owned(), command_id.to_owned());
             save_keymap(self.app.project_root(), &config)?;
-            self.command_bindings = load_command_bindings(self.app.project_root())?;
+            let (bindings, warning) = load_command_bindings_or_default(self.app.project_root());
+            self.command_bindings = bindings;
+            if let Some(warning) = warning {
+                self.message = warning;
+                return Ok(());
+            }
             self.message = format!("Bound {chord} to {}", command.label);
+            return Ok(());
+        }
+        if let Some(rest) = cmd.strip_prefix("keybinding-user-set ") {
+            let (chord, command_id) = rest
+                .split_once(' ')
+                .ok_or("use keybinding-user-set CTRL+KEY COMMAND-ID")?;
+            let event = parse_shortcut(chord)?;
+            if is_reserved_command_shortcut(event) {
+                return Err(
+                    format!("{chord} conflicts with a reserved application shortcut").into(),
+                );
+            }
+            let command = command_by_id(command_id)
+                .ok_or_else(|| format!("unknown command ID: {command_id}"))?;
+            let mut config = read_user_keymap()?;
+            config.commands.retain(|existing, _| {
+                parse_shortcut(existing).map_or(true, |candidate| {
+                    candidate.code != event.code || candidate.modifiers != event.modifiers
+                })
+            });
+            config
+                .commands
+                .insert(chord.to_owned(), command_id.to_owned());
+            save_user_keymap(&config)?;
+            let (bindings, warning) = load_command_bindings_or_default(self.app.project_root());
+            self.command_bindings = bindings;
+            self.message = warning.unwrap_or_else(|| {
+                format!(
+                    "Bound user shortcut {chord} to {}; project bindings override matching chords",
+                    command.label
+                )
+            });
+            return Ok(());
+        }
+        if let Some(chord) = cmd.strip_prefix("keybinding-user-remove ") {
+            let event = parse_shortcut(chord.trim())?;
+            let mut config = read_user_keymap()?;
+            let old_len = config.commands.len();
+            config.commands.retain(|existing, _| {
+                parse_shortcut(existing).map_or(true, |candidate| {
+                    candidate.code != event.code || candidate.modifiers != event.modifiers
+                })
+            });
+            if old_len == config.commands.len() {
+                self.message = format!("No user command shortcut is bound to {chord}");
+                return Ok(());
+            }
+            save_user_keymap(&config)?;
+            let (bindings, warning) = load_command_bindings_or_default(self.app.project_root());
+            self.command_bindings = bindings;
+            self.message =
+                warning.unwrap_or_else(|| format!("Removed user command shortcut {chord}"));
             return Ok(());
         }
         if let Some(chord) = cmd.strip_prefix("keybinding-remove ") {
@@ -6133,7 +6450,12 @@ impl AppState {
                 config.commands.remove(&removal);
             }
             save_keymap(self.app.project_root(), &config)?;
-            self.command_bindings = load_command_bindings(self.app.project_root())?;
+            let (bindings, warning) = load_command_bindings_or_default(self.app.project_root());
+            self.command_bindings = bindings;
+            if let Some(warning) = warning {
+                self.message = warning;
+                return Ok(());
+            }
             self.message = format!("Removed command shortcut {chord}");
             return Ok(());
         }
@@ -10016,7 +10338,7 @@ impl AppState {
             }
             self.message = format!("Replaced {replacements} occurrence(s) in {changed} scene(s)");
         } else if cmd == "help" {
-            self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu (menu UI pending); arrows select/scroll; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
+            self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu; arrows navigate; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
             self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
@@ -10962,12 +11284,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .ok_or("usage: writers-ide-tui <project-path>")?;
     let project_path = std::path::PathBuf::from(path);
-    let function_bindings = load_bindings(&project_path)?;
-    let command_bindings = load_command_bindings(&project_path)?;
+    let (function_bindings, function_warning) = load_bindings_or_default(&project_path);
+    let (command_bindings, command_warning) = load_command_bindings_or_default(&project_path);
     let mut app = WriterApp::open_project(&project_path)?;
     app.recover_interrupted_writing_challenges()?;
     let mut state = AppState::new(app, function_bindings);
     state.command_bindings = command_bindings;
+    state.message = [function_warning, command_warning]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(" · ");
     state.restore_session()?;
     state.refresh()?;
     let mut terminal = setup()?;
@@ -12444,11 +12771,23 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
                     .mnemonic
                     .map(|key| format!(" [{key}]"))
                     .unwrap_or_default();
+                let shortcuts = effective_command_shortcuts(s, *spec);
+                let shortcut_text = if shortcuts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", shortcuts.join(", "))
+                };
                 let args = if spec.takes_arguments { " …" } else { "" };
                 let label = if let Some(reason) = disabled {
-                    format!("{}{}{} — unavailable: {}", spec.label, mark, args, reason)
+                    format!(
+                        "{}{}{}{} — unavailable: {}",
+                        spec.label, mark, args, shortcut_text, reason
+                    )
                 } else {
-                    format!("{}{}{} — {}", spec.label, mark, args, spec.description)
+                    format!(
+                        "{}{}{}{} — {}",
+                        spec.label, mark, args, shortcut_text, spec.description
+                    )
                 };
                 ListItem::new(label).style(if disabled.is_some() {
                     Style::default().fg(Color::DarkGray)
@@ -14856,6 +15195,8 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         if let Some(command) = command_by_id(id) {
             if let Some(reason) = s.command_disabled_reason(command) {
                 s.message = reason.into();
+            } else if command.takes_arguments {
+                s.prompt_for_registered_command(command)?;
             } else if command.action == CommandAction::LegacyPalette {
                 s.dispatch_registered_with_args(command.action, command.palette_prefix)?;
             } else {
@@ -15832,6 +16173,52 @@ mod tests {
     }
 
     #[test]
+    fn per_user_keymap_is_overridden_by_project_and_invalid_config_does_not_block_startup() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
+        let user_path = root.path().join("config/writers-ide/keybindings.toml");
+        fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+        fs::write(
+            &user_path,
+            r#"[commands]
+"Ctrl+Alt+A" = "view.analytics"
+"Ctrl+Alt+B" = "view.outline"
+"#,
+        )
+        .unwrap();
+        let project_path = project.project_root().join(".writers-ide/keybindings.toml");
+        fs::write(
+            &project_path,
+            r#"[commands]
+"Ctrl+Alt+A" = "view.timeline"
+"#,
+        )
+        .unwrap();
+        let effective = load_command_bindings_from(&user_path, project.project_root()).unwrap();
+        assert_eq!(effective.len(), 2);
+        assert!(
+            effective
+                .iter()
+                .any(|(key, id)| key.code == KeyCode::Char('a') && id == "view.timeline")
+        );
+        assert!(
+            effective
+                .iter()
+                .any(|(key, id)| key.code == KeyCode::Char('b') && id == "view.outline")
+        );
+
+        fs::write(&user_path, "[unknown]\nvalue = true\n").unwrap();
+        let (fallback, warning) =
+            load_command_bindings_or_default_from(&user_path, project.project_root());
+        assert!(fallback.is_empty());
+        assert!(warning.unwrap().contains("ignored"));
+        let (function_fallback, warning) =
+            load_bindings_or_default_from(&user_path, project.project_root());
+        assert_eq!(function_fallback, default_bindings());
+        assert!(warning.is_some());
+    }
+
+    #[test]
     fn project_keybinding_commands_validate_persist_and_reload_immediately() {
         let root = tempfile::tempdir().unwrap();
         let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
@@ -15854,11 +16241,22 @@ mod tests {
                 .execute_legacy_palette_command("keybinding-set Ctrl+/ view.editor")
                 .is_err()
         );
-        assert!(
-            state
-                .execute_legacy_palette_command("keybinding-set Ctrl+Alt+J compile.selected")
-                .is_err()
-        );
+        state
+            .execute_legacy_palette_command("keybinding-set Ctrl+Alt+J compile.selected")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(
+                KeyCode::Char('j'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+        )
+        .unwrap();
+        assert_eq!(state.mode, Some(':'));
+        assert_eq!(state.prompt, "process-only ");
+        state
+            .execute_legacy_palette_command("keybinding-remove Ctrl+Alt+J")
+            .unwrap();
         state
             .execute_legacy_palette_command("keybinding-remove Ctrl+Alt+K")
             .unwrap();
@@ -15877,7 +16275,7 @@ mod tests {
     }
 
     #[test]
-    fn command_shortcuts_reject_duplicates_reserved_keys_unknown_and_argument_commands() {
+    fn command_shortcuts_reject_duplicates_reserved_keys_and_unknown_commands() {
         assert!(parse_shortcut("A").is_err());
         assert!(parse_shortcut("Ctrl+Alt+F10").is_err());
         let root = tempfile::tempdir().unwrap();
@@ -15896,7 +16294,10 @@ mod tests {
             "[commands]\n\"Ctrl+Alt+A\" = \"compile.selected\"\n",
         )
         .unwrap();
-        assert!(load_command_bindings(project.project_root()).is_err());
+        assert_eq!(
+            load_command_bindings(project.project_root()).unwrap().len(),
+            1
+        );
         fs::write(
             &config,
             "[commands]\n\"Ctrl+Alt+A\" = \"view.editor\"\n\"Ctrl+Alt+a\" = \"view.analytics\"\n",
@@ -15908,6 +16309,14 @@ mod tests {
     #[test]
     fn command_registry_has_stable_unique_ids_and_compile_taxonomy() {
         let registry = command_registry();
+        assert_eq!(
+            command_by_id("menu.main").unwrap().default_shortcuts,
+            &["Ctrl+/", "F10"]
+        );
+        assert_eq!(
+            format_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL)),
+            "Ctrl+/"
+        );
         assert_eq!(
             command_by_id("extract.dismiss").unwrap().palette_prefix,
             Some("dismiss")
