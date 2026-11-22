@@ -1725,10 +1725,18 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command(
             "view.reference-diagnostics",
             "Open Compile Diagnostics Reference",
-            "Show current compile diagnostics in a read-only reference pane",
+            "Show current compile diagnostics in a read-only reference pane; use compile-jump N to open a source-linked finding",
             "View",
             "reference-diagnostics",
             false,
+        ),
+        legacy_command(
+            "compile.jump-diagnostic",
+            "Jump to Compile Diagnostic",
+            "Open the source entity for a numbered Compile diagnostic",
+            "Compile",
+            "compile-jump",
+            true,
         ),
         legacy_command(
             "window.next",
@@ -9309,6 +9317,34 @@ impl AppState {
                 compile_diagnostics_reference_text(&self.app)?,
             );
             self.reference_focused = true;
+        } else if let Some(index) = cmd.strip_prefix("compile-jump ") {
+            let index = index
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| "compile diagnostic index must be a positive integer")?;
+            if index == 0 {
+                return Err("compile diagnostic indices start at 1".into());
+            }
+            let diagnostic = self
+                .app
+                .compile_diagnostics()?
+                .into_iter()
+                .nth(index - 1)
+                .ok_or("compile diagnostic index is no longer present")?;
+            let source = diagnostic
+                .source_entity_id
+                .ok_or("selected compile diagnostic has no source entity")?;
+            let uuid = source.parse::<uuid::Uuid>()?;
+            let scene = SceneId(uuid);
+            if self.app.get_scene(scene).is_ok() {
+                self.reference_focused = false;
+                self.open_scene(scene)?;
+            } else {
+                let content_unit = story_core::ContentUnitId(uuid);
+                self.app.get_content_unit(content_unit)?;
+                self.reference_focused = false;
+                self.open_content_unit(content_unit)?;
+            }
         } else if let Some(terms) = cmd.strip_prefix("reference-search ") {
             let terms = terms.trim();
             if terms.is_empty() {
@@ -12770,9 +12806,11 @@ fn compile_diagnostics_reference_text(
     }
     Ok(diagnostics
         .into_iter()
-        .map(|item| {
+        .enumerate()
+        .map(|(index, item)| {
             format!(
-                "{} · {:?} · {}{}",
+                "{}. {} · {:?} · {}{}",
+                index + 1,
                 item.code,
                 item.severity,
                 item.message,
@@ -19781,6 +19819,38 @@ mod tests {
         assert_eq!(
             reopened.reference_panes[3].content,
             "No current compile diagnostics."
+        );
+    }
+
+    #[test]
+    fn compile_diagnostic_reference_opens_source_scene_by_stable_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Draft placeholder", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "TODO: finish this scene.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+
+        state
+            .execute_legacy_palette_command("reference-diagnostics")
+            .unwrap();
+        let content = &state.reference_panes[state.active_reference].content;
+        assert!(content.starts_with("1. PUB004 · Warning"));
+        assert!(content.contains(&scene.to_string()));
+
+        state
+            .execute_legacy_palette_command("compile-jump 1")
+            .unwrap();
+        assert_eq!(state.editing_scene, Some(scene));
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert!(!state.reference_focused);
+        assert!(
+            state
+                .execute_legacy_palette_command("compile-jump 99")
+                .is_err()
         );
     }
 
