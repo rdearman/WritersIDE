@@ -3022,7 +3022,7 @@ fn command_for_effective_shortcut(state: &AppState, key: KeyEvent) -> Option<Com
     command_registry().into_iter().find(|command| {
         !matches!(
             command.action,
-            CommandAction::Workspace(_) | CommandAction::OpenMainMenu | CommandAction::Save
+            CommandAction::Workspace(_) | CommandAction::Save
         ) && effective_command_shortcuts(state, *command)
             .iter()
             .any(|shortcut| {
@@ -3033,27 +3033,28 @@ fn command_for_effective_shortcut(state: &AppState, key: KeyEvent) -> Option<Com
     })
 }
 
-fn registered_quit_shortcut_matches(state: &AppState, key: KeyEvent) -> bool {
+fn workspace_command_for_shortcut(state: &AppState, key: KeyEvent) -> Option<CommandSpec> {
+    command_registry().into_iter().find(|command| {
+        matches!(command.action, CommandAction::Workspace(_))
+            && effective_command_shortcuts(state, *command)
+                .iter()
+                .any(|shortcut| {
+                    parse_shortcut(shortcut).is_ok_and(|event| {
+                        same_keycode(event.code, key.code) && event.modifiers == key.modifiers
+                    })
+                })
+    })
+}
+
+fn registered_global_command_for_key(state: &AppState, key: KeyEvent) -> Option<CommandSpec> {
     if let Some((_, command_id)) = state
         .command_bindings
         .iter()
         .find(|(event, _)| same_keycode(event.code, key.code) && event.modifiers == key.modifiers)
     {
-        return command_id == "file.quit";
+        return command_by_id(command_id);
     }
-    let context = if state.menu.is_some() {
-        "menu"
-    } else if state.mode.is_some()
-        || state.find_panel.is_some()
-        || state.series_form.is_some()
-        || state.keybinding_manager.is_some()
-    {
-        "dialog"
-    } else if state.workspace == Workspace::Editor {
-        "editor"
-    } else {
-        "navigation"
-    };
+    let context = active_keybinding_context(state);
     let context_bindings = state
         .context_command_bindings
         .iter()
@@ -3067,9 +3068,62 @@ fn registered_quit_shortcut_matches(state: &AppState, key: KeyEvent) -> bool {
     if !context_bindings.is_empty() {
         return context_bindings
             .iter()
-            .any(|binding| binding.sequence.len() == 1 && binding.command_id == "file.quit");
+            .find(|binding| binding.sequence.len() == 1)
+            .and_then(|binding| command_by_id(&binding.command_id));
     }
-    command_for_effective_shortcut(state, key).is_some_and(|command| command.id == "file.quit")
+    if state.help_panel.is_some() && key.code == KeyCode::F(1) {
+        return None;
+    }
+    let modal_is_open = state.mode.is_some()
+        || state.command_palette.is_some()
+        || state.menu.is_some()
+        || state.find_panel.is_some()
+        || state.keybinding_manager.is_some()
+        || state.series_form.is_some()
+        || state.macro_preview.is_some()
+        || state.multi_replace_preview.is_some()
+        || state.snippet_preview.is_some();
+    if key.code == KeyCode::F(1)
+        && state.help_panel.is_none()
+        && (state.workspace == Workspace::Editor || modal_is_open)
+    {
+        return command_by_id("help.context");
+    }
+    if !modal_is_open
+        && !(state.workspace == Workspace::Editor
+            && matches!(key.code, KeyCode::F(3 | 5 | 11 | 12)))
+        && let Some(command) = workspace_command_for_shortcut(state, key)
+    {
+        return Some(command);
+    }
+    command_for_effective_shortcut(state, key).filter(|command| is_early_command(command.action))
+}
+
+fn dispatch_key_command(
+    state: &mut AppState,
+    command: CommandSpec,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(reason) = state.command_disabled_reason(command) {
+        state.message = format!("{} unavailable: {reason}", command.label);
+    } else if command.takes_arguments {
+        state.prompt_for_registered_command(command)?;
+    } else if command.action == CommandAction::LegacyPalette {
+        state.dispatch_registered_with_args(command.action, command.palette_prefix)?;
+    } else {
+        state.dispatch_registered(command.action)?;
+    }
+    Ok(())
+}
+
+fn is_early_command(action: CommandAction) -> bool {
+    matches!(
+        action,
+        CommandAction::RequestQuit
+            | CommandAction::OpenMainMenu
+            | CommandAction::OpenMenuCategory(_)
+            | CommandAction::Help
+            | CommandAction::Workspace(_)
+    )
 }
 
 fn command_for_workspace(workspace: Workspace) -> Option<CommandSpec> {
@@ -3292,11 +3346,6 @@ fn keybinding_manager_commands(manager: &KeybindingManagerState) -> Vec<CommandS
                 || command.id.to_ascii_lowercase().contains(&needle)
         })
         .collect()
-}
-
-fn is_menu_shortcut(key: KeyEvent) -> bool {
-    key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(key.code, KeyCode::Char('/') | KeyCode::Char('_'))
 }
 
 fn editor_position_byte(lines: &[String], row: usize, column: usize) -> usize {
@@ -4079,9 +4128,6 @@ fn load_bindings_from(
             if !(1..=14).contains(&number) {
                 return Err(format!("unsupported function key {key}").into());
             }
-            if number == 10 {
-                return Err("F10 is reserved for the hierarchical menu fallback".into());
-            }
             let workspace = Workspace::ALL
                 .iter()
                 .copied()
@@ -4174,17 +4220,17 @@ fn parse_shortcut(value: &str) -> Result<KeyEvent, Box<dyn std::error::Error>> {
         }
         modifiers |= flag;
     }
-    if modifiers.is_empty() {
-        return Err("command shortcuts must include Ctrl, Alt, or Shift".into());
-    }
     let function_number = key
         .strip_prefix('F')
         .or_else(|| key.strip_prefix('f'))
         .filter(|number| !number.is_empty());
+    if modifiers.is_empty() && function_number.is_none() {
+        return Err("command shortcuts must include Ctrl, Alt, or Shift".into());
+    }
     let code = if let Some(number) = function_number {
         let number: u8 = number.parse()?;
-        if !(1..=14).contains(&number) || number == 10 {
-            return Err("function shortcut must be F1–F9 or F11–F14".into());
+        if !(1..=14).contains(&number) {
+            return Err("function shortcut must be F1–F14".into());
         }
         KeyCode::F(number)
     } else {
@@ -4205,12 +4251,36 @@ const KEY_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(900);
 fn parse_key_sequence(value: &str) -> Result<Vec<KeyEvent>, Box<dyn std::error::Error>> {
     let sequence = value
         .split_whitespace()
-        .map(parse_shortcut)
+        .enumerate()
+        .map(|(index, chord)| {
+            if index == 0 {
+                parse_shortcut(chord)
+            } else {
+                parse_sequence_chord(chord)
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?;
     if !(1..=4).contains(&sequence.len()) {
         return Err("context key sequences must contain one to four key chords".into());
     }
     Ok(sequence)
+}
+
+fn parse_sequence_chord(value: &str) -> Result<KeyEvent, Box<dyn std::error::Error>> {
+    if let Ok(event) = parse_shortcut(value) {
+        return Ok(event);
+    }
+    let mut chars = value.chars();
+    let Some(character) = chars.next() else {
+        return Err("missing key in context sequence".into());
+    };
+    if chars.next().is_some() || !character.is_ascii() {
+        return Err(format!("invalid context sequence chord: {value}").into());
+    }
+    Ok(KeyEvent::new(
+        KeyCode::Char(character.to_ascii_lowercase()),
+        KeyModifiers::NONE,
+    ))
 }
 
 fn key_sequences_equal(left: &[KeyEvent], right: &[KeyEvent]) -> bool {
@@ -4230,10 +4300,7 @@ fn key_sequence_starts_with(sequence: &[KeyEvent], prefix: &[KeyEvent]) -> bool 
 fn is_reserved_command_shortcut(event: KeyEvent) -> bool {
     let ctrl = KeyModifiers::CONTROL;
     let exact = |code, modifiers| event.code == code && event.modifiers == modifiers;
-    exact(KeyCode::F(10), KeyModifiers::NONE)
-        || exact(KeyCode::Char('/'), ctrl)
-        || exact(KeyCode::Char('_'), ctrl)
-        || exact(KeyCode::Char('s'), ctrl)
+    exact(KeyCode::Char('s'), ctrl)
         || exact(KeyCode::Char('z'), ctrl)
         || exact(KeyCode::Char('y'), ctrl)
         || exact(KeyCode::Char('z'), ctrl | KeyModifiers::SHIFT)
@@ -4241,12 +4308,6 @@ fn is_reserved_command_shortcut(event: KeyEvent) -> bool {
         || exact(KeyCode::Tab, ctrl)
         || exact(KeyCode::F(3), KeyModifiers::NONE)
         || exact(KeyCode::F(3), KeyModifiers::SHIFT)
-}
-
-fn is_hierarchical_menu_shortcut(event: KeyEvent) -> bool {
-    (event.modifiers == KeyModifiers::CONTROL
-        && matches!(event.code, KeyCode::Char('/') | KeyCode::Char('_')))
-        || (event.code == KeyCode::F(10) && event.modifiers.is_empty())
 }
 
 fn same_keycode(left: KeyCode, right: KeyCode) -> bool {
@@ -4285,11 +4346,83 @@ fn effective_command_shortcuts(state: &AppState, command: CommandSpec) -> Vec<St
     if !configured.is_empty() {
         return configured;
     }
+    if let CommandAction::Workspace(workspace) = command.action {
+        return state
+            .function_bindings
+            .iter()
+            .filter(|(_, bound_workspace)| *bound_workspace == workspace)
+            .map(|(number, _)| format!("F{number}"))
+            .collect();
+    }
+    if command.action == CommandAction::OpenMainMenu {
+        let context = active_keybinding_context(state);
+        let mut shortcuts = state
+            .context_command_bindings
+            .iter()
+            .filter(|binding| binding.context == context && binding.command_id == command.id)
+            .map(|binding| {
+                binding
+                    .sequence
+                    .iter()
+                    .map(|event| format_key_event(*event))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>();
+        for shortcut in command.default_shortcuts {
+            let Ok(event) = parse_shortcut(shortcut) else {
+                continue;
+            };
+            let assigned_to_another_command =
+                state
+                    .command_bindings
+                    .iter()
+                    .any(|(bound_event, command_id)| {
+                        same_keycode(bound_event.code, event.code)
+                            && bound_event.modifiers == event.modifiers
+                            && command_id != command.id
+                    });
+            let claimed_by_context_sequence =
+                state.context_command_bindings.iter().any(|binding| {
+                    binding.context == context
+                        && binding.sequence.first().is_some_and(|first| {
+                            same_keycode(first.code, event.code)
+                                && first.modifiers == event.modifiers
+                        })
+                });
+            let claimed_by_workspace = event.code == KeyCode::F(10)
+                && state
+                    .function_bindings
+                    .iter()
+                    .any(|(number, _)| *number == 10);
+            if !assigned_to_another_command && !claimed_by_context_sequence && !claimed_by_workspace
+            {
+                shortcuts.push((*shortcut).to_owned());
+            }
+        }
+        return shortcuts;
+    }
     command
         .default_shortcuts
         .iter()
         .map(|shortcut| (*shortcut).to_owned())
         .collect()
+}
+
+fn active_keybinding_context(state: &AppState) -> &'static str {
+    if state.menu.is_some() {
+        "menu"
+    } else if state.mode.is_some()
+        || state.find_panel.is_some()
+        || state.series_form.is_some()
+        || state.keybinding_manager.is_some()
+    {
+        "dialog"
+    } else if state.workspace == Workspace::Editor {
+        "editor"
+    } else {
+        "navigation"
+    }
 }
 
 fn load_command_bindings(project: &Path) -> Result<CommandBindings, Box<dyn std::error::Error>> {
@@ -4363,12 +4496,6 @@ fn validate_command_binding_config(
         let mut sequences = Vec::<(String, Vec<KeyEvent>)>::new();
         for (source, id) in bindings {
             let sequence = parse_key_sequence(source)?;
-            if sequence
-                .iter()
-                .any(|event| is_hierarchical_menu_shortcut(*event))
-            {
-                return Err(format!("{source} contains a reserved menu shortcut").into());
-            }
             if sequence
                 .first()
                 .is_some_and(|event| is_reserved_command_shortcut(*event))
@@ -4483,12 +4610,6 @@ fn upsert_context_keybinding(
         return Err(format!("unknown keybinding context: {context}").into());
     }
     let sequence = parse_key_sequence(sequence_text)?;
-    if sequence
-        .iter()
-        .any(|event| is_hierarchical_menu_shortcut(*event))
-    {
-        return Err("key sequence contains a reserved menu shortcut".into());
-    }
     if sequence
         .first()
         .is_some_and(|event| is_reserved_command_shortcut(*event))
@@ -8169,12 +8290,15 @@ impl AppState {
                     return Ok(());
                 }
                 let chord = format_key_event(key);
-                match parse_shortcut(&chord) {
+                match if manager.capture_sequence.is_empty() {
+                    parse_shortcut(&chord)
+                } else {
+                    parse_sequence_chord(&chord)
+                } {
                     Err(error) => self.message = format!("Use a modified chord: {error}"),
                     Ok(event)
-                        if is_hierarchical_menu_shortcut(event)
-                            || (manager.capture_sequence.is_empty()
-                                && is_reserved_command_shortcut(event)) =>
+                        if manager.capture_sequence.is_empty()
+                            && is_reserved_command_shortcut(event) =>
                     {
                         self.message = format!("{chord} is reserved by Writer's IDE")
                     }
@@ -20591,10 +20715,14 @@ fn handle_command_palette_key(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
-    if registered_quit_shortcut_matches(s, k) {
-        if let Some(command) = command_by_id("file.quit") {
-            s.dispatch_registered(command.action)?;
+    if let Some(command) = registered_global_command_for_key(s, k) {
+        if matches!(
+            command.action,
+            CommandAction::OpenMainMenu | CommandAction::OpenMenuCategory(_)
+        ) {
+            s.help_panel = None;
         }
+        dispatch_key_command(s, command)?;
         return Ok(false);
     }
     if s.help_panel.is_some() {
@@ -20620,14 +20748,6 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     panel.scroll = panel.scroll.saturating_add(10);
                 }
             }
-            KeyCode::F(10) => {
-                s.close_context_help();
-                s.toggle_menu();
-            }
-            KeyCode::Char('/') if k.modifiers.contains(KeyModifiers::CONTROL) => {
-                s.close_context_help();
-                s.toggle_menu();
-            }
             _ => {}
         }
         return Ok(false);
@@ -20643,10 +20763,6 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         || s.snippet_preview.is_some();
     if k.code == KeyCode::F(1) && (s.workspace == Workspace::Editor || modal_is_open) {
         s.show_context_help();
-        return Ok(false);
-    }
-    if is_menu_shortcut(k) || k.code == KeyCode::F(10) {
-        s.toggle_menu();
         return Ok(false);
     }
     if s.menu.is_some() {
@@ -22560,7 +22676,7 @@ mod tests {
         state
             .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
             .unwrap();
-        for character in "view.timeline".chars() {
+        for character in "menu.main".chars() {
             state
                 .handle_keybinding_manager_key(KeyEvent::new(
                     KeyCode::Char(character),
@@ -22575,10 +22691,10 @@ mod tests {
             .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
             .unwrap();
         state
-            .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL))
             .unwrap();
         state
-            .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE))
             .unwrap();
         state
             .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -22587,14 +22703,14 @@ mod tests {
         let bindings = load_context_command_bindings(state.app.project_root()).unwrap();
         assert!(bindings.iter().any(|binding| {
             binding.context == "editor"
-                && binding.command_id == "view.timeline"
+                && binding.command_id == "menu.main"
                 && binding.sequence.len() == 2
         }));
         assert!(state.keybinding_manager.is_some());
     }
 
     #[test]
-    fn context_sequences_reject_unknown_context_reserved_keys_and_prefix_conflicts() {
+    fn context_sequences_allow_configured_menu_chords_but_reject_unknowns_and_prefix_conflicts() {
         let root = tempfile::tempdir().unwrap();
         let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
         let config = project.project_root().join(".writers-ide/keybindings.toml");
@@ -22609,7 +22725,7 @@ mod tests {
             "[contexts.editor]\n\"Ctrl+X Ctrl+/\" = \"file.save\"\n",
         )
         .unwrap();
-        assert!(load_context_command_bindings(project.project_root()).is_err());
+        assert!(load_context_command_bindings(project.project_root()).is_ok());
         fs::write(
             &config,
             "[contexts.editor]\n\"Ctrl+X\" = \"file.save\"\n\"Ctrl+X Ctrl+S\" = \"view.analytics\"\n",
@@ -22648,11 +22764,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.workspace, Workspace::Analytics);
-        assert!(
-            state
-                .execute_legacy_palette_command("keybinding-set Ctrl+/ view.editor")
-                .is_err()
+        state
+            .execute_legacy_palette_command("keybinding-set Ctrl+/ view.editor")
+            .unwrap();
+        assert_eq!(
+            effective_command_shortcuts(&state, command_by_id("menu.main").unwrap()),
+            vec!["F10"]
         );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert!(state.menu.is_none());
+        state
+            .execute_legacy_palette_command("keybinding-remove Ctrl+/")
+            .unwrap();
         state
             .execute_legacy_palette_command("keybinding-set Ctrl+Alt+J compile.selected")
             .unwrap();
@@ -22687,14 +22815,26 @@ mod tests {
     }
 
     #[test]
-    fn command_shortcuts_reject_duplicates_reserved_keys_and_unknown_commands() {
+    fn command_shortcuts_allow_function_keys_and_reject_duplicates_reserved_keys_and_unknown_commands()
+     {
         assert!(parse_shortcut("A").is_err());
-        assert!(parse_shortcut("Ctrl+Alt+F10").is_err());
+        assert_eq!(parse_shortcut("F10").unwrap().code, KeyCode::F(10));
+        assert_eq!(parse_shortcut("Ctrl+Alt+F10").unwrap().code, KeyCode::F(10));
         let root = tempfile::tempdir().unwrap();
         let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
         let config = project.project_root().join(".writers-ide/keybindings.toml");
         fs::write(&config, "[commands]\n\"Ctrl+/\" = \"view.editor\"\n").unwrap();
-        assert!(load_command_bindings(project.project_root()).is_err());
+        let mut state = AppState::new(project, default_bindings());
+        state.command_bindings = load_command_bindings(state.app.project_root()).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert!(state.menu.is_none());
+        let project = state.app;
+        let config = project.project_root().join(".writers-ide/keybindings.toml");
         fs::write(
             &config,
             "[commands]\n\"Ctrl+Alt+A\" = \"unknown.command\"\n",
@@ -25301,7 +25441,7 @@ mod tests {
     }
 
     #[test]
-    fn menu_shortcuts_are_reserved_without_consuming_plain_slash() {
+    fn menu_shortcuts_are_registry_driven_and_plain_slash_remains_prose() {
         let bindings = default_bindings();
         assert!(!bindings.iter().any(|(key, _)| *key == 10));
         assert!(
@@ -25314,18 +25454,82 @@ mod tests {
                 .iter()
                 .any(|(key, workspace)| *key == 11 && *workspace == Workspace::Issues)
         );
-        assert!(is_menu_shortcut(KeyEvent::new(
-            KeyCode::Char('/'),
-            KeyModifiers::CONTROL
-        )));
-        assert!(is_menu_shortcut(KeyEvent::new(
-            KeyCode::Char('_'),
-            KeyModifiers::CONTROL
-        )));
-        assert!(!is_menu_shortcut(KeyEvent::new(
-            KeyCode::Char('/'),
-            KeyModifiers::NONE
-        )));
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, bindings);
+        state.open_scene(scene).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(state.menu.is_some());
+        state.menu = None;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.menu.is_some());
+        state.menu = None;
+        // Slash is ordinary manuscript input when the editor owns focus.
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "/");
+    }
+
+    #[test]
+    fn function_key_override_and_menu_chord_sequence_are_registry_driven() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.function_bindings.push((10, Workspace::Analytics));
+        assert_eq!(
+            effective_command_shortcuts(&state, command_by_id("menu.main").unwrap()),
+            vec!["Ctrl+/"]
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Analytics);
+        assert!(state.menu.is_none());
+
+        state.workspace = Workspace::Editor;
+        handle(&mut state, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.workspace, Workspace::Outline);
+        state.workspace = Workspace::Editor;
+        state.context_command_bindings = vec![ContextCommandBinding {
+            context: "editor".into(),
+            sequence: parse_key_sequence("Ctrl+/ F").unwrap(),
+            command_id: "menu.main".into(),
+        }];
+        assert_eq!(
+            effective_command_shortcuts(&state, command_by_id("menu.main").unwrap()),
+            vec!["Ctrl+/ F"]
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(state.pending_command_sequence.is_some());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.menu.is_some());
+        assert!(state.pending_command_sequence.is_none());
     }
 
     #[test]
@@ -25390,10 +25594,6 @@ mod tests {
         .unwrap();
         assert!(state.help_panel.is_none());
         assert!(state.menu.is_some());
-        assert!(!is_menu_shortcut(KeyEvent::new(
-            KeyCode::Char('/'),
-            KeyModifiers::NONE
-        )));
     }
 
     #[test]
@@ -26614,12 +26814,13 @@ mod tests {
         fs::create_dir_all(dir.path().join(".writers-ide")).unwrap();
         fs::write(
             dir.path().join(".writers-ide/keybindings.toml"),
-            "[bindings]\nF1 = \"Analytics\"\nF4 = \"Reading\"\n",
+            "[bindings]\nF1 = \"Analytics\"\nF4 = \"Reading\"\nF10 = \"Issues\"\n",
         )
         .unwrap();
         let bindings = load_bindings(dir.path()).unwrap();
         assert_eq!(bindings[0], (1, Workspace::Analytics));
         assert_eq!(bindings[3], (4, Workspace::Reading));
+        assert!(bindings.contains(&(10, Workspace::Issues)));
         assert_eq!(bindings[1].1, Workspace::Outline);
     }
 
