@@ -9,7 +9,7 @@ use std::{
 };
 
 pub const SEMANTIC_SCHEMA_VERSION: u16 = 1;
-pub const COMPILE_IR_VERSION: u16 = 3;
+pub const COMPILE_IR_VERSION: u16 = 4;
 
 fn valid_language_tag(tag: &str) -> bool {
     let mut parts = tag.split('-');
@@ -284,6 +284,8 @@ pub struct CompileIr {
     pub version: u16,
     pub title: String,
     #[serde(default)]
+    pub author: Option<String>,
+    #[serde(default)]
     pub language_code: Option<String>,
     pub groups: Vec<CompileGroup>,
     pub units: Vec<CompileUnit>,
@@ -294,6 +296,7 @@ impl CompileIr {
         Self {
             version: COMPILE_IR_VERSION,
             title: title.into(),
+            author: None,
             language_code: None,
             groups: Vec::new(),
             units: Vec::new(),
@@ -770,6 +773,13 @@ impl BookDesignProfile {
 }
 
 /// Portable, project-relative compile edition configuration.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CompileMetadata {
+    pub title: Option<String>,
+    pub author: Option<String>,
+    pub cover_image: Option<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct EditionRecipe {
     pub version: u16,
@@ -780,6 +790,15 @@ pub struct EditionRecipe {
     pub assembly_id: Option<String>,
     /// Destination within the project; absolute paths and parent traversal are forbidden.
     pub output: String,
+    /// Publication title override. Omitted means the project title.
+    #[serde(default)]
+    pub metadata_title: Option<String>,
+    /// Publication author override. Omitted means the project author.
+    #[serde(default)]
+    pub metadata_author: Option<String>,
+    /// Optional project-relative EPUB cover image.
+    #[serde(default)]
+    pub cover_image: Option<String>,
     #[serde(default)]
     pub design: BookDesign,
     #[serde(default)]
@@ -856,6 +875,25 @@ impl EditionRecipe {
             return Err("edition name cannot be empty".into());
         }
         validate_project_relative_path(&self.output)?;
+        for (label, value) in [
+            ("metadata title", self.metadata_title.as_deref()),
+            ("metadata author", self.metadata_author.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                return Err(format!("edition {label} cannot be empty"));
+            }
+        }
+        if let Some(cover) = &self.cover_image {
+            validate_project_relative_path(cover)?;
+            if !matches!(
+                self.format,
+                CompileFormat::Epub | CompileFormat::Azw3 | CompileFormat::Mobi
+            ) {
+                return Err(
+                    "cover images are supported only for EPUB, AZW3, and MOBI editions".into(),
+                );
+            }
+        }
         if self.spellcheck && self.language.as_deref().is_none_or(str::is_empty) {
             return Err("spellcheck editions require a language tag".into());
         }
@@ -1113,6 +1151,23 @@ impl PandocRenderer {
         resource_root: Option<&Path>,
         design: &BookDesignProfile,
     ) -> Result<CompileArtifact, String> {
+        self.render_with_profile_and_metadata(
+            ir,
+            format,
+            resource_root,
+            design,
+            &CompileMetadata::default(),
+        )
+    }
+
+    pub fn render_with_profile_and_metadata(
+        &self,
+        ir: &CompileIr,
+        format: CompileFormat,
+        resource_root: Option<&Path>,
+        design: &BookDesignProfile,
+        metadata: &CompileMetadata,
+    ) -> Result<CompileArtifact, String> {
         if !ir.validate() {
             return Err("refusing to render invalid Compile IR".into());
         }
@@ -1131,6 +1186,31 @@ impl PandocRenderer {
                 .map_err(|error| format!("resolve custom book template: {error}"))?;
             if !path.starts_with(&root) || !path.is_file() {
                 return Err("custom book template must be a project-local regular file".into());
+            }
+            Some(path)
+        } else {
+            None
+        };
+        let cover_path = if let Some(cover) = metadata.cover_image.as_deref() {
+            if !matches!(
+                format,
+                CompileFormat::Epub | CompileFormat::Azw3 | CompileFormat::Mobi
+            ) {
+                return Err(
+                    "cover images are supported only for EPUB, AZW3, and MOBI editions".into(),
+                );
+            }
+            validate_project_relative_path(cover)?;
+            let root = resource_root.ok_or("EPUB cover images require a project root")?;
+            let root = root
+                .canonicalize()
+                .map_err(|error| format!("resolve project root: {error}"))?;
+            let path = root
+                .join(cover)
+                .canonicalize()
+                .map_err(|error| format!("resolve EPUB cover image: {error}"))?;
+            if !path.starts_with(&root) || !path.is_file() {
+                return Err("EPUB cover image must be a project-local regular file".into());
             }
             Some(path)
         } else {
@@ -1188,7 +1268,10 @@ impl PandocRenderer {
                 .arg("--standalone")
                 .arg("--wrap=none")
                 .arg("--metadata")
-                .arg(format!("title={}", ir.title))
+                .arg(format!(
+                    "title={}",
+                    metadata.title.as_deref().unwrap_or(&ir.title)
+                ))
                 .arg("--output")
                 .arg(&pandoc_output_path)
                 .stdin(Stdio::piped())
@@ -1196,6 +1279,12 @@ impl PandocRenderer {
                 .stderr(Stdio::piped());
             if let Some(language) = ir.language_code.as_deref() {
                 command.arg("--metadata").arg(format!("lang={language}"));
+            }
+            if let Some(author) = metadata.author.as_deref().or(ir.author.as_deref()) {
+                command.arg("--metadata").arg(format!("author={author}"));
+            }
+            if let Some(cover) = &cover_path {
+                command.arg("--epub-cover-image").arg(cover);
             }
             if format == CompileFormat::Pdf {
                 command
@@ -1464,6 +1553,9 @@ mod tests {
             format: CompileFormat::Epub,
             assembly_id: None,
             output: "exports/reader.epub".into(),
+            metadata_title: None,
+            metadata_author: None,
+            cover_image: None,
             design: BookDesign::Nonfiction,
             expand_transclusions: true,
             spellcheck: false,
@@ -1474,10 +1566,25 @@ mod tests {
             EditionRecipe::from_toml(&recipe.to_toml().unwrap()).unwrap(),
             recipe
         );
+        let legacy = r#"version = 1
+name = "Old recipe"
+format = "markdown"
+output = "exports/old.md"
+"#;
+        let parsed = EditionRecipe::from_toml(legacy).unwrap();
+        assert_eq!(parsed.metadata_title, None);
+        assert_eq!(parsed.metadata_author, None);
+        assert_eq!(parsed.cover_image, None);
         let mut invalid = recipe;
         invalid.output = "../outside.epub".into();
         assert!(invalid.validate().is_err());
         invalid.output = "exports/out.epub".into();
+        invalid.metadata_author = Some("  ".into());
+        assert!(invalid.validate().is_err());
+        invalid.metadata_author = None;
+        invalid.cover_image = Some("attachments/cover.png".into());
+        invalid.format = CompileFormat::Markdown;
+        assert!(invalid.validate().is_err());
     }
     use std::io::Read;
 
@@ -1684,6 +1791,7 @@ mod tests {
             return;
         }
         let mut ir = CompileIr::new("Writer’s Novel");
+        ir.author = Some("Project Author".into());
         ir.language_code = Some("en-GB".into());
         ir.push_group(CompileGroup {
             id: "chapter".into(),
@@ -1757,6 +1865,50 @@ mod tests {
             .read_to_string(&mut package)
             .unwrap();
         assert!(package.contains("en-GB"), "{package}");
+        assert!(package.contains("Project Author"), "{package}");
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(directory.path().join("attachments")).unwrap();
+        const ONE_PIXEL_PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
+            0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xda, 0x63, 0xfc, 0xff, 0x1f, 0x00, 0x03, 0x03, 0x02, 0x00, 0xef, 0xa3, 0x35, 0x2b,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(
+            directory.path().join("attachments/cover.png"),
+            ONE_PIXEL_PNG,
+        )
+        .unwrap();
+        let customized = renderer
+            .render_with_profile_and_metadata(
+                &ir,
+                CompileFormat::Epub,
+                Some(directory.path()),
+                &BookDesign::TradePaperback.profile(),
+                &CompileMetadata {
+                    title: Some("Reader’s Edition".into()),
+                    author: Some("Edition Author".into()),
+                    cover_image: Some("attachments/cover.png".into()),
+                },
+            )
+            .unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(customized.bytes)).unwrap();
+        let package_name = (0..archive.len())
+            .map(|index| archive.by_index(index).unwrap().name().to_owned())
+            .find(|name| name.ends_with(".opf"))
+            .unwrap();
+        let mut package = String::new();
+        archive
+            .by_name(&package_name)
+            .unwrap()
+            .read_to_string(&mut package)
+            .unwrap();
+        assert!(package.contains("Reader’s Edition"), "{package}");
+        assert!(package.contains("Edition Author"), "{package}");
+        assert!(package.contains("cover-image"), "{package}");
+        assert!(archive.file_names().any(|name| name.ends_with("cover.png")));
         if Command::new("lualatex").arg("--version").output().is_ok() {
             let pdf = renderer.render(&ir, CompileFormat::Pdf, None).unwrap();
             assert!(pdf.bytes.starts_with(b"%PDF-"));
@@ -1832,6 +1984,104 @@ mod tests {
         for format in [CompileFormat::Azw3, CompileFormat::Mobi] {
             let error = missing_calibre.render(&ir, format, None).unwrap_err();
             assert!(error.contains("optional Calibre 'ebook-convert'"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn epub_metadata_and_cover_are_project_local_and_passed_as_arguments() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let cover = directory.path().join("attachments/cover.png");
+        std::fs::create_dir_all(cover.parent().unwrap()).unwrap();
+        std::fs::write(&cover, b"test cover bytes").unwrap();
+        let arguments = directory.path().join("arguments.txt");
+        let program = directory.path().join("pandoc-mock");
+        std::fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nwhile [ \"$1\" != \"--output\" ]; do shift; done\nshift\nprintf 'epub' > \"$1\"\ncat >/dev/null\n",
+                arguments.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut ir = CompileIr::new("Project title");
+        ir.author = Some("Project author".into());
+        ir.push(CompileUnit {
+            id: "scene".into(),
+            parent_id: None,
+            kind: ContentUnitKind::Scene,
+            title: "Scene".into(),
+            language_code: None,
+            segments: vec![CompileSegment::new("scene", "Prose.")],
+        });
+        let metadata = CompileMetadata {
+            title: Some("Edition title".into()),
+            author: Some("Edition author".into()),
+            cover_image: Some("attachments/cover.png".into()),
+        };
+        let renderer = PandocRenderer::with_program(&program);
+        let artifact = renderer
+            .render_with_profile_and_metadata(
+                &ir,
+                CompileFormat::Epub,
+                Some(directory.path()),
+                &BookDesign::TradePaperback.profile(),
+                &metadata,
+            )
+            .unwrap();
+        assert_eq!(artifact.bytes, b"epub");
+        let args = std::fs::read_to_string(&arguments).unwrap();
+        assert!(args.contains("title=Edition title"));
+        assert!(args.contains("author=Edition author"));
+        assert!(args.contains("--epub-cover-image"));
+        assert!(args.contains(cover.to_str().unwrap()));
+
+        let fallback = CompileMetadata {
+            title: None,
+            author: None,
+            cover_image: None,
+        };
+        renderer
+            .render_with_profile_and_metadata(
+                &ir,
+                CompileFormat::Epub,
+                Some(directory.path()),
+                &BookDesign::TradePaperback.profile(),
+                &fallback,
+            )
+            .unwrap();
+        let args = std::fs::read_to_string(&arguments).unwrap();
+        assert!(args.contains("title=Project title"));
+        assert!(args.contains("author=Project author"));
+        assert!(!args.contains("--epub-cover-image"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside_directory = tempfile::tempdir().unwrap();
+            let external = outside_directory.path().join("outside.png");
+            std::fs::write(&external, b"outside").unwrap();
+            let linked = directory.path().join("attachments/external.png");
+            symlink(&external, &linked).unwrap();
+            let external_cover = CompileMetadata {
+                title: None,
+                author: None,
+                cover_image: Some("attachments/external.png".into()),
+            };
+            assert!(
+                renderer
+                    .render_with_profile_and_metadata(
+                        &ir,
+                        CompileFormat::Epub,
+                        Some(directory.path()),
+                        &BookDesign::TradePaperback.profile(),
+                        &external_cover,
+                    )
+                    .unwrap_err()
+                    .contains("project-local regular file")
+            );
         }
     }
 

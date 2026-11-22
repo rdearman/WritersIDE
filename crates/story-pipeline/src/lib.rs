@@ -90,6 +90,7 @@ pub struct PipelinePassage {
 #[derive(Clone, Debug)]
 pub struct PipelineInput {
     pub title: String,
+    pub author: Option<String>,
     pub language_code: Option<String>,
     pub target_words: Option<u64>,
     pub word_count_policy: story_core::WordCountPolicy,
@@ -947,6 +948,7 @@ fn read_proofreading_config(root: &Path) -> Result<ProofreadingConfig, String> {
 
 pub fn compile_ir(input: &PipelineInput) -> story_document::CompileIr {
     let mut ir = story_document::CompileIr::new(input.title.clone());
+    ir.author = input.author.clone();
     ir.language_code = input.language_code.clone();
     for group in &input.groups {
         ir.push_group(story_document::CompileGroup {
@@ -1166,6 +1168,7 @@ mod tests {
     fn input(text: &str) -> PipelineInput {
         PipelineInput {
             title: "Novel".into(),
+            author: None,
             language_code: None,
             target_words: Some(100),
             word_count_policy: story_core::WordCountPolicy::UnicodeWords,
@@ -1205,10 +1208,12 @@ mod tests {
     #[test]
     fn compile_ir_carries_project_and_scene_language_metadata() {
         let mut manuscript = input("Bonjour.");
+        manuscript.author = Some("Project Author".into());
         manuscript.language_code = Some("en-GB".into());
         manuscript.scenes[0].language_code = Some("fr-FR".into());
         let ir = compile_ir(&manuscript);
         assert_eq!(ir.language_code.as_deref(), Some("en-GB"));
+        assert_eq!(ir.author.as_deref(), Some("Project Author"));
         assert_eq!(ir.units[0].language_code.as_deref(), Some("fr-FR"));
         let (markdown, source_map) = ir.render_markdown();
         assert!(markdown.starts_with("---\nlang: en-GB\n---"));

@@ -1122,11 +1122,32 @@ impl WriterApp {
         expand_transclusions: bool,
         design: story_document::BookDesignProfile,
     ) -> Result<story_document::CompileArtifact> {
+        self.compile_artifact_with_profile_and_metadata(
+            format,
+            expand_transclusions,
+            design,
+            &story_document::CompileMetadata::default(),
+        )
+    }
+
+    pub fn compile_artifact_with_profile_and_metadata(
+        &self,
+        format: story_document::CompileFormat,
+        expand_transclusions: bool,
+        design: story_document::BookDesignProfile,
+        metadata: &story_document::CompileMetadata,
+    ) -> Result<story_document::CompileArtifact> {
         let input = self.processing_input_mode(expand_transclusions)?;
         let ir = story_pipeline::compile_ir(&input);
         let renderer = story_document::PandocRenderer::default();
         renderer
-            .render_with_profile(&ir, format, Some(self.store.project_root()), &design)
+            .render_with_profile_and_metadata(
+                &ir,
+                format,
+                Some(self.store.project_root()),
+                &design,
+                metadata,
+            )
             .map_err(AppError::Domain)
     }
 
@@ -1136,11 +1157,66 @@ impl WriterApp {
         format: story_document::CompileFormat,
         design: story_document::BookDesignProfile,
     ) -> Result<story_document::CompileArtifact> {
+        self.compile_artifact_for_assembly_with_metadata(
+            assembly,
+            format,
+            design,
+            &story_document::CompileMetadata::default(),
+        )
+    }
+
+    pub fn compile_artifact_for_assembly_with_metadata(
+        &self,
+        assembly: AssemblyId,
+        format: story_document::CompileFormat,
+        design: story_document::BookDesignProfile,
+        metadata: &story_document::CompileMetadata,
+    ) -> Result<story_document::CompileArtifact> {
         let ir = self.compile_assembly_ir(assembly)?;
         let renderer = story_document::PandocRenderer::default();
         renderer
-            .render_with_profile(&ir, format, Some(self.store.project_root()), &design)
+            .render_with_profile_and_metadata(
+                &ir,
+                format,
+                Some(self.store.project_root()),
+                &design,
+                metadata,
+            )
             .map_err(AppError::Domain)
+    }
+
+    /// Render a complete project-local edition recipe through the same path
+    /// used by managed builds and the CLI.
+    pub fn compile_artifact_for_edition(
+        &self,
+        recipe: &story_document::EditionRecipe,
+    ) -> Result<story_document::CompileArtifact> {
+        recipe.validate().map_err(AppError::Domain)?;
+        let metadata = story_document::CompileMetadata {
+            title: recipe.metadata_title.clone(),
+            author: recipe.metadata_author.clone(),
+            cover_image: recipe.cover_image.clone(),
+        };
+        let design = recipe.design.profile();
+        if let Some(assembly) = recipe.assembly_id.as_deref() {
+            let assembly =
+                AssemblyId(uuid::Uuid::parse_str(assembly).map_err(|error| {
+                    AppError::Domain(format!("invalid assembly UUID: {error}"))
+                })?);
+            self.compile_artifact_for_assembly_with_metadata(
+                assembly,
+                recipe.format,
+                design,
+                &metadata,
+            )
+        } else {
+            self.compile_artifact_with_profile_and_metadata(
+                recipe.format,
+                recipe.expand_transclusions,
+                design,
+                &metadata,
+            )
+        }
     }
 
     /// Publish a one-off Compile result without touching canonical project files.
@@ -1393,6 +1469,9 @@ impl WriterApp {
             format,
             assembly_id: None,
             output: format!("exports/compile/{name}/manuscript.{}", format.extension()),
+            metadata_title: None,
+            metadata_author: None,
+            cover_image: None,
             design,
             expand_transclusions: false,
             spellcheck: false,
@@ -1472,19 +1551,7 @@ impl WriterApp {
         let output = recipe.output.clone();
         let mut output_paths = vec![output.clone()];
         output_paths.push(format!("{output}.source-map.json"));
-        let artifact = if let Some(assembly) = recipe.assembly_id.as_deref() {
-            let assembly =
-                AssemblyId(uuid::Uuid::parse_str(assembly).map_err(|error| {
-                    AppError::Domain(format!("invalid assembly UUID: {error}"))
-                })?);
-            self.compile_artifact_for_assembly(assembly, recipe.format, recipe.design.profile())?
-        } else {
-            self.compile_artifact_with_design(
-                recipe.format,
-                recipe.expand_transclusions,
-                recipe.design,
-            )?
-        };
+        let artifact = self.compile_artifact_for_edition(&recipe)?;
         for auxiliary in &artifact.auxiliary_files {
             let extension = Path::new(&auxiliary.name)
                 .extension()
@@ -1928,6 +1995,7 @@ impl WriterApp {
             .collect();
         Ok(story_pipeline::PipelineInput {
             title: project.title,
+            author: (!project.author.trim().is_empty()).then_some(project.author),
             language_code: Some(project.language_code.clone()),
             target_words: project.target_words,
             word_count_policy: project.word_count_policy,
@@ -3651,6 +3719,7 @@ impl WriterApp {
             .ok_or_else(|| StorageError::NotFound(assembly.to_string()))?;
         let project = self.get_project()?;
         let mut ir = story_document::CompileIr::new(&assembly_record.title);
+        ir.author = (!project.author.trim().is_empty()).then_some(project.author.clone());
         ir.language_code = Some(project.language_code.clone());
         let nodes = self
             .store
@@ -4579,6 +4648,9 @@ unexpected_prose = "must not be silently discarded"
             format: story_document::CompileFormat::Markdown,
             assembly_id: None,
             output: "exports/compile/plain/manuscript.md".into(),
+            metadata_title: None,
+            metadata_author: None,
+            cover_image: None,
             design: story_document::BookDesign::Manuscript,
             expand_transclusions: false,
             spellcheck: false,
@@ -4648,6 +4720,9 @@ unexpected_prose = "must not be silently discarded"
             format: story_document::CompileFormat::Markdown,
             assembly_id: None,
             output: "exports/compile/unsafe/../../manuscript/scene.md".into(),
+            metadata_title: None,
+            metadata_author: None,
+            cover_image: None,
             design: story_document::BookDesign::default(),
             expand_transclusions: false,
             spellcheck: false,
@@ -5480,6 +5555,9 @@ unexpected_prose = "must not be silently discarded"
             format: story_document::CompileFormat::Markdown,
             assembly_id: Some(assembly.to_string()),
             output: "exports/compile/audio/manuscript.md".into(),
+            metadata_title: None,
+            metadata_author: None,
+            cover_image: None,
             design: story_document::BookDesign::Manuscript,
             expand_transclusions: false,
             spellcheck: false,

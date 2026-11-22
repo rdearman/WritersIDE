@@ -3335,12 +3335,7 @@ fn compile_edition_with_aspell_and_overwrite(
         None
     };
     let app = WriterApp::open_project(project)?;
-    let artifact = if let Some(assembly_id) = recipe.assembly_id.as_deref() {
-        let assembly = story_core::AssemblyId(uuid::Uuid::parse_str(assembly_id)?);
-        app.compile_artifact_for_assembly(assembly, recipe.format, recipe.design.profile())?
-    } else {
-        app.compile_artifact_with_design(recipe.format, recipe.expand_transclusions, recipe.design)?
-    };
+    let artifact = app.compile_artifact_for_edition(&recipe)?;
     let output = project.join(output_relative);
     let mut sidecars = Vec::new();
     if let Some(findings) = spelling {
