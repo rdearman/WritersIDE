@@ -8,7 +8,9 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -20,7 +22,7 @@ use ratatui::{
     text::{Line, Span, Text},
     widgets::{
         Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
-        canvas::{Canvas, Rectangle},
+        canvas::{Canvas, Line as CanvasLine, Rectangle},
     },
 };
 use story_app::WriterApp;
@@ -127,6 +129,10 @@ struct AppState {
     vertical_split_ratio: u16,
     assembly_draft: Option<story_core::AssemblyDraftId>,
     planning_board_id: Option<story_core::PlanningBoardId>,
+    planning_board_area: Option<Rect>,
+    planning_drag: Option<PlanningBoardDrag>,
+    planning_connector_source: Option<story_core::PlanningBoardItemId>,
+    planning_board_view: Option<PlanningBoardView>,
     collapsed_outline_nodes: BTreeSet<story_core::NodeId>,
     writing_stats_enabled: bool,
     typed_characters: u64,
@@ -464,6 +470,22 @@ struct KeybindingManagerState {
     capture_sequence: Vec<KeyEvent>,
     pending_capture: Option<(String, String)>,
     confirm_reset_all: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PlanningBoardDrag {
+    item_id: story_core::PlanningBoardItemId,
+    origin: (f64, f64),
+    pointer_origin: (f64, f64),
+    x_bounds: [f64; 2],
+    y_bounds: [f64; 2],
+}
+
+#[derive(Clone, Debug)]
+struct PlanningBoardView {
+    board_id: story_core::PlanningBoardId,
+    x_bounds: [f64; 2],
+    y_bounds: [f64; 2],
 }
 
 const KEYBINDING_CONTEXTS: [&str; 5] = ["global", "editor", "navigation", "dialog", "menu"];
@@ -3825,6 +3847,10 @@ impl AppState {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: writing_session.is_some(),
             typed_characters: 0,
@@ -6248,6 +6274,8 @@ impl AppState {
                     .get(self.selected)
                     .ok_or("planning board selection is out of range")?;
                 self.planning_board_id = Some(board.id);
+                self.planning_connector_source = None;
+                self.planning_board_view = None;
                 self.selected = 0;
                 self.message = format!(
                     "{} · Ctrl+arrows move cards · Esc returns to boards",
@@ -8649,6 +8677,8 @@ impl AppState {
             self.open_assembly_draft(draft.id)?;
         } else if cmd == "board-back" {
             self.planning_board_id = None;
+            self.planning_connector_source = None;
+            self.planning_board_view = None;
             self.selected = 0;
             self.message = "Planning board list".into();
         } else if let Some(value) = cmd.strip_prefix("board-open ") {
@@ -8662,12 +8692,16 @@ impl AppState {
                 return Err("planning board no longer exists".into());
             }
             self.planning_board_id = Some(id);
+            self.planning_connector_source = None;
+            self.planning_board_view = None;
             self.selected = 0;
             self.switch(Workspace::PlanningBoards);
             self.message = format!("Opened planning board {id} · Ctrl+arrows move cards");
         } else if let Some(title) = cmd.strip_prefix("board ") {
             let id = self.app.create_planning_board(title.trim())?;
             self.planning_board_id = Some(id);
+            self.planning_connector_source = None;
+            self.planning_board_view = None;
             self.selected = 0;
             self.switch(Workspace::PlanningBoards);
             self.message = format!("Created planning board {id}");
@@ -13148,6 +13182,11 @@ fn run(
                     }
                 }
                 Event::Resize(_, _) => s.pause_challenge_inactivity(),
+                Event::Mouse(mouse) => {
+                    if let Err(error) = handle_planning_board_mouse(s, mouse) {
+                        s.message = error.to_string();
+                    }
+                }
                 _ => {}
             }
         }
@@ -13243,6 +13282,7 @@ fn format_search_result_row(title: &str, text: &str, byte_offset: usize) -> Stri
 
 fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     let area = f.area();
+    s.planning_board_area = None;
     let focus_only = s.workspace == Workspace::Editor && s.editor_focus_mode;
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -13835,12 +13875,48 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             && let Some(board) = s.planning_board_id
         {
             let items = s.app.list_planning_board_items(board).unwrap_or_default();
-            let (x_bounds, y_bounds) = planning_board_bounds(&items);
+            let connectors = s
+                .app
+                .list_planning_board_connectors(board)
+                .unwrap_or_default();
+            let default_bounds = planning_board_bounds(&items);
+            if s.planning_board_view
+                .as_ref()
+                .is_some_and(|view| view.board_id != board)
+            {
+                s.planning_board_view = None;
+            }
+            let (x_bounds, y_bounds) = s
+                .planning_board_view
+                .as_ref()
+                .map(|view| (view.x_bounds, view.y_bounds))
+                .unwrap_or(default_bounds);
             let selected = s.selected;
+            let board_block = Block::default()
+                .title("Board · drag move · c connect · wheel pan · Ctrl+wheel zoom · 0 reset")
+                .borders(Borders::ALL);
+            s.planning_board_area = Some(board_block.inner(body[1]));
             let canvas = Canvas::default()
                 .x_bounds(x_bounds)
                 .y_bounds(y_bounds)
                 .paint(|context| {
+                    for connector in &connectors {
+                        let source = items
+                            .iter()
+                            .find(|item| item.id == connector.source_item_id);
+                        let target = items
+                            .iter()
+                            .find(|item| item.id == connector.target_item_id);
+                        if let (Some(source), Some(target)) = (source, target) {
+                            context.draw(&CanvasLine::new(
+                                source.x + source.width / 2.0,
+                                source.y + source.height / 2.0,
+                                target.x + target.width / 2.0,
+                                target.y + target.height / 2.0,
+                                Color::Gray,
+                            ));
+                        }
+                    }
                     for (index, item) in items.iter().enumerate() {
                         let short_id = item.entity_id.chars().take(6).collect::<String>();
                         let label = if item.note.trim().is_empty() {
@@ -13852,7 +13928,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                                 item.note.chars().take(12).collect::<String>()
                             )
                         };
-                        let color = if index == selected {
+                        let color = if s.planning_connector_source == Some(item.id) {
+                            Color::Magenta
+                        } else if index == selected {
                             Color::Yellow
                         } else {
                             Color::Cyan
@@ -13871,11 +13949,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         );
                     }
                 })
-                .block(
-                    Block::default()
-                        .title("Planning Board · Ctrl+arrows move selected card")
-                        .borders(Borders::ALL),
-                );
+                .block(board_block);
             f.render_widget(canvas, body[1]);
         } else {
             let detail = if s.workspace == Workspace::Outline {
@@ -14115,6 +14189,205 @@ fn planning_board_bounds(items: &[story_storage::PlanningBoardItemRecord]) -> ([
         bounds(items.iter().flat_map(|item| [item.x, item.x + item.width])),
         bounds(items.iter().map(|item| item.y + item.height)),
     )
+}
+
+fn planning_canvas_to_world(
+    area: Rect,
+    x_bounds: [f64; 2],
+    y_bounds: [f64; 2],
+    column: u16,
+    row: u16,
+) -> Option<(f64, f64)> {
+    if area.width == 0 || area.height == 0 || !area.contains((column, row).into()) {
+        return None;
+    }
+    let x_fraction = (column - area.x) as f64 / area.width as f64;
+    let y_fraction = (row - area.y) as f64 / area.height as f64;
+    Some((
+        x_bounds[0] + x_fraction * (x_bounds[1] - x_bounds[0]),
+        y_bounds[1] - y_fraction * (y_bounds[1] - y_bounds[0]),
+    ))
+}
+
+#[cfg(test)]
+fn planning_world_to_canvas(
+    area: Rect,
+    x_bounds: [f64; 2],
+    y_bounds: [f64; 2],
+    x: f64,
+    y: f64,
+) -> Option<(u16, u16)> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let x_fraction = ((x - x_bounds[0]) / (x_bounds[1] - x_bounds[0])).clamp(0.0, 0.999_999);
+    let y_fraction = ((y_bounds[1] - y) / (y_bounds[1] - y_bounds[0])).clamp(0.0, 0.999_999);
+    Some((
+        area.x + (x_fraction * area.width as f64).floor() as u16,
+        area.y + (y_fraction * area.height as f64).floor() as u16,
+    ))
+}
+
+fn move_planning_bounds(bounds: [f64; 2], delta: f64) -> [f64; 2] {
+    [bounds[0] + delta, bounds[1] + delta]
+}
+
+fn zoom_planning_bounds(bounds: [f64; 2], focus: f64, scale: f64) -> [f64; 2] {
+    [
+        focus + (bounds[0] - focus) * scale,
+        focus + (bounds[1] - focus) * scale,
+    ]
+}
+
+fn handle_planning_board_mouse(
+    state: &mut AppState,
+    mouse: MouseEvent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(board) = state
+        .planning_board_id
+        .filter(|_| state.workspace == Workspace::PlanningBoards)
+    else {
+        return Ok(());
+    };
+    if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+        state.planning_drag = None;
+        return Ok(());
+    }
+    let Some(area) = state.planning_board_area else {
+        return Ok(());
+    };
+    if matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+    ) && !area.contains((mouse.column, mouse.row).into())
+    {
+        return Ok(());
+    }
+    let items = state.app.list_planning_board_items(board)?;
+    let default_bounds = planning_board_bounds(&items);
+    let (x_bounds, y_bounds) = state
+        .planning_board_view
+        .as_ref()
+        .filter(|view| view.board_id == board)
+        .map(|view| (view.x_bounds, view.y_bounds))
+        .unwrap_or(default_bounds);
+    if matches!(
+        mouse.kind,
+        MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight
+    ) {
+        let mut next_x = x_bounds;
+        let mut next_y = y_bounds;
+        match mouse.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                if mouse.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let focus =
+                    planning_canvas_to_world(area, x_bounds, y_bounds, mouse.column, mouse.row)
+                        .unwrap_or((
+                            (x_bounds[0] + x_bounds[1]) / 2.0,
+                            (y_bounds[0] + y_bounds[1]) / 2.0,
+                        ));
+                let scale = if mouse.kind == MouseEventKind::ScrollUp {
+                    0.8
+                } else {
+                    1.25
+                };
+                next_x = zoom_planning_bounds(x_bounds, focus.0, scale);
+                next_y = zoom_planning_bounds(y_bounds, focus.1, scale);
+                state.message = if scale < 1.0 {
+                    "Planning board zoomed in".into()
+                } else {
+                    "Planning board zoomed out".into()
+                };
+            }
+            MouseEventKind::ScrollUp => {
+                next_y = move_planning_bounds(y_bounds, (y_bounds[1] - y_bounds[0]) * 0.1);
+                state.message = "Panned planning board up".into();
+            }
+            MouseEventKind::ScrollDown => {
+                next_y = move_planning_bounds(y_bounds, -(y_bounds[1] - y_bounds[0]) * 0.1);
+                state.message = "Panned planning board down".into();
+            }
+            MouseEventKind::ScrollLeft => {
+                next_x = move_planning_bounds(x_bounds, -(x_bounds[1] - x_bounds[0]) * 0.1);
+                state.message = "Panned planning board left".into();
+            }
+            MouseEventKind::ScrollRight => {
+                next_x = move_planning_bounds(x_bounds, (x_bounds[1] - x_bounds[0]) * 0.1);
+                state.message = "Panned planning board right".into();
+            }
+            _ => {}
+        }
+        state.planning_board_view = Some(PlanningBoardView {
+            board_id: board,
+            x_bounds: next_x,
+            y_bounds: next_y,
+        });
+        return Ok(());
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some((x, y)) =
+                planning_canvas_to_world(area, x_bounds, y_bounds, mouse.column, mouse.row)
+            else {
+                return Ok(());
+            };
+            if let Some((index, item)) = items.iter().enumerate().rev().find(|(_, item)| {
+                x >= item.x && x <= item.x + item.width && y >= item.y && y <= item.y + item.height
+            }) {
+                state.selected = index;
+                state.planning_drag = Some(PlanningBoardDrag {
+                    item_id: item.id,
+                    origin: (item.x, item.y),
+                    pointer_origin: (x, y),
+                    x_bounds,
+                    y_bounds,
+                });
+                state.message = format!("Selected {} planning card", item.entity_kind);
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let Some(drag) = state.planning_drag.clone() else {
+                return Ok(());
+            };
+            let Some((x, y)) = planning_canvas_to_world(
+                area,
+                drag.x_bounds,
+                drag.y_bounds,
+                mouse.column,
+                mouse.row,
+            ) else {
+                return Ok(());
+            };
+            let position = (
+                drag.origin.0 + x - drag.pointer_origin.0,
+                drag.origin.1 + y - drag.pointer_origin.1,
+            );
+            state
+                .app
+                .move_planning_board_item(drag.item_id, position.0, position.1)?;
+            if let Some(index) = state
+                .app
+                .list_planning_board_items(board)?
+                .iter()
+                .position(|item| item.id == drag.item_id)
+            {
+                state.selected = index;
+            }
+            state.message = format!(
+                "Moved planning card to ({:.1}, {:.1})",
+                position.0, position.1
+            );
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn format_conflict_review(
@@ -17528,6 +17801,47 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
     }
     if s.workspace == Workspace::PlanningBoards
+        && k.code == KeyCode::Char('0')
+        && k.modifiers.is_empty()
+    {
+        s.planning_board_view = None;
+        s.message = "Planning board view reset to fit all cards".into();
+        return Ok(false);
+    }
+    if s.workspace == Workspace::PlanningBoards
+        && k.code == KeyCode::Char('c')
+        && k.modifiers.is_empty()
+        && let Some(board) = s.planning_board_id
+    {
+        let items = s.app.list_planning_board_items(board)?;
+        let Some(target) = items.get(s.selected) else {
+            return Ok(false);
+        };
+        if let Some(source_id) = s.planning_connector_source.take() {
+            if source_id == target.id {
+                s.message = "Connector cancelled: choose a different target card".into();
+            } else {
+                s.app
+                    .connect_planning_board_items(board, source_id, target.id, "related")?;
+                s.message = "Connected selected planning cards with a related edge".into();
+            }
+        } else {
+            s.planning_connector_source = Some(target.id);
+            s.message = format!(
+                "Connector source selected: {}; move to a target card and press c",
+                target.entity_kind
+            );
+        }
+        return Ok(false);
+    }
+    if s.workspace == Workspace::PlanningBoards
+        && k.code == KeyCode::Esc
+        && s.planning_connector_source.take().is_some()
+    {
+        s.message = "Connector drawing cancelled".into();
+        return Ok(false);
+    }
+    if s.workspace == Workspace::PlanningBoards
         && let Some(board) = s.planning_board_id
         && k.modifiers.contains(KeyModifiers::CONTROL)
         && !k.modifiers.contains(KeyModifiers::SHIFT)
@@ -20622,6 +20936,10 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
@@ -21296,6 +21614,169 @@ mod tests {
         std::os::unix::fs::symlink(&external, project.project_root().join("exports")).unwrap();
         assert!(write_board_svg_export(project.project_root(), "board.svg", b"<svg/>").is_err());
         assert!(!external.join("board.svg").exists());
+    }
+
+    #[test]
+    fn planning_board_mouse_click_and_drag_move_only_the_selected_card() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let board = app.create_planning_board("Board").unwrap();
+        let card = app
+            .add_planning_board_item(board, "scene", &scene.to_string(), 3.0, 4.0, "beat")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::PlanningBoards;
+        state.planning_board_id = Some(board);
+        state.planning_board_area = Some(Rect::new(0, 0, 80, 24));
+        let before = state.app.list_planning_board_items(board).unwrap();
+        let item = before.iter().find(|item| item.id == card).unwrap();
+        let bounds = planning_board_bounds(&before);
+        let center = (item.x + item.width / 2.0, item.y + item.height / 2.0);
+        let (column, row) = planning_world_to_canvas(
+            state.planning_board_area.unwrap(),
+            bounds.0,
+            bounds.1,
+            center.0,
+            center.1,
+        )
+        .unwrap();
+        handle_planning_board_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            },
+        )
+        .unwrap();
+        assert_eq!(state.selected, 0);
+        assert!(state.planning_drag.is_some());
+        handle_planning_board_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: column + 6,
+                row: row.saturating_sub(3),
+                modifiers: KeyModifiers::NONE,
+            },
+        )
+        .unwrap();
+        handle_planning_board_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::Up(MouseButton::Left),
+                column: column + 6,
+                row: row.saturating_sub(3),
+                modifiers: KeyModifiers::NONE,
+            },
+        )
+        .unwrap();
+        let after = state.app.list_planning_board_items(board).unwrap();
+        let moved = after.iter().find(|item| item.id == card).unwrap();
+        assert!(moved.x > item.x);
+        assert!(moved.y > item.y);
+        assert!(state.planning_drag.is_none());
+        assert_eq!(state.app.list_scenes(false).unwrap()[0].scene.id, scene);
+    }
+
+    #[test]
+    fn planning_board_mouse_wheel_pans_and_control_wheel_zooms() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let board = app.create_planning_board("Board").unwrap();
+        app.add_planning_board_item(board, "scene", &scene.to_string(), 3.0, 4.0, "beat")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::PlanningBoards;
+        state.planning_board_id = Some(board);
+        state.planning_board_area = Some(Rect::new(0, 0, 80, 24));
+        let initial = planning_board_bounds(&state.app.list_planning_board_items(board).unwrap());
+        handle_planning_board_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 40,
+                row: 12,
+                modifiers: KeyModifiers::NONE,
+            },
+        )
+        .unwrap();
+        let panned = state.planning_board_view.as_ref().unwrap();
+        assert!(panned.y_bounds[0] > initial.1[0]);
+        let panned_y = panned.y_bounds;
+        let previous_width = panned.x_bounds[1] - panned.x_bounds[0];
+        let previous_height = panned_y[1] - panned_y[0];
+        handle_planning_board_mouse(
+            &mut state,
+            MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 40,
+                row: 12,
+                modifiers: KeyModifiers::CONTROL,
+            },
+        )
+        .unwrap();
+        let zoomed = state.planning_board_view.as_ref().unwrap();
+        assert!(zoomed.x_bounds[1] - zoomed.x_bounds[0] < previous_width);
+        assert!(zoomed.y_bounds[1] - zoomed.y_bounds[0] < previous_height);
+    }
+
+    #[test]
+    fn planning_board_keyboard_connector_creates_and_renders_edge() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first_scene = app.create_scene(chapter, "First", 0).unwrap();
+        let second_scene = app.create_scene(chapter, "Second", 1).unwrap();
+        let board = app.create_planning_board("Board").unwrap();
+        app.add_planning_board_item(board, "scene", &first_scene.to_string(), 0.0, 0.0, "first")
+            .unwrap();
+        app.add_planning_board_item(
+            board,
+            "scene",
+            &second_scene.to_string(),
+            40.0,
+            0.0,
+            "second",
+        )
+        .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::PlanningBoards;
+        state.planning_board_id = Some(board);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.planning_connector_source.is_some());
+        state.selected = 1;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.planning_connector_source.is_none());
+        let connectors = state.app.list_planning_board_connectors(board).unwrap();
+        assert_eq!(connectors.len(), 1);
+        assert_eq!(connectors[0].label, "related");
+
+        let backend = ratatui::backend::TestBackend::new(100, 28);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        assert!(state.planning_board_area.is_some());
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains('⠒'));
     }
 
     #[test]
@@ -23041,6 +23522,10 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
@@ -23158,6 +23643,10 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
@@ -23267,6 +23756,10 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
@@ -23388,6 +23881,10 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
@@ -23659,6 +24156,10 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
@@ -23780,6 +24281,10 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
@@ -23918,6 +24423,10 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
@@ -24174,6 +24683,10 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
@@ -24561,6 +25074,10 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
@@ -24693,6 +25210,10 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
@@ -24877,6 +25398,10 @@ mod tests {
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
             planning_board_id: None,
+            planning_board_area: None,
+            planning_drag: None,
+            planning_connector_source: None,
+            planning_board_view: None,
             collapsed_outline_nodes: BTreeSet::new(),
             writing_stats_enabled: false,
             typed_characters: 0,
