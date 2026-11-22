@@ -849,6 +849,67 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 println!("{}\t{}\t{}", commit.id, commit.date, commit.subject);
             }
         }
+        "git-remote-add" => {
+            let path = args.next().ok_or("missing project path")?;
+            let name = args.next().ok_or("missing remote name")?;
+            let url = args.next().ok_or("missing remote URL")?;
+            let app = WriterApp::open_project(path)?;
+            app.add_git_remote(&name, &url)?;
+            println!("Added remote {name}.");
+        }
+        "git-remotes" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            for remote in app.git_remotes()? {
+                println!("{}", remote.name);
+            }
+        }
+        "git-back-up" => {
+            let path = args.next().ok_or("missing project path")?;
+            let remote = args.next().ok_or("missing remote name")?;
+            let branch = args.next().ok_or("missing branch name")?;
+            let mut app = WriterApp::open_project(path)?;
+            let commit = app.back_up_git_branch(&remote, &branch)?;
+            println!("Backed up {branch} to {remote} at {commit}.");
+        }
+        "git-retrieve" => {
+            let path = args.next().ok_or("missing project path")?;
+            let remote = args.next().ok_or("missing remote name")?;
+            let branch = args.next().ok_or("missing branch name")?;
+            let mut app = WriterApp::open_project(path)?;
+            let commit = app.retrieve_git_branch(&remote, &branch)?;
+            println!("Retrieved {remote}/{branch} at {commit} (fast-forward only).");
+        }
+        "git-restore-preview" => {
+            let path = args.next().ok_or("missing project path")?;
+            let commit = args.next().ok_or("missing commit identifier")?;
+            let app = WriterApp::open_project(path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app.preview_git_restore(&commit)?)?
+            );
+        }
+        "git-restore-project" => {
+            let path = args.next().ok_or("missing project path")?;
+            let commit = args.next().ok_or("missing commit identifier")?;
+            let confirmation = args
+                .next()
+                .ok_or("pass --confirm after reviewing git-restore-preview")?;
+            if confirmation != "--confirm" || args.next().is_some() {
+                return Err(
+                    "full project restore requires exactly one --confirm flag after the commit"
+                        .into(),
+                );
+            }
+            let mut app = WriterApp::open_project(path)?;
+            let preview = app.restore_git_snapshot_in_place(&commit)?;
+            println!(
+                "Restored project from {} ({} committed file changes, {} pending working-tree changes previewed); a safety snapshot was taken first.",
+                preview.commit_id,
+                preview.changes.len(),
+                preview.working_tree_changes.len()
+            );
+        }
         "git-diff" => {
             let path = args.next().ok_or("missing project path")?;
             let from = args.next().ok_or("missing first commit")?;
@@ -3128,6 +3189,11 @@ fn parse_merge_choices(
 }
 
 fn usage() {
+    eprintln!("writers-ide git-restore-preview <project> <commit>");
+    eprintln!("writers-ide git-restore-project <project> <commit> --confirm");
+    eprintln!(
+        "writers-ide git-remote-add <project> <name> <url>\nwriters-ide git-remotes <project>\nwriters-ide git-back-up <project> <remote> <branch>\nwriters-ide git-retrieve <project> <remote> <branch>"
+    );
     eprintln!("writers-ide writing-language-default [BCP-47-TAG]");
     eprintln!(
         "writers-ide compile <project> <text|markdown|latex|html|epub|docx|pdf|odt|rtf|azw3|mobi (legacy)> [output] [--overwrite] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"

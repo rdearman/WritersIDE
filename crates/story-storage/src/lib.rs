@@ -446,6 +446,29 @@ pub struct ProjectStore {
     root: PathBuf,
     conn: Connection,
 }
+
+#[derive(Clone, Debug)]
+pub struct GitRestoreFile {
+    pub relative_path: String,
+    pub contents: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GitRestoreJournal {
+    format_version: u8,
+    committed: bool,
+    entries: Vec<GitRestoreJournalEntry>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct GitRestoreJournalEntry {
+    relative_path: String,
+    old_exists: bool,
+    old_sha256: Option<String>,
+    new_sha256: Option<String>,
+    backup_name: String,
+    prepared_name: String,
+}
 #[derive(Clone, Debug)]
 pub struct SceneRecord {
     pub scene: Scene,
@@ -902,6 +925,295 @@ pub enum ConflictResolution {
 }
 
 impl ProjectStore {
+    /// Applies a historical set of Git-owned files as one recoverable operation.
+    /// Prepared and original bytes are fsynced before the first canonical file changes.
+    pub fn restore_git_files(&mut self, changes: &[GitRestoreFile]) -> Result<()> {
+        if changes.is_empty() {
+            return Ok(());
+        }
+        let checkpoint: (i64, i64, i64) =
+            self.conn
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+        if checkpoint.0 != 0 {
+            return Err(StorageError::RecoveryConflict(
+                "SQLite is busy; historical project restore was not started".into(),
+            ));
+        }
+        let recovery_root = self.safe_path(Path::new(".writers-ide/recovery"))?;
+        fs::create_dir_all(&recovery_root)?;
+        let mut seen = std::collections::BTreeSet::new();
+        let transaction_id = Uuid::new_v4().to_string();
+        let transaction_dir = recovery_root.join(format!("git-restore-{transaction_id}"));
+        let original_dir = transaction_dir.join("original");
+        let prepared_dir = transaction_dir.join("prepared");
+        fs::create_dir_all(&original_dir)?;
+        fs::create_dir_all(&prepared_dir)?;
+        let mut journal = GitRestoreJournal {
+            format_version: 1,
+            committed: false,
+            entries: Vec::new(),
+        };
+        let preparation = (|| {
+            for (index, change) in changes.iter().enumerate() {
+                if !is_git_restore_path_allowed(&change.relative_path)
+                    || !seen.insert(change.relative_path.as_str())
+                {
+                    return Err(StorageError::Invalid(format!(
+                        "invalid or duplicate Git restore path: {:?}",
+                        change.relative_path
+                    )));
+                }
+                let relative = Path::new(&change.relative_path);
+                let target = self.safe_path(relative)?;
+                let old = match fs::symlink_metadata(&target) {
+                    Ok(metadata) if metadata.file_type().is_file() => Some(fs::read(&target)?),
+                    Ok(_) => {
+                        return Err(StorageError::Invalid(format!(
+                            "Git restore target is not a regular file: {:?}",
+                            change.relative_path
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                if old.as_deref() == change.contents.as_deref() {
+                    continue;
+                }
+                let suffix = format!("{index:08}.bin");
+                let backup_name = format!("original/{suffix}");
+                let prepared_name = format!("prepared/{suffix}");
+                if let Some(bytes) = old.as_deref() {
+                    write_synced(&transaction_dir.join(&backup_name), bytes)?;
+                }
+                if let Some(bytes) = change.contents.as_deref() {
+                    write_synced(&transaction_dir.join(&prepared_name), bytes)?;
+                }
+                journal.entries.push(GitRestoreJournalEntry {
+                    relative_path: change.relative_path.clone(),
+                    old_exists: old.is_some(),
+                    old_sha256: old.as_deref().map(sha256_bytes),
+                    new_sha256: change.contents.as_deref().map(sha256_bytes),
+                    backup_name,
+                    prepared_name,
+                });
+            }
+            if journal.entries.is_empty() {
+                fs::remove_dir_all(&transaction_dir)?;
+                return Ok(false);
+            }
+            sync_dir(&original_dir)?;
+            sync_dir(&prepared_dir)?;
+            sync_dir(&transaction_dir)?;
+            write_git_restore_journal(&transaction_dir, &journal)?;
+            sync_dir(transaction_dir.parent().unwrap())?;
+            Ok(true)
+        })();
+        let has_changes = match preparation {
+            Ok(has_changes) => has_changes,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&transaction_dir);
+                return Err(error);
+            }
+        };
+        if !has_changes {
+            return Ok(());
+        }
+
+        let placeholder = Connection::open_in_memory()?;
+        let current_connection = std::mem::replace(&mut self.conn, placeholder);
+        match current_connection.close() {
+            Ok(()) => {}
+            Err((connection, error)) => {
+                self.conn = connection;
+                let _ = fs::remove_dir_all(&transaction_dir);
+                return Err(error.into());
+            }
+        }
+
+        let apply_result = (|| {
+            for entry in &journal.entries {
+                let target = safe_git_restore_target(&self.root, &entry.relative_path, true)?;
+                let observed_hash = match fs::symlink_metadata(&target) {
+                    Ok(metadata) if metadata.file_type().is_file() => {
+                        Some(sha256_bytes(&fs::read(&target)?))
+                    }
+                    Ok(_) => {
+                        return Err(StorageError::RecoveryConflict(format!(
+                            "restore target changed type during operation: {}",
+                            entry.relative_path
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                if observed_hash != entry.old_sha256 {
+                    return Err(StorageError::RecoveryConflict(format!(
+                        "restore target changed externally during operation: {}; original and proposed versions are preserved",
+                        entry.relative_path
+                    )));
+                }
+                match &entry.new_sha256 {
+                    Some(expected_hash) => {
+                        let prepared = fs::read(transaction_dir.join(&entry.prepared_name))?;
+                        if sha256_bytes(&prepared) != *expected_hash {
+                            return Err(StorageError::Invalid(
+                                "prepared Git restore file failed its SHA-256 check".into(),
+                            ));
+                        }
+                        atomic_write(&target, &prepared)?;
+                    }
+                    None => match fs::remove_file(&target) {
+                        Ok(()) => sync_dir(target.parent().unwrap())?,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    },
+                }
+            }
+            let mut restored = Self::open_without_git_restore_recovery(&self.root)?;
+            restored.validate()?;
+            journal.committed = true;
+            write_git_restore_journal(&transaction_dir, &journal)?;
+            self.conn = std::mem::replace(&mut restored.conn, Connection::open_in_memory()?);
+            if fs::remove_dir_all(&transaction_dir).is_ok() {
+                sync_dir(transaction_dir.parent().unwrap())?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = apply_result {
+            let rollback = Self::recover_git_restore_transactions(&self.root);
+            let reopened = Self::open_without_git_restore_recovery(&self.root);
+            let rollback_error = rollback.err();
+            match reopened {
+                Ok(reopened) => self.conn = reopened.conn,
+                Err(reopen_error) => {
+                    return Err(StorageError::RecoveryConflict(format!(
+                        "Git restore failed ({error}); rollback result: {}; reopening also failed: {reopen_error}",
+                        rollback_error
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_else(|| "ok".into())
+                    )));
+                }
+            }
+            if let Some(rollback_error) = rollback_error {
+                return Err(StorageError::RecoveryConflict(format!(
+                    "Git restore failed ({error}); rollback needs attention: {rollback_error}"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn recover_git_restore_transactions(root: &Path) -> Result<()> {
+        let recovery = root.join(".writers-ide/recovery");
+        for directory in [root.join(".writers-ide"), recovery.clone()] {
+            match fs::symlink_metadata(&directory) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(StorageError::Invalid(
+                        "Git restore recovery directory must be a real directory".into(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let entries = match fs::read_dir(&recovery) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("git-restore-")
+            {
+                continue;
+            }
+            if entry.file_type()?.is_symlink() || !entry.file_type()?.is_dir() {
+                return Err(StorageError::Invalid(
+                    "Git restore recovery entry must be a real directory".into(),
+                ));
+            }
+            let journal_path = path.join("journal.json");
+            match fs::symlink_metadata(&journal_path) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+                    return Err(StorageError::Invalid(
+                        "Git restore journal must be a regular file".into(),
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+            let bytes = fs::read(&journal_path)?;
+            let journal: GitRestoreJournal = serde_json::from_slice(&bytes).map_err(|error| {
+                StorageError::Invalid(format!("invalid Git restore recovery journal: {error}"))
+            })?;
+            if journal.format_version != 1 {
+                return Err(StorageError::UnsupportedSchema(i64::from(
+                    journal.format_version,
+                )));
+            }
+            if journal.committed {
+                fs::remove_dir_all(&path)?;
+                sync_dir(&recovery)?;
+                continue;
+            }
+            for item in journal.entries.iter().rev() {
+                if !is_git_restore_path_allowed(&item.relative_path) {
+                    return Err(StorageError::Invalid(
+                        "recovery journal contains an unsafe project path".into(),
+                    ));
+                }
+                let target = safe_git_restore_target(root, &item.relative_path, false)?;
+                let current = match fs::symlink_metadata(&target) {
+                    Ok(metadata) if metadata.file_type().is_file() => Some(fs::read(&target)?),
+                    Ok(_) => {
+                        return Err(StorageError::RecoveryConflict(format!(
+                            "restore target became a non-file: {}",
+                            item.relative_path
+                        )));
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error.into()),
+                };
+                let current_hash = current.as_deref().map(sha256_bytes);
+                if current_hash == item.old_sha256 {
+                    continue;
+                }
+                if current_hash != item.new_sha256 {
+                    return Err(StorageError::RecoveryConflict(format!(
+                        "Git restore recovery found external divergence at {}; both versions are preserved",
+                        item.relative_path
+                    )));
+                }
+                if item.old_exists {
+                    let original = fs::read(path.join(&item.backup_name))?;
+                    if item.old_sha256.as_deref() != Some(sha256_bytes(&original).as_str()) {
+                        return Err(StorageError::Invalid(
+                            "original Git restore backup failed its SHA-256 check".into(),
+                        ));
+                    }
+                    let destination = safe_git_restore_target(root, &item.relative_path, true)?;
+                    atomic_write(&destination, &original)?;
+                } else if target.exists() {
+                    fs::remove_file(&target)?;
+                    sync_dir(target.parent().unwrap())?;
+                }
+            }
+            fs::remove_dir_all(&path)?;
+            sync_dir(&recovery)?;
+        }
+        Ok(())
+    }
+
     /// Recreates a project database from a validated deterministic metadata snapshot.
     /// The caller supplies an already-staged project directory and removes it on failure.
     pub fn restore_metadata_snapshot(root: impl AsRef<Path>) -> Result<()> {
@@ -1036,6 +1348,12 @@ impl ProjectStore {
         })
     }
     pub fn open(root: impl AsRef<Path>) -> Result<Self> {
+        let root = root.as_ref();
+        Self::recover_git_restore_transactions(root)?;
+        Self::open_without_git_restore_recovery(root)
+    }
+
+    fn open_without_git_restore_recovery(root: impl AsRef<Path>) -> Result<Self> {
         let root = root.as_ref();
         for name in ["project.toml", "story.db"] {
             let meta = fs::symlink_metadata(root.join(name))?;
@@ -8778,6 +9096,77 @@ fn atomic_write(p: &Path, b: &[u8]) -> Result<()> {
     sync_dir(p.parent().unwrap())?;
     Ok(())
 }
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hash = Sha256::new();
+    hash.update(bytes);
+    format!("{:x}", hash.finalize())
+}
+fn write_git_restore_journal(directory: &Path, journal: &GitRestoreJournal) -> Result<()> {
+    let bytes = serde_json::to_vec(journal).map_err(|error| {
+        StorageError::Invalid(format!("serialize Git restore journal: {error}"))
+    })?;
+    atomic_write(&directory.join("journal.json"), &bytes)
+}
+fn is_git_restore_path_allowed(relative: &str) -> bool {
+    let path = Path::new(relative);
+    let safe = !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)));
+    safe && (relative == "story.db"
+        || relative == ".gitignore"
+        || relative == "project.toml"
+        || relative == "snapshots/database.sql"
+        || ["manuscript/", "research/", "attachments/", "templates/"]
+            .iter()
+            .any(|prefix| relative.starts_with(prefix)))
+}
+fn safe_git_restore_target(root: &Path, relative: &str, create_parent: bool) -> Result<PathBuf> {
+    if !is_git_restore_path_allowed(relative) {
+        return Err(StorageError::Invalid("unsafe Git restore path".into()));
+    }
+    let root = fs::canonicalize(root)?;
+    let mut target = root.clone();
+    let components = Path::new(relative)
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(part) => Ok(part.to_owned()),
+            _ => Err(StorageError::Invalid("unsafe Git restore path".into())),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    for (index, component) in components.iter().enumerate() {
+        target.push(component);
+        let is_parent = index + 1 < components.len();
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StorageError::Invalid(
+                    "Git restore refuses to traverse project symlinks".into(),
+                ));
+            }
+            Ok(metadata) if is_parent && !metadata.is_dir() => {
+                return Err(StorageError::Invalid(
+                    "Git restore parent path is not a directory".into(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && is_parent && create_parent =>
+            {
+                fs::create_dir(&target)?;
+                if let Some(parent) = target.parent() {
+                    sync_dir(parent)?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        if is_parent && create_parent && !target.exists() {
+            fs::create_dir(&target)?;
+            sync_dir(target.parent().unwrap())?;
+        }
+    }
+    Ok(target)
+}
 fn collect_regular_files(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
@@ -11833,6 +12222,109 @@ mod tests {
             b"research source"
         );
         assert!(ProjectStore::restore_archive_to(&archive, &relocated).is_err());
+    }
+
+    #[test]
+    fn git_restore_file_set_reopens_and_interrupted_restore_rolls_back() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("Novel");
+        let store = ProjectStore::create(&project, "Novel").unwrap();
+        std::fs::create_dir_all(project.join("attachments")).unwrap();
+        std::fs::write(project.join("attachments/cover.bin"), b"old cover").unwrap();
+        drop(store);
+
+        let mut store = ProjectStore::open(&project).unwrap();
+        store
+            .restore_git_files(&[
+                GitRestoreFile {
+                    relative_path: "attachments/cover.bin".into(),
+                    contents: Some(b"restored cover".to_vec()),
+                },
+                GitRestoreFile {
+                    relative_path: "attachments/obsolete.bin".into(),
+                    contents: None,
+                },
+            ])
+            .unwrap();
+        assert_eq!(
+            std::fs::read(project.join("attachments/cover.bin")).unwrap(),
+            b"restored cover"
+        );
+        drop(store);
+        let store = ProjectStore::open(&project).unwrap();
+        store.validate().unwrap();
+        drop(store);
+
+        let old = b"restored cover".to_vec();
+        let proposed = b"interrupted proposal".to_vec();
+        let recovery = project.join(".writers-ide/recovery/git-restore-interrupted");
+        std::fs::create_dir_all(recovery.join("original")).unwrap();
+        std::fs::create_dir_all(recovery.join("prepared")).unwrap();
+        write_synced(&recovery.join("original/00000000.bin"), &old).unwrap();
+        write_synced(&recovery.join("prepared/00000000.bin"), &proposed).unwrap();
+        std::fs::write(project.join("attachments/cover.bin"), &proposed).unwrap();
+        let journal = GitRestoreJournal {
+            format_version: 1,
+            committed: false,
+            entries: vec![GitRestoreJournalEntry {
+                relative_path: "attachments/cover.bin".into(),
+                old_exists: true,
+                old_sha256: Some(sha256_bytes(&old)),
+                new_sha256: Some(sha256_bytes(&proposed)),
+                backup_name: "original/00000000.bin".into(),
+                prepared_name: "prepared/00000000.bin".into(),
+            }],
+        };
+        write_git_restore_journal(&recovery, &journal).unwrap();
+        let reopened = ProjectStore::open(&project).unwrap();
+        assert_eq!(
+            std::fs::read(project.join("attachments/cover.bin")).unwrap(),
+            old
+        );
+        assert!(!recovery.exists());
+        reopened.validate().unwrap();
+    }
+
+    #[test]
+    fn git_restore_recovery_preserves_an_external_conflict() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("Novel");
+        let store = ProjectStore::create(&project, "Novel").unwrap();
+        std::fs::create_dir_all(project.join("attachments")).unwrap();
+        drop(store);
+        let original = b"original";
+        let prepared = b"prepared";
+        let external = b"external divergence";
+        let recovery = project.join(".writers-ide/recovery/git-restore-conflict");
+        std::fs::create_dir_all(recovery.join("original")).unwrap();
+        std::fs::create_dir_all(recovery.join("prepared")).unwrap();
+        write_synced(&recovery.join("original/00000000.bin"), original).unwrap();
+        write_synced(&recovery.join("prepared/00000000.bin"), prepared).unwrap();
+        std::fs::write(project.join("attachments/file.bin"), external).unwrap();
+        let journal = GitRestoreJournal {
+            format_version: 1,
+            committed: false,
+            entries: vec![GitRestoreJournalEntry {
+                relative_path: "attachments/file.bin".into(),
+                old_exists: true,
+                old_sha256: Some(sha256_bytes(original)),
+                new_sha256: Some(sha256_bytes(prepared)),
+                backup_name: "original/00000000.bin".into(),
+                prepared_name: "prepared/00000000.bin".into(),
+            }],
+        };
+        write_git_restore_journal(&recovery, &journal).unwrap();
+
+        assert!(matches!(
+            ProjectStore::open(&project),
+            Err(StorageError::RecoveryConflict(_))
+        ));
+        assert_eq!(
+            std::fs::read(project.join("attachments/file.bin")).unwrap(),
+            external
+        );
+        assert!(recovery.join("original/00000000.bin").is_file());
+        assert!(recovery.join("prepared/00000000.bin").is_file());
     }
 
     #[test]

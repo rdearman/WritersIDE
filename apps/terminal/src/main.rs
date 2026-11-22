@@ -1587,6 +1587,38 @@ fn command_registry() -> Vec<CommandSpec> {
             false,
         ),
         legacy_command(
+            "git.remote-add",
+            "Add Git Backup Remote",
+            "Configure a local or SSH Git remote without embedding credentials in its URL",
+            "File",
+            "git-remote-add",
+            true,
+        ),
+        legacy_command(
+            "git.remotes",
+            "List Git Backup Remotes",
+            "Show configured project remotes",
+            "File",
+            "git-remotes",
+            false,
+        ),
+        legacy_command(
+            "git.back-up",
+            "Back Up Branch to Remote",
+            "Create a local safety snapshot and push the selected branch without force",
+            "File",
+            "git-back-up",
+            true,
+        ),
+        legacy_command(
+            "git.retrieve",
+            "Retrieve Remote Branch",
+            "Fetch and apply a fast-forward only after taking a local safety snapshot",
+            "File",
+            "git-retrieve",
+            true,
+        ),
+        legacy_command(
             "git.diff",
             "Compare Project Snapshots",
             "Compare two local project snapshots",
@@ -1600,6 +1632,22 @@ fn command_registry() -> Vec<CommandSpec> {
             "Reconstruct a validated historical project in a new directory",
             "File",
             "git-restore-new",
+            true,
+        ),
+        legacy_command(
+            "git.restore-preview",
+            "Preview Full Project Restore",
+            "Compare a historical snapshot with committed and working-tree project files",
+            "File",
+            "git-restore-preview",
+            true,
+        ),
+        legacy_command(
+            "git.restore-project",
+            "Restore Full Project from Snapshot",
+            "Requires COMMIT --confirm after reviewing the restore preview",
+            "File",
+            "git-restore-project",
             true,
         ),
         legacy_command(
@@ -9271,6 +9319,144 @@ impl AppState {
                 })
                 .collect::<Vec<_>>()
                 .join(" · ");
+        } else if let Some(args) = cmd.strip_prefix("git-remote-add ") {
+            let mut parts = args.splitn(2, ' ');
+            let name = parts.next().ok_or("use git-remote-add NAME URL")?;
+            let url = parts.next().ok_or("use git-remote-add NAME URL")?.trim();
+            self.app.add_git_remote(name, url)?;
+            self.message = format!("Added Git remote {name}");
+        } else if cmd == "git-remotes" {
+            self.message = self
+                .app
+                .git_remotes()?
+                .into_iter()
+                .map(|remote| remote.name)
+                .collect::<Vec<_>>()
+                .join(" · ");
+            if self.message.is_empty() {
+                self.message = "No Git remotes configured".into();
+            }
+        } else if let Some(args) = cmd.strip_prefix("git-back-up ") {
+            let mut parts = args.split_whitespace();
+            let remote = parts.next().ok_or("use git-back-up REMOTE BRANCH")?;
+            let branch = parts.next().ok_or("use git-back-up REMOTE BRANCH")?;
+            if parts.next().is_some() {
+                return Err("use git-back-up REMOTE BRANCH".into());
+            }
+            if self.dirty {
+                self.save()?;
+            }
+            let commit = self.app.back_up_git_branch(remote, branch)?;
+            self.message = format!("Backed up {branch} to {remote} at {commit}");
+        } else if let Some(args) = cmd.strip_prefix("git-retrieve ") {
+            let mut parts = args.split_whitespace();
+            let remote = parts.next().ok_or("use git-retrieve REMOTE BRANCH")?;
+            let branch = parts.next().ok_or("use git-retrieve REMOTE BRANCH")?;
+            if parts.next().is_some() {
+                return Err("use git-retrieve REMOTE BRANCH".into());
+            }
+            self.save()?;
+            if self.dirty {
+                return Err("save conflict; remote retrieval was not started".into());
+            }
+            let commit = self.app.retrieve_git_branch(remote, branch)?;
+            if let Some(scene) = self.editing_scene
+                && self
+                    .app
+                    .list_scenes(false)?
+                    .iter()
+                    .any(|record| record.scene.id == scene)
+            {
+                let (text, hash) = self.app.load_scene_text(scene)?;
+                self.editor = text.split('\n').map(str::to_owned).collect();
+                self.saved_hash = hash;
+                self.dirty = false;
+            }
+            self.refresh()?;
+            self.message = format!("Retrieved {remote}/{branch} at {commit}");
+        } else if let Some(commit) = cmd.strip_prefix("git-restore-preview ") {
+            let preview = self.app.preview_git_restore(commit.trim())?;
+            let mut token_hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            serde_json::to_vec(&preview)?.hash(&mut token_hasher);
+            let preview_token = format!("{:016x}", token_hasher.finish());
+            let committed = preview
+                .changes
+                .iter()
+                .map(|change| format!("{} {}", change.status, change.path))
+                .collect::<Vec<_>>();
+            let working = preview
+                .working_tree_changes
+                .iter()
+                .map(|change| format!("working {}", change.path))
+                .collect::<Vec<_>>();
+            let mut lines = committed;
+            lines.extend(working);
+            self.message = if lines.is_empty() {
+                format!(
+                    "Restore preview {} {}: no tracked file differences",
+                    preview.commit_id, preview_token
+                )
+            } else {
+                format!(
+                    "Restore preview {} {} ({} committed changes, {} working changes): {}",
+                    preview.commit_id,
+                    preview_token,
+                    preview.changes.len(),
+                    preview.working_tree_changes.len(),
+                    lines.join(" · ")
+                )
+            };
+        } else if let Some(args) = cmd.strip_prefix("git-restore-project ") {
+            let mut parts = args.split_whitespace();
+            let commit = parts
+                .next()
+                .ok_or("use git-restore-project COMMIT --confirm")?;
+            if parts.next() != Some("--confirm") || parts.next().is_some() {
+                return Err("review git-restore-preview first, then pass --confirm".into());
+            }
+            self.save()?;
+            if self.dirty {
+                return Err("save conflict; full project restore was not started".into());
+            }
+            let current_preview = self.app.preview_git_restore(commit)?;
+            let mut token_hasher = std::collections::hash_map::DefaultHasher::new();
+            use std::hash::{Hash, Hasher};
+            serde_json::to_vec(&current_preview)?.hash(&mut token_hasher);
+            let expected_preview = format!(
+                "Restore preview {} {:016x}",
+                current_preview.commit_id,
+                token_hasher.finish()
+            );
+            if !self.message.starts_with(&expected_preview) {
+                return Err(
+                    "restore preview is missing or stale; run git-restore-preview again".into(),
+                );
+            }
+            let preview = self.app.restore_git_snapshot_in_place(commit)?;
+            if let Some(scene) = self.editing_scene
+                && !self
+                    .app
+                    .list_scenes(false)?
+                    .iter()
+                    .any(|record| record.scene.id == scene)
+            {
+                self.editing_scene = None;
+                self.editor.clear();
+                self.saved_hash.clear();
+                self.dirty = false;
+                self.workspace = Workspace::Outline;
+            } else if let Some(scene) = self.editing_scene {
+                let (text, hash) = self.app.load_scene_text(scene)?;
+                self.editor = text.split('\n').map(str::to_owned).collect();
+                self.saved_hash = hash;
+            }
+            self.refresh()?;
+            self.message = format!(
+                "Restored project from {} ({} file changes); current state was safety-snapshotted",
+                preview.commit_id,
+                preview.changes.len()
+            );
         } else if let Some(args) = cmd.strip_prefix("git-diff ") {
             let mut parts = args.splitn(3, ' ');
             let from = parts
@@ -17044,6 +17230,61 @@ mod tests {
     }
 
     #[test]
+    fn full_project_restore_requires_preview_and_confirmation_command() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let chapter = state.app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = state.app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = state.app.load_scene_text(scene).unwrap();
+        state
+            .app
+            .save_scene_text(scene, Some(&hash), "Original prose.")
+            .unwrap();
+        let commit = state.app.git_snapshot("First draft").unwrap().unwrap();
+        state.app.create_scene(chapter, "Later", 1).unwrap();
+        state.app.git_snapshot("Second draft").unwrap().unwrap();
+
+        assert!(
+            command_registry().iter().any(|command| {
+                command.id == "git.restore-preview" && command.category == "File"
+            })
+        );
+        assert!(
+            command_registry().iter().any(|command| {
+                command.id == "git.restore-project" && command.category == "File"
+            })
+        );
+        assert!(
+            state
+                .execute_legacy_palette_command(&format!("git-restore-project {commit} --confirm"))
+                .is_err()
+        );
+        assert_eq!(state.app.list_scenes(false).unwrap().len(), 2);
+        state
+            .execute_legacy_palette_command(&format!("git-restore-preview {commit}"))
+            .unwrap();
+        assert!(state.message.to_ascii_lowercase().contains("preview"));
+        assert_eq!(state.app.list_scenes(false).unwrap().len(), 2);
+
+        assert!(
+            state
+                .execute_legacy_palette_command(&format!("git-restore-project {commit}"))
+                .is_err()
+        );
+        state
+            .execute_legacy_palette_command(&format!("git-restore-project {commit} --confirm"))
+            .unwrap();
+        let active = state.app.list_scenes(false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].scene.id, scene);
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Original prose."
+        );
+    }
+
+    #[test]
     fn series_menu_commands_create_select_and_open_a_new_book() {
         let root = tempfile::tempdir().unwrap();
         let initial = WriterApp::create_project(root.path().join("Initial"), "Initial").unwrap();
@@ -17569,6 +17810,24 @@ mod tests {
         assert_eq!(
             command_palette_invocation("git-history").unwrap().0.id,
             "git.history"
+        );
+        assert_eq!(
+            command_palette_invocation("git-remotes").unwrap().0.id,
+            "git.remotes"
+        );
+        assert_eq!(
+            command_palette_invocation("git-back-up backup main")
+                .unwrap()
+                .0
+                .id,
+            "git.back-up"
+        );
+        assert_eq!(
+            command_palette_invocation("git-retrieve backup main")
+                .unwrap()
+                .0
+                .id,
+            "git.retrieve"
         );
         assert_eq!(
             command_palette_invocation("git-auto-snapshot-exit on")

@@ -4577,7 +4577,7 @@ impl WriterApp {
         let stage =
             destination.with_extension(format!("writers-ide-stage-{}", uuid::Uuid::new_v4()));
         let result = (|| {
-            let files = story_git::GitHistory::open(project)?
+            let files = story_git::GitHistory::open_existing(project)?
                 .restore_files_to_new_directory(commit, &stage)?;
             ProjectStore::restore_metadata_snapshot(&stage)?;
             std::fs::rename(&stage, destination).map_err(story_storage::StorageError::from)?;
@@ -4592,6 +4592,100 @@ impl WriterApp {
             let _ = std::fs::remove_dir_all(&stage);
         }
         result
+    }
+
+    /// Builds an isolated, validated restore candidate and reports the tracked
+    /// file changes without mutating the current project or Git history.
+    pub fn preview_git_restore(&self, commit: &str) -> Result<story_git::GitRestorePreview> {
+        let history = story_git::GitHistory::open_existing(self.store.project_root())?;
+        let preview = history.restore_preview(commit)?;
+        let temporary = tempfile::tempdir().map_err(|error| {
+            AppError::Domain(format!("create Git restore preview workspace: {error}"))
+        })?;
+        let restored_path = temporary.path().join("restored-project");
+        Self::restore_git_snapshot(
+            self.store.project_root(),
+            &preview.commit_id,
+            &restored_path,
+        )?;
+        let restored = Self::open_project(&restored_path)?;
+        if restored.get_project()?.id != self.get_project()?.id {
+            return Err(AppError::Domain(
+                "selected Git snapshot belongs to a different project".into(),
+            ));
+        }
+        Ok(preview)
+    }
+
+    /// Restores committed project files in place with an optimistic, recoverable
+    /// file-set transaction. A current-state safety snapshot is taken first.
+    pub fn restore_git_snapshot_in_place(
+        &mut self,
+        commit: &str,
+    ) -> Result<story_git::GitRestorePreview> {
+        let project_id = self.get_project()?.id;
+        let preview = self.preview_git_restore(commit)?;
+        self.git_snapshot(&format!("Safety snapshot before restore {commit}"))?;
+        let history = story_git::GitHistory::open_existing(self.store.project_root())?;
+        let temporary = tempfile::tempdir().map_err(|error| {
+            AppError::Domain(format!("create Git restore staging workspace: {error}"))
+        })?;
+        let restored_path = temporary.path().join("restored-project");
+        Self::restore_git_snapshot(
+            self.store.project_root(),
+            &preview.commit_id,
+            &restored_path,
+        )?;
+        let restored = Self::open_project(&restored_path)?;
+        if restored.get_project()?.id != project_id {
+            return Err(AppError::Domain(
+                "selected Git snapshot belongs to a different project".into(),
+            ));
+        }
+        let historical_paths = history.tracked_paths(&preview.commit_id)?;
+        let current_head = history
+            .history(1)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| AppError::Domain("project has no Git history to restore".into()))?;
+        let current_paths = history.tracked_paths(&current_head.id)?;
+        let mut paths = std::collections::BTreeSet::new();
+        paths.extend(historical_paths.iter().cloned());
+        paths.extend(current_paths);
+        let mut changes = Vec::new();
+        for relative in paths {
+            let contents = if historical_paths.binary_search(&relative).is_ok() {
+                Some(
+                    std::fs::read(restored_path.join(&relative)).map_err(|error| {
+                        AppError::Domain(format!(
+                            "read staged Git restore file {relative:?}: {error}"
+                        ))
+                    })?,
+                )
+            } else {
+                None
+            };
+            changes.push(story_storage::GitRestoreFile {
+                relative_path: relative,
+                contents,
+            });
+        }
+        changes.push(story_storage::GitRestoreFile {
+            relative_path: "story.db".into(),
+            contents: Some(
+                std::fs::read(restored_path.join("story.db")).map_err(|error| {
+                    AppError::Domain(format!("read staged historical SQLite database: {error}"))
+                })?,
+            ),
+        });
+        self.store.restore_git_files(&changes)?;
+        self.validate_project()?;
+        if self.get_project()?.id != project_id {
+            return Err(AppError::Domain(
+                "restored project identity changed unexpectedly".into(),
+            ));
+        }
+        Ok(preview)
     }
 
     /// Recreate an archived or deleted scene from a committed project
@@ -4764,6 +4858,61 @@ impl WriterApp {
                 .map_err(|e| e.to_string())
         })?)
     }
+
+    pub fn add_git_remote(&self, name: &str, url: &str) -> Result<()> {
+        story_git::GitHistory::open_existing(self.store.project_root())?.add_remote(name, url)?;
+        Ok(())
+    }
+
+    pub fn git_remotes(&self) -> Result<Vec<story_git::GitRemote>> {
+        Ok(story_git::GitHistory::open_existing(self.store.project_root())?.remotes()?)
+    }
+
+    /// Snapshot current canonical files, then push the selected branch using
+    /// Git's normal non-forced push semantics. Existing credentials are
+    /// delegated to Git; credentials in remote URLs are rejected by story-git.
+    pub fn back_up_git_branch(&mut self, remote: &str, branch: &str) -> Result<String> {
+        self.git_snapshot("Before explicit remote backup")?;
+        let history = story_git::GitHistory::open_existing(self.store.project_root())?;
+        if history.current_branch()? != branch {
+            return Err(AppError::Domain(format!(
+                "current branch is not {branch}; refusing to push a different branch"
+            )));
+        }
+        let commit = history.head_commit()?;
+        history.push_branch(remote, branch)?;
+        Ok(commit)
+    }
+
+    /// Fetch and apply a remote branch only when it is a fast-forward of the
+    /// current branch. Divergent histories are left fetched but unapplied for
+    /// explicit conflict inspection. The local safety snapshot is committed
+    /// before contacting the remote.
+    pub fn retrieve_git_branch(&mut self, remote: &str, branch: &str) -> Result<String> {
+        self.git_snapshot("Safety snapshot before remote retrieval")?;
+        let history = story_git::GitHistory::open_existing(self.store.project_root())?;
+        let current_branch = history.current_branch()?;
+        if current_branch != branch {
+            return Err(AppError::Domain(format!(
+                "current branch is {current_branch}; switch to {branch} before retrieving"
+            )));
+        }
+        let current = history.head_commit()?;
+        let fetched = history.fetch_branch(remote, branch)?;
+        if fetched == current {
+            return Ok(fetched);
+        }
+        if !history.is_ancestor(&current, &fetched)? {
+            return Err(AppError::Domain(format!(
+                "remote branch {remote}/{branch} diverges from local history; it was fetched but not applied"
+            )));
+        }
+
+        self.restore_git_snapshot_in_place(&fetched)?;
+        history.fast_forward_ref_to(&fetched, &current)?;
+        Ok(fetched)
+    }
+
     pub fn set_git_auto_snapshot_interval(&self, minutes: Option<u32>) -> Result<()> {
         let mut policy = story_git::load_auto_snapshot_policy(self.store.project_root())?;
         policy.set_interval(minutes)?;
@@ -4802,7 +4951,7 @@ impl WriterApp {
         let relative_path = relative_path
             .to_str()
             .ok_or_else(|| AppError::Domain("scene manuscript path is not UTF-8".into()))?;
-        let historical = story_git::GitHistory::open(self.store.project_root())?
+        let historical = story_git::GitHistory::open_existing(self.store.project_root())?
             .read_file_at(commit, relative_path)?;
         let historical = String::from_utf8(historical)
             .map_err(|_| AppError::Domain("historical scene text is not UTF-8".into()))?;
@@ -4827,7 +4976,7 @@ impl WriterApp {
         let relative_path = relative_path
             .to_str()
             .ok_or_else(|| AppError::Domain("content-unit path is not UTF-8".into()))?;
-        let historical = story_git::GitHistory::open(self.store.project_root())?
+        let historical = story_git::GitHistory::open_existing(self.store.project_root())?
             .read_file_at(commit, relative_path)?;
         let historical = String::from_utf8(historical)
             .map_err(|_| AppError::Domain("historical content-unit text is not UTF-8".into()))?;
@@ -4842,10 +4991,13 @@ impl WriterApp {
         self.save_content_unit_text(content_unit, Some(&expected_hash), &historical)
     }
     pub fn git_history(&self, limit: usize) -> Result<Vec<story_git::GitCommit>> {
-        Ok(story_git::GitHistory::open(self.store.project_root())?.history(limit)?)
+        Ok(story_git::GitHistory::open_existing(self.store.project_root())?.history(limit)?)
     }
     pub fn git_diff(&self, from: &str, to: &str, path: Option<&str>) -> Result<String> {
-        Ok(story_git::GitHistory::open(self.store.project_root())?.diff(from, to, path)?)
+        Ok(
+            story_git::GitHistory::open_existing(self.store.project_root())?
+                .diff(from, to, path)?,
+        )
     }
     pub fn git_search_history(
         &self,
@@ -4853,8 +5005,10 @@ impl WriterApp {
         path: Option<&str>,
         limit: usize,
     ) -> Result<Vec<story_git::HistoricalTextChange>> {
-        Ok(story_git::GitHistory::open(self.store.project_root())?
-            .search_text_history(text, path, limit)?)
+        Ok(
+            story_git::GitHistory::open_existing(self.store.project_root())?
+                .search_text_history(text, path, limit)?,
+        )
     }
     pub fn git_blame(
         &self,
@@ -4862,8 +5016,10 @@ impl WriterApp {
         first_line: usize,
         last_line: usize,
     ) -> Result<Vec<story_git::BlamedLine>> {
-        Ok(story_git::GitHistory::open(self.store.project_root())?
-            .blame(path, first_line, last_line)?)
+        Ok(
+            story_git::GitHistory::open_existing(self.store.project_root())?
+                .blame(path, first_line, last_line)?,
+        )
     }
     pub fn resolve_conflict(&mut self, txid: &str, resolution: ConflictResolution) -> Result<()> {
         Ok(self.store.resolve_write_conflict(txid, resolution)?)
@@ -5279,6 +5435,143 @@ unexpected_prose = "must not be silently discarded"
     }
 
     #[test]
+    fn git_remote_backup_and_fast_forward_retrieval_reconcile_manuscript_and_metadata() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let bare = dir.path().join("backup.git");
+        let remote_work = dir.path().join("RemoteWork");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, expected) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&expected), "Local draft.")
+            .unwrap();
+        app.git_snapshot("Initial shared version").unwrap();
+        let branch = story_git::GitHistory::open_existing(&project)
+            .unwrap()
+            .current_branch()
+            .unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", bare.to_str().unwrap()])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        app.add_git_remote("backup", bare.to_str().unwrap())
+            .unwrap();
+        app.back_up_git_branch("backup", &branch).unwrap();
+        drop(app);
+
+        let cloned = Command::new("git")
+            .args([
+                "clone",
+                "--quiet",
+                "--branch",
+                &branch,
+                bare.to_str().unwrap(),
+                remote_work.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            cloned.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cloned.stderr)
+        );
+        ProjectStore::restore_metadata_snapshot(&remote_work).unwrap();
+        let mut remote_app = WriterApp::open_project(&remote_work).unwrap();
+        let (_, expected) = remote_app.load_scene_text(scene).unwrap();
+        remote_app
+            .save_scene_text(scene, Some(&expected), "Remote revision.")
+            .unwrap();
+        remote_app.back_up_git_branch("origin", &branch).unwrap();
+        drop(remote_app);
+
+        let mut local_app = WriterApp::open_project(&project).unwrap();
+        let retrieved = local_app.retrieve_git_branch("backup", &branch).unwrap();
+        assert_eq!(
+            local_app.load_scene_text(scene).unwrap().0,
+            "Remote revision."
+        );
+        assert_eq!(local_app.git_history(1).unwrap()[0].id, retrieved);
+        assert_eq!(local_app.get_scene(scene).unwrap().scene.title, "Opening");
+        local_app.validate_project().unwrap();
+    }
+
+    #[test]
+    fn git_remote_retrieval_reports_divergence_without_replacing_local_content() {
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let bare = dir.path().join("backup.git");
+        let remote_work = dir.path().join("RemoteWork");
+        let mut local = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = local.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = local.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, expected) = local.load_scene_text(scene).unwrap();
+        local
+            .save_scene_text(scene, Some(&expected), "Shared base.")
+            .unwrap();
+        local.git_snapshot("Shared base").unwrap();
+        let branch = story_git::GitHistory::open_existing(&project)
+            .unwrap()
+            .current_branch()
+            .unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "--bare", bare.to_str().unwrap()])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        local
+            .add_git_remote("backup", bare.to_str().unwrap())
+            .unwrap();
+        local.back_up_git_branch("backup", &branch).unwrap();
+
+        let cloned = Command::new("git")
+            .args([
+                "clone",
+                "--quiet",
+                "--branch",
+                &branch,
+                bare.to_str().unwrap(),
+                remote_work.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            cloned.status.success(),
+            "{}",
+            String::from_utf8_lossy(&cloned.stderr)
+        );
+        ProjectStore::restore_metadata_snapshot(&remote_work).unwrap();
+        let mut remote = WriterApp::open_project(&remote_work).unwrap();
+        let (_, expected) = remote.load_scene_text(scene).unwrap();
+        remote
+            .save_scene_text(scene, Some(&expected), "Remote branch.")
+            .unwrap();
+        remote.back_up_git_branch("origin", &branch).unwrap();
+        drop(remote);
+
+        let (_, expected) = local.load_scene_text(scene).unwrap();
+        local
+            .save_scene_text(scene, Some(&expected), "Local branch.")
+            .unwrap();
+        local.git_snapshot("Local branch").unwrap();
+        let error = local.retrieve_git_branch("backup", &branch).unwrap_err();
+        assert!(error.to_string().contains("diverges from local history"));
+        assert_eq!(local.load_scene_text(scene).unwrap().0, "Local branch.");
+        local.validate_project().unwrap();
+    }
+
+    #[test]
     fn automatic_git_snapshots_run_only_when_due_and_skip_unchanged_projects() {
         let root = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
@@ -5556,6 +5849,84 @@ unexpected_prose = "must not be silently discarded"
             restored.load_scene_text(scene).unwrap().0,
             "A restored passage."
         );
+    }
+
+    #[test]
+    fn git_restore_preview_is_read_only_and_in_place_restore_recovers_project_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let mut metadata = app.get_scene(scene).unwrap().scene;
+        metadata.synopsis = "Historical synopsis".into();
+        metadata.purpose = "Establish the mystery".into();
+        app.update_scene_metadata(&metadata).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "First committed prose.")
+            .unwrap();
+        let first = app.git_snapshot("First draft").unwrap().unwrap();
+
+        let second_scene = app.create_scene(chapter, "Later Scene", 1).unwrap();
+        let (_, hash) = app.load_scene_text(second_scene).unwrap();
+        app.save_scene_text(second_scene, Some(&hash), "Second scene prose.")
+            .unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Changed prose.")
+            .unwrap();
+        app.git_snapshot("Changed draft").unwrap().unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Unsnapshotted current prose.")
+            .unwrap();
+        std::fs::write(project.join(".gitignore"), "author-specific ignore rules\n").unwrap();
+
+        let preview = app.preview_git_restore(&first).unwrap();
+        assert!(
+            preview
+                .changes
+                .iter()
+                .any(|change| { change.status == "removed" && change.path.ends_with(".md") })
+        );
+        assert_eq!(app.list_scenes(false).unwrap().len(), 2);
+        assert_eq!(
+            app.load_scene_text(scene).unwrap().0,
+            "Unsnapshotted current prose."
+        );
+        assert!(preview.working_tree_changes.iter().any(|change| {
+            change.status == "changed" && change.path == format!("manuscript/{scene}.md")
+        }));
+        assert_eq!(
+            std::fs::read_to_string(project.join(".gitignore")).unwrap(),
+            "author-specific ignore rules\n"
+        );
+
+        let applied = app.restore_git_snapshot_in_place(&first).unwrap();
+        assert_eq!(applied.commit_id, first);
+        let active = app.list_scenes(false).unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].scene.id, scene);
+        assert_eq!(active[0].scene.synopsis, "Historical synopsis");
+        assert_eq!(active[0].scene.purpose, "Establish the mystery");
+        assert_eq!(active[0].chapter_id, Some(chapter));
+        assert_eq!(
+            app.load_scene_text(scene).unwrap().0,
+            "First committed prose."
+        );
+        assert!(
+            app.git_history(10)
+                .unwrap()
+                .iter()
+                .any(|commit| commit.subject.contains("Safety snapshot before restore"))
+        );
+        app.validate_project().unwrap();
+        drop(app);
+        let reopened = WriterApp::open_project(&project).unwrap();
+        assert_eq!(reopened.list_scenes(false).unwrap().len(), 1);
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "First committed prose."
+        );
+        reopened.validate_project().unwrap();
     }
 
     #[test]
