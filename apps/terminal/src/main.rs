@@ -1288,7 +1288,7 @@ fn command_registry() -> Vec<CommandSpec> {
         },
         CommandSpec {
             id: "help.search",
-            label: "Search Help and Commands",
+            label: "Search Commands",
             description: "Search registered command names, descriptions and shortcuts offline",
             category: "Help",
             default_shortcuts: &[],
@@ -33104,5 +33104,24 @@ mod tests {
         assert!(state.help_panel.is_some());
         handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
         assert!(state.help_panel.is_none());
+    }
+
+    #[test]
+    fn welcome_and_command_search_help_actions_dispatch_through_registry() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+
+        state
+            .dispatch_registered_command_id("help.show-welcome")
+            .unwrap();
+        assert_eq!(
+            state.help_panel.as_ref().unwrap().title,
+            "Welcome to Writer's IDE"
+        );
+
+        state.help_panel = None;
+        state.dispatch_registered_command_id("help.search").unwrap();
+        assert!(state.command_palette.is_some());
     }
 }

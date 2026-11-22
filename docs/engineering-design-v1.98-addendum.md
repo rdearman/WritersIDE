@@ -19,8 +19,8 @@ return destination and the sample is omitted from Recent Projects. The tutorial
 panel can be paused, resumed, advanced or exited back to the original project.
 Completion returns to the original project. The sample directory is not
 automatically deleted. Help includes registered Show Welcome, Resume Tutorial,
-Restart Tutorial and Search Help and Commands actions. Search Help opens the
-offline command palette. The default `help.context` binding is empty so F1
+Restart Tutorial and Search Commands actions. Search Commands opens the offline
+command palette. The default `help.context` binding is empty so F1
 continues to navigate to its configured workspace; authors can assign Help
 through the existing command keymap and can use the Help menu at any time.
 An explicit user binding such as F1 → `help.context` opens and closes the
