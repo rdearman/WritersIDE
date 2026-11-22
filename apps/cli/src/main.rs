@@ -2138,12 +2138,30 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             compile_edition_with_overwrite(&project, &recipe, overwrite)?;
         }
-        "spellcheck" => {
+        "spellcheck" | "spellcheck-hunspell" => {
             let project = PathBuf::from(args.next().ok_or("missing project path")?);
-            let language = args.next().ok_or("missing Aspell language tag")?;
+            let language = args.next().ok_or("missing spelling language tag")?;
             let dictionary = args.next();
-            let findings =
-                spellcheck_project(&project, &language, dictionary.as_deref(), "aspell")?;
+            let executable = args.next().unwrap_or_else(|| {
+                if cmd == "spellcheck-hunspell" {
+                    "hunspell"
+                } else {
+                    "aspell"
+                }
+                .into()
+            });
+            let engine = if cmd == "spellcheck-hunspell" {
+                story_document::SpellcheckEngine::Hunspell
+            } else {
+                story_document::SpellcheckEngine::Aspell
+            };
+            let findings = spellcheck_project_with_engine(
+                &project,
+                &language,
+                dictionary.as_deref(),
+                &executable,
+                engine,
+            )?;
             println!("{}", serde_json::to_string_pretty(&findings)?);
             if !findings.is_empty() {
                 return Err(
@@ -3247,7 +3265,8 @@ fn usage() {
     eprintln!("writers-ide import-manuscript <source-file> <new-project-directory> [title]");
     eprintln!("writers-ide browse <project> [loopback-port]");
     eprintln!(
-        "writers-ide compile-edition <project> <recipe.toml> [--overwrite]\nwriters-ide watch-edition <project> <recipe.toml> [poll-ms]\nwriters-ide spellcheck <project> <language-tag> [project-relative-wordlist]"
+        "writers-ide compile-edition <project> <recipe.toml> [--overwrite]\nwriters-ide watch-edition <project> <recipe.toml> [poll-ms]\nwriters-ide spellcheck <project> <language-tag> [project-relative-wordlist] [executable]
+writers-ide spellcheck-hunspell <project> <language-tag> [project-relative-wordlist] [executable]"
     );
     eprintln!(
         "writers-ide query-assert-save <project> <query-uuid> <non-empty|empty|at-least:N|at-most:N|exactly:N>...\nwriters-ide query-assert-check <project> <query-uuid>"
@@ -3505,6 +3524,22 @@ fn spellcheck_project(
     dictionary: Option<&str>,
     executable: &str,
 ) -> Result<Vec<SpellingFinding>, Box<dyn std::error::Error>> {
+    spellcheck_project_with_engine(
+        project,
+        language,
+        dictionary,
+        executable,
+        story_document::SpellcheckEngine::Aspell,
+    )
+}
+
+fn spellcheck_project_with_engine(
+    project: &Path,
+    language: &str,
+    dictionary: Option<&str>,
+    executable: &str,
+    engine: story_document::SpellcheckEngine,
+) -> Result<Vec<SpellingFinding>, Box<dyn std::error::Error>> {
     if language.trim().is_empty() {
         return Err("language tag cannot be empty".into());
     }
@@ -3535,8 +3570,7 @@ fn spellcheck_project(
         );
     for (entity_kind, entity_id, title, text) in prose {
         let mut child = Command::new(executable)
-            .arg(format!("--lang={language}"))
-            .arg("list")
+            .args(engine.command_arguments(language))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -3833,7 +3867,7 @@ mod watch_tests {
         compile_edition_with_aspell_and_overwrite, compile_edition_with_overwrite,
         edition_watch_fingerprint, parse_scene_query_filter, recover_cli_replace_groups,
         run_auto_snapshot_check, run_processing_recipe, scenes_for_scope, spellcheck_project,
-        undo_cli_replace, watch_fingerprint,
+        spellcheck_project_with_engine, undo_cli_replace, watch_fingerprint,
     };
     use std::fs;
     use story_app::WriterApp;
@@ -4332,5 +4366,30 @@ mod watch_tests {
             .unwrap()
             .0;
         assert_eq!(before, after);
+
+        let fake_hunspell = root.path().join("hunspell-mock");
+        fs::write(
+            &fake_hunspell,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'Baad\\nKnown\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_hunspell, fs::Permissions::from_mode(0o755)).unwrap();
+        let findings = spellcheck_project_with_engine(
+            &project_path,
+            "en-GB",
+            Some("dictionaries/en.txt"),
+            fake_hunspell.to_str().unwrap(),
+            story_document::SpellcheckEngine::Hunspell,
+        )
+        .unwrap();
+        assert_eq!(findings[0].candidates.get("baad"), Some(&1));
+        assert_eq!(
+            WriterApp::open_project(&project_path)
+                .unwrap()
+                .load_scene_text(scene)
+                .unwrap()
+                .0,
+            before
+        );
     }
 }

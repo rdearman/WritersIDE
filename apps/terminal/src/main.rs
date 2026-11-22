@@ -11168,13 +11168,26 @@ impl AppState {
             } else {
                 rows.join(" | ")
             };
-        } else if cmd == "spellcheck" || cmd.starts_with("spellcheck ") {
+        } else if cmd == "spellcheck"
+            || cmd.starts_with("spellcheck ")
+            || cmd == "spellcheck-hunspell"
+            || cmd.starts_with("spellcheck-hunspell ")
+        {
+            let hunspell = cmd.starts_with("spellcheck-hunspell");
             let mut parts = cmd.split_whitespace().skip(1);
             let language = parts.next().unwrap_or("en");
             let dictionary = parts.next();
-            let executable = parts.next().unwrap_or("aspell");
-            let findings =
-                spellcheck_terminal_project(&self.app, language, dictionary, executable)?;
+            let executable = parts
+                .next()
+                .unwrap_or(if hunspell { "hunspell" } else { "aspell" });
+            let engine = if hunspell {
+                story_document::SpellcheckEngine::Hunspell
+            } else {
+                story_document::SpellcheckEngine::Aspell
+            };
+            let findings = spellcheck_terminal_project_with_engine(
+                &self.app, language, dictionary, executable, engine,
+            )?;
             self.message = if findings.is_empty() {
                 "No spelling candidates found; manuscript unchanged".into()
             } else {
@@ -12189,7 +12202,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu; arrows navigate; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -14171,11 +14184,28 @@ struct TerminalSpellingFinding {
     candidates: BTreeMap<String, u32>,
 }
 
+#[cfg(test)]
 fn spellcheck_terminal_project(
     app: &WriterApp,
     language: &str,
     dictionary: Option<&str>,
     executable: &str,
+) -> Result<Vec<TerminalSpellingFinding>, Box<dyn std::error::Error>> {
+    spellcheck_terminal_project_with_engine(
+        app,
+        language,
+        dictionary,
+        executable,
+        story_document::SpellcheckEngine::Aspell,
+    )
+}
+
+fn spellcheck_terminal_project_with_engine(
+    app: &WriterApp,
+    language: &str,
+    dictionary: Option<&str>,
+    executable: &str,
+    engine: story_document::SpellcheckEngine,
 ) -> Result<Vec<TerminalSpellingFinding>, Box<dyn std::error::Error>> {
     if language.trim().is_empty() {
         return Err("spellcheck language tag cannot be empty".into());
@@ -14204,8 +14234,7 @@ fn spellcheck_terminal_project(
     let mut findings = Vec::new();
     for (kind, title, text) in prose {
         let mut child = Command::new(executable)
-            .arg(format!("--lang={language}"))
-            .arg("list")
+            .args(engine.command_arguments(language))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -14219,7 +14248,11 @@ fn spellcheck_terminal_project(
         let output = child.wait_with_output()?;
         if !output.status.success() {
             return Err(format!(
-                "Aspell failed for {kind} {title}: {}",
+                "{} failed for {kind} {title}: {}",
+                match engine {
+                    story_document::SpellcheckEngine::Aspell => "Aspell",
+                    story_document::SpellcheckEngine::Hunspell => "Hunspell",
+                },
                 String::from_utf8_lossy(&output.stderr)
             )
             .into());
@@ -20796,6 +20829,24 @@ mod tests {
             )
             .is_err()
         );
+
+        let fake_hunspell = root.path().join("hunspell-mock");
+        fs::write(
+            &fake_hunspell,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'Baad\\nKnown\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_hunspell, fs::Permissions::from_mode(0o755)).unwrap();
+        let findings = spellcheck_terminal_project_with_engine(
+            &state.app,
+            "en-GB",
+            Some("dictionaries/en.txt"),
+            fake_hunspell.to_str().unwrap(),
+            story_document::SpellcheckEngine::Hunspell,
+        )
+        .unwrap();
+        assert_eq!(findings[0].candidates.get("baad"), Some(&1));
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, "Baad word.");
     }
 
     #[test]

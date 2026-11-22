@@ -820,6 +820,24 @@ pub struct EditionRecipe {
     pub dictionary: Option<String>,
 }
 
+/// Optional local command-line spelling backends. Neither engine is required
+/// to install or run Writer's IDE.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum SpellcheckEngine {
+    #[default]
+    Aspell,
+    Hunspell,
+}
+
+impl SpellcheckEngine {
+    pub fn command_arguments(self, language: &str) -> Vec<String> {
+        match self {
+            Self::Aspell => vec![format!("--lang={language}"), "list".into()],
+            Self::Hunspell => vec!["-l".into(), "-d".into(), language.replace('-', "_")],
+        }
+    }
+}
+
 /// Parse a project-local personal word list. Supports plain one-word-per-line
 /// files, Aspell personal-word-list headers, and Hunspell `.dic` count headers
 /// with optional slash-delimited flags. Affix expansion remains the engine's
@@ -1672,6 +1690,18 @@ mod tests {
         let hunspell = parse_personal_dictionary("2\nTARDIS/SM\nGallifrey\n").unwrap();
         assert!(hunspell.contains("tardis"));
         assert!(parse_personal_dictionary("2\nTARDIS\n").is_err());
+    }
+
+    #[test]
+    fn spellcheck_engine_builds_local_backend_arguments() {
+        assert_eq!(
+            SpellcheckEngine::Aspell.command_arguments("en-GB"),
+            ["--lang=en-GB", "list"]
+        );
+        assert_eq!(
+            SpellcheckEngine::Hunspell.command_arguments("tr-TR"),
+            ["-l", "-d", "tr_TR"]
+        );
     }
 
     #[test]
