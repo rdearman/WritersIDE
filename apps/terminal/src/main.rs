@@ -30,6 +30,8 @@ use story_core::{SceneId, SceneStatus};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+pub mod onboarding;
+
 type SceneRow = (SceneId, String, SceneStatus, u32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
