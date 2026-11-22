@@ -4669,6 +4669,93 @@ impl WriterApp {
         Ok(restored)
     }
 
+    /// Reactivates an archived scene under its original UUID when the historical
+    /// chapter still exists. Prose is restored through the normal durable write
+    /// journal and current state is snapshotted first.
+    pub fn restore_archived_scene_from_git(
+        &mut self,
+        commit: &str,
+        scene_id: SceneId,
+    ) -> Result<()> {
+        let current = self.get_scene(scene_id)?;
+        if !current.scene.archived {
+            return Err(AppError::Domain(
+                "selected scene is not archived; use the scene revision restore workflow".into(),
+            ));
+        }
+        let project_id = self.get_project()?.id;
+        let temporary = tempfile::tempdir().map_err(|error| {
+            AppError::Domain(format!("create historical restore workspace: {error}"))
+        })?;
+        let historical_path = temporary.path().join("historical-project");
+        Self::restore_git_snapshot(self.store.project_root(), commit, &historical_path)?;
+        let historical = Self::open_project(&historical_path)?;
+        if historical.get_project()?.id != project_id {
+            return Err(AppError::Domain(
+                "historical snapshot belongs to a different project".into(),
+            ));
+        }
+        let source = historical.get_scene(scene_id)?;
+        if source.scene.archived {
+            return Err(AppError::Domain(
+                "selected snapshot contains the scene only in archived state".into(),
+            ));
+        }
+        let chapter = source.chapter_id.ok_or_else(|| {
+            AppError::Domain("historical scene has no chapter placement to restore".into())
+        })?;
+        let position = source.position.ok_or_else(|| {
+            AppError::Domain("historical scene has no manuscript position to restore".into())
+        })?;
+        if !self
+            .list_structural_nodes()?
+            .iter()
+            .any(|node| node.id == chapter && node.kind == "chapter")
+        {
+            return Err(AppError::Domain(
+                "historical chapter no longer exists; use Recover Deleted Scene as New and choose a chapter".into(),
+            ));
+        }
+        let (text, _) = historical.load_scene_text(scene_id)?;
+        let (current_text, current_hash) = self.load_scene_text(scene_id)?;
+        self.git_snapshot(&format!(
+            "Before restoring archived scene {}",
+            source.scene.title
+        ))?;
+        let restored_hash = self.save_scene_text(scene_id, Some(&current_hash), &text)?;
+        let result = (|| {
+            self.move_scene(scene_id, chapter, position)?;
+            let mut metadata = source.scene;
+            metadata.archived = false;
+            self.update_scene_metadata(&metadata)?;
+            Ok::<(), AppError>(())
+        })();
+        if let Err(error) = result {
+            if current_text != text
+                && let Err(rollback) =
+                    self.save_scene_text(scene_id, Some(&restored_hash), &current_text)
+            {
+                return Err(AppError::Domain(format!(
+                    "scene restore failed ({error}); prose rollback also needs attention ({rollback})"
+                )));
+            }
+            if let (Some(old_chapter), Some(old_position)) = (current.chapter_id, current.position)
+                && let Err(rollback) = self.move_scene(scene_id, old_chapter, old_position)
+            {
+                return Err(AppError::Domain(format!(
+                    "scene restore failed ({error}); placement rollback also needs attention ({rollback})"
+                )));
+            }
+            if let Err(rollback) = self.update_scene_metadata(&current.scene) {
+                return Err(AppError::Domain(format!(
+                    "scene restore failed ({error}); metadata rollback also needs attention ({rollback})"
+                )));
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn git_snapshot(&mut self, label: &str) -> Result<Option<String>> {
         let author = self.get_project()?.author;
         Ok(self.store.with_git_snapshot_barrier(|root| {
@@ -5298,6 +5385,105 @@ unexpected_prose = "must not be silently discarded"
                 .unwrap()
                 .iter()
                 .any(|item| item.scene.id == restored)
+        );
+    }
+
+    #[test]
+    fn git_reactivates_archived_scene_with_original_identity_placement_metadata_and_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let original_chapter = app.create_chapter(None, "Original Chapter", 0).unwrap();
+        let later_chapter = app.create_chapter(None, "Later Chapter", 1).unwrap();
+        let scene = app.create_scene(original_chapter, "Lost Scene", 0).unwrap();
+        let character = app.create_character("Mara").unwrap();
+        app.link_character(scene, character, ParticipationRole::Major)
+            .unwrap();
+        let plotline = app.create_plotline("The Map").unwrap();
+        app.set_scene_plotlines(
+            scene,
+            &[story_core::ScenePlotline {
+                plotline_id: plotline,
+                role: "advances".into(),
+                share_basis_points: None,
+            }],
+            WordAttributionPolicy::Overlap,
+        )
+        .unwrap();
+        let event = app.add_event("The map is found", "day 1").unwrap();
+        app.link_event(scene, event, "depicts").unwrap();
+
+        let mut metadata = app.get_scene(scene).unwrap().scene;
+        metadata.synopsis = "Historical synopsis".into();
+        metadata.purpose = "Reveal the map".into();
+        metadata.goal = "Find the route".into();
+        metadata.outcome = "The route is found".into();
+        metadata.target_words = Some(850);
+        app.update_scene_metadata(&metadata).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "The original map passage.")
+            .unwrap();
+        let snapshot = app
+            .git_snapshot("Before accidental archive")
+            .unwrap()
+            .unwrap();
+
+        app.archive_scene(scene).unwrap();
+        app.move_scene(scene, later_chapter, 0).unwrap();
+        let mut changed = app.get_scene(scene).unwrap().scene;
+        changed.synopsis = "Changed after archive".into();
+        changed.purpose = "Changed purpose".into();
+        app.update_scene_metadata(&changed).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Changed prose after archive.")
+            .unwrap();
+
+        app.restore_archived_scene_from_git(&snapshot, scene)
+            .unwrap();
+
+        let restored = app.get_scene(scene).unwrap();
+        assert_eq!(restored.scene.id, scene);
+        assert!(!restored.scene.archived);
+        assert_eq!(restored.scene.synopsis, "Historical synopsis");
+        assert_eq!(restored.scene.purpose, "Reveal the map");
+        assert_eq!(restored.scene.goal, "Find the route");
+        assert_eq!(restored.scene.outcome, "The route is found");
+        assert_eq!(restored.scene.target_words, Some(850));
+        assert_eq!(restored.chapter_id, Some(original_chapter));
+        assert_eq!(restored.position, Some(0));
+        assert_eq!(
+            app.load_scene_text(scene).unwrap().0,
+            "The original map passage."
+        );
+        assert_eq!(
+            app.store.scene_character_analytics(scene).unwrap(),
+            vec![(character.to_string(), "Mara".into(), "major".into())]
+        );
+        assert_eq!(app.scene_plotline_links(scene).unwrap().len(), 1);
+        assert_eq!(
+            app.scene_plotline_links(scene).unwrap()[0].plotline_id,
+            plotline
+        );
+        assert_eq!(
+            app.scene_event_links(scene).unwrap(),
+            vec![(event, "depicts".into())]
+        );
+        app.validate_project().unwrap();
+        let history = app.git_history(10).unwrap();
+        assert!(
+            history[0]
+                .subject
+                .contains("Before restoring archived scene")
+        );
+        drop(app);
+        let reopened = WriterApp::open_project(project).unwrap();
+        assert_eq!(
+            reopened.get_scene(scene).unwrap().chapter_id,
+            Some(original_chapter)
+        );
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "The original map passage."
         );
     }
 

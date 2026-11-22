@@ -901,6 +901,16 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             app.restore_scene_from_git(&commit, scene)?;
             println!("Scene prose restored from {commit}; previous project state snapshotted.");
         }
+        "git-restore-scene-archived" => {
+            let path = args.next().ok_or("missing project path")?;
+            let commit = args.next().ok_or("missing commit identifier")?;
+            let scene = story_core::SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let mut app = WriterApp::open_project(path)?;
+            app.restore_archived_scene_from_git(&commit, scene)?;
+            println!(
+                "Archived scene {scene} reactivated from {commit}; current state snapshotted."
+            );
+        }
         "git-restore-scene-new" => {
             let path = args.next().ok_or("missing project path")?;
             let commit = args.next().ok_or("missing commit identifier")?;
@@ -3144,6 +3154,7 @@ fn usage() {
     eprintln!(
         "writers-ide git-restore-scene-new <project> <commit> <historical-scene-uuid> <destination-chapter-uuid> <position>"
     );
+    eprintln!("writers-ide git-restore-scene-archived <project> <commit> <scene-uuid>");
     eprintln!("writers-ide inspect-manuscript <DOCX|RTF|ODT|EPUB-source>");
     eprintln!(
         "writers-ide inspect-scrivener <.scriv-project-directory|.scrivx-manifest> (experimental inventory only)"

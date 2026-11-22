@@ -290,9 +290,11 @@ Direct chapter and section prose is represented as a typed content unit with its
 **Implemented:** core model, built-in starter structures, chapter-level prose editor workflow, persistence/reopen, Markdown Compile IR, template export/check/instantiate CLI paths. **Open:** TUI template authoring/import form, user playtesting, bibliography/figure/cross-reference types, and explicitly mixed chapter-body/scene ordering. The current compiler orders direct chapter prose before child scenes.
 
 
-## Issue #11 — Recover an archived scene from Git
+## Issue #11 — Recover archived and deleted scenes from Git
 
-A named project snapshot can be used to recover an archived/deleted scene into an explicitly selected existing chapter and order position. The recovery is staged through a validated historical project, assigns a fresh scene UUID, preserves its prose and core metadata, snapshots current project state, and writes through the normal durable journal. Unresolvable POV/location references are cleared; participation, plot/event/link/custom-field relationships are deliberately not copied and the CLI/TUI say so. The historical commit and source project are read-only. Full dependency-graph restoration and transactional in-place project rollback remain open.
+For an archived scene whose original chapter still exists, `git-restore-scene-archived <project> <commit> <scene-uuid>` reactivates the existing scene UUID using the historical prose, placement and core metadata from the selected project snapshot. It first validates a reconstructed snapshot with the same immutable project identity, snapshots current state, and writes prose through the durable optimistic journal. Character, plotline and event links still present on the archived row remain attached. The terminal exposes the command through the File menu and refuses to proceed after an editor save conflict.
+
+For a scene absent from the current project database, `git-restore-scene-new` remains the recovery path: it creates a new UUID in an explicitly selected chapter and position, restores prose and supported core metadata, and clears POV/location references that do not resolve. Character participation, plotline, event, link and custom-field relationships are not restored by that path. Original-ID reactivation does not rewind relationship edits made after archiving or recover relationships that have been removed; neither path restores custom-field values or passage annotations. The historical commit and source project remain read-only. Full relationship-delta recovery, custom metadata recovery, whole-project in-place rollback, preview/confirmation and remote Git operations remain open.
 
 ## Issue #8 — Per-user and per-project command keymaps
 
