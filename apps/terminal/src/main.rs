@@ -851,6 +851,22 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "compile.preview-output",
+            "Preview Latest Compile Output",
+            "Open the latest successful Compile artifact in the system viewer",
+            "Compile",
+            "compile-preview",
+            false,
+        ),
+        legacy_command(
+            "compile.open-output-directory",
+            "Open Compile Output Directory",
+            "Open the directory containing the latest successful Compile artifact",
+            "Compile",
+            "compile-open-directory",
+            false,
+        ),
+        legacy_command(
             "compile.next-diagnostic",
             "Next Compile Diagnostic",
             "Navigate to the next current Compile finding",
@@ -9545,6 +9561,22 @@ impl AppState {
             self.navigate_compile_diagnostic(true)?;
         } else if cmd == "compile-previous" {
             self.navigate_compile_diagnostic(false)?;
+        } else if cmd == "compile-preview" || cmd == "compile-open-directory" {
+            let artifact = latest_compile_output(&self.app)?;
+            let target = if cmd == "compile-preview" {
+                artifact.clone()
+            } else {
+                artifact
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .ok_or("Compile output has no containing directory")?
+            };
+            open_with_system_viewer(&target)?;
+            self.message = if cmd == "compile-preview" {
+                format!("Opened Compile preview: {}", target.display())
+            } else {
+                format!("Opened Compile output directory: {}", target.display())
+            };
         } else if let Some(index) = cmd.strip_prefix("compile-jump ") {
             let index = index
                 .trim()
@@ -13047,6 +13079,69 @@ fn parse_compile_range(line: &str) -> Option<story_document::SourceRange> {
         start: start.parse().ok()?,
         end: end.split(':').next()?.parse().ok()?,
     })
+}
+
+fn latest_compile_output(app: &WriterApp) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let supported = [
+        "html", "htm", "epub", "docx", "pdf", "odt", "rtf", "txt", "md", "mobi", "azw3",
+    ];
+    let path = app
+        .list_compile_results()?
+        .into_iter()
+        .find(|record| record.succeeded)
+        .and_then(|record| {
+            record.outputs.into_iter().find(|output| {
+                let path = Path::new(output);
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| supported.contains(&extension.to_ascii_lowercase().as_str()))
+                    .unwrap_or(false)
+                    && !output.ends_with(".source-map.json")
+            })
+        })
+        .ok_or("No successful Compile result contains a previewable artifact")?;
+    let path = PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        app.project_root().join(path)
+    };
+    if !path.is_file() {
+        return Err(format!("Compile output is no longer available: {}", path.display()).into());
+    }
+    Ok(path)
+}
+
+fn open_with_system_viewer(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(target_os = "linux")]
+    let commands: &[(&str, &[&str])] = &[("xdg-open", &[]), ("gio", &["open"])];
+    #[cfg(target_os = "macos")]
+    let commands: &[(&str, &[&str])] = &[("open", &[])];
+    #[cfg(target_os = "windows")]
+    let commands: &[(&str, &[&str])] = &[("explorer", &[])];
+    #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
+    let commands: &[(&str, &[&str])] = &[];
+
+    let mut failures = Vec::new();
+    for (program, prefix) in commands {
+        let mut command = Command::new(program);
+        command
+            .args(*prefix)
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match command.spawn() {
+            Ok(_) => return Ok(()),
+            Err(error) => failures.push(format!("{program}: {error}")),
+        }
+    }
+    Err(format!(
+        "Could not launch a system viewer for {} ({})",
+        path.display(),
+        failures.join("; ")
+    )
+    .into())
 }
 
 fn compile_results_reference_text(
@@ -17023,6 +17118,18 @@ mod tests {
             "compile.format"
         );
         assert_eq!(
+            command_by_id("compile.preview-output")
+                .unwrap()
+                .palette_prefix,
+            Some("compile-preview")
+        );
+        assert_eq!(
+            command_by_id("compile.open-output-directory")
+                .unwrap()
+                .palette_prefix,
+            Some("compile-open-directory")
+        );
+        assert_eq!(
             command_palette_invocation("compile-config").unwrap().0.id,
             "compile.configuration"
         );
@@ -17119,6 +17226,11 @@ mod tests {
         state
             .execute_legacy_palette_command("compile-config run plain")
             .unwrap();
+        assert_eq!(
+            latest_compile_output(&state.app).unwrap(),
+            root.path()
+                .join("Compile/exports/compile/plain/manuscript.md")
+        );
         assert!(state.message.contains("Compile plain complete"));
         state
             .execute_legacy_palette_command("compile-config results")
