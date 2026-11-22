@@ -373,6 +373,13 @@ struct MenuState {
     top: usize,
     selected: usize,
     all_commands: bool,
+    group: Option<&'static str>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MenuEntry {
+    Group(&'static str),
+    Command(CommandSpec),
 }
 
 #[derive(Clone, Debug)]
@@ -924,6 +931,9 @@ struct CommandSpec {
     palette_prefix: Option<&'static str>,
     takes_arguments: bool,
     action: CommandAction,
+    task_group: &'static str,
+    menu_priority: u8,
+    advanced: bool,
 }
 
 fn command_registry() -> Vec<CommandSpec> {
@@ -958,6 +968,9 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_aliases: &[],
             palette_prefix: None,
             takes_arguments: false,
+            task_group: "",
+            menu_priority: 100,
+            advanced: true,
             action: CommandAction::Workspace(workspace),
         })
         .collect::<Vec<_>>();
@@ -985,6 +998,9 @@ fn command_registry() -> Vec<CommandSpec> {
                 palette_aliases: &[],
                 palette_prefix: None,
                 takes_arguments: false,
+                task_group: "",
+                menu_priority: 100,
+                advanced: true,
                 action: CommandAction::OpenMenuCategory(index),
             }),
     );
@@ -999,6 +1015,9 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_aliases: &["palette"],
             palette_prefix: None,
             takes_arguments: false,
+            task_group: "",
+            menu_priority: 100,
+            advanced: true,
             action: CommandAction::OpenCommandPalette,
         },
         CommandSpec {
@@ -1011,6 +1030,9 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_aliases: &[],
             palette_prefix: None,
             takes_arguments: false,
+            task_group: "",
+            menu_priority: 100,
+            advanced: true,
             action: CommandAction::OpenMainMenu,
         },
         CommandSpec {
@@ -1023,6 +1045,9 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_aliases: &["save"],
             palette_prefix: None,
             takes_arguments: false,
+            task_group: "",
+            menu_priority: 100,
+            advanced: true,
             action: CommandAction::Save,
         },
         CommandSpec {
@@ -1035,6 +1060,9 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_aliases: &[],
             palette_prefix: None,
             takes_arguments: false,
+            task_group: "",
+            menu_priority: 100,
+            advanced: true,
             action: CommandAction::ResolveSaveConflict,
         },
         CommandSpec {
@@ -1047,6 +1075,9 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_aliases: &["help"],
             palette_prefix: None,
             takes_arguments: false,
+            task_group: "",
+            menu_priority: 100,
+            advanced: true,
             action: CommandAction::Help,
         },
         CommandSpec {
@@ -1059,6 +1090,9 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_aliases: &[],
             palette_prefix: None,
             takes_arguments: false,
+            task_group: "",
+            menu_priority: 100,
+            advanced: true,
             action: CommandAction::RestoreRevisionHunk,
         },
         CommandSpec {
@@ -1071,6 +1105,9 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_aliases: &["process", "compile"],
             palette_prefix: None,
             takes_arguments: false,
+            task_group: "",
+            menu_priority: 100,
+            advanced: true,
             action: CommandAction::Process {
                 expand_transclusions: false,
             },
@@ -1085,6 +1122,9 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_aliases: &["process-expand", "compile-expand"],
             palette_prefix: None,
             takes_arguments: false,
+            task_group: "",
+            menu_priority: 100,
+            advanced: true,
             action: CommandAction::Process {
                 expand_transclusions: true,
             },
@@ -1099,6 +1139,9 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_aliases: &["process-only"],
             palette_prefix: None,
             takes_arguments: true,
+            task_group: "",
+            menu_priority: 100,
+            advanced: true,
             action: CommandAction::ProcessSelected {
                 expand_transclusions: false,
             },
@@ -1113,6 +1156,9 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_aliases: &["process-expand-only"],
             palette_prefix: None,
             takes_arguments: true,
+            task_group: "",
+            menu_priority: 100,
+            advanced: true,
             action: CommandAction::ProcessSelected {
                 expand_transclusions: true,
             },
@@ -2813,7 +2859,114 @@ fn command_registry() -> Vec<CommandSpec> {
             false,
         ),
     ]);
+    for command in &mut commands {
+        command.task_group = task_group_for_command(*command);
+        command.menu_priority = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == menu_category(command))
+            .and_then(|category| {
+                MENU_COMMON_COMMANDS[category]
+                    .iter()
+                    .position(|id| *id == command.id)
+            })
+            .map_or(100, |priority| priority.saturating_add(1) as u8);
+        command.advanced = command.menu_priority == 100 && !command.id.starts_with("menu.");
+    }
     commands
+}
+
+fn task_group_for_command(command: CommandSpec) -> &'static str {
+    let id = command.id;
+    match menu_category(&command) {
+        "File" if id.starts_with("series.") || id.starts_with("project.") => "Projects & Books",
+        "File" if id.starts_with("revision.") || id.starts_with("git.") => "History & Recovery",
+        "File" => "Files & Imports",
+        "Edit"
+            if id.starts_with("search.")
+                || id.starts_with("find.")
+                || id.starts_with("replace.") =>
+        {
+            "Find & Replace"
+        }
+        "Edit" if id.starts_with("edit.") || id.starts_with("macro.") => "Text & Editing Tools",
+        "Edit" => "Editing Preferences",
+        "Insert"
+            if id.starts_with("structure.")
+                || id.starts_with("scene.")
+                || id.starts_with("document.") =>
+        {
+            "Manuscript Structure"
+        }
+        "Insert"
+            if id.starts_with("link.")
+                || id.starts_with("anchor.")
+                || id.starts_with("comment.") =>
+        {
+            "Links & Notes"
+        }
+        "Insert" => "Writing Tools",
+        "Navigate" if id.starts_with("view.") || id.starts_with("outline.") => {
+            "Workspaces & Outline"
+        }
+        "Navigate"
+            if id.starts_with("search.")
+                || id.starts_with("find.")
+                || id.starts_with("grep.")
+                || id.starts_with("occur.") =>
+        {
+            "Search & Navigation"
+        }
+        "Navigate" => "Scenes & Documents",
+        "Review" if id.starts_with("proofread.") || id.starts_with("diagnostic.") => {
+            "Proofreading & Diagnostics"
+        }
+        "Review"
+            if id.starts_with("revision.") || id.starts_with("git.") || id.contains("conflict") =>
+        {
+            "Revisions & Recovery"
+        }
+        "Review" if id.starts_with("reading.") => "Reading & Annotations",
+        "Review"
+            if id.starts_with("analytics.")
+                || id.starts_with("timeline.")
+                || id.starts_with("plot.") =>
+        {
+            "Analysis & Timeline"
+        }
+        "Review" => "Issues & Review",
+        "Publish" if id.starts_with("assembly.") => "Manuscript Assemblies",
+        "Publish" => "Compile & Export",
+        "Tools" if id.starts_with("research.") || id.starts_with("reading.") => {
+            "Research & Reading"
+        }
+        "Tools"
+            if id.starts_with("character.")
+                || id.starts_with("location.")
+                || id.starts_with("object.")
+                || id.starts_with("story.")
+                || id.starts_with("world.") =>
+        {
+            "Story Bible"
+        }
+        "Tools"
+            if id.starts_with("timeline.")
+                || id.starts_with("plot.")
+                || id.starts_with("event.") =>
+        {
+            "Planning & Timeline"
+        }
+        "Tools" if id.starts_with("git.") || id.starts_with("revision.") => "Backup & Recovery",
+        "Tools"
+            if id.starts_with("writing.")
+                || id.starts_with("challenge.")
+                || id.starts_with("scratchpad.") =>
+        {
+            "Writing Tools"
+        }
+        "Tools" => "Advanced Tools",
+        "Help" => "Help & Documentation",
+        _ => "Other Commands",
+    }
 }
 
 fn legacy_command(
@@ -2834,6 +2987,9 @@ fn legacy_command(
         palette_aliases: &[],
         palette_prefix: Some(alias),
         takes_arguments,
+        task_group: "",
+        menu_priority: 100,
+        advanced: true,
         action: CommandAction::LegacyPalette,
     }
 }
@@ -7537,6 +7693,7 @@ impl AppState {
                 top: 0,
                 selected: 0,
                 all_commands: false,
+                group: None,
             });
             self.message = "Main menu · arrows navigate · Enter selects · Esc closes".into();
         }
@@ -7649,6 +7806,7 @@ impl AppState {
             top,
             selected: 0,
             all_commands: false,
+            group: None,
         });
         self.message = format!(
             "{} menu · common actions · Tab all commands · arrows/Enter · Esc closes",
@@ -7676,6 +7834,41 @@ impl AppState {
                     .find(|spec| spec.id == *id && menu_category(spec) == top)
                     .copied()
             })
+            .collect()
+    }
+    fn menu_groups(&self) -> Vec<&'static str> {
+        let commands = self.menu_commands();
+        let mut groups = commands
+            .iter()
+            .map(|command| command.task_group)
+            .collect::<Vec<_>>();
+        groups.sort_unstable();
+        groups.dedup();
+        groups.sort_by_key(|group| {
+            commands
+                .iter()
+                .filter(|command| command.task_group == *group)
+                .map(|command| command.menu_priority)
+                .min()
+                .unwrap_or(u8::MAX)
+        });
+        groups
+    }
+    fn menu_visible_entries(&self) -> Vec<MenuEntry> {
+        let Some(menu) = self.menu else {
+            return Vec::new();
+        };
+        if menu.all_commands && menu.group.is_none() {
+            return self
+                .menu_groups()
+                .into_iter()
+                .map(MenuEntry::Group)
+                .collect();
+        }
+        self.menu_commands()
+            .into_iter()
+            .filter(|command| menu.group.is_none_or(|group| command.task_group == group))
+            .map(MenuEntry::Command)
             .collect()
     }
     fn command_disabled_reason(&self, spec: CommandSpec) -> Option<&'static str> {
@@ -8055,14 +8248,26 @@ impl AppState {
         let mut menu = self.menu.ok_or("menu is closed")?;
         match key.code {
             KeyCode::Esc => {
-                self.menu = None;
-                self.message = "Menu closed; editor focus restored".into();
+                if menu.group.is_some() {
+                    menu.group = None;
+                    menu.selected = 0;
+                    self.menu = Some(menu);
+                    self.message = "Returned to command groups · Esc closes menu".into();
+                } else {
+                    self.menu = None;
+                    self.message = "Menu closed; editor focus restored".into();
+                }
                 return Ok(());
             }
             KeyCode::Left => {
-                menu.top = (menu.top + MENU_CATEGORIES.len() - 1) % MENU_CATEGORIES.len();
-                menu.selected = 0;
-                menu.all_commands = false;
+                if menu.group.is_some() {
+                    menu.group = None;
+                    menu.selected = 0;
+                } else {
+                    menu.top = (menu.top + MENU_CATEGORIES.len() - 1) % MENU_CATEGORIES.len();
+                    menu.selected = 0;
+                    menu.all_commands = false;
+                }
                 self.menu = Some(menu);
                 return Ok(());
             }
@@ -8070,40 +8275,55 @@ impl AppState {
                 menu.top = (menu.top + 1) % MENU_CATEGORIES.len();
                 menu.selected = 0;
                 menu.all_commands = false;
+                menu.group = None;
                 self.menu = Some(menu);
                 return Ok(());
             }
             KeyCode::Tab => {
                 menu.all_commands = true;
                 menu.selected = 0;
+                menu.group = None;
                 self.message = format!(
-                    "{} · all registered commands · Shift+Tab returns to common actions",
+                    "{} · command groups · Enter browses · Shift+Tab common actions",
                     MENU_CATEGORIES[menu.top]
                 );
             }
             KeyCode::BackTab => {
                 menu.all_commands = false;
                 menu.selected = 0;
+                menu.group = None;
                 self.message = format!(
                     "{} · common actions · Tab shows all registered commands",
                     MENU_CATEGORIES[menu.top]
                 );
             }
             KeyCode::Up => {
-                let count = self.menu_commands().len();
+                let count = self.menu_visible_entries().len();
                 if count > 0 {
                     menu.selected = (menu.selected + count - 1) % count;
                 }
             }
             KeyCode::Down => {
-                let count = self.menu_commands().len();
+                let count = self.menu_visible_entries().len();
                 if count > 0 {
                     menu.selected = (menu.selected + 1) % count;
                 }
             }
             KeyCode::Enter => {
-                let commands = self.menu_commands();
-                if let Some(spec) = commands.get(menu.selected).copied() {
+                let entries = self.menu_visible_entries();
+                if let Some(entry) = entries.get(menu.selected).copied() {
+                    let MenuEntry::Command(spec) = entry else {
+                        if let MenuEntry::Group(group) = entry {
+                            menu.group = Some(group);
+                            menu.selected = 0;
+                            self.message = format!(
+                                "{} · Enter runs a command · Left/Esc returns to groups",
+                                group
+                            );
+                            self.menu = Some(menu);
+                        }
+                        return Ok(());
+                    };
                     if let Some(reason) = self.command_disabled_reason(spec) {
                         self.message = format!("{} unavailable: {reason}", spec.label);
                         return Ok(());
@@ -8140,12 +8360,33 @@ impl AppState {
                     menu.top = index;
                     menu.selected = 0;
                     menu.all_commands = false;
+                    menu.group = None;
                     self.menu = Some(menu);
                     return Ok(());
-                } else if let Some((index, spec)) =
-                    self.menu_commands().iter().enumerate().find(|(_, spec)| {
+                } else if menu.all_commands
+                    && menu.group.is_none()
+                    && let Some(group) = self.menu_groups().into_iter().find(|group| {
+                        group
+                            .chars()
+                            .next()
+                            .is_some_and(|first| first.eq_ignore_ascii_case(&ch))
+                    })
+                {
+                    menu.group = Some(group);
+                    menu.selected = 0;
+                    self.menu = Some(menu);
+                    return Ok(());
+                } else if let Some((index, spec)) = self
+                    .menu_visible_entries()
+                    .iter()
+                    .enumerate()
+                    .find_map(|(index, entry)| {
+                        let MenuEntry::Command(spec) = entry else {
+                            return None;
+                        };
                         spec.mnemonic
                             .is_some_and(|mnemonic| mnemonic.eq_ignore_ascii_case(&ch))
+                            .then_some((index, spec))
                     })
                 {
                     menu.selected = index;
@@ -8179,7 +8420,7 @@ impl AppState {
         }
         menu.selected = menu
             .selected
-            .min(self.menu_commands().len().saturating_sub(1));
+            .min(self.menu_visible_entries().len().saturating_sub(1));
         self.menu = Some(menu);
         Ok(())
     }
@@ -15897,13 +16138,15 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
         "Command Palette".to_owned()
     } else if let Some(menu) = state.menu {
         format!(
-            "{} menu · {}",
+            "{} menu · {}{}",
             MENU_CATEGORIES[menu.top],
             if menu.all_commands {
-                "all registered commands"
+                "all commands"
             } else {
                 "common actions"
-            }
+            },
+            menu.group
+                .map_or_else(String::new, |group| format!(" · {group}"))
         )
     } else if state.find_panel.is_some() {
         "Search dialogue".to_owned()
@@ -15949,16 +16192,12 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
     } else if matches!(state.mode, Some('R' | 'K')) {
         lines.push("Conflict choices: review both versions, save a recovery copy, use the saved copy, or explicitly keep your changes".to_owned());
     }
-    if let Some(menu) = state.menu {
+    if state.menu.is_some() {
         lines.push(
-            "Menu controls: ←/→ choose a menu · ↑/↓ choose · Enter runs · Tab shows all commands · Shift+Tab returns to common actions · Esc closes"
+            "Menu controls: ←/→ choose a menu · ↑/↓ choose · Enter runs or browses a group · Tab shows grouped commands · Left/Esc returns from a group · Shift+Tab returns to common actions · Esc closes"
                 .to_owned(),
         );
-        let category = MENU_CATEGORIES[menu.top];
-        for command in command_registry()
-            .into_iter()
-            .filter(|command| command.category.eq_ignore_ascii_case(category))
-        {
+        for command in state.menu_commands() {
             let shortcuts = effective_command_shortcuts(state, command).join(", ");
             lines.push(if shortcuts.is_empty() {
                 format!("{} — {}", command.label, command.description)
@@ -17141,6 +17380,7 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         top: 0,
         selected: 0,
         all_commands: false,
+        group: None,
     });
     let category_offset = MENU_CATEGORIES
         .iter()
@@ -17155,8 +17395,12 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     };
     f.render_widget(Clear, popup);
     let direct_shortcut = effective_shortcut_label(s, MENU_CATEGORY_COMMAND_IDS[menu.top], "");
-    let contents = if menu.all_commands {
-        "All commands · Shift+Tab common"
+    let contents = if menu.all_commands && menu.group.is_none() {
+        "Command groups · Shift+Tab common"
+    } else if let Some(group) = menu.group {
+        group
+    } else if menu.all_commands {
+        "Group commands · Shift+Tab common"
     } else {
         "Common actions · Tab all commands"
     };
@@ -17174,30 +17418,39 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-    let commands = s.menu_commands();
+    let entries = s.menu_visible_entries();
     let row_width = inner.width.saturating_sub(2) as usize;
-    let items = if commands.is_empty() {
+    let items = if entries.is_empty() {
         vec![ListItem::new("No commands available yet").style(Style::default().fg(Color::DarkGray))]
     } else {
-        commands
+        entries
             .iter()
-            .map(|spec| {
-                let disabled = s.command_disabled_reason(*spec);
-                let label = menu_command_row(s, *spec, row_width);
-                ListItem::new(label).style(if disabled.is_some() {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default()
-                })
+            .map(|entry| match entry {
+                MenuEntry::Group(group) => {
+                    let (count, advanced) = menu_group_command_count(&s.menu_commands(), group);
+                    ListItem::new(truncate_display_cells(
+                        &format!("{group}  ·  {count} commands  ·  {advanced} advanced  ›"),
+                        row_width,
+                    ))
+                }
+                MenuEntry::Command(command) => {
+                    let disabled = s.command_disabled_reason(*command);
+                    let label = menu_command_row(s, *command, row_width);
+                    ListItem::new(label).style(if disabled.is_some() {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default()
+                    })
+                }
             })
             .collect()
     };
-    let selected = if commands.is_empty() {
+    let selected = if entries.is_empty() {
         None
     } else {
-        Some(menu.selected.min(commands.len() - 1))
+        Some(menu.selected.min(entries.len() - 1))
     };
-    let (command_list_area, description_area) = if !commands.is_empty() && inner.height >= 6 {
+    let (command_list_area, description_area) = if !entries.is_empty() && inner.height >= 6 {
         let split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(2)])
@@ -17213,7 +17466,11 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             .block(
                 Block::default()
                     .title(if menu.all_commands {
-                        "↑/↓ choose · Enter run · Shift+Tab common"
+                        if menu.group.is_some() {
+                            "↑/↓ choose · Enter run · Left/Esc groups"
+                        } else {
+                            "↑/↓ choose · Enter group · Shift+Tab common"
+                        }
                     } else {
                         "↑/↓ choose · Enter run · Tab all"
                     })
@@ -17223,17 +17480,36 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         &mut ListState::default().with_selected(selected),
     );
     if let Some(description_area) = description_area {
-        let selected_command = commands.get(menu.selected.min(commands.len() - 1)).unwrap();
-        let detail = if let Some(reason) = s.command_disabled_reason(*selected_command) {
-            format!("{} · unavailable: {reason}", selected_command.description)
-        } else {
-            selected_command.description.to_owned()
+        let detail = match entries.get(menu.selected.min(entries.len() - 1)) {
+            Some(MenuEntry::Group(group)) => {
+                let (count, advanced) = menu_group_command_count(&s.menu_commands(), group);
+                format!("Browse {count} commands in {group}; {advanced} are advanced commands.")
+            }
+            Some(MenuEntry::Command(command)) => {
+                if let Some(reason) = s.command_disabled_reason(*command) {
+                    format!("{} · unavailable: {reason}", command.description)
+                } else {
+                    command.description.to_owned()
+                }
+            }
+            None => String::new(),
         };
         f.render_widget(
             Paragraph::new(detail).wrap(Wrap { trim: true }),
             description_area,
         );
     }
+}
+
+fn menu_group_command_count(commands: &[CommandSpec], group: &str) -> (usize, usize) {
+    let matching = commands
+        .iter()
+        .filter(|command| command.task_group == group)
+        .collect::<Vec<_>>();
+    (
+        matching.len(),
+        matching.iter().filter(|command| command.advanced).count(),
+    )
 }
 
 fn menu_command_row(state: &AppState, command: CommandSpec, width: usize) -> String {
@@ -21199,6 +21475,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                         top,
                         selected: 0,
                         all_commands: false,
+                        group: None,
                     });
                     let selected = s
                         .menu_commands()
@@ -21624,6 +21901,7 @@ mod tests {
             top,
             selected: 0,
             all_commands: false,
+            group: None,
         });
         let selected = state
             .menu_commands()
@@ -21634,6 +21912,7 @@ mod tests {
             top,
             selected,
             all_commands: false,
+            group: None,
         });
         handle(
             &mut state,
@@ -21662,6 +21941,7 @@ mod tests {
             top,
             selected: 0,
             all_commands: false,
+            group: None,
         });
         let selected = state
             .menu_commands()
@@ -21672,6 +21952,7 @@ mod tests {
             top,
             selected,
             all_commands: false,
+            group: None,
         });
         handle(
             &mut state,
@@ -21701,6 +21982,7 @@ mod tests {
             top,
             selected: 0,
             all_commands: false,
+            group: None,
         });
         let selected = state
             .menu_commands()
@@ -21711,6 +21993,7 @@ mod tests {
             top,
             selected,
             all_commands: false,
+            group: None,
         });
         handle(state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
         Ok(())
@@ -29114,6 +29397,7 @@ mod tests {
                 top,
                 selected: 0,
                 all_commands: false,
+                group: None,
             });
             let common = state.menu_commands();
             assert!(
@@ -29143,6 +29427,42 @@ mod tests {
                 expected,
                 "Tab must expose every registered {category} action"
             );
+            let groups = state.menu_visible_entries();
+            assert!(
+                groups
+                    .iter()
+                    .all(|entry| matches!(entry, MenuEntry::Group(_)))
+            );
+            let mut grouped_ids = groups
+                .iter()
+                .flat_map(|entry| {
+                    let MenuEntry::Group(group) = entry else {
+                        return Vec::new();
+                    };
+                    all_commands
+                        .iter()
+                        .filter(|command| command.task_group == *group)
+                        .map(|command| command.id)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let mut expected_ids = expected.clone();
+            grouped_ids.sort_unstable();
+            expected_ids.sort_unstable();
+            assert_eq!(grouped_ids, expected_ids, "{category} groups lost commands");
+            for command in &all_commands {
+                assert!(
+                    !command.task_group.is_empty(),
+                    "{} has no task group",
+                    command.id
+                );
+                assert_eq!(
+                    command.advanced,
+                    !MENU_COMMON_COMMANDS[top].contains(&command.id),
+                    "{} advanced classification disagrees with common menu metadata",
+                    command.id
+                );
+            }
 
             handle(
                 &mut state,
@@ -29163,6 +29483,7 @@ mod tests {
             top: 0,
             selected: 0,
             all_commands: true,
+            group: None,
         });
 
         for command in state.menu_commands() {
@@ -29182,6 +29503,57 @@ mod tests {
         let clipped = truncate_display_cells("e\u{301}😀Novel", 4);
         assert!(UnicodeWidthStr::width(clipped.as_str()) <= 4);
         assert!(!clipped.starts_with('\u{301}'));
+    }
+
+    #[test]
+    fn full_menu_browses_task_groups_and_returns_to_the_group_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.menu = Some(MenuState {
+            top: 6,
+            selected: 0,
+            all_commands: true,
+            group: None,
+        });
+
+        let all_commands = state.menu_commands();
+        let groups = state.menu_visible_entries();
+        assert!(
+            groups
+                .iter()
+                .all(|entry| matches!(entry, MenuEntry::Group(_)))
+        );
+        assert!(groups.len() < all_commands.len());
+        let history_group = groups
+            .iter()
+            .position(|entry| *entry == MenuEntry::Group("Backup & Recovery"))
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = history_group;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.menu.unwrap().group, Some("Backup & Recovery"));
+        let commands = state.menu_visible_entries();
+        assert!(
+            commands
+                .iter()
+                .all(|entry| matches!(entry, MenuEntry::Command(_)))
+        );
+        assert!(commands.iter().any(|entry| matches!(entry,
+            MenuEntry::Command(command) if command.id == "git.snapshot"
+        )));
+
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.menu.unwrap().group.is_none());
+        assert!(
+            state
+                .menu_visible_entries()
+                .iter()
+                .all(|entry| matches!(entry, MenuEntry::Group(_)))
+        );
     }
 
     #[test]
@@ -29247,6 +29619,7 @@ mod tests {
             top: 0,
             selected: 0,
             all_commands: false,
+            group: None,
         });
         state.command_bindings.push((
             KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT),
