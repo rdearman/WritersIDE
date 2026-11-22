@@ -14035,7 +14035,7 @@ impl AppState {
             }
             self.message = format!("Replaced {replacements} occurrence(s) in {changed} scene(s)");
         } else if cmd == "help" {
-            self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu; arrows navigate; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
+            self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu; arrows navigate; Enter opens; : commands; / searches; Ctrl-S saves; Esc leaves manuscript editing; q quits from navigation".into();
         } else {
             self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... | event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... | event-relationships EVENT-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-list | snippet-insert NAME [key=value...] | snippet-preview NAME [key=value...] | snippet-user-preview NAME [key=value...] | snippet-user-set NAME TEMPLATE | snippet-user-remove NAME | snippet-user-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | multi-replace START:END[,START:END...] TEXT | multi-replace-matches TEXT => REPLACEMENT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expansion-user-set ABBREVIATION => REPLACEMENT | text-expansion-user on|off|list | text-expansion-user-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | mark-set NAME | mark-list | mark-jump NAME | mark-clear NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
@@ -16270,7 +16270,7 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
     ];
     if state.workspace == Workspace::Editor {
         lines.push(
-            "Editing: / and ? are ordinary manuscript characters; Tab inserts indentation. Esc leaves for Outline"
+        "Editing: letters, /, ? and q are ordinary manuscript text; Tab inserts indentation. Esc leaves for Outline, where q quits"
                 .to_owned(),
         );
         lines.push(
@@ -21233,7 +21233,12 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         return Ok(false);
     }
-    if k.code == KeyCode::Char('q') && k.modifiers.is_empty() {
+    // `q` is a conventional quit key in navigation workspaces, but it is
+    // ordinary prose input while the manuscript editor owns keyboard focus.
+    // Authors can leave the editor with Esc before using the navigation quit
+    // key; dirty text remains buffered and receives the normal save/discard
+    // choices.
+    if k.code == KeyCode::Char('q') && k.modifiers.is_empty() && s.workspace != Workspace::Editor {
         if s.active_challenge.is_some() {
             s.mode = Some('c');
             s.prompt = "Save and quit (s) · Discard and quit (d) · Esc continues".into();
@@ -23493,6 +23498,7 @@ mod tests {
         state.prompt = "challenge-start 100 600 kamikaze".into();
         state.command().unwrap();
         let quit_id = state.active_challenge.as_ref().unwrap().id.clone();
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         let quit = handle(
             &mut state,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
@@ -23529,6 +23535,7 @@ mod tests {
         state.command().unwrap();
         state.editor[0] = "save this draft".into();
         let quit_id = state.active_challenge.as_ref().unwrap().id.clone();
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert!(
             !handle(
                 &mut state,
@@ -25309,6 +25316,39 @@ mod tests {
         .unwrap();
         assert_eq!(state.editor.join("\n"), "?");
         assert!(state.dirty);
+    }
+
+    #[test]
+    fn quit_letter_remains_manuscript_text_until_editor_focus_is_left() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 10).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+
+        assert!(
+            !handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+        assert_eq!(state.editor.join("\n"), "q");
+        assert!(state.dirty);
+        assert_eq!(state.mode, None);
+
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.workspace, Workspace::Outline);
+        assert!(
+            !handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+        assert_eq!(state.mode, Some('q'));
+        assert!(state.prompt.contains("Quit Without Saving"));
     }
 
     #[test]
@@ -29058,6 +29098,7 @@ mod tests {
         )
         .unwrap();
 
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert!(
             !handle(
                 &mut state,
@@ -29079,6 +29120,7 @@ mod tests {
         assert_eq!(state.mode, None);
         assert_eq!(state.editor.join("\n"), "My in-memory edit");
 
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert!(
             !handle(
                 &mut state,
@@ -29114,6 +29156,7 @@ mod tests {
         state.editor = vec!["Unsaved draft".into()];
         state.dirty = true;
 
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert!(
             !handle(
                 &mut state,
@@ -29162,6 +29205,7 @@ mod tests {
             .save_scene_text(scene, Some(&current_hash), "Newer disk copy")
             .unwrap();
 
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
@@ -29222,6 +29266,7 @@ mod tests {
             .save_scene_text(scene, Some(&disk_hash), "External on-disk version")
             .unwrap();
 
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
@@ -29436,6 +29481,7 @@ mod tests {
         assert_eq!(state.app.load_scene_text(scene).unwrap().0, "Disk version");
         assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
 
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         handle(
             &mut state,
