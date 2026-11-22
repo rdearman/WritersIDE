@@ -603,12 +603,21 @@ pub struct CompileArtifact {
     pub source_map: Vec<CompileSourceMapEntry>,
     /// Renderer inputs and diagnostics useful for inspecting print output.
     pub auxiliary_files: Vec<CompileAuxiliaryFile>,
+    /// Deterministic findings from generated renderers, separate from
+    /// source-level publication diagnostics.
+    pub diagnostics: Vec<CompileDiagnostic>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CompileAuxiliaryFile {
     pub name: String,
     pub bytes: Vec<u8>,
+}
+
+struct PdfRenderOutput {
+    bytes: Vec<u8>,
+    auxiliary_files: Vec<CompileAuxiliaryFile>,
+    diagnostics: Vec<CompileDiagnostic>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1034,6 +1043,10 @@ pub struct CompileDiagnostic {
     pub source_entity_id: Option<String>,
     #[serde(default)]
     pub source_range: Option<SourceRange>,
+    #[serde(default)]
+    pub generated_file: Option<String>,
+    #[serde(default)]
+    pub generated_line: Option<u32>,
 }
 
 fn first_placeholder_range(source: &str) -> Option<SourceRange> {
@@ -1059,6 +1072,8 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
             message: "project title is empty".into(),
             source_entity_id: None,
             source_range: None,
+            generated_file: None,
+            generated_line: None,
         });
     }
     if ir.units.is_empty() {
@@ -1068,6 +1083,8 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
             message: "manuscript contains no content units or scenes".into(),
             source_entity_id: None,
             source_range: None,
+            generated_file: None,
+            generated_line: None,
         });
     }
     for unit in &ir.units {
@@ -1082,6 +1099,8 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
                 message: format!("content unit '{}' has no prose", unit.title),
                 source_entity_id: Some(unit.id.clone()),
                 source_range: None,
+                generated_file: None,
+                generated_line: None,
             });
         }
         let placeholder_count = unit
@@ -1109,6 +1128,8 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
                     .iter()
                     .filter(|segment| segment.source_entity_id == unit.id)
                     .find_map(|segment| first_placeholder_range(&segment.document.source)),
+                generated_file: None,
+                generated_line: None,
             });
         }
     }
@@ -1242,6 +1263,7 @@ impl PandocRenderer {
         let (markdown, source_map) =
             ir.render_markdown_with_language_markup(format != CompileFormat::PlainText);
         let mut auxiliary_files = Vec::new();
+        let mut renderer_diagnostics = Vec::new();
         let bytes = if format == CompileFormat::PlainText {
             let language_metadata_present = ir.language_code.is_some()
                 || ir.units.iter().any(|unit| unit.language_code.is_some());
@@ -1254,9 +1276,10 @@ impl PandocRenderer {
         } else if format == CompileFormat::Markdown {
             markdown.into_bytes()
         } else if format == CompileFormat::Pdf {
-            let (bytes, files) = self.render_lualatex_pdf(ir, resource_root, design, metadata)?;
-            auxiliary_files = files;
-            bytes
+            let rendered = self.render_lualatex_pdf(ir, resource_root, design, metadata)?;
+            auxiliary_files = rendered.auxiliary_files;
+            renderer_diagnostics = rendered.diagnostics;
+            rendered.bytes
         } else {
             let temporary =
                 tempfile::tempdir().map_err(|e| format!("create renderer workspace: {e}"))?;
@@ -1376,6 +1399,7 @@ impl PandocRenderer {
             bytes,
             source_map,
             auxiliary_files,
+            diagnostics: renderer_diagnostics,
         })
     }
 
@@ -1385,7 +1409,7 @@ impl PandocRenderer {
         resource_root: Option<&Path>,
         design: &BookDesignProfile,
         metadata: &CompileMetadata,
-    ) -> Result<(Vec<u8>, Vec<CompileAuxiliaryFile>), String> {
+    ) -> Result<PdfRenderOutput, String> {
         let temporary =
             tempfile::tempdir().map_err(|error| format!("create PDF workspace: {error}"))?;
         let texmf_var = temporary.path().join("texmf-var");
@@ -1433,9 +1457,10 @@ impl PandocRenderer {
         if !pdf.starts_with(b"%PDF-") {
             return Err("LuaLaTeX output is not a PDF file".into());
         }
-        Ok((
-            pdf,
-            vec![
+        let diagnostics = parse_lualatex_log(&log);
+        Ok(PdfRenderOutput {
+            bytes: pdf,
+            auxiliary_files: vec![
                 CompileAuxiliaryFile {
                     name: "compiled.tex".into(),
                     bytes: tex.bytes,
@@ -1445,8 +1470,67 @@ impl PandocRenderer {
                     bytes: log,
                 },
             ],
-        ))
+            diagnostics,
+        })
     }
+}
+
+fn parse_lualatex_log(log: &[u8]) -> Vec<CompileDiagnostic> {
+    let log = String::from_utf8_lossy(log);
+    let mut findings = Vec::new();
+    for (index, line) in log.lines().enumerate() {
+        let normalized = line.trim();
+        let classified = if normalized.contains("Missing character:") {
+            Some((
+                "TEXGLYPH",
+                DiagnosticSeverity::Warning,
+                "LuaLaTeX reports a missing glyph",
+            ))
+        } else if normalized.contains("Overfull \\hbox") || normalized.contains("Overfull \\vbox") {
+            Some((
+                "TEXOVER",
+                DiagnosticSeverity::Warning,
+                "LuaLaTeX reports an overfull box",
+            ))
+        } else if normalized.contains("Underfull \\hbox") || normalized.contains("Underfull \\vbox")
+        {
+            Some((
+                "TEXUNDER",
+                DiagnosticSeverity::Information,
+                "LuaLaTeX reports an underfull box",
+            ))
+        } else if normalized.contains("Reference `") && normalized.contains("undefined") {
+            Some((
+                "TEXREF",
+                DiagnosticSeverity::Warning,
+                "LuaLaTeX reports an unresolved reference",
+            ))
+        } else if normalized.contains("not loadable")
+            || normalized.contains("fontspec error")
+            || normalized.starts_with("! LaTeX Error:")
+        {
+            Some((
+                "TEXERROR",
+                DiagnosticSeverity::Error,
+                "LuaLaTeX reports a font or document error",
+            ))
+        } else {
+            None
+        };
+        let Some((code, severity, description)) = classified else {
+            continue;
+        };
+        findings.push(CompileDiagnostic {
+            code: code.into(),
+            severity,
+            message: format!("{description}: {normalized}"),
+            source_entity_id: None,
+            source_range: None,
+            generated_file: Some("lualatex.log".into()),
+            generated_line: Some(index.saturating_add(1).min(u32::MAX as usize) as u32),
+        });
+    }
+    findings
 }
 
 fn strip_compile_language_markup(markdown: &str) -> String {
@@ -2225,6 +2309,30 @@ output = "exports/old.md"
         assert_eq!(&source[range.start..range.end], "[INSERT");
         assert!(source.is_char_boundary(range.start));
         assert!(source.is_char_boundary(range.end));
+    }
+
+    #[test]
+    fn lualatex_log_diagnostics_classify_layout_fonts_glyphs_and_references() {
+        let log = br#"
+Missing character: There is no Q (U+0051) in font Latin Modern Roman.
+Overfull \hbox (5.0pt too wide) in paragraph at lines 12--13
+Underfull \vbox (badness 10000) has occurred while \output is active
+LaTeX Warning: Reference `chapter:missing' on page 2 undefined on input line 44.
+! LaTeX Error: Font `Missing Font' not loadable.
+"#;
+        let findings = parse_lualatex_log(log);
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.code.as_str())
+                .collect::<Vec<_>>(),
+            ["TEXGLYPH", "TEXOVER", "TEXUNDER", "TEXREF", "TEXERROR"]
+        );
+        assert_eq!(findings[1].severity, DiagnosticSeverity::Warning);
+        assert_eq!(findings[2].severity, DiagnosticSeverity::Information);
+        assert_eq!(findings[4].severity, DiagnosticSeverity::Error);
+        assert_eq!(findings[3].generated_file.as_deref(), Some("lualatex.log"));
+        assert_eq!(findings[3].generated_line, Some(5));
     }
 
     #[test]

@@ -1624,14 +1624,15 @@ impl WriterApp {
             ),
             Err(error) => (false, Vec::new(), Some(error.to_string())),
         };
-        let diagnostics = self.compile_diagnostics().unwrap_or_default();
+        let mut diagnostics = self.compile_diagnostics().unwrap_or_default();
+        diagnostics.extend(artifact.diagnostics.iter().cloned());
         let warnings = diagnostics
             .iter()
             .filter(|item| item.severity != story_document::DiagnosticSeverity::Error)
             .map(|item| format!("{}: {}", item.code, item.message))
             .collect();
         let record = CompileRunRecord {
-            version: 4,
+            version: 5,
             configuration: "One-off Compile".into(),
             format: Some(artifact.format.extension().to_ascii_uppercase()),
             succeeded,
@@ -1950,7 +1951,7 @@ impl WriterApp {
             ),
         };
         let record = CompileRunRecord {
-            version: 4,
+            version: 5,
             configuration: name.to_owned(),
             format,
             succeeded,
@@ -2103,7 +2104,8 @@ impl WriterApp {
         }
         *self.compile_recovery_notice.borrow_mut() = None;
         publish_compile_file_set(&project_root, project.id, &publish_files)?;
-        let diagnostics = self.compile_diagnostics()?;
+        let mut diagnostics = self.compile_diagnostics()?;
+        diagnostics.extend(artifact.diagnostics.iter().cloned());
         let warnings = diagnostics
             .iter()
             .filter(|diagnostic| diagnostic.severity != story_document::DiagnosticSeverity::Error)
@@ -2153,7 +2155,7 @@ impl WriterApp {
                     .map_err(|error| {
                         AppError::Domain(format!("invalid Compile result file: {error}"))
                     })?;
-                if !matches!(record.version, 1..=4) {
+                if !matches!(record.version, 1..=5) {
                     return Err(AppError::Domain(format!(
                         "unsupported Compile result version {}",
                         record.version
@@ -5176,7 +5178,7 @@ unexpected_prose = "must not be silently discarded"
         assert!(app.list_compile_results().unwrap().iter().any(|record| {
             record.succeeded
                 && record.outputs.contains(&recipe.output)
-                && record.version == 4
+                && record.version == 5
                 && record.format.as_deref() == Some("MD")
                 && record.diagnostics.iter().any(|item| {
                     item.code == "PUB004"
@@ -5292,9 +5294,20 @@ unexpected_prose = "must not be silently discarded"
         app.save_scene_text(scene, Some(&source_hash), "Canonical source text.")
             .unwrap();
         let (source, expected_hash) = app.load_scene_text(scene).unwrap();
-        let artifact = app
+        let mut artifact = app
             .compile_artifact(story_document::CompileFormat::Markdown, false)
             .unwrap();
+        artifact
+            .diagnostics
+            .push(story_document::CompileDiagnostic {
+                code: "TESTGEN".into(),
+                severity: story_document::DiagnosticSeverity::Warning,
+                message: "Generated TeX diagnostic".into(),
+                source_entity_id: None,
+                source_range: None,
+                generated_file: Some("lualatex.log".into()),
+                generated_line: Some(2),
+            });
         let source_path = app
             .list_project_symbols()
             .unwrap()
@@ -5317,6 +5330,15 @@ unexpected_prose = "must not be silently discarded"
         let files = app
             .publish_compile_artifact(&output, &artifact, false)
             .unwrap();
+        assert!(app.list_compile_results().unwrap().iter().any(|record| {
+            record.succeeded
+                && record.version == 5
+                && record.diagnostics.iter().any(|diagnostic| {
+                    diagnostic.code == "TESTGEN"
+                        && diagnostic.generated_file.as_deref() == Some("lualatex.log")
+                        && diagnostic.generated_line == Some(2)
+                })
+        }));
         assert_eq!(files.len(), 2);
         let original = fs::read(&output).unwrap();
         assert!(

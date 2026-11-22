@@ -13060,7 +13060,7 @@ fn compile_results_reference_text(
         }
         for diagnostic in &record.diagnostics {
             lines.push(format!(
-                "   {}{:?} {}{}{}: {}",
+                "   {}{:?} {}{}{}{}: {}",
                 if record.stale { "STALE " } else { "" },
                 diagnostic.severity,
                 diagnostic.code,
@@ -13072,6 +13072,19 @@ fn compile_results_reference_text(
                 diagnostic
                     .source_range
                     .map(|range| format!(" · range {}..{}", range.start, range.end))
+                    .unwrap_or_default(),
+                diagnostic
+                    .generated_file
+                    .as_deref()
+                    .map(|file| {
+                        format!(
+                            " · generated {file}{}",
+                            diagnostic
+                                .generated_line
+                                .map(|line| format!(":{line}"))
+                                .unwrap_or_default()
+                        )
+                    })
                     .unwrap_or_default(),
                 diagnostic.message
             ));
