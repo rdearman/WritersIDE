@@ -385,6 +385,8 @@ struct SessionSnapshot {
     #[serde(default)]
     planning_board_id: Option<String>,
     #[serde(default)]
+    planning_board_view: Option<PlanningBoardView>,
+    #[serde(default)]
     collapsed_outline_nodes: Vec<String>,
     #[serde(default)]
     writing_stats_enabled: bool,
@@ -481,7 +483,7 @@ struct PlanningBoardDrag {
     y_bounds: [f64; 2],
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct PlanningBoardView {
     board_id: story_core::PlanningBoardId,
     x_bounds: [f64; 2],
@@ -4152,6 +4154,7 @@ impl AppState {
             vertical_split_ratio: self.vertical_split_ratio,
             assembly_draft: self.assembly_draft.map(|id| id.to_string()),
             planning_board_id: self.planning_board_id.map(|id| id.to_string()),
+            planning_board_view: self.planning_board_view.clone(),
             collapsed_outline_nodes: self
                 .collapsed_outline_nodes
                 .iter()
@@ -4356,6 +4359,24 @@ impl AppState {
                     None
                 }
             },
+            None => None,
+        };
+        self.planning_board_view = match snapshot.planning_board_view {
+            Some(view)
+                if self.planning_board_id == Some(view.board_id)
+                    && view.x_bounds[0].is_finite()
+                    && view.x_bounds[1].is_finite()
+                    && view.y_bounds[0].is_finite()
+                    && view.y_bounds[1].is_finite()
+                    && view.x_bounds[0] < view.x_bounds[1]
+                    && view.y_bounds[0] < view.y_bounds[1] =>
+            {
+                Some(view)
+            }
+            Some(_) => {
+                stale_reference = true;
+                None
+            }
             None => None,
         };
         let structural_nodes = self.app.list_structural_nodes()?;
@@ -13183,8 +13204,18 @@ fn run(
                 }
                 Event::Resize(_, _) => s.pause_challenge_inactivity(),
                 Event::Mouse(mouse) => {
+                    let save_view = matches!(
+                        mouse.kind,
+                        MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                            | MouseEventKind::ScrollLeft
+                            | MouseEventKind::ScrollRight
+                    );
                     if let Err(error) = handle_planning_board_mouse(s, mouse) {
                         s.message = error.to_string();
+                    }
+                    if save_view && let Err(error) = s.save_session() {
+                        s.message = format!("Planning board view could not be saved: {error}");
                     }
                 }
                 _ => {}
@@ -21724,6 +21755,28 @@ mod tests {
         let zoomed = state.planning_board_view.as_ref().unwrap();
         assert!(zoomed.x_bounds[1] - zoomed.x_bounds[0] < previous_width);
         assert!(zoomed.y_bounds[1] - zoomed.y_bounds[0] < previous_height);
+    }
+
+    #[test]
+    fn planning_board_viewport_is_restored_from_project_session() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let board = app.create_planning_board("Board").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::PlanningBoards;
+        state.planning_board_id = Some(board);
+        state.planning_board_view = Some(PlanningBoardView {
+            board_id: board,
+            x_bounds: [-8.0, 24.0],
+            y_bounds: [-3.0, 11.0],
+        });
+        state.save_session().unwrap();
+        state.planning_board_view = None;
+        state.restore_session().unwrap();
+        let restored = state.planning_board_view.unwrap();
+        assert_eq!(restored.board_id, board);
+        assert_eq!(restored.x_bounds, [-8.0, 24.0]);
+        assert_eq!(restored.y_bounds, [-3.0, 11.0]);
     }
 
     #[test]
