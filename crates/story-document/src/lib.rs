@@ -775,6 +775,9 @@ pub struct EditionRecipe {
     pub version: u16,
     pub name: String,
     pub format: CompileFormat,
+    /// Optional selected manuscript assembly; omitted means canonical order.
+    #[serde(default)]
+    pub assembly_id: Option<String>,
     /// Destination within the project; absolute paths and parent traversal are forbidden.
     pub output: String,
     #[serde(default)]
@@ -1459,6 +1462,7 @@ mod tests {
             version: 1,
             name: "Reader EPUB".into(),
             format: CompileFormat::Epub,
+            assembly_id: None,
             output: "exports/reader.epub".into(),
             design: BookDesign::Nonfiction,
             expand_transclusions: true,

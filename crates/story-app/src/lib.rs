@@ -181,13 +181,41 @@ fn reject_project_symlink_components(root: &Path, relative: &str) -> Result<()> 
     Ok(())
 }
 
-fn write_compile_source_map(
+fn reject_absolute_symlink_components(path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        return Err(AppError::Domain(
+            "Compile output path must be absolute".into(),
+        ));
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(AppError::Domain(format!(
+                    "Compile output path contains a symlink: {}",
+                    path.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Domain(format!(
+                    "inspect Compile output path {}: {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn compile_source_map_bytes(
     destination: &Path,
     format: story_document::CompileFormat,
     entries: &[story_document::CompileSourceMapEntry],
-) -> Result<()> {
-    let sidecar = PathBuf::from(format!("{}.source-map.json", destination.display()));
-    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+) -> Result<Vec<u8>> {
+    serde_json::to_vec_pretty(&serde_json::json!({
         "schema_version": 1,
         "output": destination.file_name().and_then(|name| name.to_str()).unwrap_or("compiled"),
         "output_format": format,
@@ -195,8 +223,88 @@ fn write_compile_source_map(
         "visual_layout_mapping": false,
         "entries": entries,
     }))
-    .map_err(|error| AppError::Domain(format!("serialize compile source map: {error}")))?;
-    write_project_file_atomically(&sidecar, &bytes)
+    .map_err(|error| AppError::Domain(format!("serialize compile source map: {error}")))
+}
+
+fn publish_compile_file_set(files: &[(PathBuf, Vec<u8>)]) -> Result<()> {
+    let mut prepared = Vec::new();
+    for (destination, bytes) in files {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| AppError::Domain("Compile output has no parent directory".into()))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            AppError::Domain(format!("create Compile output directory: {error}"))
+        })?;
+        let previous = match fs::symlink_metadata(destination) {
+            Ok(metadata) if metadata.is_file() => Some(fs::read(destination).map_err(|error| {
+                AppError::Domain(format!("read prior Compile output for rollback: {error}"))
+            })?),
+            Ok(_) => {
+                return Err(AppError::Domain(format!(
+                    "Compile output is not a regular file: {}",
+                    destination.display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => {
+                return Err(AppError::Domain(format!(
+                    "inspect prior Compile output: {error}"
+                )));
+            }
+        };
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|error| AppError::Domain(format!("stage Compile output: {error}")))?;
+        use std::io::Write;
+        temporary
+            .write_all(bytes)
+            .and_then(|()| temporary.as_file().sync_all())
+            .map_err(|error| AppError::Domain(format!("write staged Compile output: {error}")))?;
+        prepared.push((destination.clone(), previous, temporary));
+    }
+
+    let mut published: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    for (destination, previous, temporary) in prepared {
+        if let Err(error) = temporary.persist(&destination) {
+            let publish_error = error.error;
+            let mut rollback_errors = Vec::new();
+            for (path, previous) in published.iter().rev() {
+                let rollback = match previous {
+                    Some(bytes) => write_project_file_atomically(path, bytes),
+                    None => match fs::remove_file(path) {
+                        Ok(()) => Ok(()),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(error) => Err(AppError::Domain(format!(
+                            "remove partial Compile output {}: {error}",
+                            path.display()
+                        ))),
+                    },
+                };
+                if let Err(error) = rollback {
+                    rollback_errors.push(error.to_string());
+                }
+            }
+            let detail = if rollback_errors.is_empty() {
+                "previous output set restored".to_owned()
+            } else {
+                format!("rollback incomplete: {}", rollback_errors.join("; "))
+            };
+            return Err(AppError::Domain(format!(
+                "publish Compile output {} failed: {publish_error}; {detail}",
+                destination.display()
+            )));
+        }
+        published.push((destination, previous));
+    }
+    for (destination, _) in published {
+        if let Some(parent) = destination.parent() {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|error| {
+                    AppError::Domain(format!("sync Compile output directory: {error}"))
+                })?;
+        }
+    }
+    Ok(())
 }
 
 fn copy_scrivener_source_tree(source: &Path, destination: &Path) -> Result<()> {
@@ -1022,6 +1130,145 @@ impl WriterApp {
             .map_err(AppError::Domain)
     }
 
+    pub fn compile_artifact_for_assembly(
+        &self,
+        assembly: AssemblyId,
+        format: story_document::CompileFormat,
+        design: story_document::BookDesignProfile,
+    ) -> Result<story_document::CompileArtifact> {
+        let ir = self.compile_assembly_ir(assembly)?;
+        let renderer = story_document::PandocRenderer::default();
+        renderer
+            .render_with_profile(&ir, format, Some(self.store.project_root()), &design)
+            .map_err(AppError::Domain)
+    }
+
+    /// Publish a one-off Compile result without touching canonical project files.
+    /// Replacement is refused unless the caller makes it explicit.
+    pub fn publish_compile_artifact(
+        &self,
+        destination: impl AsRef<Path>,
+        artifact: &story_document::CompileArtifact,
+        overwrite: bool,
+    ) -> Result<Vec<PathBuf>> {
+        self.publish_compile_artifact_with_sidecars(destination, artifact, overwrite, &[])
+    }
+
+    /// Publish a Compile artifact and additional named sidecars as one staged
+    /// file set. Sidecar names are restricted to filenames beside the artifact.
+    pub fn publish_compile_artifact_with_sidecars(
+        &self,
+        destination: impl AsRef<Path>,
+        artifact: &story_document::CompileArtifact,
+        overwrite: bool,
+        sidecars: &[(String, Vec<u8>)],
+    ) -> Result<Vec<PathBuf>> {
+        let destination = destination.as_ref();
+        let destination = if destination.is_absolute() {
+            destination.to_path_buf()
+        } else {
+            self.store.project_root().join(destination)
+        };
+        reject_absolute_symlink_components(&destination)?;
+        let file_name = destination
+            .file_name()
+            .ok_or_else(|| AppError::Domain("Compile output path has no file name".into()))?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| AppError::Domain("Compile output path has no parent".into()))?;
+        fs::create_dir_all(parent).map_err(|error| {
+            AppError::Domain(format!("create Compile output directory: {error}"))
+        })?;
+        let parent = parent.canonicalize().map_err(|error| {
+            AppError::Domain(format!("resolve Compile output directory: {error}"))
+        })?;
+        let destination = parent.join(file_name);
+        if fs::symlink_metadata(&destination)
+            .is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            return Err(AppError::Domain(
+                "refusing to replace a symlink with Compile output".into(),
+            ));
+        }
+        let project_root = self
+            .store
+            .project_root()
+            .canonicalize()
+            .map_err(|error| AppError::Domain(format!("resolve project root: {error}")))?;
+        if destination.starts_with(&project_root) {
+            let relative = destination
+                .strip_prefix(&project_root)
+                .map_err(|error| AppError::Domain(error.to_string()))?;
+            if relative.starts_with("manuscript")
+                || relative.starts_with(".writers-ide")
+                || relative == Path::new("project.toml")
+                || relative == Path::new("story.db")
+            {
+                return Err(AppError::Domain(format!(
+                    "Compile output cannot replace project source or metadata: {}",
+                    destination.display()
+                )));
+            }
+        }
+        let mut files = vec![(destination.clone(), artifact.bytes.clone())];
+        let source_map = PathBuf::from(format!("{}.source-map.json", destination.display()));
+        let relative_label = destination
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let source_map_bytes = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": 1,
+            "output": relative_label,
+            "output_format": artifact.format,
+            "offset_space": "compile-ir-markdown-utf8",
+            "visual_layout_mapping": false,
+            "entries": artifact.source_map,
+        }))
+        .map_err(|error| AppError::Domain(format!("serialize Compile source map: {error}")))?;
+        files.push((source_map, source_map_bytes));
+        for auxiliary in &artifact.auxiliary_files {
+            let extension = Path::new(&auxiliary.name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("log");
+            files.push((
+                destination.with_extension(extension),
+                auxiliary.bytes.clone(),
+            ));
+        }
+        for (name, bytes) in sidecars {
+            let sidecar_name = Path::new(name);
+            if sidecar_name.components().count() != 1
+                || !matches!(
+                    sidecar_name.components().next(),
+                    Some(std::path::Component::Normal(_))
+                )
+            {
+                return Err(AppError::Domain(format!(
+                    "Compile sidecar must be a filename: {name}"
+                )));
+            }
+            files.push((parent.join(sidecar_name), bytes.clone()));
+        }
+        let mut unique = std::collections::BTreeSet::new();
+        for (path, _) in &files {
+            if !unique.insert(path.clone()) {
+                return Err(AppError::Domain(format!(
+                    "Compile output set contains a path collision: {}",
+                    path.display()
+                )));
+            }
+            if !overwrite && path.exists() {
+                return Err(AppError::Domain(format!(
+                    "Compile output already exists: {}; pass --overwrite after review",
+                    path.display()
+                )));
+            }
+        }
+        publish_compile_file_set(&files)?;
+        Ok(files.into_iter().map(|(path, _)| path).collect())
+    }
+
     fn compile_configurations_dir(&self) -> PathBuf {
         self.store
             .project_root()
@@ -1144,6 +1391,7 @@ impl WriterApp {
             version: 1,
             name: name.replace('-', " "),
             format,
+            assembly_id: None,
             output: format!("exports/compile/{name}/manuscript.{}", format.extension()),
             design,
             expand_transclusions: false,
@@ -1224,11 +1472,19 @@ impl WriterApp {
         let output = recipe.output.clone();
         let mut output_paths = vec![output.clone()];
         output_paths.push(format!("{output}.source-map.json"));
-        let artifact = self.compile_artifact_with_design(
-            recipe.format,
-            recipe.expand_transclusions,
-            recipe.design,
-        )?;
+        let artifact = if let Some(assembly) = recipe.assembly_id.as_deref() {
+            let assembly =
+                AssemblyId(uuid::Uuid::parse_str(assembly).map_err(|error| {
+                    AppError::Domain(format!("invalid assembly UUID: {error}"))
+                })?);
+            self.compile_artifact_for_assembly(assembly, recipe.format, recipe.design.profile())?
+        } else {
+            self.compile_artifact_with_design(
+                recipe.format,
+                recipe.expand_transclusions,
+                recipe.design,
+            )?
+        };
         for auxiliary in &artifact.auxiliary_files {
             let extension = Path::new(&auxiliary.name)
                 .extension()
@@ -1275,24 +1531,29 @@ impl WriterApp {
             }
         }
         let destination = self.store.project_root().join(&output);
-        write_project_file_atomically(&destination, &artifact.bytes)?;
-        write_compile_source_map(&destination, recipe.format, &artifact.source_map)?;
+        let mut generated = std::collections::BTreeMap::new();
+        generated.insert(output.clone(), artifact.bytes.clone());
+        generated.insert(
+            format!("{output}.source-map.json"),
+            compile_source_map_bytes(&destination, recipe.format, &artifact.source_map)?,
+        );
         for auxiliary in &artifact.auxiliary_files {
             let extension = Path::new(&auxiliary.name)
                 .extension()
                 .and_then(|value| value.to_str())
                 .unwrap_or("log");
-            write_project_file_atomically(
-                &destination.with_extension(extension),
-                &auxiliary.bytes,
-            )?;
+            let auxiliary_path = Path::new(&output)
+                .with_extension(extension)
+                .to_string_lossy()
+                .into_owned();
+            generated.insert(auxiliary_path, auxiliary.bytes.clone());
         }
         manifest.version = 1;
         let managed_files = output_paths
             .iter()
             .map(|path| {
-                let bytes = fs::read(self.store.project_root().join(path)).map_err(|error| {
-                    AppError::Domain(format!("read generated Compile artefact {path}: {error}"))
+                let bytes = generated.get(path).ok_or_else(|| {
+                    AppError::Domain(format!("Compile artifact set is missing {path}"))
                 })?;
                 Ok(ManagedCompileArtifact {
                     path: path.clone(),
@@ -1303,12 +1564,21 @@ impl WriterApp {
         manifest
             .configurations
             .insert(name.to_owned(), managed_files);
-        write_project_file_atomically(
-            &self.compile_manifest_path(),
-            &serde_json::to_vec_pretty(&manifest).map_err(|error| {
+        let mut complete_file_set = generated;
+        complete_file_set.insert(
+            ".writers-ide/compile-artifacts.json".into(),
+            serde_json::to_vec_pretty(&manifest).map_err(|error| {
                 AppError::Domain(format!("serialize compile manifest: {error}"))
             })?,
-        )?;
+        );
+        let publish_files = complete_file_set
+            .into_iter()
+            .map(|(relative, bytes)| {
+                reject_project_symlink_components(self.store.project_root(), &relative)?;
+                Ok((self.store.project_root().join(relative), bytes))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        publish_compile_file_set(&publish_files)?;
         let warnings = self
             .compile_diagnostics()?
             .into_iter()
@@ -3372,34 +3642,82 @@ impl WriterApp {
     ) -> Result<()> {
         Ok(self.store.set_assembly_item_included(item, included)?)
     }
-    pub fn compile_assembly_markdown(&self, assembly: AssemblyId) -> Result<String> {
-        let title = self
+    pub fn compile_assembly_ir(&self, assembly: AssemblyId) -> Result<story_document::CompileIr> {
+        let assembly_record = self
             .store
             .list_assemblies()?
             .into_iter()
             .find(|item| item.id == assembly)
-            .ok_or_else(|| StorageError::NotFound(assembly.to_string()))?
-            .title;
-        let mut ir = story_document::CompileIr::new(&title);
-        ir.language_code = Some(self.get_project()?.language_code);
+            .ok_or_else(|| StorageError::NotFound(assembly.to_string()))?;
+        let project = self.get_project()?;
+        let mut ir = story_document::CompileIr::new(&assembly_record.title);
+        ir.language_code = Some(project.language_code.clone());
+        let nodes = self
+            .store
+            .list_structural_nodes()?
+            .into_iter()
+            .map(|node| {
+                (
+                    node.id.to_string(),
+                    (
+                        node.parent_id.map(|id| id.to_string()),
+                        match node.kind.as_str() {
+                            "section" => story_document::StructuralKind::Section,
+                            "chapter" => story_document::StructuralKind::Chapter,
+                            _ => story_document::StructuralKind::Group,
+                        },
+                        node.title,
+                    ),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut inserted_groups = std::collections::BTreeSet::new();
+        fn add_ancestors(
+            ir: &mut story_document::CompileIr,
+            nodes: &std::collections::BTreeMap<
+                String,
+                (Option<String>, story_document::StructuralKind, String),
+            >,
+            inserted_groups: &mut std::collections::BTreeSet<String>,
+            parent: Option<String>,
+        ) -> Option<String> {
+            let mut path = Vec::new();
+            let mut cursor = parent;
+            while let Some(id) = cursor {
+                let node = nodes.get(&id)?;
+                path.push((id.clone(), node.0.clone(), node.1, node.2.clone()));
+                cursor = node.0.clone();
+            }
+            path.reverse();
+            for (id, parent_id, kind, title) in &path {
+                if inserted_groups.insert(id.clone()) {
+                    ir.push_group(story_document::CompileGroup {
+                        id: id.clone(),
+                        parent_id: parent_id.clone(),
+                        kind: *kind,
+                        title: title.clone(),
+                    });
+                }
+            }
+            path.last().map(|(id, _, _, _)| id.clone())
+        }
         for item in self.store.list_assembly_items(assembly)? {
             if !item.included {
                 continue;
             }
-            let (kind, title, language_code, source_id, text) = if let Some(scene) = item.scene_id {
+            let (kind, title, language_code, source_id, text, group_parent) = if let Some(scene) =
+                item.scene_id
+            {
                 let row = self.store.get_scene(scene)?;
                 let (text, _) = self.store.load_text(scene)?;
-                let language_code = Some(
-                    row.scene
-                        .effective_language_code(&self.get_project()?)
-                        .to_owned(),
-                );
+                let language_code = Some(row.scene.effective_language_code(&project).to_owned());
                 (
                     story_document::ContentUnitKind::Scene,
                     row.scene.title,
                     language_code,
                     scene.to_string(),
                     text,
+                    row.chapter_id.map(|id| id.to_string()),
                 )
             } else if let Some(content) = item.content_unit_id {
                 let row = self.store.get_content_unit(content)?;
@@ -3410,17 +3728,24 @@ impl WriterApp {
                     ContentUnitKind::ChapterBody => story_document::ContentUnitKind::ChapterBody,
                     ContentUnitKind::BackMatter => story_document::ContentUnitKind::BackMatter,
                 };
-                let language_code =
-                    Some(row.effective_language_code(&self.get_project()?).to_owned());
-                (kind, row.title, language_code, content.to_string(), text)
+                let language_code = Some(row.effective_language_code(&project).to_owned());
+                (
+                    kind,
+                    row.title,
+                    language_code,
+                    content.to_string(),
+                    text,
+                    row.parent_id.map(|id| id.to_string()),
+                )
             } else {
                 return Err(AppError::Domain(
                     "assembly item has no source entity".into(),
                 ));
             };
+            let group_parent = add_ancestors(&mut ir, &nodes, &mut inserted_groups, group_parent);
             ir.push(story_document::CompileUnit {
                 id: item.id.to_string(),
-                parent_id: None,
+                parent_id: group_parent,
                 kind,
                 title,
                 language_code,
@@ -3432,6 +3757,12 @@ impl WriterApp {
                 "assembly produced invalid Compile IR".into(),
             ));
         }
+        Ok(ir)
+    }
+
+    pub fn compile_assembly_markdown(&self, assembly: AssemblyId) -> Result<String> {
+        let ir = self.compile_assembly_ir(assembly)?;
+        let title = ir.title.clone();
         let language = ir.language_code.clone();
         let (content, _) = ir.render_markdown();
         if let Some(language) = language {
@@ -4246,6 +4577,7 @@ unexpected_prose = "must not be silently discarded"
             version: 1,
             name: "Plain Manuscript".into(),
             format: story_document::CompileFormat::Markdown,
+            assembly_id: None,
             output: "exports/compile/plain/manuscript.md".into(),
             design: story_document::BookDesign::Manuscript,
             expand_transclusions: false,
@@ -4314,6 +4646,7 @@ unexpected_prose = "must not be silently discarded"
             version: 1,
             name: "Unsafe".into(),
             format: story_document::CompileFormat::Markdown,
+            assembly_id: None,
             output: "exports/compile/unsafe/../../manuscript/scene.md".into(),
             design: story_document::BookDesign::default(),
             expand_transclusions: false,
@@ -4354,6 +4687,114 @@ unexpected_prose = "must not be silently discarded"
             assert!(app.compile_configuration("unsafe", false).is_err());
             assert!(fs::read_dir(&outside).unwrap().next().is_none());
         }
+    }
+
+    #[test]
+    fn one_off_compile_publication_protects_sources_and_requires_explicit_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, source_hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&source_hash), "Canonical source text.")
+            .unwrap();
+        let (source, expected_hash) = app.load_scene_text(scene).unwrap();
+        let artifact = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        let source_path = app
+            .list_project_symbols()
+            .unwrap()
+            .into_iter()
+            .find(|symbol| symbol.entity_id == scene.to_string())
+            .unwrap()
+            .source_path
+            .unwrap();
+        let canonical = project.join(source_path);
+        assert!(
+            app.publish_compile_artifact(&canonical, &artifact, true)
+                .is_err()
+        );
+        assert_eq!(
+            app.load_scene_text(scene).unwrap(),
+            (source.clone(), expected_hash.clone())
+        );
+
+        let output = project.join("exports/one-off.md");
+        let files = app
+            .publish_compile_artifact(&output, &artifact, false)
+            .unwrap();
+        assert_eq!(files.len(), 2);
+        let original = fs::read(&output).unwrap();
+        assert!(
+            app.publish_compile_artifact(&output, &artifact, false)
+                .is_err()
+        );
+        assert_eq!(fs::read(&output).unwrap(), original);
+        assert!(
+            app.publish_compile_artifact(&output, &artifact, true)
+                .is_ok()
+        );
+        assert_eq!(app.load_scene_text(scene).unwrap(), (source, expected_hash));
+
+        let edition_output = project.join("exports/edition.md");
+        let sidecar_name = "edition.md.spellcheck.json".to_owned();
+        let sidecar_bytes = br#"[{"scene":"reviewed"}]"#.to_vec();
+        let published = app
+            .publish_compile_artifact_with_sidecars(
+                &edition_output,
+                &artifact,
+                false,
+                &[(sidecar_name.clone(), sidecar_bytes.clone())],
+            )
+            .unwrap();
+        assert_eq!(published.len(), 3);
+        let sidecar = project.join("exports").join(&sidecar_name);
+        assert_eq!(fs::read(&sidecar).unwrap(), sidecar_bytes);
+        assert!(
+            app.publish_compile_artifact_with_sidecars(
+                &edition_output,
+                &artifact,
+                false,
+                &[(sidecar_name, b"replacement".to_vec())],
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&sidecar).unwrap(), br#"[{"scene":"reviewed"}]"#);
+        assert!(
+            app.publish_compile_artifact_with_sidecars(
+                project.join("exports/unsafe.md"),
+                &artifact,
+                false,
+                &[("../outside.json".into(), b"escape".to_vec())],
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_off_compile_publication_rejects_symlinked_output_directories() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let artifact = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::remove_dir(project.join("exports")).unwrap();
+        symlink(&outside, project.join("exports")).unwrap();
+        assert!(
+            app.publish_compile_artifact(project.join("exports/escaped.md"), &artifact, false)
+                .is_err()
+        );
+        assert!(fs::read_dir(outside).unwrap().next().is_none());
+        assert!(app.load_scene_text(scene).unwrap().0.is_empty());
     }
 
     #[test]
@@ -5002,6 +5443,19 @@ unexpected_prose = "must not be silently discarded"
         let second_item = app.add_assembly_scene(assembly, second, 2).unwrap();
         app.move_assembly_item(assembly, second_item, 1).unwrap();
         app.set_assembly_item_included(first_item, false).unwrap();
+        let ir = app.compile_assembly_ir(assembly).unwrap();
+        let chapter_id = chapter.to_string();
+        assert_eq!(ir.groups.len(), 1);
+        assert_eq!(ir.groups[0].id, chapter_id);
+        assert!(ir.units.iter().any(|unit| {
+            unit.id == second_item.to_string()
+                && unit.parent_id.as_deref() == Some(chapter_id.as_str())
+        }));
+        assert!(!ir.units.iter().any(|unit| {
+            unit.segments
+                .iter()
+                .any(|segment| segment.document.source.contains("First canonical prose."))
+        }));
         let compiled = app.compile_assembly_markdown(assembly).unwrap();
         assert!(compiled.contains("Audio Edition"));
         assert!(compiled.contains("For the readers."));
@@ -5019,5 +5473,25 @@ unexpected_prose = "must not be silently discarded"
                 .collect::<Vec<_>>(),
             [first, second]
         );
+
+        let recipe = story_document::EditionRecipe {
+            version: 1,
+            name: "Audio Edition".into(),
+            format: story_document::CompileFormat::Markdown,
+            assembly_id: Some(assembly.to_string()),
+            output: "exports/compile/audio/manuscript.md".into(),
+            design: story_document::BookDesign::Manuscript,
+            expand_transclusions: false,
+            spellcheck: false,
+            language: None,
+            dictionary: None,
+        };
+        app.create_compile_configuration("audio", &recipe).unwrap();
+        app.compile_configuration("audio", false).unwrap();
+        let artifact =
+            fs::read_to_string(dir.path().join("Novel/exports/compile/audio/manuscript.md"))
+                .unwrap();
+        assert!(artifact.contains("Second canonical prose."));
+        assert!(!artifact.contains("First canonical prose."));
     }
 }

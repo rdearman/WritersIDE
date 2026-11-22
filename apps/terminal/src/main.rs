@@ -7658,7 +7658,7 @@ impl AppState {
             }
         } else if let Some(arguments) = cmd.strip_prefix("compile-format ") {
             let mut parts = arguments.split_whitespace();
-            let format_name = parts.next().ok_or("usage: compile-format <text|markdown|latex|html|epub|docx|pdf|odt|rtf|azw3|mobi> [output-path] [--expand-transclusions]")?;
+            let format_name = parts.next().ok_or("usage: compile-format <text|markdown|latex|html|epub|docx|pdf|odt|rtf|azw3|mobi> [output-path] [--overwrite] [--expand-transclusions]")?;
             let format = story_document::CompileFormat::parse(format_name)
                 .ok_or("format must be text, markdown, latex, html, epub, docx, pdf, odt, rtf, azw3, or mobi")?;
             let rest = parts.collect::<Vec<_>>();
@@ -7699,28 +7699,19 @@ impl AppState {
                         .join("exports")
                         .join(format!("compiled.{}", format.extension()))
                 });
-            atomic_export(&destination, &artifact.bytes)?;
-            for auxiliary in &artifact.auxiliary_files {
-                let extension = Path::new(&auxiliary.name)
-                    .extension()
-                    .and_then(|value| value.to_str())
-                    .unwrap_or("log");
-                atomic_export(&destination.with_extension(extension), &auxiliary.bytes)?;
-            }
-            let sidecar =
-                Path::new(&format!("{}.source-map.json", destination.display())).to_path_buf();
-            let source_map = serde_json::json!({
-                "schema_version": 1,
-                "output_format": format,
-                "offset_space": "compile-ir-markdown-utf8",
-                "visual_layout_mapping": false,
-                "entries": artifact.source_map,
-            });
-            atomic_export(&sidecar, &serde_json::to_vec_pretty(&source_map)?)?;
+            let destination = if destination.is_absolute() {
+                destination
+            } else {
+                std::env::current_dir()?.join(destination)
+            };
+            let overwrite = rest.contains(&"--overwrite");
+            let output_files =
+                self.app
+                    .publish_compile_artifact(&destination, &artifact, overwrite)?;
             self.message = format!(
-                "Compiled to {} · source map {}",
+                "Compiled to {} · {} artefact(s)",
                 destination.display(),
-                sidecar.display()
+                output_files.len()
             );
         } else if let Some(arguments) = cmd.strip_prefix("review-merge ") {
             let mut parts = arguments.split_whitespace();
@@ -13155,20 +13146,6 @@ fn visible_reference_indices(count: usize, active: usize, available_height: u16)
 
 fn default_split_ratio() -> u16 {
     40
-}
-
-fn atomic_export(path: &Path, bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    fs::create_dir_all(parent)?;
-    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    io::Write::write_all(&mut temporary, bytes)?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path)?;
-    fs::File::open(parent)?.sync_all()?;
-    Ok(())
 }
 
 #[cfg(test)]

@@ -1684,24 +1684,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     .join("exports")
                     .join(format!("compiled.{}", format.extension()))
             });
-            atomic_write(&destination, &artifact.bytes)?;
-            write_compile_auxiliary(&destination, &artifact.auxiliary_files)?;
-            let sidecar = PathBuf::from(format!("{}.source-map.json", destination.display()));
-            let source_map = serde_json::json!({
-                "schema_version": 1,
-                "output": destination.file_name().and_then(|name| name.to_str()).unwrap_or("compiled"),
-                "output_format": format,
-                "offset_space": "compile-ir-markdown-utf8",
-                "visual_layout_mapping": false,
-                "entries": artifact.source_map,
-            });
-            atomic_write(&sidecar, &serde_json::to_vec_pretty(&source_map)?)?;
+            let destination = if destination.is_absolute() {
+                destination
+            } else {
+                env::current_dir()?.join(destination)
+            };
+            let overwrite = remaining.iter().any(|argument| argument == "--overwrite");
+            let output_files = app.publish_compile_artifact(&destination, &artifact, overwrite)?;
             println!(
                 "Compiled {} bytes to {}",
                 artifact.bytes.len(),
                 destination.display()
             );
-            println!("Source map: {}", sidecar.display());
+            for path in output_files.iter().skip(1) {
+                println!("Generated: {}", path.display());
+            }
         }
         "compile-config" => {
             let project = args.next().ok_or("missing project path")?;
@@ -2014,7 +2011,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         "compile-edition" => {
             let project = PathBuf::from(args.next().ok_or("missing project path")?);
             let recipe = PathBuf::from(args.next().ok_or("missing edition recipe TOML")?);
-            compile_edition(&project, &recipe)?;
+            let overwrite = match args.next().as_deref() {
+                None => false,
+                Some("--overwrite") => true,
+                Some(_) => return Err("expected optional --overwrite".into()),
+            };
+            compile_edition_with_overwrite(&project, &recipe, overwrite)?;
         }
         "spellcheck" => {
             let project = PathBuf::from(args.next().ok_or("missing project path")?);
@@ -2043,7 +2045,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 let current = edition_watch_fingerprint(&project, &recipe)?;
                 if successful.needs_run(&current) {
-                    match compile_edition(&project, &recipe) {
+                    match compile_edition_with_overwrite(&project, &recipe, true) {
                         Ok(()) => successful.mark_successful(current),
                         Err(error) => {
                             eprintln!(
@@ -3069,7 +3071,7 @@ fn parse_merge_choices(
 fn usage() {
     eprintln!("writers-ide writing-language-default [BCP-47-TAG]");
     eprintln!(
-        "writers-ide compile <project> <text|markdown|latex|html|epub|docx|pdf|odt|rtf|azw3|mobi (legacy)> [output] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"
+        "writers-ide compile <project> <text|markdown|latex|html|epub|docx|pdf|odt|rtf|azw3|mobi (legacy)> [output] [--overwrite] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"
     );
     eprintln!("writers-ide compile-check <project>");
     eprintln!(
@@ -3117,7 +3119,7 @@ fn usage() {
     eprintln!("writers-ide import-manuscript <source-file> <new-project-directory> [title]");
     eprintln!("writers-ide browse <project> [loopback-port]");
     eprintln!(
-        "writers-ide compile-edition <project> <recipe.toml>\nwriters-ide watch-edition <project> <recipe.toml> [poll-ms]\nwriters-ide spellcheck <project> <language-tag> [project-relative-wordlist]"
+        "writers-ide compile-edition <project> <recipe.toml> [--overwrite]\nwriters-ide watch-edition <project> <recipe.toml> [poll-ms]\nwriters-ide spellcheck <project> <language-tag> [project-relative-wordlist]"
     );
     eprintln!(
         "writers-ide query-assert-save <project> <query-uuid> <non-empty|empty|at-least:N|at-most:N|exactly:N>...\nwriters-ide query-assert-check <project> <query-uuid>"
@@ -3287,14 +3289,33 @@ impl WatchSuccess {
     }
 }
 
+#[cfg(test)]
 fn compile_edition(project: &Path, recipe_path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    compile_edition_with_aspell(project, recipe_path, "aspell")
+    compile_edition_with_overwrite(project, recipe_path, false)
 }
 
+fn compile_edition_with_overwrite(
+    project: &Path,
+    recipe_path: &Path,
+    overwrite: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    compile_edition_with_aspell_and_overwrite(project, recipe_path, "aspell", overwrite)
+}
+
+#[cfg(test)]
 fn compile_edition_with_aspell(
     project: &Path,
     recipe_path: &Path,
     aspell: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    compile_edition_with_aspell_and_overwrite(project, recipe_path, aspell, false)
+}
+
+fn compile_edition_with_aspell_and_overwrite(
+    project: &Path,
+    recipe_path: &Path,
+    aspell: &str,
+    overwrite: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source = fs::read_to_string(recipe_path)?;
     let recipe = story_document::EditionRecipe::from_toml(&source)?;
@@ -3314,27 +3335,21 @@ fn compile_edition_with_aspell(
         None
     };
     let app = WriterApp::open_project(project)?;
-    let artifact = app.compile_artifact_with_design(
-        recipe.format,
-        recipe.expand_transclusions,
-        recipe.design,
-    )?;
+    let artifact = if let Some(assembly_id) = recipe.assembly_id.as_deref() {
+        let assembly = story_core::AssemblyId(uuid::Uuid::parse_str(assembly_id)?);
+        app.compile_artifact_for_assembly(assembly, recipe.format, recipe.design.profile())?
+    } else {
+        app.compile_artifact_with_design(recipe.format, recipe.expand_transclusions, recipe.design)?
+    };
     let output = project.join(output_relative);
-    atomic_write(&output, &artifact.bytes)?;
-    write_compile_auxiliary(&output, &artifact.auxiliary_files)?;
-    let sidecar = PathBuf::from(format!("{}.source-map.json", output.display()));
-    let map = serde_json::to_vec_pretty(&serde_json::json!({
-        "schema_version": 1,
-        "edition": recipe.name,
-        "output_format": recipe.format,
-        "offset_space": "compile-ir-markdown-utf8",
-        "visual_layout_mapping": false,
-        "entries": artifact.source_map,
-    }))?;
-    atomic_write(&sidecar, &map)?;
+    let mut sidecars = Vec::new();
     if let Some(findings) = spelling {
-        let report = PathBuf::from(format!("{}.spellcheck.json", output.display()));
-        atomic_write(&report, &serde_json::to_vec_pretty(&findings)?)?;
+        let report_name = format!(
+            "{}.spellcheck.json",
+            output.file_name().unwrap().to_string_lossy()
+        );
+        let report = output.with_file_name(&report_name);
+        sidecars.push((report_name, serde_json::to_vec_pretty(&findings)?));
         if !findings.is_empty() {
             eprintln!(
                 "Edition spelling check found candidate words in {} scene(s): {}",
@@ -3343,6 +3358,7 @@ fn compile_edition_with_aspell(
             );
         }
     }
+    app.publish_compile_artifact_with_sidecars(&output, &artifact, overwrite, &sidecars)?;
     println!(
         "Compiled edition {} · {} bytes · {}",
         recipe.name,
@@ -3691,6 +3707,7 @@ mod watch_tests {
     use super::{
         CliReplaceGroup, CliReplaceGroupEntry, CliReplaceTarget, WatchSuccess,
         apply_replace_preview, compile_edition, compile_edition_with_aspell,
+        compile_edition_with_aspell_and_overwrite, compile_edition_with_overwrite,
         edition_watch_fingerprint, parse_scene_query_filter, recover_cli_replace_groups,
         run_auto_snapshot_check, run_processing_recipe, scenes_for_scope, spellcheck_project,
         undo_cli_replace, watch_fingerprint,
@@ -3843,6 +3860,13 @@ mod watch_tests {
                 .join("exports/reader.md.source-map.json")
                 .exists()
         );
+        let initial_output = fs::read(project_path.join("exports/reader.md")).unwrap();
+        assert!(compile_edition(&project_path, &recipe_path).is_err());
+        assert_eq!(
+            fs::read(project_path.join("exports/reader.md")).unwrap(),
+            initial_output
+        );
+        compile_edition_with_overwrite(&project_path, &recipe_path, true).unwrap();
         use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(project_path.join("dictionaries")).unwrap();
         fs::write(project_path.join("dictionaries/en.txt"), "known\n").unwrap();
@@ -3859,6 +3883,17 @@ mod watch_tests {
             edition_watch_fingerprint(&project_path, &checked_recipe).unwrap();
         compile_edition_with_aspell(&project_path, &checked_recipe, mock.to_str().unwrap())
             .unwrap();
+        assert!(
+            compile_edition_with_aspell(&project_path, &checked_recipe, mock.to_str().unwrap())
+                .is_err()
+        );
+        compile_edition_with_aspell_and_overwrite(
+            &project_path,
+            &checked_recipe,
+            mock.to_str().unwrap(),
+            true,
+        )
+        .unwrap();
         let report: serde_json::Value = serde_json::from_slice(
             &fs::read(project_path.join("exports/checked.md.spellcheck.json")).unwrap(),
         )
