@@ -1600,6 +1600,58 @@ impl WriterApp {
         overwrite: bool,
         sidecars: &[(String, Vec<u8>)],
     ) -> Result<Vec<PathBuf>> {
+        use std::time::Instant;
+        let timer = Instant::now();
+        let result = self.publish_compile_artifact_with_sidecars_inner(
+            destination,
+            artifact,
+            overwrite,
+            sidecars,
+        );
+        let elapsed_millis = timer.elapsed().as_millis();
+        let (succeeded, outputs, error) = match &result {
+            Ok(paths) => (
+                true,
+                paths
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect(),
+                None,
+            ),
+            Err(error) => (false, Vec::new(), Some(error.to_string())),
+        };
+        let diagnostics = self.compile_diagnostics().unwrap_or_default();
+        let warnings = diagnostics
+            .iter()
+            .filter(|item| item.severity != story_document::DiagnosticSeverity::Error)
+            .map(|item| format!("{}: {}", item.code, item.message))
+            .collect();
+        let record = CompileRunRecord {
+            version: 2,
+            configuration: "One-off Compile".into(),
+            format: Some(artifact.format.extension().to_ascii_uppercase()),
+            succeeded,
+            created_unix_millis: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            elapsed_millis,
+            outputs,
+            warnings,
+            diagnostics,
+            error,
+        };
+        self.persist_compile_run_record(&record)?;
+        result
+    }
+
+    fn publish_compile_artifact_with_sidecars_inner(
+        &self,
+        destination: impl AsRef<Path>,
+        artifact: &story_document::CompileArtifact,
+        overwrite: bool,
+        sidecars: &[(String, Vec<u8>)],
+    ) -> Result<Vec<PathBuf>> {
         let project = self.get_project()?;
         let project_root = self
             .store
@@ -1903,16 +1955,7 @@ impl WriterApp {
             diagnostics,
             error: error.clone(),
         };
-        let log_relative = format!(
-            ".writers-ide/compile-results/{}-{}.json",
-            created_unix_millis,
-            uuid::Uuid::new_v4()
-        );
-        reject_project_symlink_components(self.store.project_root(), &log_relative)?;
-        let log_path = self.store.project_root().join(&log_relative);
-        let log_bytes = serde_json::to_vec_pretty(&record)
-            .map_err(|error| AppError::Domain(format!("serialize Compile result: {error}")))?;
-        create_project_file_new(&log_path, &log_bytes)?;
+        let log_relative = self.persist_compile_run_record(&record)?;
         match result {
             Ok(mut build) => {
                 build.status = "success".into();
@@ -2113,6 +2156,20 @@ impl WriterApp {
         records.sort_by_key(|record| record.created_unix_millis);
         records.reverse();
         Ok(records)
+    }
+
+    fn persist_compile_run_record(&self, record: &CompileRunRecord) -> Result<String> {
+        let log_relative = format!(
+            ".writers-ide/compile-results/{}-{}.json",
+            record.created_unix_millis,
+            uuid::Uuid::new_v4()
+        );
+        reject_project_symlink_components(self.store.project_root(), &log_relative)?;
+        let log_path = self.store.project_root().join(&log_relative);
+        let log_bytes = serde_json::to_vec_pretty(record)
+            .map_err(|error| AppError::Domain(format!("serialize Compile result: {error}")))?;
+        create_project_file_new(&log_path, &log_bytes)?;
+        Ok(log_relative)
     }
 
     pub fn clean_compile_configuration(&self, name: &str) -> Result<Vec<String>> {
@@ -5263,6 +5320,25 @@ unexpected_prose = "must not be silently discarded"
             )
             .is_err()
         );
+        let results = app.list_compile_results().unwrap();
+        assert!(results.iter().any(|record| {
+            record.configuration == "One-off Compile"
+                && record.format.as_deref() == Some("MD")
+                && record.succeeded
+                && record
+                    .outputs
+                    .iter()
+                    .any(|path| path.ends_with("one-off.md"))
+        }));
+        assert!(results.iter().any(|record| {
+            record.configuration == "One-off Compile"
+                && record.format.as_deref() == Some("MD")
+                && !record.succeeded
+                && record
+                    .error
+                    .as_deref()
+                    .is_some_and(|message| message.contains("already exists"))
+        }));
     }
 
     #[test]

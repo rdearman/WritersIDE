@@ -7807,14 +7807,30 @@ impl AppState {
                 std::env::current_dir()?.join(destination)
             };
             let overwrite = rest.contains(&"--overwrite");
-            let output_files =
-                self.app
-                    .publish_compile_artifact(&destination, &artifact, overwrite)?;
-            self.message = format!(
-                "Compiled to {} · {} artefact(s)",
-                destination.display(),
-                output_files.len()
-            );
+            match self
+                .app
+                .publish_compile_artifact(&destination, &artifact, overwrite)
+            {
+                Ok(output_files) => {
+                    self.message = format!(
+                        "Compiled to {} · {} artefact(s)",
+                        destination.display(),
+                        output_files.len()
+                    );
+                    if self
+                        .app
+                        .list_compile_results()?
+                        .first()
+                        .is_some_and(|record| !record.diagnostics.is_empty())
+                    {
+                        self.open_compile_results_reference()?;
+                    }
+                }
+                Err(error) => {
+                    self.message = format!("Compile failed: {error}");
+                    self.open_compile_results_reference()?;
+                }
+            }
         } else if let Some(arguments) = cmd.strip_prefix("review-merge ") {
             let mut parts = arguments.split_whitespace();
             let scene = SceneId(parts.next().ok_or("missing scene UUID")?.parse()?);
