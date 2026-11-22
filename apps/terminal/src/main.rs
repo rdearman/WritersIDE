@@ -7378,6 +7378,54 @@ impl AppState {
         self.redo_stack.clear();
         Ok(recovery)
     }
+    fn save_conflict_context(&self) -> String {
+        let project = self
+            .app
+            .project_root()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("current project");
+        let (document, path) = if let Some(scene) = self.editing_scene {
+            (
+                self.app
+                    .get_scene(scene)
+                    .map(|record| record.scene.title)
+                    .unwrap_or_else(|_| scene.to_string()),
+                Some(
+                    self.app
+                        .project_root()
+                        .join("manuscript")
+                        .join(format!("{scene}.md")),
+                ),
+            )
+        } else if let Some(unit) = self.editing_content_unit {
+            (
+                self.app
+                    .get_content_unit(unit)
+                    .map(|record| record.title)
+                    .unwrap_or_else(|_| unit.to_string()),
+                Some(
+                    self.app
+                        .project_root()
+                        .join("manuscript")
+                        .join(format!("{unit}.md")),
+                ),
+            )
+        } else {
+            ("No document selected".to_owned(), None)
+        };
+        let modified = path
+            .as_ref()
+            .and_then(|path| fs::metadata(path).ok())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|time| format!("{} (Unix seconds)", time.as_secs()))
+            .unwrap_or_else(|| "unavailable".to_owned());
+        format!(
+            "Project: {project} · Document: {document} · On-disk modified: {modified} · In-memory edits: {}",
+            if self.dirty { "unsaved" } else { "saved" }
+        )
+    }
     fn open_menu_category(&mut self, index: usize) {
         self.pending_command_sequence = None;
         let top = index.min(MENU_CATEGORIES.len().saturating_sub(1));
@@ -7975,7 +8023,10 @@ impl AppState {
             CommandAction::ResolveSaveConflict => {
                 self.mode = Some('R');
                 self.prompt = "Review Versions (v) · Save Recovery Copy (r) · Use Saved Version (u) · Keep My Changes (k) · Cancel (Esc)".into();
-                self.message = "Your manuscript remains open and unsaved. Each choice preserves the on-disk copy unless you explicitly confirm Keep My Changes.".into();
+                self.message = format!(
+                    "Your manuscript remains open and unsaved. Each choice preserves the on-disk copy unless you explicitly confirm Keep My Changes. {}",
+                    self.save_conflict_context()
+                );
             }
             CommandAction::RestoreRevisionHunk => self.restore_selected_revision_hunk()?,
             CommandAction::Process {
@@ -19770,7 +19821,8 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                         s.prompt =
                             "Save and Quit (s) · Quit Without Saving (d) · Cancel (Esc)".into();
                         s.message = format!(
-                            "Save failed. Your in-memory text is still open and unsaved: {error}. Press s to retry, d to quit without saving, or Esc to continue editing."
+                            "Save failed. Your in-memory text is still open and unsaved: {error}. Press s to retry, d to quit without saving, or Esc to continue editing. {}",
+                            s.save_conflict_context()
                         );
                         return Ok(false);
                     }
@@ -19779,7 +19831,8 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                         s.prompt =
                             "Save and Quit (s) · Quit Without Saving (d) · Cancel (Esc)".into();
                         s.message = format!(
-                            "The manuscript was not saved, so you are still in the quit choices. Your in-memory text remains open and unsaved. {reason}"
+                            "The manuscript was not saved, so you are still in the quit choices. Your in-memory text remains open and unsaved. {reason} {}",
+                            s.save_conflict_context()
                         );
                         return Ok(false);
                     }
@@ -27841,6 +27894,9 @@ mod tests {
         assert_eq!(state.mode, Some('q'));
         assert!(state.dirty);
         assert!(state.message.contains("unsaved"));
+        assert!(state.message.contains("Project: Novel"));
+        assert!(state.message.contains("Document: Scene"));
+        assert!(state.message.contains("On-disk modified:"));
         assert!(state.prompt.contains("Quit Without Saving") && state.prompt.contains("Cancel"));
         assert!(
             !handle(
@@ -28007,6 +28063,57 @@ mod tests {
             fs::read_to_string(&copies[0]).unwrap(),
             "Concurrent saved copy"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_storage_failure_does_not_block_quit_without_saving() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Disk version")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["Unsaved memory".into()];
+        state.dirty = true;
+
+        let recovery = project.join(".writers-ide/recovery");
+        fs::remove_dir(&recovery).unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        symlink(&outside, &recovery).unwrap();
+        state
+            .dispatch_registered_command_id("edit.resolve-save-conflict")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, Some('R'));
+        assert!(state.message.contains("Could not save the recovery copy"));
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, "Disk version");
+        assert_eq!(fs::read_dir(outside).unwrap().count(), 0);
+
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+            )
+            .unwrap()
+        );
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, "Disk version");
     }
 
     #[test]
