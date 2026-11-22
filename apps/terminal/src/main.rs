@@ -5352,6 +5352,47 @@ impl AppState {
         self.reference_focused = true;
         Ok(())
     }
+    fn navigate_compile_result_source_at_scroll(
+        &mut self,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(pane) = self.active_reference_pane() else {
+            return Ok(false);
+        };
+        if pane.source_key != "compile-results:project" {
+            return Ok(false);
+        }
+        let Some(line) = pane.content.lines().nth(pane.scroll) else {
+            self.message = "Compile Results has no selected line".into();
+            return Ok(true);
+        };
+        let Some(id) = line
+            .split(" · source ")
+            .nth(1)
+            .and_then(|value| value.split(':').next())
+            .and_then(|value| value.parse::<uuid::Uuid>().ok())
+        else {
+            self.message = "Selected Compile result has no source entity".into();
+            return Ok(true);
+        };
+        let scene = SceneId(id);
+        if self.app.get_scene(scene).is_ok() {
+            self.open_scene(scene)?;
+            if self.editing_scene == Some(scene) {
+                self.reference_focused = false;
+                self.message = format!("Opened Compile source scene {scene}");
+            }
+            return Ok(true);
+        }
+        let content = story_core::ContentUnitId(id);
+        if self.app.get_content_unit(content).is_ok() {
+            self.open_content_unit(content)?;
+            self.reference_focused = false;
+            self.message = format!("Opened Compile source chapter content {content}");
+            return Ok(true);
+        }
+        self.message = "Compile source entity no longer exists".into();
+        Ok(true)
+    }
     fn navigate_search_match(&mut self, forward: bool) -> Result<(), Box<dyn std::error::Error>> {
         if self.search_locations.is_empty() {
             self.message = "No active find results".into();
@@ -15894,6 +15935,9 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     }
     if s.workspace == Workspace::Editor {
         if s.reference_focused && !s.active_reference_shares_open_scene() {
+            if k.code == KeyCode::Enter && s.navigate_compile_result_source_at_scroll()? {
+                return Ok(false);
+            }
             if let Some(reference) = s.active_reference_pane_mut() {
                 match k.code {
                     KeyCode::Up => reference.scroll = reference.scroll.saturating_sub(1),
@@ -19986,6 +20030,7 @@ mod tests {
             .unwrap();
 
         let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Editor;
         state
             .execute_legacy_palette_command("compile-config run plain")
             .unwrap();
@@ -19995,6 +20040,19 @@ mod tests {
         assert!(content.contains("PUB004"));
         assert!(content.contains(&scene.to_string()));
         assert!(content.contains("likely draft placeholder"));
+        let diagnostic_row = state.reference_panes[0]
+            .content
+            .lines()
+            .position(|line| line.contains("PUB004"))
+            .unwrap();
+        state.reference_panes[0].scroll = diagnostic_row;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editing_scene, Some(scene));
+        assert!(!state.reference_focused);
     }
 
     #[test]
