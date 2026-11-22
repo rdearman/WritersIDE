@@ -121,6 +121,7 @@ struct AppState {
     prompt: String,
     message: String,
     help_panel: Option<HelpPanel>,
+    command_palette: Option<CommandPaletteState>,
     history: Vec<Workspace>,
     history_index: usize,
     location_history: Vec<EditorBookmark>,
@@ -380,6 +381,12 @@ struct HelpPanel {
     scroll: usize,
 }
 
+#[derive(Clone, Debug)]
+struct CommandPaletteState {
+    query: String,
+    selected: usize,
+}
+
 const MENU_CATEGORIES: [&str; 8] = [
     "File", "Edit", "Insert", "Navigate", "Review", "Publish", "Tools", "Help",
 ];
@@ -447,6 +454,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 8] = [
         "compile.preview-inclusions",
     ],
     &[
+        "command.palette-open",
         "research.create",
         "settings.keybinding-manager",
         "scratchpad.create",
@@ -885,6 +893,7 @@ impl Default for ChallengeConfig {
 enum CommandAction {
     Workspace(Workspace),
     OpenMainMenu,
+    OpenCommandPalette,
     OpenMenuCategory(usize),
     Save,
     Help,
@@ -972,6 +981,18 @@ fn command_registry() -> Vec<CommandSpec> {
             }),
     );
     commands.extend([
+        CommandSpec {
+            id: "command.palette-open",
+            label: "Command Palette",
+            description: "Search the registered command set and dispatch an action",
+            category: "Tools",
+            default_shortcuts: &["Ctrl+P"],
+            mnemonic: None,
+            palette_aliases: &["palette"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::OpenCommandPalette,
+        },
         CommandSpec {
             id: "menu.main",
             label: "Main Menu",
@@ -2815,6 +2836,21 @@ fn command_by_id(id: &str) -> Option<CommandSpec> {
         .find(|command| command.id == id)
 }
 
+fn command_for_effective_shortcut(state: &AppState, key: KeyEvent) -> Option<CommandSpec> {
+    command_registry().into_iter().find(|command| {
+        !matches!(
+            command.action,
+            CommandAction::Workspace(_) | CommandAction::OpenMainMenu | CommandAction::Save
+        ) && effective_command_shortcuts(state, *command)
+            .iter()
+            .any(|shortcut| {
+                parse_shortcut(shortcut).is_ok_and(|event| {
+                    same_keycode(event.code, key.code) && event.modifiers == key.modifiers
+                })
+            })
+    })
+}
+
 fn command_for_workspace(workspace: Workspace) -> Option<CommandSpec> {
     command_registry()
         .into_iter()
@@ -2862,6 +2898,54 @@ fn command_palette_invocation(text: &str) -> Option<(CommandSpec, Option<&str>)>
         }
     }
     None
+}
+
+fn command_palette_candidates(query: &str) -> Vec<CommandSpec> {
+    let query = query.trim().to_lowercase();
+    let tokens = query.split_whitespace().collect::<Vec<_>>();
+    let mut candidates = command_registry()
+        .into_iter()
+        .filter(|command| {
+            let searchable = format!(
+                "{} {} {} {} {}",
+                command.id,
+                command.label,
+                command.description,
+                command.palette_aliases.join(" "),
+                command.palette_prefix.unwrap_or_default()
+            )
+            .to_lowercase();
+            tokens.iter().all(|token| searchable.contains(token))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        let score = |command: &CommandSpec| {
+            if query.is_empty() {
+                3
+            } else if command.id.eq_ignore_ascii_case(&query)
+                || command
+                    .palette_aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(&query))
+                || command
+                    .palette_prefix
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&query))
+            {
+                0
+            } else if command.id.to_lowercase().starts_with(&query)
+                || command.label.to_lowercase().starts_with(&query)
+            {
+                1
+            } else {
+                2
+            }
+        };
+        score(left)
+            .cmp(&score(right))
+            .then_with(|| left.label.cmp(right.label))
+            .then_with(|| left.id.cmp(right.id))
+    });
+    candidates
 }
 
 fn menu_category(spec: &CommandSpec) -> &'static str {
@@ -4311,6 +4395,7 @@ impl AppState {
             prompt: String::new(),
             message,
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Dashboard],
             history_index: 0,
             location_history: Vec::new(),
@@ -7381,6 +7466,7 @@ impl AppState {
     }
     fn toggle_menu(&mut self) {
         self.pending_command_sequence = None;
+        self.command_palette = None;
         if self.menu.take().is_some() {
             self.message = "Menu closed; editor focus restored".into();
         } else {
@@ -8120,6 +8206,15 @@ impl AppState {
         match action {
             CommandAction::Workspace(workspace) => self.switch(workspace),
             CommandAction::OpenMainMenu => self.toggle_menu(),
+            CommandAction::OpenCommandPalette => {
+                self.menu = None;
+                self.command_palette = Some(CommandPaletteState {
+                    query: String::new(),
+                    selected: 0,
+                });
+                self.message =
+                    "Search registered commands by name, ID, alias, or description".into();
+            }
             CommandAction::OpenMenuCategory(index) => self.open_menu_category(index),
             CommandAction::Save => self.save()?,
             CommandAction::Help => self.show_context_help(),
@@ -15674,6 +15769,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.snippet_preview.is_some() {
         draw_snippet_preview_overlay(f, s);
     }
+    if s.command_palette.is_some() {
+        draw_command_palette_overlay(f, s);
+    }
     if s.help_panel.is_some() {
         draw_help_overlay(f, s);
     }
@@ -15682,6 +15780,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
 fn context_help_panel(state: &AppState) -> HelpPanel {
     let context = if state.mode.is_some() {
         "Active dialogue".to_owned()
+    } else if state.command_palette.is_some() {
+        "Command Palette".to_owned()
     } else if let Some(menu) = state.menu {
         format!(
             "{} menu · {}",
@@ -15704,6 +15804,10 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
         format!(
             "Menu: {} · open with Ctrl+/ or F10",
             effective_shortcut_label(state, "menu.main", "F10")
+        ),
+        format!(
+            "Command Palette: {} · ':' opens it outside manuscript editing",
+            effective_shortcut_label(state, "command.palette-open", "Ctrl+P")
         ),
         "Help: F1 opens or closes this panel; Esc returns to the previous focus".to_owned(),
         "Focus: In the editor, Ctrl+Tab switches to an open reference pane; Esc returns to the manuscript".to_owned(),
@@ -15752,6 +15856,11 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
     } else {
         lines.push(
             "Available actions are listed in the current workspace and Help menus".to_owned(),
+        );
+    }
+    if state.command_palette.is_some() {
+        lines.push(
+            "Command Palette: type to filter command names, IDs, aliases, and descriptions · ↑/↓ select · Enter run · Tab prepare arguments · Esc close".to_owned(),
         );
     }
     lines.push("Scroll: ↑/↓ or Page Up/Page Down · F10 opens menu".to_owned());
@@ -17028,6 +17137,102 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             description_area,
         );
     }
+}
+
+fn draw_command_palette_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(palette) = s.command_palette.as_ref() else {
+        return;
+    };
+    let area = f.area();
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let width = area.width.clamp(1, 88);
+    let height = area.height.clamp(1, 18);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 3,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Command Palette · search registry · Esc closes ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(format!(" > {}", palette.query)).style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        rows[0],
+    );
+    let candidates = command_palette_candidates(&palette.query);
+    let items = if candidates.is_empty() {
+        vec![ListItem::new("No registered command matches this search")]
+    } else {
+        candidates
+            .iter()
+            .map(|command| {
+                let disabled = s.command_disabled_reason(*command);
+                let shortcut = effective_command_shortcuts(s, *command);
+                let shortcut = if shortcut.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", shortcut.join(", "))
+                };
+                let availability =
+                    disabled.map_or(String::new(), |reason| format!(" · unavailable: {reason}"));
+                ListItem::new(format!(
+                    "{} · {}{}{}",
+                    command.label, command.id, shortcut, availability
+                ))
+                .style(if disabled.is_some() {
+                    Style::default().fg(Color::DarkGray)
+                } else {
+                    Style::default()
+                })
+            })
+            .collect()
+    };
+    let selected = (!candidates.is_empty())
+        .then_some(palette.selected.min(candidates.len().saturating_sub(1)));
+    f.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White)),
+        rows[1],
+        &mut ListState::default().with_selected(selected),
+    );
+    let description = candidates
+        .get(palette.selected.min(candidates.len().saturating_sub(1)))
+        .map_or_else(
+            || {
+                "Type to search registered commands · Enter runs · Tab prepares arguments"
+                    .to_owned()
+            },
+            |command| {
+                s.command_disabled_reason(*command)
+                    .map_or(command.description.to_owned(), |reason| {
+                        format!("Unavailable: {reason} · {}", command.description)
+                    })
+            },
+        );
+    f.render_widget(
+        Paragraph::new(description).wrap(Wrap { trim: true }),
+        rows[2],
+    );
 }
 
 fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
@@ -19603,6 +19808,133 @@ fn step_find_query_history(
     Ok(())
 }
 
+fn command_palette_alias(command: &CommandSpec) -> &str {
+    command
+        .palette_prefix
+        .or_else(|| command.palette_aliases.first().copied())
+        .unwrap_or(command.id)
+}
+
+fn begin_command_arguments(
+    s: &mut AppState,
+    command: CommandSpec,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(reason) = s.command_disabled_reason(command) {
+        s.command_palette = None;
+        s.message = format!("{} unavailable: {reason}", command.label);
+        return Ok(());
+    }
+    let prefix = command_palette_alias(&command);
+    s.command_palette = None;
+    s.mode = Some(':');
+    s.prompt = format!("{prefix} ");
+    s.message = format!("Arguments for {} · Enter runs · Esc cancels", command.label);
+    Ok(())
+}
+
+fn invoke_palette_command(
+    s: &mut AppState,
+    command: CommandSpec,
+    arguments: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(reason) = s.command_disabled_reason(command) {
+        s.command_palette = None;
+        s.message = format!("{} unavailable: {reason}", command.label);
+        return Ok(());
+    }
+    s.command_palette = None;
+    s.prompt.clear();
+    if command.action == CommandAction::LegacyPalette {
+        let invocation = arguments
+            .or(command.palette_prefix)
+            .ok_or("registered command has no invocation")?;
+        s.dispatch_registered_with_args(command.action, Some(invocation))?;
+    } else {
+        s.dispatch_registered_with_args(command.action, arguments)?;
+    }
+    Ok(())
+}
+
+fn handle_command_palette_key(
+    s: &mut AppState,
+    key: KeyEvent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let palette = s
+        .command_palette
+        .as_ref()
+        .ok_or("command palette is closed")?;
+    let query = palette.query.clone();
+    let candidates = command_palette_candidates(&query);
+    let selected = palette.selected.min(candidates.len().saturating_sub(1));
+    match key.code {
+        KeyCode::Esc => {
+            s.command_palette = None;
+            s.message = "Command palette closed".into();
+        }
+        KeyCode::Up if !candidates.is_empty() => {
+            let palette = s.command_palette.as_mut().unwrap();
+            palette.selected = if palette.selected == 0 {
+                candidates.len() - 1
+            } else {
+                palette.selected - 1
+            };
+        }
+        KeyCode::Down if !candidates.is_empty() => {
+            let palette = s.command_palette.as_mut().unwrap();
+            palette.selected = (palette.selected + 1) % candidates.len();
+        }
+        KeyCode::Tab => {
+            if let Some(command) = candidates.get(selected).copied() {
+                if command.takes_arguments {
+                    begin_command_arguments(s, command)?;
+                } else if let Some(palette) = s.command_palette.as_mut() {
+                    palette.query = command.id.to_owned();
+                    palette.selected = 0;
+                }
+            }
+        }
+        KeyCode::Enter => {
+            let query = query.trim();
+            if let Some((command, arguments)) = command_palette_invocation(query) {
+                if command.takes_arguments && arguments.is_none() {
+                    begin_command_arguments(s, command)?;
+                } else {
+                    let raw = (command.action == CommandAction::LegacyPalette).then_some(query);
+                    invoke_palette_command(s, command, raw.or(arguments))?;
+                }
+            } else if let Some(command) = candidates.get(selected).copied() {
+                if command.takes_arguments {
+                    begin_command_arguments(s, command)?;
+                } else {
+                    invoke_palette_command(s, command, None)?;
+                }
+            } else if !query.is_empty() {
+                s.command_palette = None;
+                match s.execute_legacy_palette_command(query) {
+                    Ok(()) => s.message = format!("Ran command: {query}"),
+                    Err(error) => s.message = format!("No matching command: {error}"),
+                }
+            }
+        }
+        KeyCode::Backspace => {
+            if let Some(palette) = s.command_palette.as_mut() {
+                palette.query.pop();
+                palette.selected = 0;
+            }
+        }
+        KeyCode::Char(character)
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            if let Some(palette) = s.command_palette.as_mut() {
+                palette.query.push(character);
+                palette.selected = 0;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
     if s.help_panel.is_some() {
         match k.code {
@@ -19640,6 +19972,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     let modal_is_open = s.mode.is_some()
+        || s.command_palette.is_some()
         || s.menu.is_some()
         || s.find_panel.is_some()
         || s.keybinding_manager.is_some()
@@ -19669,6 +20002,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         if !s.handle_context_command_key(k, "menu")? {
             s.handle_menu_key(k)?;
         }
+        return Ok(false);
+    }
+    if s.command_palette.is_some() {
+        handle_command_palette_key(s, k)?;
         return Ok(false);
     }
     if let Some(preview) = s.snippet_preview.clone() {
@@ -20037,6 +20374,18 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             } else {
                 s.dispatch_registered(command.action)?;
             }
+        }
+        return Ok(false);
+    }
+    if let Some(command) = command_for_effective_shortcut(s, k) {
+        if let Some(reason) = s.command_disabled_reason(command) {
+            s.message = format!("{} unavailable: {reason}", command.label);
+        } else if command.takes_arguments {
+            s.prompt_for_registered_command(command)?;
+        } else if command.action == CommandAction::LegacyPalette {
+            s.dispatch_registered_with_args(command.action, command.palette_prefix)?;
+        } else {
+            s.dispatch_registered(command.action)?;
         }
         return Ok(false);
     }
@@ -20584,8 +20933,9 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
         }
         KeyCode::Char(':') => {
-            s.mode = Some(':');
-            s.prompt.clear();
+            if let Some(command) = command_by_id("command.palette-open") {
+                s.dispatch_registered(command.action)?;
+            }
         }
         KeyCode::Char('/') => {
             s.mode = Some('/');
@@ -21884,6 +22234,145 @@ mod tests {
             .execute_legacy_palette_command("git-auto-snapshot-exit off")
             .unwrap();
         assert!(state.app.git_auto_snapshot_on_exit().unwrap().is_none());
+    }
+
+    #[test]
+    fn command_palette_filters_registry_and_dispatches_the_selected_action() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.command_palette.is_some());
+
+        for character in "view.timeline".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        let matches = command_palette_candidates("view.timeline");
+        assert_eq!(
+            matches.first().map(|command| command.id),
+            Some("view.timeline")
+        );
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Command Palette"));
+        assert!(screen.contains("view.timeline"));
+        for (width, height) in [(20, 6), (40, 10), (80, 24), (93, 36), (142, 60)] {
+            let mut resized =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            resized.draw(|frame| draw(frame, &mut state)).unwrap();
+        }
+
+        handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        assert!(state.help_panel.is_some());
+        assert!(state.command_palette.is_some());
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.help_panel.is_none());
+        assert!(state.command_palette.is_some());
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Timeline);
+        assert!(state.command_palette.is_none());
+
+        state
+            .execute_legacy_palette_command("keybinding-set Ctrl+Alt+P command.palette-open")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(state.command_palette.is_none());
+        handle(
+            &mut state,
+            KeyEvent::new(
+                KeyCode::Char('p'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            ),
+        )
+        .unwrap();
+        assert!(state.command_palette.is_some());
+    }
+
+    #[test]
+    fn command_palette_searches_aliases_and_preserves_argument_prompts() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        assert!(
+            command_palette_candidates("selected processing stages")
+                .iter()
+                .any(|command| command.id == "compile.selected")
+        );
+        assert!(
+            command_palette_candidates("compile-results")
+                .iter()
+                .any(|command| command.id == "compile.results")
+        );
+
+        state.command_palette = Some(CommandPaletteState {
+            query: "scene.create".into(),
+            selected: 0,
+        });
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.command_palette.is_none());
+        assert_eq!(state.mode, Some(':'));
+        assert_eq!(state.prompt, "scene ");
+
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.mode, None);
+        assert!(state.prompt.is_empty());
+    }
+
+    #[test]
+    fn command_palette_shortcut_works_in_a_blank_editor_and_colon_remains_text() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Editor;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(state.command_palette.is_some());
+        assert!(state.editor.iter().all(String::is_empty));
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+
+        let chapter = state.app.create_chapter(None, "Chapter", 10).unwrap();
+        let scene = state.app.create_scene(chapter, "Scene", 0).unwrap();
+        state.open_scene(scene).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.command_palette.is_none());
+        assert_eq!(state.editor.join("\n"), ":");
+        assert!(state.dirty);
     }
 
     #[test]
@@ -24229,6 +24718,7 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Editor],
             history_index: 0,
             location_history: Vec::new(),
@@ -27029,6 +27519,7 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Editor],
             history_index: 0,
             location_history: Vec::new(),
@@ -27157,6 +27648,7 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Editor],
             history_index: 0,
             location_history: Vec::new(),
@@ -27281,6 +27773,7 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Editor],
             history_index: 0,
             location_history: Vec::new(),
@@ -27413,6 +27906,7 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Outline],
             history_index: 0,
             location_history: Vec::new(),
@@ -27695,6 +28189,7 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Dashboard],
             history_index: 0,
             location_history: Vec::new(),
@@ -27827,6 +28322,7 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Outline],
             history_index: 0,
             location_history: Vec::new(),
@@ -28604,6 +29100,7 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Revisions],
             history_index: 0,
             location_history: Vec::new(),
@@ -28871,6 +29368,7 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Reading],
             history_index: 0,
             location_history: Vec::new(),
@@ -29273,6 +29771,7 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Search],
             history_index: 0,
             location_history: Vec::new(),
@@ -29416,6 +29915,7 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Search],
             history_index: 0,
             location_history: Vec::new(),
@@ -29611,6 +30111,7 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            command_palette: None,
             history: vec![Workspace::Outline],
             history_index: 0,
             location_history: Vec::new(),
