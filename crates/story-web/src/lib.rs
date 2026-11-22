@@ -55,7 +55,7 @@ const PAGE: &str = r#"<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Writer's IDE</title><style>
 body{font:16px system-ui;margin:0;color:#20242a;background:#f3f5f7}header{padding:1rem 2rem;background:#24354a;color:white}main{display:grid;grid-template-columns:minmax(18rem,32%) 1fr;gap:1rem;padding:1rem;max-width:1400px;margin:auto}section{background:white;border:1px solid #ccd2d9;border-radius:.4rem;padding:1rem}button{margin:.3rem 0;padding:.55rem;cursor:pointer}button.scene{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid #e5e8eb;background:white;padding:.7rem}button.scene:hover{background:#eef3f8}textarea, input, select{box-sizing:border-box;width:100%;padding:.5rem;margin:.2rem 0  .5rem}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.6}small{color:#52606d}.notice{min-height:1.4rem;color:#234f73}.graph{overflow:auto;border:1px solid #d7dce2;border-radius:.3rem}.graph svg{display:block;width:100%;min-width:760px}.graph line{stroke:#9aa7b4;stroke-width:1.5}.graph rect{rx:6;stroke:#617181;stroke-width:1}.graph text{font:12px system-ui;fill:#17202a}.graph g[data-scene-id]{cursor:pointer}.graph g[data-scene-id]:hover rect{stroke:#1769aa;stroke-width:3}.graph .group rect{fill:#f0f2f5}.graph .scene rect{fill:#e7f1fb}.graph .character rect{fill:#e8f5ec}.graph .plotline rect{fill:#fff2d9}.graph .world rect{fill:#f4eafb}.graph .knowledge rect{fill:#fff0dc}@media(max-width:750px){main{grid-template-columns:1fr}}</style>
-<header><h1 id="title">Writer's IDE</h1><p>Local planning graph · manuscript prose remains read-only here · <a href="/preview" target="_blank" rel="noopener">Open compiled manuscript preview</a></p></header><main>
+<header><h1 id="title">Writer's IDE</h1><p>Local planning graph · manuscript prose remains read-only here · <a href="/preview" target="_blank" rel="noopener">Open compiled manuscript preview</a> · <a href="/downloads">Download compiled EPUB/DOCX/PDF</a></p></header><main>
 <section><h2>Scenes</h2><label>Search<input id="scene-filter-text" type="search" placeholder="Title or synopsis"></label><label>Status<select id="scene-filter-status"><option value="">Any status</option><option>idea</option><option>outlined</option><option>ready_to_draft</option><option>drafting</option><option>draft_complete</option><option>revising</option><option>complete</option><option>archived</option></select></label><label>Character<select id="scene-filter-character"><option value="">Any character</option></select></label><label>Plotline<select id="scene-filter-plot"><option value="">Any plotline</option></select></label><div id="scenes">Loading…</div><h3>Add chapter</h3><form id="create-chapter"><input id="new-chapter-title" required placeholder="Chapter title"><button>Add chapter</button></form><h3>Add scene</h3><form id="create-scene"><select id="new-chapter"></select><input id="new-title" required placeholder="Scene title"><button>Add scene</button></form></section>
 <section><h2 id="scene-title">Select a scene</h2><small id="scene-meta"></small><p><label>Scene title<input id="scene-name"></label><label>Planning synopsis<textarea id="synopsis" rows="4"></textarea></label><label>Status<select id="status"><option>idea</option><option>outlined</option><option>ready_to_draft</option><option>drafting</option><option>draft_complete</option><option>revising</option><option>complete</option></select></label><button id="save-planning">Save planning</button></p><p><label>Story start time (ticks)<input id="scene-start-time" placeholder="? or integer / interval"></label><label>Story end time (ticks)<input id="scene-end-time" placeholder="? or integer / interval"></label><button id="save-scene-time">Save chronology</button></p><p><label>Move to chapter<select id="move-chapter"></select></label><label>Position<input id="move-position" type="number" min="0" value="0"></label><button id="move-scene">Move scene</button></p><p class="notice" id="notice"></p><h3>Read-only manuscript</h3><pre id="prose">Select a scene to inspect its text.</pre></section>
 <section><h2>Characters</h2><div id="characters"></div></section><section><h2>Plotlines</h2><div id="plotlines"></div></section><section><h2>Locations and events</h2><div id="world"></div></section><section><h2>Research and issues</h2><form id="create-issue"><input id="new-issue-title" required placeholder="Issue title"><button>Create issue</button></form><div id="work"></div></section><section><h2>Story structure and graph</h2><div id="structure"></div><div class="graph"><svg id="graph" role="img" aria-label="Story relationship and approved knowledge graph"></svg></div><div id="edges"></div><div id="knowledge"></div></section></main>
@@ -163,6 +163,45 @@ impl BrowserServer {
                     let mut body = vec![0; content_length];
                     reader.read_exact(&mut body)?;
                     let body = std::str::from_utf8(&body).unwrap_or_default();
+                    if let Some(index) = target
+                        .split('?')
+                        .next()
+                        .unwrap_or(target)
+                        .strip_prefix("/downloads/")
+                    {
+                        if method != "GET" {
+                            write_response(
+                                &mut stream,
+                                405,
+                                "text/plain; charset=utf-8",
+                                "Method not allowed",
+                            )?;
+                            continue;
+                        }
+                        let (status, mime, filename, bytes) =
+                            match download_compile_artifact(app, index) {
+                                Ok(Some(artifact)) => {
+                                    (200, artifact.mime, Some(artifact.filename), artifact.bytes)
+                                }
+                                Ok(None) => (
+                                    404,
+                                    "text/plain; charset=utf-8",
+                                    None,
+                                    b"Compile download not found".to_vec(),
+                                ),
+                                Err(error) => {
+                                    (500, "text/plain; charset=utf-8", None, error.into_bytes())
+                                }
+                            };
+                        write_binary_response(
+                            &mut stream,
+                            status,
+                            mime,
+                            filename.as_deref(),
+                            &bytes,
+                        )?;
+                        continue;
+                    }
                     let (status, mime, response) = route(app, method, target, body);
                     if status == 200 && target.split('?').next() == Some("/preview") {
                         write_preview_response(&mut stream, response.as_bytes())?;
@@ -210,6 +249,150 @@ fn write_preview_response(stream: &mut impl Write, body: &[u8]) -> std::io::Resu
     stream.write_all(body)
 }
 
+fn write_binary_response(
+    stream: &mut impl Write,
+    status: u16,
+    mime: &str,
+    filename: Option<&str>,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let disposition = filename
+        .map(|filename| {
+            let safe_filename = filename
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            format!("Content-Disposition: attachment; filename=\"{safe_filename}\"\r\n")
+        })
+        .unwrap_or_default();
+    let headers = format!(
+        "HTTP/1.1 {status} {}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\n{disposition}X-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'\r\nConnection: close\r\n\r\n",
+        reason(status),
+        body.len()
+    );
+    stream.write_all(headers.as_bytes())?;
+    stream.write_all(body)
+}
+
+fn add_download_navigation(html: String) -> String {
+    let navigation = "<nav aria-label=\"Compile downloads\" style=\"padding:.6em;background:#eef3f8\"><a href=\"/downloads\">Download latest compiled EPUB, DOCX, or PDF</a></nav>";
+    if let Some((before, after)) = html.split_once("<body>") {
+        format!("{before}<body>{navigation}{after}")
+    } else if let Some((before, after)) = html.split_once("<body ") {
+        if let Some((attributes, content)) = after.split_once('>') {
+            format!("{before}<body {attributes}>{navigation}{content}")
+        } else {
+            html
+        }
+    } else {
+        format!("{navigation}{html}")
+    }
+}
+
+struct DownloadArtifact {
+    filename: String,
+    mime: &'static str,
+    path: std::path::PathBuf,
+}
+
+struct DownloadArtifactResponse {
+    filename: String,
+    mime: &'static str,
+    bytes: Vec<u8>,
+}
+
+fn downloadable_compile_artifacts(app: &WriterApp) -> Result<Vec<DownloadArtifact>, String> {
+    let Some(record) = app
+        .list_compile_results()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|record| record.succeeded)
+    else {
+        return Ok(Vec::new());
+    };
+    let root = std::fs::canonicalize(app.project_root())
+        .map_err(|error| format!("resolve project directory: {error}"))?;
+    let exports = root.join("exports");
+    let exports = match std::fs::canonicalize(exports) {
+        Ok(path) => path,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(format!("resolve project exports directory: {error}")),
+    };
+    let mut artifacts = Vec::new();
+    for output in record.outputs {
+        let relative = std::path::Path::new(&output);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            continue;
+        }
+        let Some(extension) = relative.extension().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        let mime = match extension.to_ascii_lowercase().as_str() {
+            "epub" => "application/epub+zip",
+            "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "pdf" => "application/pdf",
+            _ => continue,
+        };
+        let path = std::fs::canonicalize(root.join(relative));
+        let Ok(path) = path else { continue };
+        if !path.is_file() || !path.starts_with(&exports) {
+            continue;
+        }
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("manuscript")
+            .to_owned();
+        artifacts.push(DownloadArtifact {
+            filename,
+            mime,
+            path,
+        });
+    }
+    Ok(artifacts)
+}
+
+fn download_compile_artifact(
+    app: &WriterApp,
+    index: &str,
+) -> Result<Option<DownloadArtifactResponse>, String> {
+    let Ok(index) = index.parse::<usize>() else {
+        return Ok(None);
+    };
+    let entries = downloadable_compile_artifacts(app)?;
+    let Some(entry) = entries.get(index) else {
+        return Ok(None);
+    };
+    let bytes =
+        std::fs::read(&entry.path).map_err(|error| format!("read Compile artifact: {error}"))?;
+    Ok(Some(DownloadArtifactResponse {
+        filename: entry.filename.clone(),
+        mime: entry.mime,
+        bytes,
+    }))
+}
+
+fn escape_html(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -231,7 +414,11 @@ fn route(app: &mut WriterApp, method: &str, path: &str, body: &str) -> (u16, &'s
     if method == "GET" && path == "/preview" {
         return match app.compile_artifact(story_document::CompileFormat::Html, false) {
             Ok(artifact) => match String::from_utf8(artifact.bytes) {
-                Ok(html) => (200, "text/html; charset=utf-8", html),
+                Ok(html) => (
+                    200,
+                    "text/html; charset=utf-8",
+                    add_download_navigation(html),
+                ),
                 Err(error) => (
                     500,
                     "text/plain; charset=utf-8",
@@ -243,6 +430,32 @@ fn route(app: &mut WriterApp, method: &str, path: &str, body: &str) -> (u16, &'s
                 "text/plain; charset=utf-8",
                 format!("Compile preview failed: {error}"),
             ),
+        };
+    }
+    if method == "GET" && path == "/downloads" {
+        return match downloadable_compile_artifacts(app) {
+            Ok(artifacts) => {
+                let links = artifacts
+                    .iter()
+                    .enumerate()
+                    .map(|(index, entry)| {
+                        format!(
+                            "<li><a href=\"/downloads/{index}\">{}</a></li>",
+                            escape_html(&entry.filename)
+                        )
+                    })
+                    .collect::<String>();
+                let links = if links.is_empty() {
+                    "<li>No supported EPUB, DOCX, or PDF downloads are available from the latest successful Compile run.</li>".to_owned()
+                } else {
+                    links
+                };
+                let page = format!(
+                    "<!doctype html><html><meta charset=\"utf-8\"><title>Compile downloads</title><h1>Compile downloads</h1><ul>{links}</ul><a href=\"/\">Back to Writer's IDE</a></html>"
+                );
+                (200, "text/html; charset=utf-8", page)
+            }
+            Err(error) => (500, "text/plain; charset=utf-8", error),
         };
     }
     if method == "POST" && path == "/api/scenes" {
@@ -835,6 +1048,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(mime, "text/html; charset=utf-8");
         assert!(html.contains("Preview text remains canonical."));
+        assert!(html.contains("href=\"/downloads\""));
         assert!(PAGE.contains("href=\"/preview\""));
         assert_eq!(app.load_scene_text(scene).unwrap().0, prose);
 
@@ -844,5 +1058,63 @@ mod tests {
         assert!(response.contains("Content-Security-Policy: default-src 'none'"));
         assert!(!response.contains("script-src 'unsafe-inline'"));
         assert!(response.ends_with(&html));
+    }
+
+    #[test]
+    fn compile_download_page_serves_only_latest_managed_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Browser Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let prose = "Download text remains canonical.";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), prose).unwrap();
+        app.create_builtin_compile_configuration("ebook", "ebook")
+            .unwrap();
+        let build = app.compile_configuration("ebook", false).unwrap();
+        assert!(build.outputs.iter().any(|output| output.ends_with(".epub")));
+
+        let (status, mime, page) = route(&mut app, "GET", "/downloads", "");
+        assert_eq!(status, 200);
+        assert_eq!(mime, "text/html; charset=utf-8");
+        assert!(page.contains("/downloads/0"));
+        let artifact = download_compile_artifact(&app, "0")
+            .unwrap()
+            .expect("compiled EPUB is downloadable");
+        assert_eq!(artifact.mime, "application/epub+zip");
+        assert!(artifact.filename.ends_with(".epub"));
+        assert!(artifact.bytes.starts_with(b"PK"));
+        assert_eq!(app.load_scene_text(scene).unwrap().0, prose);
+
+        let mut response = Vec::new();
+        write_binary_response(
+            &mut response,
+            200,
+            artifact.mime,
+            Some(&artifact.filename),
+            &artifact.bytes,
+        )
+        .unwrap();
+        let headers = String::from_utf8_lossy(
+            &response[..response
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()],
+        );
+        assert!(headers.contains("Content-Disposition: attachment;"));
+        assert!(headers.contains("application/epub+zip"));
+        assert!(response.ends_with(&artifact.bytes));
+
+        let mut unsafe_name_response = Vec::new();
+        write_binary_response(
+            &mut unsafe_name_response,
+            200,
+            "application/pdf",
+            Some("safe.pdf\r\nX-Injected: yes"),
+            b"pdf",
+        )
+        .unwrap();
+        let headers = String::from_utf8_lossy(&unsafe_name_response);
+        assert!(!headers.contains("\r\nX-Injected:"));
     }
 }
