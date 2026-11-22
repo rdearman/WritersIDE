@@ -254,6 +254,7 @@ struct AppState {
     series_form: Option<SeriesActionForm>,
     recent_project_picker: Option<RecentProjectPicker>,
     recent_projects_path: Option<PathBuf>,
+    file_browser: Option<FileBrowserState>,
 }
 
 #[derive(Clone, Debug)]
@@ -337,7 +338,6 @@ struct ScrivenerImportWizard {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SeriesFormKind {
-    NewProject,
     CreateSeries,
     SelectSeries,
     AddCurrentBook,
@@ -350,7 +350,6 @@ enum SeriesFormKind {
 impl SeriesFormKind {
     fn fields(self) -> &'static [&'static str] {
         match self {
-            Self::NewProject => &["New project directory", "Project title"],
             Self::CreateSeries => &["Series directory", "Series title"],
             Self::SelectSeries => &["Series directory"],
             Self::AddCurrentBook => &["Book title"],
@@ -378,6 +377,25 @@ struct SeriesActionForm {
     kind: SeriesFormKind,
     values: Vec<String>,
     input: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FileBrowserPurpose {
+    NewProject,
+    OpenProject,
+    Compile(story_document::CompileFormat),
+}
+
+#[derive(Clone, Debug)]
+struct FileBrowserState {
+    purpose: FileBrowserPurpose,
+    current_dir: PathBuf,
+    entries: Vec<(String, bool)>,
+    selected: usize,
+    tree_selected: usize,
+    focus: u8,
+    name: String,
+    overwrite_confirmed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1077,6 +1095,7 @@ enum CommandAction {
     OpenMenuCategory(usize),
     OpenRecentProjects,
     NewProject,
+    OpenProject,
     Save,
     RequestQuit,
     Help,
@@ -1088,6 +1107,7 @@ enum CommandAction {
     Process { expand_transclusions: bool },
     ProcessSelected { expand_transclusions: bool },
     LegacyPalette,
+    CompileWorkflow,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1238,12 +1258,12 @@ fn command_registry() -> Vec<CommandSpec> {
             default_shortcuts: &["Ctrl+O"],
             mnemonic: Some('o'),
             palette_aliases: &[],
-            palette_prefix: Some("open-project"),
-            takes_arguments: true,
+            palette_prefix: None,
+            takes_arguments: false,
             task_group: "Project & Files",
             menu_priority: 2,
             advanced: false,
-            action: CommandAction::LegacyPalette,
+            action: CommandAction::OpenProject,
         },
         CommandSpec {
             id: "file.recent-projects",
@@ -1465,14 +1485,21 @@ fn command_registry() -> Vec<CommandSpec> {
         },
     ]);
     commands.extend([
-        legacy_command(
-            "compile.format",
-            "Compile to a Document Format",
-            "Compile the manuscript to text, Markdown, HTML, EPUB, DOCX, PDF, ODT, RTF, or optional AZW3/MOBI",
-            "Compile",
-            "compile-format",
-            true,
-        ),
+        CommandSpec {
+            id: "compile.format",
+            label: "Compile / Export…",
+            description: "Choose an output format and destination, then compile the manuscript",
+            category: "Publish",
+            default_shortcuts: &[],
+            mnemonic: Some('c'),
+            palette_aliases: &["compile-format", "export manuscript"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::CompileWorkflow,
+            task_group: "Compile",
+            menu_priority: 1,
+            advanced: false,
+        },
         legacy_command(
             "compile.configuration",
             "Compile Configuration",
@@ -3679,8 +3706,9 @@ fn parse_find_mode(value: &str) -> Result<story_core::FindMode, String> {
     match value.to_ascii_lowercase().as_str() {
         "normal" => Ok(story_core::FindMode::Normal),
         "extended" => Ok(story_core::FindMode::Extended),
+        "wildcard" => Ok(story_core::FindMode::Wildcard),
         "regex" => Ok(story_core::FindMode::Regex),
-        _ => Err("search mode must be normal, extended, or regex".into()),
+        _ => Err("search mode must be normal, extended, wildcard, or regex".into()),
     }
 }
 
@@ -5223,6 +5251,7 @@ impl AppState {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings,
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -6236,6 +6265,292 @@ impl AppState {
         Ok(())
     }
 
+    fn start_file_browser(
+        &mut self,
+        purpose: FileBrowserPurpose,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let fallback = std::env::current_dir()?;
+        let current_dir = match purpose {
+            FileBrowserPurpose::Compile(_) => self.app.project_root().to_owned(),
+            FileBrowserPurpose::NewProject | FileBrowserPurpose::OpenProject => {
+                std::env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .filter(|path| path.is_dir())
+                    .unwrap_or(fallback)
+            }
+        };
+        let name = match purpose {
+            FileBrowserPurpose::NewProject => "My Novel".to_owned(),
+            FileBrowserPurpose::OpenProject => String::new(),
+            FileBrowserPurpose::Compile(format) => {
+                let title = self
+                    .app
+                    .get_project()
+                    .map(|project| project.title)
+                    .unwrap_or_else(|_| "Manuscript".into());
+                format!("{}.{}", safe_filename(&title), format.extension())
+            }
+        };
+        let entries = file_browser_entries(&current_dir)?;
+        let tree_selected = file_browser_ancestors(&current_dir).len().saturating_sub(1);
+        self.menu = None;
+        self.command_palette = None;
+        self.file_browser = Some(FileBrowserState {
+            purpose,
+            current_dir,
+            entries,
+            selected: 0,
+            tree_selected,
+            focus: 1,
+            name,
+            overwrite_confirmed: false,
+        });
+        self.message =
+            "Choose a folder or filename · F5 confirms · F7 creates folder · Esc cancels".into();
+        Ok(())
+    }
+
+    fn handle_file_browser_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(mut browser) = self.file_browser.take() else {
+            return Ok(());
+        };
+        let mut close = false;
+        match key.code {
+            KeyCode::Esc => {
+                close = true;
+                self.message = "File selection cancelled".into();
+            }
+            KeyCode::Tab | KeyCode::BackTab => browser.focus = (browser.focus + 1) % 3,
+            KeyCode::Up => {
+                if browser.focus == 0 {
+                    browser.tree_selected = browser.tree_selected.saturating_sub(1);
+                } else if browser.focus == 1 && !browser.entries.is_empty() {
+                    browser.selected = browser.selected.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if browser.focus == 0 {
+                    browser.tree_selected = (browser.tree_selected + 1).min(
+                        file_browser_ancestors(&browser.current_dir)
+                            .len()
+                            .saturating_sub(1),
+                    );
+                } else if browser.focus == 1 && !browser.entries.is_empty() {
+                    browser.selected = (browser.selected + 1).min(browser.entries.len() - 1);
+                }
+            }
+            KeyCode::Home if browser.focus == 0 => {
+                if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+                    && home.is_dir()
+                {
+                    browser.current_dir = home;
+                    browser.entries = file_browser_entries(&browser.current_dir)?;
+                    browser.selected = 0;
+                    browser.tree_selected = file_browser_ancestors(&browser.current_dir)
+                        .len()
+                        .saturating_sub(1);
+                }
+            }
+            KeyCode::F(2) => {
+                if let FileBrowserPurpose::Compile(current) = browser.purpose {
+                    let formats = [
+                        story_document::CompileFormat::PlainText,
+                        story_document::CompileFormat::Markdown,
+                        story_document::CompileFormat::Html,
+                        story_document::CompileFormat::Epub,
+                        story_document::CompileFormat::Docx,
+                        story_document::CompileFormat::Pdf,
+                        story_document::CompileFormat::Odt,
+                        story_document::CompileFormat::Rtf,
+                        story_document::CompileFormat::Latex,
+                    ];
+                    let next = formats[(formats
+                        .iter()
+                        .position(|format| *format == current)
+                        .unwrap_or(0)
+                        + 1)
+                        % formats.len()];
+                    let stem = Path::new(&browser.name)
+                        .file_stem()
+                        .and_then(|stem| stem.to_str())
+                        .unwrap_or("Manuscript");
+                    browser.name = format!("{stem}.{}", next.extension());
+                    browser.purpose = FileBrowserPurpose::Compile(next);
+                    browser.overwrite_confirmed = false;
+                }
+            }
+            KeyCode::Char('/') if browser.focus == 0 => {
+                browser.current_dir = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+                browser.entries = file_browser_entries(&browser.current_dir)?;
+                browser.selected = 0;
+                browser.tree_selected = 0;
+            }
+            KeyCode::Enter if browser.focus == 0 => {
+                let ancestors = file_browser_ancestors(&browser.current_dir);
+                if let Some(path) = ancestors.get(browser.tree_selected).cloned() {
+                    browser.current_dir = path;
+                    browser.entries = file_browser_entries(&browser.current_dir)?;
+                    browser.selected = 0;
+                    browser.tree_selected = file_browser_ancestors(&browser.current_dir)
+                        .len()
+                        .saturating_sub(1);
+                }
+            }
+            KeyCode::Backspace | KeyCode::Left if browser.focus != 2 => {
+                if let Some(parent) = browser.current_dir.parent() {
+                    browser.current_dir = parent.to_owned();
+                    browser.entries = file_browser_entries(&browser.current_dir)?;
+                    browser.selected = 0;
+                    browser.tree_selected = file_browser_ancestors(&browser.current_dir)
+                        .len()
+                        .saturating_sub(1);
+                }
+            }
+            KeyCode::Enter if browser.focus == 1 => {
+                if let Some((name, is_dir)) = browser.entries.get(browser.selected).cloned() {
+                    if is_dir {
+                        browser.current_dir.push(name);
+                        browser.entries = file_browser_entries(&browser.current_dir)?;
+                        browser.selected = 0;
+                        browser.tree_selected = file_browser_ancestors(&browser.current_dir)
+                            .len()
+                            .saturating_sub(1);
+                    } else {
+                        browser.name = name;
+                        browser.focus = 2;
+                    }
+                }
+            }
+            KeyCode::F(7) => {
+                let folder = browser.name.trim();
+                if !file_browser_leaf_name_is_safe(folder) {
+                    self.message = "Enter a valid folder name before pressing F7".into();
+                } else {
+                    let path = browser.current_dir.join(folder);
+                    match fs::create_dir(&path) {
+                        Ok(()) => {
+                            browser.entries = file_browser_entries(&browser.current_dir)?;
+                            self.message = format!("Created folder {}", path.display());
+                        }
+                        Err(error) => self.message = format!("Could not create folder: {error}"),
+                    }
+                }
+            }
+            KeyCode::F(5) => {
+                let name = browser.name.trim();
+                if browser.purpose != FileBrowserPurpose::OpenProject
+                    && !file_browser_leaf_name_is_safe(name)
+                {
+                    self.message = "Enter a valid name".into();
+                    self.file_browser = Some(browser);
+                    return Ok(());
+                }
+                let destination = browser.current_dir.join(name);
+                match browser.purpose {
+                    FileBrowserPurpose::OpenProject => {
+                        let selected = browser
+                            .entries
+                            .get(browser.selected)
+                            .map(|entry| entry.0.as_str());
+                        let project_path = selected
+                            .map(|item| browser.current_dir.join(item))
+                            .filter(|path| path.is_dir() && path.join("project.toml").is_file());
+                        let Some(project_path) = project_path else {
+                            self.message =
+                                "Select a folder containing project.toml, then press F5".into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        };
+                        match self.switch_to_project(
+                            project_path.clone(),
+                            format!("Opened project: {}", project_path.display()),
+                        ) {
+                            Ok(()) => close = true,
+                            Err(error) => {
+                                self.message = format!("Could not open project: {error}");
+                                self.file_browser = Some(browser);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    FileBrowserPurpose::NewProject => {
+                        if self.dirty || self.active_challenge.is_some() {
+                            self.message = "Save or finish the active writing session before creating a project".into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        }
+                        if fs::symlink_metadata(&destination).is_ok() {
+                            self.message =
+                                "That project folder already exists; choose another name".into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        }
+                        fs::create_dir(&destination)?;
+                        if let Err(error) = WriterApp::create_project(&destination, name) {
+                            let _ = fs::remove_dir(&destination);
+                            self.message = format!("Project creation failed: {error}");
+                            return Ok(());
+                        }
+                        self.switch_to_project(
+                            destination,
+                            format!("Created and opened project: {name}"),
+                        )?;
+                        close = true;
+                    }
+                    FileBrowserPurpose::Compile(format) => {
+                        if destination.exists() && !browser.overwrite_confirmed {
+                            browser.overwrite_confirmed = true;
+                            self.message =
+                                "Output exists. Press F5 again to replace it, or edit the filename"
+                                    .into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        }
+                        let artifact = self.app.compile_artifact_recording_failure(
+                            format,
+                            false,
+                            story_document::BookDesign::default().profile(),
+                        )?;
+                        match self.app.publish_compile_artifact(
+                            &destination,
+                            &artifact,
+                            browser.overwrite_confirmed,
+                        ) {
+                            Ok(files) => {
+                                self.message = format!(
+                                    "Compiled {} · {} output file(s)",
+                                    destination.display(),
+                                    files.len()
+                                );
+                                close = true;
+                            }
+                            Err(error) => {
+                                self.message = format!("Compile failed: {error}");
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(c)
+                if browser.focus == 2
+                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
+            {
+                browser.name.push(c);
+                browser.overwrite_confirmed = false;
+            }
+            KeyCode::Backspace if browser.focus == 2 => {
+                browser.name.pop();
+                browser.overwrite_confirmed = false;
+            }
+            _ => {}
+        }
+        if !close {
+            self.file_browser = Some(browser);
+        }
+        Ok(())
+    }
+
     fn series_root(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
         if let Some(root) = self.selected_series_root.as_ref() {
             story_series::SeriesStore::open(root)?;
@@ -6253,8 +6568,10 @@ impl AppState {
         current_series_books(&self.app)
     }
     fn start_series_form(&mut self, command_id: &str) -> Result<(), Box<dyn std::error::Error>> {
+        if command_id == "file.new-project" {
+            return self.start_file_browser(FileBrowserPurpose::NewProject);
+        }
         let kind = match command_id {
-            "file.new-project" => SeriesFormKind::NewProject,
             "series.create" => SeriesFormKind::CreateSeries,
             "series.select" => SeriesFormKind::SelectSeries,
             "series.add-current" => SeriesFormKind::AddCurrentBook,
@@ -6266,8 +6583,7 @@ impl AppState {
         };
         if !matches!(
             kind,
-            SeriesFormKind::NewProject
-                | SeriesFormKind::CreateSeries
+            SeriesFormKind::CreateSeries
                 | SeriesFormKind::SelectSeries
                 | SeriesFormKind::CreateStoryLink
                 | SeriesFormKind::DeleteStoryLink
@@ -6329,50 +6645,6 @@ impl AppState {
         values: &[String],
     ) -> Result<(), Box<dyn std::error::Error>> {
         match kind {
-            SeriesFormKind::NewProject => {
-                let path = PathBuf::from(&values[0]);
-                if self.dirty {
-                    return Err(
-                        "save the current manuscript buffer before creating a project".into(),
-                    );
-                }
-                if self.active_challenge.is_some() {
-                    return Err(
-                        "finish or quit the active writing challenge before creating a project"
-                            .into(),
-                    );
-                }
-                if fs::symlink_metadata(&path).is_ok() {
-                    return Err("project destination already exists; choose a new directory".into());
-                }
-                let parent = path
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty());
-                if let Some(parent) = parent {
-                    fs::create_dir_all(parent)?;
-                }
-                if let Err(error) = fs::create_dir(&path) {
-                    return Err(if error.kind() == io::ErrorKind::AlreadyExists {
-                        "project destination already exists; choose a new directory".into()
-                    } else {
-                        error.into()
-                    });
-                }
-                if let Err(error) = WriterApp::create_project(&path, &values[1]) {
-                    let _ = fs::remove_dir_all(&path);
-                    return Err(error.into());
-                }
-                match self.switch_to_project(
-                    path.clone(),
-                    format!("Created and opened project: {}", values[1]),
-                ) {
-                    Ok(()) => {}
-                    Err(error) => {
-                        let _ = fs::remove_dir_all(path);
-                        return Err(error);
-                    }
-                }
-            }
             SeriesFormKind::CreateSeries => {
                 let series = story_series::SeriesStore::create(&values[0], &values[1])?;
                 self.selected_series_root = Some(series.root().to_owned());
@@ -9592,7 +9864,23 @@ impl AppState {
             }
             CommandAction::OpenRecentProjects => self.open_recent_project_picker(),
             CommandAction::OpenMenuCategory(index) => self.open_menu_category(index),
-            CommandAction::NewProject => self.start_series_form("file.new-project")?,
+            CommandAction::NewProject => {
+                if let Err(error) = self.start_file_browser(FileBrowserPurpose::NewProject) {
+                    self.message = format!("Could not open the project browser: {error}");
+                }
+            }
+            CommandAction::OpenProject => {
+                if let Err(error) = self.start_file_browser(FileBrowserPurpose::OpenProject) {
+                    self.message = format!("Could not open the project browser: {error}");
+                }
+            }
+            CommandAction::CompileWorkflow => {
+                if let Err(error) = self.start_file_browser(FileBrowserPurpose::Compile(
+                    story_document::CompileFormat::Docx,
+                )) {
+                    self.message = format!("Could not open the Compile browser: {error}");
+                }
+            }
             CommandAction::Save => self.save()?,
             CommandAction::RequestQuit => self.request_quit(),
             CommandAction::Help => {
@@ -15113,9 +15401,10 @@ impl AppState {
             }
             self.message = format!("Replaced {replacements} occurrence(s) in {changed} scene(s)");
         } else if cmd == "help" {
-            self.message="F1-F9, F11-F14 workspaces; hold Ctrl and press / or use F10 for the main menu; plain / remains available for writing and search; arrows navigate; Enter opens; : commands; Ctrl-S saves; Esc leaves manuscript editing; q quits from navigation".into();
+            self.show_context_help();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... | event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... | event-relationships EVENT-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-list | snippet-insert NAME [key=value...] | snippet-preview NAME [key=value...] | snippet-user-preview NAME [key=value...] | snippet-user-set NAME TEMPLATE | snippet-user-remove NAME | snippet-user-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | multi-replace START:END[,START:END...] TEXT | multi-replace-matches TEXT => REPLACEMENT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expansion-user-set ABBREVIATION => REPLACEMENT | text-expansion-user on|off|list | text-expansion-user-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | mark-set NAME | mark-list | mark-jump NAME | mark-clear NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message =
+                "Command not recognised. Open Help or Command Search to find an action.".into();
         }
         Ok(())
     }
@@ -17124,28 +17413,23 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             f.render_widget(canvas, body[1]);
         } else {
             let detail = if s.workspace == Workspace::Dashboard && s.scenes.is_empty() {
-                format!(
-                    "Welcome to Writer's IDE\n\nSelect Start Writing to create a chapter and first scene, then start drafting. Select Open or Import to continue an existing manuscript. Offline Help is available with ? .\n\n{}",
-                    s.message
-                )
+                "Welcome to Writer's IDE\n\nSelect Start Writing to create a chapter and first scene, then start drafting. Select Open or Import to continue an existing manuscript. Offline Help is available with ? .".into()
             } else if s.workspace == Workspace::Outline {
                 let row = workspace_items(s)
                     .get(s.selected)
                     .cloned()
                     .unwrap_or_else(|| "No outline row selected".into());
                 format!(
-                    "{row}\n\nEnter or Space toggles chapter collapse. Enter on a scene opens it.\n\n{}",
-                    s.message
+                    "{row}\n\nEnter or Space toggles chapter collapse. Enter on a scene opens it."
                 )
             } else if s.workspace == Workspace::Research && s.proposal_review_active {
                 format!(
-                    "{}\n\n{}\n\n{}",
+                    "{}\n\n{}",
                     workspace_items(s)
                         .get(s.proposal_review_index)
                         .map(String::as_str)
                         .unwrap_or("No proposal claim selected"),
-                    "Use :approve PROPOSAL-PATH CLAIM-INDEX or :dismiss PROPOSAL-PATH CLAIM-INDEX to record a decision.",
-                    s.message
+                    "Use :approve PROPOSAL-PATH CLAIM-INDEX or :dismiss PROPOSAL-PATH CLAIM-INDEX to record a decision."
                 )
             } else if matches!(
                 s.workspace,
@@ -17153,19 +17437,17 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             ) {
                 let selected = workspace_items(s).get(s.selected).cloned();
                 format!(
-                    "{}\n\n{}\n\n{}",
+                    "{}\n\n{}",
                     selected.as_deref().unwrap_or("No record selected"),
-                    "Enter inspects this record and its related story information.",
-                    s.message
+                    "Enter inspects this record and its related story information."
                 )
             } else if let Some((_, title, status, words)) = s.scenes.get(s.selected) {
                 format!(
-                    "Scene: {title}\nStatus: {}\nWords: {words}\n\nEnter opens the manuscript editor.\n\n{}",
-                    status.as_str(),
-                    s.message
+                    "Scene: {title}\nStatus: {}\nWords: {words}\n\nEnter opens the manuscript editor.",
+                    status.as_str()
                 )
             } else {
-                format!("{}\n\n{}", s.workspace.title(), s.message)
+                s.workspace.title().to_owned()
             };
             f.render_widget(
                 Paragraph::new(detail).wrap(Wrap { trim: false }).block(
@@ -17189,8 +17471,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             }
         };
         let mode = match panel.mode {
-            story_core::FindMode::Normal => "Normal",
-            story_core::FindMode::Extended => "Extended",
+            story_core::FindMode::Normal => "Literal",
+            story_core::FindMode::Extended => "Escapes",
+            story_core::FindMode::Wildcard => "Wildcards (*, ?)",
             story_core::FindMode::Regex => "Regex",
         };
         let replace_text = if panel.replacing {
@@ -17201,7 +17484,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         let help = if panel.replacing && s.pending_replace.is_some() {
             "F3: Next match · F6: Include/exclude match · F8: Include/exclude scene · F5: Apply reviewed changes · Esc: Back to fields"
         } else if panel.replacing {
-            "Tab/Shift+Tab: Find or Replace with · Enter: Review changes · F9: Replace next · F4: Change search area · Esc: Close"
+            "Tab: Replace field · Shift+Tab: Find field · Enter: Preview all · F9: Replace next match · F4: Change search area · Esc: Close"
         } else {
             "Enter: Find · F3/Shift+F3: Next/previous · F4: Change search area · Ctrl+H: Show Replace with · Esc: Close"
         };
@@ -17240,7 +17523,10 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 " Search in: {scope} · {mode} · {match_count} match(es) · {options}"
             )),
             Line::from(help),
-            Line::from(format!(" {}", s.message)),
+            Line::from(format!(
+                " {}",
+                truncate_display_cells(&s.message, rows[2].width.saturating_sub(2) as usize)
+            )),
         ];
         f.render_widget(
             Paragraph::new(lines).block(Block::default().borders(Borders::TOP)),
@@ -17264,7 +17550,11 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 sections[0],
             );
             f.render_widget(
-                Paragraph::new(s.message.as_str()).wrap(Wrap { trim: true }),
+                Paragraph::new(truncate_display_cells(
+                    &s.message,
+                    sections[1].width.saturating_sub(2) as usize,
+                ))
+                .wrap(Wrap { trim: true }),
                 sections[1],
             );
             let focus = if s.menu.is_some() {
@@ -17353,7 +17643,11 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         };
         if s.mode.is_none() && s.workspace != Workspace::Editor {
             f.render_widget(
-                Paragraph::new(_footer).block(Block::default().borders(Borders::TOP)),
+                Paragraph::new(truncate_display_cells(
+                    &_footer,
+                    rows[2].width.saturating_sub(2) as usize,
+                ))
+                .block(Block::default().borders(Borders::TOP)),
                 rows[2],
             );
         } else if s.mode.is_none() {
@@ -17432,11 +17726,20 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     effective_shortcut_label(s, "help.context", "Help menu")
                 )
             };
-            f.render_widget(Paragraph::new(actions), footer_rows[1]);
+            f.render_widget(
+                Paragraph::new(truncate_display_cells(
+                    &actions,
+                    footer_rows[1].width.saturating_sub(2) as usize,
+                )),
+                footer_rows[1],
+            );
         }
     }
     if s.menu.is_some() {
         draw_menu_overlay(f, s);
+    }
+    if s.file_browser.is_some() {
+        draw_file_browser_overlay(f, s);
     }
     if s.series_form.is_some() {
         draw_series_form_overlay(f, s);
@@ -17467,6 +17770,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
 fn context_help_panel(state: &AppState) -> HelpPanel {
     let context = if state.mode.is_some() {
         "Active dialogue".to_owned()
+    } else if state.file_browser.is_some() {
+        "File Browser".to_owned()
     } else if state.command_palette.is_some() {
         "Command Palette".to_owned()
     } else if state.recent_project_picker.is_some() {
@@ -17485,7 +17790,10 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
         )
     } else if state.find_panel.is_some() {
         "Search dialogue".to_owned()
-    } else if state.series_form.is_some() || state.keybinding_manager.is_some() {
+    } else if state.series_form.is_some()
+        || state.file_browser.is_some()
+        || state.keybinding_manager.is_some()
+    {
         "Dialogue".to_owned()
     } else {
         state.workspace.title().to_owned()
@@ -17512,10 +17820,13 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
             if state.dirty { "unsaved" } else { "saved" }
         ),
         format!(
-            "Quit: {} · in the manuscript editor, q is text; Esc returns to navigation",
+        "Quit: {} · in the manuscript editor, q is text; Esc returns to navigation",
             effective_shortcut_label(state, "file.quit", "Ctrl+Q")
         ),
     ];
+    if state.file_browser.is_some() {
+        lines.push("File browser: Tab/Shift+Tab changes panes and filename; Enter opens a folder; Backspace goes to the parent; Home opens your home folder; / opens filesystem root; F2 changes compile format; F5 confirms; F7 creates a folder; Esc cancels.".into());
+    }
     if state.workspace == Workspace::Editor {
         lines.push(
         "Editing: letters, /, ? and q are ordinary manuscript text; Tab inserts indentation. Esc leaves for Outline, where q quits"
@@ -19117,7 +19428,6 @@ fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let fields = form.kind.fields();
     let field = fields.get(form.values.len()).copied().unwrap_or("Value");
     let title = match form.kind {
-        SeriesFormKind::NewProject => " New Project ",
         SeriesFormKind::CreateStoryLink => " Create Story Relationship ",
         SeriesFormKind::DeleteStoryLink => " Remove Story Relationship ",
         _ => " Series setup ",
@@ -19151,6 +19461,189 @@ fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
         popup,
+    );
+}
+
+fn file_browser_entries(path: &Path) -> io::Result<Vec<(String, bool)>> {
+    let mut entries = fs::read_dir(path)?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let kind = entry.file_type().ok()?;
+            Some((name, kind.is_dir()))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        right
+            .1
+            .cmp(&left.1)
+            .then_with(|| left.0.to_lowercase().cmp(&right.0.to_lowercase()))
+    });
+    Ok(entries)
+}
+
+fn file_browser_ancestors(path: &Path) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    let mut cursor = Some(path);
+    while let Some(item) = cursor {
+        paths.push(item.to_owned());
+        cursor = item.parent();
+    }
+    paths.reverse();
+    paths
+}
+
+fn safe_filename(value: &str) -> String {
+    let cleaned = value
+        .chars()
+        .map(|character| {
+            if character.is_control() || matches!(character, '/' | '\\') {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let cleaned = cleaned.trim().trim_matches('.');
+    if cleaned.is_empty() {
+        "Manuscript".into()
+    } else {
+        cleaned.to_owned()
+    }
+}
+
+fn file_browser_leaf_name_is_safe(name: &str) -> bool {
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && Path::new(name)
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(browser) = s.file_browser.as_ref() else {
+        return;
+    };
+    let area = f.area();
+    if area.width < 30 || area.height < 12 {
+        return;
+    }
+    let popup = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    f.render_widget(Clear, popup);
+    let purpose = match browser.purpose {
+        FileBrowserPurpose::NewProject => "New Project · choose parent folder and project name",
+        FileBrowserPurpose::OpenProject => "Open Project · choose a Writer's IDE project folder",
+        FileBrowserPurpose::Compile(format) => match format {
+            story_document::CompileFormat::Docx => "Compile · DOCX",
+            story_document::CompileFormat::Epub => "Compile · EPUB",
+            story_document::CompileFormat::Pdf => "Compile · PDF",
+            story_document::CompileFormat::Html => "Compile · HTML",
+            story_document::CompileFormat::Markdown => "Compile · Markdown",
+            story_document::CompileFormat::PlainText => "Compile · Plain text",
+            story_document::CompileFormat::Latex => "Compile · LaTeX",
+            story_document::CompileFormat::Odt => "Compile · ODT",
+            story_document::CompileFormat::Rtf => "Compile · RTF",
+            story_document::CompileFormat::Azw3 => "Compile · AZW3",
+            story_document::CompileFormat::Mobi => "Compile · MOBI",
+        },
+    };
+    let block = Block::default()
+        .title(format!(" {purpose} "))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(2),
+        ])
+        .split(inner);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
+        .split(chunks[0]);
+    let ancestors = file_browser_ancestors(&browser.current_dir);
+    let left = ancestors
+        .iter()
+        .map(|path| {
+            ListItem::new(truncate_display_cells(
+                &path.display().to_string(),
+                columns[0].width.saturating_sub(2) as usize,
+            ))
+        })
+        .collect::<Vec<_>>();
+    f.render_stateful_widget(
+        List::new(left)
+            .block(
+                Block::default()
+                    .title("Directory tree · Home/root")
+                    .borders(Borders::ALL),
+            )
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White)),
+        columns[0],
+        &mut ListState::default().with_selected(Some(
+            browser.tree_selected.min(ancestors.len().saturating_sub(1)),
+        )),
+    );
+    let right = browser
+        .entries
+        .iter()
+        .map(|(name, is_dir)| ListItem::new(format!("{}{name}", if *is_dir { "▸ " } else { "  " })))
+        .collect::<Vec<_>>();
+    f.render_stateful_widget(
+        List::new(right)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
+            .block(
+                Block::default()
+                    .title("Folder contents")
+                    .borders(Borders::ALL),
+            ),
+        columns[1],
+        &mut ListState::default()
+            .with_selected((!browser.entries.is_empty()).then_some(browser.selected)),
+    );
+    f.render_widget(
+        Paragraph::new(format!(
+            "Selected path: {}",
+            browser.current_dir.join(&browser.name).display()
+        ))
+        .wrap(Wrap { trim: true }),
+        chunks[1],
+    );
+    f.render_widget(
+        Paragraph::new(format!(
+            "Name: {}{}",
+            browser.name,
+            if browser.focus == 2 { "▏" } else { "" }
+        ))
+        .style(Style::default().fg(Color::Yellow)),
+        chunks[2],
+    );
+    let message = if browser.overwrite_confirmed {
+        "F5 again: confirm overwrite · Esc: Cancel"
+    } else if matches!(browser.purpose, FileBrowserPurpose::Compile(_)) {
+        "↑/↓ browse · Enter Open · Home home · / root · Tab filename · F2 format · F5 Save/Compile · F7 New Folder · Backspace parent · Esc Cancel"
+    } else if browser.purpose == FileBrowserPurpose::OpenProject {
+        "↑/↓ browse · Enter Open folder · Home home · / root · F5 Open Project · Backspace parent · Esc Cancel"
+    } else {
+        "↑/↓ browse · Enter Open · Home home · / root · Tab project name · F5 Create Project · F7 New Folder · Backspace parent · Esc Cancel"
+    };
+    f.render_widget(
+        Paragraph::new(truncate_display_cells(message, chunks[3].width as usize))
+            .wrap(Wrap { trim: true }),
+        chunks[3],
     );
 }
 
@@ -21572,8 +22065,16 @@ fn handle_find_panel_key(
         return Ok(());
     }
     if key.code == KeyCode::F(5) && s.find_panel.as_ref().is_some_and(|panel| panel.replacing) {
-        if let Err(error) = s.execute_legacy_palette_command("replace-apply") {
-            s.message = error.to_string();
+        match s.execute_legacy_palette_command("replace-apply") {
+            Ok(()) if s.pending_replace.is_none() => {
+                let result = s.message.clone();
+                if let Err(error) = s.persist_find_panel_session() {
+                    s.message = format!("{result} · Find preferences could not be saved: {error}");
+                }
+                s.find_panel = None;
+            }
+            Ok(()) => {}
+            Err(error) => s.message = error.to_string(),
         }
         return Ok(());
     }
@@ -21606,9 +22107,10 @@ fn handle_find_panel_key(
     match key.code {
         KeyCode::F(2) => {
             panel.mode = match panel.mode {
-                story_core::FindMode::Normal => story_core::FindMode::Extended,
-                story_core::FindMode::Extended => story_core::FindMode::Regex,
-                story_core::FindMode::Regex => story_core::FindMode::Normal,
+                story_core::FindMode::Normal => story_core::FindMode::Wildcard,
+                story_core::FindMode::Wildcard => story_core::FindMode::Regex,
+                story_core::FindMode::Regex => story_core::FindMode::Extended,
+                story_core::FindMode::Extended => story_core::FindMode::Normal,
             };
         }
         KeyCode::F(6) => panel.case_sensitive = !panel.case_sensitive,
@@ -22114,6 +22616,14 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     }
     if s.keybinding_manager.is_some() {
         s.handle_keybinding_manager_key(k)?;
+        return Ok(false);
+    }
+    if s.file_browser.is_some() {
+        let previous_browser = s.file_browser.clone();
+        if let Err(error) = s.handle_file_browser_key(k) {
+            s.file_browser = previous_browser;
+            s.message = format!("File browser error: {error}");
+        }
         return Ok(false);
     }
     if s.series_form.is_some() {
@@ -23013,8 +23523,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                         .position(|command| command.id == "file.open-project")
                         .unwrap_or(0);
                     s.menu.as_mut().unwrap().selected = selected;
-                    s.message =
-                        "Open a project by path, or choose an import action from File".into();
+                    s.message = "Open a project folder or choose an import action from File".into();
                 }
                 2 => {
                     s.resume_tutorial()?;
@@ -23340,24 +23849,20 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         )
         .unwrap();
-        assert_eq!(state.prompt, "open-project ");
-        for character in target_path.to_string_lossy().chars() {
-            let modifiers = if character.is_ascii_uppercase() {
-                KeyModifiers::SHIFT
-            } else {
-                KeyModifiers::NONE
-            };
-            handle(
-                &mut state,
-                KeyEvent::new(KeyCode::Char(character), modifiers),
-            )
-            .unwrap();
+        assert!(state.file_browser.is_some());
+        {
+            let browser = state.file_browser.as_mut().unwrap();
+            browser.current_dir = target_root.path().to_owned();
+            browser.entries = file_browser_entries(target_root.path()).unwrap();
+            browser.selected = browser
+                .entries
+                .iter()
+                .position(|entry| entry.0 == "A Project With Spaces")
+                .unwrap();
         }
-        handle(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        )
-        .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
 
         assert_eq!(state.app.get_project().unwrap().title, "Target Novel");
         assert_eq!(state.app.project_root(), target_path);
@@ -23386,52 +23891,24 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         )
         .unwrap();
-        assert_eq!(
-            state.series_form.as_ref().unwrap().kind,
-            SeriesFormKind::NewProject
-        );
-        for character in root.path().join("A New Project").to_string_lossy().chars() {
-            let modifiers = if character.is_ascii_uppercase() {
-                KeyModifiers::SHIFT
-            } else {
-                KeyModifiers::NONE
-            };
-            handle(
-                &mut state,
-                KeyEvent::new(KeyCode::Char(character), modifiers),
-            )
-            .unwrap();
+        assert!(state.file_browser.is_some());
+        {
+            let browser = state.file_browser.as_mut().unwrap();
+            browser.current_dir = root.path().to_owned();
+            browser.entries = file_browser_entries(root.path()).unwrap();
+            browser.name = "A New Project".into();
         }
-        handle(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        )
-        .unwrap();
-        for character in "A New Novel".chars() {
-            let modifiers = if character.is_ascii_uppercase() {
-                KeyModifiers::SHIFT
-            } else {
-                KeyModifiers::NONE
-            };
-            handle(
-                &mut state,
-                KeyEvent::new(KeyCode::Char(character), modifiers),
-            )
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
-        }
-        handle(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        )
-        .unwrap();
 
-        assert_eq!(state.app.get_project().unwrap().title, "A New Novel");
+        assert_eq!(state.app.get_project().unwrap().title, "A New Project");
         assert_eq!(state.app.project_root(), root.path().join("A New Project"));
         assert!(state.message.contains("Created and opened project"));
     }
 
     #[test]
-    fn ctrl_n_opens_the_registered_new_project_form() {
+    fn ctrl_n_opens_the_registered_new_project_browser() {
         let root = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
         let mut state = AppState::new(app, default_bindings());
@@ -23442,18 +23919,11 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            state.series_form.as_ref().unwrap().kind,
-            SeriesFormKind::NewProject
-        );
-        assert_eq!(
-            SeriesFormKind::NewProject.fields(),
-            &["New project directory", "Project title"]
-        );
+        assert!(state.file_browser.is_some());
     }
 
     #[test]
-    fn command_palette_dispatches_new_project_through_the_same_form() {
+    fn command_palette_dispatches_new_project_through_the_same_browser() {
         let root = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
         let mut state = AppState::new(app, default_bindings());
@@ -23470,10 +23940,7 @@ mod tests {
         .unwrap();
 
         assert!(state.command_palette.is_none());
-        assert_eq!(
-            state.series_form.as_ref().unwrap().kind,
-            SeriesFormKind::NewProject
-        );
+        assert!(state.file_browser.is_some());
     }
 
     #[test]
@@ -23483,22 +23950,21 @@ mod tests {
         let target_path = root.path().join("Existing");
         drop(WriterApp::create_project(&target_path, "Keep Existing").unwrap());
         let mut state = AppState::new(current, default_bindings());
-        state.start_series_form("file.new-project").unwrap();
-        state.series_form.as_mut().unwrap().input = target_path.display().to_string();
-        handle(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        )
-        .unwrap();
-        state.series_form.as_mut().unwrap().input = "Must Not Replace".into();
-        handle(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        )
-        .unwrap();
+        state
+            .start_file_browser(FileBrowserPurpose::NewProject)
+            .unwrap();
+        {
+            let browser = state.file_browser.as_mut().unwrap();
+            browser.current_dir = root.path().to_owned();
+            browser.entries = file_browser_entries(root.path()).unwrap();
+            browser.name = "Existing".into();
+        }
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
 
         assert_eq!(state.app.get_project().unwrap().title, "Current");
-        assert!(state.message.contains("destination already exists"));
+        assert!(state.message.contains("already exists"));
         assert_eq!(
             WriterApp::open_project(&target_path)
                 .unwrap()
@@ -27405,6 +27871,7 @@ mod tests {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -29568,6 +30035,88 @@ mod tests {
     }
 
     #[test]
+    fn find_replace_fields_are_editable_before_search_and_wildcard_mode_is_explicit() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "cat cot cut")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        open_find_panel(&mut state, true);
+
+        handle(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            state.find_panel.as_ref().unwrap().field,
+            FindPanelField::Replacement
+        );
+        for character in "replacement first".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+        )
+        .unwrap();
+        for character in "missing".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            state.find_panel.as_ref().unwrap().replacement,
+            "replacement first"
+        );
+        assert_eq!(state.find_panel.as_ref().unwrap().pattern, "missing");
+        assert!(state.search_locations.is_empty());
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.find_panel.is_some());
+        assert!(state.pending_replace.is_none());
+        assert_eq!(
+            state.find_panel.as_ref().unwrap().replacement,
+            "replacement first"
+        );
+
+        handle(&mut state, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            state.find_panel.as_ref().unwrap().mode,
+            story_core::FindMode::Wildcard
+        );
+        for character in "c?t".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Wildcards (*, ?)") || rendered.contains("Wildcards"));
+        assert!(rendered.contains("Replace field"));
+    }
+
+    #[test]
     fn terminal_find_and_replace_use_each_scenes_locale() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -29617,6 +30166,38 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "Ankara and Iskenderun."
         );
+    }
+
+    #[test]
+    fn applying_replace_all_closes_find_panel_and_reports_result() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "word word")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        open_find_panel(&mut state, true);
+        {
+            let panel = state.find_panel.as_mut().unwrap();
+            panel.pattern = "word".into();
+            panel.replacement = "term".into();
+        }
+        state
+            .stage_replace_preview(
+                "current",
+                "word",
+                "term",
+                story_core::FindOptions::default(),
+                false,
+            )
+            .unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)).unwrap();
+        assert!(state.find_panel.is_none());
+        assert!(state.message.contains("Applied 2 replacement"));
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, "term term");
     }
 
     #[test]
@@ -30006,7 +30587,7 @@ mod tests {
             rendered.contains("Search in: Current scene"),
             "{rendered:?}"
         );
-        assert!(rendered.contains("Enter: Review changes"), "{rendered:?}");
+        assert!(rendered.contains("Enter: Preview all"), "{rendered:?}");
 
         handle(
             &mut state,
@@ -30280,6 +30861,7 @@ mod tests {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -30414,6 +30996,7 @@ mod tests {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -30544,6 +31127,7 @@ mod tests {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -30682,6 +31266,7 @@ mod tests {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -30970,6 +31555,7 @@ mod tests {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -31108,6 +31694,7 @@ mod tests {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -32230,11 +32817,11 @@ mod tests {
         let menu = state.menu.as_ref().expect("File menu should open");
         assert_eq!(MENU_CATEGORIES[menu.top], "File");
         assert_eq!(state.menu_commands()[menu.selected].id, "file.open-project");
-        assert!(state.message.contains("Open a project by path"));
+        assert!(state.message.contains("Open a project folder"));
     }
 
     #[test]
-    fn ctrl_o_opens_the_registered_project_path_prompt() {
+    fn ctrl_o_opens_the_registered_project_browser() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
         let mut state = AppState::new(app, default_bindings());
@@ -32245,8 +32832,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(state.mode, Some(':'));
-        assert_eq!(state.prompt, "open-project ");
+        assert!(state.file_browser.is_some());
     }
 
     #[test]
@@ -32390,6 +32976,7 @@ mod tests {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -32663,6 +33250,7 @@ mod tests {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -33071,6 +33659,7 @@ mod tests {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -33220,6 +33809,7 @@ mod tests {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -33421,6 +34011,7 @@ mod tests {
             series_form: None,
             recent_project_picker: None,
             recent_projects_path: None,
+            file_browser: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -33788,6 +34379,227 @@ mod tests {
         assert!(state.help_panel.is_some());
         handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
         assert!(state.help_panel.is_none());
+    }
+
+    #[test]
+    fn unknown_legacy_command_never_dumps_command_reference_into_scene_details_or_footer() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.switch(Workspace::Outline);
+
+        state
+            .execute_legacy_palette_command("not-a-real-command")
+            .unwrap();
+        assert_eq!(
+            state.message,
+            "Command not recognised. Open Help or Command Search to find an action."
+        );
+        assert!(!state.message.contains("Commands:"));
+        assert!(!state.message.contains("macro-record"));
+
+        for (width, height) in [(80, 24), (115, 60), (177, 60)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            if width >= 115 {
+                assert!(
+                    rendered.contains("Command not recognised"),
+                    "{width}x{height}"
+                );
+            }
+            assert!(
+                !rendered.contains("Commands: section TITLE"),
+                "{width}x{height}"
+            );
+            assert!(
+                !rendered.contains("scene-field SCENE FIELD"),
+                "{width}x{height}"
+            );
+            assert!(!rendered.contains("macro-record NAME"), "{width}x{height}");
+        }
+        assert!(state.app.get_scene(scene).is_ok());
+    }
+
+    #[test]
+    fn compile_format_command_opens_save_as_and_creates_docx() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project_path, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "The manuscript reaches the reader.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+
+        let publish_index = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Publish")
+            .unwrap();
+        state.open_menu_category(publish_index);
+        let compile_index = state.menu_visible_entries().iter().position(|entry| matches!(entry, MenuEntry::Command(command) if command.id == "compile.format")).unwrap();
+        state.menu.as_mut().unwrap().selected = compile_index;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::Compile(story_document::CompileFormat::Docx)
+        ));
+        let mut narrow =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        narrow.draw(|frame| draw(frame, &mut state)).unwrap();
+        let narrow_text = narrow
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(narrow_text.contains("Compile · DOCX"));
+        let mut wide = ratatui::Terminal::new(ratatui::backend::TestBackend::new(177, 60)).unwrap();
+        wide.draw(|frame| draw(frame, &mut state)).unwrap();
+        let wide_text = wide
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(wide_text.contains("Selected path:"));
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = directory.path().to_owned();
+        browser.name = "novel.docx".into();
+        browser.entries = file_browser_entries(directory.path()).unwrap();
+        fs::write(directory.path().join("novel.docx"), "existing output").unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.file_browser.as_ref().unwrap().overwrite_confirmed);
+        assert_eq!(
+            fs::read(directory.path().join("novel.docx")).unwrap(),
+            b"existing output"
+        );
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+
+        let output = directory.path().join("novel.docx");
+        assert!(output.is_file());
+        assert!(fs::metadata(output).unwrap().len() > 0);
+        let mut archive =
+            zip::ZipArchive::new(fs::File::open(directory.path().join("novel.docx")).unwrap())
+                .unwrap();
+        let mut document = String::new();
+        std::io::Read::read_to_string(
+            &mut archive.by_name("word/document.xml").unwrap(),
+            &mut document,
+        )
+        .unwrap();
+        assert!(document.contains("The manuscript reaches the reader."));
+        assert!(state.message.starts_with("Compiled"), "{}", state.message);
+        assert!(state.file_browser.is_none());
+    }
+
+    #[test]
+    fn new_project_browser_creates_project_inside_selected_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("Projects");
+        fs::create_dir(&root).unwrap();
+        let app = WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .dispatch_registered_command_id("file.new-project")
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = root.clone();
+        browser.entries = file_browser_entries(&root).unwrap();
+        browser.name = "New Novel".into();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.app.project_root(), root.join("New Novel"));
+        assert!(root.join("New Novel/project.toml").is_file());
+        assert!(state.file_browser.is_none());
+    }
+
+    #[test]
+    fn cancelling_file_browser_has_no_project_side_effect() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .dispatch_registered_command_id("file.new-project")
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = directory.path().to_owned();
+        browser.name = "Never Created".into();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!directory.path().join("Never Created").exists());
+        assert!(state.file_browser.is_none());
+        assert_eq!(state.message, "File selection cancelled");
+    }
+
+    #[test]
+    fn new_project_browser_rejects_parent_path_traversal() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
+        let parent = directory.path().join("Parent");
+        fs::create_dir(&parent).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .start_file_browser(FileBrowserPurpose::NewProject)
+            .unwrap();
+        {
+            let browser = state.file_browser.as_mut().unwrap();
+            browser.current_dir = parent;
+            browser.name = "../Escaped".into();
+        }
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        assert!(!directory.path().join("Escaped").exists());
+        assert!(state.file_browser.is_some());
+        assert!(state.message.contains("valid name"));
+    }
+
+    #[test]
+    fn open_project_browser_opens_selected_project_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let current =
+            WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
+        let target = directory.path().join("Target");
+        drop(WriterApp::create_project(&target, "Target").unwrap());
+        let mut state = AppState::new(current, default_bindings());
+        state
+            .dispatch_registered_command_id("file.open-project")
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = directory.path().to_owned();
+        browser.entries = file_browser_entries(directory.path()).unwrap();
+        browser.selected = browser
+            .entries
+            .iter()
+            .position(|entry| entry.0 == "Target")
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.app.project_root(), target);
+        assert_eq!(state.app.get_project().unwrap().title, "Target");
+        assert!(state.file_browser.is_none());
     }
 
     #[test]

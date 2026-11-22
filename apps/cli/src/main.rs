@@ -2888,8 +2888,9 @@ fn parse_find_mode(value: &str) -> Result<story_core::FindMode, Box<dyn std::err
     Ok(match value.to_ascii_lowercase().as_str() {
         "normal" => story_core::FindMode::Normal,
         "extended" => story_core::FindMode::Extended,
+        "wildcard" => story_core::FindMode::Wildcard,
         "regex" => story_core::FindMode::Regex,
-        _ => return Err("mode must be normal, extended, or regex".into()),
+        _ => return Err("mode must be normal, extended, wildcard, or regex".into()),
     })
 }
 

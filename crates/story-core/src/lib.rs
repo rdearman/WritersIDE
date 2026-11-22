@@ -465,6 +465,7 @@ fn is_unspaced_script_character(character: char) -> bool {
 pub enum FindMode {
     Normal,
     Extended,
+    Wildcard,
     Regex,
 }
 
@@ -511,6 +512,7 @@ pub fn find_matches_with_options(
     let mut source = match options.mode {
         FindMode::Normal => regex::escape(pattern),
         FindMode::Extended => regex::escape(&decode_extended(pattern)?),
+        FindMode::Wildcard => wildcard_expression(pattern),
         FindMode::Regex => pattern.to_owned(),
     };
     if options.whole_word {
@@ -605,6 +607,7 @@ pub fn find_matches_with_locale(
             turkic,
             accent_sensitive,
         )),
+        FindMode::Wildcard => wildcard_expression(&folded_pattern),
         FindMode::Regex => unreachable!(),
     };
     if options.whole_word {
@@ -722,6 +725,7 @@ pub fn replace_selected_matches_with_options(
     let replacement = match options.mode {
         FindMode::Normal => replacement.to_owned(),
         FindMode::Extended => decode_extended(replacement)?,
+        FindMode::Wildcard => replacement.to_owned(),
         FindMode::Regex => replacement.to_owned(),
     };
     let mut output = String::with_capacity(text.len());
@@ -755,6 +759,7 @@ fn build_find_regex(pattern: &str, options: FindOptions) -> Result<regex::Regex,
     let mut source = match options.mode {
         FindMode::Normal => regex::escape(pattern),
         FindMode::Extended => regex::escape(&decode_extended(pattern)?),
+        FindMode::Wildcard => wildcard_expression(pattern),
         FindMode::Regex => pattern.to_owned(),
     };
     if options.whole_word {
@@ -765,6 +770,21 @@ fn build_find_regex(pattern: &str, options: FindOptions) -> Result<regex::Regex,
         .multi_line(true)
         .build()
         .map_err(|error| format!("invalid regular expression: {error}"))
+}
+
+/// Converts a deliberately small, author-facing wildcard syntax to a regex.
+/// `*` matches zero or more Unicode scalar values, `?` matches one, and all
+/// other characters are literal. Wildcards are distinct from regex syntax.
+fn wildcard_expression(pattern: &str) -> String {
+    let mut expression = String::new();
+    for character in pattern.chars() {
+        match character {
+            '*' => expression.push_str(".*"),
+            '?' => expression.push('.'),
+            other => expression.push_str(&regex::escape(&other.to_string())),
+        }
+    }
+    expression
 }
 
 fn decode_extended(text: &str) -> Result<String, String> {
@@ -924,6 +944,28 @@ mod multilingual_tests {
             ("one\n22 two".to_owned(), 1)
         );
         assert!(find_matches(source, "[", FindMode::Regex).is_err());
+    }
+
+    #[test]
+    fn wildcard_search_is_explicit_literal_safe_and_supports_unicode_and_replacement() {
+        use super::{FindMode, find_matches, replace_matches};
+        let text = "cat cot cut cöt catapult\nfox";
+        assert_eq!(
+            find_matches(text, "c?t", FindMode::Wildcard).unwrap(),
+            [0..3, 4..7, 8..11, 12..16, 17..20]
+        );
+        assert_eq!(
+            find_matches(text, "c*t", FindMode::Wildcard).unwrap(),
+            std::iter::once(0..25).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            find_matches(text, "c.[t", FindMode::Wildcard).unwrap(),
+            Vec::<std::ops::Range<usize>>::new()
+        );
+        assert_eq!(
+            replace_matches(text, "c?t", "dog", FindMode::Wildcard).unwrap(),
+            ("dog dog dog dog dogapult\nfox".into(), 5)
+        );
     }
 
     #[test]
