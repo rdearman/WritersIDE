@@ -418,12 +418,12 @@ const MENU_CATEGORY_COMMAND_IDS: [&str; 8] = [
 ];
 const MENU_COMMON_COMMANDS: [&[&str]; 8] = [
     &[
+        "file.open-project",
         "file.save",
         "file.quit",
         "series.import-scrivener",
         "series.create",
         "series.open",
-        "series.select",
         "series.new-book",
     ],
     &[
@@ -1037,6 +1037,21 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 100,
             advanced: true,
             action: CommandAction::OpenMainMenu,
+        },
+        CommandSpec {
+            id: "file.open-project",
+            label: "Open Project",
+            description: "Open a Writer's IDE project directory",
+            category: "File",
+            default_shortcuts: &[],
+            mnemonic: Some('o'),
+            palette_aliases: &[],
+            palette_prefix: Some("open-project"),
+            takes_arguments: true,
+            task_group: "Project & Files",
+            menu_priority: 1,
+            advanced: false,
+            action: CommandAction::LegacyPalette,
         },
         CommandSpec {
             id: "file.save",
@@ -8978,6 +8993,17 @@ impl AppState {
             self.selected = 0;
             self.switch(Workspace::Series);
             self.message = "Series Books · Enter opens a book · Ctrl+/ → Series for create/import/reference actions".into();
+            return Ok(());
+        }
+        if let Some(path) = cmd
+            .strip_prefix("open-project ")
+            .or_else(|| cmd.strip_prefix("project-open "))
+        {
+            let path = path.trim();
+            if path.is_empty() {
+                return Err("use open-project PROJECT_DIRECTORY".into());
+            }
+            self.switch_to_project(PathBuf::from(path), format!("Opened project: {path}"))?;
             return Ok(());
         }
         if let Some(arguments) = cmd.strip_prefix("series-create ") {
@@ -21828,10 +21854,11 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     let selected = s
                         .menu_commands()
                         .iter()
-                        .position(|command| command.id.contains("import"))
+                        .position(|command| command.id == "file.open-project")
                         .unwrap_or(0);
                     s.menu.as_mut().unwrap().selected = selected;
-                    s.message = "Choose an Import command from File, or open a project from the command palette".into();
+                    s.message =
+                        "Open a project by path, or choose an import action from File".into();
                 }
                 2 => {
                     s.message = "The interactive tutorial is not available yet. Offline help is ready with ?".into();
@@ -22006,6 +22033,60 @@ mod tests {
             assert_eq!(command.category, "Series");
             assert!(matches!(command.action, CommandAction::LegacyPalette));
         }
+    }
+
+    #[test]
+    fn file_menu_opens_an_existing_project_by_path() {
+        let current_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let target_path = target_root.path().join("A Project With Spaces");
+        let target = WriterApp::create_project(&target_path, "Target Novel").unwrap();
+        drop(target);
+        let current =
+            WriterApp::create_project(current_root.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(current, default_bindings());
+
+        let file_menu = MENU_CATEGORIES
+            .iter()
+            .position(|name| *name == "File")
+            .unwrap();
+        state.menu = Some(MenuState {
+            top: file_menu,
+            selected: 0,
+            all_commands: false,
+            group: None,
+        });
+        assert!(
+            state
+                .menu_commands()
+                .iter()
+                .any(|command| command.id == "file.open-project")
+        );
+
+        state.mode = Some(':');
+        state.prompt = format!("open-project {}", target_path.display());
+        state.command().unwrap();
+
+        assert_eq!(state.app.get_project().unwrap().title, "Target Novel");
+        assert_eq!(state.app.project_root(), target_path);
+        assert!(state.message.contains("Opened project"));
+    }
+
+    #[test]
+    fn opening_another_project_refuses_to_discard_a_dirty_buffer() {
+        let current_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let target_path = target_root.path().join("Target");
+        drop(WriterApp::create_project(&target_path, "Target").unwrap());
+        let app =
+            WriterApp::create_project(current_root.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.dirty = true;
+        state.mode = Some(':');
+        state.prompt = format!("open-project {}", target_path.display());
+
+        assert!(state.command().is_err());
+        assert_eq!(state.app.get_project().unwrap().title, "Current");
     }
 
     #[test]
@@ -30329,6 +30410,27 @@ mod tests {
     }
 
     #[test]
+    fn blank_project_open_or_import_action_starts_with_open_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Dashboard;
+        state.scenes.clear();
+        state.selected = 1;
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        let menu = state.menu.as_ref().expect("File menu should open");
+        assert_eq!(MENU_CATEGORIES[menu.top], "File");
+        assert_eq!(state.menu_commands()[menu.selected].id, "file.open-project");
+        assert!(state.message.contains("Open a project by path"));
+    }
+
+    #[test]
     fn blank_dashboard_start_writing_creates_the_right_first_document_for_each_book_type() {
         let directory = tempfile::tempdir().unwrap();
         let mut fiction =
@@ -30372,11 +30474,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(MENU_CATEGORIES[import_state.menu.unwrap().top], "File");
+        let file_actions = import_state.menu_commands();
+        assert_eq!(
+            file_actions[import_state.menu.unwrap().selected].id,
+            "file.open-project"
+        );
         assert!(
-            import_state
-                .menu_commands()
-                .get(import_state.menu.unwrap().selected)
-                .is_some_and(|command| command.id.contains("import"))
+            file_actions
+                .iter()
+                .any(|command| command.id == "series.import-scrivener")
         );
     }
 
