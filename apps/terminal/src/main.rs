@@ -21209,7 +21209,9 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             KeyCode::Backspace => {
                 s.prompt.pop();
             }
-            KeyCode::Char(c) if k.modifiers.is_empty() => s.prompt.push(c),
+            KeyCode::Char(c) if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT => {
+                s.prompt.push(c)
+            }
             _ => {}
         }
         return Ok(false);
@@ -22063,9 +22065,29 @@ mod tests {
                 .any(|command| command.id == "file.open-project")
         );
 
-        state.mode = Some(':');
-        state.prompt = format!("open-project {}", target_path.display());
-        state.command().unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.prompt, "open-project ");
+        for character in target_path.to_string_lossy().chars() {
+            let modifiers = if character.is_ascii_uppercase() {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), modifiers),
+            )
+            .unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
 
         assert_eq!(state.app.get_project().unwrap().title, "Target Novel");
         assert_eq!(state.app.project_root(), target_path);
