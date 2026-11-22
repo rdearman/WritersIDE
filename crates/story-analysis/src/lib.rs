@@ -109,9 +109,102 @@ pub struct ProofreadingFinding {
     pub message: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TypographySuggestion {
+    pub byte_range: std::ops::Range<usize>,
+    pub original: String,
+    pub replacement: String,
+    pub message: String,
+}
+
+/// Return optional, non-mutating typography suggestions for a document language.
+/// Suggestions are byte-mapped to the original UTF-8 text and require explicit author action.
+pub fn typography_suggestions(text: &str, language: &str) -> Vec<TypographySuggestion> {
+    let primary = language
+        .split(['-', '_'])
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let mut suggestions = Vec::new();
+
+    if primary == "fr" {
+        let chars = text.char_indices().collect::<Vec<_>>();
+        for pair in chars.windows(2) {
+            let (space_start, space) = pair[0];
+            let (punctuation_start, punctuation) = pair[1];
+            if matches!(space, ' ' | '\u{00a0}')
+                && matches!(punctuation, ';' | ':' | '!' | '?')
+                && space_start > 0
+                && !text[..space_start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace)
+            {
+                let end = punctuation_start + punctuation.len_utf8();
+                suggestions.push(TypographySuggestion {
+                    byte_range: space_start..end,
+                    original: text[space_start..end].to_owned(),
+                    replacement: format!("\u{202f}{punctuation}"),
+                    message: "French typography convention: use a narrow no-break space before this punctuation".into(),
+                });
+            }
+        }
+        let quote_offsets = text
+            .char_indices()
+            .filter_map(|(offset, character)| (character == '"').then_some(offset))
+            .collect::<Vec<_>>();
+        for pair in quote_offsets.as_chunks::<2>().0 {
+            for (offset, replacement) in [(pair[0], "«\u{202f}"), (pair[1], "\u{202f}»")] {
+                suggestions.push(TypographySuggestion {
+                    byte_range: offset..offset + 1,
+                    original: "\"".into(),
+                    replacement: replacement.into(),
+                    message: "French quotation style suggestion".into(),
+                });
+            }
+        }
+    } else if primary == "it" {
+        let chars = text.char_indices().collect::<Vec<_>>();
+        for (index, (offset, character)) in chars.iter().copied().enumerate() {
+            if character == '\''
+                && index > 0
+                && index + 1 < chars.len()
+                && chars[index - 1].1.is_alphabetic()
+                && chars[index + 1].1.is_alphabetic()
+            {
+                suggestions.push(TypographySuggestion {
+                    byte_range: offset..offset + character.len_utf8(),
+                    original: "'".into(),
+                    replacement: "’".into(),
+                    message: "Italian typographic apostrophe suggestion".into(),
+                });
+            }
+        }
+        let quote_offsets = text
+            .char_indices()
+            .filter_map(|(offset, character)| (character == '"').then_some(offset))
+            .collect::<Vec<_>>();
+        for pair in quote_offsets.as_chunks::<2>().0 {
+            for (offset, replacement) in [(pair[0], "“"), (pair[1], "”")] {
+                suggestions.push(TypographySuggestion {
+                    byte_range: offset..offset + 1,
+                    original: "\"".into(),
+                    replacement: replacement.into(),
+                    message: "Italian quotation style suggestion".into(),
+                });
+            }
+        }
+    }
+    suggestions.sort_by_key(|suggestion| (suggestion.byte_range.start, suggestion.byte_range.end));
+    suggestions
+}
+
 #[cfg(test)]
 mod proofread_tests {
-    use super::{ProofreadingConfig, ProofreadingRule, proofread, proofread_with_config};
+    use super::{
+        ProofreadingConfig, ProofreadingRule, proofread, proofread_with_config,
+        typography_suggestions,
+    };
 
     #[test]
     fn mechanical_findings_are_unicode_byte_mapped_and_non_mutating() {
@@ -152,6 +245,48 @@ mod proofread_tests {
         assert_eq!(&text[finding.byte_range.clone()], "was followed");
         assert_eq!(finding.severity, "warning");
         assert!(ProofreadingConfig::from_toml("version=1\n[[rules]]\nid='x'\nenabled=true\nkind='regex'\npattern='['\nseverity='warning'\nmessage='bad'").is_err());
+    }
+
+    #[test]
+    fn typography_suggestions_are_language_scoped_non_mutating_and_utf8_mapped() {
+        let french = "Déjà vu ! \"où ?\"";
+        let suggestions = typography_suggestions(french, "fr-FR");
+        assert_eq!(french, "Déjà vu ! \"où ?\"");
+        assert!(suggestions.iter().any(|suggestion| {
+            suggestion.original == " !"
+                && suggestion.replacement == "\u{202f}!"
+                && suggestion.byte_range.start > 0
+        }));
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.replacement == "«\u{202f}")
+        );
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.replacement == "\u{202f}»")
+        );
+
+        let italian = "L'amore è \"qui\".";
+        let suggestions = typography_suggestions(italian, "it-IT");
+        assert!(
+            suggestions.iter().any(|suggestion| {
+                suggestion.original == "'" && suggestion.replacement == "’"
+            })
+        );
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.replacement == "“")
+        );
+        assert!(
+            suggestions
+                .iter()
+                .any(|suggestion| suggestion.replacement == "”")
+        );
+        assert!(typography_suggestions("Where?", "en-GB").is_empty());
+        assert!(typography_suggestions("안녕하세요?", "ko-KR").is_empty());
     }
 }
 

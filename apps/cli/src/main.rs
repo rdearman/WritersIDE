@@ -1430,6 +1430,41 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        "typography-preview" => {
+            let path = args.next().ok_or("missing project path")?;
+            let scope = args.next().unwrap_or_else(|| "all".into());
+            if args.next().is_some() {
+                return Err("too many arguments".into());
+            }
+            let app = WriterApp::open_project(path)?;
+            let project = app.get_project()?;
+            let scene_id = if scope == "all" {
+                None
+            } else {
+                let value = scope.strip_prefix("scene:").unwrap_or(&scope);
+                Some(story_core::SceneId(uuid::Uuid::parse_str(value)?))
+            };
+            for scene in app
+                .list_scenes(false)?
+                .into_iter()
+                .filter(|record| scene_id.is_none_or(|id| id == record.scene.id))
+            {
+                let language = scene.scene.effective_language_code(&project);
+                let (text, _) = app.load_scene_text(scene.scene.id)?;
+                for suggestion in story_analysis::typography_suggestions(&text, language) {
+                    println!(
+                        "{}\t{}\t{}..{}\t'{}' -> '{}'\t{}",
+                        scene.scene.id,
+                        scene.scene.title,
+                        suggestion.byte_range.start,
+                        suggestion.byte_range.end,
+                        suggestion.original,
+                        suggestion.replacement,
+                        suggestion.message
+                    );
+                }
+            }
+        }
         "proofread" => {
             let path = args.next().ok_or("missing project path")?;
             let scope = args.next().unwrap_or_else(|| "all".into());
@@ -3016,6 +3051,9 @@ fn usage() {
     );
     eprintln!(
         "writers-ide proofread-config <project> (creates editable .writers-ide/diagnostics.toml)"
+    );
+    eprintln!(
+        "writers-ide typography-preview <project> [all|scene:SCENE-UUID] (read-only suggestions)"
     );
     eprintln!(
         "writers-ide find <path> <normal|extended|regex> <all|scene-uuid|chapter:uuid|assembly:uuid|selected:uuid,uuid> <pattern>\nwriters-ide replace-preview <path> <normal|extended|regex> <scope> <pattern> => <replacement>\nwriters-ide replace-apply <path> <preview.json>\nwriters-ide replace-undo <path>\nwriters-ide replace-recover <path>\nwriters-ide tags-export <path>\nwriters-ide replace <path> <normal|extended|regex> <scope> <pattern> => <replacement>\nwriters-ide language <path> [language-tag]"

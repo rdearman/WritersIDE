@@ -1827,6 +1827,14 @@ fn command_registry() -> Vec<CommandSpec> {
             false,
         ),
         legacy_command(
+            "language.typography-preview",
+            "Preview Typography Suggestions",
+            "Show optional non-destructive typography suggestions for the current scene language",
+            "Edit",
+            "typography-preview",
+            false,
+        ),
+        legacy_command(
             "mention.jump",
             "Jump to Story Mention",
             "Navigate to a detected passage",
@@ -7956,6 +7964,40 @@ impl AppState {
                     " · unconfirmed candidate; no story facts changed"
                 }
             );
+        } else if cmd == "typography-preview" {
+            let scene_id = self
+                .editing_scene
+                .or_else(|| self.active_scene())
+                .ok_or("open or select a scene first")?;
+            if self.dirty {
+                self.message = "Save the scene before previewing language typography".into();
+                return Ok(());
+            }
+            let record = self.app.get_scene(scene_id)?;
+            let project = self.app.get_project()?;
+            let language = record.scene.effective_language_code(&project).to_owned();
+            let (text, _) = self.app.load_scene_text(scene_id)?;
+            let suggestions = story_analysis::typography_suggestions(&text, &language);
+            self.message = if suggestions.is_empty() {
+                format!("No typography suggestions for {language}")
+            } else {
+                suggestions
+                    .into_iter()
+                    .map(|suggestion| {
+                        format!(
+                            "{}..{} '{}' → '{}' ({})",
+                            suggestion.byte_range.start,
+                            suggestion.byte_range.end,
+                            suggestion.original,
+                            suggestion.replacement,
+                            suggestion.message
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            };
+            self.message
+                .push_str(" · preview only; manuscript unchanged");
         } else if let Some(value) = cmd.strip_prefix("mention-jump ") {
             let mention_id = story_core::MentionId(value.trim().parse()?);
             let scene_id = self
@@ -18803,6 +18845,27 @@ mod tests {
                 .contains("A small brass key with a red thread")
         );
         assert!(state.message.contains("participation is separate"));
+    }
+
+    #[test]
+    fn typography_preview_uses_scene_language_and_never_edits_canonical_text() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("French"), "French").unwrap();
+        let chapter = app.create_chapter(None, "Chapitre", 0).unwrap();
+        let scene = app.create_scene(chapter, "Dialogue", 0).unwrap();
+        app.set_scene_language(scene, Some("fr-FR")).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Bonjour ! \"où ?\"")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        let before = state.app.load_scene_text(scene).unwrap();
+        state
+            .execute_legacy_palette_command("typography-preview")
+            .unwrap();
+        assert!(state.message.contains("narrow no-break space"));
+        assert!(state.message.contains("preview only; manuscript unchanged"));
+        assert_eq!(state.app.load_scene_text(scene).unwrap(), before);
     }
 
     #[test]
