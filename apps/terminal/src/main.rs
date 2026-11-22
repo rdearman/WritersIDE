@@ -21867,20 +21867,18 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 }
                 KeyCode::Char('s' | 'S') => {
                     if let Err(error) = s.save() {
-                        s.prompt =
-                            "Save and Quit (s) · Quit Without Saving (d) · Cancel (Esc)".into();
+                        s.prompt = "Retry (s) · Review (v) · Recovery Copy (r) · Quit Without Saving (d) · Edit (Esc)".into();
                         s.message = format!(
-                            "Save failed. Your in-memory text is still open and unsaved: {error}. Press s to retry, d to quit without saving, or Esc to continue editing. {}",
+                            "Save failed. The on-disk manuscript was not replaced and your in-memory text is still unsaved: {error}. Review the versions, save a separate recovery copy, retry, discard and quit, or return to editing. {}",
                             s.save_conflict_context()
                         );
                         return Ok(false);
                     }
                     if s.dirty {
                         let reason = s.message.clone();
-                        s.prompt =
-                            "Save and Quit (s) · Quit Without Saving (d) · Cancel (Esc)".into();
+                        s.prompt = "Retry (s) · Review (v) · Recovery Copy (r) · Quit Without Saving (d) · Edit (Esc)".into();
                         s.message = format!(
-                            "The manuscript was not saved, so you are still in the quit choices. Your in-memory text remains open and unsaved. {reason} {}",
+                            "The manuscript was not saved, so you are still in the quit choices. Your in-memory text remains unsaved and the on-disk version remains intact. Review the versions, save a separate recovery copy, retry, discard and quit, or return to editing. {reason} {}",
                             s.save_conflict_context()
                         );
                         return Ok(false);
@@ -21894,6 +21892,34 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                         "Quit without saving; the existing on-disk manuscript was left unchanged"
                             .into();
                     return Ok(true);
+                }
+                KeyCode::Char('r' | 'R') => {
+                    let text = s.editor.join("\n");
+                    match s.write_recovery_text(&text) {
+                        Ok(path) => {
+                            s.prompt = "Saved copy · Retry (s) · Review (v) · Quit Without Saving (d) · Edit (Esc)".into();
+                            s.message = format!(
+                                "A separate recovery copy of your in-memory text was saved to {}. The on-disk manuscript was not changed; the editor remains unsaved.",
+                                path.display()
+                            );
+                        }
+                        Err(error) => {
+                            s.message = format!(
+                                "Could not save the separate recovery copy: {error}. Your in-memory text remains open and unsaved; the on-disk manuscript was not changed. Press r to retry, d to quit without saving, or Esc to return to editing. {}",
+                                s.save_conflict_context()
+                            );
+                        }
+                    }
+                    return Ok(false);
+                }
+                KeyCode::Char('v' | 'V') => {
+                    s.mode = Some('R');
+                    s.prompt = "Review Versions (v) · Save Recovery Copy (r) · Use Saved Version (u) · Keep My Changes (k) · Cancel (Esc)".into();
+                    s.message = format!(
+                        "Conflict review opened from the quit dialogue. Your in-memory text remains available. {}",
+                        s.save_conflict_context()
+                    );
+                    return Ok(false);
                 }
                 _ => return Ok(false),
             }
@@ -30819,7 +30845,7 @@ mod tests {
         assert!(state.message.contains("Project: Novel"));
         assert!(state.message.contains("Document: Scene"));
         assert!(state.message.contains("On-disk modified:"));
-        assert!(state.prompt.contains("Quit Without Saving") && state.prompt.contains("Cancel"));
+        assert!(state.prompt.contains("Quit Without Saving") && state.prompt.contains("Review"));
         assert!(
             !handle(
                 &mut state,
@@ -30827,7 +30853,13 @@ mod tests {
             )
             .unwrap()
         );
-        assert_eq!(state.mode, Some('q'));
+        assert_eq!(state.mode, Some('R'));
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
         assert!(
             handle(
                 &mut state,
@@ -30892,7 +30924,81 @@ mod tests {
         assert!(screen.contains("Save Ctrl+S"));
         assert!(screen.contains("Menu Ctrl+/ or F10"));
         assert!(screen.contains("Help Help menu"));
-        assert!(screen.contains("Quit Without Saving"));
+        assert!(screen.contains("Quit Without Saving") || screen.contains("Quit Without Sav"));
+    }
+
+    #[test]
+    fn quit_conflict_can_save_memory_recovery_without_replacing_disk_then_discard() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Original saved version")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["My in-memory edits".into()];
+        state.dirty = true;
+
+        let mut concurrent = WriterApp::open_project(&project).unwrap();
+        let (_, current_hash) = concurrent.load_scene_text(scene).unwrap();
+        concurrent
+            .save_scene_text(scene, Some(&current_hash), "Newer on-disk version")
+            .unwrap();
+
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(
+            !handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)
+            )
+            .unwrap()
+        );
+        assert!(state.prompt.contains("Review (v)"));
+        assert!(state.prompt.contains("Recovery Copy (r)"));
+
+        assert!(
+            !handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE)
+            )
+            .unwrap()
+        );
+        assert!(state.dirty);
+        assert!(state.message.contains("separate recovery copy"));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Newer on-disk version"
+        );
+        let recovery_dir = project.join(".writers-ide/recovery");
+        let recovery_files = fs::read_dir(&recovery_dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>();
+        assert_eq!(recovery_files.len(), 1);
+        assert_eq!(
+            fs::read_to_string(&recovery_files[0]).unwrap(),
+            "My in-memory edits"
+        );
+
+        assert!(
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Newer on-disk version"
+        );
     }
 
     #[test]
