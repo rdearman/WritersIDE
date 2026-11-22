@@ -209,6 +209,8 @@ struct AppState {
     series_references: Vec<SeriesReferenceRow>,
     scrivener_import: Option<ScrivenerImportWizard>,
     series_form: Option<SeriesActionForm>,
+    recent_project_picker: Option<RecentProjectPicker>,
+    recent_projects_path: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -405,6 +407,18 @@ struct CommandHistoryFile {
     commands: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct RecentProjectsFile {
+    version: u16,
+    paths: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug)]
+struct RecentProjectPicker {
+    paths: Vec<PathBuf>,
+    selected: usize,
+}
+
 const MENU_CATEGORIES: [&str; 8] = [
     "File", "Edit", "Insert", "Navigate", "Review", "Publish", "Tools", "Help",
 ];
@@ -422,11 +436,10 @@ const MENU_COMMON_COMMANDS: [&[&str]; 8] = [
     &[
         "file.new-project",
         "file.open-project",
+        "file.recent-projects",
+        "series.import-scrivener",
         "file.save",
         "file.quit",
-        "series.import-scrivener",
-        "series.create",
-        "series.open",
     ],
     &[
         "search.find-panel",
@@ -914,6 +927,7 @@ enum CommandAction {
     OpenMainMenu,
     OpenCommandPalette,
     OpenMenuCategory(usize),
+    OpenRecentProjects,
     NewProject,
     Save,
     RequestQuit,
@@ -1070,6 +1084,21 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 2,
             advanced: false,
             action: CommandAction::LegacyPalette,
+        },
+        CommandSpec {
+            id: "file.recent-projects",
+            label: "Recent Projects",
+            description: "Open a project from the portable list of recently used projects",
+            category: "File",
+            default_shortcuts: &[],
+            mnemonic: Some('r'),
+            palette_aliases: &["recent-projects"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Projects & Files",
+            menu_priority: 3,
+            advanced: false,
+            action: CommandAction::OpenRecentProjects,
         },
         CommandSpec {
             id: "file.save",
@@ -4190,6 +4219,47 @@ fn user_keymap_path() -> PathBuf {
     config_root.join("writers-ide/keybindings.toml")
 }
 
+fn user_recent_projects_path() -> PathBuf {
+    user_keymap_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("recent-projects.json")
+}
+
+fn load_recent_projects(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    let file = match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<RecentProjectsFile>(&bytes)?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if file.version != 1 {
+        return Err(format!("unsupported recent-projects version {}", file.version).into());
+    }
+    let mut paths = Vec::new();
+    for path in file.paths {
+        if !paths.contains(&path) && paths.len() < 12 {
+            paths.push(path);
+        }
+    }
+    Ok(paths)
+}
+
+fn remember_recent_project(
+    store_path: &Path,
+    project_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project_path = project_path.canonicalize()?;
+    if !project_path.join("project.toml").is_file() {
+        return Err("recent project must contain project.toml".into());
+    }
+    let mut paths = load_recent_projects(store_path)?;
+    paths.retain(|path| path != &project_path);
+    paths.insert(0, project_path);
+    paths.truncate(12);
+    let value = serde_json::to_value(RecentProjectsFile { version: 1, paths })?;
+    write_json_atomically(store_path, &value)
+}
+
 fn read_keymap_file(path: &Path) -> Result<Option<KeymapFile>, Box<dyn std::error::Error>> {
     match fs::read_to_string(path) {
         Ok(text) => Ok(Some(toml::from_str(&text)?)),
@@ -4417,6 +4487,7 @@ fn effective_command_shortcuts(state: &AppState, command: CommandSpec) -> Vec<St
             || state.menu.is_some()
             || state.mode.is_some()
             || state.command_palette.is_some()
+            || state.recent_project_picker.is_some()
             || state.find_panel.is_some()
             || state.series_form.is_some()
             || state.keybinding_manager.is_some()
@@ -4508,6 +4579,7 @@ fn active_keybinding_context(state: &AppState) -> &'static str {
     } else if state.mode.is_some()
         || state.find_panel.is_some()
         || state.series_form.is_some()
+        || state.recent_project_picker.is_some()
         || state.keybinding_manager.is_some()
     {
         "dialog"
@@ -4919,6 +4991,8 @@ impl AppState {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings,
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -5870,6 +5944,68 @@ impl AppState {
 
         self.switch_to_project(path, format!("Opened series book: {}", book.title))
     }
+    fn open_recent_project_picker(&mut self) {
+        let Some(path) = self.recent_projects_path.as_deref() else {
+            self.message = "Recent projects are unavailable in this session".into();
+            return;
+        };
+        match load_recent_projects(path) {
+            Ok(paths) if paths.is_empty() => {
+                self.recent_project_picker = None;
+                self.message = "No recent projects yet · use File > Open Project".into();
+            }
+            Ok(paths) => {
+                self.recent_project_picker = Some(RecentProjectPicker { paths, selected: 0 });
+                self.message = "↑/↓ choose a project · Enter opens · Esc returns".into();
+            }
+            Err(error) => {
+                self.recent_project_picker = None;
+                self.message = format!("Recent projects could not be read: {error}");
+            }
+        }
+    }
+
+    fn handle_recent_project_picker_key(
+        &mut self,
+        key: KeyEvent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(picker) = self.recent_project_picker.as_mut() else {
+            return Ok(());
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.recent_project_picker = None;
+                self.message = "Recent projects closed".into();
+            }
+            KeyCode::Up if !picker.paths.is_empty() => {
+                picker.selected = if picker.selected == 0 {
+                    picker.paths.len() - 1
+                } else {
+                    picker.selected - 1
+                };
+            }
+            KeyCode::Down if !picker.paths.is_empty() => {
+                picker.selected = (picker.selected + 1) % picker.paths.len();
+            }
+            KeyCode::Enter if !picker.paths.is_empty() => {
+                let path = picker.paths[picker.selected].clone();
+                if !path.join("project.toml").is_file() {
+                    self.message = format!(
+                        "Recent project is unavailable at {}; remove or relocate it before opening",
+                        path.display()
+                    );
+                    return Ok(());
+                }
+                match self.switch_to_project(path.clone(), format!("Opened {}", path.display())) {
+                    Ok(()) => {}
+                    Err(error) => self.message = format!("Project was not opened: {error}"),
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn series_root(&self) -> Result<PathBuf, Box<dyn std::error::Error>> {
         if let Some(root) = self.selected_series_root.as_ref() {
             story_series::SeriesStore::open(root)?;
@@ -6089,6 +6225,7 @@ impl AppState {
         path: PathBuf,
         notice: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let recent_projects_path = self.recent_projects_path.clone();
         if self.dirty {
             return Err("save the current manuscript buffer before changing books".into());
         }
@@ -6102,6 +6239,7 @@ impl AppState {
         let mut app = WriterApp::open_project(&path)?;
         app.recover_interrupted_writing_challenges()?;
         let mut next = Self::new(app, function_bindings);
+        next.recent_projects_path = recent_projects_path.clone();
         next.command_bindings = command_bindings;
         next.context_command_bindings = context_command_bindings;
         next.message = [function_warning, command_warning]
@@ -6115,6 +6253,14 @@ impl AppState {
         next.restore_session()?;
         next.refresh()?;
         next.message = notice;
+        if let Some(recent_path) = recent_projects_path
+            && let Err(error) = remember_recent_project(&recent_path, &path)
+        {
+            next.message = format!(
+                "{} · Recent-project history was not saved: {error}",
+                next.message
+            );
+        }
         *self = next;
         Ok(())
     }
@@ -8007,6 +8153,7 @@ impl AppState {
     fn toggle_menu(&mut self) {
         self.pending_command_sequence = None;
         self.command_palette = None;
+        self.recent_project_picker = None;
         if self.menu.take().is_some() {
             self.message = "Menu closed; editor focus restored".into();
         } else {
@@ -8910,6 +9057,7 @@ impl AppState {
                     self.message = "Search commands · recent commands appear first".into();
                 }
             }
+            CommandAction::OpenRecentProjects => self.open_recent_project_picker(),
             CommandAction::OpenMenuCategory(index) => self.open_menu_category(index),
             CommandAction::NewProject => self.start_series_form("file.new-project")?,
             CommandAction::Save => self.save()?,
@@ -8965,6 +9113,7 @@ impl AppState {
     fn request_quit(&mut self) {
         self.help_panel = None;
         self.command_palette = None;
+        self.recent_project_picker = None;
         self.find_panel = None;
         self.menu = None;
         self.series_form = None;
@@ -15374,6 +15523,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = WriterApp::open_project(&project_path)?;
     app.recover_interrupted_writing_challenges()?;
     let mut state = AppState::new(app, function_bindings);
+    let recent_projects_path = user_recent_projects_path();
+    state.recent_projects_path = Some(recent_projects_path.clone());
     state.command_bindings = command_bindings;
     state.context_command_bindings = context_command_bindings;
     state.message = [function_warning, command_warning, context_command_warning]
@@ -15381,6 +15532,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .flatten()
         .collect::<Vec<_>>()
         .join(" · ");
+    if let Err(error) = remember_recent_project(&recent_projects_path, &project_path) {
+        state.message = [
+            state.message.clone(),
+            format!("Recent-project history was not saved: {error}"),
+        ]
+        .into_iter()
+        .filter(|message| !message.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
+    }
     state.restore_session()?;
     state.refresh()?;
     let mut terminal = setup()?;
@@ -16604,6 +16765,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.command_palette.is_some() {
         draw_command_palette_overlay(f, s);
     }
+    if s.recent_project_picker.is_some() {
+        draw_recent_project_picker_overlay(f, s);
+    }
     if s.help_panel.is_some() {
         draw_help_overlay(f, s);
     }
@@ -16614,6 +16778,8 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
         "Active dialogue".to_owned()
     } else if state.command_palette.is_some() {
         "Command Palette".to_owned()
+    } else if state.recent_project_picker.is_some() {
+        "Recent Projects".to_owned()
     } else if let Some(menu) = state.menu {
         format!(
             "{} menu · {}{}",
@@ -18137,6 +18303,62 @@ fn draw_command_palette_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     f.render_widget(
         Paragraph::new(description).wrap(Wrap { trim: true }),
         rows[2],
+    );
+}
+
+fn draw_recent_project_picker_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
+    let Some(picker) = state.recent_project_picker.as_ref() else {
+        return;
+    };
+    let area = f.area();
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    let width = area.width.saturating_sub(4).clamp(1, 92);
+    let height = (picker.paths.len() as u16)
+        .saturating_add(4)
+        .min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 3,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Recent Projects · ↑/↓ choose · Enter open · Esc close ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let items = picker
+        .paths
+        .iter()
+        .map(|path| {
+            let availability = if path.join("project.toml").is_file() {
+                ""
+            } else {
+                "  · unavailable"
+            };
+            ListItem::new(truncate_display_cells(
+                &format!("{}{}", path.display(), availability),
+                inner.width as usize,
+            ))
+            .style(if availability.is_empty() {
+                Style::default()
+            } else {
+                Style::default().fg(Color::DarkGray)
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected =
+        (!items.is_empty()).then_some(picker.selected.min(items.len().saturating_sub(1)));
+    f.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White)),
+        inner,
+        &mut ListState::default().with_selected(selected),
     );
 }
 
@@ -20933,6 +21155,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     }
     let modal_is_open = s.mode.is_some()
         || s.command_palette.is_some()
+        || s.recent_project_picker.is_some()
         || s.menu.is_some()
         || s.find_panel.is_some()
         || s.keybinding_manager.is_some()
@@ -20962,6 +21185,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     }
     if s.command_palette.is_some() {
         handle_command_palette_key(s, k)?;
+        return Ok(false);
+    }
+    if s.recent_project_picker.is_some() {
+        s.handle_recent_project_picker_key(k)?;
         return Ok(false);
     }
     if let Some(preview) = s.snippet_preview.clone() {
@@ -22130,6 +22357,119 @@ mod tests {
             assert_eq!(command.category, "Series");
             assert!(matches!(command.action, CommandAction::LegacyPalette));
         }
+    }
+
+    #[test]
+    fn recent_project_history_is_deduplicated_bounded_and_most_recent_first() {
+        let root = tempfile::tempdir().unwrap();
+        let store_path = root.path().join("prefs/recent-projects.json");
+        let mut projects = Vec::new();
+        for index in 0..14 {
+            let path = root.path().join(format!("Novel-{index}"));
+            WriterApp::create_project(&path, &format!("Novel {index}")).unwrap();
+            remember_recent_project(&store_path, &path).unwrap();
+            projects.push(path.canonicalize().unwrap());
+        }
+
+        let recent = load_recent_projects(&store_path).unwrap();
+        assert_eq!(recent.len(), 12);
+        assert_eq!(recent[0], projects[13]);
+        assert_eq!(recent[11], projects[2]);
+
+        remember_recent_project(&store_path, &projects[7]).unwrap();
+        let recent = load_recent_projects(&store_path).unwrap();
+        assert_eq!(recent[0], projects[7]);
+        assert_eq!(recent.len(), 12);
+        assert_eq!(
+            recent.iter().filter(|path| *path == &projects[7]).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn recent_project_picker_opens_selected_project_and_updates_history() {
+        let root = tempfile::tempdir().unwrap();
+        let current_path = root.path().join("Current");
+        let older_path = root.path().join("Older Novel");
+        let newer_path = root.path().join("Newer Novel");
+        let current = WriterApp::create_project(&current_path, "Current").unwrap();
+        WriterApp::create_project(&older_path, "Older Novel").unwrap();
+        WriterApp::create_project(&newer_path, "Newer Novel").unwrap();
+        let store_path = root.path().join("config/recent-projects.json");
+        remember_recent_project(&store_path, &older_path).unwrap();
+        remember_recent_project(&store_path, &newer_path).unwrap();
+        let mut state = AppState::new(current, default_bindings());
+        state.recent_projects_path = Some(store_path.clone());
+
+        let file_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "File")
+            .unwrap();
+        state.menu = Some(MenuState {
+            top: file_menu,
+            selected: 0,
+            all_commands: false,
+            group: None,
+        });
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "file.recent-projects")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.recent_project_picker.as_ref().unwrap().paths,
+            vec![
+                newer_path.canonicalize().unwrap(),
+                older_path.canonicalize().unwrap()
+            ]
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert!(state.recent_project_picker.is_none());
+        assert_eq!(state.app.get_project().unwrap().title, "Older Novel");
+        assert_eq!(
+            load_recent_projects(&store_path).unwrap()[0],
+            older_path.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn recent_project_picker_keeps_missing_entries_visible_without_switching() {
+        let root = tempfile::tempdir().unwrap();
+        let current = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
+        let missing = root.path().join("Relocated Novel");
+        let store_path = root.path().join("config/recent-projects.json");
+        write_json_atomically(
+            &store_path,
+            &serde_json::to_value(RecentProjectsFile {
+                version: 1,
+                paths: vec![missing.clone()],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut state = AppState::new(current, default_bindings());
+        state.recent_projects_path = Some(store_path);
+        state.open_recent_project_picker();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(state.app.get_project().unwrap().title, "Current");
+        assert!(state.recent_project_picker.is_some());
+        assert!(state.message.contains("unavailable"));
     }
 
     #[test]
@@ -26220,6 +26560,8 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -29023,6 +29365,8 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -29153,6 +29497,8 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -29279,6 +29625,8 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -29413,6 +29761,8 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -29697,6 +30047,8 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -29831,6 +30183,8 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -30364,6 +30718,21 @@ mod tests {
         assert_eq!(
             menu_category(&command_by_id("help.context").unwrap()),
             "Help"
+        );
+        let file = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "File")
+            .unwrap();
+        assert_eq!(
+            MENU_COMMON_COMMANDS[file],
+            [
+                "file.new-project",
+                "file.open-project",
+                "file.recent-projects",
+                "series.import-scrivener",
+                "file.save",
+                "file.quit",
+            ]
         );
 
         let root = tempfile::tempdir().unwrap();
@@ -30905,6 +31274,8 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -31174,6 +31545,8 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -31578,6 +31951,8 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -31723,6 +32098,8 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -31920,6 +32297,8 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            recent_project_picker: None,
+            recent_projects_path: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
