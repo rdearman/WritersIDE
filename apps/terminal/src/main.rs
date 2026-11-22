@@ -4,7 +4,7 @@ use std::{
     env, fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use crossterm::{
@@ -33,6 +33,16 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 pub mod onboarding;
 
 type SceneRow = (SceneId, String, SceneStatus, u32);
+
+fn manual_save_confirmation() -> String {
+    let minutes = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / 60
+        % (24 * 60);
+    format!("Saved at {:02}:{:02} UTC", minutes / 60, minutes % 60)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Workspace {
@@ -6957,7 +6967,7 @@ impl AppState {
         self.selected = 0;
         self.switch(Workspace::Search);
         self.message = format!(
-            "{} symbol definition(s) matching ‘{query}’ · stable entity IDs; Enter opens",
+            "{} symbol definition(s) matching ‘{query}’ · Enter opens a definition",
             self.search_hits.len()
         );
         Ok(())
@@ -7061,7 +7071,7 @@ impl AppState {
         let is_selected = *selected;
         target.selected_file = target.selected_matches.iter().any(|selected| *selected);
         self.message = format!(
-            "Preview match {} {}",
+            "Match {} {} in the review",
             self.replace_preview_match + 1,
             if is_selected { "selected" } else { "skipped" }
         );
@@ -7077,7 +7087,7 @@ impl AppState {
         target.selected_file = !target.selected_file;
         target.selected_matches.fill(target.selected_file);
         self.message = format!(
-            "{} {} in replacement preview",
+            "Scene {} {} in the review",
             target.title,
             if target.selected_file {
                 "included"
@@ -7085,6 +7095,42 @@ impl AppState {
                 "skipped"
             }
         );
+    }
+    fn find_scope_label(&self, scope: &str) -> String {
+        match scope {
+            "current" => "Current scene".into(),
+            "open" => "Open scenes".into(),
+            "selected" => "Selected scenes".into(),
+            "all" => "All scenes".into(),
+            value if value.starts_with("chapter:") => value
+                .strip_prefix("chapter:")
+                .and_then(|id| id.parse::<uuid::Uuid>().ok().map(story_core::NodeId))
+                .and_then(|id| {
+                    self.app
+                        .list_structural_nodes()
+                        .ok()?
+                        .into_iter()
+                        .find(|node| node.id == id)
+                        .map(|node| node.title)
+                })
+                .map(|title| format!("Chapter: {title}"))
+                .unwrap_or_else(|| "Chapter".into()),
+            value if value.starts_with("assembly:") => value
+                .strip_prefix("assembly:")
+                .and_then(|id| id.parse::<uuid::Uuid>().ok())
+                .map(story_core::AssemblyId)
+                .and_then(|id| {
+                    self.app
+                        .list_assemblies()
+                        .ok()?
+                        .into_iter()
+                        .find(|assembly| assembly.id == id)
+                        .map(|assembly| assembly.title)
+                })
+                .map(|title| format!("Assembly: {title}"))
+                .unwrap_or_else(|| "Assembly".into()),
+            _ => "Search scope".into(),
+        }
     }
     fn stage_replace_preview(
         &mut self,
@@ -7151,7 +7197,7 @@ impl AppState {
             self.replace_preview_match = 0;
             self.scroll = 0;
             self.message = format!(
-                "Read-only preview: {total} match(es) in {target_count} scene(s). F3 match · F6 toggle match · F8 toggle file · F5 apply selected · Esc cancel"
+                "Review changes: {total} replacement(s) in {target_count} scene(s) · F5 applies · Esc returns to Find and Replace"
             );
         }
         Ok(())
@@ -8200,7 +8246,7 @@ impl AppState {
                     if self.writing_stats_enabled {
                         self.successful_saves = self.successful_saves.saturating_add(1);
                     }
-                    self.message = "Saved".into();
+                    self.message = manual_save_confirmation();
                     if self.app.should_prompt_for_missing_scene_time(id)? {
                         self.message = format!(
                             "Optional chronology · Set date with `scene-time-set {id} | START | END`; Not yet: leave it unset; Don't ask again: `chronology never`"
@@ -8227,7 +8273,7 @@ impl AppState {
                     if self.writing_stats_enabled {
                         self.successful_saves = self.successful_saves.saturating_add(1);
                     }
-                    self.message = "Saved direct prose".into();
+                    self.message = manual_save_confirmation();
                 }
                 Err(error) => self.message = format!("Save conflict/error: {error}"),
             }
@@ -8343,9 +8389,9 @@ impl AppState {
         };
         if !self.collapsed_outline_nodes.insert(node) {
             self.collapsed_outline_nodes.remove(&node);
-            self.message = format!("Expanded chapter {node}");
+            self.message = "Chapter expanded".into();
         } else {
-            self.message = format!("Collapsed chapter {node}");
+            self.message = "Chapter collapsed".into();
         }
         let rows = outline_rows(self);
         self.selected = selected_scene
@@ -16393,7 +16439,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         })
                         .collect::<Vec<_>>(),
                     format!(
-                        "Replacement Preview · file {}/{} · F3 match, F6 match, F8 file",
+                        "Review Changes · scene {}/{} · F3 next match · F6 include/exclude",
                         s.replace_preview_target + 1,
                         targets.len()
                     ),
@@ -16407,7 +16453,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         .map(ListItem::new)
                         .collect::<Vec<_>>(),
                     format!(
-                        "Find Results · {}/{} · F3 / Shift-F3",
+                        "Find Results · {}/{} · F3 next · Shift+F3 previous",
                         s.search_location_index + 1,
                         s.search_result_rows.len()
                     ),
@@ -16511,7 +16557,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     .copied()
                     .unwrap_or(false);
                 let preview = format!(
-                    "File: {}\nMatch {}/{} · {} · F6 toggle match · F8 toggle file\n\n--- Original ---\n{}\n\n--- Proposed selection ---\n{}",
+                    "Scene: {}\nMatch {}/{} · {} · F6 include/exclude match · F8 include/exclude scene\n\n--- Original ---\n{}\n\n--- Proposed changes ---\n{}",
                     target.title,
                     s.replace_preview_match + 1,
                     target.replacements,
@@ -16528,10 +16574,10 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         .lines()
                         .map(|line| Line::from(line.to_owned()))
                         .collect(),
-                    format!("Replacement Preview — {}", target.title),
+                    format!("Review Changes — {}", target.title),
                 )
             } else {
-                (Vec::new(), "Replacement Preview".into())
+                (Vec::new(), "Review Changes".into())
             }
         } else {
             let full_text = s.editor.join("\n");
@@ -17041,12 +17087,12 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 format!(
                     "{}\n\n{}\n\n{}",
                     selected.as_deref().unwrap_or("No record selected"),
-                    "Enter inspects this record; relationships use stable entity IDs.",
+                    "Enter inspects this record and its related story information.",
                     s.message
                 )
-            } else if let Some((id, title, status, words)) = s.scenes.get(s.selected) {
+            } else if let Some((_, title, status, words)) = s.scenes.get(s.selected) {
                 format!(
-                    "Scene: {title}\nID: {id}\nStatus: {}\nWords: {words}\n\nEnter opens the manuscript editor.\n\n{}",
+                    "Scene: {title}\nStatus: {}\nWords: {words}\n\nEnter opens the manuscript editor.\n\n{}",
                     status.as_str(),
                     s.message
                 )
@@ -17082,18 +17128,22 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         let replace_text = if panel.replacing {
             panel.replacement.as_str()
         } else {
-            "(Ctrl+H to enable replacement)"
+            "Ctrl+H to show this field"
         };
         let help = if panel.replacing && s.pending_replace.is_some() {
-            "F3 next match · F6 toggle match · F8 toggle file · F5 apply selected · Esc cancel"
+            "F3: Next match · F6: Include/exclude match · F8: Include/exclude scene · F5: Apply reviewed changes · Esc: Back to fields"
         } else if panel.replacing {
-            "F9 replace next · Enter preview all · F5 apply · F3 match · F6 case · F7 word · F8 accent · F11 older query · F12 newer query · Esc"
+            "Tab/Shift+Tab: Find or Replace with · Enter: Review changes · F9: Replace next · F4: Change search area · Esc: Close"
         } else {
-            "Enter find · F3 next · F2 mode · F4 scope · F6 case · F7 word · F8 accent · F11 older query · F12 newer query · Tab · Ctrl+H replace · Esc"
+            "Enter: Find · F3/Shift+F3: Next/previous · F4: Change search area · Ctrl+H: Show Replace with · Esc: Close"
         };
         let options = format!(
-            "Case {} · whole word {} · accents {}",
-            if panel.case_sensitive { "on" } else { "off" },
+            "Case {} · whole words {} · accents {}",
+            if panel.case_sensitive {
+                "sensitive"
+            } else {
+                "ignored"
+            },
             if panel.whole_word { "on" } else { "off" },
             if panel.accent_sensitive {
                 "sensitive"
@@ -17101,21 +17151,27 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 "folded"
             }
         );
+        let match_count = if let Some(targets) = &s.pending_replace {
+            targets.iter().map(|target| target.replacements).sum()
+        } else {
+            s.search_locations.len()
+        };
+        let scope = s.find_scope_label(&panel.scope);
         let lines = vec![
             Line::from(vec![
-                Span::raw(format!(" Mode: {mode} · Scope: ")),
-                Span::styled(&panel.scope, focused(FindPanelField::Scope)),
-                Span::raw(format!(" · {options}")),
-            ]),
-            Line::from(format!(" Keys: {help}")),
-            Line::from(vec![
-                Span::raw(" Find: "),
+                Span::styled(" Find: ", Style::default().add_modifier(Modifier::BOLD)),
                 Span::styled(&panel.pattern, focused(FindPanelField::Pattern)),
-            ]),
-            Line::from(vec![
-                Span::raw(" Replace: "),
+                Span::raw("    "),
+                Span::styled(
+                    "Replace with: ",
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(replace_text, focused(FindPanelField::Replacement)),
             ]),
+            Line::from(format!(
+                " Search in: {scope} · {mode} · {match_count} match(es) · {options}"
+            )),
+            Line::from(help),
             Line::from(format!(" {}", s.message)),
         ];
         f.render_widget(
@@ -17162,7 +17218,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 "Tab workspaces"
             };
             let status = format!(
-                " Focus:{focus} · {} · Save {} · Menu {} · Help {} · {pane_hint}{}",
+                " Active:{focus} · {} · Save {} · Menu {} · Help {} · {pane_hint}{}",
                 if s.dirty { "UNSAVED" } else { "saved" },
                 effective_shortcut_label(s, "file.save", "Ctrl+S"),
                 effective_shortcut_label(s, "menu.main", "F10"),
@@ -17193,7 +17249,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 format!(" · {challenge}")
             };
             format!(
-                " Focus:{}{} · Menu {} · Help {} · Save {} · q quit · {}{} · {}",
+                " Active:{}{} · Menu {} · Help {} · Save {} · q quit · {}{} · {}",
                 if s.menu.is_some() {
                     "menu"
                 } else if s.reference_focused {
@@ -17368,7 +17424,7 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
             "Help: {} opens or closes this panel; Esc returns to the previous focus",
             effective_shortcut_label(state, "help.context", "Help menu / command palette")
         ),
-        "Focus: In the editor, Ctrl+Tab switches to an open reference pane; Esc returns to the manuscript".to_owned(),
+        "Writing: Ctrl+Tab switches to an open reference pane; Esc returns to the manuscript".to_owned(),
         "Navigation: Tab moves to the next workspace and Shift+Tab to the previous workspace outside text fields".to_owned(),
         format!(
             "Save: {} · current buffer is {}",
@@ -17418,7 +17474,7 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
     }
     if state.command_palette.is_some() {
         lines.push(
-            "Command Palette: type to filter command names, IDs, aliases, and descriptions · ↑/↓ select · Enter run · Tab prepare arguments · Esc close".to_owned(),
+            "Command Palette: type to search actions and descriptions · ↑/↓ select · Enter run · Tab prepare arguments · Esc close".to_owned(),
         );
     }
     lines.push("Scroll: ↑/↓ or Page Up/Page Down · F10 opens menu".to_owned());
@@ -21333,15 +21389,16 @@ fn handle_find_panel_key(
         return Ok(());
     }
     if key.code == KeyCode::Esc {
+        if s.pending_replace.take().is_some() {
+            s.message =
+                "Review cancelled; Find and Replace values kept, manuscript unchanged".into();
+            return Ok(());
+        }
         if let Err(error) = s.persist_find_panel_session() {
             s.message = format!("Find preferences could not be saved: {error}");
         }
         s.find_panel = None;
-        if s.pending_replace.take().is_some() {
-            s.message = "Replacement preview cancelled; manuscript unchanged".into();
-        } else if s.message.is_empty()
-            || !s.message.starts_with("Find preferences could not be saved")
-        {
+        if s.message.is_empty() || !s.message.starts_with("Find preferences could not be saved") {
             s.message = "Find panel closed".into();
         }
         return Ok(());
@@ -21463,18 +21520,23 @@ fn handle_find_panel_key(
         KeyCode::F(8) => panel.accent_sensitive = !panel.accent_sensitive,
         KeyCode::Tab | KeyCode::BackTab => {
             let forward = key.code == KeyCode::Tab;
-            panel.field = match (panel.replacing, forward, panel.field) {
-                (true, true, FindPanelField::Pattern) => FindPanelField::Replacement,
-                (true, true, FindPanelField::Replacement) => FindPanelField::Scope,
-                (true, true, FindPanelField::Scope) => FindPanelField::Pattern,
-                (true, false, FindPanelField::Pattern) => FindPanelField::Scope,
-                (true, false, FindPanelField::Scope) => FindPanelField::Replacement,
-                (true, false, FindPanelField::Replacement) => FindPanelField::Pattern,
-                (false, true, FindPanelField::Pattern) => FindPanelField::Scope,
-                (false, true, FindPanelField::Scope) => FindPanelField::Pattern,
-                (false, false, FindPanelField::Pattern) => FindPanelField::Scope,
-                (false, false, FindPanelField::Scope) => FindPanelField::Pattern,
-                (false, _, FindPanelField::Replacement) => FindPanelField::Pattern,
+            panel.field = if panel.replacing {
+                match (forward, panel.field) {
+                    (true, FindPanelField::Pattern | FindPanelField::Scope) => {
+                        FindPanelField::Replacement
+                    }
+                    (true, FindPanelField::Replacement) => FindPanelField::Pattern,
+                    (false, FindPanelField::Replacement) => FindPanelField::Pattern,
+                    (_, FindPanelField::Pattern) => FindPanelField::Replacement,
+                    (_, FindPanelField::Scope) => FindPanelField::Pattern,
+                }
+            } else {
+                match (forward, panel.field) {
+                    (true, FindPanelField::Pattern) | (false, FindPanelField::Scope) => {
+                        FindPanelField::Scope
+                    }
+                    _ => FindPanelField::Pattern,
+                }
             };
         }
         KeyCode::Backspace => match panel.field {
@@ -29807,6 +29869,74 @@ mod tests {
     }
 
     #[test]
+    fn find_replace_preview_escape_returns_to_editable_fields_without_losing_values() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "A cat waits.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        open_find_panel(&mut state, true);
+        for character in "cat".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            state.find_panel.as_ref().unwrap().field,
+            FindPanelField::Pattern
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            state.find_panel.as_ref().unwrap().field,
+            FindPanelField::Replacement
+        );
+        for character in "fox".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Find:"), "{rendered:?}");
+        assert!(rendered.contains("Replace with:"), "{rendered:?}");
+        assert!(
+            rendered.contains("Search in: Current scene"),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("Enter: Review changes"), "{rendered:?}");
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.pending_replace.is_some());
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.pending_replace.is_none());
+        assert_eq!(state.find_panel.as_ref().unwrap().pattern, "cat");
+        assert_eq!(state.find_panel.as_ref().unwrap().replacement, "fox");
+        assert!(state.message.contains("values kept"));
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, "A cat waits.");
+    }
+
+    #[test]
     fn replacement_preview_can_skip_individual_matches_and_whole_files() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -31897,6 +32027,8 @@ mod tests {
         );
         assert!(rendered.contains("[SAVED]"));
         assert!(rendered.contains("Saved"));
+        assert!(state.message.starts_with("Saved at "));
+        assert!(state.message.ends_with(" UTC"));
         assert!(!rendered.contains(&scene.to_string()));
         assert!(!rendered.contains("Scenes"));
 
