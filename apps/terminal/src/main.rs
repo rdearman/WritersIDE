@@ -5373,18 +5373,23 @@ impl AppState {
         let Some(id) = line
             .split(" · source ")
             .nth(1)
+            .and_then(|value| value.split(" · ").next())
             .and_then(|value| value.split(':').next())
             .and_then(|value| value.parse::<uuid::Uuid>().ok())
         else {
             self.message = "Selected Compile result has no source entity".into();
             return Ok(true);
         };
+        let source_range = parse_compile_range(line);
         let scene = SceneId(id);
         if self.app.get_scene(scene).is_ok() {
             self.open_scene(scene)?;
             if self.editing_scene == Some(scene) {
                 self.reference_focused = false;
                 self.message = format!("Opened Compile source scene {scene}");
+                if let Some(range) = source_range {
+                    self.select_compile_source_range(range);
+                }
             }
             return Ok(true);
         }
@@ -5393,10 +5398,32 @@ impl AppState {
             self.open_content_unit(content)?;
             self.reference_focused = false;
             self.message = format!("Opened Compile source chapter content {content}");
+            if let Some(range) = source_range {
+                self.select_compile_source_range(range);
+            }
             return Ok(true);
         }
         self.message = "Compile source entity no longer exists".into();
         Ok(true)
+    }
+    fn select_compile_source_range(&mut self, range: story_document::SourceRange) {
+        let text = self.editor.join("\n");
+        if range.start > range.end || range.end > text.len() {
+            self.message.push_str(" · source range is no longer valid");
+            return;
+        }
+        let Some(start) = editor_position_from_byte(&text, range.start) else {
+            self.message
+                .push_str(" · source range start is no longer valid");
+            return;
+        };
+        let Some(end) = editor_position_from_byte(&text, range.end) else {
+            self.message
+                .push_str(" · source range end is no longer valid");
+            return;
+        };
+        self.editor_selection = Some(start);
+        self.cursor = end;
     }
     fn navigate_search_match(&mut self, forward: bool) -> Result<(), Box<dyn std::error::Error>> {
         if self.search_locations.is_empty() {
@@ -9454,6 +9481,7 @@ impl AppState {
                 .into_iter()
                 .nth(index - 1)
                 .ok_or("compile diagnostic index is no longer present")?;
+            let source_range = diagnostic.source_range;
             let source = diagnostic
                 .source_entity_id
                 .ok_or("selected compile diagnostic has no source entity")?;
@@ -9462,11 +9490,17 @@ impl AppState {
             if self.app.get_scene(scene).is_ok() {
                 self.reference_focused = false;
                 self.open_scene(scene)?;
+                if let Some(range) = source_range {
+                    self.select_compile_source_range(range);
+                }
             } else {
                 let content_unit = story_core::ContentUnitId(uuid);
                 self.app.get_content_unit(content_unit)?;
                 self.reference_focused = false;
                 self.open_content_unit(content_unit)?;
+                if let Some(range) = source_range {
+                    self.select_compile_source_range(range);
+                }
             }
         } else if let Some(terms) = cmd.strip_prefix("reference-search ") {
             let terms = terms.trim();
@@ -12932,18 +12966,29 @@ fn compile_diagnostics_reference_text(
         .enumerate()
         .map(|(index, item)| {
             format!(
-                "{}. {} · {:?} · {}{}",
+                "{}. {} · {:?} · {}{}{}",
                 index + 1,
                 item.code,
                 item.severity,
                 item.message,
                 item.source_entity_id
                     .map(|id| format!(" · source {id}"))
+                    .unwrap_or_default(),
+                item.source_range
+                    .map(|range| format!(" · range {}..{}", range.start, range.end))
                     .unwrap_or_default()
             )
         })
         .collect::<Vec<_>>()
         .join("\n"))
+}
+
+fn parse_compile_range(line: &str) -> Option<story_document::SourceRange> {
+    let (start, end) = line.split_once(" · range ")?.1.split_once("..")?;
+    Some(story_document::SourceRange {
+        start: start.parse().ok()?,
+        end: end.split(':').next()?.parse().ok()?,
+    })
 }
 
 fn compile_results_reference_text(
@@ -13015,7 +13060,7 @@ fn compile_results_reference_text(
         }
         for diagnostic in &record.diagnostics {
             lines.push(format!(
-                "   {}{:?} {}{}: {}",
+                "   {}{:?} {}{}{}: {}",
                 if record.stale { "STALE " } else { "" },
                 diagnostic.severity,
                 diagnostic.code,
@@ -13023,6 +13068,10 @@ fn compile_results_reference_text(
                     .source_entity_id
                     .as_deref()
                     .map(|id| format!(" · source {id}"))
+                    .unwrap_or_default(),
+                diagnostic
+                    .source_range
+                    .map(|range| format!(" · range {}..{}", range.start, range.end))
                     .unwrap_or_default(),
                 diagnostic.message
             ));
@@ -20083,6 +20132,7 @@ mod tests {
         assert_eq!(state.editing_scene, Some(scene));
         assert_eq!(state.workspace, Workspace::Editor);
         assert!(!state.reference_focused);
+        assert_eq!(state.selected_text().as_deref(), Some("TODO"));
         assert!(
             state
                 .execute_legacy_palette_command("compile-jump 99")
@@ -20114,6 +20164,7 @@ mod tests {
         assert!(content.contains("PUB004"));
         assert!(content.contains(&scene.to_string()));
         assert!(content.contains("likely draft placeholder"));
+        assert!(content.contains("range 0..4"));
         let diagnostic_row = state.reference_panes[0]
             .content
             .lines()
@@ -20127,6 +20178,7 @@ mod tests {
         .unwrap();
         assert_eq!(state.editing_scene, Some(scene));
         assert!(!state.reference_focused);
+        assert_eq!(state.selected_text().as_deref(), Some("TODO"));
         state
             .execute_legacy_palette_command("compile-results errors")
             .unwrap();

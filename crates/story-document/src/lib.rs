@@ -1032,6 +1032,21 @@ pub struct CompileDiagnostic {
     pub severity: DiagnosticSeverity,
     pub message: String,
     pub source_entity_id: Option<String>,
+    #[serde(default)]
+    pub source_range: Option<SourceRange>,
+}
+
+fn first_placeholder_range(source: &str) -> Option<SourceRange> {
+    let lowered = source.to_ascii_lowercase();
+    ["todo", "fixme", "[insert", "lorem ipsum"]
+        .iter()
+        .filter_map(|marker| {
+            lowered.find(marker).map(|start| SourceRange {
+                start,
+                end: start + marker.len(),
+            })
+        })
+        .min_by_key(|range| range.start)
 }
 
 /// Deterministic, non-mutating checks useful before publication or export.
@@ -1043,6 +1058,7 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
             severity: DiagnosticSeverity::Warning,
             message: "project title is empty".into(),
             source_entity_id: None,
+            source_range: None,
         });
     }
     if ir.units.is_empty() {
@@ -1051,6 +1067,7 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
             severity: DiagnosticSeverity::Warning,
             message: "manuscript contains no content units or scenes".into(),
             source_entity_id: None,
+            source_range: None,
         });
     }
     for unit in &ir.units {
@@ -1064,13 +1081,14 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
                 severity: DiagnosticSeverity::Information,
                 message: format!("content unit '{}' has no prose", unit.title),
                 source_entity_id: Some(unit.id.clone()),
+                source_range: None,
             });
         }
         let placeholder_count = unit
             .segments
             .iter()
             .map(|segment| {
-                let source = segment.document.source.to_lowercase();
+                let source = segment.document.source.to_ascii_lowercase();
                 ["todo", "fixme", "[insert", "lorem ipsum"]
                     .iter()
                     .map(|marker| source.matches(marker).count())
@@ -1086,6 +1104,11 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
                     unit.title
                 ),
                 source_entity_id: Some(unit.id.clone()),
+                source_range: unit
+                    .segments
+                    .iter()
+                    .filter(|segment| segment.source_entity_id == unit.id)
+                    .find_map(|segment| first_placeholder_range(&segment.document.source)),
             });
         }
     }
@@ -2149,10 +2172,37 @@ output = "exports/old.md"
             diagnostics[2].source_entity_id.as_deref(),
             Some("draft-scene")
         );
+        let range = diagnostics[2].source_range.unwrap();
+        assert_eq!(
+            &ir.units[1].segments[0].document.source[range.start..range.end],
+            "TODO"
+        );
         assert_eq!(
             ir.units[1].segments[0].document.source,
             "Mara finds the key. TODO: check the lock; [INSERT FINAL CLUE]."
         );
+    }
+
+    #[test]
+    fn placeholder_diagnostic_range_is_utf8_byte_exact() {
+        let source = "Élodie checks the door. [INSERT clue]";
+        let mut ir = CompileIr::new("Novel");
+        ir.push(CompileUnit {
+            id: "scene-1".into(),
+            parent_id: None,
+            kind: ContentUnitKind::Scene,
+            title: "Scene".into(),
+            language_code: None,
+            segments: vec![CompileSegment::new("scene-1", source)],
+        });
+        let diagnostic = publication_diagnostics(&ir)
+            .into_iter()
+            .find(|item| item.code == "PUB004")
+            .unwrap();
+        let range = diagnostic.source_range.unwrap();
+        assert_eq!(&source[range.start..range.end], "[INSERT");
+        assert!(source.is_char_boundary(range.start));
+        assert!(source.is_char_boundary(range.end));
     }
 
     #[test]

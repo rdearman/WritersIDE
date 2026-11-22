@@ -1631,7 +1631,7 @@ impl WriterApp {
             .map(|item| format!("{}: {}", item.code, item.message))
             .collect();
         let record = CompileRunRecord {
-            version: 3,
+            version: 4,
             configuration: "One-off Compile".into(),
             format: Some(artifact.format.extension().to_ascii_uppercase()),
             succeeded,
@@ -1950,7 +1950,7 @@ impl WriterApp {
             ),
         };
         let record = CompileRunRecord {
-            version: 3,
+            version: 4,
             configuration: name.to_owned(),
             format,
             succeeded,
@@ -2153,7 +2153,7 @@ impl WriterApp {
                     .map_err(|error| {
                         AppError::Domain(format!("invalid Compile result file: {error}"))
                     })?;
-                if !matches!(record.version, 1..=3) {
+                if !matches!(record.version, 1..=4) {
                     return Err(AppError::Domain(format!(
                         "unsupported Compile result version {}",
                         record.version
@@ -5176,7 +5176,7 @@ unexpected_prose = "must not be silently discarded"
         assert!(app.list_compile_results().unwrap().iter().any(|record| {
             record.succeeded
                 && record.outputs.contains(&recipe.output)
-                && record.version == 3
+                && record.version == 4
                 && record.format.as_deref() == Some("MD")
                 && record.diagnostics.iter().any(|item| {
                     item.code == "PUB004"
