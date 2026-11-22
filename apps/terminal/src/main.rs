@@ -9003,7 +9003,10 @@ impl AppState {
             if path.is_empty() {
                 return Err("use open-project PROJECT_DIRECTORY".into());
             }
-            self.switch_to_project(PathBuf::from(path), format!("Opened project: {path}"))?;
+            match self.switch_to_project(PathBuf::from(path), format!("Opened project: {path}")) {
+                Ok(()) => {}
+                Err(error) => self.message = format!("Could not open project '{path}': {error}"),
+            }
             return Ok(());
         }
         if let Some(arguments) = cmd.strip_prefix("series-create ") {
@@ -22107,8 +22110,34 @@ mod tests {
         state.mode = Some(':');
         state.prompt = format!("open-project {}", target_path.display());
 
-        assert!(state.command().is_err());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
         assert_eq!(state.app.get_project().unwrap().title, "Current");
+        assert!(state.message.contains("save the current manuscript buffer"));
+    }
+
+    #[test]
+    fn opening_a_missing_project_keeps_the_current_workspace_running() {
+        let current_root = tempfile::tempdir().unwrap();
+        let missing = current_root.path().join("Missing Project");
+        let app =
+            WriterApp::create_project(current_root.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.mode = Some(':');
+        state.prompt = format!("open-project {}", missing.display());
+
+        let should_quit = handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert!(!should_quit);
+        assert_eq!(state.app.get_project().unwrap().title, "Current");
+        assert!(state.message.contains("Could not open project"));
     }
 
     #[test]
