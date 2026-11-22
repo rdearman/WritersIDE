@@ -332,6 +332,7 @@ struct ScrivenerImportWizard {
     series_root: PathBuf,
     folder_name: String,
     book_title: String,
+    series_import: bool,
     inventory: story_import::ScrivenerProjectInventory,
     plan: story_import::ScrivenerImportPlan,
 }
@@ -383,6 +384,7 @@ struct SeriesActionForm {
 enum FileBrowserPurpose {
     NewProject,
     OpenProject,
+    ImportScrivenerSource,
     Compile(story_document::CompileFormat),
 }
 
@@ -605,6 +607,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 8] = [
         "file.new-project",
         "file.open-project",
         "file.recent-projects",
+        "file.import-scrivener",
         "series.import-scrivener",
         "file.save",
         "file.quit",
@@ -1096,6 +1099,7 @@ enum CommandAction {
     OpenRecentProjects,
     NewProject,
     OpenProject,
+    ImportScrivenerNew,
     Save,
     RequestQuit,
     Help,
@@ -1264,6 +1268,21 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 2,
             advanced: false,
             action: CommandAction::OpenProject,
+        },
+        CommandSpec {
+            id: "file.import-scrivener",
+            label: "Import Scrivener as New Project…",
+            description: "Choose a Scrivener project, review its binder mapping, and import it as a standalone novel",
+            category: "File",
+            default_shortcuts: &[],
+            mnemonic: Some('i'),
+            palette_aliases: &["scrivener import", "import manuscript"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Import & Export",
+            menu_priority: 3,
+            advanced: false,
+            action: CommandAction::ImportScrivenerNew,
         },
         CommandSpec {
             id: "file.recent-projects",
@@ -6272,16 +6291,18 @@ impl AppState {
         let fallback = std::env::current_dir()?;
         let current_dir = match purpose {
             FileBrowserPurpose::Compile(_) => self.app.project_root().to_owned(),
-            FileBrowserPurpose::NewProject | FileBrowserPurpose::OpenProject => {
-                std::env::var_os("HOME")
-                    .map(PathBuf::from)
-                    .filter(|path| path.is_dir())
-                    .unwrap_or(fallback)
-            }
+            FileBrowserPurpose::NewProject
+            | FileBrowserPurpose::OpenProject
+            | FileBrowserPurpose::ImportScrivenerSource => std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_dir())
+                .unwrap_or(fallback),
         };
         let name = match purpose {
             FileBrowserPurpose::NewProject => "My Novel".to_owned(),
-            FileBrowserPurpose::OpenProject => String::new(),
+            FileBrowserPurpose::OpenProject | FileBrowserPurpose::ImportScrivenerSource => {
+                String::new()
+            }
             FileBrowserPurpose::Compile(format) => {
                 let title = self
                     .app
@@ -6438,8 +6459,10 @@ impl AppState {
             }
             KeyCode::F(5) => {
                 let name = browser.name.trim();
-                if browser.purpose != FileBrowserPurpose::OpenProject
-                    && !file_browser_leaf_name_is_safe(name)
+                if !matches!(
+                    browser.purpose,
+                    FileBrowserPurpose::OpenProject | FileBrowserPurpose::ImportScrivenerSource
+                ) && !file_browser_leaf_name_is_safe(name)
                 {
                     self.message = "Enter a valid name".into();
                     self.file_browser = Some(browser);
@@ -6468,6 +6491,34 @@ impl AppState {
                             Ok(()) => close = true,
                             Err(error) => {
                                 self.message = format!("Could not open project: {error}");
+                                self.file_browser = Some(browser);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    FileBrowserPurpose::ImportScrivenerSource => {
+                        let source = browser
+                            .entries
+                            .get(browser.selected)
+                            .map(|(item, _)| browser.current_dir.join(item))
+                            .filter(|path| {
+                                (path.is_dir()
+                                    && path.extension().is_some_and(|ext| ext == "scriv"))
+                                    || (path.is_file()
+                                        && path.extension().is_some_and(|ext| ext == "scrivx"))
+                            });
+                        let Some(source) = source else {
+                            self.message =
+                                "Select a .scriv project folder or .scrivx manifest, then press F5"
+                                    .into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        };
+                        match self.start_scrivener_import_standalone(source) {
+                            Ok(()) => close = true,
+                            Err(error) => {
+                                self.message =
+                                    format!("Could not inspect Scrivener project: {error}");
                                 self.file_browser = Some(browser);
                                 return Ok(());
                             }
@@ -6785,6 +6836,7 @@ impl AppState {
             series_root,
             folder_name,
             book_title,
+            series_import: true,
             inventory,
             plan,
         });
@@ -6793,6 +6845,43 @@ impl AppState {
         self.workspace = Workspace::Series;
         self.message = format!(
             "Scrivener preview: {item_count} binder items · ←/→ map selected item · Space include/skip · Ctrl-Enter import · Esc cancel"
+        );
+        Ok(())
+    }
+    fn start_scrivener_import_standalone(
+        &mut self,
+        source: PathBuf,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let inventory = story_import::inspect_scrivener_project(&source)?;
+        let folder_name = format!("{} (Writer's IDE)", safe_filename(&inventory.title));
+        let source_path = PathBuf::from(&inventory.source_path);
+        let source_container = if source_path.is_file() {
+            source_path.parent().and_then(Path::parent)
+        } else {
+            source_path.parent()
+        };
+        let series_root = source_container
+            .ok_or("Scrivener source has no parent directory")?
+            .to_owned();
+        let destination = series_root.join(&folder_name);
+        if destination.exists() {
+            return Err(format!("destination already exists: {}", destination.display()).into());
+        }
+        let plan = story_import::ScrivenerImportPlan::proposed(&inventory);
+        let item_count = inventory.items.len();
+        self.scrivener_import = Some(ScrivenerImportWizard {
+            series_root,
+            folder_name,
+            book_title: inventory.title.clone(),
+            series_import: false,
+            inventory,
+            plan,
+        });
+        self.series_reference_view = false;
+        self.selected = 0;
+        self.workspace = Workspace::Series;
+        self.message = format!(
+            "Standalone Scrivener preview: {item_count} binder items · destination beside source · ←/→ map · Space include/skip · Ctrl-Enter import · Esc cancel"
         );
         Ok(())
     }
@@ -6878,6 +6967,7 @@ impl AppState {
             .into());
         }
         let series_root = wizard.series_root.clone();
+        let series_import = wizard.series_import;
         let source_fingerprint = wizard.inventory.source_fingerprint.clone();
         let folder_name = wizard.folder_name.clone();
         let title = wizard.book_title.clone();
@@ -6913,20 +7003,26 @@ impl AppState {
         let project_id = app.get_project()?.id;
         drop(app);
         fs::rename(&staging_project, &destination)?;
-        let mut series = story_series::SeriesStore::open(&series_root)?;
-        if let Err(error) =
-            series.add_book(project_id, &destination, &title, Some(&source_fingerprint))
-        {
-            if series.book_for_project(project_id)?.is_none() {
-                let _ = fs::remove_dir_all(&destination);
+        if series_import {
+            let mut series = story_series::SeriesStore::open(&series_root)?;
+            if let Err(error) =
+                series.add_book(project_id, &destination, &title, Some(&source_fingerprint))
+            {
+                if series.book_for_project(project_id)?.is_none() {
+                    let _ = fs::remove_dir_all(&destination);
+                }
+                return Err(error.into());
             }
-            return Err(error.into());
         }
         self.scrivener_import = None;
-        self.selected_series_root = Some(series_root);
+        self.selected_series_root = series_import.then_some(series_root);
         self.switch_to_project(
             destination,
-            format!("Imported {title} into the selected series"),
+            if series_import {
+                format!("Imported {title} into the selected series")
+            } else {
+                format!("Imported {title} as a new Writer's IDE project")
+            },
         )
     }
     fn create_series_book(
@@ -9872,6 +9968,13 @@ impl AppState {
             CommandAction::OpenProject => {
                 if let Err(error) = self.start_file_browser(FileBrowserPurpose::OpenProject) {
                     self.message = format!("Could not open the project browser: {error}");
+                }
+            }
+            CommandAction::ImportScrivenerNew => {
+                if let Err(error) =
+                    self.start_file_browser(FileBrowserPurpose::ImportScrivenerSource)
+                {
+                    self.message = format!("Could not open the Scrivener browser: {error}");
                 }
             }
             CommandAction::CompileWorkflow => {
@@ -19539,6 +19642,9 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let purpose = match browser.purpose {
         FileBrowserPurpose::NewProject => "New Project · choose parent folder and project name",
         FileBrowserPurpose::OpenProject => "Open Project · choose a Writer's IDE project folder",
+        FileBrowserPurpose::ImportScrivenerSource => {
+            "Import Scrivener · choose a .scriv folder or .scrivx manifest"
+        }
         FileBrowserPurpose::Compile(format) => match format {
             story_document::CompileFormat::Docx => "Compile · DOCX",
             story_document::CompileFormat::Epub => "Compile · EPUB",
@@ -19637,6 +19743,8 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         "↑/↓ browse · Enter Open · Home home · / root · Tab filename · F2 format · F5 Save/Compile · F7 New Folder · Backspace parent · Esc Cancel"
     } else if browser.purpose == FileBrowserPurpose::OpenProject {
         "↑/↓ browse · Enter Open folder · Home home · / root · F5 Open Project · Backspace parent · Esc Cancel"
+    } else if browser.purpose == FileBrowserPurpose::ImportScrivenerSource {
+        "↑/↓ browse · Enter Open folder · Home home · / root · F5 Inspect selected Scrivener project · Backspace parent · Esc Cancel"
     } else {
         "↑/↓ browse · Enter Open · Home home · / root · Tab project name · F5 Create Project · F7 New Folder · Backspace parent · Esc Cancel"
     };
@@ -24523,6 +24631,118 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn standalone_scrivener_import_works_without_series_and_preserves_source() {
+        fn copy_tree(source: &Path, destination: &Path) {
+            fs::create_dir_all(destination).unwrap();
+            for entry in fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let output = destination.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &output);
+                } else {
+                    fs::copy(entry.path(), output).unwrap();
+                }
+            }
+        }
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../cli/tests/fixtures/scrivener-windows-311/Windows Regression.scriv");
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("Windows Regression.scriv");
+        copy_tree(&fixture, &source);
+        let before = story_import::inspect_scrivener_project(&source)
+            .unwrap()
+            .source_fingerprint;
+        let initial = WriterApp::create_project(root.path().join("Initial"), "Initial").unwrap();
+        let mut state = AppState::new(initial, default_bindings());
+        state
+            .start_scrivener_import_standalone(source.clone())
+            .unwrap();
+        assert!(state.selected_series_root.is_none());
+        assert!(state.message.contains("Standalone Scrivener preview"));
+
+        use story_import::ScrivenerDestinationKind as Kind;
+        let mappings = state
+            .scrivener_import
+            .as_ref()
+            .unwrap()
+            .inventory
+            .items
+            .iter()
+            .map(|item| {
+                (
+                    item.source_document_id.clone(),
+                    item.type_code.clone(),
+                    item.area.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (source_id, type_code, area) in mappings {
+            let decision = state
+                .scrivener_import
+                .as_mut()
+                .unwrap()
+                .plan
+                .decisions
+                .iter_mut()
+                .find(|decision| decision.source_document_id == source_id)
+                .unwrap();
+            match type_code.as_deref() {
+                Some("DraftFolder") => decision.destination_kind = Kind::Unmapped,
+                Some("Text") if area == "manuscript" => decision.destination_kind = Kind::Scene,
+                Some("ResearchFolder") => decision.destination_kind = Kind::Research,
+                _ => {
+                    decision.destination_kind = Kind::Skip;
+                    decision.include_in_import = false;
+                }
+            }
+        }
+        let draft = state
+            .scrivener_import
+            .as_ref()
+            .unwrap()
+            .inventory
+            .items
+            .iter()
+            .position(|item| item.type_code.as_deref() == Some("DraftFolder"))
+            .unwrap();
+        state.scrivener_import.as_mut().unwrap().plan.decisions[draft].destination_kind =
+            Kind::Chapter;
+        state.commit_scrivener_import().unwrap();
+
+        assert_eq!(state.app.get_project().unwrap().title, "Windows Regression");
+        assert_eq!(state.app.list_scenes(false).unwrap().len(), 1);
+        assert_eq!(
+            story_import::inspect_scrivener_project(&source)
+                .unwrap()
+                .source_fingerprint,
+            before
+        );
+        assert!(
+            state
+                .app
+                .project_root()
+                .join("exports/scrivener-import-report.json")
+                .is_file()
+        );
+        assert!(story_series::SeriesStore::open_for_book(state.app.project_root()).is_err());
+    }
+
+    #[test]
+    fn standalone_scrivener_import_command_opens_shared_file_browser() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .dispatch_registered_command_id("file.import-scrivener")
+            .unwrap();
+        assert_eq!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::ImportScrivenerSource
+        );
+        assert!(state.message.contains("Choose a folder or filename"));
     }
 
     #[test]
@@ -32319,6 +32539,7 @@ mod tests {
                 "file.new-project",
                 "file.open-project",
                 "file.recent-projects",
+                "file.import-scrivener",
                 "series.import-scrivener",
                 "file.save",
                 "file.quit",
