@@ -340,9 +340,9 @@ struct ScrivenerImportWizard {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SeriesFormKind {
     CreateSeries,
+    CreateSeriesThenImport,
     SelectSeries,
     AddCurrentBook,
-    ImportScrivener,
     NewBook,
     CreateStoryLink,
     DeleteStoryLink,
@@ -351,12 +351,11 @@ enum SeriesFormKind {
 impl SeriesFormKind {
     fn fields(self) -> &'static [&'static str] {
         match self {
-            Self::CreateSeries => &["Series directory", "Series title"],
+            Self::CreateSeries | Self::CreateSeriesThenImport => {
+                &["Series directory", "Series title"]
+            }
             Self::SelectSeries => &["Series directory"],
             Self::AddCurrentBook => &["Book title"],
-            Self::ImportScrivener => {
-                &["Scrivener .scriv project path", "Book folder", "Book title"]
-            }
             Self::NewBook => &["Book folder", "Book title"],
             Self::CreateStoryLink => &[
                 "Source entity name",
@@ -385,6 +384,7 @@ enum FileBrowserPurpose {
     NewProject,
     OpenProject,
     ImportScrivenerSource,
+    ImportScrivenerSeries,
     Compile(story_document::CompileFormat),
 }
 
@@ -6293,16 +6293,17 @@ impl AppState {
             FileBrowserPurpose::Compile(_) => self.app.project_root().to_owned(),
             FileBrowserPurpose::NewProject
             | FileBrowserPurpose::OpenProject
-            | FileBrowserPurpose::ImportScrivenerSource => std::env::var_os("HOME")
+            | FileBrowserPurpose::ImportScrivenerSource
+            | FileBrowserPurpose::ImportScrivenerSeries => std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .filter(|path| path.is_dir())
                 .unwrap_or(fallback),
         };
         let name = match purpose {
             FileBrowserPurpose::NewProject => "My Novel".to_owned(),
-            FileBrowserPurpose::OpenProject | FileBrowserPurpose::ImportScrivenerSource => {
-                String::new()
-            }
+            FileBrowserPurpose::OpenProject
+            | FileBrowserPurpose::ImportScrivenerSource
+            | FileBrowserPurpose::ImportScrivenerSeries => String::new(),
             FileBrowserPurpose::Compile(format) => {
                 let title = self
                     .app
@@ -6461,7 +6462,9 @@ impl AppState {
                 let name = browser.name.trim();
                 if !matches!(
                     browser.purpose,
-                    FileBrowserPurpose::OpenProject | FileBrowserPurpose::ImportScrivenerSource
+                    FileBrowserPurpose::OpenProject
+                        | FileBrowserPurpose::ImportScrivenerSource
+                        | FileBrowserPurpose::ImportScrivenerSeries
                 ) && !file_browser_leaf_name_is_safe(name)
                 {
                     self.message = "Enter a valid name".into();
@@ -6519,6 +6522,44 @@ impl AppState {
                             Err(error) => {
                                 self.message =
                                     format!("Could not inspect Scrivener project: {error}");
+                                self.file_browser = Some(browser);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    FileBrowserPurpose::ImportScrivenerSeries => {
+                        let source = browser
+                            .entries
+                            .get(browser.selected)
+                            .map(|(item, _)| browser.current_dir.join(item))
+                            .filter(|path| {
+                                (path.is_dir()
+                                    && path.extension().is_some_and(|ext| ext == "scriv"))
+                                    || (path.is_file()
+                                        && path.extension().is_some_and(|ext| ext == "scrivx"))
+                            });
+                        let Some(source) = source else {
+                            self.message =
+                                "Select a .scriv project folder or .scrivx manifest, then press F5"
+                                    .into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        };
+                        let inventory = match story_import::inspect_scrivener_project(&source) {
+                            Ok(inventory) => inventory,
+                            Err(error) => {
+                                self.message =
+                                    format!("Could not inspect Scrivener project: {error}");
+                                self.file_browser = Some(browser);
+                                return Ok(());
+                            }
+                        };
+                        let folder = safe_filename(&inventory.title);
+                        match self.start_scrivener_import(source, folder, inventory.title) {
+                            Ok(()) => close = true,
+                            Err(error) => {
+                                self.message =
+                                    format!("Could not prepare Scrivener import: {error}");
                                 self.file_browser = Some(browser);
                                 return Ok(());
                             }
@@ -6622,11 +6663,23 @@ impl AppState {
         if command_id == "file.new-project" {
             return self.start_file_browser(FileBrowserPurpose::NewProject);
         }
+        if command_id == "series.import-scrivener" {
+            if self.selected_series_root.is_none() {
+                self.series_form = Some(SeriesActionForm {
+                    kind: SeriesFormKind::CreateSeriesThenImport,
+                    values: Vec::new(),
+                    input: String::new(),
+                });
+                self.menu = None;
+                self.message = "Create a series, then choose the Scrivener source · Enter continues · Esc cancels".into();
+                return Ok(());
+            }
+            return self.start_file_browser(FileBrowserPurpose::ImportScrivenerSeries);
+        }
         let kind = match command_id {
             "series.create" => SeriesFormKind::CreateSeries,
             "series.select" => SeriesFormKind::SelectSeries,
             "series.add-current" => SeriesFormKind::AddCurrentBook,
-            "series.import-scrivener" => SeriesFormKind::ImportScrivener,
             "series.new-book" => SeriesFormKind::NewBook,
             "link.create" => SeriesFormKind::CreateStoryLink,
             "link.delete" => SeriesFormKind::DeleteStoryLink,
@@ -6704,6 +6757,14 @@ impl AppState {
                 self.switch(Workspace::Series);
                 self.message = format!("Created series '{}'", series.title());
             }
+            SeriesFormKind::CreateSeriesThenImport => {
+                let series = story_series::SeriesStore::create(&values[0], &values[1])?;
+                self.selected_series_root = Some(series.root().to_owned());
+                self.series_reference_view = false;
+                self.selected = 0;
+                self.switch(Workspace::Series);
+                self.start_file_browser(FileBrowserPurpose::ImportScrivenerSeries)?;
+            }
             SeriesFormKind::SelectSeries => {
                 let series = story_series::SeriesStore::open(&values[0])?;
                 self.selected_series_root = Some(series.root().to_owned());
@@ -6724,11 +6785,6 @@ impl AppState {
                 self.switch(Workspace::Series);
                 self.message = format!("Added current project as '{}'", book.title);
             }
-            SeriesFormKind::ImportScrivener => self.start_scrivener_import(
-                PathBuf::from(&values[0]),
-                values[1].clone(),
-                values[2].clone(),
-            )?,
             SeriesFormKind::NewBook => self.create_series_book(&values[0], &values[1])?,
             SeriesFormKind::CreateStoryLink => {
                 let source = resolve_named_link_entity(&self.app, &values[0])?;
@@ -9271,10 +9327,7 @@ impl AppState {
             }
             _ if matches!(
                 spec.id,
-                "series.add-current"
-                    | "series.import-scrivener"
-                    | "series.new-book"
-                    | "series.references"
+                "series.add-current" | "series.new-book" | "series.references"
             ) && self.selected_series_root.is_none() =>
             {
                 Some("Select or create a series first")
@@ -19645,6 +19698,9 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         FileBrowserPurpose::ImportScrivenerSource => {
             "Import Scrivener · choose a .scriv folder or .scrivx manifest"
         }
+        FileBrowserPurpose::ImportScrivenerSeries => {
+            "Import Scrivener into Series · choose a .scriv folder or .scrivx manifest"
+        }
         FileBrowserPurpose::Compile(format) => match format {
             story_document::CompileFormat::Docx => "Compile · DOCX",
             story_document::CompileFormat::Epub => "Compile · EPUB",
@@ -19743,7 +19799,10 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         "↑/↓ browse · Enter Open · Home home · / root · Tab filename · F2 format · F5 Save/Compile · F7 New Folder · Backspace parent · Esc Cancel"
     } else if browser.purpose == FileBrowserPurpose::OpenProject {
         "↑/↓ browse · Enter Open folder · Home home · / root · F5 Open Project · Backspace parent · Esc Cancel"
-    } else if browser.purpose == FileBrowserPurpose::ImportScrivenerSource {
+    } else if matches!(
+        browser.purpose,
+        FileBrowserPurpose::ImportScrivenerSource | FileBrowserPurpose::ImportScrivenerSeries
+    ) {
         "↑/↓ browse · Enter Open folder · Home home · / root · F5 Inspect selected Scrivener project · Backspace parent · Esc Cancel"
     } else {
         "↑/↓ browse · Enter Open · Home home · / root · Tab project name · F5 Create Project · F7 New Folder · Backspace parent · Esc Cancel"
@@ -24501,12 +24560,9 @@ mod tests {
         let source_before = story_import::inspect_scrivener_project(&fixture)
             .unwrap()
             .source_fingerprint;
-        select_series_menu_action(&mut state, "series.import-scrivener").unwrap();
-        enter_series_form_values(
-            &mut state,
-            &[fixture.to_str().unwrap(), "Book-01", "Book One"],
-        )
-        .unwrap();
+        state
+            .start_scrivener_import(fixture.clone(), "Book-01".into(), "Book One".into())
+            .unwrap();
         assert_eq!(state.workspace, Workspace::Series);
         assert!(!workspace_items(&state).is_empty());
         assert!(state.scrivener_import.is_some());
@@ -24743,6 +24799,21 @@ mod tests {
             FileBrowserPurpose::ImportScrivenerSource
         );
         assert!(state.message.contains("Choose a folder or filename"));
+    }
+
+    #[test]
+    fn series_scrivener_import_uses_shared_browser_when_a_series_exists() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let series =
+            story_series::SeriesStore::create(root.path().join("Series"), "Series").unwrap();
+        state.selected_series_root = Some(series.root().to_owned());
+        select_series_menu_action(&mut state, "series.import-scrivener").unwrap();
+        assert_eq!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::ImportScrivenerSeries
+        );
     }
 
     #[test]
@@ -32777,16 +32848,11 @@ mod tests {
     }
 
     #[test]
-    fn series_actions_without_series_context_are_disabled_and_keep_the_menu_open() {
+    fn series_import_offers_inline_series_creation_while_other_actions_explain_prerequisite() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
         let mut state = AppState::new(app, default_bindings());
-        for id in [
-            "series.add-current",
-            "series.import-scrivener",
-            "series.new-book",
-            "series.references",
-        ] {
+        for id in ["series.add-current", "series.new-book", "series.references"] {
             assert_eq!(
                 state.command_disabled_reason(command_by_id(id).unwrap()),
                 Some("Select or create a series first"),
@@ -32798,13 +32864,20 @@ mod tests {
             None
         );
 
-        select_series_menu_action(&mut state, "series.new-book").unwrap();
-        assert!(
-            state.menu.is_some(),
-            "an unavailable action must not close the menu"
+        select_series_menu_action(&mut state, "series.import-scrivener").unwrap();
+        assert!(state.menu.is_none());
+        assert_eq!(
+            state.series_form.as_ref().unwrap().kind,
+            SeriesFormKind::CreateSeriesThenImport
         );
-        assert!(state.message.contains("Select or create a series first"));
-        assert!(state.series_form.is_none());
+        assert!(state.message.contains("Create a series"));
+        let series_path = directory.path().join("New Series");
+        enter_series_form_values(&mut state, &[series_path.to_str().unwrap(), "New Series"])
+            .unwrap();
+        assert_eq!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::ImportScrivenerSeries
+        );
     }
 
     #[test]
