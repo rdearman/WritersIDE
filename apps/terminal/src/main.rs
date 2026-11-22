@@ -14267,8 +14267,16 @@ fn run(
                     }
                 }
                 Event::Paste(text) if s.workspace == Workspace::Editor => {
-                    s.push_undo();
-                    s.paste_text(&text);
+                    if s.editing_scene.is_none()
+                        && s.editing_content_unit.is_none()
+                        && s.assembly_draft.is_none()
+                        && s.active_challenge.is_none()
+                    {
+                        s.message = "No document is selected; paste was ignored. Create or open a manuscript document first".into();
+                    } else {
+                        s.push_undo();
+                        s.paste_text(&text);
+                    }
                     if s.active_challenge.as_ref().is_some_and(|challenge| {
                         s.count_words_for_project(&s.editor.join("\n")) >= challenge.target_words
                     }) {
@@ -14306,9 +14314,14 @@ fn run(
         }
         if autosave_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             autosave_deadline = None;
-            s.save()?;
-            if s.dirty {
-                s.message = "Autosave found a conflict; your text remains open and unsaved. Resolve it before saving again.".into();
+            if let Err(error) = s.save() {
+                s.message =
+                    format!("Autosave failed; in-memory text remains open and unsaved: {error}");
+            } else if s.dirty {
+                s.message = format!(
+                    "Autosave could not save this buffer. Your in-memory text remains open and unsaved. Press q for safe quit choices or Ctrl+S to retry. {}",
+                    s.message
+                );
             } else {
                 s.message = "Autosaved".into();
                 if let Err(error) = s.save_session() {
@@ -14521,7 +14534,21 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             && s.reference_focused
             && !s.reference_panes_hidden
             && !s.reference_panes.is_empty();
-        let (content, editor_title) = if maximized_reference {
+        let has_open_document = s.editing_scene.is_some()
+            || s.editing_content_unit.is_some()
+            || s.assembly_draft.is_some()
+            || s.active_challenge.is_some();
+        let (content, editor_title) = if !has_open_document {
+            (
+                vec![
+                    Line::from("No manuscript document is open."),
+                    Line::from(
+                        "Use F10 or Ctrl+/ → Write → Create Chapter, or choose Open/Import.",
+                    ),
+                ],
+                "Start Writing".into(),
+            )
+        } else if maximized_reference {
             let reference = &s.reference_panes[s.active_reference.min(s.reference_panes.len() - 1)];
             let shared_scene = reference.shared_scene && reference.scene_id == s.editing_scene;
             let lines = if shared_scene {
@@ -15189,11 +15216,25 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     challenge_footer(challenge, &s.editor, policy)
                 })
                 .unwrap_or_default();
+            let challenge = if challenge.is_empty() {
+                String::new()
+            } else {
+                format!(" · {challenge}")
+            };
             format!(
-                " {}   {}   Enter open | j/k or ↑/↓ select | Tab next | Backspace back | {}",
-                s.message,
+                " Focus:{} · Menu Ctrl+/ or F10 · Help ? · Save Ctrl+S · q quit · {}{} · {}",
+                if s.menu.is_some() {
+                    "menu"
+                } else if s.reference_focused {
+                    "reference"
+                } else if s.workspace == Workspace::Editor {
+                    "manuscript"
+                } else {
+                    "navigation"
+                },
+                if s.dirty { "unsaved" } else { "saved" },
                 challenge,
-                if s.dirty { "modified" } else { "clean" }
+                s.message,
             )
         };
         f.render_widget(
@@ -16338,8 +16379,8 @@ fn parse_challenge_tail(
 
 fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let area = f.area();
-    let width = area.width.clamp(40, 86);
-    let height = area.height.clamp(8, 24);
+    let width = area.width.min(86);
+    let height = area.height.min(24);
     let popup = Rect {
         x: area.x + (area.width - width) / 2,
         y: area.y + (area.height - height) / 2,
@@ -16353,14 +16394,22 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-    let panes = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Length(18), Constraint::Min(10)])
-        .split(inner);
     let menu = s.menu.unwrap_or(MenuState {
         top: 0,
         selected: 0,
     });
+    let narrow = inner.width < 48 || inner.height < 10;
+    let panes = if narrow {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(inner)
+    } else {
+        Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(18), Constraint::Min(10)])
+            .split(inner)
+    };
     let roots = MENU_CATEGORIES
         .iter()
         .enumerate()
@@ -16372,13 +16421,25 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             ))
         })
         .collect::<Vec<_>>();
-    f.render_stateful_widget(
-        List::new(roots)
-            .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-            .block(Block::default().title("Menu").borders(Borders::RIGHT)),
-        panes[0],
-        &mut ListState::default().with_selected(Some(menu.top)),
-    );
+    if narrow {
+        f.render_widget(
+            Paragraph::new(format!(
+                "◂ {} {}/{} ▸",
+                MENU_CATEGORIES[menu.top],
+                menu.top + 1,
+                MENU_CATEGORIES.len()
+            )),
+            panes[0],
+        );
+    } else {
+        f.render_stateful_widget(
+            List::new(roots)
+                .highlight_style(Style::default().add_modifier(Modifier::BOLD))
+                .block(Block::default().title("Menu").borders(Borders::RIGHT)),
+            panes[0],
+            &mut ListState::default().with_selected(Some(menu.top)),
+        );
+    }
     let commands = s.menu_commands();
     let items = if commands.is_empty() {
         vec![ListItem::new("No commands available yet").style(Style::default().fg(Color::DarkGray))]
@@ -16404,10 +16465,7 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
                         spec.label, mark, args, shortcut_text, reason
                     )
                 } else {
-                    format!(
-                        "{}{}{}{} — {}",
-                        spec.label, mark, args, shortcut_text, spec.description
-                    )
+                    format!("{}{}{}{}", spec.label, mark, args, shortcut_text)
                 };
                 ListItem::new(label).style(if disabled.is_some() {
                     Style::default().fg(Color::DarkGray)
@@ -16434,6 +16492,23 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         panes[1],
         &mut ListState::default().with_selected(selected),
     );
+    if !commands.is_empty() && panes[1].height > 1 {
+        let selected_command = commands.get(menu.selected.min(commands.len() - 1)).unwrap();
+        let detail = s
+            .command_disabled_reason(*selected_command)
+            .map(|reason| format!("Unavailable: {reason}"))
+            .unwrap_or_else(|| selected_command.description.to_owned());
+        let detail_area = Rect {
+            x: panes[1].x,
+            y: panes[1].bottom().saturating_sub(2),
+            width: panes[1].width,
+            height: 2.min(panes[1].height),
+        };
+        f.render_widget(
+            Paragraph::new(detail).wrap(Wrap { trim: true }),
+            detail_area,
+        );
+    }
 }
 
 fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
@@ -16441,7 +16516,7 @@ fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         return;
     };
     let area = f.area();
-    let width = area.width.clamp(36, 76);
+    let width = area.width.min(76);
     let height = 8.min(area.height);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -16493,8 +16568,8 @@ fn draw_keybinding_manager_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         return;
     };
     let area = f.area();
-    let width = area.width.saturating_sub(4).clamp(40, 100);
-    let height = area.height.saturating_sub(3).clamp(8, 28);
+    let width = area.width.min(100);
+    let height = area.height.min(28);
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height) / 2,
@@ -19003,6 +19078,16 @@ fn step_find_query_history(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if is_menu_shortcut(k) || k.code == KeyCode::F(10) {
+        s.toggle_menu();
+        return Ok(false);
+    }
+    if s.menu.is_some() {
+        if !s.handle_context_command_key(k, "menu")? {
+            s.handle_menu_key(k)?;
+        }
+        return Ok(false);
+    }
     if let Some(preview) = s.snippet_preview.clone() {
         match k.code {
             KeyCode::Enter => {
@@ -19122,28 +19207,6 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         s.handle_series_form_key(k)?;
         return Ok(false);
     }
-    if s.menu.is_some() {
-        if is_menu_shortcut(k) || k.code == KeyCode::F(10) {
-            s.toggle_menu();
-        } else if s.handle_context_command_key(k, "menu")? {
-            return Ok(false);
-        } else {
-            s.handle_menu_key(k)?;
-        }
-        return Ok(false);
-    }
-    if is_menu_shortcut(k) {
-        if let Some(spec) = command_by_id("menu.main") {
-            s.dispatch_registered(spec.action)?;
-        }
-        return Ok(false);
-    }
-    if k.code == KeyCode::F(10) {
-        if let Some(spec) = command_by_id("menu.main") {
-            s.dispatch_registered(spec.action)?;
-        }
-        return Ok(false);
-    }
     let context = if s.find_panel.is_some() || s.mode.is_some() {
         "dialog"
     } else if s.workspace == Workspace::Editor {
@@ -19159,6 +19222,37 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if s.mode.is_some() {
+        if s.mode == Some('q') {
+            match k.code {
+                KeyCode::Esc => {
+                    s.mode = None;
+                    s.message = "Quit cancelled; returned to editing".into();
+                    return Ok(false);
+                }
+                KeyCode::Char('s' | 'S') => {
+                    if let Err(error) = s.save() {
+                        s.message = format!("Save before quit failed: {error}");
+                        return Ok(false);
+                    }
+                    if s.dirty {
+                        s.message = format!(
+                            "Save failed; your in-memory text is still open. Choose d to quit without saving, or Esc to continue editing. {}",
+                            s.message
+                        );
+                        return Ok(false);
+                    }
+                    s.mode = None;
+                    return Ok(true);
+                }
+                KeyCode::Char('d' | 'D') => {
+                    s.mode = None;
+                    s.message =
+                        "Quit without saving; the saved manuscript was left unchanged".into();
+                    return Ok(true);
+                }
+                _ => return Ok(false),
+            }
+        }
         if s.mode == Some('c') {
             match k.code {
                 KeyCode::Esc => {
@@ -19516,10 +19610,37 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             return Ok(false);
         }
         if s.dirty {
-            s.message = "Unsaved text: Ctrl-S to save before quitting".into();
+            s.mode = Some('q');
+            s.prompt =
+                "Save and Quit (s) · Quit Without Saving (d) · Esc returns to editing".into();
+            s.message = "Choose how to leave the current unsaved text".into();
             return Ok(false);
         }
         return Ok(true);
+    }
+    let unattached_edit = matches!(
+        k.code,
+        KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete | KeyCode::Tab
+    ) || (matches!(k.code, KeyCode::Char(_))
+        && (!k.modifiers.contains(KeyModifiers::CONTROL)
+            && !k.modifiers.contains(KeyModifiers::ALT)
+            || (k.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(k.code, KeyCode::Char('x' | 'v')))));
+    if s.workspace == Workspace::Editor
+        && s.editing_scene.is_none()
+        && s.editing_content_unit.is_none()
+        && s.assembly_draft.is_none()
+        && s.active_challenge.is_none()
+        && !s.reference_focused
+        && unattached_edit
+    {
+        if matches!(
+            k.code,
+            KeyCode::Char(_) | KeyCode::Enter | KeyCode::Backspace | KeyCode::Delete | KeyCode::Tab
+        ) {
+            s.message = "No document is selected; use the menu to create or open one. Nothing was typed into an unattached buffer".into();
+        }
+        return Ok(false);
     }
     if s.workspace == Workspace::Editor {
         if s.reference_focused && !s.active_reference_shares_open_scene() {
@@ -20476,10 +20597,13 @@ mod tests {
     #[test]
     fn command_shortcuts_load_from_registry_and_dispatch_without_replacing_slash_input() {
         let root = tempfile::tempdir().unwrap();
-        let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
+        let mut project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
+        let chapter = project.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = project.create_scene(chapter, "Scene", 0).unwrap();
         let config = project.project_root().join(".writers-ide/keybindings.toml");
         fs::write(&config, "[commands]\n\"Ctrl+Alt+A\" = \"view.analytics\"\n").unwrap();
         let mut state = AppState::new(project, default_bindings());
+        state.open_scene(scene).unwrap();
         state.command_bindings = load_command_bindings(state.app.project_root()).unwrap();
         handle(
             &mut state,
@@ -21648,6 +21772,18 @@ mod tests {
             state.snippet_preview.as_ref().unwrap().proposed,
             "Project: Hana!"
         );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.menu.is_some());
+        assert!(state.snippet_preview.is_some());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        )
+        .unwrap();
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert!(state.snippet_preview.is_none());
         assert_eq!(state.editor.join("\n"), "");
@@ -23206,17 +23342,21 @@ mod tests {
     #[test]
     fn editor_slash_is_text_and_menu_invocation_preserves_edit_state() {
         let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 10).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let saved_hash = app.load_scene_text(scene).unwrap().1;
         let mut state = AppState {
-            app: WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap(),
+            app,
             workspace: Workspace::Editor,
             scenes: Vec::new(),
             selected: 1,
             editor: vec!["text".into()],
-            editing_scene: None,
+            editing_scene: Some(scene),
             editing_content_unit: None,
             cursor: (0, 4),
             narrowed_passage: None,
-            saved_hash: String::new(),
+            saved_hash,
             dirty: true,
             mode: None,
             prompt: String::new(),
@@ -23329,7 +23469,7 @@ mod tests {
         assert!(state.menu.is_some());
         assert_eq!(
             state.command_disabled_reason(command_by_id("file.save").unwrap()),
-            Some("Open a scene or assembly draft first")
+            None
         );
         handle(
             &mut state,
@@ -26022,18 +26162,22 @@ mod tests {
 
     #[test]
     fn editor_selection_copy_cut_and_paste_preserve_multiline_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("N"), "N").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let saved_hash = app.load_scene_text(scene).unwrap().1;
         let mut state = AppState {
-            app: WriterApp::create_project(tempfile::tempdir().unwrap().path().join("N"), "N")
-                .unwrap(),
+            app,
             workspace: Workspace::Editor,
             scenes: Vec::new(),
             selected: 0,
             editor: vec!["alpha".into(), "beta".into()],
-            editing_scene: None,
+            editing_scene: Some(scene),
             editing_content_unit: None,
             cursor: (1, 2),
             narrowed_passage: None,
-            saved_hash: String::new(),
+            saved_hash,
             dirty: false,
             mode: None,
             prompt: String::new(),
@@ -26268,18 +26412,22 @@ mod tests {
 
     #[test]
     fn editor_accepts_shifted_characters_and_moves_between_lines() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("N"), "N").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let saved_hash = app.load_scene_text(scene).unwrap().1;
         let mut state = AppState {
-            app: WriterApp::create_project(tempfile::tempdir().unwrap().path().join("N"), "N")
-                .unwrap(),
+            app,
             workspace: Workspace::Editor,
             scenes: Vec::new(),
             selected: 0,
             editor: vec![String::new(), "next".into()],
-            editing_scene: None,
+            editing_scene: Some(scene),
             editing_content_unit: None,
             cursor: (0, 0),
             narrowed_passage: None,
-            saved_hash: String::new(),
+            saved_hash,
             dirty: false,
             mode: None,
             prompt: String::new(),
@@ -26924,6 +27072,88 @@ mod tests {
         assert!(state.dirty);
         assert!(state.message.contains("Save conflict/error"));
         assert_eq!(state.editor[0], "A");
+    }
+
+    #[test]
+    fn quit_after_save_conflict_can_discard_without_touching_saved_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Saved version")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["My in-memory edit".into()];
+        state.dirty = true;
+        fs::write(
+            project.join("manuscript").join(format!("{scene}.md")),
+            "Newer disk version",
+        )
+        .unwrap();
+
+        assert!(
+            !handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+            )
+            .unwrap()
+        );
+        assert_eq!(state.mode, Some('q'));
+        assert!(
+            !handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE)
+            )
+            .unwrap()
+        );
+        assert!(state.dirty);
+        assert!(!state.message.is_empty());
+        assert!(!handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap());
+        assert_eq!(state.mode, None);
+        assert_eq!(state.editor.join("\n"), "My in-memory edit");
+
+        assert!(
+            !handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)
+            )
+            .unwrap()
+        );
+        assert!(
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE)
+            )
+            .unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(project.join("manuscript").join(format!("{scene}.md"))).unwrap(),
+            "Newer disk version"
+        );
+    }
+
+    #[test]
+    fn blank_editor_has_no_unattached_text_and_menu_survives_terminal_resizing() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.workspace = Workspace::Editor;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor, [""]);
+        assert!(state.message.contains("No document is selected"));
+        state.toggle_menu();
+        for (width, height) in [(20, 6), (40, 10), (80, 24), (142, 60)] {
+            let backend = ratatui::backend::TestBackend::new(width, height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        }
     }
 
     #[test]
