@@ -22,9 +22,41 @@ pub struct ProofreadingRule {
     pub message: String,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProofreadingPreset {
+    Drafting,
+    Copyedit,
+    Publication,
+}
+
+impl ProofreadingPreset {
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "drafting" | "standard" => Some(Self::Drafting),
+            "copyedit" => Some(Self::Copyedit),
+            "publication" => Some(Self::Publication),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Drafting => "drafting",
+            Self::Copyedit => "copyedit",
+            Self::Publication => "publication",
+        }
+    }
+}
+
 impl Default for ProofreadingConfig {
     fn default() -> Self {
-        Self {
+        Self::preset(ProofreadingPreset::Drafting)
+    }
+}
+
+impl ProofreadingConfig {
+    pub fn preset(preset: ProofreadingPreset) -> Self {
+        let mut config = Self {
             version: 1,
             rules: vec![
                 ProofreadingRule {
@@ -52,11 +84,28 @@ impl Default for ProofreadingConfig {
                     message: "Space before punctuation".into(),
                 },
             ],
+        };
+        match preset {
+            ProofreadingPreset::Drafting => {}
+            ProofreadingPreset::Copyedit => {
+                for rule in &mut config.rules {
+                    rule.severity = "warning".into();
+                }
+            }
+            ProofreadingPreset::Publication => {
+                for rule in &mut config.rules {
+                    rule.severity = if rule.kind == "repeated-word" {
+                        "error"
+                    } else {
+                        "warning"
+                    }
+                    .into();
+                }
+            }
         }
+        config
     }
-}
 
-impl ProofreadingConfig {
     pub fn validate(&self) -> Result<(), String> {
         if self.version != 1 {
             return Err(format!(
@@ -202,7 +251,7 @@ pub fn typography_suggestions(text: &str, language: &str) -> Vec<TypographySugge
 #[cfg(test)]
 mod proofread_tests {
     use super::{
-        ProofreadingConfig, ProofreadingRule, proofread, proofread_with_config,
+        ProofreadingConfig, ProofreadingPreset, ProofreadingRule, proofread, proofread_with_config,
         typography_suggestions,
     };
 
@@ -245,6 +294,33 @@ mod proofread_tests {
         assert_eq!(&text[finding.byte_range.clone()], "was followed");
         assert_eq!(finding.severity, "warning");
         assert!(ProofreadingConfig::from_toml("version=1\n[[rules]]\nid='x'\nenabled=true\nkind='regex'\npattern='['\nseverity='warning'\nmessage='bad'").is_err());
+    }
+
+    #[test]
+    fn diagnostic_presets_are_named_deterministic_and_keep_custom_rules_editable() {
+        let drafting = ProofreadingConfig::preset(ProofreadingPreset::Drafting);
+        let copyedit = ProofreadingConfig::preset(ProofreadingPreset::Copyedit);
+        let publication = ProofreadingConfig::preset(ProofreadingPreset::Publication);
+        assert_eq!(drafting.rules[0].severity, "warning");
+        assert_eq!(drafting.rules[1].severity, "information");
+        assert!(copyedit.rules.iter().all(|rule| rule.severity == "warning"));
+        assert_eq!(publication.rules[0].severity, "error");
+        assert_eq!(publication.rules[1].severity, "warning");
+        assert_eq!(
+            ProofreadingPreset::parse("standard"),
+            Some(ProofreadingPreset::Drafting)
+        );
+        assert_eq!(
+            ProofreadingPreset::parse("copyedit").unwrap().name(),
+            "copyedit"
+        );
+        assert!(ProofreadingPreset::parse("unknown").is_none());
+        for config in [drafting, copyedit, publication] {
+            assert_eq!(
+                ProofreadingConfig::from_toml(&config.to_toml().unwrap()).unwrap(),
+                config
+            );
+        }
     }
 
     #[test]

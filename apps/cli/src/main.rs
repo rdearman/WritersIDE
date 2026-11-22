@@ -1764,10 +1764,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         "proofread-config" => {
             let path = args.next().ok_or("missing project path")?;
+            let preset_name = args.next().unwrap_or_else(|| "drafting".into());
+            if args.next().is_some() {
+                return Err("proofread-config accepts at most one preset".into());
+            }
+            let preset = story_analysis::ProofreadingPreset::parse(&preset_name)
+                .ok_or("unknown diagnostics preset; use drafting, copyedit, or publication")?;
             let app = WriterApp::open_project(path)?;
             println!(
-                "Created diagnostics configuration at {}",
-                app.write_default_proofreading_config()?.display()
+                "Created {} diagnostics configuration at {}",
+                preset.name(),
+                app.write_proofreading_config(preset)?.display()
             );
         }
         "process" => {
@@ -3455,7 +3462,7 @@ writers-ide spellcheck-hunspell <project> <language-tag> [project-relative-wordl
         "writers-ide query-assert-save <project> <query-uuid> <non-empty|empty|at-least:N|at-most:N|exactly:N>...\nwriters-ide query-assert-check <project> <query-uuid>"
     );
     eprintln!(
-        "writers-ide proofread-config <project> (creates editable .writers-ide/diagnostics.toml)"
+        "writers-ide proofread-config <project> [drafting|copyedit|publication] (creates editable .writers-ide/diagnostics.toml; never overwrites)"
     );
     eprintln!(
         "writers-ide typography-preview <project> [all|scene:SCENE-UUID] (read-only suggestions)"

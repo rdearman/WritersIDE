@@ -2667,11 +2667,17 @@ impl WriterApp {
             .map_err(AppError::Domain)
     }
     pub fn write_default_proofreading_config(&self) -> Result<std::path::PathBuf> {
+        self.write_proofreading_config(story_analysis::ProofreadingPreset::Drafting)
+    }
+    pub fn write_proofreading_config(
+        &self,
+        preset: story_analysis::ProofreadingPreset,
+    ) -> Result<std::path::PathBuf> {
         let path = self
             .store
             .project_root()
             .join(".writers-ide/diagnostics.toml");
-        let source = story_analysis::ProofreadingConfig::default()
+        let source = story_analysis::ProofreadingConfig::preset(preset)
             .to_toml()
             .map_err(AppError::Domain)?;
         use std::io::Write;
@@ -6892,6 +6898,8 @@ unexpected_prose = "must not be silently discarded"
         let app = WriterApp::create_project(&project, "Novel").unwrap();
         let config_path = app.write_default_proofreading_config().unwrap();
         assert!(config_path.starts_with(&project));
+        let drafting = std::fs::read_to_string(&config_path).unwrap();
+        assert!(drafting.contains("severity = \"information\""));
         assert!(app.write_default_proofreading_config().is_err());
         let default_findings = app.proofread_text("Mara was followed.").unwrap();
         assert!(default_findings.is_empty());
@@ -6903,6 +6911,18 @@ unexpected_prose = "must not be silently discarded"
         assert_eq!(configured.len(), 1);
         assert_eq!(configured[0].category, "passive");
         assert!(configured[0].byte_range.end <= "Mara was followed.".len());
+
+        let copyedit_project = directory.path().join("Copyedit");
+        let copyedit = WriterApp::create_project(&copyedit_project, "Copyedit").unwrap();
+        let copyedit_path = copyedit
+            .write_proofreading_config(story_analysis::ProofreadingPreset::Copyedit)
+            .unwrap();
+        let copyedit_source = std::fs::read_to_string(copyedit_path).unwrap();
+        assert!(copyedit_source.contains("severity = \"warning\""));
+        assert_eq!(
+            copyedit.proofread_text("Mara  followed !").unwrap().len(),
+            2
+        );
     }
 
     #[test]
