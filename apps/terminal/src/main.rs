@@ -396,6 +396,82 @@ struct HelpPanel {
     scroll: usize,
 }
 
+fn welcome_panel(has_progress: bool) -> HelpPanel {
+    let mut lines = vec![
+        "Choose how to begin. The tutorial uses its own disposable sample project.".into(),
+        "Guided Tour · overview of navigation, writing, references and publishing".into(),
+        "Quick Start · create/open, write and save, then compile".into(),
+        "Skip · continue directly to your project; Help remains available".into(),
+    ];
+    if has_progress {
+        lines.push("Resume Tutorial · return to saved progress".into());
+    }
+    lines.push("↑/↓ select · Enter choose · Esc skip".into());
+    HelpPanel {
+        title: "Welcome to Writer's IDE".into(),
+        lines,
+        scroll: 0,
+    }
+}
+
+fn tutorial_panel(track: onboarding::TutorialTrack, step: usize) -> HelpPanel {
+    let lessons: &[(&str, &str)] = match track {
+        onboarding::TutorialTrack::QuickStart => &[
+            (
+                "Project",
+                "This separate sample book is disposable. Your opened novel is unchanged.",
+            ),
+            (
+                "Write and save",
+                "Open the sample scene from Outline or Scene Cards. Type normally; Ctrl+S saves it.",
+            ),
+            (
+                "Compile",
+                "Open the Publish menu and choose Compile. Select EPUB and inspect Compile Results.",
+            ),
+        ],
+        onboarding::TutorialTrack::GuidedTour => &[
+            (
+                "Project",
+                "This separate sample book is disposable. Your opened novel is unchanged.",
+            ),
+            (
+                "Navigate",
+                "Use Tab and Shift+Tab to move between workspaces. Outline and Scene Cards show the same scenes.",
+            ),
+            (
+                "Write and save",
+                "Open the sample scene. Type normally; Ctrl+S saves it. The saved text can be reopened from the outline.",
+            ),
+            (
+                "References",
+                "Open a reference pane from the Window menu, then use Ctrl+Tab to move focus between panes.",
+            ),
+            (
+                "Search and review",
+                "Use Search to find manuscript text. Diagnostics and Issues provide review and follow-up lists.",
+            ),
+            (
+                "Compile",
+                "Open the Publish menu, compile EPUB, then inspect Compile Results and its source navigation.",
+            ),
+        ],
+    };
+    let (title, body) = lessons
+        .get(step)
+        .copied()
+        .unwrap_or(("Complete", "The tutorial route is complete."));
+    HelpPanel {
+        title: format!("Tutorial · {title} · {}/{}", step + 1, lessons.len()),
+        lines: vec![
+            body.into(),
+            "Use the application while this panel is open; ordinary keys continue to the workspace.".into(),
+            "Shift+F6 previous · F6 next · Esc hide · q return outside the editor · ? contextual help".into(),
+        ],
+        scroll: 0,
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CommandPaletteState {
     query: String,
@@ -4226,6 +4302,21 @@ fn user_recent_projects_path() -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("recent-projects.json")
+}
+
+fn user_tutorial_preferences_path() -> PathBuf {
+    user_keymap_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("tutorial-state.json")
+}
+
+fn user_tutorial_project_path() -> PathBuf {
+    let data_root = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from(".local/share"));
+    data_root.join("writers-ide/tutorial/sample-project")
 }
 
 fn load_recent_projects(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
@@ -8170,6 +8261,153 @@ impl AppState {
     }
     fn show_context_help(&mut self) {
         self.help_panel = Some(context_help_panel(self));
+    }
+    fn begin_tutorial(
+        &mut self,
+        track: onboarding::TutorialTrack,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.begin_tutorial_at(
+            track,
+            user_tutorial_project_path(),
+            user_tutorial_preferences_path(),
+        )
+    }
+    fn begin_tutorial_at(
+        &mut self,
+        track: onboarding::TutorialTrack,
+        demo_path: PathBuf,
+        preferences_path: PathBuf,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err(
+                "save or resolve the current manuscript buffer before starting the tutorial".into(),
+            );
+        }
+        if self.active_challenge.is_some() {
+            return Err(
+                "finish or quit the active writing challenge before starting the tutorial".into(),
+            );
+        }
+        let return_project = self.app.project_root().canonicalize()?;
+        let demo_title = "Writer's IDE Tutorial Sample";
+        let mut demo = if demo_path.exists() {
+            let app = WriterApp::open_project(&demo_path)?;
+            if app.get_project()?.title != demo_title {
+                return Err(
+                    "the reserved tutorial project path contains an unrelated project".into(),
+                );
+            }
+            app
+        } else {
+            WriterApp::create_project(&demo_path, demo_title)?
+        };
+        if demo.list_scenes(false)?.is_empty() {
+            let chapter = demo.create_chapter(None, "A Sample Chapter", 0)?;
+            let scene = demo.create_scene(chapter, "The First Page", 0)?;
+            let (text, hash) = demo.load_scene_text(scene)?;
+            if text.is_empty() {
+                demo.save_scene_text(
+                    scene,
+                    Some(&hash),
+                    "Mara opened the old book and found a note inside.\n\nThis is a disposable tutorial scene. Try editing it, then save with Ctrl+S.",
+                )?;
+            }
+        }
+        demo.recover_interrupted_writing_challenges()?;
+        let mut preferences = onboarding::load(&preferences_path)?;
+        preferences.version = onboarding::PREFERENCES_VERSION;
+        preferences.welcome_seen = true;
+        preferences.tutorial_dismissed = false;
+        preferences.tutorial_completed = false;
+        preferences.active_tutorial = Some(onboarding::TutorialProgress {
+            track,
+            step: 0,
+            demo_project: demo_path.canonicalize()?.to_string_lossy().into_owned(),
+            return_project: return_project.to_string_lossy().into_owned(),
+        });
+        onboarding::store(&preferences_path, &preferences)?;
+        let recent_projects_path = self.recent_projects_path.take();
+        let switched = self.switch_to_project(demo_path, "Tutorial sample opened".into());
+        self.recent_projects_path = recent_projects_path;
+        switched?;
+        self.help_panel = Some(tutorial_panel(track, 0));
+        Ok(())
+    }
+    fn exit_tutorial(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let preferences = onboarding::load(&user_tutorial_preferences_path())?;
+        let Some(progress) = preferences.active_tutorial else {
+            self.help_panel = None;
+            return Ok(());
+        };
+        if self.dirty {
+            self.save()?;
+        }
+        let recent_projects_path = self.recent_projects_path.take();
+        let switched = self.switch_to_project(
+            PathBuf::from(progress.return_project),
+            "Tutorial paused · choose Guided Tutorial to resume".into(),
+        );
+        self.recent_projects_path = recent_projects_path;
+        switched?;
+        self.help_panel = None;
+        Ok(())
+    }
+    fn resume_tutorial(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let preferences_path = user_tutorial_preferences_path();
+        let preferences = onboarding::load(&preferences_path)?;
+        let Some(progress) = preferences.active_tutorial else {
+            return self.begin_tutorial(onboarding::TutorialTrack::GuidedTour);
+        };
+        let demo_path = PathBuf::from(&progress.demo_project);
+        let current_path = self.app.project_root().canonicalize().ok();
+        let target_path = demo_path.canonicalize()?;
+        if current_path.as_ref() != Some(&target_path) {
+            let recent_projects_path = self.recent_projects_path.take();
+            let switched =
+                self.switch_to_project(demo_path, "Resumed the disposable tutorial project".into());
+            self.recent_projects_path = recent_projects_path;
+            switched?;
+        }
+        self.help_panel = Some(tutorial_panel(progress.track, progress.step));
+        Ok(())
+    }
+    fn advance_tutorial(&mut self, direction: isize) -> Result<(), Box<dyn std::error::Error>> {
+        let path = user_tutorial_preferences_path();
+        let mut preferences = onboarding::load(&path)?;
+        let Some(progress) = preferences.active_tutorial.as_mut() else {
+            self.help_panel = None;
+            return Ok(());
+        };
+        let last = match progress.track {
+            onboarding::TutorialTrack::QuickStart => 2,
+            onboarding::TutorialTrack::GuidedTour => 5,
+        };
+        if direction < 0 {
+            progress.step = progress.step.saturating_sub(1);
+        } else if progress.step >= last {
+            if self.dirty {
+                self.save()?;
+            }
+            let original = PathBuf::from(&progress.return_project);
+            preferences.active_tutorial = None;
+            preferences.tutorial_completed = true;
+            preferences.tutorial_dismissed = false;
+            onboarding::store(&path, &preferences)?;
+            self.help_panel = None;
+            self.message = "Tutorial complete · your original project is unchanged".into();
+            let recent_projects_path = self.recent_projects_path.take();
+            let switched = self.switch_to_project(original, "Returned from tutorial".into());
+            self.recent_projects_path = recent_projects_path;
+            switched?;
+            return Ok(());
+        } else {
+            progress.step += 1;
+        }
+        let track = progress.track;
+        let step = progress.step;
+        onboarding::store(&path, &preferences)?;
+        self.help_panel = Some(tutorial_panel(track, step));
+        Ok(())
     }
     fn close_context_help(&mut self) {
         self.help_panel = None;
@@ -15546,6 +15784,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     state.restore_session()?;
     state.refresh()?;
+    let onboarding_path = user_tutorial_preferences_path();
+    match onboarding::load(&onboarding_path) {
+        Ok(preferences) if !preferences.welcome_seen || preferences.active_tutorial.is_some() => {
+            state.help_panel = Some(welcome_panel(preferences.active_tutorial.is_some()));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            state.message = format!("{} · Tutorial progress unavailable: {error}", state.message)
+                .trim_start_matches(" · ")
+                .to_owned();
+        }
+    }
     let mut terminal = setup()?;
     let result = run(&mut terminal, &mut state);
     restore(&mut terminal)?;
@@ -16890,13 +17140,45 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
         height,
     );
     f.render_widget(Clear, rect);
-    let text = panel
-        .lines
-        .iter()
-        .skip(panel.scroll)
-        .cloned()
-        .collect::<Vec<_>>()
-        .join("\n");
+    let text = if panel.title == "Welcome to Writer's IDE" {
+        let choices = panel
+            .lines
+            .iter()
+            .filter(|line| {
+                ["Guided Tour", "Quick Start", "Skip", "Resume Tutorial"]
+                    .iter()
+                    .any(|prefix| line.starts_with(prefix))
+            })
+            .count();
+        panel
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                if (1..=choices).contains(&index) {
+                    format!(
+                        "{} {line}",
+                        if index - 1 == panel.scroll {
+                            "›"
+                        } else {
+                            " "
+                        }
+                    )
+                } else {
+                    line.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        panel
+            .lines
+            .iter()
+            .skip(panel.scroll)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     f.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: true }).block(
             Block::default()
@@ -19368,7 +19650,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
         Workspace::Dashboard if s.scenes.is_empty() => vec![
             "Start Writing · create a chapter and first scene".into(),
             "Open or Import · bring in an existing manuscript".into(),
-            "Guided Tutorial · not available yet".into(),
+            "Guided Tutorial · start or resume in a disposable sample project".into(),
             "Advanced Tools · search registered commands".into(),
             "Offline Help · workflows and shortcuts".into(),
         ],
@@ -19382,6 +19664,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                     .count()
             ),
             format!("{} words", s.scenes.iter().map(|x| x.3).sum::<u32>()),
+            "Guided Tutorial · start or resume in a disposable sample project".into(),
         ],
         Workspace::Outline => outline_rows(s)
             .into_iter()
@@ -21129,31 +21412,112 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if s.help_panel.is_some() {
-        match k.code {
-            KeyCode::Esc | KeyCode::F(1) => s.close_context_help(),
-            KeyCode::Up => {
-                if let Some(panel) = s.help_panel.as_mut() {
-                    panel.scroll = panel.scroll.saturating_sub(1);
+        let panel_title = s.help_panel.as_ref().map(|panel| panel.title.as_str());
+        if panel_title == Some("Welcome to Writer's IDE") {
+            match k.code {
+                KeyCode::Esc => {
+                    let path = user_tutorial_preferences_path();
+                    let mut preferences = onboarding::load(&path)?;
+                    preferences.welcome_seen = true;
+                    preferences.tutorial_dismissed = true;
+                    onboarding::store(&path, &preferences)?;
+                    s.help_panel = None;
+                    s.message = "Welcome skipped · reopen it from the Help menu".into();
                 }
-            }
-            KeyCode::Down => {
-                if let Some(panel) = s.help_panel.as_mut() {
-                    panel.scroll = panel.scroll.saturating_add(1);
+                KeyCode::Up => {
+                    if let Some(panel) = s.help_panel.as_mut() {
+                        panel.scroll = panel.scroll.saturating_sub(1);
+                    }
                 }
-            }
-            KeyCode::PageUp => {
-                if let Some(panel) = s.help_panel.as_mut() {
-                    panel.scroll = panel.scroll.saturating_sub(10);
+                KeyCode::Down => {
+                    if let Some(panel) = s.help_panel.as_mut() {
+                        let max = if panel
+                            .lines
+                            .iter()
+                            .any(|line| line.starts_with("Resume Tutorial"))
+                        {
+                            3
+                        } else {
+                            2
+                        };
+                        panel.scroll = (panel.scroll + 1).min(max);
+                    }
                 }
-            }
-            KeyCode::PageDown => {
-                if let Some(panel) = s.help_panel.as_mut() {
-                    panel.scroll = panel.scroll.saturating_add(10);
+                KeyCode::Enter => {
+                    let selected = s.help_panel.as_ref().map_or(0, |panel| panel.scroll);
+                    match selected {
+                        0 => s.begin_tutorial(onboarding::TutorialTrack::GuidedTour)?,
+                        1 => s.begin_tutorial(onboarding::TutorialTrack::QuickStart)?,
+                        2 => {
+                            let path = user_tutorial_preferences_path();
+                            let mut preferences = onboarding::load(&path)?;
+                            preferences.welcome_seen = true;
+                            preferences.tutorial_dismissed = true;
+                            onboarding::store(&path, &preferences)?;
+                            s.help_panel = None;
+                            s.message =
+                                "Tutorial skipped · Help remains available from the Help menu"
+                                    .into();
+                        }
+                        _ => s.resume_tutorial()?,
+                    }
                 }
+                KeyCode::F(1) => s.close_context_help(),
+                _ => {}
             }
-            _ => {}
+            return Ok(false);
         }
-        return Ok(false);
+        if panel_title.is_some_and(|title| title.starts_with("Tutorial ·")) {
+            match k.code {
+                KeyCode::F(6) if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                    s.advance_tutorial(-1)?
+                }
+                KeyCode::F(6) => s.advance_tutorial(1)?,
+                KeyCode::Char('q' | 'Q') if s.workspace != Workspace::Editor => {
+                    s.exit_tutorial()?;
+                    return Ok(false);
+                }
+                KeyCode::Esc => {
+                    s.help_panel = None;
+                    s.message =
+                        "Tutorial paused · choose Guided Tutorial on the dashboard to resume"
+                            .into();
+                    return Ok(false);
+                }
+                _ => s.help_panel = None,
+            }
+            if s.help_panel.is_none() {
+                // Let ordinary editor and workspace keys continue to the application.
+            } else {
+                return Ok(false);
+            }
+        } else {
+            match k.code {
+                KeyCode::Esc | KeyCode::F(1) => s.close_context_help(),
+                KeyCode::Up => {
+                    if let Some(panel) = s.help_panel.as_mut() {
+                        panel.scroll = panel.scroll.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(panel) = s.help_panel.as_mut() {
+                        panel.scroll = panel.scroll.saturating_add(1);
+                    }
+                }
+                KeyCode::PageUp => {
+                    if let Some(panel) = s.help_panel.as_mut() {
+                        panel.scroll = panel.scroll.saturating_sub(10);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if let Some(panel) = s.help_panel.as_mut() {
+                        panel.scroll = panel.scroll.saturating_add(10);
+                    }
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
     }
     let modal_is_open = s.mode.is_some()
         || s.command_palette.is_some()
@@ -22187,7 +22551,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                         "Open a project by path, or choose an import action from File".into();
                 }
                 2 => {
-                    s.message = "The interactive tutorial is not available yet. Offline help is ready with ?".into();
+                    s.resume_tutorial()?;
                 }
                 3 => {
                     s.mode = Some(':');
@@ -22201,6 +22565,9 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     }
                 }
             }
+        }
+        KeyCode::Enter if s.workspace == Workspace::Dashboard && s.selected == 3 => {
+            s.resume_tutorial()?;
         }
         KeyCode::Enter if s.workspace == Workspace::Research && s.proposal_review_active => {}
         KeyCode::Esc if s.workspace == Workspace::Revisions && s.revision_diff.is_some() => {
@@ -32442,5 +32809,114 @@ mod tests {
                 .join("Novel/.writers-ide/processing/word-count.txt")
                 .exists()
         );
+    }
+
+    #[test]
+    fn tutorial_uses_a_separate_sample_project_and_keeps_original_prose_intact() {
+        let dir = tempfile::tempdir().unwrap();
+        let original_path = dir.path().join("Original Novel");
+        let mut original = WriterApp::create_project(&original_path, "Original Novel").unwrap();
+        let chapter = original.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = original.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = original.load_scene_text(scene).unwrap();
+        original
+            .save_scene_text(scene, Some(&hash), "Author's existing manuscript.")
+            .unwrap();
+        let demo_path = dir.path().join("tutorial/sample-project");
+        let preferences_path = dir.path().join("config/tutorial-state.json");
+        let mut state = AppState::new(original, default_bindings());
+        state.refresh().unwrap();
+
+        state
+            .begin_tutorial_at(
+                onboarding::TutorialTrack::QuickStart,
+                demo_path.clone(),
+                preferences_path.clone(),
+            )
+            .unwrap();
+
+        assert_eq!(state.app.project_root(), demo_path);
+        assert!(
+            state
+                .help_panel
+                .as_ref()
+                .unwrap()
+                .title
+                .starts_with("Tutorial ·")
+        );
+        let sample = state.app.list_scenes(false).unwrap();
+        assert_eq!(sample.len(), 1);
+        assert!(
+            state
+                .app
+                .load_scene_text(sample[0].scene.id)
+                .unwrap()
+                .0
+                .contains("disposable tutorial scene")
+        );
+        let reopened_original = WriterApp::open_project(&original_path).unwrap();
+        assert_eq!(
+            reopened_original.load_scene_text(scene).unwrap().0,
+            "Author's existing manuscript."
+        );
+        let preferences = onboarding::load(&preferences_path).unwrap();
+        let progress = preferences.active_tutorial.unwrap();
+        assert_eq!(progress.track, onboarding::TutorialTrack::QuickStart);
+        assert_eq!(progress.step, 0);
+        assert_eq!(
+            PathBuf::from(progress.return_project),
+            original_path.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn tutorial_welcome_offers_two_tracks_skip_and_resume() {
+        let panel = welcome_panel(true);
+        assert_eq!(panel.title, "Welcome to Writer's IDE");
+        assert!(
+            panel
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Guided Tour"))
+        );
+        assert!(
+            panel
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Quick Start"))
+        );
+        assert!(panel.lines.iter().any(|line| line.starts_with("Skip")));
+        assert!(
+            panel
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Resume Tutorial"))
+        );
+        assert!(
+            tutorial_panel(onboarding::TutorialTrack::QuickStart, 2)
+                .title
+                .contains("Compile")
+        );
+    }
+
+    #[test]
+    fn q_remains_manuscript_text_while_tutorial_panel_is_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.help_panel = Some(tutorial_panel(onboarding::TutorialTrack::GuidedTour, 0));
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(state.editor.join("\n"), "q");
+        assert!(state.dirty);
+        assert!(state.help_panel.is_none());
     }
 }
