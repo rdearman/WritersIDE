@@ -15329,7 +15329,13 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         .constraints([
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(if s.find_panel.is_some() { 6 } else { 2 }),
+            Constraint::Length(if s.find_panel.is_some() {
+                6
+            } else if s.mode.is_some() {
+                5
+            } else {
+                2
+            }),
         ])
         .split(area);
     s.width = area.width as usize;
@@ -16104,7 +16110,52 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         );
     } else {
         let footer = if let Some(mode) = s.mode {
-            format!(" {mode} {}_", s.prompt)
+            let block = Block::default().borders(Borders::TOP);
+            let inner = block.inner(rows[2]);
+            f.render_widget(block, rows[2]);
+            let sections = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(1),
+                    Constraint::Min(2),
+                    Constraint::Length(1),
+                ])
+                .split(inner);
+            f.render_widget(
+                Paragraph::new(format!(" {mode} {}_", s.prompt)),
+                sections[0],
+            );
+            f.render_widget(
+                Paragraph::new(s.message.as_str()).wrap(Wrap { trim: true }),
+                sections[1],
+            );
+            let focus = if s.menu.is_some() {
+                "menu"
+            } else if s.reference_focused {
+                "reference"
+            } else if s.workspace == Workspace::Editor {
+                "manuscript"
+            } else {
+                "navigation"
+            };
+            let pane_hint = if s.workspace == Workspace::Editor {
+                if !s.reference_panes.is_empty() && !s.reference_panes_hidden {
+                    "Ctrl+Tab panes"
+                } else {
+                    "Esc outline"
+                }
+            } else {
+                "Tab workspaces"
+            };
+            let status = format!(
+                " Focus:{focus} · {} · Save {} · Menu {} · Help {} · {pane_hint}",
+                if s.dirty { "UNSAVED" } else { "saved" },
+                effective_shortcut_label(s, "file.save", "Ctrl+S"),
+                effective_shortcut_label(s, "menu.main", "F10"),
+                effective_shortcut_label(s, "help.context", "?")
+            );
+            f.render_widget(Paragraph::new(status), sections[2]);
+            String::new()
         } else {
             let challenge = s
                 .active_challenge
@@ -16141,10 +16192,12 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 s.message,
             )
         };
-        f.render_widget(
-            Paragraph::new(footer).block(Block::default().borders(Borders::TOP)),
-            rows[2],
-        );
+        if s.mode.is_none() {
+            f.render_widget(
+                Paragraph::new(footer).block(Block::default().borders(Borders::TOP)),
+                rows[2],
+            );
+        }
     }
     if s.menu.is_some() {
         draw_menu_overlay(f, s);
@@ -29147,6 +29200,59 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "Newer disk copy"
         );
+    }
+
+    #[test]
+    fn quit_conflict_render_shows_save_failure_unsaved_state_and_recovery_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Saved version")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["Unsaved in-memory version".into()];
+        state.dirty = true;
+        let mut concurrent = WriterApp::open_project(&project).unwrap();
+        let (_, disk_hash) = concurrent.load_scene_text(scene).unwrap();
+        concurrent
+            .save_scene_text(scene, Some(&disk_hash), "External on-disk version")
+            .unwrap();
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, Some('q'));
+        assert!(state.dirty);
+        assert!(state.message.contains("not saved"));
+        assert!(state.message.contains("Project: Novel"));
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Save failed") || screen.contains("not saved"));
+        assert!(screen.contains("UNSAVED"));
+        assert!(screen.contains("Save Ctrl+S"));
+        assert!(screen.contains("Menu Ctrl+/ or F10"));
+        assert!(screen.contains("Help ?"));
+        assert!(screen.contains("Quit Without Saving"));
     }
 
     #[test]
