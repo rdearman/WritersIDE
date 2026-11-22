@@ -1010,6 +1010,9 @@ enum CommandAction {
     Save,
     RequestQuit,
     Help,
+    ShowWelcome,
+    ResumeTutorial,
+    RestartTutorial,
     ResolveSaveConflict,
     RestoreRevisionHunk,
     Process { expand_transclusions: bool },
@@ -1228,7 +1231,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Context Help",
             description: "Show keyboard and command help",
             category: "Help",
-            default_shortcuts: &["F1"],
+            default_shortcuts: &[],
             mnemonic: Some('h'),
             palette_aliases: &["help"],
             palette_prefix: None,
@@ -1237,6 +1240,66 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 100,
             advanced: true,
             action: CommandAction::Help,
+        },
+        CommandSpec {
+            id: "help.show-welcome",
+            label: "Show Welcome",
+            description: "Reopen first-run choices for the guided tutorial or quick start",
+            category: "Help",
+            default_shortcuts: &[],
+            mnemonic: Some('w'),
+            palette_aliases: &["welcome"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Getting Started",
+            menu_priority: 1,
+            advanced: false,
+            action: CommandAction::ShowWelcome,
+        },
+        CommandSpec {
+            id: "help.resume-tutorial",
+            label: "Resume Tutorial",
+            description: "Resume the saved guided tutorial in its disposable sample project",
+            category: "Help",
+            default_shortcuts: &[],
+            mnemonic: Some('t'),
+            palette_aliases: &["tutorial", "resume-tutorial"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Getting Started",
+            menu_priority: 2,
+            advanced: false,
+            action: CommandAction::ResumeTutorial,
+        },
+        CommandSpec {
+            id: "help.restart-tutorial",
+            label: "Restart Tutorial",
+            description: "Restart the guided tutorial from its first step",
+            category: "Help",
+            default_shortcuts: &[],
+            mnemonic: Some('r'),
+            palette_aliases: &["restart-tutorial"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Getting Started",
+            menu_priority: 3,
+            advanced: false,
+            action: CommandAction::RestartTutorial,
+        },
+        CommandSpec {
+            id: "help.search",
+            label: "Search Help and Commands",
+            description: "Search registered command names, descriptions and shortcuts offline",
+            category: "Help",
+            default_shortcuts: &[],
+            mnemonic: Some('s'),
+            palette_aliases: &["search-help"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Getting Started",
+            menu_priority: 4,
+            advanced: false,
+            action: CommandAction::OpenCommandPalette,
         },
         CommandSpec {
             id: "revision.restore-hunk",
@@ -3217,9 +3280,6 @@ fn registered_global_command_for_key(state: &AppState, key: KeyEvent) -> Option<
             .find(|binding| binding.sequence.len() == 1)
             .and_then(|binding| command_by_id(&binding.command_id));
     }
-    if state.help_panel.is_some() && key.code == KeyCode::F(1) {
-        return None;
-    }
     let modal_is_open = state.mode.is_some()
         || state.command_palette.is_some()
         || state.menu.is_some()
@@ -4556,13 +4616,8 @@ fn effective_command_shortcuts(state: &AppState, command: CommandSpec) -> Vec<St
             .collect();
     }
     if command.action == CommandAction::Help {
-        let f1_workspace = state
-            .function_bindings
-            .iter()
-            .find(|(number, _)| *number == 1)
-            .map(|(_, workspace)| *workspace);
         let context = active_keybinding_context(state);
-        let mut contextual_shortcuts = state
+        return state
             .context_command_bindings
             .iter()
             .filter(|binding| binding.context == context && binding.command_id == command.id)
@@ -4575,41 +4630,6 @@ fn effective_command_shortcuts(state: &AppState, command: CommandSpec) -> Vec<St
                     .join(" ")
             })
             .collect::<Vec<_>>();
-        let help_context = state.help_panel.is_some()
-            || state.workspace == Workspace::Editor
-            || state.menu.is_some()
-            || state.mode.is_some()
-            || state.command_palette.is_some()
-            || state.recent_project_picker.is_some()
-            || state.find_panel.is_some()
-            || state.series_form.is_some()
-            || state.keybinding_manager.is_some()
-            || state.macro_preview.is_some()
-            || state.multi_replace_preview.is_some()
-            || state.snippet_preview.is_some();
-        let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
-        let f1_claimed_by_command = state.command_bindings.iter().any(|(event, id)| {
-            same_keycode(event.code, f1.code) && event.modifiers == f1.modifiers && id != command.id
-        });
-        let f1_claimed_by_context = state.context_command_bindings.iter().any(|binding| {
-            binding.context == context
-                && binding.sequence.first().is_some_and(|event| {
-                    same_keycode(event.code, f1.code) && event.modifiers == f1.modifiers
-                })
-        });
-        if help_context
-            && f1_workspace.is_none_or(|workspace| workspace == Workspace::Dashboard)
-            && !f1_claimed_by_command
-            && !f1_claimed_by_context
-        {
-            contextual_shortcuts.extend(
-                command
-                    .default_shortcuts
-                    .iter()
-                    .map(|shortcut| (*shortcut).to_owned()),
-            );
-        }
-        return contextual_shortcuts;
     }
     if command.action == CommandAction::OpenMainMenu {
         let context = active_keybinding_context(state);
@@ -8262,6 +8282,34 @@ impl AppState {
     fn show_context_help(&mut self) {
         self.help_panel = Some(context_help_panel(self));
     }
+    fn show_welcome(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let preferences = onboarding::load(&user_tutorial_preferences_path())?;
+        self.help_panel = Some(welcome_panel(preferences.active_tutorial.is_some()));
+        Ok(())
+    }
+    fn restart_tutorial(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let preferences = onboarding::load(&user_tutorial_preferences_path())?;
+        let progress = preferences.active_tutorial;
+        let track = progress
+            .as_ref()
+            .map_or(onboarding::TutorialTrack::GuidedTour, |progress| {
+                progress.track
+            });
+        if let Some(progress) = progress {
+            if self.dirty {
+                self.save()?;
+            }
+            let original = PathBuf::from(progress.return_project);
+            if self.app.project_root().canonicalize()? != original.canonicalize()? {
+                let recent_projects_path = self.recent_projects_path.take();
+                let switched =
+                    self.switch_to_project(original, "Restarting tutorial from step one".into());
+                self.recent_projects_path = recent_projects_path;
+                switched?;
+            }
+        }
+        self.begin_tutorial(track)
+    }
     fn begin_tutorial(
         &mut self,
         track: onboarding::TutorialTrack,
@@ -9302,7 +9350,16 @@ impl AppState {
             CommandAction::NewProject => self.start_series_form("file.new-project")?,
             CommandAction::Save => self.save()?,
             CommandAction::RequestQuit => self.request_quit(),
-            CommandAction::Help => self.show_context_help(),
+            CommandAction::Help => {
+                if self.help_panel.is_some() {
+                    self.close_context_help();
+                } else {
+                    self.show_context_help();
+                }
+            }
+            CommandAction::ShowWelcome => self.show_welcome()?,
+            CommandAction::ResumeTutorial => self.resume_tutorial()?,
+            CommandAction::RestartTutorial => self.restart_tutorial()?,
             CommandAction::ResolveSaveConflict => {
                 self.mode = Some('R');
                 self.prompt = "Review Versions (v) · Save Recovery Copy (r) · Use Saved Version (u) · Keep My Changes (k) · Cancel (Esc)".into();
@@ -16948,7 +17005,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 if s.dirty { "UNSAVED" } else { "saved" },
                 effective_shortcut_label(s, "file.save", "Ctrl+S"),
                 effective_shortcut_label(s, "menu.main", "F10"),
-                effective_shortcut_label(s, "help.context", "?")
+                effective_shortcut_label(s, "help.context", "Help menu")
             );
             f.render_widget(Paragraph::new(status), sections[2]);
             String::new()
@@ -16982,7 +17039,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     "navigation"
                 },
                 effective_shortcut_label(s, "menu.main", "F10"),
-                effective_shortcut_label(s, "help.context", "?"),
+                effective_shortcut_label(s, "help.context", "Help menu"),
                 effective_shortcut_label(s, "file.save", "unbound"),
                 if s.dirty { "unsaved" } else { "saved" },
                 challenge,
@@ -17063,7 +17120,7 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
         ),
         format!(
             "Help: {} opens or closes this panel; Esc returns to the previous focus",
-            effective_shortcut_label(state, "help.context", "F1")
+            effective_shortcut_label(state, "help.context", "Help menu / command palette")
         ),
         "Focus: In the editor, Ctrl+Tab switches to an open reference pane; Esc returns to the manuscript".to_owned(),
         "Navigation: Tab moves to the next workspace and Shift+Tab to the previous workspace outside text fields".to_owned(),
@@ -21519,20 +21576,6 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             return Ok(false);
         }
     }
-    let modal_is_open = s.mode.is_some()
-        || s.command_palette.is_some()
-        || s.recent_project_picker.is_some()
-        || s.menu.is_some()
-        || s.find_panel.is_some()
-        || s.keybinding_manager.is_some()
-        || s.series_form.is_some()
-        || s.macro_preview.is_some()
-        || s.multi_replace_preview.is_some()
-        || s.snippet_preview.is_some();
-    if k.code == KeyCode::F(1) && (s.workspace == Workspace::Editor || modal_is_open) {
-        s.show_context_help();
-        return Ok(false);
-    }
     if s.menu.is_some() {
         if let Some((_, command_id)) = s
             .command_bindings
@@ -24240,7 +24283,9 @@ mod tests {
             resized.draw(|frame| draw(frame, &mut state)).unwrap();
         }
 
-        handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        state
+            .dispatch_registered_command_id("help.context")
+            .unwrap();
         assert!(state.help_panel.is_some());
         assert!(state.command_palette.is_some());
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
@@ -26704,7 +26749,9 @@ mod tests {
         let original_prompt = state.prompt.clone();
         let original_message = state.message.clone();
 
-        handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        state
+            .dispatch_registered_command_id("help.context")
+            .unwrap();
         assert_eq!(state.mode, Some('q'));
         assert_eq!(state.prompt, original_prompt);
         assert_eq!(state.message, original_message);
@@ -26747,7 +26794,9 @@ mod tests {
         let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
         let mut state = AppState::new(app, default_bindings());
         state.workspace = Workspace::Editor;
-        handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        state
+            .dispatch_registered_command_id("help.context")
+            .unwrap();
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
@@ -30842,7 +30891,7 @@ mod tests {
         assert!(screen.contains("UNSAVED"));
         assert!(screen.contains("Save Ctrl+S"));
         assert!(screen.contains("Menu Ctrl+/ or F10"));
-        assert!(screen.contains("Help F1"));
+        assert!(screen.contains("Help Help menu"));
         assert!(screen.contains("Quit Without Saving"));
     }
 
@@ -32917,6 +32966,37 @@ mod tests {
 
         assert_eq!(state.editor.join("\n"), "q");
         assert!(state.dirty);
+        assert!(state.help_panel.is_none());
+    }
+
+    #[test]
+    fn help_commands_are_registered_without_claiming_the_f1_workspace_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Editor;
+        let help = command_by_id("help.context").unwrap();
+        assert!(help.default_shortcuts.is_empty());
+        assert!(effective_command_shortcuts(&state, help).is_empty());
+        for id in [
+            "help.show-welcome",
+            "help.resume-tutorial",
+            "help.restart-tutorial",
+            "help.search",
+        ] {
+            assert_eq!(command_by_id(id).unwrap().category, "Help");
+        }
+
+        handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+
+        assert_eq!(state.workspace, Workspace::Dashboard);
+        assert!(state.help_panel.is_none());
+
+        state.workspace = Workspace::Editor;
+        state.command_bindings = vec![(parse_shortcut("F1").unwrap(), "help.context".to_owned())];
+        handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        assert!(state.help_panel.is_some());
+        handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
         assert!(state.help_panel.is_none());
     }
 }
