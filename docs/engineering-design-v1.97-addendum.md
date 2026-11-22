@@ -12,7 +12,7 @@ This addendum implements the Recent Projects action requested by GitHub Issue #3
 
 ## Verification
 
-Automated tests cover bounded ordering, deduplication, selection and reopening, history updates, missing-project handling, and the curated File menu contents. Terminal workspace verification is recorded with the implementation commit.
+Automated tests cover bounded ordering, deduplication, selection and reopening, history updates, missing-project handling, and the curated File menu contents. A local 80×24 PTY run used F10, opened File > Recent Projects, selected a second project, verified that it moved to the front of the persisted history, and exited cleanly with Ctrl+Q. SSH, tmux and the author's terminal emulator have not been validated.
 
 ## Remaining Issue #39 work
 
