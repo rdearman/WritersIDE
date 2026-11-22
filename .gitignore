@@ -1,3 +1,4 @@
 /target/
+/test-builds/
 *.db-wal
 *.db-shm
