@@ -141,6 +141,9 @@ struct AppState {
     reading_selection_start: Option<u64>,
     function_bindings: Vec<(u8, Workspace)>,
     command_bindings: CommandBindings,
+    context_command_bindings: Vec<ContextCommandBinding>,
+    pending_command_sequence: Option<PendingCommandSequence>,
+    keybinding_manager: Option<KeybindingManagerState>,
     revision_diff: Option<story_core::SnapshotId>,
     revision_scene: Option<SceneId>,
     revision_index: usize,
@@ -425,14 +428,45 @@ struct RevisionHunk {
     selection: story_core::SnapshotRestoreSelection,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct KeymapFile {
     #[serde(default)]
     bindings: BTreeMap<String, String>,
     #[serde(default)]
     commands: BTreeMap<String, String>,
+    #[serde(default)]
+    contexts: BTreeMap<String, BTreeMap<String, String>>,
 }
+
+#[derive(Clone, Debug)]
+struct ContextCommandBinding {
+    context: String,
+    sequence: Vec<KeyEvent>,
+    command_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct PendingCommandSequence {
+    context: String,
+    sequence: Vec<KeyEvent>,
+    started: Instant,
+}
+
+#[derive(Clone, Debug)]
+struct KeybindingManagerState {
+    selected: usize,
+    context_index: usize,
+    user_scope: bool,
+    filter: String,
+    filtering: bool,
+    capture_command_id: Option<String>,
+    capture_sequence: Vec<KeyEvent>,
+    pending_capture: Option<(String, String)>,
+    confirm_reset_all: bool,
+}
+
+const KEYBINDING_CONTEXTS: [&str; 5] = ["global", "editor", "navigation", "dialog", "menu"];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct EditorToolsFile {
@@ -1378,6 +1412,14 @@ fn command_registry() -> Vec<CommandSpec> {
             false,
         ),
         legacy_command(
+            "settings.keybinding-manager",
+            "Keybinding Manager",
+            "Search commands, inspect effective bindings, capture shortcuts, remove bindings, and reset a scope",
+            "Tools",
+            "keybinding-manager",
+            false,
+        ),
+        legacy_command(
             "settings.keybinding-set",
             "Bind Command Shortcut",
             "Assign a validated modified-key chord to a stable command ID",
@@ -1400,6 +1442,38 @@ fn command_registry() -> Vec<CommandSpec> {
             "Tools",
             "keybinding-list",
             false,
+        ),
+        legacy_command(
+            "settings.keybinding-context-set",
+            "Bind Context Key Sequence",
+            "Bind one to four chords in editor, navigation, dialog, or menu context",
+            "Tools",
+            "keybinding-context-set",
+            true,
+        ),
+        legacy_command(
+            "settings.keybinding-context-remove",
+            "Remove Context Key Sequence",
+            "Remove a context-specific key sequence",
+            "Tools",
+            "keybinding-context-remove",
+            true,
+        ),
+        legacy_command(
+            "settings.keybinding-user-context-set",
+            "Bind User Context Key Sequence",
+            "Bind a context sequence in the user keymap, overridden by project sequences",
+            "Tools",
+            "keybinding-user-context-set",
+            true,
+        ),
+        legacy_command(
+            "settings.keybinding-user-context-remove",
+            "Remove User Context Key Sequence",
+            "Remove a context sequence from the user keymap",
+            "Tools",
+            "keybinding-user-context-remove",
+            true,
         ),
         legacy_command(
             "settings.keybinding-user-set",
@@ -2491,6 +2565,18 @@ fn menu_category(category: &str) -> &'static str {
     }
 }
 
+fn keybinding_manager_commands(manager: &KeybindingManagerState) -> Vec<CommandSpec> {
+    let needle = manager.filter.to_ascii_lowercase();
+    command_registry()
+        .into_iter()
+        .filter(|command| {
+            needle.is_empty()
+                || command.label.to_ascii_lowercase().contains(&needle)
+                || command.id.to_ascii_lowercase().contains(&needle)
+        })
+        .collect()
+}
+
 fn is_menu_shortcut(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(key.code, KeyCode::Char('/') | KeyCode::Char('_'))
@@ -3278,6 +3364,33 @@ fn parse_shortcut(value: &str) -> Result<KeyEvent, Box<dyn std::error::Error>> {
     Ok(KeyEvent::new(code, modifiers))
 }
 
+const KEY_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(900);
+
+fn parse_key_sequence(value: &str) -> Result<Vec<KeyEvent>, Box<dyn std::error::Error>> {
+    let sequence = value
+        .split_whitespace()
+        .map(parse_shortcut)
+        .collect::<Result<Vec<_>, _>>()?;
+    if !(1..=4).contains(&sequence.len()) {
+        return Err("context key sequences must contain one to four key chords".into());
+    }
+    Ok(sequence)
+}
+
+fn key_sequences_equal(left: &[KeyEvent], right: &[KeyEvent]) -> bool {
+    left.len() == right.len()
+        && left.iter().zip(right).all(|(left, right)| {
+            same_keycode(left.code, right.code) && left.modifiers == right.modifiers
+        })
+}
+
+fn key_sequence_starts_with(sequence: &[KeyEvent], prefix: &[KeyEvent]) -> bool {
+    prefix.len() <= sequence.len()
+        && sequence.iter().zip(prefix).all(|(key, prefix_key)| {
+            same_keycode(key.code, prefix_key.code) && key.modifiers == prefix_key.modifiers
+        })
+}
+
 fn is_reserved_command_shortcut(event: KeyEvent) -> bool {
     let ctrl = KeyModifiers::CONTROL;
     let exact = |code, modifiers| event.code == code && event.modifiers == modifiers;
@@ -3292,6 +3405,12 @@ fn is_reserved_command_shortcut(event: KeyEvent) -> bool {
         || exact(KeyCode::Tab, ctrl)
         || exact(KeyCode::F(3), KeyModifiers::NONE)
         || exact(KeyCode::F(3), KeyModifiers::SHIFT)
+}
+
+fn is_hierarchical_menu_shortcut(event: KeyEvent) -> bool {
+    (event.modifiers == KeyModifiers::CONTROL
+        && matches!(event.code, KeyCode::Char('/') | KeyCode::Char('_')))
+        || (event.code == KeyCode::F(10) && event.modifiers.is_empty())
 }
 
 fn same_keycode(left: KeyCode, right: KeyCode) -> bool {
@@ -3398,7 +3517,164 @@ fn validate_command_binding_config(
         let _command = command_by_id(id).ok_or_else(|| format!("unknown command ID: {id}"))?;
         result.push((event, id.clone()));
     }
+    for (context, bindings) in &config.contexts {
+        if !matches!(
+            context.as_str(),
+            "editor" | "navigation" | "dialog" | "menu"
+        ) {
+            return Err(format!("unknown keybinding context: {context}").into());
+        }
+        let mut sequences = Vec::<(String, Vec<KeyEvent>)>::new();
+        for (source, id) in bindings {
+            let sequence = parse_key_sequence(source)?;
+            if sequence
+                .iter()
+                .any(|event| is_hierarchical_menu_shortcut(*event))
+            {
+                return Err(format!("{source} contains a reserved menu shortcut").into());
+            }
+            if sequence
+                .first()
+                .is_some_and(|event| is_reserved_command_shortcut(*event))
+            {
+                return Err(format!("{source} contains a reserved application shortcut").into());
+            }
+            if command_by_id(id).is_none() {
+                return Err(format!("unknown command ID: {id}").into());
+            }
+            if sequences
+                .iter()
+                .any(|(_, other)| key_sequences_equal(other, &sequence))
+            {
+                return Err(
+                    format!("duplicate key sequence in {context} context: {source}").into(),
+                );
+            }
+            if sequences.iter().any(|(_, other)| {
+                key_sequence_starts_with(other, &sequence)
+                    || key_sequence_starts_with(&sequence, other)
+            }) {
+                return Err(format!(
+                    "key sequence prefixes conflict in {context} context: {source}"
+                )
+                .into());
+            }
+            sequences.push((source.clone(), sequence));
+        }
+    }
     Ok(result)
+}
+
+fn load_context_command_bindings(
+    project: &Path,
+) -> Result<Vec<ContextCommandBinding>, Box<dyn std::error::Error>> {
+    load_context_command_bindings_from(&user_keymap_path(), project)
+}
+
+fn load_context_command_bindings_from(
+    user_path: &Path,
+    project: &Path,
+) -> Result<Vec<ContextCommandBinding>, Box<dyn std::error::Error>> {
+    merge_context_keymap_configs(load_keymap_scopes_from(user_path, project)?)
+}
+
+fn merge_context_keymap_configs(
+    configs: Vec<KeymapFile>,
+) -> Result<Vec<ContextCommandBinding>, Box<dyn std::error::Error>> {
+    let mut result = Vec::new();
+    for config in configs {
+        validate_command_binding_config(&config)?;
+        for (context, bindings) in config.contexts {
+            for (source, command_id) in bindings {
+                let sequence = parse_key_sequence(&source)?;
+                result.retain(|existing: &ContextCommandBinding| {
+                    existing.context != context
+                        || !key_sequences_equal(&existing.sequence, &sequence)
+                });
+                result.push(ContextCommandBinding {
+                    context: context.clone(),
+                    sequence,
+                    command_id,
+                });
+            }
+        }
+    }
+    for context in KEYBINDING_CONTEXTS
+        .iter()
+        .copied()
+        .filter(|name| *name != "global")
+    {
+        let sequences = result
+            .iter()
+            .filter(|binding| binding.context == context)
+            .collect::<Vec<_>>();
+        for (index, left) in sequences.iter().enumerate() {
+            for right in sequences.iter().skip(index + 1) {
+                if key_sequence_starts_with(&left.sequence, &right.sequence)
+                    || key_sequence_starts_with(&right.sequence, &left.sequence)
+                {
+                    return Err(format!(
+                        "effective key sequences conflict in {context} context: {} and {}",
+                        left.command_id, right.command_id
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn load_context_command_bindings_or_default(
+    project: &Path,
+) -> (Vec<ContextCommandBinding>, Option<String>) {
+    match load_context_command_bindings(project) {
+        Ok(bindings) => (bindings, None),
+        Err(error) => (
+            Vec::new(),
+            Some(format!("Context keybinding configuration ignored: {error}")),
+        ),
+    }
+}
+
+fn upsert_context_keybinding(
+    config: &mut KeymapFile,
+    context: &str,
+    sequence_text: &str,
+    command_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !matches!(context, "editor" | "navigation" | "dialog" | "menu") {
+        return Err(format!("unknown keybinding context: {context}").into());
+    }
+    let sequence = parse_key_sequence(sequence_text)?;
+    if sequence
+        .iter()
+        .any(|event| is_hierarchical_menu_shortcut(*event))
+    {
+        return Err("key sequence contains a reserved menu shortcut".into());
+    }
+    if sequence
+        .first()
+        .is_some_and(|event| is_reserved_command_shortcut(*event))
+    {
+        return Err("key sequence starts with a reserved application shortcut".into());
+    }
+    let command =
+        command_by_id(command_id).ok_or_else(|| format!("unknown command ID: {command_id}"))?;
+    let bindings = config.contexts.entry(context.to_owned()).or_default();
+    let existing = bindings
+        .keys()
+        .find(|existing| {
+            parse_key_sequence(existing)
+                .is_ok_and(|candidate| key_sequences_equal(&candidate, &sequence))
+        })
+        .cloned();
+    if let Some(existing) = existing {
+        bindings.remove(&existing);
+    }
+    bindings.insert(sequence_text.to_owned(), command.id.to_owned());
+    validate_command_binding_config(config)?;
+    Ok(())
 }
 
 fn save_keymap(project: &Path, config: &KeymapFile) -> Result<(), Box<dyn std::error::Error>> {
@@ -3430,6 +3706,7 @@ fn read_keymap(project: &Path) -> Result<KeymapFile, Box<dyn std::error::Error>>
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(KeymapFile {
             bindings: BTreeMap::new(),
             commands: BTreeMap::new(),
+            contexts: BTreeMap::new(),
         }),
         Err(error) => Err(error.into()),
     }
@@ -3441,6 +3718,7 @@ fn read_user_keymap() -> Result<KeymapFile, Box<dyn std::error::Error>> {
         None => Ok(KeymapFile {
             bindings: BTreeMap::new(),
             commands: BTreeMap::new(),
+            contexts: BTreeMap::new(),
         }),
     }
 }
@@ -3566,6 +3844,9 @@ impl AppState {
             series_form: None,
             function_bindings,
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -4530,10 +4811,12 @@ impl AppState {
         self.save_session()?;
         let (function_bindings, function_warning) = load_bindings_or_default(&path);
         let (command_bindings, command_warning) = load_command_bindings_or_default(&path);
+        let context_command_bindings = load_context_command_bindings_or_default(&path).0;
         let mut app = WriterApp::open_project(&path)?;
         app.recover_interrupted_writing_challenges()?;
         let mut next = Self::new(app, function_bindings);
         next.command_bindings = command_bindings;
+        next.context_command_bindings = context_command_bindings;
         next.message = [function_warning, command_warning]
             .into_iter()
             .flatten()
@@ -6297,6 +6580,7 @@ impl AppState {
         Ok(())
     }
     fn toggle_menu(&mut self) {
+        self.pending_command_sequence = None;
         if self.menu.take().is_some() {
             self.message = "Menu closed; editor focus restored".into();
         } else {
@@ -6335,6 +6619,353 @@ impl AppState {
             _ => None,
         }
     }
+
+    fn bind_manager_capture(
+        &mut self,
+        manager: &KeybindingManagerState,
+        sequence: &str,
+        command_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let context = KEYBINDING_CONTEXTS[manager.context_index];
+        let invocation = if context == "global" {
+            if manager.user_scope {
+                format!("keybinding-user-set {sequence} {command_id}")
+            } else {
+                format!("keybinding-set {sequence} {command_id}")
+            }
+        } else if manager.user_scope {
+            format!("keybinding-user-context-set {context} {sequence} {command_id}")
+        } else {
+            format!("keybinding-context-set {context} {sequence} {command_id}")
+        };
+        self.execute_legacy_palette_command(&invocation)
+    }
+
+    fn manager_capture_conflict(
+        &self,
+        manager: &KeybindingManagerState,
+        sequence_text: &str,
+        command_id: &str,
+    ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+        let context = KEYBINDING_CONTEXTS[manager.context_index];
+        let candidate = parse_key_sequence(sequence_text)?;
+        let conflict = if context == "global" {
+            let event = candidate.first().copied().ok_or("empty key sequence")?;
+            if candidate.len() != 1 {
+                return Err(
+                    "global shortcuts accept one chord; use a context for sequences".into(),
+                );
+            }
+            let project = read_keymap(self.app.project_root())?;
+            let user = read_user_keymap()?;
+            if manager.user_scope
+                && project.commands.keys().any(|existing| {
+                    parse_shortcut(existing).is_ok_and(|existing_event| {
+                        same_keycode(existing_event.code, event.code)
+                            && existing_event.modifiers == event.modifiers
+                    })
+                })
+            {
+                return Err("this chord is assigned in the project keymap, which takes precedence; edit the project scope".into());
+            }
+            let mut effective = BTreeMap::<String, String>::new();
+            for config in [user, project] {
+                for (existing, id) in config.commands {
+                    if let Ok(existing_event) = parse_shortcut(&existing) {
+                        effective.insert(format_key_event(existing_event), id);
+                    }
+                }
+            }
+            effective
+                .into_iter()
+                .find(|(existing, id)| {
+                    parse_shortcut(existing).is_ok_and(|existing_event| {
+                        same_keycode(existing_event.code, event.code)
+                            && existing_event.modifiers == event.modifiers
+                    }) && id != command_id
+                })
+                .map(|(_, id)| id)
+        } else {
+            let project = read_keymap(self.app.project_root())?;
+            if manager.user_scope {
+                for (source, id) in project.contexts.get(context).into_iter().flatten() {
+                    let existing = parse_key_sequence(source)?;
+                    if key_sequences_equal(&existing, &candidate)
+                        || key_sequence_starts_with(&existing, &candidate)
+                        || key_sequence_starts_with(&candidate, &existing)
+                    {
+                        return Err(format!(
+                            "project context binding for {id} takes precedence; edit the project scope"
+                        )
+                        .into());
+                    }
+                }
+            }
+            let effective = load_context_command_bindings(self.app.project_root())?;
+            for existing in effective
+                .iter()
+                .filter(|binding| binding.context == context)
+            {
+                if existing.command_id == command_id {
+                    continue;
+                }
+                if key_sequences_equal(&existing.sequence, &candidate) {
+                    return Ok(Some(existing.command_id.clone()));
+                }
+                if key_sequence_starts_with(&existing.sequence, &candidate)
+                    || key_sequence_starts_with(&candidate, &existing.sequence)
+                {
+                    return Err(format!(
+                        "sequence prefix conflicts with {} in the effective {context} keymap; remove that binding first",
+                        existing.command_id
+                    )
+                    .into());
+                }
+            }
+            None
+        };
+        Ok(conflict)
+    }
+
+    fn remove_manager_binding(
+        &mut self,
+        manager: &KeybindingManagerState,
+        command_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let context = KEYBINDING_CONTEXTS[manager.context_index];
+        let mut config = if manager.user_scope {
+            read_user_keymap()?
+        } else {
+            read_keymap(self.app.project_root())?
+        };
+        if context == "global" {
+            config.commands.retain(|_, id| id != command_id);
+        } else if let Some(bindings) = config.contexts.get_mut(context) {
+            bindings.retain(|_, id| id != command_id);
+        }
+        if manager.user_scope {
+            save_user_keymap(&config)?;
+        } else {
+            save_keymap(self.app.project_root(), &config)?;
+        }
+        self.function_bindings = load_bindings_or_default(self.app.project_root()).0;
+        self.command_bindings = load_command_bindings_or_default(self.app.project_root()).0;
+        self.context_command_bindings =
+            load_context_command_bindings_or_default(self.app.project_root()).0;
+        Ok(())
+    }
+
+    fn handle_keybinding_manager_key(
+        &mut self,
+        key: KeyEvent,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut manager = self
+            .keybinding_manager
+            .take()
+            .ok_or("keybinding manager is closed")?;
+        if let Some((chord, command_id)) = manager.pending_capture.clone() {
+            match key.code {
+                KeyCode::Esc => {
+                    manager.pending_capture = None;
+                    self.message = "Shortcut replacement cancelled".into();
+                }
+                KeyCode::Enter => match self.bind_manager_capture(&manager, &chord, &command_id) {
+                    Ok(()) => {
+                        manager.pending_capture = None;
+                        self.message = format!("Bound {chord} to {command_id}");
+                    }
+                    Err(error) => {
+                        self.message = error.to_string();
+                    }
+                },
+                _ => {
+                    self.message =
+                        "Press Enter to replace the conflicting binding, or Esc to cancel".into();
+                }
+            }
+            self.keybinding_manager = Some(manager);
+            return Ok(());
+        }
+        if let Some(command_id) = manager.capture_command_id.take() {
+            if key.code == KeyCode::Esc {
+                self.message = "Shortcut capture cancelled".into();
+                manager.capture_sequence.clear();
+            } else if key.code == KeyCode::Enter {
+                let sequence = manager
+                    .capture_sequence
+                    .iter()
+                    .map(|event| format_key_event(*event))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if sequence.is_empty() {
+                    manager.capture_command_id = Some(command_id);
+                    self.message = "Capture at least one modified chord before Enter".into();
+                } else {
+                    match self.manager_capture_conflict(&manager, &sequence, &command_id) {
+                        Ok(Some(existing)) => {
+                            manager.pending_capture = Some((sequence.clone(), command_id));
+                            self.message = format!(
+                                "{sequence} conflicts with {existing}; Enter replaces it, Esc cancels"
+                            );
+                        }
+                        Ok(None) => {
+                            match self.bind_manager_capture(&manager, &sequence, &command_id) {
+                                Ok(()) => {
+                                    self.message = format!("Bound {sequence} to {command_id}")
+                                }
+                                Err(error) => self.message = error.to_string(),
+                            }
+                        }
+                        Err(error) => {
+                            self.message = error.to_string();
+                            manager.capture_command_id = Some(command_id);
+                        }
+                    }
+                    manager.capture_sequence.clear();
+                }
+            } else {
+                if KEYBINDING_CONTEXTS[manager.context_index] == "global"
+                    && !manager.capture_sequence.is_empty()
+                {
+                    self.message = "Global shortcuts use one chord; press Enter to finish".into();
+                    manager.capture_command_id = Some(command_id);
+                    self.keybinding_manager = Some(manager);
+                    return Ok(());
+                }
+                let chord = format_key_event(key);
+                match parse_shortcut(&chord) {
+                    Err(error) => self.message = format!("Use a modified chord: {error}"),
+                    Ok(event)
+                        if is_hierarchical_menu_shortcut(event)
+                            || (manager.capture_sequence.is_empty()
+                                && is_reserved_command_shortcut(event)) =>
+                    {
+                        self.message = format!("{chord} is reserved by Writer's IDE")
+                    }
+                    Ok(_) if manager.capture_sequence.len() == 4 => {
+                        self.message = "A sequence can contain at most four chords".into();
+                    }
+                    Ok(event) => {
+                        manager.capture_sequence.push(event);
+                        let sequence = manager
+                            .capture_sequence
+                            .iter()
+                            .map(|event| format_key_event(*event))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+                        self.message =
+                            format!("Captured {sequence}; press another chord or Enter to finish")
+                    }
+                }
+                manager.capture_command_id = Some(command_id);
+            }
+            self.keybinding_manager = Some(manager);
+            return Ok(());
+        }
+        if manager.confirm_reset_all {
+            match key.code {
+                KeyCode::Enter => {
+                    let path = if manager.user_scope {
+                        user_keymap_path()
+                    } else {
+                        self.app
+                            .project_root()
+                            .join(".writers-ide/keybindings.toml")
+                    };
+                    match fs::remove_file(path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    self.function_bindings = load_bindings_or_default(self.app.project_root()).0;
+                    self.command_bindings =
+                        load_command_bindings_or_default(self.app.project_root()).0;
+                    self.context_command_bindings =
+                        load_context_command_bindings_or_default(self.app.project_root()).0;
+                    self.message = if manager.user_scope {
+                        "User keymap reset; project overrides remain active".into()
+                    } else {
+                        "Project keymap reset; user bindings remain active".into()
+                    };
+                }
+                KeyCode::Esc => self.message = "Reset cancelled".into(),
+                _ => {
+                    self.message = "Press Enter to reset this scope, or Esc to cancel".into();
+                }
+            }
+            manager.confirm_reset_all = false;
+            self.keybinding_manager = Some(manager);
+            return Ok(());
+        }
+        if manager.filtering {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => manager.filtering = false,
+                KeyCode::Backspace => {
+                    manager.filter.pop();
+                }
+                KeyCode::Char(character) if key.modifiers.is_empty() => {
+                    manager.filter.push(character);
+                }
+                _ => {}
+            }
+            manager.selected = manager.selected.min(
+                keybinding_manager_commands(&manager)
+                    .len()
+                    .saturating_sub(1),
+            );
+            self.keybinding_manager = Some(manager);
+            return Ok(());
+        }
+        match key.code {
+            KeyCode::Esc => {
+                self.message = "Keybinding Manager closed".into();
+                return Ok(());
+            }
+            KeyCode::Up => manager.selected = manager.selected.saturating_sub(1),
+            KeyCode::Down => {
+                let length = keybinding_manager_commands(&manager).len();
+                manager.selected = manager
+                    .selected
+                    .saturating_add(1)
+                    .min(length.saturating_sub(1));
+            }
+            KeyCode::Tab => {
+                manager.context_index = (manager.context_index + 1) % KEYBINDING_CONTEXTS.len()
+            }
+            KeyCode::BackTab => {
+                manager.context_index = (manager.context_index + KEYBINDING_CONTEXTS.len() - 1)
+                    % KEYBINDING_CONTEXTS.len()
+            }
+            KeyCode::Char('u') if key.modifiers.is_empty() => {
+                manager.user_scope = !manager.user_scope
+            }
+            KeyCode::Char('/') if key.modifiers.is_empty() => manager.filtering = true,
+            KeyCode::Char('b') if key.modifiers.is_empty() => {
+                if let Some(command) = keybinding_manager_commands(&manager).get(manager.selected) {
+                    manager.capture_command_id = Some(command.id.to_owned());
+                    self.message = format!(
+                        "Capture one or more modified chords; Enter finishes {}",
+                        command.label
+                    );
+                }
+            }
+            KeyCode::Char('r') if key.modifiers.is_empty() => {
+                if let Some(command) = keybinding_manager_commands(&manager).get(manager.selected) {
+                    self.remove_manager_binding(&manager, command.id)?;
+                    self.message =
+                        format!("Removed custom binding for {} in this scope", command.label);
+                }
+            }
+            KeyCode::Char('R') if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                manager.confirm_reset_all = true;
+                self.message = "Press Enter to reset this keymap scope, or Esc to cancel".into();
+            }
+            _ => {}
+        }
+        self.keybinding_manager = Some(manager);
+        Ok(())
+    }
+
     fn handle_menu_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn std::error::Error>> {
         let mut menu = self.menu.ok_or("menu is closed")?;
         match key.code {
@@ -6448,6 +7079,74 @@ impl AppState {
         self.menu = Some(menu);
         Ok(())
     }
+    fn dispatch_registered_command_id(
+        &mut self,
+        command_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let command = command_by_id(command_id)
+            .ok_or_else(|| format!("registered command disappeared: {command_id}"))?;
+        if let Some(reason) = self.command_disabled_reason(command) {
+            self.message = format!("{} unavailable: {reason}", command.label);
+        } else if command.takes_arguments {
+            self.prompt_for_registered_command(command)?;
+        } else if command.action == CommandAction::LegacyPalette {
+            self.dispatch_registered_with_args(command.action, command.palette_prefix)?;
+        } else {
+            self.dispatch_registered(command.action)?;
+        }
+        Ok(())
+    }
+
+    fn handle_context_command_key(
+        &mut self,
+        key: KeyEvent,
+        context: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let pending = self.pending_command_sequence.take();
+        let had_pending = pending.is_some();
+        let mut prefix = Vec::new();
+        if let Some(pending) = pending
+            && pending.context == context
+            && pending.started.elapsed() < KEY_SEQUENCE_TIMEOUT
+        {
+            prefix = pending.sequence;
+        }
+        prefix.push(key);
+        let candidates = self
+            .context_command_bindings
+            .iter()
+            .filter(|binding| {
+                binding.context == context && key_sequence_starts_with(&binding.sequence, &prefix)
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return if had_pending {
+                self.handle_context_command_key(key, context)
+            } else {
+                Ok(false)
+            };
+        }
+        if let Some(binding) = candidates
+            .iter()
+            .find(|binding| key_sequences_equal(&binding.sequence, &prefix))
+        {
+            let command_id = binding.command_id.clone();
+            self.message.clear();
+            self.dispatch_registered_command_id(&command_id)?;
+            return Ok(true);
+        }
+        self.pending_command_sequence = Some(PendingCommandSequence {
+            context: context.to_owned(),
+            sequence: prefix,
+            started: Instant::now(),
+        });
+        self.message = format!(
+            "Key sequence pending for {context} · next chord within {} ms; Esc cancels",
+            KEY_SEQUENCE_TIMEOUT.as_millis()
+        );
+        Ok(true)
+    }
+
     fn dispatch_registered(
         &mut self,
         action: CommandAction,
@@ -6704,6 +7403,23 @@ impl AppState {
             step_find_query_history(self, cmd == "find-history-older")?;
             return Ok(());
         }
+        if cmd == "keybinding-manager" {
+            self.keybinding_manager = Some(KeybindingManagerState {
+                selected: 0,
+                context_index: 0,
+                user_scope: false,
+                filter: String::new(),
+                filtering: false,
+                capture_command_id: None,
+                capture_sequence: Vec::new(),
+                pending_capture: None,
+                confirm_reset_all: false,
+            });
+            self.mode = None;
+            self.prompt.clear();
+            self.message = "Keybinding Manager · Tab changes context · b captures · u removes · r resets selected".into();
+            return Ok(());
+        }
         if cmd == "keybinding-list" {
             let scopes = load_keymap_scopes(self.app.project_root())?;
             let mut effective = BTreeMap::new();
@@ -6715,6 +7431,15 @@ impl AppState {
                         (id.clone(), if user_scope { "user" } else { "project" }),
                     );
                 }
+                let user_scope = user_keymap_path().is_file() && index == 0;
+                for (context, bindings) in &config.contexts {
+                    for (sequence, id) in bindings {
+                        effective.insert(
+                            format!("{context}: {sequence}"),
+                            (id.clone(), if user_scope { "user" } else { "project" }),
+                        );
+                    }
+                }
             }
             self.message = if effective.is_empty() {
                 "No user or project command shortcuts are configured".into()
@@ -6725,6 +7450,101 @@ impl AppState {
                     .collect::<Vec<_>>()
                     .join(" · ")
             };
+            return Ok(());
+        }
+        if let Some(rest) = cmd.strip_prefix("keybinding-context-set ") {
+            let words = rest.split_whitespace().collect::<Vec<_>>();
+            if words.len() < 3 {
+                return Err(
+                    "use keybinding-context-set CONTEXT CHORD [CHORD ...] COMMAND-ID".into(),
+                );
+            }
+            let context = words[0];
+            let sequence_text = words[1..words.len() - 1].join(" ");
+            let command_id = words[words.len() - 1];
+            let mut config = read_keymap(self.app.project_root())?;
+            upsert_context_keybinding(&mut config, context, &sequence_text, command_id)?;
+            merge_context_keymap_configs(vec![read_user_keymap()?, config.clone()])?;
+            save_keymap(self.app.project_root(), &config)?;
+            self.context_command_bindings =
+                load_context_command_bindings_or_default(self.app.project_root()).0;
+            self.message = format!("Bound {context} sequence {sequence_text} to {command_id}");
+            return Ok(());
+        }
+        if let Some(rest) = cmd.strip_prefix("keybinding-user-context-set ") {
+            let words = rest.split_whitespace().collect::<Vec<_>>();
+            if words.len() < 3 {
+                return Err(
+                    "use keybinding-user-context-set CONTEXT CHORD [CHORD ...] COMMAND-ID".into(),
+                );
+            }
+            let context = words[0];
+            let sequence_text = words[1..words.len() - 1].join(" ");
+            let command_id = words[words.len() - 1];
+            let mut config = read_user_keymap()?;
+            upsert_context_keybinding(&mut config, context, &sequence_text, command_id)?;
+            merge_context_keymap_configs(vec![
+                config.clone(),
+                read_keymap(self.app.project_root())?,
+            ])?;
+            save_user_keymap(&config)?;
+            self.context_command_bindings =
+                load_context_command_bindings_or_default(self.app.project_root()).0;
+            self.message = format!(
+                "Bound user {context} sequence {sequence_text} to {command_id}; project context bindings override matching sequences"
+            );
+            return Ok(());
+        }
+        if let Some(rest) = cmd.strip_prefix("keybinding-context-remove ") {
+            let (context, sequence_text) = rest
+                .split_once(' ')
+                .ok_or("use keybinding-context-remove CONTEXT CHORD [CHORD ...]")?;
+            let sequence_text = sequence_text.trim();
+            let sequence = parse_key_sequence(sequence_text)?;
+            let mut config = read_keymap(self.app.project_root())?;
+            let bindings = config.contexts.entry(context.to_owned()).or_default();
+            let remove = bindings
+                .keys()
+                .find(|existing| {
+                    parse_key_sequence(existing)
+                        .is_ok_and(|candidate| key_sequences_equal(&candidate, &sequence))
+                })
+                .cloned();
+            if let Some(remove) = remove {
+                bindings.remove(&remove);
+                save_keymap(self.app.project_root(), &config)?;
+                self.context_command_bindings =
+                    load_context_command_bindings_or_default(self.app.project_root()).0;
+                self.message = format!("Removed {context} key sequence {sequence_text}");
+            } else {
+                self.message = format!("No {context} key sequence is bound to {sequence_text}");
+            }
+            return Ok(());
+        }
+        if let Some(rest) = cmd.strip_prefix("keybinding-user-context-remove ") {
+            let (context, sequence_text) = rest
+                .split_once(' ')
+                .ok_or("use keybinding-user-context-remove CONTEXT CHORD [CHORD ...]")?;
+            let sequence_text = sequence_text.trim();
+            let sequence = parse_key_sequence(sequence_text)?;
+            let mut config = read_user_keymap()?;
+            let bindings = config.contexts.entry(context.to_owned()).or_default();
+            let remove = bindings
+                .keys()
+                .find(|existing| {
+                    parse_key_sequence(existing)
+                        .is_ok_and(|candidate| key_sequences_equal(&candidate, &sequence))
+                })
+                .cloned();
+            if let Some(remove) = remove {
+                bindings.remove(&remove);
+                save_user_keymap(&config)?;
+                self.context_command_bindings =
+                    load_context_command_bindings_or_default(self.app.project_root()).0;
+                self.message = format!("Removed user {context} key sequence {sequence_text}");
+            } else {
+                self.message = format!("No user {context} sequence is bound to {sequence_text}");
+            }
             return Ok(());
         }
         if cmd == "keybinding-reset" || cmd == "keybinding-user-reset" {
@@ -6744,6 +7564,8 @@ impl AppState {
             self.function_bindings = load_bindings_or_default(self.app.project_root()).0;
             let (bindings, warning) = load_command_bindings_or_default(self.app.project_root());
             self.command_bindings = bindings;
+            self.context_command_bindings =
+                load_context_command_bindings_or_default(self.app.project_root()).0;
             self.message = warning.unwrap_or_else(|| {
                 if user_scope {
                     "User keymap reset; project overrides remain active".into()
@@ -6808,6 +7630,8 @@ impl AppState {
             save_keymap(self.app.project_root(), &config)?;
             let (bindings, warning) = load_command_bindings_or_default(self.app.project_root());
             self.command_bindings = bindings;
+            self.context_command_bindings =
+                load_context_command_bindings_or_default(self.app.project_root()).0;
             if let Some(warning) = warning {
                 self.message = warning;
                 return Ok(());
@@ -6839,6 +7663,8 @@ impl AppState {
             save_user_keymap(&config)?;
             let (bindings, warning) = load_command_bindings_or_default(self.app.project_root());
             self.command_bindings = bindings;
+            self.context_command_bindings =
+                load_context_command_bindings_or_default(self.app.project_root()).0;
             self.message = warning.unwrap_or_else(|| {
                 format!(
                     "Bound user shortcut {chord} to {}; project bindings override matching chords",
@@ -6863,6 +7689,8 @@ impl AppState {
             save_user_keymap(&config)?;
             let (bindings, warning) = load_command_bindings_or_default(self.app.project_root());
             self.command_bindings = bindings;
+            self.context_command_bindings =
+                load_context_command_bindings_or_default(self.app.project_root()).0;
             self.message =
                 warning.unwrap_or_else(|| format!("Removed user command shortcut {chord}"));
             return Ok(());
@@ -6892,6 +7720,8 @@ impl AppState {
             save_keymap(self.app.project_root(), &config)?;
             let (bindings, warning) = load_command_bindings_or_default(self.app.project_root());
             self.command_bindings = bindings;
+            self.context_command_bindings =
+                load_context_command_bindings_or_default(self.app.project_root()).0;
             if let Some(warning) = warning {
                 self.message = warning;
                 return Ok(());
@@ -12212,11 +13042,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let project_path = std::path::PathBuf::from(path);
     let (function_bindings, function_warning) = load_bindings_or_default(&project_path);
     let (command_bindings, command_warning) = load_command_bindings_or_default(&project_path);
+    let (context_command_bindings, context_command_warning) =
+        load_context_command_bindings_or_default(&project_path);
     let mut app = WriterApp::open_project(&project_path)?;
     app.recover_interrupted_writing_challenges()?;
     let mut state = AppState::new(app, function_bindings);
     state.command_bindings = command_bindings;
-    state.message = [function_warning, command_warning]
+    state.context_command_bindings = context_command_bindings;
+    state.message = [function_warning, command_warning, context_command_warning]
         .into_iter()
         .flatten()
         .collect::<Vec<_>>()
@@ -12235,7 +13068,10 @@ fn setup() -> Result<Terminal<CrosstermBackend<io::Stdout>>, io::Error> {
         out,
         EnterAlternateScreen,
         crossterm::event::EnableMouseCapture,
-        crossterm::event::EnableBracketedPaste
+        crossterm::event::EnableBracketedPaste,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
     )?;
     Terminal::new(CrosstermBackend::new(out))
 }
@@ -12245,7 +13081,8 @@ fn restore(t: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), io::Err
         t.backend_mut(),
         LeaveAlternateScreen,
         crossterm::event::DisableMouseCapture,
-        crossterm::event::DisableBracketedPaste
+        crossterm::event::DisableBracketedPaste,
+        crossterm::event::PopKeyboardEnhancementFlags
     )?;
     t.show_cursor()
 }
@@ -13178,6 +14015,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.series_form.is_some() {
         draw_series_form_overlay(f, s);
     }
+    if s.keybinding_manager.is_some() {
+        draw_keybinding_manager_overlay(f, s);
+    }
 }
 
 struct TerminalSpellingFinding {
@@ -14038,6 +14878,81 @@ fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
         popup,
+    );
+}
+
+fn draw_keybinding_manager_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(manager) = s.keybinding_manager.as_ref() else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(40, 100);
+    let height = area.height.saturating_sub(3).clamp(8, 28);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+    let context = KEYBINDING_CONTEXTS[manager.context_index];
+    let scope = if manager.user_scope {
+        "User"
+    } else {
+        "Project"
+    };
+    let block = Block::default()
+        .title(format!(
+            " Keybinding Manager · {scope} · {context} · / filter · Esc close "
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let commands = keybinding_manager_commands(manager);
+    let items = if commands.is_empty() {
+        vec![ListItem::new("No commands match the filter")]
+    } else {
+        commands
+            .iter()
+            .map(|command| {
+                let binding = if context == "global" {
+                    effective_command_shortcuts(s, *command).join(", ")
+                } else {
+                    s.context_command_bindings
+                        .iter()
+                        .filter(|binding| {
+                            binding.context == context && binding.command_id == command.id
+                        })
+                        .map(|binding| {
+                            binding
+                                .sequence
+                                .iter()
+                                .map(|key| format_key_event(*key))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                ListItem::new(format!("{}  [{}]  {}", command.label, command.id, binding))
+            })
+            .collect()
+    };
+    f.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
+            .block(Block::default().title(if manager.filtering {
+                format!("Filter: {}_", manager.filter)
+            } else {
+                "Commands · b bind · u scope · r remove · Shift-R reset scope · Tab context".into()
+            })),
+        inner,
+        &mut ListState::default().with_selected(
+            (!commands.is_empty())
+                .then_some(manager.selected.min(commands.len().saturating_sub(1))),
+        ),
     );
 }
 fn pane_direction(width: usize) -> Direction {
@@ -16335,13 +17250,22 @@ fn step_find_query_history(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if s.keybinding_manager.is_some() {
+        s.handle_keybinding_manager_key(k)?;
+        return Ok(false);
+    }
     if s.series_form.is_some() {
+        if s.handle_context_command_key(k, "dialog")? {
+            return Ok(false);
+        }
         s.handle_series_form_key(k)?;
         return Ok(false);
     }
     if s.menu.is_some() {
         if is_menu_shortcut(k) || k.code == KeyCode::F(10) {
             s.toggle_menu();
+        } else if s.handle_context_command_key(k, "menu")? {
+            return Ok(false);
         } else {
             s.handle_menu_key(k)?;
         }
@@ -16357,6 +17281,16 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         if let Some(spec) = command_by_id("menu.main") {
             s.dispatch_registered(spec.action)?;
         }
+        return Ok(false);
+    }
+    let context = if s.find_panel.is_some() || s.mode.is_some() {
+        "dialog"
+    } else if s.workspace == Workspace::Editor {
+        "editor"
+    } else {
+        "navigation"
+    };
+    if s.handle_context_command_key(k, context)? {
         return Ok(false);
     }
     if s.find_panel.is_some() {
@@ -17642,6 +18576,162 @@ mod tests {
             load_bindings_or_default_from(&user_path, project.project_root());
         assert_eq!(function_fallback, default_bindings());
         assert!(warning.is_some());
+    }
+
+    #[test]
+    fn context_sequences_dispatch_and_project_scope_overrides_user_scope() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
+        let user_path = root.path().join("config/writers-ide/keybindings.toml");
+        fs::create_dir_all(user_path.parent().unwrap()).unwrap();
+        fs::write(
+            &user_path,
+            "[contexts.editor]\n\"Ctrl+X Ctrl+S\" = \"view.analytics\"\n[contexts.navigation]\n\"Ctrl+X Ctrl+S\" = \"view.outline\"\n",
+        )
+        .unwrap();
+        let project_path = project.project_root().join(".writers-ide/keybindings.toml");
+        fs::write(
+            &project_path,
+            "[contexts.editor]\n\"Ctrl+X Ctrl+S\" = \"view.timeline\"\n",
+        )
+        .unwrap();
+        let effective =
+            load_context_command_bindings_from(&user_path, project.project_root()).unwrap();
+        assert_eq!(effective.len(), 2);
+        assert!(effective.iter().any(|binding| {
+            binding.context == "editor" && binding.command_id == "view.timeline"
+        }));
+        assert!(effective.iter().any(|binding| {
+            binding.context == "navigation" && binding.command_id == "view.outline"
+        }));
+
+        let mut state = AppState::new(project, default_bindings());
+        state.context_command_bindings = effective;
+        state.workspace = Workspace::Editor;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(state.pending_command_sequence.is_some());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Timeline);
+        assert!(state.pending_command_sequence.is_none());
+    }
+
+    #[test]
+    fn menu_shortcut_cancels_a_pending_sequence_and_remains_reserved() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.workspace = Workspace::Editor;
+        state.context_command_bindings = vec![ContextCommandBinding {
+            context: "editor".into(),
+            sequence: parse_key_sequence("Ctrl+X Ctrl+S").unwrap(),
+            command_id: "view.timeline".into(),
+        }];
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(state.pending_command_sequence.is_some());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(state.menu.is_some());
+        assert!(state.pending_command_sequence.is_none());
+    }
+
+    #[test]
+    fn keybinding_manager_captures_context_sequence_and_persists_it() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state
+            .execute_legacy_palette_command("keybinding-manager")
+            .unwrap();
+        state
+            .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        // The first context is global; Tab selects the editor context.
+        state
+            .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))
+            .unwrap();
+        for character in "view.timeline".chars() {
+            state
+                .handle_keybinding_manager_key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))
+                .unwrap();
+        }
+        state
+            .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL))
+            .unwrap();
+        state
+            .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+            .unwrap();
+        state
+            .handle_keybinding_manager_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        let bindings = load_context_command_bindings(state.app.project_root()).unwrap();
+        assert!(bindings.iter().any(|binding| {
+            binding.context == "editor"
+                && binding.command_id == "view.timeline"
+                && binding.sequence.len() == 2
+        }));
+        assert!(state.keybinding_manager.is_some());
+    }
+
+    #[test]
+    fn context_sequences_reject_unknown_context_reserved_keys_and_prefix_conflicts() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
+        let config = project.project_root().join(".writers-ide/keybindings.toml");
+        fs::write(
+            &config,
+            "[contexts.unknown]\n\"Ctrl+X Ctrl+S\" = \"file.save\"\n",
+        )
+        .unwrap();
+        assert!(load_context_command_bindings(project.project_root()).is_err());
+        fs::write(
+            &config,
+            "[contexts.editor]\n\"Ctrl+X Ctrl+/\" = \"file.save\"\n",
+        )
+        .unwrap();
+        assert!(load_context_command_bindings(project.project_root()).is_err());
+        fs::write(
+            &config,
+            "[contexts.editor]\n\"Ctrl+X\" = \"file.save\"\n\"Ctrl+X Ctrl+S\" = \"view.analytics\"\n",
+        )
+        .unwrap();
+        assert!(load_context_command_bindings(project.project_root()).is_err());
+        let mut user = KeymapFile::default();
+        user.contexts.insert(
+            "editor".into(),
+            BTreeMap::from([("Ctrl+X".into(), "file.save".into())]),
+        );
+        let mut project_scope = KeymapFile::default();
+        project_scope.contexts.insert(
+            "editor".into(),
+            BTreeMap::from([("Ctrl+X Ctrl+S".into(), "view.analytics".into())]),
+        );
+        assert!(merge_context_keymap_configs(vec![user, project_scope]).is_err());
+        assert!(parse_key_sequence("Ctrl+X Ctrl+S Ctrl+T Ctrl+O Ctrl+P").is_err());
     }
 
     #[test]
@@ -19551,6 +20641,9 @@ mod tests {
             series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -21967,6 +23060,9 @@ mod tests {
             series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -22081,6 +23177,9 @@ mod tests {
             series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -22187,6 +23286,9 @@ mod tests {
             series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -22305,6 +23407,9 @@ mod tests {
             series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -22573,6 +23678,9 @@ mod tests {
             series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -22691,6 +23799,9 @@ mod tests {
             series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -22826,6 +23937,9 @@ mod tests {
             series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -23079,6 +24193,9 @@ mod tests {
             series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -23463,6 +24580,9 @@ mod tests {
             series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -23592,6 +24712,9 @@ mod tests {
             series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
@@ -23773,6 +24896,9 @@ mod tests {
             series_form: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
+            context_command_bindings: Vec::new(),
+            pending_command_sequence: None,
+            keybinding_manager: None,
             revision_diff: None,
             revision_scene: None,
             revision_index: 0,
