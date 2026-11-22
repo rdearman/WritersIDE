@@ -169,6 +169,8 @@ struct AppState {
     redo_stack: Vec<EditorSnapshot>,
     clipboard: String,
     snippets: BTreeMap<String, String>,
+    user_snippets: BTreeMap<String, String>,
+    user_snippets_path: PathBuf,
     registers: BTreeMap<String, String>,
     macros: BTreeMap<String, Vec<story_core::EditMacroOp>>,
     recording_macro: Option<(String, Vec<story_core::EditMacroOp>)>,
@@ -184,6 +186,7 @@ struct AppState {
     last_yank: Option<LastYank>,
     macro_preview: Option<MacroPreview>,
     multi_replace_preview: Option<MultiReplacePreview>,
+    snippet_preview: Option<SnippetPreview>,
     pending_replace: Option<Vec<ReplaceTarget>>,
     replace_preview_target: usize,
     replace_preview_match: usize,
@@ -527,6 +530,12 @@ struct EditorToolsFile {
     kill_ring: Vec<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct UserSnippetsFile {
+    #[serde(default)]
+    snippets: BTreeMap<String, String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct RecordedCommand {
     command_id: String,
@@ -555,6 +564,18 @@ struct MultiReplacePreview {
     source: String,
     proposed: String,
     ranges: Vec<std::ops::Range<usize>>,
+}
+
+#[derive(Clone, Debug)]
+struct SnippetPreview {
+    name: String,
+    scope: String,
+    source: String,
+    proposed: String,
+    cursor_byte: usize,
+    expansion_cursor_byte: usize,
+    scene_id: Option<SceneId>,
+    content_unit_id: Option<story_core::ContentUnitId>,
 }
 
 #[derive(Clone, Debug)]
@@ -2495,7 +2516,13 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command("edit.snippet-save", "Define Session Snippet", "Store a reusable snippet with an optional ${cursor} marker", "Insert", "snippet", true),
+        legacy_command("edit.snippet-list", "List Effective Snippets", "List project and personal snippets with project-over-personal precedence", "Insert", "snippet-list", false),
         legacy_command("edit.snippet-insert", "Insert Session Snippet", "Expand and insert a named session snippet", "Insert", "snippet-insert", true),
+        legacy_command("edit.snippet-preview", "Preview Effective Snippet", "Review expanded text before inserting a project or personal snippet", "Insert", "snippet-preview", true),
+        legacy_command("edit.snippet-user-set", "Define Personal Snippet", "Save a reusable snippet in the user's offline TOML configuration", "Insert", "snippet-user-set", true),
+        legacy_command("edit.snippet-user-remove", "Remove Personal Snippet", "Remove a personal snippet without changing project snippets", "Insert", "snippet-user-remove", true),
+        legacy_command("edit.snippet-user-insert", "Insert Personal Snippet", "Insert a personal snippet even when a project snippet uses the same name", "Insert", "snippet-user-insert", true),
+        legacy_command("edit.snippet-user-preview", "Preview Personal Snippet", "Review personal snippet text before inserting it", "Insert", "snippet-user-preview", true),
         legacy_command("edit.register-save", "Save Editor Register", "Save the selection or current line in a named register", "Edit", "register-save", true),
         legacy_command("edit.register-insert", "Insert Editor Register", "Insert a named editor register", "Edit", "register-insert", true),
         legacy_command("edit.register-rotate", "Rotate Editor Registers", "Rotate values through two or more named registers", "Edit", "register-rotate", true),
@@ -2890,6 +2917,82 @@ fn user_text_expansion_path() -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("text-expansion.toml")
+}
+
+fn user_snippets_path() -> PathBuf {
+    user_keymap_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("snippets.toml")
+}
+
+fn load_user_snippets_file(
+    path: &Path,
+) -> Result<BTreeMap<String, String>, Box<dyn std::error::Error>> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if text.len() > 1024 * 1024 {
+        return Err("personal snippets file exceeds the 1 MiB limit".into());
+    }
+    let config: UserSnippetsFile = toml::from_str(&text)?;
+    validate_user_snippets(&config.snippets)?;
+    Ok(config.snippets)
+}
+
+fn save_user_snippets_file(
+    path: &Path,
+    snippets: &BTreeMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_user_snippets(snippets)?;
+    let config = UserSnippetsFile {
+        snippets: snippets.clone(),
+    };
+    let bytes = toml::to_string(&config)?;
+    if bytes.len() > 1024 * 1024 {
+        return Err("personal snippets file exceeds the 1 MiB limit".into());
+    }
+    let parent = path
+        .parent()
+        .ok_or("personal snippet path needs a parent")?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    use std::io::Write;
+    temporary.write_all(bytes.as_bytes())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(path)?;
+    fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn validate_user_snippets(snippets: &BTreeMap<String, String>) -> io::Result<()> {
+    if snippets.len() > 1000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "personal snippets exceed 1000 entries",
+        ));
+    }
+    for (name, body) in snippets {
+        if name.is_empty()
+            || name.len() > 64
+            || name.chars().any(char::is_control)
+            || name.chars().any(char::is_whitespace)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snippet names must be 1–64 non-whitespace characters",
+            ));
+        }
+        if body.is_empty() || body.len() > 32 * 1024 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "snippet bodies must contain 1–32768 UTF-8 bytes",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn load_text_expansion_file(
@@ -3955,6 +4058,15 @@ impl AppState {
                 format!("Editor tools not loaded: {error}"),
             ),
         };
+        let user_snippets_path = user_snippets_path();
+        let (user_snippets, user_snippets_error) =
+            match load_user_snippets_file(&user_snippets_path) {
+                Ok(snippets) => (snippets, String::new()),
+                Err(error) => (
+                    BTreeMap::new(),
+                    format!("Personal snippets not loaded: {error}"),
+                ),
+            };
         let (text_expansion, expansion_error) = match load_text_expansion(app.project_root()) {
             Ok(config) => (config, String::new()),
             Err(error) => (
@@ -3997,6 +4109,7 @@ impl AppState {
                 tools_error,
                 expansion_error,
                 user_expansion_error,
+                user_snippets_error,
                 preferences_error,
             ])
             .filter(|notice| !notice.is_empty())
@@ -4081,6 +4194,8 @@ impl AppState {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: tools.snippets,
+            user_snippets,
+            user_snippets_path,
             registers: tools.registers,
             macros: tools.macros,
             recording_macro: None,
@@ -4096,6 +4211,7 @@ impl AppState {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -4134,6 +4250,95 @@ impl AppState {
         temporary.as_file().sync_all()?;
         temporary.persist(&path)?;
         fs::File::open(directory)?.sync_all()?;
+        Ok(())
+    }
+    fn insert_named_snippet(
+        &mut self,
+        arguments: &str,
+        personal_only: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut parts = arguments.split_whitespace();
+        let name = parts
+            .next()
+            .ok_or("use snippet-insert NAME [key=value ...]")?;
+        let values = parts
+            .map(|item| {
+                let (key, value) = item
+                    .split_once('=')
+                    .ok_or("snippet values must use key=value")?;
+                Ok((key.to_owned(), value.to_owned()))
+            })
+            .collect::<Result<BTreeMap<_, _>, Box<dyn std::error::Error>>>()?;
+        let source = if personal_only {
+            self.user_snippets.get(name)
+        } else {
+            self.snippets
+                .get(name)
+                .or_else(|| self.user_snippets.get(name))
+        }
+        .ok_or("unknown snippet in the requested scope")?
+        .clone();
+        let expansion = story_core::expand_snippet(&source, &values)?;
+        self.insert_text_at_cursor(&expansion.text)?;
+        let text = self.editor.join("\n");
+        if let Some((row, column)) = editor_position_from_byte(
+            &text,
+            editor_position_byte(&self.editor, self.cursor.0, self.cursor.1)
+                .saturating_sub(expansion.text.len())
+                .saturating_add(expansion.cursor_byte),
+        ) {
+            self.cursor = (row, column);
+        }
+        self.message = format!(
+            "Inserted {} snippet {name}",
+            if personal_only {
+                "personal"
+            } else {
+                "effective"
+            }
+        );
+        Ok(())
+    }
+    fn preview_named_snippet(
+        &mut self,
+        arguments: &str,
+        personal_only: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut parts = arguments.split_whitespace();
+        let name = parts
+            .next()
+            .ok_or("use snippet-preview NAME [key=value ...]")?;
+        let values = parts
+            .map(|item| {
+                let (key, value) = item
+                    .split_once('=')
+                    .ok_or("snippet values must use key=value")?;
+                Ok((key.to_owned(), value.to_owned()))
+            })
+            .collect::<Result<BTreeMap<_, _>, Box<dyn std::error::Error>>>()?;
+        let (template, scope) = if personal_only {
+            (self.user_snippets.get(name), "personal")
+        } else if let Some(template) = self.snippets.get(name) {
+            (Some(template), "project")
+        } else {
+            (self.user_snippets.get(name), "personal")
+        };
+        let expansion = story_core::expand_snippet(
+            template.ok_or("unknown snippet in the requested scope")?,
+            &values,
+        )?;
+        let source = self.editor.join("\n");
+        self.snippet_preview = Some(SnippetPreview {
+            name: name.to_owned(),
+            scope: scope.to_owned(),
+            source,
+            proposed: expansion.text,
+            cursor_byte: editor_position_byte(&self.editor, self.cursor.0, self.cursor.1),
+            expansion_cursor_byte: expansion.cursor_byte,
+            scene_id: self.editing_scene,
+            content_unit_id: self.editing_content_unit,
+        });
+        self.message = format!("Previewing {scope} snippet {name} · Enter inserts, Esc cancels");
         Ok(())
     }
     fn persist_find_panel_session(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -8324,36 +8529,51 @@ impl AppState {
             self.snippets.insert(name.to_owned(), body.to_owned());
             self.persist_editor_tools()?;
             self.message = format!("Snippet {name} saved in this project");
-        } else if let Some(name) = cmd.strip_prefix("snippet-insert ") {
-            let mut parts = name.split_whitespace();
-            let snippet_name = parts
-                .next()
-                .ok_or("use snippet-insert NAME [key=value ...]")?;
-            let values = parts
-                .map(|item| {
-                    let (key, value) = item
-                        .split_once('=')
-                        .ok_or("snippet values must use key=value")?;
-                    Ok((key.to_owned(), value.to_owned()))
-                })
-                .collect::<Result<BTreeMap<_, _>, Box<dyn std::error::Error>>>()?;
-            let source = self
-                .snippets
-                .get(snippet_name)
-                .ok_or("unknown session snippet")?
-                .clone();
-            let expansion = story_core::expand_snippet(&source, &values)?;
-            self.insert_text_at_cursor(&expansion.text)?;
-            let text = self.editor.join("\n");
-            if let Some((row, column)) = editor_position_from_byte(
-                &text,
-                editor_position_byte(&self.editor, self.cursor.0, self.cursor.1)
-                    .saturating_sub(expansion.text.len())
-                    .saturating_add(expansion.cursor_byte),
-            ) {
-                self.cursor = (row, column);
+        } else if let Some(rest) = cmd.strip_prefix("snippet-user-set ") {
+            let (name, body) = rest
+                .split_once(' ')
+                .ok_or("use snippet-user-set NAME TEXT")?;
+            let name = name.to_owned();
+            let body = body.to_owned();
+            let mut snippets = self.user_snippets.clone();
+            snippets.insert(name.clone(), body);
+            save_user_snippets_file(&self.user_snippets_path, &snippets)?;
+            self.user_snippets = snippets;
+            self.message = format!("Saved personal snippet {name}");
+        } else if let Some(name) = cmd.strip_prefix("snippet-user-remove ") {
+            let name = name.trim();
+            let mut snippets = self.user_snippets.clone();
+            if snippets.remove(name).is_none() {
+                return Err("unknown personal snippet".into());
             }
-            self.message = format!("Inserted snippet {snippet_name}");
+            save_user_snippets_file(&self.user_snippets_path, &snippets)?;
+            self.user_snippets = snippets;
+            self.message = format!("Removed personal snippet {name}");
+        } else if cmd == "snippet-list" {
+            let mut rows = self
+                .snippets
+                .keys()
+                .map(|name| format!("{name} [project]"))
+                .collect::<Vec<_>>();
+            rows.extend(
+                self.user_snippets
+                    .keys()
+                    .filter(|name| !self.snippets.contains_key(*name))
+                    .map(|name| format!("{name} [personal]")),
+            );
+            self.message = if rows.is_empty() {
+                "No project or personal snippets".into()
+            } else {
+                rows.join(" | ")
+            };
+        } else if let Some(arguments) = cmd.strip_prefix("snippet-preview ") {
+            self.preview_named_snippet(arguments, false)?;
+        } else if let Some(arguments) = cmd.strip_prefix("snippet-insert ") {
+            self.insert_named_snippet(arguments, false)?;
+        } else if let Some(arguments) = cmd.strip_prefix("snippet-user-preview ") {
+            self.preview_named_snippet(arguments, true)?;
+        } else if let Some(arguments) = cmd.strip_prefix("snippet-user-insert ") {
+            self.insert_named_snippet(arguments, true)?;
         } else if let Some(name) = cmd.strip_prefix("register-save ") {
             let value = if let Some(start) = self.editor_selection {
                 let a = editor_position_byte(&self.editor, start.0, start.1);
@@ -13008,7 +13228,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu; arrows navigate; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... | event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... | event-relationships EVENT-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | multi-replace START:END[,START:END...] TEXT | multi-replace-matches TEXT => REPLACEMENT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expansion-user-set ABBREVIATION => REPLACEMENT | text-expansion-user on|off|list | text-expansion-user-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | mark-set NAME | mark-list | mark-jump NAME | mark-clear NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... | event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... | event-relationships EVENT-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-list | snippet-insert NAME [key=value...] | snippet-preview NAME [key=value...] | snippet-user-preview NAME [key=value...] | snippet-user-set NAME TEMPLATE | snippet-user-remove NAME | snippet-user-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | multi-replace START:END[,START:END...] TEXT | multi-replace-matches TEXT => REPLACEMENT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expansion-user-set ABBREVIATION => REPLACEMENT | text-expansion-user on|off|list | text-expansion-user-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | mark-set NAME | mark-list | mark-jump NAME | mark-clear NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -14996,6 +15216,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.multi_replace_preview.is_some() {
         draw_multi_replace_preview_overlay(f, s);
     }
+    if s.snippet_preview.is_some() {
+        draw_snippet_preview_overlay(f, s);
+    }
 }
 
 fn draw_macro_preview_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
@@ -15090,6 +15313,55 @@ fn draw_multi_replace_preview_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) 
             .block(
                 Block::default()
                     .title("Proposed replacement")
+                    .borders(Borders::ALL),
+            ),
+        panes[1],
+    );
+}
+
+fn draw_snippet_preview_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(preview) = &s.snippet_preview else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.min(100);
+    let height = area.height.min(20);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(
+            " Snippet Preview · {} [{}] · Enter insert · Esc cancel ",
+            preview.name, preview.scope
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(preview.source.as_str())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Current buffer")
+                    .borders(Borders::ALL),
+            ),
+        panes[0],
+    );
+    f.render_widget(
+        Paragraph::new(preview.proposed.as_str())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Expanded snippet")
                     .borders(Borders::ALL),
             ),
         panes[1],
@@ -18731,6 +19003,39 @@ fn step_find_query_history(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(preview) = s.snippet_preview.clone() {
+        match k.code {
+            KeyCode::Enter => {
+                s.snippet_preview = None;
+                if s.editor.join("\n") != preview.source
+                    || editor_position_byte(&s.editor, s.cursor.0, s.cursor.1)
+                        != preview.cursor_byte
+                    || s.editing_scene != preview.scene_id
+                    || s.editing_content_unit != preview.content_unit_id
+                {
+                    s.message =
+                        "Snippet preview expired because the active buffer or cursor changed"
+                            .into();
+                    return Ok(false);
+                }
+                s.insert_text_at_cursor(&preview.proposed)?;
+                let text = s.editor.join("\n");
+                if let Some(position) = editor_position_from_byte(
+                    &text,
+                    preview.cursor_byte + preview.expansion_cursor_byte,
+                ) {
+                    s.cursor = position;
+                }
+                s.message = format!("Inserted {} snippet {}", preview.scope, preview.name);
+            }
+            KeyCode::Esc => {
+                s.snippet_preview = None;
+                s.message = "Cancelled snippet preview; manuscript unchanged".into();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if let Some(preview) = s.multi_replace_preview.clone() {
         match k.code {
             KeyCode::Enter => {
@@ -21266,6 +21571,129 @@ mod tests {
     }
 
     #[test]
+    fn user_snippets_round_trip_and_project_names_take_precedence() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("config/writers-ide/snippets.toml");
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.user_snippets_path = path.clone();
+        state
+            .execute_legacy_palette_command("snippet-user-set greeting Personal: ${name}!${cursor}")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("snippet-user-set signature Yours,\nA. Writer")
+            .unwrap();
+        assert_eq!(
+            load_user_snippets_file(&path).unwrap()["signature"],
+            "Yours,\nA. Writer"
+        );
+
+        state
+            .execute_legacy_palette_command("snippet greeting Project: ${name}!${cursor}")
+            .unwrap();
+        state.open_scene(scene).unwrap();
+        state
+            .execute_legacy_palette_command("snippet-list")
+            .unwrap();
+        assert!(state.message.contains("greeting [project]"));
+        assert!(state.message.contains("signature [personal]"));
+
+        state
+            .execute_legacy_palette_command("snippet-insert greeting name=Hana")
+            .unwrap();
+        assert_eq!(state.editor.join("\n"), "Project: Hana!");
+        assert_eq!(state.cursor, (0, "Project: Hana!".graphemes(true).count()));
+        state.undo_edit();
+        state
+            .execute_legacy_palette_command("snippet-user-insert greeting name=Hana")
+            .unwrap();
+        assert_eq!(state.editor.join("\n"), "Personal: Hana!");
+        assert!(state.message.contains("personal snippet"));
+
+        state
+            .execute_legacy_palette_command("snippet-user-remove signature")
+            .unwrap();
+        assert!(
+            !load_user_snippets_file(&path)
+                .unwrap()
+                .contains_key("signature")
+        );
+        let mut invalid = BTreeMap::new();
+        invalid.insert("bad name".into(), "text".into());
+        assert!(validate_user_snippets(&invalid).is_err());
+    }
+
+    #[test]
+    fn snippet_preview_is_cancelable_stale_safe_and_undoable() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state
+            .snippets
+            .insert("greeting".into(), "Project: ${name}!${cursor}".into());
+        state
+            .user_snippets
+            .insert("greeting".into(), "Personal: ${name}!${cursor}".into());
+
+        state
+            .execute_legacy_palette_command("snippet-preview greeting name=Hana")
+            .unwrap();
+        assert_eq!(state.editor.join("\n"), "");
+        assert_eq!(
+            state.snippet_preview.as_ref().unwrap().proposed,
+            "Project: Hana!"
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.snippet_preview.is_none());
+        assert_eq!(state.editor.join("\n"), "");
+
+        state
+            .execute_legacy_palette_command("snippet-preview greeting name=Hana")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "Project: Hana!");
+        assert_eq!(state.cursor, (0, "Project: Hana!".graphemes(true).count()));
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), "");
+
+        state
+            .execute_legacy_palette_command("snippet-user-preview greeting name=Hana")
+            .unwrap();
+        assert_eq!(
+            state.snippet_preview.as_ref().unwrap().proposed,
+            "Personal: Hana!"
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "Personal: Hana!");
+        state.undo_edit();
+
+        state
+            .execute_legacy_palette_command("snippet-preview greeting name=Hana")
+            .unwrap();
+        state.insert('x');
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.message.contains("preview expired"));
+        assert_eq!(state.editor.join("\n"), "x");
+    }
+
+    #[test]
     fn recorded_edit_macro_persists_insertions_and_cursor_edits() {
         let root = tempfile::tempdir().unwrap();
         let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
@@ -22847,6 +23275,8 @@ mod tests {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: BTreeMap::new(),
+            user_snippets: BTreeMap::new(),
+            user_snippets_path: PathBuf::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -22862,6 +23292,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -22960,7 +23391,13 @@ mod tests {
                 "structure.section",
                 "structure.chapter",
                 "edit.snippet-save",
+                "edit.snippet-list",
                 "edit.snippet-insert",
+                "edit.snippet-preview",
+                "edit.snippet-user-set",
+                "edit.snippet-user-remove",
+                "edit.snippet-user-insert",
+                "edit.snippet-user-preview",
                 "edit.text-expansion-set",
                 "edit.text-expansion-remove",
                 "edit.text-expansion",
@@ -25655,6 +26092,8 @@ mod tests {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: BTreeMap::new(),
+            user_snippets: BTreeMap::new(),
+            user_snippets_path: PathBuf::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -25670,6 +26109,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -25779,6 +26219,8 @@ mod tests {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: BTreeMap::new(),
+            user_snippets: BTreeMap::new(),
+            user_snippets_path: PathBuf::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -25794,6 +26236,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -25895,6 +26338,8 @@ mod tests {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: BTreeMap::new(),
+            user_snippets: BTreeMap::new(),
+            user_snippets_path: PathBuf::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -25910,6 +26355,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -26023,6 +26469,8 @@ mod tests {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: BTreeMap::new(),
+            user_snippets: BTreeMap::new(),
+            user_snippets_path: PathBuf::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -26038,6 +26486,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -26301,6 +26750,8 @@ mod tests {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: BTreeMap::new(),
+            user_snippets: BTreeMap::new(),
+            user_snippets_path: PathBuf::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -26316,6 +26767,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -26429,6 +26881,8 @@ mod tests {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: BTreeMap::new(),
+            user_snippets: BTreeMap::new(),
+            user_snippets_path: PathBuf::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -26444,6 +26898,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -26574,6 +27029,8 @@ mod tests {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: BTreeMap::new(),
+            user_snippets: BTreeMap::new(),
+            user_snippets_path: PathBuf::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -26589,6 +27046,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -26837,6 +27295,8 @@ mod tests {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: BTreeMap::new(),
+            user_snippets: BTreeMap::new(),
+            user_snippets_path: PathBuf::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -26852,6 +27312,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -27235,6 +27696,8 @@ mod tests {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: BTreeMap::new(),
+            user_snippets: BTreeMap::new(),
+            user_snippets_path: PathBuf::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -27250,6 +27713,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -27374,6 +27838,8 @@ mod tests {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: BTreeMap::new(),
+            user_snippets: BTreeMap::new(),
+            user_snippets_path: PathBuf::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -27389,6 +27855,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -27565,6 +28032,8 @@ mod tests {
             redo_stack: Vec::new(),
             clipboard: String::new(),
             snippets: BTreeMap::new(),
+            user_snippets: BTreeMap::new(),
+            user_snippets_path: PathBuf::new(),
             registers: BTreeMap::new(),
             macros: BTreeMap::new(),
             recording_macro: None,
@@ -27580,6 +28049,7 @@ mod tests {
             last_yank: None,
             macro_preview: None,
             multi_replace_preview: None,
+            snippet_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
