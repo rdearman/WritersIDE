@@ -13,7 +13,7 @@ This addendum supplements [Engineering Design v1.92](engineering-design-v1.92.md
 
 ## Verification
 
-Automated tests cover the Ctrl+N route, creating and opening a directory and title containing spaces and capitals, refusing an existing destination without changing it, and preserving access to all category commands through the nested full menu. The full terminal suite passed: 187 tests. Terminal Clippy and formatting checks passed. A local 80×24 PTY check entered Ctrl+N, typed a path and title, selected Start Writing, and verified a manuscript file in the new project after clean exit. SSH, tmux, and the author's terminal emulator remain unverified.
+Automated tests cover the Ctrl+N and command-palette routes, creating and opening a directory and title containing spaces and capitals, refusing an existing destination without changing it, and preserving access to all category commands through the nested full menu. The full terminal suite passed: 188 tests. Terminal Clippy and formatting checks passed. A local 80×24 PTY check entered Ctrl+N, typed a path and title, selected Start Writing, and verified a manuscript file in the new project after clean exit. SSH, tmux, and the author's terminal emulator remain unverified.
 
 ## Remaining Issue #39 work
 

@@ -22264,6 +22264,30 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_dispatches_new_project_through_the_same_form() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.command_palette = Some(CommandPaletteState {
+            query: "New Project".into(),
+            selected: 0,
+            recent_commands: Vec::new(),
+        });
+
+        handle_command_palette_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert!(state.command_palette.is_none());
+        assert_eq!(
+            state.series_form.as_ref().unwrap().kind,
+            SeriesFormKind::NewProject
+        );
+    }
+
+    #[test]
     fn new_project_action_rejects_an_existing_directory_without_switching() {
         let root = tempfile::tempdir().unwrap();
         let current = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
