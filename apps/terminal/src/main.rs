@@ -28,6 +28,7 @@ use ratatui::{
 use story_app::WriterApp;
 use story_core::{SceneId, SceneStatus};
 use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 type SceneRow = (SceneId, String, SceneStatus, u32);
 
@@ -17101,6 +17102,7 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let inner = block.inner(popup);
     f.render_widget(block, popup);
     let commands = s.menu_commands();
+    let row_width = inner.width.saturating_sub(2) as usize;
     let items = if commands.is_empty() {
         vec![ListItem::new("No commands available yet").style(Style::default().fg(Color::DarkGray))]
     } else {
@@ -17108,25 +17110,7 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             .iter()
             .map(|spec| {
                 let disabled = s.command_disabled_reason(*spec);
-                let mark = spec
-                    .mnemonic
-                    .map(|key| format!(" [{key}]"))
-                    .unwrap_or_default();
-                let shortcuts = effective_command_shortcuts(s, *spec);
-                let shortcut_text = if shortcuts.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", shortcuts.join(", "))
-                };
-                let args = if spec.takes_arguments { " …" } else { "" };
-                let label = if let Some(reason) = disabled {
-                    format!(
-                        "{}{}{}{} — unavailable: {}",
-                        spec.label, mark, args, shortcut_text, reason
-                    )
-                } else {
-                    format!("{}{}{}{}", spec.label, mark, args, shortcut_text)
-                };
+                let label = menu_command_row(s, *spec, row_width);
                 ListItem::new(label).style(if disabled.is_some() {
                     Style::default().fg(Color::DarkGray)
                 } else {
@@ -17167,15 +17151,76 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     );
     if let Some(description_area) = description_area {
         let selected_command = commands.get(menu.selected.min(commands.len() - 1)).unwrap();
-        let detail = s
-            .command_disabled_reason(*selected_command)
-            .map(|reason| format!("Unavailable: {reason}"))
-            .unwrap_or_else(|| selected_command.description.to_owned());
+        let detail = if let Some(reason) = s.command_disabled_reason(*selected_command) {
+            format!("{} · unavailable: {reason}", selected_command.description)
+        } else {
+            selected_command.description.to_owned()
+        };
         f.render_widget(
             Paragraph::new(detail).wrap(Wrap { trim: true }),
             description_area,
         );
     }
+}
+
+fn menu_command_row(state: &AppState, command: CommandSpec, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let mnemonic = command
+        .mnemonic
+        .map(|key| format!(" [{key}]"))
+        .unwrap_or_default();
+    let arguments = if command.takes_arguments { " …" } else { "" };
+    let label = format!("{}{}{}", command.label, mnemonic, arguments);
+    let shortcuts = effective_command_shortcuts(state, command);
+    let shortcut = match shortcuts.as_slice() {
+        [] => String::new(),
+        [single] => format!(" ({single})"),
+        [first, rest @ ..] => format!(" ({first} +{})", rest.len()),
+    };
+
+    let shortcut_width = UnicodeWidthStr::width(shortcut.as_str());
+    let (label, shortcut) = if shortcut_width < width {
+        let label_width = width - shortcut_width;
+        (truncate_display_cells(&label, label_width), shortcut)
+    } else {
+        (truncate_display_cells(&label, width), String::new())
+    };
+    format!("{label}{shortcut}")
+}
+
+fn truncate_display_cells(text: &str, max_width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let ellipsis = "…";
+    let content_width = max_width.saturating_sub(UnicodeWidthStr::width(ellipsis));
+    let mut width = 0;
+    let mut result = String::new();
+    for grapheme in text.graphemes(true) {
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > content_width {
+            break;
+        }
+        result.push_str(grapheme);
+        width += grapheme_width;
+    }
+    if UnicodeWidthStr::width(ellipsis) <= max_width {
+        result.push_str(ellipsis);
+    } else {
+        for character in text.chars() {
+            let character_width = character.width().unwrap_or(0);
+            if UnicodeWidthStr::width(result.as_str()) + character_width > max_width {
+                break;
+            }
+            result.push(character);
+        }
+    }
+    result
 }
 
 fn draw_command_palette_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
@@ -28942,6 +28987,36 @@ mod tests {
             assert!(!state.menu.unwrap().all_commands);
             assert_eq!(state.menu_commands().len(), common.len());
         }
+    }
+
+    #[test]
+    fn menu_rows_fit_compact_terminals_and_keep_effective_shortcuts_visible() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.menu = Some(MenuState {
+            top: 0,
+            selected: 0,
+            all_commands: true,
+        });
+
+        for command in state.menu_commands() {
+            let row = menu_command_row(&state, command, 36);
+            assert!(
+                UnicodeWidthStr::width(row.as_str()) <= 36,
+                "{} exceeds the menu row width: {row:?}",
+                command.id
+            );
+        }
+
+        let save = command_by_id("file.save").unwrap();
+        let save_row = menu_command_row(&state, save, 36);
+        assert!(save_row.contains("Ctrl+S"), "{save_row}");
+        assert!(save_row.starts_with("Save Manuscript"), "{save_row}");
+
+        let clipped = truncate_display_cells("e\u{301}😀Novel", 4);
+        assert!(UnicodeWidthStr::width(clipped.as_str()) <= 4);
+        assert!(!clipped.starts_with('\u{301}'));
     }
 
     #[test]
