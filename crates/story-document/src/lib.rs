@@ -818,11 +818,14 @@ pub struct EditionRecipe {
     pub language: Option<String>,
     #[serde(default)]
     pub dictionary: Option<String>,
+    #[serde(default)]
+    pub spelling_engine: SpellcheckEngine,
 }
 
 /// Optional local command-line spelling backends. Neither engine is required
 /// to install or run Writer's IDE.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum SpellcheckEngine {
     #[default]
     Aspell,
@@ -923,6 +926,9 @@ impl EditionRecipe {
         }
         if self.spellcheck && self.language.as_deref().is_none_or(str::is_empty) {
             return Err("spellcheck editions require a language tag".into());
+        }
+        if !self.spellcheck && self.spelling_engine != SpellcheckEngine::Aspell {
+            return Err("edition spelling engine is only valid when spellcheck is enabled".into());
         }
         if let Some(dictionary) = &self.dictionary {
             if !self.spellcheck {
@@ -1720,6 +1726,7 @@ mod tests {
             spellcheck: false,
             language: None,
             dictionary: None,
+            spelling_engine: SpellcheckEngine::default(),
         };
         assert_eq!(
             EditionRecipe::from_toml(&recipe.to_toml().unwrap()).unwrap(),

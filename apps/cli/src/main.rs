@@ -3446,7 +3446,7 @@ fn compile_edition_with_overwrite(
     recipe_path: &Path,
     overwrite: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    compile_edition_with_aspell_and_overwrite(project, recipe_path, "aspell", overwrite)
+    compile_edition_using_recipe_engine(project, recipe_path, None, overwrite)
 }
 
 #[cfg(test)]
@@ -3455,13 +3455,23 @@ fn compile_edition_with_aspell(
     recipe_path: &Path,
     aspell: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    compile_edition_with_aspell_and_overwrite(project, recipe_path, aspell, false)
+    compile_edition_using_recipe_engine(project, recipe_path, Some(aspell), false)
 }
 
+#[cfg(test)]
 fn compile_edition_with_aspell_and_overwrite(
     project: &Path,
     recipe_path: &Path,
     aspell: &str,
+    overwrite: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    compile_edition_using_recipe_engine(project, recipe_path, Some(aspell), overwrite)
+}
+
+fn compile_edition_using_recipe_engine(
+    project: &Path,
+    recipe_path: &Path,
+    executable_override: Option<&str>,
     overwrite: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let source = fs::read_to_string(recipe_path)?;
@@ -3469,14 +3479,19 @@ fn compile_edition_with_aspell_and_overwrite(
     let output_relative = Path::new(&recipe.output);
     ensure_project_path_has_no_symlink(project, output_relative)?;
     let spelling = if recipe.spellcheck {
-        Some(spellcheck_project(
+        let default_executable = match recipe.spelling_engine {
+            story_document::SpellcheckEngine::Aspell => "aspell",
+            story_document::SpellcheckEngine::Hunspell => "hunspell",
+        };
+        Some(spellcheck_project_with_engine(
             project,
             recipe
                 .language
                 .as_deref()
                 .ok_or("spellcheck language missing")?,
             recipe.dictionary.as_deref(),
-            aspell,
+            executable_override.unwrap_or(default_executable),
+            recipe.spelling_engine,
         )?)
     } else {
         None
@@ -3518,6 +3533,7 @@ struct SpellingFinding {
     candidates: std::collections::BTreeMap<String, usize>,
 }
 
+#[cfg(test)]
 fn spellcheck_project(
     project: &Path,
     language: &str,
@@ -3863,11 +3879,12 @@ fn main() -> ExitCode {
 mod watch_tests {
     use super::{
         CliReplaceGroup, CliReplaceGroupEntry, CliReplaceTarget, WatchSuccess,
-        apply_replace_preview, compile_edition, compile_edition_with_aspell,
-        compile_edition_with_aspell_and_overwrite, compile_edition_with_overwrite,
-        edition_watch_fingerprint, parse_scene_query_filter, recover_cli_replace_groups,
-        run_auto_snapshot_check, run_processing_recipe, scenes_for_scope, spellcheck_project,
-        spellcheck_project_with_engine, undo_cli_replace, watch_fingerprint,
+        apply_replace_preview, compile_edition, compile_edition_using_recipe_engine,
+        compile_edition_with_aspell, compile_edition_with_aspell_and_overwrite,
+        compile_edition_with_overwrite, edition_watch_fingerprint, parse_scene_query_filter,
+        recover_cli_replace_groups, run_auto_snapshot_check, run_processing_recipe,
+        scenes_for_scope, spellcheck_project, spellcheck_project_with_engine, undo_cli_replace,
+        watch_fingerprint,
     };
     use std::fs;
     use story_app::WriterApp;
@@ -4075,6 +4092,57 @@ mod watch_tests {
         .unwrap();
         fs::write(&checked_recipe, "version=1\nname='Checked reader'\nformat='markdown'\noutput='exports/checked.md'\nspellcheck=true\nlanguage='en_GB'\ndictionary='dictionaries/linked.txt'\n").unwrap();
         assert!(edition_watch_fingerprint(&project_path, &checked_recipe).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn edition_recipe_selects_hunspell_backend() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Novel");
+        let mut project = WriterApp::create_project(&project_path, "Novel").unwrap();
+        let chapter = project.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = project.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = project.load_scene_text(scene).unwrap();
+        project
+            .save_scene_text(scene, Some(&hash), "The manuscript stays unchanged.")
+            .unwrap();
+        drop(project);
+        fs::create_dir_all(project_path.join("dictionaries")).unwrap();
+        fs::write(project_path.join("dictionaries/en.txt"), "known\n").unwrap();
+        let mock = root.path().join("hunspell");
+        fs::write(
+            &mock,
+            "#!/bin/sh\ncat >/dev/null\nprintf 'baad\\nknown\\n'\n",
+        )
+        .unwrap();
+        fs::set_permissions(&mock, fs::Permissions::from_mode(0o755)).unwrap();
+        let recipe = root.path().join("edition.toml");
+        fs::write(
+            &recipe,
+            "version=1\nname='Reader'\nformat='markdown'\noutput='exports/reader.md'\nspellcheck=true\nlanguage='en-GB'\ndictionary='dictionaries/en.txt'\nspelling_engine='hunspell'\n",
+        )
+        .unwrap();
+        compile_edition_using_recipe_engine(
+            &project_path,
+            &recipe,
+            Some(mock.to_str().unwrap()),
+            false,
+        )
+        .unwrap();
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(project_path.join("exports/reader.md.spellcheck.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report[0]["candidates"]["baad"], 1);
+        assert_eq!(
+            WriterApp::open_project(&project_path)
+                .unwrap()
+                .load_scene_text(scene)
+                .unwrap()
+                .0,
+            "The manuscript stays unchanged."
+        );
     }
 
     #[test]

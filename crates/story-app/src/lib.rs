@@ -2070,6 +2070,7 @@ impl WriterApp {
             spellcheck: false,
             language: None,
             dictionary: None,
+            spelling_engine: story_document::SpellcheckEngine::default(),
         };
         self.create_compile_configuration(name, &recipe)
     }
@@ -6010,6 +6011,7 @@ unexpected_prose = "must not be silently discarded"
             spellcheck: false,
             language: None,
             dictionary: None,
+            spelling_engine: story_document::SpellcheckEngine::default(),
         };
         app.create_compile_configuration("plain", &recipe).unwrap();
         assert!(app.create_compile_configuration("plain", &recipe).is_err());
@@ -6111,6 +6113,7 @@ unexpected_prose = "must not be silently discarded"
             spellcheck: false,
             language: None,
             dictionary: None,
+            spelling_engine: story_document::SpellcheckEngine::default(),
         };
         assert!(app.create_compile_configuration("unsafe", &recipe).is_err());
 
@@ -7103,6 +7106,7 @@ unexpected_prose = "must not be silently discarded"
             spellcheck: false,
             language: None,
             dictionary: None,
+            spelling_engine: story_document::SpellcheckEngine::default(),
         };
         app.create_compile_configuration("audio", &recipe).unwrap();
         app.compile_configuration("audio", false).unwrap();
