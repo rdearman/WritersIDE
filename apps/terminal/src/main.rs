@@ -25530,6 +25530,19 @@ mod tests {
         .unwrap();
         assert!(state.menu.is_some());
         assert!(state.pending_command_sequence.is_none());
+
+        state.menu = None;
+        state.command_bindings = vec![(parse_shortcut("Alt+F").unwrap(), "menu.file".to_owned())];
+        assert_eq!(
+            effective_command_shortcuts(&state, command_by_id("menu.file").unwrap()),
+            vec!["Alt+F"]
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+        )
+        .unwrap();
+        assert_eq!(state.menu.as_ref().map(|menu| menu.top), Some(0));
     }
 
     #[test]
