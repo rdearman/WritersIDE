@@ -9159,10 +9159,10 @@ impl AppState {
                 let profile =
                     story_document::BookDesignProfile::from_toml(&fs::read_to_string(path)?)?;
                 self.app
-                    .compile_artifact_with_profile(format, expand, profile)?
+                    .compile_artifact_recording_failure(format, expand, profile)?
             } else {
                 self.app
-                    .compile_artifact_with_design(format, expand, design)?
+                    .compile_artifact_recording_failure(format, expand, design.profile())?
             };
             let destination = output
                 .map(Path::new)

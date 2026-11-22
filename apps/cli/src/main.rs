@@ -1795,9 +1795,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let profile =
                     story_document::BookDesignProfile::from_toml(&std::fs::read_to_string(path)?)?;
-                app.compile_artifact_with_profile(format, expand, profile)?
+                app.compile_artifact_recording_failure(format, expand, profile)?
             } else {
-                app.compile_artifact_with_design(format, expand, design)?
+                app.compile_artifact_recording_failure(format, expand, design.profile())?
             };
             let destination = output.map(PathBuf::from).unwrap_or_else(|| {
                 app.project_root()
@@ -2100,8 +2100,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let fingerprint = watch_fingerprint(&project)?;
                 if successful.needs_run(&fingerprint) {
                     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
-                        let artifact =
-                            WriterApp::open_project(&project)?.compile_artifact(format, false)?;
+                        let app = WriterApp::open_project(&project)?;
+                        let artifact = app.compile_artifact_recording_failure(
+                            format,
+                            false,
+                            story_document::BookDesign::default().profile(),
+                        )?;
                         atomic_write(&output, &artifact.bytes)?;
                         write_compile_auxiliary(&output, &artifact.auxiliary_files)?;
                         let map = serde_json::to_vec_pretty(
@@ -3497,7 +3501,7 @@ fn compile_edition_using_recipe_engine(
         None
     };
     let app = WriterApp::open_project(project)?;
-    let artifact = app.compile_artifact_for_edition(&recipe)?;
+    let artifact = app.compile_edition_artifact_recording_failure(&recipe)?;
     let output = project.join(output_relative);
     let mut sidecars = Vec::new();
     if let Some(findings) = spelling {

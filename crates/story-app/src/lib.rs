@@ -1678,6 +1678,75 @@ impl WriterApp {
             .map_err(AppError::Domain)
     }
 
+    /// Render a one-off Compile request and persist a result if rendering
+    /// fails before an artifact exists. Successful publication is recorded by
+    /// `publish_compile_artifact_with_sidecars`.
+    pub fn compile_artifact_recording_failure(
+        &self,
+        format: story_document::CompileFormat,
+        expand_transclusions: bool,
+        design: story_document::BookDesignProfile,
+    ) -> Result<story_document::CompileArtifact> {
+        self.render_artifact_recording_failure("One-off Compile", format, || {
+            self.compile_artifact_with_profile(format, expand_transclusions, design)
+        })
+    }
+
+    /// Render an edition recipe and persist a result if validation or rendering
+    /// fails before an artifact exists. Publication is recorded separately.
+    pub fn compile_edition_artifact_recording_failure(
+        &self,
+        recipe: &story_document::EditionRecipe,
+    ) -> Result<story_document::CompileArtifact> {
+        self.render_artifact_recording_failure(&recipe.name, recipe.format, || {
+            self.compile_artifact_for_edition(recipe)
+        })
+    }
+
+    fn render_artifact_recording_failure<F>(
+        &self,
+        configuration: &str,
+        format: story_document::CompileFormat,
+        render: F,
+    ) -> Result<story_document::CompileArtifact>
+    where
+        F: FnOnce() -> Result<story_document::CompileArtifact>,
+    {
+        use std::time::Instant;
+
+        let timer = Instant::now();
+        let result = render();
+        if let Err(error) = &result {
+            let diagnostics = self.compile_diagnostics().unwrap_or_default();
+            let warnings = diagnostics
+                .iter()
+                .filter(|diagnostic| {
+                    diagnostic.severity != story_document::DiagnosticSeverity::Error
+                })
+                .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+                .collect();
+            let record = CompileRunRecord {
+                version: 5,
+                configuration: configuration.to_owned(),
+                format: Some(format.extension().to_ascii_uppercase()),
+                succeeded: false,
+                created_unix_millis: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis(),
+                elapsed_millis: timer.elapsed().as_millis(),
+                outputs: Vec::new(),
+                warnings,
+                diagnostics,
+                error: Some(error.to_string()),
+                source_fingerprint: self.compile_source_fingerprint().ok(),
+                stale: false,
+            };
+            self.persist_compile_run_record(&record)?;
+        }
+        result
+    }
+
     pub fn compile_artifact_for_assembly(
         &self,
         assembly: AssemblyId,
@@ -5980,6 +6049,32 @@ unexpected_prose = "must not be silently discarded"
         let plain = String::from_utf8(plain.bytes).unwrap();
         assert!(plain.contains("Élodie arrives."));
         assert!(!plain.contains("{lang=it-IT}"));
+    }
+
+    #[test]
+    fn failed_one_off_renderer_attempt_is_recorded_without_an_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(dir.path().join("Novel"), "A Novel").unwrap();
+        let result = app.render_artifact_recording_failure(
+            "One-off Compile",
+            story_document::CompileFormat::Epub,
+            || Err(AppError::Domain("synthetic renderer failure".into())),
+        );
+        assert!(
+            matches!(result, Err(AppError::Domain(message)) if message == "synthetic renderer failure")
+        );
+
+        let runs = app.list_compile_results().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].configuration, "One-off Compile");
+        assert_eq!(runs[0].format.as_deref(), Some("EPUB"));
+        assert!(!runs[0].succeeded);
+        assert!(runs[0].outputs.is_empty());
+        assert_eq!(
+            runs[0].error.as_deref(),
+            Some("invalid domain input: synthetic renderer failure")
+        );
+        assert!(runs[0].source_fingerprint.is_some());
     }
 
     #[test]
