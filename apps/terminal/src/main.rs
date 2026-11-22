@@ -5366,6 +5366,10 @@ impl AppState {
             self.message = "Compile Results has no selected line".into();
             return Ok(true);
         };
+        if line.contains("STALE ") {
+            self.message = "Compile finding is stale; rerun Compile before navigating".into();
+            return Ok(true);
+        }
         let Some(id) = line
             .split(" · source ")
             .nth(1)
@@ -12949,10 +12953,10 @@ fn compile_results_reference_text(
     let filter = if filter.is_empty() { "all" } else { filter };
     if !matches!(
         filter,
-        "all" | "errors" | "warnings" | "info" | "failed" | "success"
+        "all" | "errors" | "warnings" | "info" | "failed" | "success" | "stale" | "current"
     ) {
         return Err(
-            "Compile Results filter must be all, errors, warnings, info, failed, or success".into(),
+            "Compile Results filter must be all, errors, warnings, info, failed, success, stale, or current".into(),
         );
     }
     let records = app.list_compile_results()?;
@@ -12962,6 +12966,8 @@ fn compile_results_reference_text(
     let records = records
         .into_iter()
         .filter(|record| match filter {
+            "stale" => record.stale,
+            "current" => !record.stale,
             "failed" => !record.succeeded,
             "success" => record.succeeded,
             "errors" => {
@@ -12991,7 +12997,8 @@ fn compile_results_reference_text(
     let mut lines = Vec::new();
     for (index, record) in records.iter().enumerate() {
         lines.push(format!(
-            "{}. {} · {} · {} · {} ms · run {}",
+            "{}{}. {} · {} · {} · {} ms · run {}",
+            if record.stale { "STALE " } else { "" },
             index + 1,
             record.configuration,
             record.format.as_deref().unwrap_or("unknown target"),
@@ -13008,7 +13015,8 @@ fn compile_results_reference_text(
         }
         for diagnostic in &record.diagnostics {
             lines.push(format!(
-                "   {:?} {}{}: {}",
+                "   {}{:?} {}{}: {}",
+                if record.stale { "STALE " } else { "" },
                 diagnostic.severity,
                 diagnostic.code,
                 diagnostic
@@ -20128,6 +20136,27 @@ mod tests {
                 .contains("No Compile results match")
         );
         assert!(state.reference_focused);
+        let (_, current_hash) = state.app.load_scene_text(scene).unwrap();
+        state
+            .app
+            .save_scene_text(scene, Some(&current_hash), "Updated since compile.")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("compile-results stale")
+            .unwrap();
+        let stale_row = state.reference_panes[2]
+            .content
+            .lines()
+            .position(|line| line.contains("STALE Warning PUB004"))
+            .unwrap();
+        state.reference_panes[2].scroll = stale_row;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editing_scene, Some(scene));
+        assert!(state.message.contains("stale; rerun Compile"));
     }
 
     #[test]

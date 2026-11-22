@@ -69,6 +69,10 @@ pub struct CompileRunRecord {
     #[serde(default)]
     pub diagnostics: Vec<story_document::CompileDiagnostic>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub source_fingerprint: Option<String>,
+    #[serde(skip)]
+    pub stale: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1627,7 +1631,7 @@ impl WriterApp {
             .map(|item| format!("{}: {}", item.code, item.message))
             .collect();
         let record = CompileRunRecord {
-            version: 2,
+            version: 3,
             configuration: "One-off Compile".into(),
             format: Some(artifact.format.extension().to_ascii_uppercase()),
             succeeded,
@@ -1640,6 +1644,8 @@ impl WriterApp {
             warnings,
             diagnostics,
             error,
+            source_fingerprint: self.compile_source_fingerprint().ok(),
+            stale: false,
         };
         self.persist_compile_run_record(&record)?;
         result
@@ -1944,7 +1950,7 @@ impl WriterApp {
             ),
         };
         let record = CompileRunRecord {
-            version: 2,
+            version: 3,
             configuration: name.to_owned(),
             format,
             succeeded,
@@ -1954,6 +1960,8 @@ impl WriterApp {
             warnings,
             diagnostics,
             error: error.clone(),
+            source_fingerprint: self.compile_source_fingerprint().ok(),
+            stale: false,
         };
         let log_relative = self.persist_compile_run_record(&record)?;
         match result {
@@ -2128,6 +2136,7 @@ impl WriterApp {
             Err(error) => return Err(AppError::Domain(format!("read Compile results: {error}"))),
         };
         let mut records = Vec::new();
+        let current_fingerprint = self.compile_source_fingerprint().ok();
         for entry in entries {
             let entry = entry
                 .map_err(|error| AppError::Domain(format!("read Compile result entry: {error}")))?;
@@ -2137,19 +2146,21 @@ impl WriterApp {
                     .extension()
                     .is_some_and(|extension| extension == "json")
             {
-                let record: CompileRunRecord =
+                let mut record: CompileRunRecord =
                     serde_json::from_slice(&fs::read(entry.path()).map_err(|error| {
                         AppError::Domain(format!("read Compile result file: {error}"))
                     })?)
                     .map_err(|error| {
                         AppError::Domain(format!("invalid Compile result file: {error}"))
                     })?;
-                if !matches!(record.version, 1 | 2) {
+                if !matches!(record.version, 1..=3) {
                     return Err(AppError::Domain(format!(
                         "unsupported Compile result version {}",
                         record.version
                     )));
                 }
+                record.stale =
+                    record.source_fingerprint.as_deref() != current_fingerprint.as_deref();
                 records.push(record);
             }
         }
@@ -2281,6 +2292,14 @@ impl WriterApp {
         Ok(story_document::publication_diagnostics(
             &story_pipeline::compile_ir(&input),
         ))
+    }
+    fn compile_source_fingerprint(&self) -> Result<String> {
+        let input = self.processing_input()?;
+        let ir = story_pipeline::compile_ir(&input);
+        let bytes = serde_json::to_vec(&ir).map_err(|error| {
+            AppError::Domain(format!("serialize Compile source snapshot: {error}"))
+        })?;
+        Ok(compile_sha256(&bytes))
     }
     pub fn proofreading_config(&self) -> Result<story_analysis::ProofreadingConfig> {
         let path = self
@@ -5157,13 +5176,37 @@ unexpected_prose = "must not be silently discarded"
         assert!(app.list_compile_results().unwrap().iter().any(|record| {
             record.succeeded
                 && record.outputs.contains(&recipe.output)
-                && record.version == 2
+                && record.version == 3
                 && record.format.as_deref() == Some("MD")
                 && record.diagnostics.iter().any(|item| {
                     item.code == "PUB004"
                         && item.source_entity_id.as_deref() == Some(&scene.to_string())
                 })
         }));
+        assert!(
+            app.list_compile_results()
+                .unwrap()
+                .iter()
+                .all(|record| !record.stale)
+        );
+        let (compiled_text, compiled_hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&compiled_hash), "Changed after compile.")
+            .unwrap();
+        assert!(
+            app.list_compile_results()
+                .unwrap()
+                .iter()
+                .all(|record| record.stale)
+        );
+        let (_, changed_hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&changed_hash), &compiled_text)
+            .unwrap();
+        assert!(
+            app.list_compile_results()
+                .unwrap()
+                .iter()
+                .all(|record| !record.stale)
+        );
 
         fs::write(&output, "author edited generated output").unwrap();
         assert!(app.clean_compile_configuration("plain").is_err());
