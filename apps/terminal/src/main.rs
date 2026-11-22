@@ -372,14 +372,7 @@ struct MenuState {
 }
 
 const MENU_CATEGORIES: [&str; 8] = [
-    "Write",
-    "Open/Import",
-    "Navigate",
-    "Find",
-    "Review",
-    "Compile/Export",
-    "Help",
-    "More",
+    "File", "Edit", "Insert", "Navigate", "Review", "Publish", "Tools", "Help",
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2754,22 +2747,35 @@ fn menu_category(spec: &CommandSpec) -> &'static str {
         "Help"
     } else if spec.category == "Compile" || id.starts_with("compile.") || id.starts_with("export.")
     {
-        "Compile/Export"
-    } else if spec.category == "Series" || id.contains("import") || id.starts_with("project.open") {
-        "Open/Import"
+        "Publish"
+    } else if spec.category == "Series"
+        || id.contains("import")
+        || id.starts_with("project.open")
+        || id.starts_with("project.new")
+        || id.starts_with("file.")
+        || id.starts_with("series.")
+    {
+        "File"
+    } else if spec.category == "Insert"
+        || id == "scene.create"
+        || id.starts_with("structure.")
+        || id == "document.new-content-unit"
+        || id.starts_with("link.")
+        || id.starts_with("edit.snippet-")
+        || id.starts_with("edit.text-expansion")
+    {
+        "Insert"
     } else if spec.category == "View"
         || id.starts_with("view.")
         || id.starts_with("scene.open")
         || id.starts_with("outline.")
         || id.starts_with("reference.")
         || id.starts_with("document.open")
+        || ["search.", "find.", "grep.", "occur.", "replace.", "query."]
+            .iter()
+            .any(|prefix| id.starts_with(prefix))
     {
         "Navigate"
-    } else if ["search.", "find.", "grep.", "occur.", "replace.", "query."]
-        .iter()
-        .any(|prefix| id.starts_with(prefix))
-    {
-        "Find"
     } else if spec.category == "Plot"
         || [
             "analytics.",
@@ -2784,16 +2790,10 @@ fn menu_category(spec: &CommandSpec) -> &'static str {
         .any(|prefix| id.starts_with(prefix))
     {
         "Review"
-    } else if id == "file.save"
-        || id == "scene.create"
-        || id.starts_with("structure.")
-        || id == "document.new-content-unit"
-        || id.starts_with("edit.snippet-")
-        || id.starts_with("edit.text-expansion")
-    {
-        "Write"
+    } else if spec.category == "Edit" || id.starts_with("edit.") {
+        "Edit"
     } else {
-        "More"
+        "Tools"
     }
 }
 
@@ -4185,7 +4185,7 @@ impl AppState {
             history_index: 0,
             location_history: Vec::new(),
             width: 80,
-            editor_focus_mode: false,
+            editor_focus_mode: true,
             horizontal_split_ratio: default_split_ratio(),
             vertical_split_ratio: default_split_ratio(),
             assembly_draft: None,
@@ -6443,6 +6443,7 @@ impl AppState {
         title: String,
         content: String,
     ) {
+        self.editor_focus_mode = false;
         let shared_scene = scene_id.is_some()
             && scene_id == self.editing_scene
             && !source_key.starts_with("scene-card:");
@@ -14519,39 +14520,59 @@ fn format_search_result_row(title: &str, text: &str, byte_offset: usize) -> Stri
     format!("{title}:{line_number}: {excerpt}")
 }
 
+fn menu_bar_line(s: &AppState, width: usize) -> Line<'static> {
+    if width < 60 {
+        let menu_key = effective_shortcut_label(s, "menu.main", "F10");
+        let selected = s.menu.map(|menu| MENU_CATEGORIES[menu.top]);
+        let status = selected.map_or_else(
+            || format!("{menu_key} Menu · ? Help"),
+            |category| format!("{menu_key} {category} · arrows/Enter · Esc"),
+        );
+        return Line::from(Span::styled(
+            status,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let active = s.menu.map(|menu| menu.top);
+    let mut spans = vec![Span::raw(" ")];
+    for (index, category) in MENU_CATEGORIES.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let style = if active == Some(index) {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        spans.push(Span::styled((*category).to_owned(), style));
+    }
+    Line::from(spans)
+}
+
+fn effective_shortcut_label(state: &AppState, command_id: &str, fallback: &str) -> String {
+    command_by_id(command_id)
+        .map(|command| effective_command_shortcuts(state, command).join(" or "))
+        .filter(|shortcuts| !shortcuts.is_empty())
+        .unwrap_or_else(|| fallback.to_owned())
+}
+
 fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     let area = f.area();
     s.planning_board_area = None;
-    let focus_only = s.workspace == Workspace::Editor && s.editor_focus_mode;
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(if focus_only { 0 } else { 1 }),
+            Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(if focus_only {
-                0
-            } else if s.find_panel.is_some() {
-                6
-            } else {
-                2
-            }),
+            Constraint::Length(if s.find_panel.is_some() { 6 } else { 2 }),
         ])
         .split(area);
     s.width = area.width as usize;
-    let project = s
-        .app
-        .get_project()
-        .map(|p| p.title)
-        .unwrap_or_else(|_| "Project".into());
-    let dirty = if s.dirty { "● unsaved" } else { "saved" };
-    let head = Paragraph::new(Line::from(vec![
-        Span::styled(
-            format!(" {project}  |  {}  |  {dirty} ", s.workspace.title()),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("F1-F9, F11-F14 workspaces  Ctrl+/ or F10 menu  Ctrl-G focus  Ctrl+arrows split  ? help  : commands  / search  Ctrl-S save  q quit"),
-    ]))
-    .block(Block::default().borders(Borders::BOTTOM));
+    let head = Paragraph::new(menu_bar_line(s, area.width as usize));
     f.render_widget(head, rows[0]);
     let body = if pane_direction(s.width) == Direction::Vertical {
         Layout::default()
@@ -14658,7 +14679,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 vec![
                     Line::from("No manuscript document is open."),
                     Line::from(
-                        "Use F10 or Ctrl+/ → Write → Create Chapter, or choose Open/Import.",
+                        "Use F10 or Ctrl+/ → Insert → Create Chapter, or choose File → Import.",
                     ),
                 ],
                 "Start Writing".into(),
@@ -15209,7 +15230,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         } else {
             let detail = if s.workspace == Workspace::Dashboard && s.scenes.is_empty() {
                 format!(
-                    "Welcome to Writer's IDE\n\nTo begin, open the menu with Ctrl+/ or F10 and choose Write → Create Chapter. Then create a scene and start drafting.\n\nTo migrate an existing project, choose Open/Import. Press ? for offline help.\n\n{}",
+                    "Welcome to Writer's IDE\n\nStart Writing: choose Insert → Create Chapter. Open or Import: choose File → Import. For first steps, press ? for offline help.\n\n{}",
                     s.message
                 )
             } else if s.workspace == Workspace::Outline {
@@ -15342,7 +15363,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 format!(" · {challenge}")
             };
             format!(
-                " Focus:{} · Menu Ctrl+/ or F10 · Help ? · Save Ctrl+S · q quit · {}{} · {}",
+                " Focus:{} · Menu {} · Help ? · Save {} · q quit · {}{} · {}",
                 if s.menu.is_some() {
                     "menu"
                 } else if s.reference_focused {
@@ -15352,6 +15373,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 } else {
                     "navigation"
                 },
+                effective_shortcut_label(s, "menu.main", "F10"),
+                effective_shortcut_label(s, "file.save", "unbound"),
                 if s.dirty { "unsaved" } else { "saved" },
                 challenge,
                 s.message,
@@ -16499,67 +16522,33 @@ fn parse_challenge_tail(
 
 fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let area = f.area();
-    let width = area.width.min(86);
-    let height = area.height.min(24);
+    let width = area.width.min(64);
+    let height = area.height.saturating_sub(1).min(20);
+    if width == 0 || height == 0 {
+        return;
+    }
+    let menu = s.menu.unwrap_or(MenuState {
+        top: 0,
+        selected: 0,
+    });
+    let category_offset = MENU_CATEGORIES
+        .iter()
+        .take(menu.top)
+        .map(|category| category.chars().count() + 2)
+        .sum::<usize>();
     let popup = Rect {
-        x: area.x + (area.width - width) / 2,
-        y: area.y + (area.height - height) / 2,
+        x: area.x + (category_offset as u16).min(area.width.saturating_sub(width)),
+        y: area.y + 1,
         width,
         height,
     };
     f.render_widget(Clear, popup);
     let block = Block::default()
-        .title(" Main Menu · Ctrl+/ or F10 · Esc close ")
+        .title(format!(" {} · Esc close ", MENU_CATEGORIES[menu.top]))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-    let menu = s.menu.unwrap_or(MenuState {
-        top: 0,
-        selected: 0,
-    });
-    let narrow = inner.width < 48 || inner.height < 10;
-    let panes = if narrow {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(1)])
-            .split(inner)
-    } else {
-        Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(18), Constraint::Min(10)])
-            .split(inner)
-    };
-    let roots = MENU_CATEGORIES
-        .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            ListItem::new(format!(
-                "{}{}",
-                if i == menu.top { "▸ " } else { "  " },
-                name
-            ))
-        })
-        .collect::<Vec<_>>();
-    if narrow {
-        f.render_widget(
-            Paragraph::new(format!(
-                "◂ {} {}/{} ▸",
-                MENU_CATEGORIES[menu.top],
-                menu.top + 1,
-                MENU_CATEGORIES.len()
-            )),
-            panes[0],
-        );
-    } else {
-        f.render_stateful_widget(
-            List::new(roots)
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-                .block(Block::default().title("Menu").borders(Borders::RIGHT)),
-            panes[0],
-            &mut ListState::default().with_selected(Some(menu.top)),
-        );
-    }
     let commands = s.menu_commands();
     let items = if commands.is_empty() {
         vec![ListItem::new("No commands available yet").style(Style::default().fg(Color::DarkGray))]
@@ -16600,14 +16589,14 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     } else {
         Some(menu.selected.min(commands.len() - 1))
     };
-    let (command_list_area, description_area) = if !commands.is_empty() && panes[1].height >= 6 {
+    let (command_list_area, description_area) = if !commands.is_empty() && inner.height >= 6 {
         let split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(2)])
-            .split(panes[1]);
+            .split(inner);
         (split[0], Some(split[1]))
     } else {
-        (panes[1], None)
+        (inner, None)
     };
     f.render_stateful_widget(
         List::new(items)
@@ -16615,8 +16604,8 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
             .block(
                 Block::default()
-                    .title(MENU_CATEGORIES[menu.top])
-                    .borders(Borders::LEFT),
+                    .title("Choose an action · ↑/↓ · Enter")
+                    .borders(Borders::NONE),
             ),
         command_list_area,
         &mut ListState::default().with_selected(selected),
@@ -17636,8 +17625,10 @@ fn workspace_items(s: &AppState) -> Vec<String> {
     match s.workspace {
         Workspace::Dashboard if s.scenes.is_empty() => vec![
             "Welcome — your manuscript is ready to start".into(),
-            "Write: create your first chapter, then add a scene".into(),
-            "Open/Import: bring in an existing manuscript".into(),
+            "Start Writing: create a chapter, then add a scene".into(),
+            "Open or Import: bring in an existing manuscript".into(),
+            "Guided Tutorial: unavailable · Help is available offline".into(),
+            "Advanced Tools: press : to search registered commands".into(),
             "Help: press ? · Main menu: Ctrl+/ or F10".into(),
         ],
         Workspace::Dashboard => vec![
@@ -20554,7 +20545,7 @@ mod tests {
         let mut state = AppState::new(app, default_bindings());
         let top = MENU_CATEGORIES
             .iter()
-            .position(|category| *category == "More")
+            .position(|category| *category == "Insert")
             .unwrap();
         state.menu = Some(MenuState { top, selected: 0 });
         let selected = state
@@ -20615,8 +20606,8 @@ mod tests {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let top = MENU_CATEGORIES
             .iter()
-            .position(|category| *category == "Open/Import")
-            .ok_or("Open/Import menu category is missing")?;
+            .position(|category| *category == "File")
+            .ok_or("File menu category is missing")?;
         state.menu = Some(MenuState { top, selected: 0 });
         let selected = state
             .menu_commands()
@@ -23754,7 +23745,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
         )
         .unwrap();
-        assert_eq!(state.menu.unwrap().top, 2);
+        assert_eq!(state.menu.unwrap().top, 3);
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -23768,10 +23759,10 @@ mod tests {
         state.toggle_menu();
         handle(
             &mut state,
-            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
         )
         .unwrap();
-        assert_eq!(MENU_CATEGORIES[state.menu.unwrap().top], "Write");
+        assert_eq!(MENU_CATEGORIES[state.menu.unwrap().top], "Insert");
         let ids = state
             .menu_commands()
             .into_iter()
@@ -25106,7 +25097,7 @@ mod tests {
     }
 
     #[test]
-    fn focus_mode_hides_reference_panes_and_application_chrome() {
+    fn focus_mode_hides_reference_panes_but_keeps_the_menu_bar_available() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
         let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
@@ -25143,7 +25134,7 @@ mod tests {
             .collect::<String>();
         assert!(focused.contains("PROSEVISIBLE"));
         assert!(!focused.contains("REFERENCEHIDDEN"));
-        assert!(!focused.contains("F1-F9"));
+        assert!(focused.contains("File"), "{focused:?}");
 
         state.reference_focused = true;
         terminal.draw(|frame| draw(frame, &mut state)).unwrap();
@@ -27604,18 +27595,11 @@ mod tests {
     }
 
     #[test]
-    fn main_menu_groups_commands_by_writer_task_and_blank_dashboard_has_actions() {
+    fn main_menu_uses_compact_writer_familiar_menu_roots_and_blank_dashboard_has_actions() {
         assert_eq!(
             MENU_CATEGORIES,
             [
-                "Write",
-                "Open/Import",
-                "Navigate",
-                "Find",
-                "Review",
-                "Compile/Export",
-                "Help",
-                "More"
+                "File", "Edit", "Insert", "Navigate", "Review", "Publish", "Tools", "Help",
             ]
         );
         for category in MENU_CATEGORIES {
@@ -27627,7 +27611,7 @@ mod tests {
         }
         assert_eq!(
             menu_category(&command_by_id("scene.create").unwrap()),
-            "Write"
+            "Insert"
         );
         assert_eq!(
             menu_category(&command_by_id("help.context").unwrap()),
@@ -27638,8 +27622,69 @@ mod tests {
         let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
         let state = AppState::new(project, default_bindings());
         let items = workspace_items(&state);
-        assert!(items.iter().any(|item| item.contains("first chapter")));
-        assert!(items.iter().any(|item| item.contains("Open/Import")));
+        assert!(items.iter().any(|item| item.contains("create a chapter")));
+        assert!(items.iter().any(|item| item.contains("Open or Import")));
+        assert!(items.iter().any(|item| item.contains("Guided Tutorial")));
+        assert!(items.iter().any(|item| item.contains("Advanced Tools")));
+    }
+
+    #[test]
+    fn persistent_menu_bar_adapts_to_available_width_and_effective_menu_keymap() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let wide = menu_bar_line(&state, 80)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        for category in MENU_CATEGORIES {
+            assert!(wide.contains(category), "missing menu root {category}");
+        }
+        let narrow = menu_bar_line(&state, 40)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(narrow.contains("Ctrl+/ or F10 Menu"), "{narrow:?}");
+
+        state.command_bindings = vec![(
+            KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
+            "menu.main".into(),
+        )];
+        let remapped = menu_bar_line(&state, 40)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(remapped.contains("Alt+M Menu"));
+    }
+
+    #[test]
+    fn new_projects_use_a_single_writing_canvas_with_persistent_menu_and_status() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["A sentence ready for drafting.".into()];
+        assert!(state.editor_focus_mode);
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("File"));
+        assert!(rendered.contains("A sentence ready for drafting."));
+        assert!(rendered.contains("manuscript"));
+        assert!(!rendered.contains("Scenes"));
     }
 
     #[test]
