@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 uuid.workspace = true
 unicode-segmentation.workspace = true
+unicode-normalization.workspace = true
 regex.workspace = true
 serde.workspace = true
 thiserror.workspace = true

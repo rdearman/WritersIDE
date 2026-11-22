@@ -464,6 +464,113 @@ pub fn find_matches_with_options(
     Ok(re.find_iter(text).map(|m| m.start()..m.end()).collect())
 }
 
+/// Finds text with Unicode normalization and locale-aware case handling while
+/// returning byte ranges into the original, unchanged UTF-8 source.
+///
+/// Turkish and Azerbaijani use the dotted/dotless-I mappings defined for their
+/// language. Other language tags use Rust's Unicode lowercase mapping. When
+/// `accent_sensitive` is false, canonical combining marks are ignored. Regex
+/// mode remains the responsibility of [`find_matches_with_options`] because
+/// transforming a regular expression would change its syntax.
+pub fn find_matches_with_locale(
+    text: &str,
+    pattern: &str,
+    options: FindOptions,
+    language_tag: &str,
+    accent_sensitive: bool,
+) -> Result<Vec<std::ops::Range<usize>>, String> {
+    use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
+
+    if options.case_sensitive || options.mode == FindMode::Regex {
+        return find_matches_with_options(text, pattern, options);
+    }
+    if pattern.is_empty() {
+        return Err("search pattern cannot be empty".into());
+    }
+
+    fn turkic_language(tag: &str) -> bool {
+        matches!(
+            tag.split('-')
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .as_str(),
+            "tr" | "az"
+        )
+    }
+
+    fn fold_cluster(cluster: &str, turkic: bool, accent_sensitive: bool) -> String {
+        let mut mapped = String::new();
+        for character in cluster.chars() {
+            match (turkic, character) {
+                (true, 'I') => mapped.push('ı'),
+                (true, 'İ') => mapped.push('i'),
+                _ => mapped.extend(character.to_lowercase()),
+            }
+        }
+        if accent_sensitive {
+            mapped.nfc().collect()
+        } else {
+            mapped
+                .nfd()
+                .filter(|character| !is_combining_mark(*character))
+                .collect()
+        }
+    }
+
+    fn fold_source(
+        text: &str,
+        turkic: bool,
+        accent_sensitive: bool,
+    ) -> (String, Vec<std::ops::Range<usize>>) {
+        use unicode_segmentation::UnicodeSegmentation;
+        let mut folded = String::new();
+        let mut map = Vec::new();
+        for (start, cluster) in text.grapheme_indices(true) {
+            let end = start + cluster.len();
+            for character in fold_cluster(cluster, turkic, accent_sensitive).chars() {
+                folded.push(character);
+                map.push(start..end);
+            }
+        }
+        (folded, map)
+    }
+
+    let turkic = turkic_language(language_tag);
+    let folded_pattern = fold_cluster(pattern, turkic, accent_sensitive);
+    let mut expression = match options.mode {
+        FindMode::Normal => regex::escape(&folded_pattern),
+        FindMode::Extended => regex::escape(&fold_cluster(
+            &decode_extended(pattern)?,
+            turkic,
+            accent_sensitive,
+        )),
+        FindMode::Regex => unreachable!(),
+    };
+    if options.whole_word {
+        expression = format!(r"\b(?:{expression})\b");
+    }
+    let regex = regex::RegexBuilder::new(&expression)
+        .case_insensitive(false)
+        .multi_line(true)
+        .build()
+        .map_err(|error| format!("invalid regular expression: {error}"))?;
+    let (folded_text, source_ranges) = fold_source(text, turkic, accent_sensitive);
+    Ok(regex
+        .find_iter(&folded_text)
+        .filter_map(|matched| {
+            let first = source_ranges.get(folded_text[..matched.start()].chars().count())?;
+            let last = source_ranges.get(
+                folded_text[..matched.end()]
+                    .chars()
+                    .count()
+                    .saturating_sub(1),
+            )?;
+            Some(first.start..last.end)
+        })
+        .collect())
+}
+
 pub fn replace_matches(
     text: &str,
     pattern: &str,
@@ -634,6 +741,33 @@ mod multilingual_tests {
         // keeping a composed syllable and its jamo representation consistent.
         assert_eq!(count_words_with_policy("한글", script), 2);
         assert_eq!(count_words_with_policy("cafe\u{301}", unicode), 1);
+    }
+
+    #[test]
+    fn locale_aware_find_maps_turkish_and_accent_folds_to_original_byte_ranges() {
+        use super::{FindMode, FindOptions, find_matches_with_locale};
+        let options = FindOptions {
+            mode: FindMode::Normal,
+            case_sensitive: false,
+            whole_word: false,
+        };
+
+        let turkish = "Işık İSTANBUL ıslak iz";
+        let matches = find_matches_with_locale(turkish, "ışık", options, "tr-TR", true).unwrap();
+        assert_eq!(&turkish[matches[0].clone()], "Işık");
+        let matches = find_matches_with_locale(turkish, "istanbul", options, "tr", true).unwrap();
+        assert_eq!(&turkish[matches[0].clone()], "İSTANBUL");
+
+        let source = "Cafe\u{301} CAFÉ cafe";
+        let insensitive =
+            find_matches_with_locale(source, "café", options, "fr-FR", false).unwrap();
+        assert_eq!(insensitive.len(), 3);
+        assert_eq!(&source[insensitive[0].clone()], "Cafe\u{301}");
+        assert_eq!(&source[insensitive[1].clone()], "CAFÉ");
+        let sensitive = find_matches_with_locale(source, "café", options, "fr-FR", true).unwrap();
+        assert_eq!(sensitive.len(), 2);
+        assert_eq!(&source[sensitive[0].clone()], "Cafe\u{301}");
+        assert_eq!(&source[sensitive[1].clone()], "CAFÉ");
     }
 
     #[test]
