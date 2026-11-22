@@ -1529,14 +1529,35 @@ fn parse_lualatex_log(log: &[u8]) -> Vec<CompileDiagnostic> {
                 DiagnosticSeverity::Warning,
                 "LuaLaTeX reports an unresolved reference",
             ))
+        } else if normalized.contains("Citation `") && normalized.contains("undefined") {
+            Some((
+                "TEXCITE",
+                DiagnosticSeverity::Warning,
+                "LuaLaTeX reports an unresolved citation",
+            ))
+        } else if normalized.contains("Label(s) may have changed") {
+            Some((
+                "TEXRERUN",
+                DiagnosticSeverity::Information,
+                "LuaLaTeX recommends rerunning to update cross-references",
+            ))
         } else if normalized.contains("not loadable")
             || normalized.contains("fontspec error")
             || normalized.starts_with("! LaTeX Error:")
+            || normalized.starts_with("! ")
         {
             Some((
                 "TEXERROR",
                 DiagnosticSeverity::Error,
-                "LuaLaTeX reports a font or document error",
+                "LuaLaTeX reports a fatal font or document error",
+            ))
+        } else if normalized.starts_with("LaTeX Warning:")
+            || (normalized.starts_with("Package ") && normalized.contains(" Warning:"))
+        {
+            Some((
+                "TEXWARN",
+                DiagnosticSeverity::Warning,
+                "LuaLaTeX or a package reports a warning",
             ))
         } else {
             None
@@ -2416,6 +2437,34 @@ LaTeX Warning: Reference `chapter:missing' on page 2 undefined on input line 44.
         assert_eq!(findings[4].severity, DiagnosticSeverity::Error);
         assert_eq!(findings[3].generated_file.as_deref(), Some("lualatex.log"));
         assert_eq!(findings[3].generated_line, Some(5));
+    }
+
+    #[test]
+    fn lualatex_log_diagnostics_retain_package_warnings_citations_and_fatal_errors() {
+        let log = br#"
+LaTeX Warning: Citation `missing-source' on page 1 undefined on input line 8.
+Package hyperref Warning: Token not allowed in a PDF string.
+LaTeX Warning: Label(s) may have changed. Rerun to get cross-references right.
+! Package fontspec Error: The font cannot be found.
+! Emergency stop.
+"#;
+        let findings = parse_lualatex_log(log);
+        assert_eq!(
+            findings
+                .iter()
+                .map(|finding| finding.code.as_str())
+                .collect::<Vec<_>>(),
+            ["TEXCITE", "TEXWARN", "TEXRERUN", "TEXERROR", "TEXERROR"]
+        );
+        assert_eq!(findings[0].severity, DiagnosticSeverity::Warning);
+        assert_eq!(findings[1].generated_line, Some(3));
+        assert_eq!(findings[2].severity, DiagnosticSeverity::Information);
+        assert_eq!(findings[3].severity, DiagnosticSeverity::Error);
+        assert_eq!(findings[4].severity, DiagnosticSeverity::Error);
+        assert!(findings.iter().all(|finding| {
+            finding.generated_file.as_deref() == Some("lualatex.log")
+                && finding.generated_line.is_some()
+        }));
     }
 
     #[test]
