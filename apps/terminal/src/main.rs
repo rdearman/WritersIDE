@@ -17231,6 +17231,7 @@ mod tests {
         app.save_scene_text(scene, Some(&hash), "The old road bends.\nA gate stands.")
             .unwrap();
         let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
         state.open_scene(scene).unwrap();
         state.editor_selection = Some((0, 4));
         state.cursor = (0, 12);
@@ -19438,6 +19439,84 @@ mod tests {
             .collect::<String>();
         assert!(maximized.contains("REFERENCEHIDDEN"));
         assert!(!maximized.contains("PROSEVISIBLE"));
+    }
+
+    #[test]
+    fn compact_terminal_focus_and_resize_preserve_open_editor_and_reference_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Draft", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["BOOKLENGTHPROSE".into()];
+        state.cursor = (0, 6);
+        state.open_reference_buffer(
+            "research:first".into(),
+            None,
+            "Pinned first reference".into(),
+            "First heading\nFIRSTREFERENCE".into(),
+        );
+        state.open_reference_buffer(
+            "research:second".into(),
+            None,
+            "Pinned second reference".into(),
+            "Second heading\nSECONDREFERENCE".into(),
+        );
+        state.reference_panes[0].scroll = 1;
+        state.reference_panes[1].scroll = 1;
+        state.active_reference = 1;
+
+        let backend = ratatui::backend::TestBackend::new(80, 10);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let editor_only = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(editor_only.contains("BOOKLENGTHPROSE"));
+        assert!(!editor_only.contains("FIRSTREFERENCE"));
+        assert!(!editor_only.contains("SECONDREFERENCE"));
+
+        state.reference_focused = true;
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let reference_only = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(reference_only.contains("SECONDREFERENCE"));
+        assert!(!reference_only.contains("BOOKLENGTHPROSE"));
+
+        drop(terminal);
+        let backend = ratatui::backend::TestBackend::new(120, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        state.width = 120;
+        state.reference_focused = false;
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let restored = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(restored.contains("BOOKLENGTHPROSE"));
+        assert!(restored.contains("FIRSTREFERENCE"), "{restored:?}");
+        assert!(restored.contains("SECONDREFERENCE"), "{restored:?}");
+        assert_eq!(state.cursor, (0, 6));
+        assert_eq!(state.reference_panes.len(), 2);
+        assert_eq!(state.reference_panes[0].source_key, "research:first");
+        assert_eq!(state.reference_panes[1].source_key, "research:second");
+        assert_eq!(state.reference_panes[0].scroll, 1);
+        assert_eq!(state.reference_panes[1].scroll, 1);
+        assert_eq!(state.active_reference, 1);
     }
 
     #[test]
