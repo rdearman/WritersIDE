@@ -46,10 +46,12 @@ pub struct EmacsTagsExport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct CompileBuildResult {
     pub configuration: String,
+    pub format: String,
     pub status: String,
     pub outputs: Vec<String>,
     pub elapsed_millis: u128,
     pub warnings: Vec<String>,
+    pub diagnostics: Vec<story_document::CompileDiagnostic>,
     pub log_path: String,
 }
 
@@ -57,11 +59,15 @@ pub struct CompileBuildResult {
 pub struct CompileRunRecord {
     pub version: u16,
     pub configuration: String,
+    #[serde(default)]
+    pub format: Option<String>,
     pub succeeded: bool,
     pub created_unix_millis: u128,
     pub elapsed_millis: u128,
     pub outputs: Vec<String>,
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub diagnostics: Vec<story_document::CompileDiagnostic>,
     pub error: Option<String>,
 }
 
@@ -1860,18 +1866,41 @@ impl WriterApp {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let (succeeded, outputs, warnings, error) = match &result {
-            Ok(build) => (true, build.outputs.clone(), build.warnings.clone(), None),
-            Err(error) => (false, Vec::new(), Vec::new(), Some(error.to_string())),
+        let configured_format = self
+            .compile_configurations_dir()
+            .join(format!("{name}.toml"));
+        let configured_format = fs::read_to_string(configured_format)
+            .ok()
+            .and_then(|source| story_document::EditionRecipe::from_toml(&source).ok())
+            .map(|recipe| recipe.format.extension().to_ascii_uppercase());
+        let (succeeded, outputs, warnings, error, format, diagnostics) = match &result {
+            Ok(build) => (
+                true,
+                build.outputs.clone(),
+                build.warnings.clone(),
+                None,
+                Some(build.format.clone()),
+                build.diagnostics.clone(),
+            ),
+            Err(error) => (
+                false,
+                Vec::new(),
+                Vec::new(),
+                Some(error.to_string()),
+                configured_format,
+                Vec::new(),
+            ),
         };
         let record = CompileRunRecord {
-            version: 1,
+            version: 2,
             configuration: name.to_owned(),
+            format,
             succeeded,
             created_unix_millis,
             elapsed_millis,
             outputs,
             warnings,
+            diagnostics,
             error: error.clone(),
         };
         let log_relative = format!(
@@ -2023,18 +2052,20 @@ impl WriterApp {
         }
         *self.compile_recovery_notice.borrow_mut() = None;
         publish_compile_file_set(&project_root, project.id, &publish_files)?;
-        let warnings = self
-            .compile_diagnostics()?
-            .into_iter()
+        let diagnostics = self.compile_diagnostics()?;
+        let warnings = diagnostics
+            .iter()
             .filter(|diagnostic| diagnostic.severity != story_document::DiagnosticSeverity::Error)
             .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
             .collect();
         Ok(CompileBuildResult {
             configuration: name.to_owned(),
+            format: recipe.format.extension().to_ascii_uppercase(),
             status: "success".into(),
             outputs: output_paths,
             elapsed_millis: 0,
             warnings,
+            diagnostics,
             log_path: String::new(),
         })
     }
@@ -2070,7 +2101,7 @@ impl WriterApp {
                     .map_err(|error| {
                         AppError::Domain(format!("invalid Compile result file: {error}"))
                     })?;
-                if record.version != 1 {
+                if !matches!(record.version, 1 | 2) {
                     return Err(AppError::Domain(format!(
                         "unsupported Compile result version {}",
                         record.version
@@ -5016,8 +5047,12 @@ unexpected_prose = "must not be silently discarded"
         let chapter = app.create_chapter(None, "Opening", 0).unwrap();
         let scene = app.create_scene(chapter, "First scene", 0).unwrap();
         let (_, source_hash) = app.load_scene_text(scene).unwrap();
-        app.save_scene_text(scene, Some(&source_hash), "Canonical prose remains here.")
-            .unwrap();
+        app.save_scene_text(
+            scene,
+            Some(&source_hash),
+            "Canonical prose remains here. TODO",
+        )
+        .unwrap();
         let (_, expected_hash) = app.load_scene_text(scene).unwrap();
         let recipe = story_document::EditionRecipe {
             version: 1,
@@ -5047,6 +5082,7 @@ unexpected_prose = "must not be silently discarded"
         let failed = app.list_compile_results().unwrap();
         assert_eq!(failed.len(), 1);
         assert!(!failed[0].succeeded);
+        assert_eq!(failed[0].format.as_deref(), Some("MD"));
         assert!(
             failed[0]
                 .error
@@ -5061,12 +5097,16 @@ unexpected_prose = "must not be silently discarded"
         assert!(output.exists());
         assert!(Path::new(&format!("{}.source-map.json", output.display())).exists());
         assert!(app.compile_configuration("plain", false).is_ok());
-        assert!(
-            app.list_compile_results()
-                .unwrap()
-                .iter()
-                .any(|record| record.succeeded && record.outputs.contains(&recipe.output))
-        );
+        assert!(app.list_compile_results().unwrap().iter().any(|record| {
+            record.succeeded
+                && record.outputs.contains(&recipe.output)
+                && record.version == 2
+                && record.format.as_deref() == Some("MD")
+                && record.diagnostics.iter().any(|item| {
+                    item.code == "PUB004"
+                        && item.source_entity_id.as_deref() == Some(&scene.to_string())
+                })
+        }));
 
         fs::write(&output, "author edited generated output").unwrap();
         assert!(app.clean_compile_configuration("plain").is_err());
@@ -5082,7 +5122,7 @@ unexpected_prose = "must not be silently discarded"
         assert!(!output.exists());
         assert!(output.parent().unwrap().join("author-note.txt").exists());
         let (source, actual_hash) = app.load_scene_text(scene).unwrap();
-        assert_eq!(source, "Canonical prose remains here.");
+        assert_eq!(source, "Canonical prose remains here. TODO");
         assert_eq!(actual_hash, expected_hash);
     }
 

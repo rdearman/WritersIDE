@@ -842,6 +842,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "compile.results",
+            "Compile Results",
+            "Open recent Compile runs, outputs and source-linked findings",
+            "Compile",
+            "compile-results",
+            false,
+        ),
+        legacy_command(
             "review.merge",
             "Merge Editorial Revision",
             "Three-way merge a reviewed manuscript into a scene and preserve conflicts for inspection",
@@ -3974,6 +3982,11 @@ impl AppState {
                         .ok()
                         .map(|content| (None, "Compile Diagnostics".into(), content))
                 }
+                "compile-results" if source_id == "project" => {
+                    compile_results_reference_text(&self.app)
+                        .ok()
+                        .map(|content| (None, "Compile Results".into(), content))
+                }
                 "search" => decode_hex(source_id).and_then(|terms| {
                     search_reference_text(&self.app, &terms)
                         .ok()
@@ -5328,6 +5341,16 @@ impl AppState {
             });
             self.active_reference = self.reference_panes.len() - 1;
         }
+    }
+    fn open_compile_results_reference(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.open_reference_buffer(
+            "compile-results:project".into(),
+            None,
+            "Compile Results".into(),
+            compile_results_reference_text(&self.app)?,
+        );
+        self.reference_focused = true;
+        Ok(())
     }
     fn navigate_search_match(&mut self, forward: bool) -> Result<(), Box<dyn std::error::Error>> {
         if self.search_locations.is_empty() {
@@ -7562,6 +7585,14 @@ impl AppState {
                 .join(format!("assembly-{assembly}.md"));
             fs::write(&destination, text.as_bytes())?;
             self.message = format!("Compiled assembly to {}", destination.display());
+        } else if cmd == "compile-results" {
+            self.open_reference_buffer(
+                "compile-results:project".into(),
+                None,
+                "Compile Results".into(),
+                compile_results_reference_text(&self.app)?,
+            );
+            self.reference_focused = true;
         } else if let Some(arguments) = cmd.strip_prefix("compile-config ") {
             let mut parts = arguments.split_whitespace();
             let action = parts
@@ -7618,16 +7649,26 @@ impl AppState {
                     let name = parts.next().ok_or("missing configuration name")?;
                     let overwrite =
                         action == "rebuild" || parts.any(|value| value == "--overwrite");
-                    let result = self.app.compile_configuration(name, overwrite)?;
-                    self.message = format!(
-                        "Compile {} complete in {} ms · {}",
-                        result.configuration,
-                        result.elapsed_millis,
-                        result.outputs.join(", ")
-                    );
-                    if !result.warnings.is_empty() {
-                        self.message
-                            .push_str(&format!(" · {} warning(s)", result.warnings.len()));
+                    match self.app.compile_configuration(name, overwrite) {
+                        Ok(result) => {
+                            self.message = format!(
+                                "Compile {} complete in {} ms · {}",
+                                result.configuration,
+                                result.elapsed_millis,
+                                result.outputs.join(", ")
+                            );
+                            if !result.warnings.is_empty() {
+                                self.message
+                                    .push_str(&format!(" · {} warning(s)", result.warnings.len()));
+                            }
+                            if !result.diagnostics.is_empty() {
+                                self.open_compile_results_reference()?;
+                            }
+                        }
+                        Err(error) => {
+                            self.message = format!("Compile {name} failed: {error}");
+                            self.open_compile_results_reference()?;
+                        }
                     }
                 }
                 "all" => {
@@ -7635,9 +7676,13 @@ impl AppState {
                     let names = self.app.list_compile_configurations()?;
                     let mut done = Vec::new();
                     let mut failed = Vec::new();
+                    let mut has_findings = false;
                     for name in names {
                         match self.app.compile_configuration(&name, overwrite) {
-                            Ok(_) => done.push(name),
+                            Ok(result) => {
+                                has_findings |= !result.diagnostics.is_empty();
+                                done.push(name);
+                            }
                             Err(error) => failed.push(format!("{name}: {error}")),
                         }
                     }
@@ -7646,6 +7691,9 @@ impl AppState {
                     } else {
                         format!("Compile All incomplete · {}", failed.join("; "))
                     };
+                    if has_findings || !failed.is_empty() {
+                        self.open_compile_results_reference()?;
+                    }
                 }
                 "clean" => {
                     let name = parts.next().ok_or("missing configuration name or all")?;
@@ -12828,6 +12876,58 @@ fn compile_diagnostics_reference_text(
         .join("\n"))
 }
 
+fn compile_results_reference_text(app: &WriterApp) -> Result<String, Box<dyn std::error::Error>> {
+    let records = app.list_compile_results()?;
+    if records.is_empty() {
+        return Ok("No Compile runs have been recorded.".into());
+    }
+    let mut lines = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        lines.push(format!(
+            "{}. {} · {} · {} · {} ms · run {}",
+            index + 1,
+            record.configuration,
+            record.format.as_deref().unwrap_or("unknown target"),
+            if record.succeeded {
+                "SUCCESS"
+            } else {
+                "FAILED"
+            },
+            record.elapsed_millis,
+            record.created_unix_millis
+        ));
+        for output in &record.outputs {
+            lines.push(format!("   Output: {output}"));
+        }
+        for diagnostic in &record.diagnostics {
+            lines.push(format!(
+                "   {:?} {}{}: {}",
+                diagnostic.severity,
+                diagnostic.code,
+                diagnostic
+                    .source_entity_id
+                    .as_deref()
+                    .map(|id| format!(" · source {id}"))
+                    .unwrap_or_default(),
+                diagnostic.message
+            ));
+        }
+        for warning in &record.warnings {
+            if !record
+                .diagnostics
+                .iter()
+                .any(|item| warning.starts_with(&format!("{}:", item.code)))
+            {
+                lines.push(format!("   Warning: {warning}"));
+            }
+        }
+        if let Some(error) = &record.error {
+            lines.push(format!("   Error: {error}"));
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
 fn encode_hex(value: &str) -> String {
     value
         .as_bytes()
@@ -16689,6 +16789,10 @@ mod tests {
             "compile.configuration"
         );
         assert_eq!(
+            command_palette_invocation("compile-results").unwrap().0.id,
+            "compile.results"
+        );
+        assert_eq!(
             command_palette_invocation("review-merge").unwrap().0.id,
             "review.merge"
         );
@@ -19786,10 +19890,11 @@ mod tests {
             "reference-timeline".to_owned(),
             "reference-search Moonstone".to_owned(),
             "reference-diagnostics".to_owned(),
+            "compile-results".to_owned(),
         ] {
             state.execute_legacy_palette_command(&command).unwrap();
         }
-        assert_eq!(state.reference_panes.len(), 4);
+        assert_eq!(state.reference_panes.len(), 5);
         assert!(state.reference_panes[0].content.contains("Chapter One"));
         assert!(
             state.reference_panes[0]
@@ -19806,6 +19911,10 @@ mod tests {
             state.reference_panes[3].content,
             "No current compile diagnostics."
         );
+        assert_eq!(
+            state.reference_panes[4].content,
+            "No Compile runs have been recorded."
+        );
         state.save_session().unwrap();
 
         let mut reopened = AppState::new(
@@ -19813,7 +19922,7 @@ mod tests {
             default_bindings(),
         );
         reopened.restore_session().unwrap();
-        assert_eq!(reopened.reference_panes.len(), 4);
+        assert_eq!(reopened.reference_panes.len(), 5);
         assert!(reopened.reference_panes[0].content.contains("Chapter One"));
         assert!(
             reopened.reference_panes[1]
@@ -19824,6 +19933,10 @@ mod tests {
         assert_eq!(
             reopened.reference_panes[3].content,
             "No current compile diagnostics."
+        );
+        assert_eq!(
+            reopened.reference_panes[4].content,
+            "No Compile runs have been recorded."
         );
     }
 
@@ -19857,6 +19970,31 @@ mod tests {
                 .execute_legacy_palette_command("compile-jump 99")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn compile_results_reference_shows_run_target_diagnostics_and_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Compile Results Novel");
+        let mut app = WriterApp::create_project(&project, "Compile Results Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Draft scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "TODO: finish this scene.")
+            .unwrap();
+        app.create_builtin_compile_configuration("plain", "plain")
+            .unwrap();
+
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command("compile-config run plain")
+            .unwrap();
+        assert!(state.reference_focused);
+        let content = &state.reference_panes[0].content;
+        assert!(content.contains("plain · TXT · SUCCESS"));
+        assert!(content.contains("PUB004"));
+        assert!(content.contains(&scene.to_string()));
+        assert!(content.contains("likely draft placeholder"));
     }
 
     #[test]
