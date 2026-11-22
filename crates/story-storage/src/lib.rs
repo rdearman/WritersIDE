@@ -6043,6 +6043,15 @@ impl ProjectStore {
         self.conn.execute("INSERT INTO story_link(id,source_kind,source_id,source_anchor_id,target_kind,target_id,target_anchor_id,link_kind,label,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)", params![link.id.to_string(),link.source.kind(),link.source.id(),link.source_anchor.map(|x|x.to_string()),link.target.kind(),link.target.id(),link.target_anchor.map(|x|x.to_string()),link.kind.as_str(),link.label,now()])?;
         Ok(())
     }
+    pub fn delete_story_link(&mut self, id: LinkId) -> Result<()> {
+        let changed = self
+            .conn
+            .execute("DELETE FROM story_link WHERE id=?1", [id.to_string()])?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
     pub fn create_research_item(
         &mut self,
         title: &str,

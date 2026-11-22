@@ -3442,6 +3442,9 @@ impl WriterApp {
     pub fn create_story_link(&mut self, link: &StoryLink) -> Result<()> {
         Ok(self.store.create_story_link(link)?)
     }
+    pub fn delete_story_link(&mut self, id: LinkId) -> Result<()> {
+        Ok(self.store.delete_story_link(id)?)
+    }
     pub fn create_research_item(
         &mut self,
         title: &str,

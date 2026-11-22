@@ -55,6 +55,17 @@ struct CreateIssueRequest {
 struct IssueStatusRequest {
     status: String,
 }
+#[derive(Deserialize)]
+struct CreateLinkRequest {
+    source_kind: String,
+    source_id: String,
+    source_anchor: Option<story_core::AnchorId>,
+    target_kind: String,
+    target_id: String,
+    target_anchor: Option<story_core::AnchorId>,
+    kind: String,
+    label: String,
+}
 
 const PAGE: &str = r#"<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
@@ -63,13 +74,14 @@ body{font:16px system-ui;margin:0;color:#20242a;background:#f3f5f7}header{paddin
 <header><h1 id="title">Writer's IDE</h1><p>Local planning graph · manuscript prose remains read-only here · <a href="/preview" target="_blank" rel="noopener">Open compiled manuscript preview</a> · <a href="/downloads">Download compiled EPUB/DOCX/PDF</a></p></header><main>
 <section><h2>Scenes</h2><label>Search<input id="scene-filter-text" type="search" placeholder="Title or synopsis"></label><label>Status<select id="scene-filter-status"><option value="">Any status</option><option>idea</option><option>outlined</option><option>ready_to_draft</option><option>drafting</option><option>draft_complete</option><option>revising</option><option>complete</option><option>archived</option></select></label><label>Character<select id="scene-filter-character"><option value="">Any character</option></select></label><label>Plotline<select id="scene-filter-plot"><option value="">Any plotline</option></select></label><div id="scenes">Loading…</div><h3>Add chapter</h3><form id="create-chapter"><input id="new-chapter-title" required placeholder="Chapter title"><button>Add chapter</button></form><h3>Add scene</h3><form id="create-scene"><select id="new-chapter"></select><input id="new-title" required placeholder="Scene title"><button>Add scene</button></form></section>
 <section><h2 id="scene-title">Select a scene</h2><small id="scene-meta"></small><p><label>Scene title<input id="scene-name"></label><label>Planning synopsis<textarea id="synopsis" rows="4"></textarea></label><label>Status<select id="status"><option>idea</option><option>outlined</option><option>ready_to_draft</option><option>drafting</option><option>draft_complete</option><option>revising</option><option>complete</option></select></label><button id="save-planning">Save planning</button></p><p><label>Story start time (ticks)<input id="scene-start-time" placeholder="? or integer / interval"></label><label>Story end time (ticks)<input id="scene-end-time" placeholder="? or integer / interval"></label><button id="save-scene-time">Save chronology</button></p><p><label>Move to chapter<select id="move-chapter"></select></label><label>Position<input id="move-position" type="number" min="0" value="0"></label><button id="move-scene">Move scene</button></p><p class="notice" id="notice"></p><h3>Read-only manuscript</h3><pre id="prose">Select a scene to inspect its text.</pre></section>
-<section><h2>Characters</h2><div id="characters"></div></section><section><h2>Plotlines</h2><div id="plotlines"></div></section><section><h2>Locations and events</h2><div id="world"></div></section><section><h2>Research and issues</h2><form id="create-issue"><input id="new-issue-title" required placeholder="Issue title"><button>Create issue</button></form><div id="work"></div></section><section><h2>Story structure and graph</h2><div id="structure"></div><div class="graph"><svg id="graph" role="img" aria-label="Story relationship and approved knowledge graph"></svg></div><div id="edges"></div><div id="knowledge"></div></section></main>
+<section><h2>Characters</h2><div id="characters"></div></section><section><h2>Plotlines</h2><div id="plotlines"></div></section><section><h2>Locations and events</h2><div id="world"></div></section><section><h2>Research and issues</h2><form id="create-issue"><input id="new-issue-title" required placeholder="Issue title"><button>Create issue</button></form><div id="work"></div></section><section><h2>Story structure and graph</h2><div id="structure"></div><div class="graph"><svg id="graph" role="img" aria-label="Story relationship and approved knowledge graph"></svg></div><div id="edges"></div><form id="create-link"><h3>Add typed relationship</h3><label>From<select id="link-source"></select></label><label>To<select id="link-target"></select></label><label>Type<select id="link-kind"><option>related</option><option>cites</option><option>transcludes</option><option>includes</option><option>navigates</option></select></label><label>Label<input id="link-label"></label><button>Add relationship</button></form><div id="knowledge"></div></section></main>
 <script>
 let plan,selected;async function api(path,method='GET',data){const r=await fetch(path,{method,headers:data?{'Content-Type':'application/json'}:{},body:data?JSON.stringify(data):undefined});const j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.error||r.statusText);return j}
 function renderScenes(){const query=document.querySelector('#scene-filter-text').value.trim().toLocaleLowerCase();const status=document.querySelector('#scene-filter-status').value;const character=document.querySelector('#scene-filter-character').value;const plot=document.querySelector('#scene-filter-plot').value;const matches=plan.scenes.filter(s=>(!query||`${s.title} ${s.synopsis||''}`.toLocaleLowerCase().includes(query))&&(!status||s.status===status)&&(!character||s.characters.some(x=>x.id===character))&&(!plot||s.plotlines.some(x=>x.id===plot)));document.querySelector('#scenes').innerHTML=matches.map(s=>`<button class="scene" data-id="${s.id}"><b>${esc(s.title)}</b><br><small>${esc(s.chapter||'Unplaced')} · ${s.actual_words} words · ${esc(s.status)}</small><p>${esc(s.synopsis||'')}</p></button>`).join('')||'No matching scenes';document.querySelectorAll('#scenes [data-id]').forEach(b=>b.onclick=()=>openScene(b.dataset.id))}
-async function load(){plan=await api('/api/plan');document.querySelector('#title').textContent=plan.project.title;document.querySelector('#scene-filter-character').innerHTML='<option value="">Any character</option>'+plan.characters.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');document.querySelector('#scene-filter-plot').innerHTML='<option value="">Any plotline</option>'+plan.plotlines.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');renderScenes();document.querySelector('#characters').innerHTML=plan.characters.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No characters';document.querySelector('#plotlines').innerHTML=plan.plotlines.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No plotlines';document.querySelector('#world').innerHTML=[...plan.locations.map(x=>`<p>Location · ${esc(x.name)}</p>`),...plan.events.map(x=>`<p><button data-event="${esc(x.id)}" data-start="${esc(timeLabel(x.start))}" data-end="${esc(timeLabel(x.end))}" data-source="${esc(x.source_time)}">Edit time · ${esc(x.title)}</button> <button data-event-rel="${esc(x.id)}" data-characters="${esc(JSON.stringify(x.characters||[]))}" data-locations="${esc(JSON.stringify(x.locations||[]))}">Edit relationships</button> <small>${esc(x.source_time)} · ${esc(timeLabel(x.start))} → ${esc(timeLabel(x.end))} · ${(x.characters||[]).length} people · ${(x.locations||[]).length} locations</small></p>`)].join('')||'No locations or events';document.querySelector('#work').innerHTML=[...plan.research.map(x=>`<p>Research · ${esc(x.title)}</p>`),...plan.issues.map(x=>`<p>Issue · ${esc(x.title)} <small>${esc(x.status)}</small><select data-issue-status="${esc(x.id)}"><option value="open" ${x.status==='open'?'selected':''}>Open</option><option value="in_progress" ${x.status==='in_progress'?'selected':''}>In progress</option><option value="resolved" ${x.status==='resolved'?'selected':''}>Resolved</option><option value="deferred" ${x.status==='deferred'?'selected':''}>Deferred</option><option value="closed" ${x.status==='closed'?'selected':''}>Closed</option></select></p>`)].join('')||'No research or issues';document.querySelector('#structure').innerHTML=plan.groups.map(x=>`<p>${'　'.repeat(x.depth)}${esc(x.title)} <small>${esc(x.kind)}</small></p>`).join('')||'No structure';drawGraph();document.querySelector('#edges').innerHTML=`<small>${plan.edges.length} stable-ID relationships in the project graph</small>`;document.querySelector('#knowledge').innerHTML=plan.claims.map(x=>`<p><b>${esc(x.name)}</b> · ${esc(x.claim)}<br><small>Evidence: ${esc(x.evidence_quote)} · ${esc(x.source_kind)} ${esc(x.source_id)}:${x.evidence_start_byte}..${x.evidence_end_byte}</small></p>`).join('')||'No approved knowledge claims';const chapters=plan.groups.filter(x=>x.kind==='chapter');for(const id of ['new-chapter','move-chapter'])document.querySelector('#'+id).innerHTML=chapters.map(c=>`<option value="${c.id}">${esc(c.title)}</option>`).join('');document.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>openScene(b.dataset.id))}
+async function load(){plan=await api('/api/plan');document.querySelector('#title').textContent=plan.project.title;document.querySelector('#scene-filter-character').innerHTML='<option value="">Any character</option>'+plan.characters.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');document.querySelector('#scene-filter-plot').innerHTML='<option value="">Any plotline</option>'+plan.plotlines.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');renderScenes();document.querySelector('#characters').innerHTML=plan.characters.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No characters';document.querySelector('#plotlines').innerHTML=plan.plotlines.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No plotlines';document.querySelector('#world').innerHTML=[...plan.locations.map(x=>`<p>Location · ${esc(x.name)}</p>`),...plan.events.map(x=>`<p><button data-event="${esc(x.id)}" data-start="${esc(timeLabel(x.start))}" data-end="${esc(timeLabel(x.end))}" data-source="${esc(x.source_time)}">Edit time · ${esc(x.title)}</button> <button data-event-rel="${esc(x.id)}" data-characters="${esc(JSON.stringify(x.characters||[]))}" data-locations="${esc(JSON.stringify(x.locations||[]))}">Edit relationships</button> <small>${esc(x.source_time)} · ${esc(timeLabel(x.start))} → ${esc(timeLabel(x.end))} · ${(x.characters||[]).length} people · ${(x.locations||[]).length} locations</small></p>`)].join('')||'No locations or events';document.querySelector('#work').innerHTML=[...plan.research.map(x=>`<p>Research · ${esc(x.title)}</p>`),...plan.issues.map(x=>`<p>Issue · ${esc(x.title)} <small>${esc(x.status)}</small><select data-issue-status="${esc(x.id)}"><option value="open" ${x.status==='open'?'selected':''}>Open</option><option value="in_progress" ${x.status==='in_progress'?'selected':''}>In progress</option><option value="resolved" ${x.status==='resolved'?'selected':''}>Resolved</option><option value="deferred" ${x.status==='deferred'?'selected':''}>Deferred</option><option value="closed" ${x.status==='closed'?'selected':''}>Closed</option></select></p>`)].join('')||'No research or issues';document.querySelector('#structure').innerHTML=plan.groups.map(x=>`<p>${'　'.repeat(x.depth)}${esc(x.title)} <small>${esc(x.kind)}</small></p>`).join('')||'No structure';drawGraph();document.querySelector('#edges').innerHTML=plan.edges.filter(x=>x.id).map(x=>`<p><small>${esc(x.source_kind)} ${esc(x.from)} → ${esc(x.target_kind)} ${esc(x.to)} · ${esc(x.kind)} ${esc(x.label||'')}</small> <button data-delete-link="${esc(x.id)}">Remove</button></p>`).join('')||'<small>No typed links</small>';const entities=[...plan.scenes.map(x=>({key:'scene:'+x.id,label:'Scene · '+x.title})),...plan.characters.map(x=>({key:'character:'+x.id,label:'Character · '+x.name})),...plan.plotlines.map(x=>({key:'plotline:'+x.id,label:'Plotline · '+x.name})),...plan.research.map(x=>({key:'research:'+x.id,label:'Research · '+x.title}))];for(const id of ['link-source','link-target'])document.querySelector('#'+id).innerHTML=entities.map(x=>`<option value="${esc(x.key)}">${esc(x.label)}</option>`).join('');document.querySelector('#knowledge').innerHTML=plan.claims.map(x=>`<p><b>${esc(x.name)}</b> · ${esc(x.claim)}<br><small>Evidence: ${esc(x.evidence_quote)} · ${esc(x.source_kind)} ${esc(x.source_id)}:${x.evidence_start_byte}..${x.evidence_end_byte}</small></p>`).join('')||'No approved knowledge claims';const chapters=plan.groups.filter(x=>x.kind==='chapter');for(const id of ['new-chapter','move-chapter'])document.querySelector('#'+id).innerHTML=chapters.map(c=>`<option value="${c.id}">${esc(c.title)}</option>`).join('');document.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>openScene(b.dataset.id))}
 function drawGraph(){const columns=[['group',plan.groups.map(n=>({...n,label:n.title}))],['scene',plan.scenes.map(n=>({...n,label:n.title}))],['character',plan.characters.map(n=>({...n,label:n.name}))],['plotline',plan.plotlines.map(n=>({...n,label:n.name}))],['world',[...plan.locations.map(n=>({...n,label:'Location · '+n.name})),...plan.events.map(n=>({...n,label:'Event · '+n.title}))]],['knowledge',plan.claims.map(n=>({...n,label:'Fact · '+n.name}))]];const nodes=[],positions=new Map();let height=180;columns.forEach(([kind,items],col)=>{items.forEach((n,row)=>{const x=20+col*190,y=24+row*54;const node={id:String(n.id),kind,label:n.label,x,y};nodes.push(node);if(!positions.has(node.id))positions.set(node.id,node);height=Math.max(height,y+52)})});const lines=plan.edges.map(e=>{const a=positions.get(String(e.from)),b=positions.get(String(e.to));return a&&b?`<line x1="${a.x+160}" y1="${a.y+16}" x2="${b.x}" y2="${b.y+16}"><title>${esc(e.kind)}</title></line>`:''}).join('');const cards=nodes.map(n=>`<g class="${n.kind}" ${n.kind==='scene'?`data-scene-id="${esc(n.id)}"`:''}><rect x="${n.x}" y="${n.y}" width="160" height="32"></rect><text x="${n.x+8}" y="${n.y+21}">${esc(n.label.slice(0,22))}</text><title>${esc(n.label)}</title></g>`).join('');const svg=document.querySelector('#graph');svg.setAttribute('viewBox',`0 0 ${20+columns.length*190} ${height}`);svg.setAttribute('height',height);svg.innerHTML=lines+cards;svg.querySelectorAll('[data-scene-id]').forEach(node=>node.onclick=()=>openScene(node.dataset.sceneId))}
 async function openScene(id){selected=id;const s=await api('/api/scenes/'+encodeURIComponent(id));document.querySelector('#scene-title').textContent=s.title;document.querySelector('#scene-meta').textContent=`${s.actual_words} words · ${s.status} · POV ${s.pov||'unset'}`;document.querySelector('#scene-name').value=s.title;document.querySelector('#synopsis').value=s.synopsis;document.querySelector('#status').value=s.status;document.querySelector('#scene-start-time').value=timeLabel(s.start_time);document.querySelector('#scene-end-time').value=timeLabel(s.end_time);document.querySelector('#prose').textContent=s.text}
+document.querySelector('#create-link').onsubmit=async e=>{e.preventDefault();try{const [source_kind,source_id]=document.querySelector('#link-source').value.split(':');const [target_kind,target_id]=document.querySelector('#link-target').value.split(':');await api('/api/links','POST',{source_kind,source_id,target_kind,target_id,kind:document.querySelector('#link-kind').value,label:document.querySelector('#link-label').value});document.querySelector('#link-label').value='';await load();notice('Relationship created')}catch(error){notice(error.message)}};document.querySelector('#edges').addEventListener('click',async e=>{const button=e.target.closest('[data-delete-link]');if(!button)return;if(!confirm('Remove this story relationship?'))return;try{await api('/api/links/'+encodeURIComponent(button.dataset.deleteLink),'DELETE');await load();notice('Relationship removed')}catch(error){notice(error.message)}});
 document.querySelector('#create-issue').onsubmit=async e=>{e.preventDefault();try{await api('/api/issues','POST',{title:document.querySelector('#new-issue-title').value,scene_id:selected||null});document.querySelector('#new-issue-title').value='';await load();notice('Issue created')}catch(e){notice(e.message)}};document.querySelector('#work').addEventListener('change',async e=>{const select=e.target.closest('[data-issue-status]');if(!select)return;try{await api('/api/issues/'+encodeURIComponent(select.dataset.issueStatus)+'/status','POST',{status:select.value});await load();notice('Issue status saved')}catch(error){notice(error.message)}});
 document.querySelector('#create-scene').onsubmit=async e=>{e.preventDefault();try{const chapter=document.querySelector('#new-chapter').value;const position=plan.scenes.filter(s=>s.chapter_id===chapter).length;const s=await api('/api/scenes','POST',{chapter_id:chapter,title:document.querySelector('#new-title').value,position});document.querySelector('#new-title').value='';await load();await openScene(s.id);notice('Scene created')}catch(e){notice(e.message)}};
 document.querySelector('#create-chapter').onsubmit=async e=>{e.preventDefault();try{await api('/api/chapters','POST',{title:document.querySelector('#new-chapter-title').value,position:plan.groups.filter(g=>g.kind==='chapter').length});document.querySelector('#new-chapter-title').value='';await load();notice('Chapter created')}catch(e){notice(e.message)}};
@@ -551,6 +563,58 @@ fn route(app: &mut WriterApp, method: &str, path: &str, body: &str) -> (u16, &'s
             Err(error) => api_error(error.to_string()),
         };
     }
+    if method == "POST" && path == "/api/links" {
+        return match serde_json::from_str::<CreateLinkRequest>(body) {
+            Ok(request) => {
+                let source = match parse_entity_ref(&request.source_kind, &request.source_id) {
+                    Ok(entity) => entity,
+                    Err(error) => return api_error(error),
+                };
+                let target = match parse_entity_ref(&request.target_kind, &request.target_id) {
+                    Ok(entity) => entity,
+                    Err(error) => return api_error(error),
+                };
+                let kind = match parse_link_kind(&request.kind) {
+                    Some(kind) => kind,
+                    None => return api_error("unknown story relationship type".into()),
+                };
+                let link = story_core::StoryLink {
+                    id: story_core::LinkId::new(),
+                    source,
+                    source_anchor: request.source_anchor,
+                    target,
+                    target_anchor: request.target_anchor,
+                    kind,
+                    label: request.label,
+                };
+                match app.create_story_link(&link) {
+                    Ok(()) => (
+                        201,
+                        "application/json; charset=utf-8",
+                        serde_json::json!({"id":link.id}).to_string(),
+                    ),
+                    Err(error) => api_error(error.to_string()),
+                }
+            }
+            Err(error) => api_error(error.to_string()),
+        };
+    }
+    if let Some(id) = path.strip_prefix("/api/links/")
+        && method == "DELETE"
+    {
+        let id = match uuid::Uuid::from_str(id) {
+            Ok(id) => story_core::LinkId(id),
+            Err(error) => return api_error(error.to_string()),
+        };
+        return match app.delete_story_link(id) {
+            Ok(()) => (
+                200,
+                "application/json; charset=utf-8",
+                serde_json::json!({"deleted":true,"id":id}).to_string(),
+            ),
+            Err(error) => api_error(error.to_string()),
+        };
+    }
     if let Some(id) = path.strip_prefix("/api/issues/")
         && let Some(id) = id.strip_suffix("/status")
         && method == "POST"
@@ -773,6 +837,29 @@ fn parse_status(value: &str) -> Option<story_core::SceneStatus> {
     })
 }
 
+fn parse_entity_ref(kind: &str, value: &str) -> Result<story_core::EntityRef, String> {
+    let id = uuid::Uuid::from_str(value).map_err(|error| error.to_string())?;
+    Ok(match kind {
+        "scene" => story_core::EntityRef::Scene(story_core::SceneId(id)),
+        "character" => story_core::EntityRef::Character(story_core::CharacterId(id)),
+        "plotline" => story_core::EntityRef::Plotline(story_core::PlotlineId(id)),
+        "research" => story_core::EntityRef::Research(story_core::ResearchId(id)),
+        "reading" => story_core::EntityRef::Reading(story_core::ReadingId(id)),
+        _ => return Err(format!("unsupported story-link endpoint type: {kind}")),
+    })
+}
+
+fn parse_link_kind(value: &str) -> Option<story_core::LinkKind> {
+    Some(match value {
+        "related" => story_core::LinkKind::Related,
+        "cites" => story_core::LinkKind::Cites,
+        "transcludes" => story_core::LinkKind::Transcludes,
+        "includes" => story_core::LinkKind::Includes,
+        "navigates" => story_core::LinkKind::Navigates,
+        _ => return None,
+    })
+}
+
 fn plan_json(app: &WriterApp) -> Result<String, String> {
     let project = app.get_project().map_err(|error| error.to_string())?;
     let groups = app
@@ -833,11 +920,38 @@ fn plan_json(app: &WriterApp) -> Result<String, String> {
         {
             edges.push(serde_json::json!({"from":scene.scene.id,"to":event,"kind":"story-event","relation":relation}));
         }
+    }
+    let mut link_sources = scenes
+        .iter()
+        .map(|row| story_core::EntityRef::Scene(row.scene.id))
+        .collect::<Vec<_>>();
+    link_sources.extend(
+        chars
+            .iter()
+            .map(|item| story_core::EntityRef::Character(item.id)),
+    );
+    link_sources.extend(
+        plots
+            .iter()
+            .map(|item| story_core::EntityRef::Plotline(item.id)),
+    );
+    link_sources.extend(
+        research
+            .iter()
+            .map(|item| story_core::EntityRef::Research(item.id)),
+    );
+    link_sources.extend(
+        app.list_reading_documents()
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|item| story_core::EntityRef::Reading(item.id)),
+    );
+    for source in link_sources {
         for link in app
-            .outgoing_links(story_core::EntityRef::Scene(scene.scene.id))
+            .outgoing_links(source)
             .map_err(|error| error.to_string())?
         {
-            edges.push(serde_json::json!({"from":link.source.id(),"to":link.target.id(),"kind":link.kind,"label":link.label}));
+            edges.push(serde_json::json!({"id":link.id,"from":link.source.id(),"source_kind":link.source.kind(),"to":link.target.id(),"target_kind":link.target.kind(),"kind":link.kind.as_str(),"label":link.label}));
         }
     }
     let mut event_rows = Vec::new();
@@ -927,6 +1041,42 @@ mod tests {
         assert!(plan.contains("approved-knowledge"));
         assert!(plan.contains("Review only."));
         assert!(plan.contains("event-character") && plan.contains("event-location"));
+        let link_body = serde_json::json!({
+            "source_kind":"scene","source_id":scene,
+            "target_kind":"character","target_id":character,
+            "kind":"related","label":"opening witness"
+        })
+        .to_string();
+        let (status, _, response) = route(&mut app, "POST", "/api/links", &link_body);
+        assert_eq!(status, 201);
+        let link_id = serde_json::from_str::<serde_json::Value>(&response).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(
+            app.outgoing_links(story_core::EntityRef::Scene(scene))
+                .unwrap()
+                .len(),
+            1
+        );
+        let (_, _, updated_plan) = route(&mut app, "GET", "/api/plan", "");
+        assert!(updated_plan.contains(&link_id));
+        assert_eq!(
+            route(&mut app, "DELETE", &format!("/api/links/{link_id}"), "").0,
+            200
+        );
+        assert!(
+            app.outgoing_links(story_core::EntityRef::Scene(scene))
+                .unwrap()
+                .is_empty()
+        );
+        let invalid_link = serde_json::json!({
+            "source_kind":"scene","source_id":scene,
+            "target_kind":"scene","target_id":scene,
+            "kind":"transcludes","label":"cycle"
+        })
+        .to_string();
+        assert_eq!(route(&mut app, "POST", "/api/links", &invalid_link).0, 400);
         let (status, mime, page) = route(&mut app, "GET", "/", "");
         assert_eq!(status, 200);
         assert!(mime.starts_with("text/html"));

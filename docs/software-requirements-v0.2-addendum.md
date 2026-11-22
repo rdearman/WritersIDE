@@ -210,6 +210,8 @@ The browser now supports chapter/scene creation, scene synopsis/status changes, 
 
 The browser event inspector now displays explicit participants and locations and can replace both lists through a single validated, atomic API call. Stable UUIDs and typed relationship roles are used, and an invalid relationship leaves the existing event associations intact. Browser prose remains read-only. The current form accepts UUID-based entries; selectable name-based controls and broader graph editing remain open.
 
+The browser graph can now create and remove typed links between scene, character, plotline and research entities by stable UUID, including labeled links and domain-validated inclusion/transclusion cycle checks. Link IDs and endpoint kinds are included in the shared plan projection; the graph refreshes after mutation. Reading-document choices and passage-anchor pickers remain deferred.
+
 The loopback HTTP server now requires a same-origin `Origin` header on non-GET/HEAD requests, validates any supplied Origin against Host, continues to require the loopback Host, and sends no permissive CORS headers. Originless navigation requests remain available. This reduces cross-site request forgery risk; project ownership and revision-token synchronization across concurrently opened processes remain open.
 
 ### Issue #10 — Configurable deterministic diagnostics foundation
