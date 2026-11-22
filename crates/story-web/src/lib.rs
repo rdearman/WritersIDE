@@ -55,7 +55,7 @@ const PAGE: &str = r#"<!doctype html>
 <html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width">
 <title>Writer's IDE</title><style>
 body{font:16px system-ui;margin:0;color:#20242a;background:#f3f5f7}header{padding:1rem 2rem;background:#24354a;color:white}main{display:grid;grid-template-columns:minmax(18rem,32%) 1fr;gap:1rem;padding:1rem;max-width:1400px;margin:auto}section{background:white;border:1px solid #ccd2d9;border-radius:.4rem;padding:1rem}button{margin:.3rem 0;padding:.55rem;cursor:pointer}button.scene{display:block;width:100%;text-align:left;border:0;border-bottom:1px solid #e5e8eb;background:white;padding:.7rem}button.scene:hover{background:#eef3f8}textarea, input, select{box-sizing:border-box;width:100%;padding:.5rem;margin:.2rem 0  .5rem}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;line-height:1.6}small{color:#52606d}.notice{min-height:1.4rem;color:#234f73}.graph{overflow:auto;border:1px solid #d7dce2;border-radius:.3rem}.graph svg{display:block;width:100%;min-width:760px}.graph line{stroke:#9aa7b4;stroke-width:1.5}.graph rect{rx:6;stroke:#617181;stroke-width:1}.graph text{font:12px system-ui;fill:#17202a}.graph g[data-scene-id]{cursor:pointer}.graph g[data-scene-id]:hover rect{stroke:#1769aa;stroke-width:3}.graph .group rect{fill:#f0f2f5}.graph .scene rect{fill:#e7f1fb}.graph .character rect{fill:#e8f5ec}.graph .plotline rect{fill:#fff2d9}.graph .world rect{fill:#f4eafb}.graph .knowledge rect{fill:#fff0dc}@media(max-width:750px){main{grid-template-columns:1fr}}</style>
-<header><h1 id="title">Writer's IDE</h1><p>Local planning graph · manuscript prose remains read-only here</p></header><main>
+<header><h1 id="title">Writer's IDE</h1><p>Local planning graph · manuscript prose remains read-only here · <a href="/preview" target="_blank" rel="noopener">Open compiled manuscript preview</a></p></header><main>
 <section><h2>Scenes</h2><label>Search<input id="scene-filter-text" type="search" placeholder="Title or synopsis"></label><label>Status<select id="scene-filter-status"><option value="">Any status</option><option>idea</option><option>outlined</option><option>ready_to_draft</option><option>drafting</option><option>draft_complete</option><option>revising</option><option>complete</option><option>archived</option></select></label><label>Character<select id="scene-filter-character"><option value="">Any character</option></select></label><label>Plotline<select id="scene-filter-plot"><option value="">Any plotline</option></select></label><div id="scenes">Loading…</div><h3>Add chapter</h3><form id="create-chapter"><input id="new-chapter-title" required placeholder="Chapter title"><button>Add chapter</button></form><h3>Add scene</h3><form id="create-scene"><select id="new-chapter"></select><input id="new-title" required placeholder="Scene title"><button>Add scene</button></form></section>
 <section><h2 id="scene-title">Select a scene</h2><small id="scene-meta"></small><p><label>Scene title<input id="scene-name"></label><label>Planning synopsis<textarea id="synopsis" rows="4"></textarea></label><label>Status<select id="status"><option>idea</option><option>outlined</option><option>ready_to_draft</option><option>drafting</option><option>draft_complete</option><option>revising</option><option>complete</option></select></label><button id="save-planning">Save planning</button></p><p><label>Story start time (ticks)<input id="scene-start-time" placeholder="? or integer / interval"></label><label>Story end time (ticks)<input id="scene-end-time" placeholder="? or integer / interval"></label><button id="save-scene-time">Save chronology</button></p><p><label>Move to chapter<select id="move-chapter"></select></label><label>Position<input id="move-position" type="number" min="0" value="0"></label><button id="move-scene">Move scene</button></p><p class="notice" id="notice"></p><h3>Read-only manuscript</h3><pre id="prose">Select a scene to inspect its text.</pre></section>
 <section><h2>Characters</h2><div id="characters"></div></section><section><h2>Plotlines</h2><div id="plotlines"></div></section><section><h2>Locations and events</h2><div id="world"></div></section><section><h2>Research and issues</h2><form id="create-issue"><input id="new-issue-title" required placeholder="Issue title"><button>Create issue</button></form><div id="work"></div></section><section><h2>Story structure and graph</h2><div id="structure"></div><div class="graph"><svg id="graph" role="img" aria-label="Story relationship and approved knowledge graph"></svg></div><div id="edges"></div><div id="knowledge"></div></section></main>
@@ -164,7 +164,11 @@ impl BrowserServer {
                     reader.read_exact(&mut body)?;
                     let body = std::str::from_utf8(&body).unwrap_or_default();
                     let (status, mime, response) = route(app, method, target, body);
-                    write_response(&mut stream, status, mime, &response)?;
+                    if status == 200 && target.split('?').next() == Some("/preview") {
+                        write_preview_response(&mut stream, response.as_bytes())?;
+                    } else {
+                        write_response(&mut stream, status, mime, &response)?;
+                    }
                 }
                 Err(_) => continue,
             }
@@ -197,6 +201,15 @@ fn write_response(
     stream.write_all(body.as_bytes())
 }
 
+fn write_preview_response(stream: &mut impl Write, body: &[u8]) -> std::io::Result<()> {
+    let headers = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nX-Content-Type-Options: nosniff\r\nCache-Control: no-store\r\nContent-Security-Policy: default-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(headers.as_bytes())?;
+    stream.write_all(body)
+}
+
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
@@ -214,6 +227,23 @@ fn route(app: &mut WriterApp, method: &str, path: &str, body: &str) -> (u16, &'s
     let path = path.split('?').next().unwrap_or(path);
     if method == "GET" && path == "/" {
         return (200, "text/html; charset=utf-8", PAGE.into());
+    }
+    if method == "GET" && path == "/preview" {
+        return match app.compile_artifact(story_document::CompileFormat::Html, false) {
+            Ok(artifact) => match String::from_utf8(artifact.bytes) {
+                Ok(html) => (200, "text/html; charset=utf-8", html),
+                Err(error) => (
+                    500,
+                    "text/plain; charset=utf-8",
+                    format!("HTML renderer returned invalid UTF-8: {error}"),
+                ),
+            },
+            Err(error) => (
+                500,
+                "text/plain; charset=utf-8",
+                format!("Compile preview failed: {error}"),
+            ),
+        };
     }
     if method == "POST" && path == "/api/scenes" {
         return match serde_json::from_str::<CreateSceneRequest>(body) {
@@ -789,5 +819,30 @@ mod tests {
         assert!(!valid_host("evil.example:7878", address));
         assert!(valid_origin("http://localhost:7878", "localhost:7878"));
         assert!(!valid_origin("https://evil.example", "localhost:7878"));
+    }
+
+    #[test]
+    fn browser_compile_preview_renders_html_without_mutating_manuscript() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Browser Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let prose = "Preview text remains canonical.";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), prose).unwrap();
+
+        let (status, mime, html) = route(&mut app, "GET", "/preview", "");
+        assert_eq!(status, 200);
+        assert_eq!(mime, "text/html; charset=utf-8");
+        assert!(html.contains("Preview text remains canonical."));
+        assert!(PAGE.contains("href=\"/preview\""));
+        assert_eq!(app.load_scene_text(scene).unwrap().0, prose);
+
+        let mut response = Vec::new();
+        write_preview_response(&mut response, html.as_bytes()).unwrap();
+        let response = String::from_utf8(response).unwrap();
+        assert!(response.contains("Content-Security-Policy: default-src 'none'"));
+        assert!(!response.contains("script-src 'unsafe-inline'"));
+        assert!(response.ends_with(&html));
     }
 }

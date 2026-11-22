@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 story-app = { path = "../story-app" }
 story-core = { path = "../story-core" }
+story-document = { path = "../story-document" }
 story-storage = { path = "../story-storage" }
 serde_json.workspace = true
 serde.workspace = true
