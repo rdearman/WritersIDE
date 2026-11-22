@@ -1017,11 +1017,13 @@ pub fn character_chronology_findings(
             let first_characters = first
                 .characters
                 .iter()
+                .filter(|character| character.role != ParticipationRole::Mentioned)
                 .map(|character| character.id.as_str())
                 .collect::<BTreeSet<_>>();
             let shared_character_ids = second
                 .characters
                 .iter()
+                .filter(|character| character.role != ParticipationRole::Mentioned)
                 .filter(|character| first_characters.contains(character.id.as_str()))
                 .map(|character| character.id.clone())
                 .collect::<BTreeSet<_>>()
@@ -1320,6 +1322,16 @@ mod tests {
         unrelated.start_time = story_core::StoryTime::exact(5);
         unrelated.end_time = story_core::StoryTime::exact(20);
         assert!(character_chronology_findings(&[first, unrelated]).is_empty());
+    }
+
+    #[test]
+    fn mentioned_characters_do_not_count_as_scene_presence_for_chronology() {
+        let mut first = scene("first", None, &["Mara"], &[]);
+        let mut second = scene("second", None, &["Mara"], &[]);
+        first.characters[0].role = ParticipationRole::Mentioned;
+        second.start_time = story_core::StoryTime::exact(1);
+        second.end_time = story_core::StoryTime::exact(2);
+        assert!(character_chronology_findings(&[first, second]).is_empty());
     }
 
     #[test]

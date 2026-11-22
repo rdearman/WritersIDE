@@ -2828,8 +2828,158 @@ impl WriterApp {
                 }
             }
         }
+        let chronology_enabled = self.chronology_preferences()?.enabled;
+        let plotline_gap_threshold = policy.minimum_plotline_gap_scenes.or(match policy.preset {
+            story_document::DiagnosticPreset::Thorough => Some(8),
+            story_document::DiagnosticPreset::Extended => Some(4),
+            story_document::DiagnosticPreset::Pedantic => Some(1),
+            story_document::DiagnosticPreset::Quiet
+            | story_document::DiagnosticPreset::Standard => None,
+        });
+        if plotline_gap_threshold.is_some() || chronology_enabled {
+            let scenes = self.analytics_dataset()?;
+            if let Some(threshold) = plotline_gap_threshold {
+                for gap in story_analysis::subplot_gaps(&scenes, threshold as usize) {
+                    diagnostics.push(Self::source_compile_diagnostic(
+                        "PLOT001",
+                        "plotting",
+                        story_document::DiagnosticSeverity::Information,
+                        format!(
+                            "plotline '{}' has a gap of {} intervening scene(s), meeting the configured {}-scene threshold",
+                            gap.plotline_name, gap.intervening_scenes, threshold
+                        ),
+                        Some(gap.from_scene_id),
+                        Some("Review the recorded gap against the intended subplot rhythm"),
+                    ));
+                }
+            }
+            if chronology_enabled {
+                for finding in story_analysis::character_chronology_findings(&scenes) {
+                    let (code, severity, label) = match finding.status {
+                        story_analysis::CharacterChronologyStatus::DefiniteOverlap => (
+                            "CHR001",
+                            story_document::DiagnosticSeverity::Warning,
+                            "recorded character intervals overlap",
+                        ),
+                        story_analysis::CharacterChronologyStatus::PossibleOverlap => (
+                            "CHR002",
+                            story_document::DiagnosticSeverity::Information,
+                            "recorded character intervals may overlap",
+                        ),
+                        story_analysis::CharacterChronologyStatus::Unverified => (
+                            "CHR003",
+                            story_document::DiagnosticSeverity::Information,
+                            "character chronology cannot be verified from incomplete times",
+                        ),
+                    };
+                    diagnostics.push(Self::source_compile_diagnostic(
+                        code,
+                        "chronology",
+                        severity,
+                        format!(
+                            "{label} in scenes {} and {} for character record(s) {}",
+                            finding.first_scene_id,
+                            finding.second_scene_id,
+                            finding.shared_character_ids.join(", ")
+                        ),
+                        Some(finding.first_scene_id),
+                        Some("Review both recorded story-time intervals and participation roles"),
+                    ));
+                }
+                for finding in self.inspect_location_incompatibilities()? {
+                    let (code, severity, label) = match finding.status {
+                        story_analysis::LocationRuleFindingStatus::DefiniteConflict => (
+                            "LOC001",
+                            story_document::DiagnosticSeverity::Warning,
+                            "explicit incompatible-location rule conflicts with the recorded intervals",
+                        ),
+                        story_analysis::LocationRuleFindingStatus::PossibleConflict => (
+                            "LOC002",
+                            story_document::DiagnosticSeverity::Information,
+                            "explicit incompatible-location rule may conflict with the recorded intervals",
+                        ),
+                        story_analysis::LocationRuleFindingStatus::Unverified => (
+                            "LOC003",
+                            story_document::DiagnosticSeverity::Information,
+                            "explicit incompatible-location rule cannot be verified from incomplete times",
+                        ),
+                    };
+                    diagnostics.push(Self::source_compile_diagnostic(
+                        code,
+                        "continuity",
+                        severity,
+                        format!(
+                            "{label}: {} between scenes {} and {}",
+                            finding.description, finding.first_scene_id, finding.second_scene_id
+                        ),
+                        Some(finding.first_scene_id),
+                        Some("Review the rule, location assignments, and story-time intervals"),
+                    ));
+                }
+                let event_scene_ids = scenes
+                    .iter()
+                    .flat_map(|scene| {
+                        scene
+                            .events
+                            .iter()
+                            .map(move |event| (event.id.clone(), scene.scene_id.clone()))
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                for (dependency, result) in self.inspect_event_dependencies()? {
+                    let (code, severity) = match result.status {
+                        story_analysis::InspectionStatus::Fail => {
+                            ("EVT001", story_document::DiagnosticSeverity::Warning)
+                        }
+                        story_analysis::InspectionStatus::Unknown => {
+                            ("EVT002", story_document::DiagnosticSeverity::Information)
+                        }
+                        story_analysis::InspectionStatus::Pass
+                        | story_analysis::InspectionStatus::Skip => continue,
+                    };
+                    let source = event_scene_ids
+                        .get(&dependency.predecessor.to_string())
+                        .or_else(|| event_scene_ids.get(&dependency.successor.to_string()))
+                        .cloned();
+                    diagnostics.push(Self::source_compile_diagnostic(
+                        code,
+                        "chronology",
+                        severity,
+                        format!(
+                            "recorded event prerequisite is {:?}: {}",
+                            result.status, result.assertion
+                        ),
+                        source,
+                        Some("Review the prerequisite relation and both event times"),
+                    ));
+                }
+            }
+        }
         self.apply_diagnostic_suppressions(&mut diagnostics)?;
         Ok(diagnostics)
+    }
+
+    fn source_compile_diagnostic(
+        code: &str,
+        category: &str,
+        severity: story_document::DiagnosticSeverity,
+        message: String,
+        source_entity_id: Option<String>,
+        remediation_hint: Option<&str>,
+    ) -> story_document::CompileDiagnostic {
+        story_document::CompileDiagnostic {
+            code: code.into(),
+            category: category.into(),
+            severity,
+            effective_level: None,
+            message,
+            remediation_hint: remediation_hint.map(str::to_owned),
+            source_entity_id,
+            source_range: None,
+            generated_file: None,
+            generated_line: None,
+            suppressed_by: None,
+            suppressed: false,
+        }
     }
 
     fn apply_diagnostic_suppressions(
@@ -6823,6 +6973,133 @@ unexpected_prose = "must not be silently discarded"
         drop(app);
         let reopened = WriterApp::open_project(&project).unwrap();
         assert_eq!(reopened.diagnostic_suppressions().unwrap()[0].id, id);
+    }
+
+    #[test]
+    fn compile_diagnostics_add_thresholded_plot_gaps_and_gate_timeline_checks_by_preference() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let middle = app.create_scene(chapter, "Middle", 1).unwrap();
+        let last = app.create_scene(chapter, "Last", 2).unwrap();
+        let character = app.create_character("Mara").unwrap();
+        app.link_character(first, character, ParticipationRole::Major)
+            .unwrap();
+        app.link_character(last, character, ParticipationRole::Major)
+            .unwrap();
+        app.update_scene_story_interval(
+            first,
+            StoryInterval::closed(StoryTime::exact(0), StoryTime::exact(100)),
+        )
+        .unwrap();
+        app.update_scene_story_interval(
+            last,
+            StoryInterval::closed(StoryTime::exact(50), StoryTime::exact(75)),
+        )
+        .unwrap();
+        let plotline = app.create_plotline("The Compass").unwrap();
+        for scene in [first, last] {
+            app.set_scene_plotlines(
+                scene,
+                &[ScenePlotline {
+                    plotline_id: plotline,
+                    role: "advances".into(),
+                    share_basis_points: None,
+                }],
+                WordAttributionPolicy::Overlap,
+            )
+            .unwrap();
+        }
+        assert_eq!(app.get_scene(middle).unwrap().scene.title, "Middle");
+
+        let policy = story_document::DiagnosticPolicy {
+            minimum_plotline_gap_scenes: Some(1),
+            ..story_document::DiagnosticPolicy::default()
+        };
+        let disabled = app.compile_diagnostics_with_policy(&policy).unwrap();
+        assert!(disabled.iter().any(|finding| finding.code == "PLOT001"));
+        assert!(!disabled.iter().any(|finding| finding.code == "CHR001"));
+
+        app.set_chronology_preferences(ChronologyPreferences {
+            enabled: true,
+            ..ChronologyPreferences::default()
+        })
+        .unwrap();
+        let bridge = app.create_location("Bridge").unwrap();
+        let vault = app.create_location("Vault").unwrap();
+        for (scene_id, location) in [(first, bridge), (last, vault)] {
+            let mut scene = app.get_scene(scene_id).unwrap().scene;
+            scene.start_location = Some(location);
+            app.update_scene_metadata(&scene).unwrap();
+        }
+        app.add_location_incompatibility_rule(&LocationIncompatibilityRule {
+            id: ContinuityRuleId::new(),
+            first_location: bridge,
+            second_location: vault,
+            description: "Mara cannot be in both places".into(),
+            enabled: true,
+        })
+        .unwrap();
+        let predecessor = EventId::new();
+        let successor = EventId::new();
+        app.add_story_event(&StoryEvent {
+            id: predecessor,
+            title: "Arrival".into(),
+            description: String::new(),
+            start: StoryTime::exact(80),
+            end: StoryTime::exact(90),
+            source_time_text: "later".into(),
+        })
+        .unwrap();
+        app.add_story_event(&StoryEvent {
+            id: successor,
+            title: "Departure".into(),
+            description: String::new(),
+            start: StoryTime::exact(10),
+            end: StoryTime::exact(20),
+            source_time_text: "earlier".into(),
+        })
+        .unwrap();
+        app.link_event(first, predecessor, "depicts").unwrap();
+        app.link_event(last, successor, "depicts").unwrap();
+        app.add_event_dependency(&StoryEventDependency {
+            predecessor,
+            successor,
+            kind: "precedes".into(),
+            notes: "Arrival must precede departure".into(),
+        })
+        .unwrap();
+        let enabled = app.compile_diagnostics_with_policy(&policy).unwrap();
+        let overlap = enabled
+            .iter()
+            .find(|finding| finding.code == "CHR001")
+            .unwrap();
+        assert_eq!(
+            overlap.source_entity_id.as_deref(),
+            Some(first.to_string().as_str())
+        );
+        assert_eq!(
+            overlap.severity,
+            story_document::DiagnosticSeverity::Warning
+        );
+        assert!(enabled.iter().any(|finding| finding.code == "PLOT001"));
+        assert!(enabled.iter().any(|finding| finding.code == "LOC001"));
+        assert!(enabled.iter().any(|finding| finding.code == "EVT001"));
+        let extended = app
+            .compile_diagnostics_with_policy(&story_document::DiagnosticPolicy {
+                preset: story_document::DiagnosticPreset::Extended,
+                ..story_document::DiagnosticPolicy::default()
+            })
+            .unwrap();
+        assert!(!extended.iter().any(|finding| finding.code == "PLOT001"));
+        let pedantic = app
+            .compile_diagnostics_with_policy(&story_document::DiagnosticPolicy {
+                preset: story_document::DiagnosticPreset::Pedantic,
+                ..story_document::DiagnosticPolicy::default()
+            })
+            .unwrap();
+        assert!(pedantic.iter().any(|finding| finding.code == "PLOT001"));
     }
 
     #[test]

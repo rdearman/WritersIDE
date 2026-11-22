@@ -1091,6 +1091,8 @@ pub struct DiagnosticPolicy {
     pub warnings_as_errors: bool,
     pub rules: std::collections::BTreeMap<String, DiagnosticLevel>,
     pub short_chapter_threshold_words: Option<u32>,
+    #[serde(default)]
+    pub minimum_plotline_gap_scenes: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1098,6 +1100,8 @@ pub struct DiagnosticOverrides {
     pub preset: Option<DiagnosticPreset>,
     pub warnings_as_errors: Option<bool>,
     pub rules: std::collections::BTreeMap<String, DiagnosticLevel>,
+    pub short_chapter_threshold_words: Option<u32>,
+    pub minimum_plotline_gap_scenes: Option<u32>,
 }
 
 impl DiagnosticOverrides {
@@ -1121,6 +1125,26 @@ impl DiagnosticOverrides {
         }
         if flag == "-Wno-error" || flag == "--no-warnings-as-errors" {
             self.warnings_as_errors = Some(false);
+            return Ok(true);
+        }
+        if let Some(value) = flag.strip_prefix("--short-chapter-under=") {
+            let threshold = value
+                .parse::<u32>()
+                .map_err(|_| "short-chapter threshold must be a positive integer".to_owned())?;
+            if threshold == 0 {
+                return Err("short-chapter threshold must be a positive integer".into());
+            }
+            self.short_chapter_threshold_words = Some(threshold);
+            return Ok(true);
+        }
+        if let Some(value) = flag.strip_prefix("--plotline-gap-at-least=") {
+            let threshold = value
+                .parse::<u32>()
+                .map_err(|_| "plotline gap threshold must be a positive integer".to_owned())?;
+            if threshold == 0 {
+                return Err("plotline gap threshold must be a positive integer".into());
+            }
+            self.minimum_plotline_gap_scenes = Some(threshold);
             return Ok(true);
         }
         for (prefix, level) in [
@@ -1159,6 +1183,7 @@ impl Default for DiagnosticPolicy {
             warnings_as_errors: false,
             rules: std::collections::BTreeMap::new(),
             short_chapter_threshold_words: None,
+            minimum_plotline_gap_scenes: None,
         }
     }
 }
@@ -1172,6 +1197,12 @@ impl DiagnosticPolicy {
             self.warnings_as_errors = warnings_as_errors;
         }
         self.rules.extend(overrides.rules.clone());
+        if overrides.short_chapter_threshold_words.is_some() {
+            self.short_chapter_threshold_words = overrides.short_chapter_threshold_words;
+        }
+        if overrides.minimum_plotline_gap_scenes.is_some() {
+            self.minimum_plotline_gap_scenes = overrides.minimum_plotline_gap_scenes;
+        }
     }
 
     pub fn validate(&self) -> Result<(), String> {
@@ -1184,6 +1215,9 @@ impl DiagnosticPolicy {
         }
         if self.short_chapter_threshold_words == Some(0) {
             return Err("short chapter threshold must be greater than zero".into());
+        }
+        if self.minimum_plotline_gap_scenes == Some(0) {
+            return Err("plotline gap threshold must be greater than zero".into());
         }
         Ok(())
     }
@@ -1204,14 +1238,17 @@ impl DiagnosticPolicy {
                     DiagnosticSeverity::Warning => DiagnosticLevel::Warning,
                     DiagnosticSeverity::Information => DiagnosticLevel::Information,
                 },
-                DiagnosticPreset::Thorough | DiagnosticPreset::Extended => {
-                    match diagnostic.severity {
-                        DiagnosticSeverity::Error => DiagnosticLevel::Error,
-                        DiagnosticSeverity::Warning | DiagnosticSeverity::Information => {
-                            DiagnosticLevel::Warning
-                        }
+                DiagnosticPreset::Thorough => match diagnostic.severity {
+                    DiagnosticSeverity::Error => DiagnosticLevel::Error,
+                    DiagnosticSeverity::Warning | DiagnosticSeverity::Information => {
+                        DiagnosticLevel::Warning
                     }
-                }
+                },
+                DiagnosticPreset::Extended => match diagnostic.severity {
+                    DiagnosticSeverity::Error => DiagnosticLevel::Error,
+                    DiagnosticSeverity::Warning => DiagnosticLevel::Warning,
+                    DiagnosticSeverity::Information => DiagnosticLevel::Information,
+                },
                 DiagnosticPreset::Pedantic => DiagnosticLevel::Error,
             });
         if self.warnings_as_errors && base == DiagnosticLevel::Warning {
@@ -2104,10 +2141,18 @@ output = "exports/old.md"
             thorough.effective_level(&diagnostic),
             DiagnosticLevel::Warning
         );
+        let extended = DiagnosticPolicy {
+            preset: DiagnosticPreset::Extended,
+            ..DiagnosticPolicy::default()
+        };
+        assert_eq!(
+            extended.effective_level(&diagnostic),
+            DiagnosticLevel::Information
+        );
         thorough.preset = DiagnosticPreset::Extended;
         assert_eq!(
             thorough.effective_level(&diagnostic),
-            DiagnosticLevel::Warning
+            DiagnosticLevel::Information
         );
         thorough.preset = DiagnosticPreset::Pedantic;
         assert_eq!(
@@ -2162,6 +2207,18 @@ output = "exports/old.md"
         assert_eq!(flags.warnings_as_errors, Some(false));
         assert!(flags.parse_flag("-w").unwrap());
         assert_eq!(flags.preset, Some(DiagnosticPreset::Quiet));
+        assert!(flags.parse_flag("--short-chapter-under=1200").unwrap());
+        assert!(flags.parse_flag("--plotline-gap-at-least=7").unwrap());
+        let mut policy = DiagnosticPolicy::default();
+        policy.apply_overrides(&flags);
+        assert_eq!(policy.short_chapter_threshold_words, Some(1200));
+        assert_eq!(policy.minimum_plotline_gap_scenes, Some(7));
+        assert!(
+            flags
+                .clone()
+                .parse_flag("--plotline-gap-at-least=0")
+                .is_err()
+        );
         assert!(!flags.parse_flag("--overwrite").unwrap());
     }
 

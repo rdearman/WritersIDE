@@ -20253,6 +20253,17 @@ mod tests {
             .execute_legacy_palette_command("compile-config run plain -w")
             .unwrap();
         assert!(state.message.contains("Compile plain success"));
+        state
+            .execute_legacy_palette_command(
+                "compile-config run plain --overwrite --short-chapter-under=100 --plotline-gap-at-least=1 -Wextra -Werror",
+            )
+            .unwrap();
+        assert!(state.message.contains("Compile plain failed"));
+        assert!(
+            compile_results_reference_text(&state.app, "errors")
+                .unwrap()
+                .contains("short-chapter")
+        );
     }
 
     #[test]

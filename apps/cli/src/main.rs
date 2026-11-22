@@ -3490,7 +3490,7 @@ fn usage() {
     eprintln!("writers-ide compile-check <project>");
     eprintln!("writers-ide compile-recovery <project> [status|retry]");
     eprintln!(
-        "writers-ide compile-config <project> <list|results|create <preset> [name>|run <name> [--overwrite] [-w|-Wall|-Wextra|-Wpedantic|-Werror|-Werror=RULE|-Wno-RULE]|all [flags]|rebuild <name>|clean <name|all> --yes>"
+        "writers-ide compile-config <project> <list|results|create <preset> [name>|run <name> [--overwrite] [-w|-Wall|-Wextra|-Wpedantic|-Werror|-Werror=RULE|-Wno-RULE|--short-chapter-under=N|--plotline-gap-at-least=N]|all [flags]|rebuild <name>|clean <name|all> --yes>"
     );
     eprintln!("writers-ide word-count-policy <project> [unicode-words|script-graphemes]");
     eprintln!("writers-ide scene-language <project> <scene-uuid> [language-tag|inherit]");

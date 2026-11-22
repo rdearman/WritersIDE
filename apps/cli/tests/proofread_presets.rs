@@ -95,6 +95,25 @@ fn cli_compile_flags_promote_or_suppress_only_authoring_findings() {
             .exists()
     );
 
+    let threshold = Command::new(executable)
+        .args([
+            "compile-config",
+            project.to_str().unwrap(),
+            "run",
+            "plain",
+            "--overwrite",
+            "--short-chapter-under=100",
+            "--plotline-gap-at-least=1",
+            "-Wextra",
+            "-Werror",
+        ])
+        .output()
+        .unwrap();
+    assert!(!threshold.status.success());
+    let output = String::from_utf8_lossy(&threshold.stdout);
+    assert!(output.contains("short-chapter"));
+    assert!(output.contains("\"effective_level\": \"error\""));
+
     let recipe_path = project.join(".writers-ide/compile-configurations/plain.toml");
     let original = std::fs::read_to_string(&recipe_path).unwrap();
     std::fs::write(&recipe_path, "not a valid recipe").unwrap();
