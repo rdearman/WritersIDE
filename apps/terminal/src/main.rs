@@ -370,6 +370,7 @@ enum CursorMotion {
 struct MenuState {
     top: usize,
     selected: usize,
+    all_commands: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -391,6 +392,69 @@ const MENU_CATEGORY_COMMAND_IDS: [&str; 8] = [
     "menu.publish",
     "menu.tools",
     "menu.help",
+];
+const MENU_COMMON_COMMANDS: [&[&str]; 8] = [
+    &[
+        "file.save",
+        "series.import-scrivener",
+        "series.create",
+        "series.open",
+        "series.select",
+        "series.new-book",
+    ],
+    &[
+        "search.find-panel",
+        "search.replace-panel",
+        "scene.rename",
+        "scene.status",
+        "scene.field",
+        "comment.create",
+    ],
+    &[
+        "structure.section",
+        "structure.chapter",
+        "scene.create",
+        "document.new-content-unit",
+        "link.create",
+        "link.delete",
+        "edit.snippet-insert",
+    ],
+    &[
+        "view.dashboard",
+        "view.outline",
+        "view.editor",
+        "view.cards",
+        "view.search",
+        "scene.open",
+        "search.return-position",
+    ],
+    &[
+        "edit.resolve-save-conflict",
+        "issue.create",
+        "reading.list-annotations",
+        "reading.list-bookmarks",
+        "revision.history",
+        "revision.diff",
+        "revision.snapshot",
+    ],
+    &[
+        "compile.run",
+        "compile.format",
+        "compile.results",
+        "compile.configuration",
+        "assembly.compile",
+        "compile.preview-output",
+        "compile.preview-inclusions",
+    ],
+    &[
+        "research.create",
+        "settings.keybinding-manager",
+        "scratchpad.create",
+        "writing.stats",
+        "extract.propose",
+        "story-template-list",
+    ],
+    &["help.context"],
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2824,6 +2888,8 @@ fn menu_category(spec: &CommandSpec) -> &'static str {
         || id.starts_with("edit.text-expansion")
     {
         "Insert"
+    } else if matches!(id, "search.find-panel" | "search.replace-panel") {
+        "Edit"
     } else if spec.category == "View"
         || id.starts_with("view.")
         || id.starts_with("scene.open")
@@ -7321,6 +7387,7 @@ impl AppState {
             self.menu = Some(MenuState {
                 top: 0,
                 selected: 0,
+                all_commands: false,
             });
             self.message = "Main menu · arrows navigate · Enter selects · Esc closes".into();
         }
@@ -7429,9 +7496,13 @@ impl AppState {
     fn open_menu_category(&mut self, index: usize) {
         self.pending_command_sequence = None;
         let top = index.min(MENU_CATEGORIES.len().saturating_sub(1));
-        self.menu = Some(MenuState { top, selected: 0 });
+        self.menu = Some(MenuState {
+            top,
+            selected: 0,
+            all_commands: false,
+        });
         self.message = format!(
-            "{} menu · arrows navigate · Enter selects · Esc closes",
+            "{} menu · common actions · Tab all commands · arrows/Enter · Esc closes",
             MENU_CATEGORIES[top]
         );
     }
@@ -7439,10 +7510,23 @@ impl AppState {
         let Some(menu) = self.menu else {
             return Vec::new();
         };
-        let top = MENU_CATEGORIES[menu.top.min(MENU_CATEGORIES.len() - 1)];
-        command_registry()
-            .into_iter()
-            .filter(|spec| !spec.id.starts_with("menu.") && menu_category(spec) == top)
+        let menu_index = menu.top.min(MENU_CATEGORIES.len() - 1);
+        let top = MENU_CATEGORIES[menu_index];
+        let commands = command_registry();
+        if menu.all_commands {
+            return commands
+                .into_iter()
+                .filter(|spec| !spec.id.starts_with("menu.") && menu_category(spec) == top)
+                .collect();
+        }
+        MENU_COMMON_COMMANDS[menu_index]
+            .iter()
+            .filter_map(|id| {
+                commands
+                    .iter()
+                    .find(|spec| spec.id == *id && menu_category(spec) == top)
+                    .copied()
+            })
             .collect()
     }
     fn command_disabled_reason(&self, spec: CommandSpec) -> Option<&'static str> {
@@ -7829,14 +7913,32 @@ impl AppState {
             KeyCode::Left => {
                 menu.top = (menu.top + MENU_CATEGORIES.len() - 1) % MENU_CATEGORIES.len();
                 menu.selected = 0;
+                menu.all_commands = false;
                 self.menu = Some(menu);
                 return Ok(());
             }
             KeyCode::Right => {
                 menu.top = (menu.top + 1) % MENU_CATEGORIES.len();
                 menu.selected = 0;
+                menu.all_commands = false;
                 self.menu = Some(menu);
                 return Ok(());
+            }
+            KeyCode::Tab => {
+                menu.all_commands = true;
+                menu.selected = 0;
+                self.message = format!(
+                    "{} · all registered commands · Shift+Tab returns to common actions",
+                    MENU_CATEGORIES[menu.top]
+                );
+            }
+            KeyCode::BackTab => {
+                menu.all_commands = false;
+                menu.selected = 0;
+                self.message = format!(
+                    "{} · common actions · Tab shows all registered commands",
+                    MENU_CATEGORIES[menu.top]
+                );
             }
             KeyCode::Up => {
                 let count = self.menu_commands().len();
@@ -7892,6 +7994,7 @@ impl AppState {
                 }) {
                     menu.top = index;
                     menu.selected = 0;
+                    menu.all_commands = false;
                     self.menu = Some(menu);
                     return Ok(());
                 } else if let Some((index, spec)) =
@@ -15580,7 +15683,15 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
     let context = if state.mode.is_some() {
         "Active dialogue".to_owned()
     } else if let Some(menu) = state.menu {
-        format!("{} menu", MENU_CATEGORIES[menu.top])
+        format!(
+            "{} menu · {}",
+            MENU_CATEGORIES[menu.top],
+            if menu.all_commands {
+                "all registered commands"
+            } else {
+                "common actions"
+            }
+        )
     } else if state.find_panel.is_some() {
         "Search dialogue".to_owned()
     } else if state.series_form.is_some() || state.keybinding_manager.is_some() {
@@ -15623,7 +15734,7 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
     }
     if let Some(menu) = state.menu {
         lines.push(
-            "Menu controls: ←/→ choose a menu · ↑/↓ choose a command · Enter runs · Esc closes"
+            "Menu controls: ←/→ choose a menu · ↑/↓ choose · Enter runs · Tab shows all commands · Shift+Tab returns to common actions · Esc closes"
                 .to_owned(),
         );
         let category = MENU_CATEGORIES[menu.top];
@@ -16807,6 +16918,7 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let menu = s.menu.unwrap_or(MenuState {
         top: 0,
         selected: 0,
+        all_commands: false,
     });
     let category_offset = MENU_CATEGORIES
         .iter()
@@ -16821,11 +16933,16 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     };
     f.render_widget(Clear, popup);
     let direct_shortcut = effective_shortcut_label(s, MENU_CATEGORY_COMMAND_IDS[menu.top], "");
+    let contents = if menu.all_commands {
+        "All commands · Shift+Tab common"
+    } else {
+        "Common actions · Tab all commands"
+    };
     let title = if direct_shortcut.is_empty() {
-        format!(" {} · Esc close ", MENU_CATEGORIES[menu.top])
+        format!(" {} · {contents} · Esc close ", MENU_CATEGORIES[menu.top])
     } else {
         format!(
-            " {} · {} · Esc close ",
+            " {} · {contents} · {} · Esc close ",
             MENU_CATEGORIES[menu.top], direct_shortcut
         )
     };
@@ -16890,7 +17007,11 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
             .block(
                 Block::default()
-                    .title("Choose an action · ↑/↓ · Enter")
+                    .title(if menu.all_commands {
+                        "↑/↓ choose · Enter run · Shift+Tab common"
+                    } else {
+                        "↑/↓ choose · Enter run · Tab all"
+                    })
                     .borders(Borders::NONE),
             ),
         command_list_area,
@@ -20508,7 +20629,11 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                         .iter()
                         .position(|category| *category == "File")
                         .unwrap_or(0);
-                    s.menu = Some(MenuState { top, selected: 0 });
+                    s.menu = Some(MenuState {
+                        top,
+                        selected: 0,
+                        all_commands: false,
+                    });
                     let selected = s
                         .menu_commands()
                         .iter()
@@ -20929,13 +21054,21 @@ mod tests {
             .iter()
             .position(|category| *category == "Insert")
             .unwrap();
-        state.menu = Some(MenuState { top, selected: 0 });
+        state.menu = Some(MenuState {
+            top,
+            selected: 0,
+            all_commands: false,
+        });
         let selected = state
             .menu_commands()
             .iter()
             .position(|command| command.id == "link.create")
             .unwrap();
-        state.menu = Some(MenuState { top, selected });
+        state.menu = Some(MenuState {
+            top,
+            selected,
+            all_commands: false,
+        });
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -20959,13 +21092,21 @@ mod tests {
         assert_eq!(links[0].target, story_core::EntityRef::Character(character));
         assert_eq!(links[0].label, "Opening witness");
         assert!(state.message.contains("Created related relationship"));
-        state.menu = Some(MenuState { top, selected: 0 });
+        state.menu = Some(MenuState {
+            top,
+            selected: 0,
+            all_commands: false,
+        });
         let selected = state
             .menu_commands()
             .iter()
             .position(|command| command.id == "link.delete")
             .unwrap();
-        state.menu = Some(MenuState { top, selected });
+        state.menu = Some(MenuState {
+            top,
+            selected,
+            all_commands: false,
+        });
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -20990,13 +21131,21 @@ mod tests {
             .iter()
             .position(|category| *category == "File")
             .ok_or("File menu category is missing")?;
-        state.menu = Some(MenuState { top, selected: 0 });
+        state.menu = Some(MenuState {
+            top,
+            selected: 0,
+            all_commands: false,
+        });
         let selected = state
             .menu_commands()
             .iter()
             .position(|command| command.id == command_id)
             .ok_or("Series command is missing from the menu")?;
-        state.menu = Some(MenuState { top, selected });
+        state.menu = Some(MenuState {
+            top,
+            selected,
+            all_commands: false,
+        });
         handle(state, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?;
         Ok(())
     }
@@ -28194,6 +28343,63 @@ mod tests {
     }
 
     #[test]
+    fn menus_default_to_curated_actions_and_keep_the_full_registry_reachable() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+
+        for (top, category) in MENU_CATEGORIES.iter().enumerate() {
+            for id in MENU_COMMON_COMMANDS[top] {
+                assert!(
+                    command_by_id(id).is_some_and(|command| menu_category(&command) == *category),
+                    "{category} curated menu command {id} is unregistered or miscategorized"
+                );
+            }
+            state.menu = Some(MenuState {
+                top,
+                selected: 0,
+                all_commands: false,
+            });
+            let common = state.menu_commands();
+            assert!(
+                common.len() <= 7,
+                "{category} menu has {} common actions",
+                common.len()
+            );
+            assert!(
+                !common.is_empty(),
+                "{category} menu has no curated common actions"
+            );
+
+            handle(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+            let all_commands = state.menu_commands();
+            let expected = command_registry()
+                .into_iter()
+                .filter(|command| {
+                    !command.id.starts_with("menu.") && menu_category(command) == *category
+                })
+                .map(|command| command.id)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                all_commands
+                    .iter()
+                    .map(|command| command.id)
+                    .collect::<Vec<_>>(),
+                expected,
+                "Tab must expose every registered {category} action"
+            );
+
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::BackTab, KeyModifiers::NONE),
+            )
+            .unwrap();
+            assert!(!state.menu.unwrap().all_commands);
+            assert_eq!(state.menu_commands().len(), common.len());
+        }
+    }
+
+    #[test]
     fn persistent_menu_bar_adapts_to_available_width_and_effective_menu_keymap() {
         let dir = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
@@ -28255,6 +28461,7 @@ mod tests {
         state.menu = Some(MenuState {
             top: 0,
             selected: 0,
+            all_commands: false,
         });
         state.command_bindings.push((
             KeyEvent::new(KeyCode::Char('i'), KeyModifiers::ALT),
