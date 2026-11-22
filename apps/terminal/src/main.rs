@@ -15595,9 +15595,8 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
             effective_shortcut_label(state, "menu.main", "F10")
         ),
         "Help: F1 opens or closes this panel; Esc returns to the previous focus".to_owned(),
-        "Focus: Ctrl+G switches between the navigation pane and manuscript".to_owned(),
-        "Reference: Ctrl+Tab cycles reference panes when available".to_owned(),
-        "Navigation: Tab changes workspace outside text fields; Shift+Tab moves back".to_owned(),
+        "Focus: In the editor, Ctrl+Tab switches to an open reference pane; Esc returns to the manuscript".to_owned(),
+        "Navigation: Tab moves to the next workspace and Shift+Tab to the previous workspace outside text fields".to_owned(),
         format!(
             "Save: {} · current buffer is {}",
             effective_shortcut_label(state, "file.save", "Ctrl+S"),
@@ -15606,7 +15605,7 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
     ];
     if state.workspace == Workspace::Editor {
         lines.push(
-            "Editing: / and ? are ordinary manuscript characters; Tab inserts indentation"
+            "Editing: / and ? are ordinary manuscript characters; Tab inserts indentation. Esc leaves for Outline"
                 .to_owned(),
         );
         lines.push(
@@ -23996,6 +23995,29 @@ mod tests {
         assert!(state.help_panel.is_none());
         assert_eq!(state.mode, Some('q'));
         assert_eq!(state.prompt, original_prompt);
+    }
+
+    #[test]
+    fn editor_help_matches_the_actual_focus_and_tab_behaviour() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Editor;
+
+        let panel = context_help_panel(&state);
+        assert!(panel.lines.iter().any(|line| {
+            line.contains("Ctrl+Tab switches to an open reference pane")
+                && line.contains("Esc returns to the manuscript")
+        }));
+        assert!(panel.lines.iter().any(|line| {
+            line.contains("Tab inserts indentation") && line.contains("Esc leaves for Outline")
+        }));
+        assert!(
+            !panel
+                .lines
+                .iter()
+                .any(|line| line.contains("Ctrl+G switches"))
+        );
     }
 
     #[test]
