@@ -68,3 +68,65 @@ fn cli_configures_optional_chronology_and_updates_scene_time() {
         "The manuscript remains intact."
     );
 }
+
+#[test]
+fn cli_persists_explicit_event_character_and_location_relationships() {
+    let directory = tempfile::tempdir().unwrap();
+    let project_path = directory.path().join("Book");
+    let mut app = story_app::WriterApp::create_project(&project_path, "Book").unwrap();
+    let character = app.create_character("Mara").unwrap();
+    let location = app.create_location("North Station").unwrap();
+    let event = app.add_event("The station bell rings", "day 2").unwrap();
+    drop(app);
+
+    let executable = env!("CARGO_BIN_EXE_writers-ide");
+    let characters = Command::new(executable)
+        .args([
+            "event-characters-set",
+            project_path.to_str().unwrap(),
+            &event.to_string(),
+            &format!("{character}=witness"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        characters.status.success(),
+        "{}",
+        String::from_utf8_lossy(&characters.stderr)
+    );
+    let locations = Command::new(executable)
+        .args([
+            "event-locations-set",
+            project_path.to_str().unwrap(),
+            &event.to_string(),
+            &format!("{location}=occurred_at"),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        locations.status.success(),
+        "{}",
+        String::from_utf8_lossy(&locations.stderr)
+    );
+    let report = Command::new(executable)
+        .args([
+            "event-relationships",
+            project_path.to_str().unwrap(),
+            &event.to_string(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        report.status.success(),
+        "{}",
+        String::from_utf8_lossy(&report.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&report.stdout).unwrap();
+    assert_eq!(
+        report["characters"][0]["character_id"],
+        character.to_string()
+    );
+    assert_eq!(report["characters"][0]["role"], "witness");
+    assert_eq!(report["locations"][0]["location_id"], location.to_string());
+    assert_eq!(report["locations"][0]["role"], "occurred_at");
+}

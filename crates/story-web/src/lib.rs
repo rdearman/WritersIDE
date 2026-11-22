@@ -810,10 +810,29 @@ fn plan_json(app: &WriterApp) -> Result<String, String> {
             edges.push(serde_json::json!({"from":link.source.id(),"to":link.target.id(),"kind":link.kind,"label":link.label}));
         }
     }
+    let mut event_rows = Vec::new();
+    for event in &events {
+        let participants = app
+            .event_characters(event.id)
+            .map_err(|error| error.to_string())?;
+        let event_locations = app
+            .event_locations(event.id)
+            .map_err(|error| error.to_string())?;
+        for participant in &participants {
+            edges.push(serde_json::json!({"from":event.id,"to":participant.character_id,"kind":"event-character","role":participant.role}));
+        }
+        for location in &event_locations {
+            edges.push(serde_json::json!({"from":event.id,"to":location.location_id,"kind":"event-location","role":location.role}));
+        }
+        event_rows.push(serde_json::json!({
+            "id":event.id,"title":event.title,"start":event.start,"end":event.end,"source_time":event.source_time,
+            "characters":participants,"locations":event_locations
+        }));
+    }
     for claim in &claims {
         edges.push(serde_json::json!({"from":claim.source_id,"to":claim.id,"kind":"approved-knowledge","source_kind":claim.source_kind,"evidence":claim.evidence_quote}));
     }
-    Ok(serde_json::json!({"project":{"title":project.title,"book_type":project.book_type,"target_words":project.target_words},"groups":nodes,"scenes":scene_rows,"claims":claims.iter().map(|claim|serde_json::json!({"id":claim.id,"kind":claim.kind,"name":claim.name,"claim":claim.claim,"source_kind":claim.source_kind,"source_id":claim.source_id,"evidence_quote":claim.evidence_quote,"evidence_start_byte":claim.evidence_start_byte,"evidence_end_byte":claim.evidence_end_byte})).collect::<Vec<_>>(),"characters":chars.iter().map(|item|serde_json::json!({"id":item.id,"name":item.name,"scene_count":item.scene_count})).collect::<Vec<_>>(),"plotlines":plots.iter().map(|item|serde_json::json!({"id":item.id,"name":item.name,"scene_count":item.scene_count})).collect::<Vec<_>>(),"locations":locations.iter().map(|item|serde_json::json!({"id":item.id,"name":item.name})).collect::<Vec<_>>(),"events":events.iter().map(|item|serde_json::json!({"id":item.id,"title":item.title,"start":item.start,"end":item.end,"source_time":item.source_time})).collect::<Vec<_>>(),"issues":issues.iter().map(|item|serde_json::json!({"id":item.id,"title":item.title,"status":item.status,"scene_count":item.scene_count})).collect::<Vec<_>>(),"research":research.iter().map(|item|serde_json::json!({"id":item.id,"title":item.title,"media_type":item.media_type})).collect::<Vec<_>>(),"edges":edges}).to_string())
+    Ok(serde_json::json!({"project":{"title":project.title,"book_type":project.book_type,"target_words":project.target_words},"groups":nodes,"scenes":scene_rows,"claims":claims.iter().map(|claim|serde_json::json!({"id":claim.id,"kind":claim.kind,"name":claim.name,"claim":claim.claim,"source_kind":claim.source_kind,"source_id":claim.source_id,"evidence_quote":claim.evidence_quote,"evidence_start_byte":claim.evidence_start_byte,"evidence_end_byte":claim.evidence_end_byte})).collect::<Vec<_>>(),"characters":chars.iter().map(|item|serde_json::json!({"id":item.id,"name":item.name,"scene_count":item.scene_count})).collect::<Vec<_>>(),"plotlines":plots.iter().map(|item|serde_json::json!({"id":item.id,"name":item.name,"scene_count":item.scene_count})).collect::<Vec<_>>(),"locations":locations.iter().map(|item|serde_json::json!({"id":item.id,"name":item.name})).collect::<Vec<_>>(),"events":event_rows,"issues":issues.iter().map(|item|serde_json::json!({"id":item.id,"title":item.title,"status":item.status,"scene_count":item.scene_count})).collect::<Vec<_>>(),"research":research.iter().map(|item|serde_json::json!({"id":item.id,"title":item.title,"media_type":item.media_type})).collect::<Vec<_>>(),"edges":edges}).to_string())
 }
 
 fn scene_json(app: &WriterApp, id: story_core::SceneId) -> Result<String, String> {
@@ -831,6 +850,25 @@ mod tests {
         let mut app = WriterApp::create_project(dir.path().join("Novel"), "Browser Novel").unwrap();
         let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
         let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let character = app.create_character("Mara").unwrap();
+        let location = app.create_location("North Station").unwrap();
+        let event = app.add_event("The station bell rings", "day 2").unwrap();
+        app.set_event_characters(
+            event,
+            &[story_core::EventCharacterParticipation {
+                character_id: character,
+                role: story_core::EventParticipationRole::Witness,
+            }],
+        )
+        .unwrap();
+        app.set_event_locations(
+            event,
+            &[story_core::EventLocationAssociation {
+                location_id: location,
+                role: story_core::EventLocationRole::OccurredAt,
+            }],
+        )
+        .unwrap();
         let (_, hash) = app.load_scene_text(scene).unwrap();
         app.save_scene_text(scene, Some(&hash), "Review only.")
             .unwrap();
@@ -858,6 +896,7 @@ mod tests {
         assert!(plan.contains(&claim_id.to_string()));
         assert!(plan.contains("approved-knowledge"));
         assert!(plan.contains("Review only."));
+        assert!(plan.contains("event-character") && plan.contains("event-location"));
         let (status, mime, page) = route(&mut app, "GET", "/", "");
         assert_eq!(status, 200);
         assert!(mime.starts_with("text/html"));

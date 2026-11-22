@@ -1227,6 +1227,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             WriterApp::open_project(path)?.update_story_event_time(id, start, end, &source_time)?;
             println!("Updated story-time bounds for event {id}");
         }
+        "event-characters-set" => {
+            let path = args.next().ok_or("missing project path")?;
+            let event = story_core::EventId(args.next().ok_or("missing event UUID")?.parse()?);
+            let specification = args.next().ok_or("missing UUID=role list or none")?;
+            let participants = parse_event_character_specification(&specification)?;
+            let mut app = WriterApp::open_project(path)?;
+            app.set_event_characters(event, &participants)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app.event_characters(event)?)?
+            );
+        }
+        "event-locations-set" => {
+            let path = args.next().ok_or("missing project path")?;
+            let event = story_core::EventId(args.next().ok_or("missing event UUID")?.parse()?);
+            let specification = args.next().ok_or("missing UUID=role list or none")?;
+            let locations = parse_event_location_specification(&specification)?;
+            let mut app = WriterApp::open_project(path)?;
+            app.set_event_locations(event, &locations)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&app.event_locations(event)?)?
+            );
+        }
+        "event-relationships" => {
+            let path = args.next().ok_or("missing project path")?;
+            let event = story_core::EventId(args.next().ok_or("missing event UUID")?.parse()?);
+            let app = WriterApp::open_project(path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "characters": app.event_characters(event)?,
+                    "locations": app.event_locations(event)?,
+                }))?
+            );
+        }
         "chronology-preferences" => {
             let path = args.next().ok_or("missing project path")?;
             let action = args.next().unwrap_or_else(|| "show".into());
@@ -3280,6 +3316,55 @@ fn parse_cli_interval_boundary(
     }
 }
 
+fn parse_event_character_specification(
+    specification: &str,
+) -> Result<Vec<story_core::EventCharacterParticipation>, Box<dyn std::error::Error>> {
+    if specification == "none" {
+        return Ok(Vec::new());
+    }
+    specification
+        .split(',')
+        .map(|entry| {
+            let (id, role) = entry.split_once('=').ok_or("expected UUID=role")?;
+            let role = match role {
+                "participant" => story_core::EventParticipationRole::Participant,
+                "witness" => story_core::EventParticipationRole::Witness,
+                "cause" => story_core::EventParticipationRole::Cause,
+                "affected" => story_core::EventParticipationRole::Affected,
+                _ => return Err(format!("unknown event participation role: {role}").into()),
+            };
+            Ok(story_core::EventCharacterParticipation {
+                character_id: story_core::CharacterId(id.parse()?),
+                role,
+            })
+        })
+        .collect()
+}
+
+fn parse_event_location_specification(
+    specification: &str,
+) -> Result<Vec<story_core::EventLocationAssociation>, Box<dyn std::error::Error>> {
+    if specification == "none" {
+        return Ok(Vec::new());
+    }
+    specification
+        .split(',')
+        .map(|entry| {
+            let (id, role) = entry.split_once('=').ok_or("expected UUID=role")?;
+            let role = match role {
+                "occurred_at" => story_core::EventLocationRole::OccurredAt,
+                "starts_at" => story_core::EventLocationRole::StartsAt,
+                "ends_at" => story_core::EventLocationRole::EndsAt,
+                _ => return Err(format!("unknown event location role: {role}").into()),
+            };
+            Ok(story_core::EventLocationAssociation {
+                location_id: story_core::LocationId(id.parse()?),
+                role,
+            })
+        })
+        .collect()
+}
+
 fn parse_merge_choices(
     value: &str,
 ) -> Result<Vec<story_import::MergeConflictChoice>, Box<dyn std::error::Error>> {
@@ -3396,7 +3481,10 @@ writers-ide spellcheck-hunspell <project> <language-tag> [project-relative-wordl
         "writers-ide scratchpad-create <path> <title> [body]\nwriters-ide scratchpad-list <path>\nwriters-ide scratchpad-promote <path> <note-uuid> <scene|character|location|object|research> <entity-uuid>\nwriters-ide mentions <path> <scene-uuid>\nwriters-ide entity-mentions <path> <character|location|object> <entity-uuid>\nwriters-ide mention-confirm <path> <mention-uuid> <character|location|object> <entity-uuid>\nwriters-ide mention-dismiss <path> <mention-uuid>\nwriters-ide object-create <path> <name> [description]\nwriters-ide assembly-draft-create <path> <assembly-uuid>\nwriters-ide assembly-draft-list <path>\nwriters-ide assembly-draft-set <path> <draft-uuid> <scene-uuid> <text.md>\nwriters-ide assembly-draft-commit <path> <draft-uuid>\nwriters-ide board-create <path> <title>\nwriters-ide board-add-scene <path> <board-uuid> <scene-uuid> <x> <y> [note]\nwriters-ide board-list <path> <board-uuid>\nwriters-ide board-resize <path> <item-uuid> <width> <height>\nwriters-ide board-export <path> <board-uuid> (Markdown to stdout)\nwriters-ide board-export-svg <path> <board-uuid> (SVG to stdout)\nwriters-ide backup-archive <project-path> <archive.zip>\nwriters-ide restore-archive <archive.zip> <new-project-directory>"
     );
     eprintln!(
-        "writers-ide compile-watch <path> <format> <output> [poll-ms]\nwriters-ide process-recipe <project> <recipe.toml>\nwriters-ide watch-process <project> <recipe.toml> [poll-ms]\nwriters-ide query-assert <path> <query-uuid> <empty|non-empty|at-least:N|at-most:N|exactly:N>\nwriters-ide coverage <path> <dimension> <entity-uuid> <minimum-scenes>\nwriters-ide event-dependency-add <project> <before-event> <after-event> <precedes|requires> [notes]\nwriters-ide event-dependency-list|event-dependency-check <project>\nwriters-ide event-dependency-update <project> <before-event> <after-event> <kind> [notes]\nwriters-ide event-dependency-remove <project> <before-event> <after-event> <kind>\nwriters-ide location-rule-add <project> <location-a> <location-b> <description>\nwriters-ide location-rule-list <project>\nwriters-ide location-rule-update <project> <rule-uuid> <enabled|disabled> <description>\nwriters-ide location-rule-remove <project> <rule-uuid>\nwriters-ide location-rule-check <project>\nwriters-ide challenge-start <path> <target-words> <duration-seconds> [steady|kamikaze]\nwriters-ide challenge-finish <path> <challenge-id> <words-written> [abandoned]\nwriters-ide challenge-list <path>\nwriters-ide goal-create <project> <start> <end> <target> <baseline> <UTC|±HH:MM> <raw|real> <project|scene-uuid> <title>\nwriters-ide goal-list <project> [--all]\nwriters-ide goal-record <project> <goal> <unix-time> <origin> <source-id> <fingerprint> <scene-uuid|none> <raw> <real> [detail]\nwriters-ide goal-events <project> <goal>\nwriters-ide goal-progress <project> <goal>\nwriters-ide goal-weekly <project> <goal>\nwriters-ide goal-archive <project> <goal>\nwriters-ide goal-reconcile <project> <event> <fingerprint> <raw> <real> <reason>"
+        "writers-ide compile-watch <path> <format> <output> [poll-ms]\nwriters-ide process-recipe <project> <recipe.toml>\nwriters-ide watch-process <project> <recipe.toml> [poll-ms]\nwriters-ide query-assert <path> <query-uuid> <empty|non-empty|at-least:N|at-most:N|exactly:N>\nwriters-ide coverage <path> <dimension> <entity-uuid> <minimum-scenes>\nwriters-ide event-characters-set <project> <event-uuid> <UUID=role,...|none>
+writers-ide event-locations-set <project> <event-uuid> <UUID=role,...|none>
+writers-ide event-relationships <project> <event-uuid>
+writers-ide event-dependency-add <project> <before-event> <after-event> <precedes|requires> [notes]\nwriters-ide event-dependency-list|event-dependency-check <project>\nwriters-ide event-dependency-update <project> <before-event> <after-event> <kind> [notes]\nwriters-ide event-dependency-remove <project> <before-event> <after-event> <kind>\nwriters-ide location-rule-add <project> <location-a> <location-b> <description>\nwriters-ide location-rule-list <project>\nwriters-ide location-rule-update <project> <rule-uuid> <enabled|disabled> <description>\nwriters-ide location-rule-remove <project> <rule-uuid>\nwriters-ide location-rule-check <project>\nwriters-ide challenge-start <path> <target-words> <duration-seconds> [steady|kamikaze]\nwriters-ide challenge-finish <path> <challenge-id> <words-written> [abandoned]\nwriters-ide challenge-list <path>\nwriters-ide goal-create <project> <start> <end> <target> <baseline> <UTC|±HH:MM> <raw|real> <project|scene-uuid> <title>\nwriters-ide goal-list <project> [--all]\nwriters-ide goal-record <project> <goal> <unix-time> <origin> <source-id> <fingerprint> <scene-uuid|none> <raw> <real> [detail]\nwriters-ide goal-events <project> <goal>\nwriters-ide goal-progress <project> <goal>\nwriters-ide goal-weekly <project> <goal>\nwriters-ide goal-archive <project> <goal>\nwriters-ide goal-reconcile <project> <event> <fingerprint> <raw> <real> <reason>"
     );
 }
 

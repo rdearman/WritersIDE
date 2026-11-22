@@ -2233,6 +2233,50 @@ pub struct StoryEvent {
     pub end: StoryTime,
     pub source_time_text: String,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventParticipationRole {
+    Participant,
+    Witness,
+    Cause,
+    Affected,
+}
+impl EventParticipationRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Participant => "participant",
+            Self::Witness => "witness",
+            Self::Cause => "cause",
+            Self::Affected => "affected",
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventCharacterParticipation {
+    pub character_id: CharacterId,
+    pub role: EventParticipationRole,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventLocationRole {
+    OccurredAt,
+    StartsAt,
+    EndsAt,
+}
+impl EventLocationRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OccurredAt => "occurred_at",
+            Self::StartsAt => "starts_at",
+            Self::EndsAt => "ends_at",
+        }
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct EventLocationAssociation {
+    pub location_id: LocationId,
+    pub role: EventLocationRole,
+}
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StoryEventDependency {
     pub predecessor: EventId,

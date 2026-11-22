@@ -1604,6 +1604,9 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("search.query-assert-check", "Check Query Assertions", "Evaluate saved count assertions against refreshed results", "View", "query-assert-check", true),
         legacy_command("analysis.coverage-add", "Add Coverage Rule", "Add a project-local character or plotline appearance requirement", "Plot", "coverage-add", true),
         legacy_command("analysis.event-dependency-add", "Add Event Dependency", "Record a story-time precedence or prerequisite assertion", "Plot", "event-dependency-add", true),
+        legacy_command("analysis.event-characters-set", "Set Event Participants", "Replace an event's explicit character participation", "Plot", "event-characters-set", true),
+        legacy_command("analysis.event-locations-set", "Set Event Locations", "Replace an event's explicit location associations", "Plot", "event-locations-set", true),
+        legacy_command("analysis.event-relationships", "Show Event Relationships", "Inspect explicit event participants and locations", "Plot", "event-relationships", false),
         legacy_command("analysis.event-dependency-list", "List Event Dependencies", "Show saved event-order assertions", "Plot", "event-dependency-list", false),
         legacy_command("analysis.event-dependency-check", "Check Event Dependencies", "Evaluate saved event-order assertions with uncertainty", "Plot", "event-dependency-check", false),
         legacy_command("analysis.event-dependency-update", "Update Event Dependency", "Edit the note on a saved event assertion", "Plot", "event-dependency-update", true),
@@ -11062,13 +11065,55 @@ impl AppState {
                 .into_iter()
                 .find(|row| row.id == id)
                 .ok_or("event reference not found")?;
+            let characters = self
+                .app
+                .event_characters(id)?
+                .into_iter()
+                .map(|item| {
+                    let name = self
+                        .app
+                        .list_characters()
+                        .ok()
+                        .and_then(|items| {
+                            items
+                                .into_iter()
+                                .find(|x| x.id == item.character_id)
+                                .map(|x| x.name)
+                        })
+                        .unwrap_or_else(|| item.character_id.to_string());
+                    format!("{name} ({})", item.role.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            let locations = self
+                .app
+                .event_locations(id)?
+                .into_iter()
+                .map(|item| {
+                    let name = self
+                        .app
+                        .list_locations()
+                        .ok()
+                        .and_then(|items| {
+                            items
+                                .into_iter()
+                                .find(|x| x.id == item.location_id)
+                                .map(|x| x.name)
+                        })
+                        .unwrap_or_else(|| item.location_id.to_string());
+                    format!("{name} ({})", item.role.as_str())
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
             self.open_reference_buffer(
                 format!("event:{id}"),
                 None,
                 row.title.clone(),
                 format!(
-                    "Event: {}\nSource time: {}\nStart: {:?}\nEnd: {:?}",
-                    row.title, row.source_time, row.start, row.end
+                    "Event: {}\nSource time: {}\nStart: {:?}\nEnd: {:?}\nCharacters: {}\nLocations: {}",
+                    row.title, row.source_time, row.start, row.end,
+                    if characters.is_empty() { "none" } else { &characters },
+                    if locations.is_empty() { "none" } else { &locations }
                 ),
             );
             self.reference_focused = false;
@@ -11559,6 +11604,25 @@ impl AppState {
                     notes: notes.into(),
                 })?;
             self.message = "Added event dependency".into();
+        } else if let Some(rest) = cmd.strip_prefix("event-characters-set ") {
+            let (event, specification) = rest.split_once(' ').ok_or("use event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... (or none)")?;
+            let event = story_core::EventId(event.parse()?);
+            let participants = parse_event_character_specification(specification)?;
+            self.app.set_event_characters(event, &participants)?;
+            self.message = format!("Saved {} event character relationships", participants.len());
+        } else if let Some(rest) = cmd.strip_prefix("event-locations-set ") {
+            let (event, specification) = rest.split_once(' ').ok_or("use event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... (or none)")?;
+            let event = story_core::EventId(event.parse()?);
+            let locations = parse_event_location_specification(specification)?;
+            self.app.set_event_locations(event, &locations)?;
+            self.message = format!("Saved {} event location relationships", locations.len());
+        } else if let Some(rest) = cmd.strip_prefix("event-relationships ") {
+            let event = story_core::EventId(rest.trim().parse()?);
+            self.message = format!(
+                "Characters: {:?} · Locations: {:?}",
+                self.app.event_characters(event)?,
+                self.app.event_locations(event)?
+            );
         } else if cmd == "event-dependency-list" {
             self.message = self
                 .app
@@ -12464,7 +12528,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu; arrows navigate; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... | event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... | event-relationships EVENT-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -16038,6 +16102,55 @@ fn parse_interval_boundary(
         "exclusive" => Ok(story_core::IntervalBoundary::Exclusive),
         _ => Err("boundary must be inclusive or exclusive".into()),
     }
+}
+
+fn parse_event_character_specification(
+    specification: &str,
+) -> Result<Vec<story_core::EventCharacterParticipation>, Box<dyn std::error::Error>> {
+    if specification.trim() == "none" {
+        return Ok(Vec::new());
+    }
+    specification
+        .split(',')
+        .map(|entry| {
+            let (id, role) = entry.split_once('=').ok_or("expected UUID=role")?;
+            let role = match role {
+                "participant" => story_core::EventParticipationRole::Participant,
+                "witness" => story_core::EventParticipationRole::Witness,
+                "cause" => story_core::EventParticipationRole::Cause,
+                "affected" => story_core::EventParticipationRole::Affected,
+                _ => return Err(format!("unknown event participation role: {role}").into()),
+            };
+            Ok(story_core::EventCharacterParticipation {
+                character_id: story_core::CharacterId(id.parse()?),
+                role,
+            })
+        })
+        .collect()
+}
+
+fn parse_event_location_specification(
+    specification: &str,
+) -> Result<Vec<story_core::EventLocationAssociation>, Box<dyn std::error::Error>> {
+    if specification.trim() == "none" {
+        return Ok(Vec::new());
+    }
+    specification
+        .split(',')
+        .map(|entry| {
+            let (id, role) = entry.split_once('=').ok_or("expected UUID=role")?;
+            let role = match role {
+                "occurred_at" => story_core::EventLocationRole::OccurredAt,
+                "starts_at" => story_core::EventLocationRole::StartsAt,
+                "ends_at" => story_core::EventLocationRole::EndsAt,
+                _ => return Err(format!("unknown event location role: {role}").into()),
+            };
+            Ok(story_core::EventLocationAssociation {
+                location_id: story_core::LocationId(id.parse()?),
+                role,
+            })
+        })
+        .collect()
 }
 
 fn format_story_interval(time: story_core::StoryTime) -> String {
@@ -21041,6 +21154,57 @@ mod tests {
             ))
             .unwrap();
         assert!(state.app.list_event_dependencies().unwrap().is_empty());
+    }
+
+    #[test]
+    fn terminal_sets_lists_and_clears_event_participants_and_locations() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        let event = state
+            .app
+            .add_event("The station bell rings", "day 2")
+            .unwrap();
+        let character = state.app.create_character("Mara").unwrap();
+        let location = state.app.create_location("North Station").unwrap();
+        state
+            .execute_legacy_palette_command(&format!(
+                "event-characters-set {event} {character}=witness"
+            ))
+            .unwrap();
+        state
+            .execute_legacy_palette_command(&format!(
+                "event-locations-set {event} {location}=occurred_at"
+            ))
+            .unwrap();
+        assert_eq!(
+            state.app.event_characters(event).unwrap(),
+            vec![story_core::EventCharacterParticipation {
+                character_id: character,
+                role: story_core::EventParticipationRole::Witness,
+            }]
+        );
+        assert_eq!(
+            state.app.event_locations(event).unwrap(),
+            vec![story_core::EventLocationAssociation {
+                location_id: location,
+                role: story_core::EventLocationRole::OccurredAt,
+            }]
+        );
+        state
+            .execute_legacy_palette_command(&format!("event-relationships {event}"))
+            .unwrap();
+        assert!(state.message.contains("Witness"));
+        state
+            .execute_legacy_palette_command(&format!("event-characters-set {event} none"))
+            .unwrap();
+        state
+            .execute_legacy_palette_command(&format!("event-locations-set {event} none"))
+            .unwrap();
+        assert!(state.app.event_characters(event).unwrap().is_empty());
+        assert!(state.app.event_locations(event).unwrap().is_empty());
+        assert!(parse_event_character_specification("bad=role").is_err());
+        assert!(parse_event_location_specification("bad=role").is_err());
     }
 
     #[test]

@@ -3311,6 +3311,26 @@ impl WriterApp {
     pub fn scene_event_links(&self, scene: SceneId) -> Result<Vec<(EventId, String)>> {
         Ok(self.store.scene_event_links(scene)?)
     }
+    pub fn set_event_characters(
+        &mut self,
+        event: EventId,
+        participants: &[EventCharacterParticipation],
+    ) -> Result<()> {
+        Ok(self.store.set_event_characters(event, participants)?)
+    }
+    pub fn event_characters(&self, event: EventId) -> Result<Vec<EventCharacterParticipation>> {
+        Ok(self.store.event_characters(event)?)
+    }
+    pub fn set_event_locations(
+        &mut self,
+        event: EventId,
+        locations: &[EventLocationAssociation],
+    ) -> Result<()> {
+        Ok(self.store.set_event_locations(event, locations)?)
+    }
+    pub fn event_locations(&self, event: EventId) -> Result<Vec<EventLocationAssociation>> {
+        Ok(self.store.event_locations(event)?)
+    }
     pub fn add_event_dependency(&mut self, dependency: &StoryEventDependency) -> Result<()> {
         Ok(self.store.add_event_dependency(dependency)?)
     }
