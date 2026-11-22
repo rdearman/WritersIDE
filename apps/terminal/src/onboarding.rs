@@ -5,7 +5,7 @@
 //! manuscript project.
 
 use serde::{Deserialize, Serialize};
-use std::{fs, io, path::Path};
+use std::{collections::BTreeSet, fs, io, path::Path};
 
 pub const PREFERENCES_VERSION: u16 = 1;
 
@@ -25,6 +25,10 @@ pub struct TutorialProgress {
     pub step: usize,
     pub demo_project: String,
     pub return_project: String,
+    /// Verified user actions for the current tutorial route. Older preference
+    /// files deserialize with an empty set so progress remains resumable.
+    #[serde(default)]
+    pub verified_actions: BTreeSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -118,6 +122,7 @@ mod tests {
             step: 1,
             demo_project: "demo".into(),
             return_project: "book".into(),
+            verified_actions: BTreeSet::new(),
         });
         store(&path, &preferences).unwrap();
         assert_eq!(load(&path).unwrap(), preferences);
@@ -136,7 +141,7 @@ mod tests {
 
     #[test]
     fn tutorial_progress_is_global_and_serializable() {
-        let preferences = Preferences {
+        let mut preferences = Preferences {
             version: PREFERENCES_VERSION,
             welcome_seen: true,
             tutorial_dismissed: false,
@@ -146,10 +151,38 @@ mod tests {
                 step: 3,
                 demo_project: "/tutorial/demo".into(),
                 return_project: "/books/novel".into(),
+                verified_actions: BTreeSet::new(),
             }),
         };
+        preferences
+            .active_tutorial
+            .as_mut()
+            .unwrap()
+            .verified_actions
+            .insert("return".into());
         let json = serde_json::to_string(&preferences).unwrap();
         assert!(json.contains("guided_tour"));
         assert!(json.contains("/books/novel"));
+        assert!(load_progress_from_json(&json));
+    }
+
+    fn load_progress_from_json(json: &str) -> bool {
+        serde_json::from_str::<Preferences>(json)
+            .ok()
+            .and_then(|preferences| preferences.active_tutorial)
+            .is_some_and(|progress| progress.verified_actions.contains("return"))
+    }
+
+    #[test]
+    fn older_tutorial_preferences_default_to_no_verified_actions() {
+        let json = r#"{"version":1,"welcome_seen":true,"active_tutorial":{"track":"guided_tour","step":0,"demo_project":"demo","return_project":"book"}}"#;
+        let preferences: Preferences = serde_json::from_str(json).unwrap();
+        assert!(
+            preferences
+                .active_tutorial
+                .unwrap()
+                .verified_actions
+                .is_empty()
+        );
     }
 }

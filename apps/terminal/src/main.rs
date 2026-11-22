@@ -124,6 +124,8 @@ struct AppState {
     prompt: String,
     message: String,
     help_panel: Option<HelpPanel>,
+    tutorial_preferences_path: PathBuf,
+    tutorial_progress_label: Option<String>,
     command_palette: Option<CommandPaletteState>,
     history: Vec<Workspace>,
     history_index: usize,
@@ -414,16 +416,20 @@ fn welcome_panel(has_progress: bool) -> HelpPanel {
     }
 }
 
-fn tutorial_panel(track: onboarding::TutorialTrack, step: usize) -> HelpPanel {
+fn tutorial_panel_at(
+    track: onboarding::TutorialTrack,
+    step: usize,
+    preferences_path: &Path,
+) -> HelpPanel {
     let lessons: &[(&str, &str)] = match track {
         onboarding::TutorialTrack::QuickStart => &[
             (
-                "Project",
-                "This separate sample book is disposable. Your opened novel is unchanged.",
+                "Find your way around",
+                "Practice this route: press F10 to open the menu; on supported terminals you can hold Ctrl and press /. Use Left/Right for menu groups, Up/Down for choices, Enter to open, and Esc to go back. Open Outline, choose the sample scene, type a few words, save with File > Save or the Save shortcut shown below, then press Esc to return to Outline. Open Help > Resume Tutorial and press F6 only after completing the route.",
             ),
             (
                 "Write and save",
-                "Open the sample scene from Outline or Scene Cards. Type normally; Ctrl+S saves it.",
+                "This separate sample book is disposable. Your opened novel is unchanged. Open the sample scene from Outline, type normally and save with File > Save or the shortcut shown below.",
             ),
             (
                 "Compile",
@@ -432,16 +438,16 @@ fn tutorial_panel(track: onboarding::TutorialTrack, step: usize) -> HelpPanel {
         ],
         onboarding::TutorialTrack::GuidedTour => &[
             (
-                "Project",
-                "This separate sample book is disposable. Your opened novel is unchanged.",
+                "Find your way around",
+                "Practice this route: press F10 to open the menu; on supported terminals you can hold Ctrl and press /. Use Left/Right for menu groups, Up/Down for choices, Enter to open, and Esc to go back. Open Outline, choose the sample scene, type a few words, save with File > Save or the Save shortcut shown below, then press Esc to return to Outline. Open Help > Resume Tutorial and press F6 only after completing the route.",
             ),
             (
-                "Navigate",
-                "Use Tab and Shift+Tab to move between workspaces. Outline and Scene Cards show the same scenes.",
+                "Your sample book",
+                "This separate sample book is disposable. Your opened novel is unchanged. Outline and Scene Cards show the same scenes.",
             ),
             (
                 "Write and save",
-                "Open the sample scene. Type normally; Ctrl+S saves it. The saved text can be reopened from the outline.",
+                "Open the sample scene. Type normally; save with File > Save or the shortcut shown below. The saved text can be reopened from Outline.",
             ),
             (
                 "References",
@@ -461,13 +467,40 @@ fn tutorial_panel(track: onboarding::TutorialTrack, step: usize) -> HelpPanel {
         .get(step)
         .copied()
         .unwrap_or(("Complete", "The tutorial route is complete."));
+    let required = [
+        ("menu", "Open the menu"),
+        ("outline", "Visit Outline"),
+        ("scene", "Open the sample scene"),
+        ("write", "Write in the scene"),
+        ("save", "Save your writing"),
+        ("return", "Return to Outline with Esc"),
+        ("resume", "Resume this tutorial from Help"),
+    ];
+    let preferences = onboarding::load(preferences_path).ok();
+    let verified = preferences
+        .as_ref()
+        .and_then(|prefs| prefs.active_tutorial.as_ref())
+        .map(|progress| &progress.verified_actions);
+    let mut lines = vec![
+        body.into(),
+        "Practice the route in the sample book. Your progress is saved; F6 moves on after the navigation steps are verified.".into(),
+    ];
+    if step == 0 {
+        lines.extend(required.iter().map(|(key, label)| {
+            let mark = if verified.is_some_and(|actions| actions.contains(*key)) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            format!("{mark} {label}")
+        }));
+    }
+    lines.push(
+        "F6 next · Shift+F6 previous · Esc pause · Help > Resume Tutorial continues here".into(),
+    );
     HelpPanel {
         title: format!("Tutorial · {title} · {}/{}", step + 1, lessons.len()),
-        lines: vec![
-            body.into(),
-            "Use the application while this panel is open; ordinary keys continue to the workspace.".into(),
-            "Shift+F6 previous · F6 next · Esc hide · q return outside the editor · ? contextual help".into(),
-        ],
+        lines,
         scroll: 0,
     }
 }
@@ -4958,6 +4991,32 @@ fn read_user_keymap() -> Result<KeymapFile, Box<dyn std::error::Error>> {
     }
 }
 impl AppState {
+    fn record_tutorial_action(&mut self, action: &str) {
+        let path = self.tutorial_preferences_path.clone();
+        let Ok(mut preferences) = onboarding::load(&path) else {
+            return;
+        };
+        let Some(progress) = preferences.active_tutorial.as_mut() else {
+            return;
+        };
+        if progress.verified_actions.insert(action.to_owned()) {
+            let _ = onboarding::store(&path, &preferences);
+        }
+    }
+
+    fn refresh_tutorial_progress_label(&mut self) {
+        self.tutorial_progress_label = onboarding::load(&self.tutorial_preferences_path)
+            .ok()
+            .and_then(|preferences| preferences.active_tutorial)
+            .map(|progress| {
+                let total = match progress.track {
+                    onboarding::TutorialTrack::QuickStart => 3,
+                    onboarding::TutorialTrack::GuidedTour => 6,
+                };
+                format!("Tutorial {}/{} · Help/Resume", progress.step + 1, total)
+            });
+    }
+
     fn new(mut app: WriterApp, function_bindings: Vec<(u8, Workspace)>) -> Self {
         let replacement_recovery_notice = match recover_replace_groups(&mut app) {
             Ok(notices) => notices.join(" · "),
@@ -5073,6 +5132,17 @@ impl AppState {
             prompt: String::new(),
             message,
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: onboarding::load(&user_tutorial_preferences_path())
+                .ok()
+                .and_then(|preferences| preferences.active_tutorial)
+                .map(|progress| {
+                    let total = match progress.track {
+                        onboarding::TutorialTrack::QuickStart => 3,
+                        onboarding::TutorialTrack::GuidedTour => 6,
+                    };
+                    format!("Tutorial {}/{} · Help/Resume", progress.step + 1, total)
+                }),
             command_palette: None,
             history: vec![Workspace::Dashboard],
             history_index: 0,
@@ -7944,6 +8014,7 @@ impl AppState {
         self.assembly_draft = None;
         self.dirty = false;
         self.workspace = Workspace::Editor;
+        self.record_tutorial_action("scene");
         for pane in &mut self.reference_panes {
             let is_scene_document = pane.source_key.starts_with("scene:");
             let was_shared = pane.shared_scene;
@@ -8125,6 +8196,7 @@ impl AppState {
                 Ok(hash) => {
                     self.saved_hash = hash;
                     self.dirty = false;
+                    self.record_tutorial_action("save");
                     if self.writing_stats_enabled {
                         self.successful_saves = self.successful_saves.saturating_add(1);
                     }
@@ -8193,6 +8265,9 @@ impl AppState {
     }
     fn switch(&mut self, w: Workspace) {
         if self.workspace != w {
+            if w == Workspace::Outline {
+                self.record_tutorial_action("outline");
+            }
             if self.history_index + 1 < self.history.len() {
                 self.history.truncate(self.history_index + 1);
             }
@@ -8226,9 +8301,29 @@ impl AppState {
         }
     }
     fn selected_scene(&self) -> String {
-        self.active_scene()
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "No scene selected".into())
+        let Some(id) = self.editing_scene.or_else(|| self.active_scene()) else {
+            return "No manuscript open".into();
+        };
+        let Ok(record) = self.app.get_scene(id) else {
+            return "Manuscript scene unavailable".into();
+        };
+        let chapter = record.chapter_id.and_then(|chapter| {
+            self.app
+                .list_structural_nodes()
+                .ok()?
+                .into_iter()
+                .find(|node| node.id == chapter)
+                .map(|node| node.title)
+        });
+        let book = self
+            .app
+            .get_project()
+            .map(|project| project.title)
+            .unwrap_or_else(|_| "Manuscript".into());
+        chapter.map_or_else(
+            || format!("{book} > {}", record.scene.title),
+            |chapter| format!("{book} > {chapter} > {}", record.scene.title),
+        )
     }
     fn toggle_outline_node(
         &mut self,
@@ -8270,6 +8365,7 @@ impl AppState {
         if self.menu.take().is_some() {
             self.message = "Menu closed; editor focus restored".into();
         } else {
+            self.record_tutorial_action("menu");
             self.menu = Some(MenuState {
                 top: 0,
                 selected: 0,
@@ -8337,6 +8433,7 @@ impl AppState {
             );
         }
         let return_project = self.app.project_root().canonicalize()?;
+        self.tutorial_preferences_path = preferences_path.clone();
         let demo_title = "Writer's IDE Tutorial Sample";
         let mut demo = if demo_path.exists() {
             let app = WriterApp::open_project(&demo_path)?;
@@ -8357,7 +8454,7 @@ impl AppState {
                 demo.save_scene_text(
                     scene,
                     Some(&hash),
-                    "Mara opened the old book and found a note inside.\n\nThis is a disposable tutorial scene. Try editing it, then save with Ctrl+S.",
+                    "Mara opened the old book and found a note inside.\n\nThis is a disposable tutorial scene. Try editing it, then save with the shortcut shown below.",
                 )?;
             }
         }
@@ -8372,13 +8469,16 @@ impl AppState {
             step: 0,
             demo_project: demo_path.canonicalize()?.to_string_lossy().into_owned(),
             return_project: return_project.to_string_lossy().into_owned(),
+            verified_actions: BTreeSet::new(),
         });
         onboarding::store(&preferences_path, &preferences)?;
         let recent_projects_path = self.recent_projects_path.take();
         let switched = self.switch_to_project(demo_path, "Tutorial sample opened".into());
         self.recent_projects_path = recent_projects_path;
         switched?;
-        self.help_panel = Some(tutorial_panel(track, 0));
+        self.tutorial_preferences_path = preferences_path.clone();
+        self.refresh_tutorial_progress_label();
+        self.help_panel = Some(tutorial_panel_at(track, 0, &self.tutorial_preferences_path));
         Ok(())
     }
     fn exit_tutorial(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -8397,12 +8497,24 @@ impl AppState {
         );
         self.recent_projects_path = recent_projects_path;
         switched?;
+        self.refresh_tutorial_progress_label();
         self.help_panel = None;
         Ok(())
     }
     fn resume_tutorial(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let preferences_path = user_tutorial_preferences_path();
-        let preferences = onboarding::load(&preferences_path)?;
+        self.resume_tutorial_at(&user_tutorial_preferences_path())
+    }
+    fn resume_tutorial_at(
+        &mut self,
+        preferences_path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let preferences_path = preferences_path.to_owned();
+        self.tutorial_preferences_path = preferences_path.clone();
+        let mut preferences = onboarding::load(&preferences_path)?;
+        if let Some(progress) = preferences.active_tutorial.as_mut() {
+            progress.verified_actions.insert("resume".into());
+            onboarding::store(&preferences_path, &preferences)?;
+        }
         let Some(progress) = preferences.active_tutorial else {
             return self.begin_tutorial(onboarding::TutorialTrack::GuidedTour);
         };
@@ -8416,16 +8528,55 @@ impl AppState {
             self.recent_projects_path = recent_projects_path;
             switched?;
         }
-        self.help_panel = Some(tutorial_panel(progress.track, progress.step));
+        self.tutorial_preferences_path = preferences_path.clone();
+        self.help_panel = Some(tutorial_panel_at(
+            progress.track,
+            progress.step,
+            &self.tutorial_preferences_path,
+        ));
+        self.refresh_tutorial_progress_label();
         Ok(())
     }
     fn advance_tutorial(&mut self, direction: isize) -> Result<(), Box<dyn std::error::Error>> {
-        let path = user_tutorial_preferences_path();
+        let path = self.tutorial_preferences_path.clone();
         let mut preferences = onboarding::load(&path)?;
         let Some(progress) = preferences.active_tutorial.as_mut() else {
             self.help_panel = None;
             return Ok(());
         };
+        if direction > 0 && progress.step == 0 {
+            let required = [
+                "menu", "outline", "scene", "write", "save", "return", "resume",
+            ];
+            let missing: Vec<_> = required
+                .iter()
+                .copied()
+                .filter(|action| !progress.verified_actions.contains(*action))
+                .collect();
+            if !missing.is_empty() {
+                let labels = missing
+                    .iter()
+                    .map(|action| match *action {
+                        "menu" => "open the menu",
+                        "outline" => "visit Outline",
+                        "scene" => "open the sample scene",
+                        "write" => "write in the scene",
+                        "save" => "save your writing",
+                        "return" => "return to Outline with Esc",
+                        "resume" => "resume this tutorial from Help",
+                        _ => "complete the practice",
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.message = format!("Finish the navigation practice first: {labels}");
+                self.help_panel = Some(tutorial_panel_at(
+                    progress.track,
+                    progress.step,
+                    &self.tutorial_preferences_path,
+                ));
+                return Ok(());
+            }
+        }
         let last = match progress.track {
             onboarding::TutorialTrack::QuickStart => 2,
             onboarding::TutorialTrack::GuidedTour => 5,
@@ -8441,6 +8592,7 @@ impl AppState {
             preferences.tutorial_completed = true;
             preferences.tutorial_dismissed = false;
             onboarding::store(&path, &preferences)?;
+            self.tutorial_progress_label = None;
             self.help_panel = None;
             self.message = "Tutorial complete · your original project is unchanged".into();
             let recent_projects_path = self.recent_projects_path.take();
@@ -8454,7 +8606,12 @@ impl AppState {
         let track = progress.track;
         let step = progress.step;
         onboarding::store(&path, &preferences)?;
-        self.help_panel = Some(tutorial_panel(track, step));
+        self.help_panel = Some(tutorial_panel_at(
+            track,
+            step,
+            &self.tutorial_preferences_path,
+        ));
+        self.refresh_tutorial_progress_label();
         Ok(())
     }
     fn close_context_help(&mut self) {
@@ -8565,7 +8722,7 @@ impl AppState {
             group: None,
         });
         self.message = format!(
-            "{} menu · common actions · Tab all commands · arrows/Enter · Esc closes",
+            "{} menu · common actions · Tab: show all commands · arrows/Enter · Esc closes",
             MENU_CATEGORIES[top]
         );
     }
@@ -15006,6 +15163,7 @@ impl AppState {
         Ok(())
     }
     fn insert(&mut self, ch: char) {
+        self.record_tutorial_action("write");
         self.last_yank = None;
         let insertion = if ch == '\t' && self.editor_preferences.indentation == "spaces" {
             " ".repeat(self.editor_preferences.indent_width)
@@ -16089,7 +16247,8 @@ fn format_search_result_row(title: &str, text: &str, byte_offset: usize) -> Stri
 
 fn menu_bar_line(s: &AppState, width: usize) -> Line<'static> {
     if width < 60 {
-        let menu_key = effective_shortcut_label(s, "menu.main", "F10");
+        let menu_key =
+            effective_shortcut_label(s, "menu.main", "F10").replace("Ctrl+/", "hold Ctrl, press /");
         let selected = s.menu.map(|menu| MENU_CATEGORIES[menu.top]);
         let status = selected.map_or_else(
             || format!("{menu_key} Menu · ? Help"),
@@ -16186,6 +16345,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 6
             } else if s.mode.is_some() {
                 5
+            } else if s.workspace == Workspace::Editor {
+                3
             } else {
                 2
             }),
@@ -16962,7 +17123,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             rows[2],
         );
     } else {
-        let footer = if let Some(mode) = s.mode {
+        let _footer = if let Some(mode) = s.mode {
             let block = Block::default().borders(Borders::TOP);
             let inner = block.inner(rows[2]);
             f.render_widget(block, rows[2]);
@@ -17001,11 +17162,15 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 "Tab workspaces"
             };
             let status = format!(
-                " Focus:{focus} · {} · Save {} · Menu {} · Help {} · {pane_hint}",
+                " Focus:{focus} · {} · Save {} · Menu {} · Help {} · {pane_hint}{}",
                 if s.dirty { "UNSAVED" } else { "saved" },
                 effective_shortcut_label(s, "file.save", "Ctrl+S"),
                 effective_shortcut_label(s, "menu.main", "F10"),
-                effective_shortcut_label(s, "help.context", "Help menu")
+                effective_shortcut_label(s, "help.context", "Help menu"),
+                s.tutorial_progress_label
+                    .as_ref()
+                    .map(|label| format!(" · {label}"))
+                    .unwrap_or_default()
             );
             f.render_widget(Paragraph::new(status), sections[2]);
             String::new()
@@ -17028,7 +17193,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 format!(" · {challenge}")
             };
             format!(
-                " Focus:{} · Menu {} · Help {} · Save {} · q quit · {}{} · {}",
+                " Focus:{}{} · Menu {} · Help {} · Save {} · q quit · {}{} · {}",
                 if s.menu.is_some() {
                     "menu"
                 } else if s.reference_focused {
@@ -17038,6 +17203,10 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 } else {
                     "navigation"
                 },
+                s.tutorial_progress_label
+                    .as_ref()
+                    .map(|label| format!(" · {label}"))
+                    .unwrap_or_default(),
                 effective_shortcut_label(s, "menu.main", "F10"),
                 effective_shortcut_label(s, "help.context", "Help menu"),
                 effective_shortcut_label(s, "file.save", "unbound"),
@@ -17046,11 +17215,88 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 s.message,
             )
         };
-        if s.mode.is_none() {
+        if s.mode.is_none() && s.workspace != Workspace::Editor {
             f.render_widget(
-                Paragraph::new(footer).block(Block::default().borders(Borders::TOP)),
+                Paragraph::new(_footer).block(Block::default().borders(Borders::TOP)),
                 rows[2],
             );
+        } else if s.mode.is_none() {
+            let block = Block::default().borders(Borders::TOP);
+            let inner = block.inner(rows[2]);
+            f.render_widget(block, rows[2]);
+            let footer_rows = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .split(inner);
+            let breadcrumb = if s.workspace == Workspace::Editor {
+                s.selected_scene()
+            } else {
+                let book = s
+                    .app
+                    .get_project()
+                    .map(|project| project.title)
+                    .unwrap_or_else(|_| "Book".into());
+                format!("{book} > {}", s.workspace.title())
+            };
+            let save_state = if s.message.starts_with("Save conflict/error:")
+                || s.message.starts_with("Autosave failed")
+                || s.message.starts_with("Autosave could not save")
+            {
+                ("[SAVE FAILED]", Color::Red)
+            } else if s.dirty {
+                ("[UNSAVED]", Color::Yellow)
+            } else if s.message == "Autosaved" {
+                ("[AUTOSAVED]", Color::Green)
+            } else {
+                ("[SAVED]", Color::Green)
+            };
+            let state_width = save_state
+                .0
+                .width()
+                .saturating_add(2)
+                .min(inner.width as usize) as u16;
+            let top = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Min(1), Constraint::Length(state_width)])
+                .split(footer_rows[0]);
+            f.render_widget(Paragraph::new(format!(" {breadcrumb}")), top[0]);
+            f.render_widget(
+                Paragraph::new(save_state.0).style(
+                    Style::default()
+                        .fg(save_state.1)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                top[1],
+            );
+            let pane_hint = if s.workspace == Workspace::Editor {
+                if !s.reference_panes.is_empty() && !s.reference_panes_hidden {
+                    "Ctrl+Tab: Reference · Esc: Outline"
+                } else {
+                    "Esc: Outline"
+                }
+            } else {
+                "Tab: next workspace"
+            };
+            let tutorial = s
+                .tutorial_progress_label
+                .as_ref()
+                .map(|label| format!(" · {label}"))
+                .unwrap_or_default();
+            let menu_hint = effective_shortcut_label(s, "menu.main", "F10")
+                .replace("Ctrl+/", "hold Ctrl, press /");
+            let actions = format!(
+                " {} · Save {} · Menu {} · Help {} · {pane_hint}{}",
+                if s.message.is_empty() {
+                    ""
+                } else {
+                    s.message.as_str()
+                },
+                effective_shortcut_label(s, "file.save", "Ctrl+S"),
+                menu_hint,
+                effective_shortcut_label(s, "help.context", "Help menu"),
+                tutorial
+            );
+            f.render_widget(Paragraph::new(actions), footer_rows[1]);
         }
     }
     if s.menu.is_some() {
@@ -17111,9 +17357,9 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
     let mut lines = vec![
         format!("Context: {context}"),
         format!(
-            "Menu: {} · open with Ctrl+/ or F10",
-            effective_shortcut_label(state, "menu.main", "F10")
-        ),
+                "Menu: hold Ctrl and press / when available; fallback shortcut {}",
+                effective_shortcut_label(state, "menu.main", "F10")
+            ),
         format!(
             "Command Palette: {} · ':' opens it outside manuscript editing",
             effective_shortcut_label(state, "command.palette-open", "Ctrl+P")
@@ -18382,7 +18628,7 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     } else if menu.all_commands {
         "Commands · Shift+Tab common"
     } else {
-        "Common · Tab all · Esc closes"
+        "Common actions · Tab: show all commands · Esc closes"
     };
     let title = format!(" {} · {contents} ", MENU_CATEGORIES[menu.top]);
     let block = Block::default()
@@ -18444,7 +18690,7 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
                             "↑/↓ choose · Enter group · Shift+Tab common"
                         }
                     } else {
-                        "↑/↓ choose · Enter run · Tab all"
+                        "↑/↓ choose · Enter run · Tab: show all commands"
                     })
                     .borders(Borders::NONE),
             ),
@@ -22506,7 +22752,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             {
                 s.insert(c)
             }
-            KeyCode::Esc => s.switch(Workspace::Outline),
+            KeyCode::Esc => {
+                s.record_tutorial_action("return");
+                s.switch(Workspace::Outline);
+            }
             _ => {}
         }
         return Ok(false);
@@ -26973,6 +27222,8 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: None,
             command_palette: None,
             history: vec![Workspace::Editor],
             history_index: 0,
@@ -29778,6 +30029,8 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: None,
             command_palette: None,
             history: vec![Workspace::Editor],
             history_index: 0,
@@ -29910,6 +30163,8 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: None,
             command_palette: None,
             history: vec![Workspace::Editor],
             history_index: 0,
@@ -30038,6 +30293,8 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: None,
             command_palette: None,
             history: vec![Workspace::Editor],
             history_index: 0,
@@ -30174,6 +30431,8 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: None,
             command_palette: None,
             history: vec![Workspace::Outline],
             history_index: 0,
@@ -30460,6 +30719,8 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: None,
             command_palette: None,
             history: vec![Workspace::Dashboard],
             history_index: 0,
@@ -30596,6 +30857,8 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: None,
             command_palette: None,
             history: vec![Workspace::Outline],
             history_index: 0,
@@ -31538,7 +31801,10 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(narrow.contains("Ctrl+/ or F10 Menu"), "{narrow:?}");
+        assert!(
+            narrow.contains("hold Ctrl, press / or F10 Menu"),
+            "{narrow:?}"
+        );
 
         state.command_bindings = vec![(
             KeyEvent::new(KeyCode::Char('m'), KeyModifiers::ALT),
@@ -31607,6 +31873,11 @@ mod tests {
         state.open_scene(scene).unwrap();
         state.editor = vec!["A sentence ready for drafting.".into()];
         assert!(state.editor_focus_mode);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
 
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -31620,8 +31891,38 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("File"));
         assert!(rendered.contains("A sentence ready for drafting."));
-        assert!(rendered.contains("manuscript"));
+        assert!(
+            rendered.contains("Novel > Chapter One > Opening"),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("[SAVED]"));
+        assert!(rendered.contains("Saved"));
+        assert!(!rendered.contains(&scene.to_string()));
         assert!(!rendered.contains("Scenes"));
+
+        state.dirty = true;
+        state.message = "Save conflict/error: the file changed on disk".into();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let failed = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(failed.contains("[SAVE FAILED]"));
+
+        state.dirty = false;
+        state.message = "Autosaved".into();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let autosaved = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(autosaved.contains("[AUTOSAVED]"));
     }
 
     #[test]
@@ -31767,6 +32068,8 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: None,
             command_palette: None,
             history: vec![Workspace::Revisions],
             history_index: 0,
@@ -32038,6 +32341,8 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: None,
             command_palette: None,
             history: vec![Workspace::Reading],
             history_index: 0,
@@ -32444,6 +32749,8 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: None,
             command_palette: None,
             history: vec![Workspace::Search],
             history_index: 0,
@@ -32591,6 +32898,8 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: None,
             command_palette: None,
             history: vec![Workspace::Search],
             history_index: 0,
@@ -32790,6 +33099,8 @@ mod tests {
             prompt: String::new(),
             message: String::new(),
             help_panel: None,
+            tutorial_preferences_path: user_tutorial_preferences_path(),
+            tutorial_progress_label: None,
             command_palette: None,
             history: vec![Workspace::Outline],
             history_index: 0,
@@ -33048,9 +33359,85 @@ mod tests {
                 .any(|line| line.starts_with("Resume Tutorial"))
         );
         assert!(
-            tutorial_panel(onboarding::TutorialTrack::QuickStart, 2)
-                .title
-                .contains("Compile")
+            tutorial_panel_at(
+                onboarding::TutorialTrack::QuickStart,
+                2,
+                &user_tutorial_preferences_path()
+            )
+            .title
+            .contains("Compile")
+        );
+    }
+
+    #[test]
+    fn navigation_tutorial_requires_verified_menu_write_save_return_and_resume_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let original_path = directory.path().join("Original");
+        let app = WriterApp::create_project(&original_path, "Original").unwrap();
+        let demo_path = directory.path().join("Tutorial");
+        let preferences_path = directory.path().join("prefs/tutorial.json");
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .begin_tutorial_at(
+                onboarding::TutorialTrack::GuidedTour,
+                demo_path.clone(),
+                preferences_path.clone(),
+            )
+            .unwrap();
+
+        state.advance_tutorial(1).unwrap();
+        assert_eq!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .step,
+            0,
+            "F6 must not skip the navigation practice"
+        );
+        assert!(state.message.contains("Finish the navigation practice"));
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.menu.is_some());
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        state.switch(Workspace::Outline);
+        state.help_panel = None;
+        let scene = state.app.list_scenes(false).unwrap()[0].scene.id;
+        state.open_scene(scene).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(!state.dirty);
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.workspace, Workspace::Outline);
+        state.resume_tutorial_at(&preferences_path).unwrap();
+        assert!(
+            state
+                .tutorial_progress_label
+                .as_deref()
+                .unwrap()
+                .contains("1/6")
+        );
+        state.advance_tutorial(1).unwrap();
+        let progress = onboarding::load(&preferences_path)
+            .unwrap()
+            .active_tutorial
+            .unwrap();
+        assert_eq!(
+            progress.step, 1,
+            "verified actions: {:?}; message: {}",
+            progress.verified_actions, state.message
         );
     }
 
@@ -33062,7 +33449,11 @@ mod tests {
         let scene = app.create_scene(chapter, "Scene", 0).unwrap();
         let mut state = AppState::new(app, default_bindings());
         state.open_scene(scene).unwrap();
-        state.help_panel = Some(tutorial_panel(onboarding::TutorialTrack::GuidedTour, 0));
+        state.help_panel = Some(tutorial_panel_at(
+            onboarding::TutorialTrack::GuidedTour,
+            0,
+            &user_tutorial_preferences_path(),
+        ));
 
         handle(
             &mut state,
