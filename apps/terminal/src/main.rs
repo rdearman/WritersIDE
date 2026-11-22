@@ -33124,4 +33124,44 @@ mod tests {
         state.dispatch_registered_command_id("help.search").unwrap();
         assert!(state.command_palette.is_some());
     }
+
+    #[test]
+    fn help_is_reachable_from_dirty_quit_dialogue_via_f10_menu_and_returns_to_dialogue() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.mode = Some('q');
+        state.prompt = "Save and Quit · Quit Without Saving · Cancel".into();
+        state.message = "Choose how to leave the current unsaved text".into();
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.menu.is_some());
+        assert_eq!(state.mode, Some('q'));
+
+        for _ in 0..MENU_CATEGORIES.len() - 1 {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        assert_eq!(state.menu.unwrap().top, MENU_CATEGORIES.len() - 1);
+        assert_eq!(state.menu_commands()[0].id, "help.context");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.help_panel.is_some());
+        assert_eq!(state.mode, Some('q'));
+
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.help_panel.is_none());
+        assert_eq!(state.mode, Some('q'));
+        assert_eq!(state.prompt, "Save and Quit · Quit Without Saving · Cancel");
+    }
 }
