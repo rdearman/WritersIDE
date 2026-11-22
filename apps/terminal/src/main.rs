@@ -178,10 +178,12 @@ struct AppState {
     user_text_expansion: TextExpansionConfig,
     editor_preferences: EditorPreferences,
     bookmarks: BTreeMap<String, EditorBookmark>,
+    ephemeral_marks: BTreeMap<String, EditorBookmark>,
     kill_ring: Vec<String>,
     kill_ring_index: usize,
     last_yank: Option<LastYank>,
     macro_preview: Option<MacroPreview>,
+    multi_replace_preview: Option<MultiReplacePreview>,
     pending_replace: Option<Vec<ReplaceTarget>>,
     replace_preview_target: usize,
     replace_preview_match: usize,
@@ -544,6 +546,15 @@ struct MacroPreview {
     repetitions: usize,
     source: String,
     proposed: String,
+}
+
+#[derive(Clone, Debug)]
+struct MultiReplacePreview {
+    scene_id: Option<SceneId>,
+    content_unit_id: Option<story_core::ContentUnitId>,
+    source: String,
+    proposed: String,
+    ranges: Vec<std::ops::Range<usize>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2490,6 +2501,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.register-rotate", "Rotate Editor Registers", "Rotate values through two or more named registers", "Edit", "register-rotate", true),
         legacy_command("edit.multi-insert", "Multi-cursor Insert", "Insert text at multiple original UTF-8 byte offsets", "Edit", "multi-insert", true),
         legacy_command("edit.multi-replace", "Replace Multiple Selections", "Replace grapheme-bounded ranges in the active buffer as one undoable edit", "Edit", "multi-replace", true),
+        legacy_command("edit.multi-replace-matches", "Replace All Active-Buffer Matches", "Preview replacing every exact match in the active manuscript buffer", "Edit", "multi-replace-matches", true),
         legacy_command("edit.macro", "Run Edit Macro", "Apply an undoable selection or line edit macro", "Edit", "macro", true),
         legacy_command("edit.macro-define", "Define Edit Macro", "Save a reusable, data-only edit macro", "Edit", "macro-define", true),
         legacy_command("edit.macro-run", "Run Named Edit Macro", "Apply a saved macro once or a bounded number of times", "Edit", "macro-run", true),
@@ -2513,6 +2525,10 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.bookmark-save", "Save Passage Bookmark", "Save a named stable-ID bookmark for the current passage", "Navigate", "manuscript-bookmark-save", true),
         legacy_command("edit.bookmark-list", "List Passage Bookmarks", "List saved manuscript passage bookmarks", "Navigate", "manuscript-bookmark-list", false),
         legacy_command("edit.bookmark-jump", "Jump to Passage Bookmark", "Navigate to a saved passage, following stable scene identity", "Navigate", "manuscript-bookmark-jump", true),
+        legacy_command("edit.mark-set", "Set Temporary Mark", "Mark the current manuscript passage for this terminal session", "Navigate", "mark-set", true),
+        legacy_command("edit.mark-list", "List Temporary Marks", "List volatile marks; these are not saved with the project", "Navigate", "mark-list", false),
+        legacy_command("edit.mark-jump", "Jump to Temporary Mark", "Jump to a passage marked during this terminal session", "Navigate", "mark-jump", true),
+        legacy_command("edit.mark-clear", "Clear Temporary Mark", "Remove a session-only manuscript mark", "Navigate", "mark-clear", true),
         legacy_command("edit.kill-ring-list", "List Kill Ring", "Inspect retained copied and cut manuscript text", "Edit", "kill-ring-list", false),
         legacy_command("edit.kill-ring-insert", "Insert Kill Ring Entry", "Insert a retained text entry by its number", "Edit", "kill-ring-insert", true),
         legacy_command("edit.yank-pop", "Cycle Previous Yank", "Replace the last yank with the next retained kill-ring entry", "Edit", "yank-pop", false),
@@ -4074,10 +4090,12 @@ impl AppState {
             user_text_expansion,
             editor_preferences,
             bookmarks: tools.bookmarks,
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: tools.kill_ring,
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -8415,6 +8433,40 @@ impl AppState {
                 "Inserted at {} distinct UTF-8 cursor anchors",
                 anchors.iter().collect::<BTreeSet<_>>().len()
             );
+        } else if let Some(rest) = cmd.strip_prefix("multi-replace-matches ") {
+            if self.editing_scene.is_none() && self.editing_content_unit.is_none() {
+                return Err("open a manuscript scene or direct-prose document first".into());
+            }
+            let (needle, replacement) = rest
+                .split_once(" => ")
+                .ok_or("use multi-replace-matches TEXT => REPLACEMENT")?;
+            if needle.is_empty() {
+                return Err("multi-replace-matches needs non-empty search text".into());
+            }
+            let source = self.editor.join("\n");
+            let (narrow_start, narrow_end) = self.narrowed_passage.unwrap_or((0, source.len()));
+            let ranges = source
+                .match_indices(needle)
+                .map(|(start, found)| start..start + found.len())
+                .filter(|range| range.start >= narrow_start && range.end <= narrow_end)
+                .collect::<Vec<_>>();
+            if ranges.is_empty() {
+                return Err("no exact matches in the active buffer or narrowed passage".into());
+            }
+            let proposed = story_core::replace_at_grapheme_ranges(&source, &ranges, replacement)?;
+            self.multi_replace_preview = Some(MultiReplacePreview {
+                scene_id: self.editing_scene,
+                content_unit_id: self.editing_content_unit,
+                source,
+                proposed,
+                ranges,
+            });
+            self.message = format!(
+                "Previewing {} exact match(es) in the active buffer · Enter applies, Esc cancels",
+                self.multi_replace_preview
+                    .as_ref()
+                    .map_or(0, |preview| preview.ranges.len())
+            );
         } else if let Some(rest) = cmd.strip_prefix("multi-replace ") {
             let (ranges_text, replacement) = rest
                 .split_once(' ')
@@ -8439,25 +8491,15 @@ impl AppState {
                 );
             }
             let updated = story_core::replace_at_grapheme_ranges(&original, &ranges, replacement)?;
-            if updated != original {
-                self.push_undo();
-                let first = ranges
-                    .iter()
-                    .min_by_key(|range| (range.start, range.end))
-                    .expect("the core operation validated at least one range");
-                self.editor = updated.lines().map(str::to_owned).collect();
-                if self.editor.is_empty() {
-                    self.editor.push(String::new());
-                }
-                let cursor_byte = first.start + replacement.len();
-                self.cursor = editor_position_from_byte(&updated, cursor_byte).unwrap_or((0, 0));
-                self.editor_selection = None;
-                self.extra_cursors.clear();
-                self.dirty = true;
-                self.update_narrowed_passage(&original);
-            }
+            self.multi_replace_preview = Some(MultiReplacePreview {
+                scene_id: self.editing_scene,
+                content_unit_id: self.editing_content_unit,
+                source: original,
+                proposed: updated,
+                ranges: ranges.clone(),
+            });
             self.message = format!(
-                "Replaced {} grapheme-bounded selections as one undoable edit",
+                "Previewing {} grapheme-bounded selections · Enter applies, Esc cancels",
                 ranges.len()
             );
         } else if let Some(rest) = cmd.strip_prefix("macro-define ") {
@@ -8779,6 +8821,93 @@ impl AppState {
             self.cursor = editor_position_from_byte(&text, offset)
                 .ok_or("bookmark offset is not a valid UTF-8 position")?;
             self.message = format!("Jumped to manuscript bookmark {}", name.trim());
+        } else if let Some(name) = cmd.strip_prefix("mark-set ") {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err("mark name cannot be empty".into());
+            }
+            let scene_id = self.editing_scene.ok_or("open a manuscript scene first")?;
+            let text = self.editor.join("\n");
+            let (offset, quote) = if let Some((start, end)) = self.selection_bounds() {
+                let start = editor_position_byte(&self.editor, start.0, start.1);
+                let end = editor_position_byte(&self.editor, end.0, end.1);
+                (
+                    start,
+                    text.get(start..end)
+                        .ok_or("selection is not valid UTF-8")?
+                        .to_owned(),
+                )
+            } else {
+                let offset = editor_position_byte(&self.editor, self.cursor.0, 0);
+                (offset, self.editor[self.cursor.0].clone())
+            };
+            self.ephemeral_marks.insert(
+                name.to_owned(),
+                EditorBookmark {
+                    scene_id,
+                    offset,
+                    quote,
+                },
+            );
+            self.message = format!("Set temporary mark {name}; it lasts for this terminal session");
+        } else if cmd == "mark-list" {
+            let marks = self
+                .ephemeral_marks
+                .iter()
+                .map(|(name, mark)| {
+                    format!(
+                        "{name} · {} · {}",
+                        mark.scene_id,
+                        if mark.quote.is_empty() {
+                            "(insertion point)".to_owned()
+                        } else {
+                            mark.quote.replace('\n', " ↵ ")
+                        }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            self.message = if marks.is_empty() {
+                "No temporary marks in this terminal session".into()
+            } else {
+                marks
+            };
+        } else if let Some(name) = cmd.strip_prefix("mark-jump ") {
+            if self.dirty {
+                return Err(
+                    "save the current manuscript before jumping to a temporary mark".into(),
+                );
+            }
+            let name = name.trim();
+            let mark = self
+                .ephemeral_marks
+                .get(name)
+                .ok_or("unknown temporary mark in this terminal session")?
+                .clone();
+            let (text, _) = self.app.load_scene_text(mark.scene_id)?;
+            let offset = if mark.quote.is_empty() {
+                mark.offset.min(text.len())
+            } else {
+                text.get(mark.offset..mark.offset.saturating_add(mark.quote.len()))
+                    .filter(|candidate| *candidate == mark.quote)
+                    .map(|_| mark.offset)
+                    .or_else(|| {
+                        let mut matches = text.match_indices(&mark.quote);
+                        let first = matches.next().map(|(offset, _)| offset)?;
+                        matches.next().is_none().then_some(first)
+                    })
+                    .ok_or("temporary mark passage is missing or ambiguous")?
+            };
+            self.open_scene(mark.scene_id)?;
+            self.cursor = editor_position_from_byte(&text, offset)
+                .ok_or("temporary mark offset is not a valid UTF-8 position")?;
+            self.message = format!("Jumped to temporary mark {name}");
+        } else if let Some(name) = cmd.strip_prefix("mark-clear ") {
+            let name = name.trim();
+            if self.ephemeral_marks.remove(name).is_none() {
+                return Err("unknown temporary mark in this terminal session".into());
+            }
+            self.message = format!("Cleared temporary mark {name}");
         } else if cmd == "kill-ring-list" {
             self.message = self
                 .kill_ring
@@ -12879,7 +13008,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu; arrows navigate; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... | event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... | event-relationships EVENT-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | multi-replace START:END[,START:END...] TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expansion-user-set ABBREVIATION => REPLACEMENT | text-expansion-user on|off|list | text-expansion-user-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... | event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... | event-relationships EVENT-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | multi-replace START:END[,START:END...] TEXT | multi-replace-matches TEXT => REPLACEMENT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expansion-user-set ABBREVIATION => REPLACEMENT | text-expansion-user on|off|list | text-expansion-user-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | mark-set NAME | mark-list | mark-jump NAME | mark-clear NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -14864,6 +14993,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.macro_preview.is_some() {
         draw_macro_preview_overlay(f, s);
     }
+    if s.multi_replace_preview.is_some() {
+        draw_multi_replace_preview_overlay(f, s);
+    }
 }
 
 fn draw_macro_preview_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
@@ -14909,6 +15041,55 @@ fn draw_macro_preview_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             .block(
                 Block::default()
                     .title("Proposed macro result")
+                    .borders(Borders::ALL),
+            ),
+        panes[1],
+    );
+}
+
+fn draw_multi_replace_preview_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(preview) = &s.multi_replace_preview else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.min(110);
+    let height = area.height.min(26);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(
+            " Multi-selection Preview · {} matches · Enter apply · Esc cancel ",
+            preview.ranges.len()
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(preview.source.as_str())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Current manuscript")
+                    .borders(Borders::ALL),
+            ),
+        panes[0],
+    );
+    f.render_widget(
+        Paragraph::new(preview.proposed.as_str())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Proposed replacement")
                     .borders(Borders::ALL),
             ),
         panes[1],
@@ -18550,6 +18731,65 @@ fn step_find_query_history(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(preview) = s.multi_replace_preview.clone() {
+        match k.code {
+            KeyCode::Enter => {
+                s.multi_replace_preview = None;
+                let current = s.editor.join("\n");
+                if current != preview.source
+                    || s.editing_scene != preview.scene_id
+                    || s.editing_content_unit != preview.content_unit_id
+                {
+                    s.message =
+                        "Multi-selection preview expired because the active document changed"
+                            .into();
+                    return Ok(false);
+                }
+                if preview.proposed != preview.source {
+                    let snapshot = if preview.ranges.len() > 1 {
+                        if s.dirty {
+                            s.save()?;
+                            if s.dirty {
+                                s.message = "Multi-selection replacement cancelled because the source could not be saved safely".into();
+                                return Ok(false);
+                            }
+                        }
+                        s.app
+                            .git_snapshot("Before simultaneous selection replacement")?
+                    } else {
+                        None
+                    };
+                    s.push_undo();
+                    s.editor = preview.proposed.lines().map(str::to_owned).collect();
+                    if s.editor.is_empty() {
+                        s.editor.push(String::new());
+                    }
+                    let first = preview.ranges.first().expect("preview has matches");
+                    s.cursor =
+                        editor_position_from_byte(&preview.proposed, first.start).unwrap_or((0, 0));
+                    s.editor_selection = None;
+                    s.extra_cursors.clear();
+                    s.dirty = true;
+                    s.update_narrowed_passage(&preview.source);
+                    s.message = format!(
+                        "Applied {} exact match replacements as one undoable edit{}",
+                        preview.ranges.len(),
+                        snapshot
+                            .map(|_| " · pre-change project snapshot created")
+                            .unwrap_or("")
+                    );
+                } else {
+                    s.message = "Preview contained no content changes".into();
+                }
+            }
+            KeyCode::Esc => {
+                s.multi_replace_preview = None;
+                s.message = "Cancelled multi-selection replacement; manuscript unchanged".into();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if let Some(preview) = s.macro_preview.clone() {
         match k.code {
             KeyCode::Enter => {
@@ -21322,6 +21562,53 @@ mod tests {
     }
 
     #[test]
+    fn temporary_marks_navigate_during_session_but_do_not_persist() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Marks"), "Marks").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let (_, hash) = app.load_scene_text(first).unwrap();
+        app.save_scene_text(first, Some(&hash), "Road before the bridge.\nNext line.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(first).unwrap();
+        state.cursor = (0, 0);
+        state
+            .execute_legacy_palette_command("mark-set bridge")
+            .unwrap();
+        assert!(state.message.contains("temporary"));
+        assert_eq!(state.ephemeral_marks.len(), 1);
+
+        state.open_scene(second).unwrap();
+        state
+            .execute_legacy_palette_command("mark-jump bridge")
+            .unwrap();
+        assert_eq!(state.editing_scene, Some(first));
+        assert_eq!(state.cursor, (0, 0));
+        state.execute_legacy_palette_command("mark-list").unwrap();
+        assert!(state.message.contains("bridge"));
+        state
+            .execute_legacy_palette_command("mark-clear bridge")
+            .unwrap();
+        assert!(state.ephemeral_marks.is_empty());
+
+        state
+            .execute_legacy_palette_command("mark-set bridge")
+            .unwrap();
+        let mut reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        assert!(reopened.ephemeral_marks.is_empty());
+        assert!(
+            reopened
+                .execute_legacy_palette_command("mark-jump bridge")
+                .is_err()
+        );
+    }
+
+    #[test]
     fn kill_ring_persists_and_yank_pop_is_undoable() {
         let root = tempfile::tempdir().unwrap();
         let project =
@@ -21570,8 +21857,19 @@ mod tests {
             .join(",");
         state.prompt = format!("multi-replace {selections} Hero");
         state.command().unwrap();
+        assert_eq!(state.editor.join("\n"), original);
+        assert!(state.multi_replace_preview.is_some());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
         assert_eq!(state.editor, ["Heroe\u{301} here", "Hero there"]);
-        assert!(state.message.contains("2 grapheme-bounded selections"));
+        assert!(
+            state
+                .message
+                .contains("pre-change project snapshot created")
+        );
         state.undo_edit();
         assert_eq!(state.editor.join("\n"), original);
 
@@ -21582,6 +21880,11 @@ mod tests {
 
         state.prompt = format!("multi-replace {selections} Hero");
         state.command().unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
         state.save().unwrap();
         drop(state);
         let reopened = WriterApp::open_project(project_path).unwrap();
@@ -21590,6 +21893,73 @@ mod tests {
             "Heroe\u{301} here\nHero there"
         );
         assert_eq!(reopened.load_scene_text(second).unwrap().0, "other scene");
+    }
+
+    #[test]
+    fn matching_passages_preview_cancel_and_apply_as_one_undoable_edit() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Matches"), "Matches").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["🙂 cat, cat and e\u{301} cat".into()];
+        state.dirty = true;
+        let original = state.editor.join("\n");
+
+        state.prompt = "multi-replace-matches cat => feline".into();
+        state.command().unwrap();
+        assert_eq!(state.editor.join("\n"), original);
+        assert_eq!(
+            state.multi_replace_preview.as_ref().unwrap().ranges.len(),
+            3
+        );
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(visible.contains("Current manuscript"));
+        assert!(visible.contains("Proposed replacement"));
+        assert!(visible.contains("feline"));
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.multi_replace_preview.is_none());
+        assert_eq!(state.editor.join("\n"), original);
+
+        state.prompt = "multi-replace-matches cat => feline".into();
+        state.command().unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor, ["🙂 feline, feline and e\u{301} feline"]);
+        assert!(
+            state
+                .app
+                .git_history(5)
+                .unwrap()
+                .iter()
+                .any(|commit| commit.subject == "Before simultaneous selection replacement")
+        );
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), original);
+
+        state.prompt = "multi-replace-matches cat => feline".into();
+        state.command().unwrap();
+        state.editor[0].push_str(" changed");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor, ["🙂 cat, cat and e\u{301} cat changed"]);
+        assert!(state.message.contains("preview expired"));
     }
 
     #[test]
@@ -22486,10 +22856,12 @@ mod tests {
             user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -25292,10 +25664,12 @@ mod tests {
             user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -25414,10 +25788,12 @@ mod tests {
             user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -25528,10 +25904,12 @@ mod tests {
             user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -25654,10 +26032,12 @@ mod tests {
             user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -25930,10 +26310,12 @@ mod tests {
             user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -26056,10 +26438,12 @@ mod tests {
             user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -26199,10 +26583,12 @@ mod tests {
             user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -26460,10 +26846,12 @@ mod tests {
             user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -26856,10 +27244,12 @@ mod tests {
             user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -26993,10 +27383,12 @@ mod tests {
             user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -27182,10 +27574,12 @@ mod tests {
             user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
+            ephemeral_marks: BTreeMap::new(),
             kill_ring: Vec::new(),
             kill_ring_index: 0,
             last_yank: None,
             macro_preview: None,
+            multi_replace_preview: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
