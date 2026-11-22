@@ -642,7 +642,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 8] = [
         "extract.propose",
         "story-template-list",
     ],
-    &["help.context"],
+    &["help.resume-tutorial", "help.context"],
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1338,9 +1338,9 @@ fn command_registry() -> Vec<CommandSpec> {
         CommandSpec {
             id: "help.resume-tutorial",
             label: "Resume Tutorial",
-            description: "Resume the saved guided tutorial in its disposable sample project",
+            description: "Start the tutorial or return to the saved lesson in its disposable sample project",
             category: "Help",
-            default_shortcuts: &[],
+            default_shortcuts: &["Ctrl+Shift+R"],
             mnemonic: Some('t'),
             palette_aliases: &["tutorial", "resume-tutorial"],
             palette_prefix: None,
@@ -3406,6 +3406,7 @@ fn is_early_command(action: CommandAction) -> bool {
             | CommandAction::OpenMainMenu
             | CommandAction::OpenMenuCategory(_)
             | CommandAction::Help
+            | CommandAction::ResumeTutorial
             | CommandAction::Workspace(_)
     )
 }
@@ -5059,7 +5060,7 @@ impl AppState {
                     onboarding::TutorialTrack::QuickStart => 3,
                     onboarding::TutorialTrack::GuidedTour => 6,
                 };
-                format!("Tutorial {}/{} · Help/Resume", progress.step + 1, total)
+                format!("Tutorial {}/{}", progress.step + 1, total)
             });
     }
 
@@ -5187,7 +5188,7 @@ impl AppState {
                         onboarding::TutorialTrack::QuickStart => 3,
                         onboarding::TutorialTrack::GuidedTour => 6,
                     };
-                    format!("Tutorial {}/{} · Help/Resume", progress.step + 1, total)
+                    format!("Tutorial {}/{}", progress.step + 1, total)
                 }),
             command_palette: None,
             history: vec![Workspace::Dashboard],
@@ -8584,7 +8585,8 @@ impl AppState {
         Ok(())
     }
     fn resume_tutorial(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        self.resume_tutorial_at(&user_tutorial_preferences_path())
+        let preferences_path = self.tutorial_preferences_path.clone();
+        self.resume_tutorial_at(&preferences_path)
     }
     fn resume_tutorial_at(
         &mut self,
@@ -8598,7 +8600,11 @@ impl AppState {
             onboarding::store(&preferences_path, &preferences)?;
         }
         let Some(progress) = preferences.active_tutorial else {
-            return self.begin_tutorial(onboarding::TutorialTrack::GuidedTour);
+            return self.begin_tutorial_at(
+                onboarding::TutorialTrack::GuidedTour,
+                user_tutorial_project_path(),
+                preferences_path,
+            );
         };
         let demo_path = PathBuf::from(&progress.demo_project);
         let current_path = self.app.project_root().canonicalize().ok();
@@ -9597,7 +9603,11 @@ impl AppState {
                 }
             }
             CommandAction::ShowWelcome => self.show_welcome()?,
-            CommandAction::ResumeTutorial => self.resume_tutorial()?,
+            CommandAction::ResumeTutorial => {
+                self.menu = None;
+                self.command_palette = None;
+                self.resume_tutorial()?;
+            }
             CommandAction::RestartTutorial => self.restart_tutorial()?,
             CommandAction::ResolveSaveConflict => {
                 self.mode = Some('R');
@@ -16430,6 +16440,15 @@ fn display_shortcut_label(label: String) -> String {
     label.replace("Ctrl+/", "hold Ctrl, press /")
 }
 
+fn tutorial_footer_status(state: &AppState) -> Option<String> {
+    state.tutorial_progress_label.as_ref().map(|progress| {
+        format!(
+            "{progress} · Resume {}",
+            effective_shortcut_label(state, "help.resume-tutorial", "Ctrl+Shift+R")
+        )
+    })
+}
+
 fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     let area = f.area();
     s.planning_board_area = None;
@@ -17266,17 +17285,21 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             } else {
                 "Tab destinations"
             };
-            let status = format!(
-                " Active:{focus} · {} · Save {} · Menu {} · Help {} · {pane_hint}{}",
-                if s.dirty { "UNSAVED" } else { "saved" },
-                effective_shortcut_label(s, "file.save", "Ctrl+S"),
-                effective_shortcut_label(s, "menu.main", "F10"),
-                effective_shortcut_label(s, "help.context", "Help menu"),
-                s.tutorial_progress_label
-                    .as_ref()
-                    .map(|label| format!(" · {label}"))
-                    .unwrap_or_default()
-            );
+            let status = if let Some(tutorial) = tutorial_footer_status(s) {
+                format!(
+                    " Active:{focus} · {} · Save {} · {tutorial}",
+                    if s.dirty { "UNSAVED" } else { "saved" },
+                    effective_shortcut_label(s, "file.save", "Ctrl+S")
+                )
+            } else {
+                format!(
+                    " Active:{focus} · {} · Save {} · Menu {} · Help {} · {pane_hint}",
+                    if s.dirty { "UNSAVED" } else { "saved" },
+                    effective_shortcut_label(s, "file.save", "Ctrl+S"),
+                    effective_shortcut_label(s, "menu.main", "F10"),
+                    effective_shortcut_label(s, "help.context", "Help menu")
+                )
+            };
             f.render_widget(Paragraph::new(status), sections[2]);
             String::new()
         } else {
@@ -17297,28 +17320,36 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             } else {
                 format!(" · {challenge}")
             };
-            format!(
-                " Active:{}{} · Menu {} · Help {} · Save {} · q quit · {}{} · {}",
-                if s.menu.is_some() {
-                    "menu"
-                } else if s.reference_focused {
-                    "reference"
-                } else if s.workspace == Workspace::Editor {
-                    "manuscript"
-                } else {
-                    "navigation"
-                },
-                s.tutorial_progress_label
-                    .as_ref()
-                    .map(|label| format!(" · {label}"))
-                    .unwrap_or_default(),
-                effective_shortcut_label(s, "menu.main", "F10"),
-                effective_shortcut_label(s, "help.context", "Help menu"),
-                effective_shortcut_label(s, "file.save", "unbound"),
-                if s.dirty { "unsaved" } else { "saved" },
-                challenge,
-                s.message,
-            )
+            if let Some(tutorial) = tutorial_footer_status(s) {
+                format!(
+                    " {tutorial} · F10 Menu · Tab: destinations · {}{}",
+                    if s.dirty { "unsaved" } else { "saved" },
+                    if s.message.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" · {}", s.message)
+                    }
+                )
+            } else {
+                format!(
+                    " Active:{} · Menu {} · Help {} · Save {} · q quit · {}{} · {}",
+                    if s.menu.is_some() {
+                        "menu"
+                    } else if s.reference_focused {
+                        "reference"
+                    } else if s.workspace == Workspace::Editor {
+                        "manuscript"
+                    } else {
+                        "navigation"
+                    },
+                    effective_shortcut_label(s, "menu.main", "F10"),
+                    effective_shortcut_label(s, "help.context", "Help menu"),
+                    effective_shortcut_label(s, "file.save", "unbound"),
+                    if s.dirty { "unsaved" } else { "saved" },
+                    challenge,
+                    s.message,
+                )
+            }
         };
         if s.mode.is_none() && s.workspace != Workspace::Editor {
             f.render_widget(
@@ -17382,24 +17413,25 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             } else {
                 "Tab: destinations"
             };
-            let tutorial = s
-                .tutorial_progress_label
-                .as_ref()
-                .map(|label| format!(" · {label}"))
-                .unwrap_or_default();
             let menu_hint = display_shortcut_label(effective_shortcut_label(s, "menu.main", "F10"));
-            let actions = format!(
-                " {} · Save {} · Menu {} · Help {} · {pane_hint}{}",
-                if s.message.is_empty() {
-                    ""
-                } else {
-                    s.message.as_str()
-                },
-                effective_shortcut_label(s, "file.save", "Ctrl+S"),
-                menu_hint,
-                effective_shortcut_label(s, "help.context", "Help menu"),
-                tutorial
-            );
+            let actions = if let Some(tutorial) = tutorial_footer_status(s) {
+                format!(
+                    " Save {} · Esc: Outline · {tutorial}",
+                    effective_shortcut_label(s, "file.save", "Ctrl+S")
+                )
+            } else {
+                format!(
+                    " {} · Save {} · Menu {} · Help {} · {pane_hint}",
+                    if s.message.is_empty() {
+                        ""
+                    } else {
+                        s.message.as_str()
+                    },
+                    effective_shortcut_label(s, "file.save", "Ctrl+S"),
+                    menu_hint,
+                    effective_shortcut_label(s, "help.context", "Help menu")
+                )
+            };
             f.render_widget(Paragraph::new(actions), footer_rows[1]);
         }
     }
@@ -18843,7 +18875,12 @@ fn menu_command_row(state: &AppState, command: CommandSpec, width: usize) -> Str
         .map(|key| format!(" [{key}]"))
         .unwrap_or_default();
     let arguments = if command.takes_arguments { " …" } else { "" };
-    let label = format!("{}{}{}", command.label, mnemonic, arguments);
+    let label = format!(
+        "{}{}{}",
+        displayed_command_label(state, command),
+        mnemonic,
+        arguments
+    );
     let shortcuts = effective_command_shortcuts(state, command);
     let shortcut = match shortcuts.as_slice() {
         [] => String::new(),
@@ -18859,6 +18896,17 @@ fn menu_command_row(state: &AppState, command: CommandSpec, width: usize) -> Str
         (truncate_display_cells(&label, width), String::new())
     };
     format!("{label}{shortcut}")
+}
+
+fn displayed_command_label(state: &AppState, command: CommandSpec) -> String {
+    if command.id != "help.resume-tutorial" {
+        return command.label.to_owned();
+    }
+    match onboarding::load(&state.tutorial_preferences_path) {
+        Ok(preferences) if preferences.active_tutorial.is_some() => "Resume Tutorial".into(),
+        Ok(preferences) if preferences.tutorial_completed => "Restart Tutorial".into(),
+        _ => "Start Tutorial".into(),
+    }
 }
 
 fn truncate_display_cells(text: &str, max_width: usize) -> String {
@@ -33722,6 +33770,12 @@ mod tests {
         ] {
             assert_eq!(command_by_id(id).unwrap().category, "Help");
         }
+        assert_eq!(
+            command_by_id("help.resume-tutorial")
+                .unwrap()
+                .default_shortcuts,
+            &["Ctrl+Shift+R"]
+        );
 
         handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
 
@@ -33756,6 +33810,116 @@ mod tests {
     }
 
     #[test]
+    fn help_menu_resumes_active_tutorial_by_command_and_shortcut_without_losing_edits() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let preferences_path = directory.path().join("preferences/tutorial-state.json");
+        let demo_path = directory.path().join("tutorial-sample");
+        let mut state = AppState::new(app, default_bindings());
+        state.tutorial_preferences_path = preferences_path.clone();
+
+        state.menu = Some(MenuState {
+            top: MENU_CATEGORIES.len() - 1,
+            selected: 0,
+            all_commands: false,
+            group: None,
+        });
+        let command = state.menu_commands()[0];
+        assert_eq!(command.id, "help.resume-tutorial");
+        assert_eq!(displayed_command_label(&state, command), "Start Tutorial");
+        let row = menu_command_row(&state, command, 56);
+        assert!(row.contains("Start Tutorial"), "{row}");
+        assert!(row.contains("Ctrl+Shift+R"), "{row}");
+
+        let completed = onboarding::Preferences {
+            version: onboarding::PREFERENCES_VERSION,
+            tutorial_completed: true,
+            ..onboarding::Preferences::default()
+        };
+        onboarding::store(&preferences_path, &completed).unwrap();
+        assert_eq!(displayed_command_label(&state, command), "Restart Tutorial");
+
+        state
+            .begin_tutorial_at(
+                onboarding::TutorialTrack::GuidedTour,
+                demo_path,
+                preferences_path.clone(),
+            )
+            .unwrap();
+        state.help_panel = None;
+        let scene = state.app.list_scenes(false).unwrap()[0].scene.id;
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["Unsaved sentence stays here.".into()];
+        state.dirty = true;
+        state.menu = Some(MenuState {
+            top: MENU_CATEGORIES.len() - 1,
+            selected: 0,
+            all_commands: false,
+            group: None,
+        });
+        let resume = state.menu_commands()[0];
+        assert_eq!(displayed_command_label(&state, resume), "Resume Tutorial");
+        assert!(menu_command_row(&state, resume, 56).contains("Ctrl+Shift+R"));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let menu_screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(menu_screen.contains("Resume Tutorial"));
+        assert!(menu_screen.contains("Ctrl+Shift+R"));
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.menu.is_none());
+        assert_eq!(state.editor, ["Unsaved sentence stays here."]);
+        assert!(state.dirty);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let tutorial_screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(tutorial_screen.contains("Resume Ctrl+Shift+R"));
+        assert!(!tutorial_screen.contains("Help/Resume"));
+        assert_eq!(
+            state.help_panel.as_ref().unwrap().title,
+            "Tutorial · Find your way around · 1/6"
+        );
+        assert_eq!(
+            tutorial_footer_status(&state).as_deref(),
+            Some("Tutorial 1/6 · Resume Ctrl+Shift+R")
+        );
+
+        state.help_panel = None;
+        handle(
+            &mut state,
+            KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            state.help_panel.as_ref().unwrap().title,
+            "Tutorial · Find your way around · 1/6"
+        );
+        assert_eq!(state.editor, ["Unsaved sentence stays here."]);
+        assert!(state.dirty);
+    }
+
+    #[test]
     fn help_is_reachable_from_dirty_quit_dialogue_via_f10_menu_and_returns_to_dialogue() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -33780,7 +33944,8 @@ mod tests {
             .unwrap();
         }
         assert_eq!(state.menu.unwrap().top, MENU_CATEGORIES.len() - 1);
-        assert_eq!(state.menu_commands()[0].id, "help.context");
+        assert_eq!(state.menu_commands()[1].id, "help.context");
+        state.menu.as_mut().unwrap().selected = 1;
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
