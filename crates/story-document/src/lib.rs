@@ -1774,6 +1774,52 @@ output = "exports/old.md"
     }
 
     #[test]
+    fn semantic_projection_covers_the_declared_markdown_subset_deterministically() {
+        let source = "# Heading\n\nPlain [link](https://example.test \"title\") and ![alt](figure.png) with `code` and ~~deleted~~.\n\n- [x] checked\n- [ ] pending\n\n> quoted\n\nA hard break.  \nNext line.\n\n| Name | Value |\n| --- | --- |\n| Élodie | 2 |\n\n---\n\n[^note]: note text\n\n<aside>raw HTML</aside>\n";
+        let first = SemanticDocument::parse(source);
+        let second = SemanticDocument::parse(source);
+        assert_eq!(first, second);
+        assert_eq!(first.to_markdown(), source);
+        assert!(first.validate_ranges());
+
+        let has = |predicate: fn(&SemanticKind) -> bool| {
+            first.nodes.iter().any(|node| predicate(&node.kind))
+        };
+        assert!(has(|kind| matches!(
+            kind,
+            SemanticKind::Heading { level: 1 }
+        )));
+        assert!(has(|kind| matches!(kind, SemanticKind::Paragraph)));
+        assert!(has(|kind| matches!(kind, SemanticKind::Link { .. })));
+        assert!(has(|kind| matches!(kind, SemanticKind::Image { .. })));
+        assert!(has(|kind| matches!(kind, SemanticKind::InlineCode { .. })));
+        assert!(has(|kind| matches!(kind, SemanticKind::Strikethrough)));
+        assert!(has(|kind| matches!(
+            kind,
+            SemanticKind::TaskListMarker { checked: true }
+        )));
+        assert!(has(|kind| matches!(
+            kind,
+            SemanticKind::TaskListMarker { checked: false }
+        )));
+        assert!(has(|kind| matches!(kind, SemanticKind::BlockQuote)));
+        assert!(has(|kind| matches!(kind, SemanticKind::HardBreak)));
+        assert!(has(|kind| matches!(kind, SemanticKind::Table)));
+        assert!(has(|kind| matches!(kind, SemanticKind::TableCell)));
+        assert!(has(|kind| matches!(kind, SemanticKind::Rule)));
+        assert!(has(|kind| matches!(
+            kind,
+            SemanticKind::FootnoteDefinition { .. }
+        )));
+        assert!(has(|kind| matches!(kind, SemanticKind::Html { .. })));
+        assert!(first.nodes.iter().all(|node| {
+            source.is_char_boundary(node.source.start)
+                && source.is_char_boundary(node.source.end)
+                && node.parent.is_none_or(|parent| parent < first.nodes.len())
+        }));
+    }
+
+    #[test]
     fn compile_ir_is_ordered_renderer_neutral_and_maps_unicode_source_segments() {
         let text = "Mara — then left.";
         let mut ir = CompileIr::new("Novel");
