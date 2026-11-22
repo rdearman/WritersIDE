@@ -1640,6 +1640,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 thread::sleep(Duration::from_millis(poll_ms));
             }
         }
+        "compile-recovery" => {
+            let project = args.next().ok_or("missing project path")?;
+            let action = args.next().as_deref().unwrap_or("status").to_owned();
+            let app = WriterApp::open_project(project)?;
+            let notice = match action.as_str() {
+                "status" => app.compile_recovery_notice(),
+                "retry" => app.retry_compile_publication_recovery()?,
+                _ => return Err("compile-recovery action must be status or retry".into()),
+            };
+            if let Some(notice) = notice {
+                println!("Recovery requires review: {notice}");
+            } else {
+                println!("No pending Compile output recovery");
+            }
+        }
         "compile" => {
             let project = args.next().ok_or("missing project path")?;
             let format_name = args
@@ -3074,6 +3089,7 @@ fn usage() {
         "writers-ide compile <project> <text|markdown|latex|html|epub|docx|pdf|odt|rtf|azw3|mobi (legacy)> [output] [--overwrite] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"
     );
     eprintln!("writers-ide compile-check <project>");
+    eprintln!("writers-ide compile-recovery <project> [status|retry]");
     eprintln!(
         "writers-ide compile-config <project> <list|results|create <preset> [name>|run <name> [--overwrite]|all [--overwrite]|rebuild <name>|clean <name|all> --yes>"
     );

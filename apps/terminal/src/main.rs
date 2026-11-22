@@ -3369,11 +3369,16 @@ impl AppState {
                 tools_error
             }
         });
-        let message = [existing_notice, replacement_recovery_notice]
-            .into_iter()
-            .filter(|notice| !notice.is_empty())
-            .collect::<Vec<_>>()
-            .join(" · ");
+        let compile_recovery_notice = app.compile_recovery_notice().unwrap_or_default();
+        let message = [
+            existing_notice,
+            replacement_recovery_notice,
+            compile_recovery_notice,
+        ]
+        .into_iter()
+        .filter(|notice| !notice.is_empty())
+        .collect::<Vec<_>>()
+        .join(" · ");
         Self {
             app,
             workspace: Workspace::Dashboard,

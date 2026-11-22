@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     fs,
@@ -74,6 +75,122 @@ struct ManagedCompileManifest {
 struct ManagedCompileArtifact {
     path: String,
     sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum CompilePublicationState {
+    Prepared,
+    Committed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+enum CompilePublicationPath {
+    ProjectRelative(PathBuf),
+    Absolute(PathBuf),
+}
+
+impl CompilePublicationPath {
+    fn store(path: &Path, project_root: &Path) -> Self {
+        match path.strip_prefix(project_root) {
+            Ok(relative) => Self::ProjectRelative(relative.to_path_buf()),
+            Err(_) => Self::Absolute(path.to_path_buf()),
+        }
+    }
+
+    fn resolve(&self, project_root: &Path) -> PathBuf {
+        match self {
+            Self::ProjectRelative(path) => project_root.join(path),
+            Self::Absolute(path) => path.clone(),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self {
+            Self::ProjectRelative(path)
+                if path.is_absolute()
+                    || path
+                        .components()
+                        .any(|component| !matches!(component, std::path::Component::Normal(_))) =>
+            {
+                Err(AppError::Domain(
+                    "Compile recovery journal contains an unsafe project-relative path".into(),
+                ))
+            }
+            Self::Absolute(path) if !path.is_absolute() => Err(AppError::Domain(
+                "Compile recovery journal contains a non-absolute external path".into(),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct CompilePublicationFile {
+    destination: CompilePublicationPath,
+    staged: CompilePublicationPath,
+    backup: CompilePublicationPath,
+    previous_sha256: Option<String>,
+    proposed_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct CompilePublicationJournal {
+    version: u16,
+    project_id: String,
+    transaction_id: String,
+    state: CompilePublicationState,
+    files: Vec<CompilePublicationFile>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CompilePublishFailpoint {
+    IntentWritten,
+    OutputPublished(usize),
+    CommitWritten,
+}
+
+fn compile_sha256(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn file_sha256(path: &Path) -> Result<Option<String>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(compile_sha256(&bytes))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AppError::Domain(format!(
+            "read Compile recovery file {}: {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn sync_output_directory(path: &Path) -> Result<()> {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            AppError::Domain(format!(
+                "synchronize Compile output directory {}: {error}",
+                path.display()
+            ))
+        })
+}
+
+fn compile_publication_journal_path(project_root: &Path) -> PathBuf {
+    project_root.join(".writers-ide/recovery/compile-publication.json")
+}
+
+fn remove_compile_journal_file(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(AppError::Domain(format!(
+                "remove Compile recovery file {}: {error}",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn write_project_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -226,85 +343,305 @@ fn compile_source_map_bytes(
     .map_err(|error| AppError::Domain(format!("serialize compile source map: {error}")))
 }
 
-fn publish_compile_file_set(files: &[(PathBuf, Vec<u8>)]) -> Result<()> {
-    let mut prepared = Vec::new();
-    for (destination, bytes) in files {
+fn publish_compile_file_set(
+    project_root: &Path,
+    project_id: ProjectId,
+    files: &[(PathBuf, Vec<u8>)],
+) -> Result<()> {
+    publish_compile_file_set_with_failpoint(project_root, project_id, files, None)
+}
+
+fn publish_compile_file_set_with_failpoint(
+    project_root: &Path,
+    project_id: ProjectId,
+    files: &[(PathBuf, Vec<u8>)],
+    failpoint: Option<CompilePublishFailpoint>,
+) -> Result<()> {
+    let project_root = project_root
+        .canonicalize()
+        .map_err(|error| AppError::Domain(format!("resolve project root: {error}")))?;
+    let transaction_id = uuid::Uuid::new_v4().to_string();
+    let mut journal_files = Vec::with_capacity(files.len());
+    let mut touched_directories = std::collections::BTreeSet::new();
+
+    for (index, (destination, bytes)) in files.iter().enumerate() {
         let parent = destination
             .parent()
             .ok_or_else(|| AppError::Domain("Compile output has no parent directory".into()))?;
         fs::create_dir_all(parent).map_err(|error| {
             AppError::Domain(format!("create Compile output directory: {error}"))
         })?;
-        let previous = match fs::symlink_metadata(destination) {
-            Ok(metadata) if metadata.is_file() => Some(fs::read(destination).map_err(|error| {
-                AppError::Domain(format!("read prior Compile output for rollback: {error}"))
-            })?),
+        let parent = parent.canonicalize().map_err(|error| {
+            AppError::Domain(format!("resolve Compile output directory: {error}"))
+        })?;
+        let file_name = destination
+            .file_name()
+            .ok_or_else(|| AppError::Domain("Compile output has no file name".into()))?;
+        let destination = parent.join(file_name);
+        let (previous_sha256, previous_exists) = match fs::symlink_metadata(&destination) {
+            Ok(metadata) if metadata.is_file() => (
+                Some(compile_sha256(&fs::read(&destination).map_err(
+                    |error| {
+                        AppError::Domain(format!("read prior Compile output for recovery: {error}"))
+                    },
+                )?)),
+                true,
+            ),
             Ok(_) => {
                 return Err(AppError::Domain(format!(
                     "Compile output is not a regular file: {}",
                     destination.display()
                 )));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, false),
             Err(error) => {
                 return Err(AppError::Domain(format!(
                     "inspect prior Compile output: {error}"
                 )));
             }
         };
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)
-            .map_err(|error| AppError::Domain(format!("stage Compile output: {error}")))?;
+        let stage_path = parent.join(format!(".writers-ide-compile-{transaction_id}-{index}.new"));
+        let backup_path = parent.join(format!(".writers-ide-compile-{transaction_id}-{index}.old"));
         use std::io::Write;
-        temporary
+        let mut staged = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&stage_path)
+            .map_err(|error| AppError::Domain(format!("stage Compile output: {error}")))?;
+        staged
             .write_all(bytes)
-            .and_then(|()| temporary.as_file().sync_all())
+            .and_then(|()| staged.sync_all())
             .map_err(|error| AppError::Domain(format!("write staged Compile output: {error}")))?;
-        prepared.push((destination.clone(), previous, temporary));
-    }
-
-    let mut published: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
-    for (destination, previous, temporary) in prepared {
-        if let Err(error) = temporary.persist(&destination) {
-            let publish_error = error.error;
-            let mut rollback_errors = Vec::new();
-            for (path, previous) in published.iter().rev() {
-                let rollback = match previous {
-                    Some(bytes) => write_project_file_atomically(path, bytes),
-                    None => match fs::remove_file(path) {
-                        Ok(()) => Ok(()),
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                        Err(error) => Err(AppError::Domain(format!(
-                            "remove partial Compile output {}: {error}",
-                            path.display()
-                        ))),
-                    },
-                };
-                if let Err(error) = rollback {
-                    rollback_errors.push(error.to_string());
-                }
-            }
-            let detail = if rollback_errors.is_empty() {
-                "previous output set restored".to_owned()
-            } else {
-                format!("rollback incomplete: {}", rollback_errors.join("; "))
-            };
-            return Err(AppError::Domain(format!(
-                "publish Compile output {} failed: {publish_error}; {detail}",
-                destination.display()
-            )));
-        }
-        published.push((destination, previous));
-    }
-    for (destination, _) in published {
-        if let Some(parent) = destination.parent() {
-            fs::File::open(parent)
-                .and_then(|directory| directory.sync_all())
+        if previous_exists {
+            fs::copy(&destination, &backup_path).map_err(|error| {
+                AppError::Domain(format!("stage Compile rollback copy: {error}"))
+            })?;
+            fs::File::open(&backup_path)
+                .and_then(|backup| backup.sync_all())
                 .map_err(|error| {
-                    AppError::Domain(format!("sync Compile output directory: {error}"))
+                    AppError::Domain(format!("sync Compile rollback copy: {error}"))
                 })?;
         }
+        sync_output_directory(&parent)?;
+        touched_directories.insert(parent.clone());
+        journal_files.push(CompilePublicationFile {
+            destination: CompilePublicationPath::store(&destination, &project_root),
+            staged: CompilePublicationPath::store(&stage_path, &project_root),
+            backup: CompilePublicationPath::store(&backup_path, &project_root),
+            previous_sha256,
+            proposed_sha256: compile_sha256(bytes),
+        });
     }
+
+    let journal_path = compile_publication_journal_path(&project_root);
+    reject_project_symlink_components(
+        &project_root,
+        ".writers-ide/recovery/compile-publication.json",
+    )?;
+    if journal_path.exists() {
+        return Err(AppError::Domain(
+            "a Compile output recovery journal already exists; inspect it before publishing".into(),
+        ));
+    }
+    let mut journal = CompilePublicationJournal {
+        version: 1,
+        project_id: project_id.to_string(),
+        transaction_id: transaction_id.clone(),
+        state: CompilePublicationState::Prepared,
+        files: journal_files,
+    };
+    let serialized = serde_json::to_vec_pretty(&journal)
+        .map_err(|error| AppError::Domain(format!("serialize Compile recovery intent: {error}")))?;
+    write_project_file_atomically(&journal_path, &serialized)?;
+    if failpoint == Some(CompilePublishFailpoint::IntentWritten) {
+        return Err(AppError::Domain(
+            "injected failure after Compile recovery intent".into(),
+        ));
+    }
+
+    for (index, file) in journal.files.iter().enumerate() {
+        let destination = file.destination.resolve(&project_root);
+        let staged = file.staged.resolve(&project_root);
+        fs::rename(&staged, &destination).map_err(|error| {
+            AppError::Domain(format!(
+                "publish Compile output {} with recovery journal retained: {error}",
+                destination.display()
+            ))
+        })?;
+        let parent = destination
+            .parent()
+            .ok_or_else(|| AppError::Domain("Compile output has no parent directory".into()))?;
+        sync_output_directory(parent)?;
+        if failpoint == Some(CompilePublishFailpoint::OutputPublished(index)) {
+            return Err(AppError::Domain(format!(
+                "injected failure after Compile output {index}; recovery journal retained"
+            )));
+        }
+    }
+
+    journal.state = CompilePublicationState::Committed;
+    let serialized = serde_json::to_vec_pretty(&journal)
+        .map_err(|error| AppError::Domain(format!("serialize Compile commit record: {error}")))?;
+    write_project_file_atomically(&journal_path, &serialized)?;
+    if failpoint == Some(CompilePublishFailpoint::CommitWritten) {
+        return Err(AppError::Domain(
+            "injected failure after Compile commit record; cleanup journal retained".into(),
+        ));
+    }
+    for file in &journal.files {
+        remove_compile_journal_file(&file.backup.resolve(&project_root))?;
+        remove_compile_journal_file(&file.staged.resolve(&project_root))?;
+    }
+    for directory in touched_directories {
+        sync_output_directory(&directory)?;
+    }
+    remove_compile_journal_file(&journal_path)?;
+    sync_output_directory(journal_path.parent().unwrap())?;
     Ok(())
+}
+
+fn recover_compile_file_set(project_root: &Path, project_id: ProjectId) -> Result<Option<String>> {
+    let project_root = project_root
+        .canonicalize()
+        .map_err(|error| AppError::Domain(format!("resolve project root: {error}")))?;
+    let journal_path = compile_publication_journal_path(&project_root);
+    reject_project_symlink_components(
+        &project_root,
+        ".writers-ide/recovery/compile-publication.json",
+    )?;
+    let journal = match fs::read(&journal_path) {
+        Ok(bytes) => {
+            serde_json::from_slice::<CompilePublicationJournal>(&bytes).map_err(|error| {
+                AppError::Domain(format!("invalid Compile recovery journal: {error}"))
+            })?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(AppError::Domain(format!(
+                "read Compile recovery journal: {error}"
+            )));
+        }
+    };
+    if journal.version != 1 || journal.files.is_empty() {
+        return Err(AppError::Domain(
+            "unsupported or empty Compile recovery journal".into(),
+        ));
+    }
+    if journal.project_id != project_id.to_string() {
+        return Err(AppError::Domain(
+            "Compile recovery journal belongs to a different project identity".into(),
+        ));
+    }
+    let transaction = uuid::Uuid::parse_str(&journal.transaction_id)
+        .map_err(|_| AppError::Domain("invalid Compile recovery transaction ID".into()))?;
+    let transaction = transaction.to_string();
+    let mut resolved = Vec::with_capacity(journal.files.len());
+    for (index, file) in journal.files.iter().enumerate() {
+        file.destination.validate()?;
+        file.staged.validate()?;
+        file.backup.validate()?;
+        if let CompilePublicationPath::ProjectRelative(relative) = &file.destination
+            && (relative.starts_with("manuscript")
+                || relative.starts_with(".writers-ide")
+                || relative == Path::new("project.toml")
+                || relative == Path::new("story.db"))
+        {
+            return Err(AppError::Domain(
+                "Compile recovery journal targets protected project data".into(),
+            ));
+        }
+        let destination = file.destination.resolve(&project_root);
+        let staged = file.staged.resolve(&project_root);
+        let backup = file.backup.resolve(&project_root);
+        let parent = destination
+            .parent()
+            .ok_or_else(|| AppError::Domain("Compile recovery target has no parent".into()))?;
+        if staged.parent() != Some(parent)
+            || backup.parent() != Some(parent)
+            || staged.file_name().and_then(|name| name.to_str())
+                != Some(format!(".writers-ide-compile-{transaction}-{index}.new").as_str())
+            || backup.file_name().and_then(|name| name.to_str())
+                != Some(format!(".writers-ide-compile-{transaction}-{index}.old").as_str())
+        {
+            return Err(AppError::Domain(
+                "Compile recovery journal paths are invalid".into(),
+            ));
+        }
+        reject_absolute_symlink_components(&destination)?;
+        resolved.push((file, destination, staged, backup));
+    }
+
+    let mut conflicts = Vec::new();
+    for (index, (file, destination, _, backup)) in resolved.iter().enumerate() {
+        let current = file_sha256(destination)?;
+        match journal.state {
+            CompilePublicationState::Prepared => {
+                let is_previous = current == file.previous_sha256;
+                let is_proposed = current.as_deref() == Some(file.proposed_sha256.as_str());
+                if !is_previous && !is_proposed {
+                    conflicts.push(format!("output {index}: {}", destination.display()));
+                } else if is_proposed
+                    && file.previous_sha256.is_some()
+                    && file_sha256(backup)?.as_deref() != file.previous_sha256.as_deref()
+                {
+                    conflicts.push(format!(
+                        "missing or changed rollback copy {index}: {}",
+                        backup.display()
+                    ));
+                }
+            }
+            CompilePublicationState::Committed => {
+                if current.as_deref() != Some(file.proposed_sha256.as_str()) {
+                    conflicts.push(format!(
+                        "committed output changed {index}: {}",
+                        destination.display()
+                    ));
+                }
+            }
+        }
+    }
+    if !conflicts.is_empty() {
+        return Ok(Some(format!(
+            "Compile output recovery found external or conflicting versions; all versions were preserved. Review {0} and targets: {1}",
+            journal_path.display(),
+            conflicts.join(", ")
+        )));
+    }
+
+    match journal.state {
+        CompilePublicationState::Prepared => {
+            for (file, destination, _, backup) in &resolved {
+                let current = file_sha256(destination)?;
+                if current == file.previous_sha256 {
+                    continue;
+                }
+                if file.previous_sha256.is_some() {
+                    let previous = fs::read(backup).map_err(|error| {
+                        AppError::Domain(format!("read previous Compile output: {error}"))
+                    })?;
+                    write_project_file_atomically(destination, &previous)?;
+                } else {
+                    remove_compile_journal_file(destination)?;
+                }
+                sync_output_directory(destination.parent().unwrap())?;
+            }
+        }
+        CompilePublicationState::Committed => {}
+    }
+    let mut cleanup_directories = std::collections::BTreeSet::new();
+    for (_, _, staged, backup) in &resolved {
+        remove_compile_journal_file(staged)?;
+        remove_compile_journal_file(backup)?;
+        if let Some(parent) = staged.parent() {
+            cleanup_directories.insert(parent.to_path_buf());
+        }
+    }
+    for directory in cleanup_directories {
+        sync_output_directory(&directory)?;
+    }
+    remove_compile_journal_file(&journal_path)?;
+    sync_output_directory(journal_path.parent().unwrap())?;
+    Ok(None)
 }
 
 fn copy_scrivener_source_tree(source: &Path, destination: &Path) -> Result<()> {
@@ -478,6 +815,7 @@ pub struct EntityMentionAppearance {
 
 pub struct WriterApp {
     store: ProjectStore,
+    compile_recovery_notice: RefCell<Option<String>>,
 }
 impl WriterApp {
     pub fn user_preferences() -> Result<UserPreferences> {
@@ -669,6 +1007,7 @@ impl WriterApp {
     pub fn create_project_with_metadata(path: impl AsRef<Path>, project: &Project) -> Result<Self> {
         Ok(Self {
             store: ProjectStore::create_for(path, project)?,
+            compile_recovery_notice: RefCell::new(None),
         })
     }
     pub fn get_project(&self) -> Result<Project> {
@@ -708,9 +1047,25 @@ impl WriterApp {
         Ok(self.store.set_project_word_count_policy(policy)?)
     }
     pub fn open_project(path: impl AsRef<Path>) -> Result<Self> {
+        let store = ProjectStore::open(path)?;
+        let recovery_notice =
+            recover_compile_file_set(store.project_root(), store.get_project()?.id)?;
         Ok(Self {
-            store: ProjectStore::open(path)?,
+            store,
+            compile_recovery_notice: RefCell::new(recovery_notice),
         })
+    }
+
+    pub fn compile_recovery_notice(&self) -> Option<String> {
+        self.compile_recovery_notice.borrow().clone()
+    }
+
+    /// Recheck the durable compile-output journal after the author resolves a
+    /// reported conflict in the preserved target or recovery files.
+    pub fn retry_compile_publication_recovery(&self) -> Result<Option<String>> {
+        let notice = recover_compile_file_set(self.store.project_root(), self.get_project()?.id)?;
+        *self.compile_recovery_notice.borrow_mut() = notice.clone();
+        Ok(notice)
     }
     pub fn create_section(&mut self, title: &str, position: u32) -> Result<NodeId> {
         Ok(self
@@ -1239,6 +1594,17 @@ impl WriterApp {
         overwrite: bool,
         sidecars: &[(String, Vec<u8>)],
     ) -> Result<Vec<PathBuf>> {
+        let project = self.get_project()?;
+        let project_root = self
+            .store
+            .project_root()
+            .canonicalize()
+            .map_err(|error| AppError::Domain(format!("resolve project root: {error}")))?;
+        if let Some(notice) = recover_compile_file_set(&project_root, project.id)? {
+            *self.compile_recovery_notice.borrow_mut() = Some(notice.clone());
+            return Err(AppError::Domain(notice));
+        }
+        *self.compile_recovery_notice.borrow_mut() = None;
         let destination = destination.as_ref();
         let destination = if destination.is_absolute() {
             destination.to_path_buf()
@@ -1341,7 +1707,7 @@ impl WriterApp {
                 )));
             }
         }
-        publish_compile_file_set(&files)?;
+        publish_compile_file_set(&project_root, project.id, &files)?;
         Ok(files.into_iter().map(|(path, _)| path).collect())
     }
 
@@ -1645,7 +2011,18 @@ impl WriterApp {
                 Ok((self.store.project_root().join(relative), bytes))
             })
             .collect::<Result<Vec<_>>>()?;
-        publish_compile_file_set(&publish_files)?;
+        let project = self.get_project()?;
+        let project_root = self
+            .store
+            .project_root()
+            .canonicalize()
+            .map_err(|error| AppError::Domain(format!("resolve project root: {error}")))?;
+        if let Some(notice) = recover_compile_file_set(&project_root, project.id)? {
+            *self.compile_recovery_notice.borrow_mut() = Some(notice.clone());
+            return Err(AppError::Domain(notice));
+        }
+        *self.compile_recovery_notice.borrow_mut() = None;
+        publish_compile_file_set(&project_root, project.id, &publish_files)?;
         let warnings = self
             .compile_diagnostics()?
             .into_iter()
@@ -4846,6 +5223,124 @@ unexpected_prose = "must not be silently discarded"
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn compile_publication_journal_rolls_back_after_crash_and_project_relocation() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Journal project");
+        let app = WriterApp::create_project(&project, "Journal project").unwrap();
+        let project_id = app.get_project().unwrap().id;
+        let first = project.join("exports/book.epub");
+        let second = project.join("exports/book.epub.source-map.json");
+        fs::create_dir_all(first.parent().unwrap()).unwrap();
+        fs::write(&first, b"previous epub").unwrap();
+        let files = vec![
+            (first.clone(), b"proposed epub".to_vec()),
+            (second.clone(), b"proposed source map".to_vec()),
+        ];
+        assert!(
+            publish_compile_file_set_with_failpoint(
+                &project,
+                project_id,
+                &files,
+                Some(CompilePublishFailpoint::OutputPublished(0)),
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&first).unwrap(), b"proposed epub");
+        assert!(!second.exists());
+        drop(app);
+
+        let relocated = directory.path().join("Moved project");
+        fs::rename(&project, &relocated).unwrap();
+        let reopened = WriterApp::open_project(&relocated).unwrap();
+        assert_eq!(
+            fs::read(relocated.join("exports/book.epub")).unwrap(),
+            b"previous epub"
+        );
+        assert!(!relocated.join("exports/book.epub.source-map.json").exists());
+        assert_eq!(reopened.compile_recovery_notice(), None);
+        assert!(!compile_publication_journal_path(&relocated).exists());
+        assert!(
+            fs::read_dir(relocated.join("exports"))
+                .unwrap()
+                .all(|entry| !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("writers-ide-compile-"))
+        );
+    }
+
+    #[test]
+    fn compile_publication_journal_finishes_committed_cleanup_and_preserves_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Committed project");
+        let app = WriterApp::create_project(&project, "Committed project").unwrap();
+        let project_id = app.get_project().unwrap().id;
+        let output = project.join("exports/book.epub");
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        fs::write(&output, b"previous").unwrap();
+        let files = vec![(output.clone(), b"committed".to_vec())];
+        assert!(
+            publish_compile_file_set_with_failpoint(
+                &project,
+                project_id,
+                &files,
+                Some(CompilePublishFailpoint::CommitWritten),
+            )
+            .is_err()
+        );
+        drop(app);
+        let reopened = WriterApp::open_project(&project).unwrap();
+        assert_eq!(fs::read(&output).unwrap(), b"committed");
+        assert_eq!(reopened.compile_recovery_notice(), None);
+        assert!(!compile_publication_journal_path(&project).exists());
+        drop(reopened);
+
+        let project = directory.path().join("Conflict project");
+        let app = WriterApp::create_project(&project, "Conflict project").unwrap();
+        let project_id = app.get_project().unwrap().id;
+        let output = project.join("exports/book.epub");
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        fs::write(&output, b"previous").unwrap();
+        let files = vec![(output.clone(), b"proposed".to_vec())];
+        assert!(
+            publish_compile_file_set_with_failpoint(
+                &project,
+                project_id,
+                &files,
+                Some(CompilePublishFailpoint::IntentWritten),
+            )
+            .is_err()
+        );
+        fs::write(&output, b"external edit").unwrap();
+        drop(app);
+        let app = WriterApp::open_project(&project).unwrap();
+        let notice = app.compile_recovery_notice().unwrap();
+        assert!(notice.contains("conflicting versions"));
+        assert_eq!(fs::read(&output).unwrap(), b"external edit");
+        let recovery_files = fs::read_dir(output.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(recovery_files.iter().any(|name| name.ends_with(".old")));
+        assert!(compile_publication_journal_path(&project).exists());
+        let artifact = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        assert!(
+            app.publish_compile_artifact(&output, &artifact, true)
+                .unwrap_err()
+                .to_string()
+                .contains("conflicting versions")
+        );
+        assert_eq!(fs::read(&output).unwrap(), b"external edit");
+        fs::write(&output, b"previous").unwrap();
+        assert_eq!(app.retry_compile_publication_recovery().unwrap(), None);
+        assert_eq!(fs::read(&output).unwrap(), b"previous");
+        assert!(!compile_publication_journal_path(&project).exists());
     }
 
     #[cfg(unix)]
