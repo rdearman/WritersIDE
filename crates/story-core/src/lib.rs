@@ -571,6 +571,40 @@ pub fn find_matches_with_locale(
         .collect())
 }
 
+/// Replaces the selected locale-aware literal matches while preserving every
+/// unselected grapheme exactly as it appeared in the source text.
+pub fn replace_selected_matches_with_locale(
+    text: &str,
+    pattern: &str,
+    replacement: &str,
+    options: FindOptions,
+    selected: &[bool],
+    language_tag: &str,
+    accent_sensitive: bool,
+) -> Result<(String, usize), String> {
+    let matches = find_matches_with_locale(text, pattern, options, language_tag, accent_sensitive)?;
+    if matches.len() != selected.len() {
+        return Err(
+            "selection must contain one choice for every match in the unchanged source".into(),
+        );
+    }
+    let mut output = String::new();
+    let mut cursor = 0;
+    let mut count = 0;
+    for (matched, replace) in matches.iter().zip(selected) {
+        output.push_str(&text[cursor..matched.start]);
+        if *replace {
+            output.push_str(replacement);
+            count += 1;
+        } else {
+            output.push_str(&text[matched.clone()]);
+        }
+        cursor = matched.end;
+    }
+    output.push_str(&text[cursor..]);
+    Ok((output, count))
+}
+
 pub fn replace_matches(
     text: &str,
     pattern: &str,
@@ -745,7 +779,9 @@ mod multilingual_tests {
 
     #[test]
     fn locale_aware_find_maps_turkish_and_accent_folds_to_original_byte_ranges() {
-        use super::{FindMode, FindOptions, find_matches_with_locale};
+        use super::{
+            FindMode, FindOptions, find_matches_with_locale, replace_selected_matches_with_locale,
+        };
         let options = FindOptions {
             mode: FindMode::Normal,
             case_sensitive: false,
@@ -768,6 +804,19 @@ mod multilingual_tests {
         assert_eq!(sensitive.len(), 2);
         assert_eq!(&source[sensitive[0].clone()], "Cafe\u{301}");
         assert_eq!(&source[sensitive[1].clone()], "CAFÉ");
+        assert_eq!(
+            replace_selected_matches_with_locale(
+                source,
+                "café",
+                "tea",
+                options,
+                &[true, false, true],
+                "fr-FR",
+                false,
+            )
+            .unwrap(),
+            ("tea CAFÉ tea".into(), 2)
+        );
     }
 
     #[test]

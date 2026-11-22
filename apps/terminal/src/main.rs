@@ -542,6 +542,8 @@ struct ReplaceTarget {
     pattern: String,
     replacement: String,
     options: story_core::FindOptions,
+    language_tag: String,
+    accent_sensitive: bool,
     selected_file: bool,
     selected_matches: Vec<bool>,
 }
@@ -5256,12 +5258,13 @@ impl AppState {
             return Err("enter a search pattern first".into());
         }
         let scenes = self.scenes_for_scope(&panel.scope)?;
+        let project = self.app.get_project()?;
         let mut found = Vec::new();
         self.search_locations.clear();
         self.search_result_rows.clear();
         for record in scenes {
             let text = self.find_scope_text(record.scene.id, &panel.scope)?.0;
-            let matches = story_core::find_matches_with_options(
+            let matches = story_core::find_matches_with_locale(
                 &text,
                 &panel.pattern,
                 story_core::FindOptions {
@@ -5269,6 +5272,8 @@ impl AppState {
                     case_sensitive: panel.case_sensitive,
                     whole_word: panel.whole_word,
                 },
+                record.scene.effective_language_code(&project),
+                false,
             )?;
             if !matches.is_empty() {
                 for matched in &matches {
@@ -5500,11 +5505,26 @@ impl AppState {
         }
         let mut targets = Vec::new();
         let mut total = 0usize;
+        let project = self.app.get_project()?;
         for record in scenes {
             let (source, expected_hash) = self.find_scope_text(record.scene.id, scope)?;
-            let matches = story_core::find_matches_with_options(&source, pattern, options)?;
-            let (updated, count) =
-                story_core::replace_matches_with_options(&source, pattern, replacement, options)?;
+            let language_tag = record.scene.effective_language_code(&project).to_owned();
+            let matches = story_core::find_matches_with_locale(
+                &source,
+                pattern,
+                options,
+                &language_tag,
+                false,
+            )?;
+            let (updated, count) = story_core::replace_selected_matches_with_locale(
+                &source,
+                pattern,
+                replacement,
+                options,
+                &vec![true; matches.len()],
+                &language_tag,
+                false,
+            )?;
             if count > 0 {
                 total += count;
                 targets.push(ReplaceTarget {
@@ -5517,6 +5537,8 @@ impl AppState {
                     pattern: pattern.into(),
                     replacement: replacement.into(),
                     options,
+                    language_tag,
+                    accent_sensitive: false,
                     selected_file: true,
                     selected_matches: vec![true; matches.len()],
                 });
@@ -5555,7 +5577,19 @@ impl AppState {
             case_sensitive: panel.case_sensitive,
             whole_word: panel.whole_word,
         };
-        let matches = story_core::find_matches_with_options(&source, &panel.pattern, options)?;
+        let language_tag = self
+            .app
+            .get_scene(scene)?
+            .scene
+            .effective_language_code(&self.app.get_project()?)
+            .to_owned();
+        let matches = story_core::find_matches_with_locale(
+            &source,
+            &panel.pattern,
+            options,
+            &language_tag,
+            false,
+        )?;
         if matches.is_empty() {
             self.message = "No match in the current scene".into();
             return Ok(());
@@ -5567,12 +5601,14 @@ impl AppState {
             .unwrap_or(0);
         let mut selected = vec![false; matches.len()];
         selected[index] = true;
-        let (updated, count) = story_core::replace_selected_matches_with_options(
+        let (updated, count) = story_core::replace_selected_matches_with_locale(
             &source,
             &panel.pattern,
             &panel.replacement,
             options,
             &selected,
+            &language_tag,
+            false,
         )?;
         if count == 0 {
             self.message = "No match selected; manuscript unchanged".into();
@@ -11987,12 +12023,14 @@ impl AppState {
                 target.selected_file && target.selected_matches.iter().any(|selected| *selected)
             }) {
                 let (proposed, replacement_count) =
-                    story_core::replace_selected_matches_with_options(
+                    story_core::replace_selected_matches_with_locale(
                         &target.original,
                         &target.pattern,
                         &target.replacement,
                         target.options,
                         &target.selected_matches,
+                        &target.language_tag,
+                        target.accent_sensitive,
                     )?;
                 let mut applied_target = target.clone();
                 applied_target.proposed = proposed;
@@ -13471,12 +13509,14 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 .get(s.replace_preview_target)
                 .or_else(|| targets.first());
             if let Some(target) = target {
-                let (proposed, _) = story_core::replace_selected_matches_with_options(
+                let (proposed, _) = story_core::replace_selected_matches_with_locale(
                     &target.original,
                     &target.pattern,
                     &target.replacement,
                     target.options,
                     &target.selected_matches,
+                    &target.language_tag,
+                    target.accent_sensitive,
                 )
                 .unwrap_or_else(|_| (target.proposed.clone(), target.replacements));
                 let match_selected = target
@@ -23084,6 +23124,55 @@ mod tests {
         assert_eq!(state.search_locations.len(), 1);
         assert_eq!(state.search_locations[0].0, scene);
         assert!(state.find_panel.is_some());
+    }
+
+    #[test]
+    fn terminal_find_and_replace_use_each_scenes_locale() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        app.set_project_language("tr-TR").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "İSTANBUL and Iskenderun.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        open_find_panel(&mut state, false);
+        {
+            let panel = state.find_panel.as_mut().unwrap();
+            panel.pattern = "istanbul".into();
+            panel.case_sensitive = false;
+        }
+        state.run_find_panel_search().unwrap();
+        assert_eq!(state.search_locations.len(), 1);
+        assert_eq!(
+            &state.app.load_scene_text(scene).unwrap().0
+                [state.search_locations[0].1..state.search_locations[0].2],
+            "İSTANBUL"
+        );
+
+        state
+            .stage_replace_preview(
+                story_core::FindMode::Normal,
+                "current",
+                "istanbul",
+                "Ankara",
+                false,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            state.pending_replace.as_ref().unwrap()[0].proposed,
+            "Ankara and Iskenderun."
+        );
+        state
+            .execute_legacy_palette_command("replace-apply")
+            .unwrap();
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Ankara and Iskenderun."
+        );
     }
 
     #[test]
