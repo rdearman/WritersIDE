@@ -4,7 +4,7 @@ This addendum supplements [Engineering Design v1.92](engineering-design-v1.92.md
 
 ## Implemented behavior
 
-- The File menu provides a registered `file.open-project` action.
+- The File menu provides a registered `file.open-project` action, also available through the conventional, configurable Ctrl+O shortcut.
 - Selecting it requests a project directory through the existing command prompt (`open-project PROJECT_DIRECTORY`). Paths containing spaces are accepted.
 - The action uses the existing project-switch service, which validates the project through `WriterApp::open_project`, refuses to switch while manuscript text is dirty or a writing challenge is active, and restores the destination project's session and keybindings.
 - The blank-project Dashboard's Open or Import action opens the File menu with Open Project selected. Import actions remain available in that menu.
@@ -12,7 +12,7 @@ This addendum supplements [Engineering Design v1.92](engineering-design-v1.92.md
 
 ## Verification
 
-Automated terminal tests cover opening a project from a path containing spaces, refusal to abandon a dirty buffer, and the blank-project Dashboard route. The full terminal test suite passed: 182 tests. Terminal Clippy passed with warnings denied. A prior local PTY check exercised direct menu aliases, but the new project-path prompt has only automated TestBackend coverage so far.
+Automated terminal tests cover opening a project from a path containing spaces, refusal to abandon a dirty buffer, the blank-project Dashboard route, and Ctrl+O opening the project-path prompt. The full terminal test suite passed: 183 tests. Terminal Clippy passed with warnings denied. A prior local PTY check exercised direct menu aliases, but the new project-path prompt has only automated TestBackend coverage so far.
 
 ## Remaining Issue #39 work
 

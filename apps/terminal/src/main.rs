@@ -1043,7 +1043,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Open Project",
             description: "Open a Writer's IDE project directory",
             category: "File",
-            default_shortcuts: &[],
+            default_shortcuts: &["Ctrl+O"],
             mnemonic: Some('o'),
             palette_aliases: &[],
             palette_prefix: Some("open-project"),
@@ -30428,6 +30428,22 @@ mod tests {
         assert_eq!(MENU_CATEGORIES[menu.top], "File");
         assert_eq!(state.menu_commands()[menu.selected].id, "file.open-project");
         assert!(state.message.contains("Open a project by path"));
+    }
+
+    #[test]
+    fn ctrl_o_opens_the_registered_project_path_prompt() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+
+        assert_eq!(state.mode, Some(':'));
+        assert_eq!(state.prompt, "open-project ");
     }
 
     #[test]
