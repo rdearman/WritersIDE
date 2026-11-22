@@ -1088,7 +1088,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Context Help",
             description: "Show keyboard and command help",
             category: "Help",
-            default_shortcuts: &[],
+            default_shortcuts: &["F1"],
             mnemonic: Some('h'),
             palette_aliases: &["help"],
             palette_prefix: None,
@@ -3083,11 +3083,10 @@ fn registered_global_command_for_key(state: &AppState, key: KeyEvent) -> Option<
         || state.macro_preview.is_some()
         || state.multi_replace_preview.is_some()
         || state.snippet_preview.is_some();
-    if key.code == KeyCode::F(1)
-        && state.help_panel.is_none()
-        && (state.workspace == Workspace::Editor || modal_is_open)
+    if let Some(help) = command_for_effective_shortcut(state, key)
+        .filter(|command| command.action == CommandAction::Help)
     {
-        return command_by_id("help.context");
+        return Some(help);
     }
     if !modal_is_open
         && !(state.workspace == Workspace::Editor
@@ -4353,6 +4352,61 @@ fn effective_command_shortcuts(state: &AppState, command: CommandSpec) -> Vec<St
             .filter(|(_, bound_workspace)| *bound_workspace == workspace)
             .map(|(number, _)| format!("F{number}"))
             .collect();
+    }
+    if command.action == CommandAction::Help {
+        let f1_workspace = state
+            .function_bindings
+            .iter()
+            .find(|(number, _)| *number == 1)
+            .map(|(_, workspace)| *workspace);
+        let context = active_keybinding_context(state);
+        let mut contextual_shortcuts = state
+            .context_command_bindings
+            .iter()
+            .filter(|binding| binding.context == context && binding.command_id == command.id)
+            .map(|binding| {
+                binding
+                    .sequence
+                    .iter()
+                    .map(|event| format_key_event(*event))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>();
+        let help_context = state.help_panel.is_some()
+            || state.workspace == Workspace::Editor
+            || state.menu.is_some()
+            || state.mode.is_some()
+            || state.command_palette.is_some()
+            || state.find_panel.is_some()
+            || state.series_form.is_some()
+            || state.keybinding_manager.is_some()
+            || state.macro_preview.is_some()
+            || state.multi_replace_preview.is_some()
+            || state.snippet_preview.is_some();
+        let f1 = KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE);
+        let f1_claimed_by_command = state.command_bindings.iter().any(|(event, id)| {
+            same_keycode(event.code, f1.code) && event.modifiers == f1.modifiers && id != command.id
+        });
+        let f1_claimed_by_context = state.context_command_bindings.iter().any(|binding| {
+            binding.context == context
+                && binding.sequence.first().is_some_and(|event| {
+                    same_keycode(event.code, f1.code) && event.modifiers == f1.modifiers
+                })
+        });
+        if help_context
+            && f1_workspace.is_none_or(|workspace| workspace == Workspace::Dashboard)
+            && !f1_claimed_by_command
+            && !f1_claimed_by_context
+        {
+            contextual_shortcuts.extend(
+                command
+                    .default_shortcuts
+                    .iter()
+                    .map(|shortcut| (*shortcut).to_owned()),
+            );
+        }
+        return contextual_shortcuts;
     }
     if command.action == CommandAction::OpenMainMenu {
         let context = active_keybinding_context(state);
@@ -16384,7 +16438,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 format!(" · {challenge}")
             };
             format!(
-                " Focus:{} · Menu {} · Help ? · Save {} · q quit · {}{} · {}",
+                " Focus:{} · Menu {} · Help {} · Save {} · q quit · {}{} · {}",
                 if s.menu.is_some() {
                     "menu"
                 } else if s.reference_focused {
@@ -16395,6 +16449,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     "navigation"
                 },
                 effective_shortcut_label(s, "menu.main", "F10"),
+                effective_shortcut_label(s, "help.context", "?"),
                 effective_shortcut_label(s, "file.save", "unbound"),
                 if s.dirty { "unsaved" } else { "saved" },
                 challenge,
@@ -16468,7 +16523,10 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
             "Command Palette: {} · ':' opens it outside manuscript editing",
             effective_shortcut_label(state, "command.palette-open", "Ctrl+P")
         ),
-        "Help: F1 opens or closes this panel; Esc returns to the previous focus".to_owned(),
+        format!(
+            "Help: {} opens or closes this panel; Esc returns to the previous focus",
+            effective_shortcut_label(state, "help.context", "F1")
+        ),
         "Focus: In the editor, Ctrl+Tab switches to an open reference pane; Esc returns to the manuscript".to_owned(),
         "Navigation: Tab moves to the next workspace and Shift+Tab to the previous workspace outside text fields".to_owned(),
         format!(
@@ -25543,6 +25601,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.menu.as_ref().map(|menu| menu.top), Some(0));
+
+        state.menu = None;
+        state.command_bindings = vec![(parse_shortcut("F1").unwrap(), "view.analytics".to_owned())];
+        assert!(
+            effective_command_shortcuts(&state, command_by_id("help.context").unwrap()).is_empty()
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.workspace, Workspace::Analytics);
+        assert!(state.help_panel.is_none());
     }
 
     #[test]
@@ -29680,7 +29747,7 @@ mod tests {
         assert!(screen.contains("UNSAVED"));
         assert!(screen.contains("Save Ctrl+S"));
         assert!(screen.contains("Menu Ctrl+/ or F10"));
-        assert!(screen.contains("Help ?"));
+        assert!(screen.contains("Help F1"));
         assert!(screen.contains("Quit Without Saving"));
     }
 
