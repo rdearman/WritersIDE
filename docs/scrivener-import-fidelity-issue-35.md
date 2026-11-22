@@ -12,8 +12,11 @@ The original project is excluded from Git.
 - Manifest revision: `2.0`.
 - Main manifest and the manifests inside `binder.autosave` and `binder.backup`
   were structurally equivalent; both archives contained the main manifest.
-- Binder inventory: 5 items — 1 Draft folder with 1 text document, 1 empty
-  Research folder, and 1 Trash folder with 1 text document.
+- Binder inventory: 5 items in this exact order: Draft folder (root), its
+  text document (child), empty Research folder (root), Trash folder (root),
+  and its text document (child). The real-fixture integration test asserts
+  every item's type, area, parent and sibling position without exposing
+  binder titles or source identifiers in the report.
 - The selected import mapping produced 1 chapter, 1 scene, 1 research
   reference, and 2 explicitly skipped Trash items. Binder order and parent
   links were retained. The selected text document remained a single scene.
@@ -36,11 +39,14 @@ The original project is excluded from Git.
   separators; line-break-versus-paragraph semantics are therefore not
   preserved.
 - No RTF picture or object controls were found in the manuscript document.
-- No synopsis or notes files were present for the imported manuscript item.
-- The binder title and compile-inclusion value were inventoried. Source binder
-  IDs and raw binder fields remain traceable through import provenance. UI
-  selection state and Scrivener-specific `TextSettings` are not converted to
-  Writer's IDE editing metadata.
+- No synopsis or notes were present for the imported manuscript item. Binder
+  titles, source IDs, compile-inclusion values and raw binder fields were
+  inventoried; the text item's selection state was observed in
+  `TextSettings`. Source IDs and raw binder fields remain traceable through
+  import provenance. UI selection state and Scrivener-specific `TextSettings`
+  are not converted to Writer's IDE editing metadata. The trashed text record
+  has an empty title in the source inventory; no replacement title is
+  synthesized.
 
 ## End-to-end verification
 

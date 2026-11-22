@@ -293,6 +293,39 @@ fn author_scrivener_project_import_and_series_book_three_smoke() {
     assert_eq!(original.format_version.as_deref(), Some("2.0"));
     assert_eq!(original.creator.as_deref(), Some("SCRWIN-3.1.1.0"));
     assert_eq!(original.items.len(), 5);
+    let binder_shape: Vec<_> = original
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.type_code.as_deref(),
+                item.area.as_str(),
+                item.position,
+                item.parent_source_id.as_deref(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        binder_shape,
+        vec![
+            (Some("DraftFolder"), "manuscript", 0, None),
+            (
+                Some("Text"),
+                "manuscript",
+                0,
+                Some(original.items[0].source_document_id.as_str()),
+            ),
+            (Some("ResearchFolder"), "research", 1, None),
+            (Some("TrashFolder"), "trash", 2, None),
+            (
+                Some("Text"),
+                "trash",
+                0,
+                Some(original.items[3].source_document_id.as_str()),
+            ),
+        ],
+        "complete Scrivener binder structure or order changed"
+    );
     assert!(original.items[0].parent_source_id.is_none());
     assert_eq!(original.items[0].position, 0);
     assert_eq!(original.items[2].position, 1);
@@ -315,6 +348,15 @@ fn author_scrivener_project_import_and_series_book_three_smoke() {
     );
     assert_eq!(original.items[1].include_in_compile, Some(true));
     assert!(original.items[1].fields.contains_key("TextSelection"));
+    assert!(
+        original.items[..4]
+            .iter()
+            .all(|item| !item.title.is_empty())
+    );
+    assert!(original.items[4].title.is_empty());
+    assert!(original.items[1].synopsis.is_none());
+    assert!(original.items[1].notes_markdown.is_none());
+    assert!(original.items[2].content_markdown.is_none());
 
     let inspected = Command::new(env!("CARGO_BIN_EXE_writers-ide"))
         .args(["inspect-scrivener", source.to_str().unwrap()])
