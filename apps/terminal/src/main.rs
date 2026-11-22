@@ -175,6 +175,7 @@ struct AppState {
     command_macros: BTreeMap<String, Vec<RecordedCommand>>,
     recording_command_macro: Option<(String, Vec<RecordedCommand>)>,
     text_expansion: TextExpansionConfig,
+    user_text_expansion: TextExpansionConfig,
     editor_preferences: EditorPreferences,
     bookmarks: BTreeMap<String, EditorBookmark>,
     kill_ring: Vec<String>,
@@ -665,7 +666,7 @@ struct EditorPreferencesFile {
     editor: EditorPreferences,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 struct TextExpansionConfig {
     enabled: bool,
@@ -2498,7 +2499,11 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("command-macro.run", "Run Command Sequence", "Replay a saved command sequence through the shared dispatcher", "Edit", "command-macro-run", true),
         legacy_command("command-macro.list", "List Command Sequences", "List saved command sequences", "Edit", "command-macro-list", false),
         legacy_command("edit.text-expansion-set", "Set Text Expansion", "Add a literal abbreviation and replacement to the project dictionary", "Insert", "text-expansion-set", true),
+        legacy_command("edit.text-expansion-remove", "Remove Text Expansion", "Remove a mapping from the project dictionary", "Insert", "text-expansion-remove", true),
         legacy_command("edit.text-expansion", "Text Expansion Settings", "Enable, disable, or list project text expansions", "Insert", "text-expansion", true),
+        legacy_command("edit.text-expansion-user-set", "Set Personal Text Expansion", "Add a literal abbreviation to the user-wide dictionary", "Insert", "text-expansion-user-set", true),
+        legacy_command("edit.text-expansion-user-remove", "Remove Personal Text Expansion", "Remove a mapping from the user-wide dictionary", "Insert", "text-expansion-user-remove", true),
+        legacy_command("edit.text-expansion-user", "Personal Text Expansion Settings", "Enable, disable, or list user-wide text expansions", "Insert", "text-expansion-user", true),
         legacy_command("edit.text-expand", "Expand Abbreviation", "Expand the abbreviation immediately before the editor cursor", "Insert", "text-expand", false),
         legacy_command("document.new-content-unit", "Create Direct Prose Unit", "Add chapter or section prose without creating scenes", "Insert", "content-new", true),
         legacy_command("document.open-content-unit", "Open Direct Prose Unit", "Open a chapter or section prose document by stable ID", "Insert", "content-open", true),
@@ -2859,29 +2864,23 @@ fn load_editor_tools(root: &Path) -> Result<EditorToolsFile, Box<dyn std::error:
 }
 
 fn load_text_expansion(root: &Path) -> Result<TextExpansionConfig, Box<dyn std::error::Error>> {
-    let path = root.join(".writers-ide/text-expansion.toml");
+    load_text_expansion_file(&root.join(".writers-ide/text-expansion.toml"))
+}
+
+fn user_text_expansion_path() -> PathBuf {
+    user_keymap_path()
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("text-expansion.toml")
+}
+
+fn load_text_expansion_file(
+    path: &Path,
+) -> Result<TextExpansionConfig, Box<dyn std::error::Error>> {
     match fs::read_to_string(path) {
         Ok(text) => {
             let config: TextExpansionFile = toml::from_str(&text)?;
-            if config
-                .text_expansion
-                .triggers
-                .iter()
-                .any(|trigger| !matches!(trigger.as_str(), "space" | "enter" | "tab"))
-            {
-                return Err("text expansion triggers must be space or enter".into());
-            }
-            if config
-                .text_expansion
-                .mappings
-                .iter()
-                .any(|(key, _)| key.is_empty() || key.chars().any(char::is_whitespace))
-            {
-                return Err(
-                    "text expansion abbreviations must be non-empty and contain no whitespace"
-                        .into(),
-                );
-            }
+            validate_text_expansion(&config.text_expansion)?;
             Ok(config.text_expansion)
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(TextExpansionConfig::default()),
@@ -2889,21 +2888,66 @@ fn load_text_expansion(root: &Path) -> Result<TextExpansionConfig, Box<dyn std::
     }
 }
 
+fn validate_text_expansion(config: &TextExpansionConfig) -> io::Result<()> {
+    if config
+        .triggers
+        .iter()
+        .any(|trigger| !matches!(trigger.as_str(), "space" | "enter" | "tab"))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "text expansion triggers must be space, enter, or tab",
+        ));
+    }
+    if config
+        .mappings
+        .iter()
+        .any(|(key, _)| key.is_empty() || key.chars().any(char::is_whitespace))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "text expansion abbreviations must be non-empty and contain no whitespace",
+        ));
+    }
+    Ok(())
+}
+
+fn merge_text_expansion_mappings(
+    user: &TextExpansionConfig,
+    project: &TextExpansionConfig,
+) -> BTreeMap<String, String> {
+    let mut mappings = user.mappings.clone();
+    mappings.extend(
+        project
+            .mappings
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone())),
+    );
+    mappings
+}
+
 fn save_text_expansion(
     root: &Path,
     config: &TextExpansionConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let directory = root.join(".writers-ide");
-    fs::create_dir_all(&directory)?;
-    let path = directory.join("text-expansion.toml");
+    save_text_expansion_file(&root.join(".writers-ide/text-expansion.toml"), config)
+}
+
+fn save_text_expansion_file(
+    path: &Path,
+    config: &TextExpansionConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_text_expansion(config)?;
+    let directory = path.parent().ok_or("text expansion path has no parent")?;
+    fs::create_dir_all(directory)?;
     let text = toml::to_string_pretty(&TextExpansionFile {
         text_expansion: config.clone(),
     })?;
-    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
     use std::io::Write;
     temporary.write_all(text.as_bytes())?;
     temporary.as_file().sync_all()?;
-    temporary.persist(&path)?;
+    temporary.persist(path)?;
     fs::File::open(directory)?.sync_all()?;
     Ok(())
 }
@@ -3900,6 +3944,14 @@ impl AppState {
                 format!("Text expansions not loaded: {error}"),
             ),
         };
+        let (user_text_expansion, user_expansion_error) =
+            match load_text_expansion_file(&user_text_expansion_path()) {
+                Ok(config) => (config, String::new()),
+                Err(error) => (
+                    TextExpansionConfig::default(),
+                    format!("Personal text expansions not loaded: {error}"),
+                ),
+            };
         let (editor_preferences, preferences_error) =
             match load_editor_preferences(app.project_root()) {
                 Ok(preferences) => (preferences, String::new()),
@@ -3921,17 +3973,17 @@ impl AppState {
                 scene_id: session.scene_id,
                 initial_words: session.start_words,
             });
-        let existing_notice = draft_notice.unwrap_or({
-            if tools_error.is_empty() {
-                if expansion_error.is_empty() {
-                    preferences_error
-                } else {
-                    expansion_error
-                }
-            } else {
-                tools_error
-            }
-        });
+        let existing_notice = draft_notice
+            .into_iter()
+            .chain([
+                tools_error,
+                expansion_error,
+                user_expansion_error,
+                preferences_error,
+            ])
+            .filter(|notice| !notice.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
         let compile_recovery_notice = app.compile_recovery_notice().unwrap_or_default();
         let message = [
             existing_notice,
@@ -4017,6 +4069,7 @@ impl AppState {
             command_macros: tools.command_macros,
             recording_command_macro: tools.recording_command_macro,
             text_expansion,
+            user_text_expansion,
             editor_preferences,
             bookmarks: tools.bookmarks,
             kill_ring: tools.kill_ring,
@@ -8451,6 +8504,60 @@ impl AppState {
                         .unwrap_or("")
                 );
             }
+        } else if let Some(value) = cmd.strip_prefix("text-expansion-user-set ") {
+            let (abbreviation, replacement) = value
+                .split_once("=>")
+                .ok_or("use text-expansion-user-set ABBREVIATION => REPLACEMENT")?;
+            let abbreviation = abbreviation.trim();
+            if abbreviation.is_empty() || abbreviation.chars().any(char::is_whitespace) {
+                return Err("abbreviation must be non-empty and contain no whitespace".into());
+            }
+            self.user_text_expansion
+                .mappings
+                .insert(abbreviation.to_owned(), replacement.trim().to_owned());
+            save_text_expansion_file(&user_text_expansion_path(), &self.user_text_expansion)?;
+            self.message = format!("Saved personal text expansion {abbreviation}");
+        } else if let Some(abbreviation) = cmd.strip_prefix("text-expansion-user-remove ") {
+            if self
+                .user_text_expansion
+                .mappings
+                .remove(abbreviation.trim())
+                .is_none()
+            {
+                return Err("unknown personal text expansion".into());
+            }
+            save_text_expansion_file(&user_text_expansion_path(), &self.user_text_expansion)?;
+            self.message = format!("Removed personal text expansion {}", abbreviation.trim());
+        } else if let Some(value) = cmd.strip_prefix("text-expansion-user ") {
+            match value.trim() {
+                "on" | "off" => {
+                    self.user_text_expansion.enabled = value.trim() == "on";
+                    save_text_expansion_file(
+                        &user_text_expansion_path(),
+                        &self.user_text_expansion,
+                    )?;
+                    self.message = format!(
+                        "Personal text expansion {}",
+                        if self.user_text_expansion.enabled {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
+                    );
+                }
+                "list" => {
+                    self.message = self
+                        .user_text_expansion
+                        .mappings
+                        .iter()
+                        .map(|(abbreviation, replacement)| {
+                            format!("{abbreviation} → {replacement}")
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" · ");
+                }
+                _ => return Err("use text-expansion-user on|off|list".into()),
+            }
         } else if let Some(value) = cmd.strip_prefix("text-expansion-set ") {
             let (abbreviation, replacement) = value
                 .split_once("=>")
@@ -8490,12 +8597,19 @@ impl AppState {
                     );
                 }
                 "list" => {
-                    self.message = self
-                        .text_expansion
-                        .mappings
+                    let effective = merge_text_expansion_mappings(
+                        &self.user_text_expansion,
+                        &self.text_expansion,
+                    );
+                    self.message = effective
                         .iter()
                         .map(|(abbreviation, replacement)| {
-                            format!("{abbreviation} → {replacement}")
+                            let scope = if self.text_expansion.mappings.contains_key(abbreviation) {
+                                "project"
+                            } else {
+                                "user"
+                            };
+                            format!("{abbreviation} → {replacement} [{scope}]")
                         })
                         .collect::<Vec<_>>()
                         .join(" · ");
@@ -12713,7 +12827,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu; arrows navigate; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... | event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... | event-relationships EVENT-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... | event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... | event-relationships EVENT-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expansion-user-set ABBREVIATION => REPLACEMENT | text-expansion-user on|off|list | text-expansion-user-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -12974,7 +13088,10 @@ impl AppState {
         delimiter: &str,
         record_undo: bool,
     ) -> bool {
-        if !self.text_expansion.enabled || !self.extra_cursors.is_empty() {
+        if !self.text_expansion.enabled
+            || !self.user_text_expansion.enabled
+            || !self.extra_cursors.is_empty()
+        {
             return false;
         }
         let original = self.editor.join("\n");
@@ -12988,14 +13105,15 @@ impl AppState {
                     .text_expansion
                     .triggers
                     .iter()
+                    .chain(self.user_text_expansion.triggers.iter())
                     .any(|configured| configured == trigger))
         {
             return false;
         }
         let token_end = cursor - trigger_bytes;
-        let candidates = self
-            .text_expansion
-            .mappings
+        let mappings =
+            merge_text_expansion_mappings(&self.user_text_expansion, &self.text_expansion);
+        let candidates = mappings
             .iter()
             .filter(|(abbreviation, _)| original[..token_end].ends_with(abbreviation.as_str()))
             .collect::<Vec<_>>();
@@ -13278,7 +13396,6 @@ impl AppState {
             return;
         }
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.record_macro_op(story_core::EditMacroOp::Insert(normalized.clone()));
         if self.writing_stats_enabled {
             self.pasted_characters = self
                 .pasted_characters
@@ -20795,6 +20912,8 @@ mod tests {
         let mut state = AppState::new(project, default_bindings());
         state.prompt = "macro-record punctuate".into();
         state.command().unwrap();
+        state.paste_text("private pasted passage");
+        assert!(state.recording_macro.as_ref().unwrap().1.is_empty());
         state.insert('!');
         state.record_macro_op(story_core::EditMacroOp::MoveLeft);
         state.backspace();
@@ -20922,6 +21041,15 @@ mod tests {
         config.mappings.insert("%D%".into(), "short".into());
         save_text_expansion(app.project_root(), &config).unwrap();
         let mut state = AppState::new(app, default_bindings());
+        state.user_text_expansion = TextExpansionConfig::default();
+        state
+            .user_text_expansion
+            .mappings
+            .insert("%DWAP%".into(), "personal override".into());
+        state
+            .user_text_expansion
+            .mappings
+            .insert("%USER%".into(), "personal dictionary".into());
 
         state.editor = vec!["%DWAP%".into()];
         state.cursor = (0, 6);
@@ -20948,6 +21076,18 @@ mod tests {
         state.insert('\t');
         assert_eq!(state.editor, ["short\t"]);
 
+        state.editor = vec!["%USER%".into()];
+        state.cursor = (0, 6);
+        state.insert(' ');
+        assert_eq!(state.editor, ["personal dictionary "]);
+
+        state.user_text_expansion.enabled = false;
+        state.editor = vec!["%USER%".into()];
+        state.cursor = (0, 6);
+        state.insert(' ');
+        assert_eq!(state.editor, ["%USER% "]);
+        state.user_text_expansion.enabled = true;
+
         state.editor = vec!["%D%".into()];
         state.cursor = (0, 3);
         assert!(state.expand_text_before_cursor("", "", true));
@@ -20965,6 +21105,40 @@ mod tests {
             reopened.text_expansion.mappings["%DWAP%"],
             "Department of Work and Pensions"
         );
+    }
+
+    #[test]
+    fn personal_text_expansion_toml_is_portable_and_project_mappings_win() {
+        let directory = tempfile::tempdir().unwrap();
+        let user_path = directory
+            .path()
+            .join("config/writers-ide/text-expansion.toml");
+        let project_path = directory
+            .path()
+            .join("project/.writers-ide/text-expansion.toml");
+        let mut user = TextExpansionConfig::default();
+        user.mappings
+            .insert("%DWAP%".into(), "personal value".into());
+        user.mappings
+            .insert("%USER%".into(), "personal-only value".into());
+        save_text_expansion_file(&user_path, &user).unwrap();
+        let loaded_user = load_text_expansion_file(&user_path).unwrap();
+
+        let mut project = TextExpansionConfig::default();
+        project
+            .mappings
+            .insert("%DWAP%".into(), "project value".into());
+        project
+            .mappings
+            .insert("%PROJECT%".into(), "project-only value".into());
+        save_text_expansion_file(&project_path, &project).unwrap();
+        let loaded_project = load_text_expansion_file(&project_path).unwrap();
+
+        let effective = merge_text_expansion_mappings(&loaded_user, &loaded_project);
+        assert_eq!(effective["%DWAP%"], "project value");
+        assert_eq!(effective["%USER%"], "personal-only value");
+        assert_eq!(effective["%PROJECT%"], "project-only value");
+        assert_eq!(load_text_expansion_file(&user_path).unwrap(), loaded_user);
     }
 
     #[test]
@@ -22119,6 +22293,7 @@ mod tests {
             command_macros: BTreeMap::new(),
             recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
@@ -22225,7 +22400,11 @@ mod tests {
                 "edit.snippet-save",
                 "edit.snippet-insert",
                 "edit.text-expansion-set",
+                "edit.text-expansion-remove",
                 "edit.text-expansion",
+                "edit.text-expansion-user-set",
+                "edit.text-expansion-user-remove",
+                "edit.text-expansion-user",
                 "edit.text-expand",
                 "document.new-content-unit",
                 "document.open-content-unit"
@@ -24920,6 +25099,7 @@ mod tests {
             command_macros: BTreeMap::new(),
             recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
@@ -25041,6 +25221,7 @@ mod tests {
             command_macros: BTreeMap::new(),
             recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
@@ -25154,6 +25335,7 @@ mod tests {
             command_macros: BTreeMap::new(),
             recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
@@ -25279,6 +25461,7 @@ mod tests {
             command_macros: BTreeMap::new(),
             recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
@@ -25554,6 +25737,7 @@ mod tests {
             command_macros: BTreeMap::new(),
             recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
@@ -25679,6 +25863,7 @@ mod tests {
             command_macros: BTreeMap::new(),
             recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
@@ -25821,6 +26006,7 @@ mod tests {
             command_macros: BTreeMap::new(),
             recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
@@ -26081,6 +26267,7 @@ mod tests {
             command_macros: BTreeMap::new(),
             recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
@@ -26476,6 +26663,7 @@ mod tests {
             command_macros: BTreeMap::new(),
             recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
@@ -26612,6 +26800,7 @@ mod tests {
             command_macros: BTreeMap::new(),
             recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
@@ -26800,6 +26989,7 @@ mod tests {
             command_macros: BTreeMap::new(),
             recording_command_macro: None,
             text_expansion: TextExpansionConfig::default(),
+            user_text_expansion: TextExpansionConfig::default(),
             editor_preferences: EditorPreferences::default(),
             bookmarks: BTreeMap::new(),
             kill_ring: Vec::new(),
