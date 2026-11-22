@@ -386,6 +386,13 @@ struct HelpPanel {
 struct CommandPaletteState {
     query: String,
     selected: usize,
+    recent_commands: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct CommandHistoryFile {
+    version: u16,
+    commands: Vec<String>,
 }
 
 const MENU_CATEGORIES: [&str; 8] = [
@@ -2972,6 +2979,22 @@ fn command_palette_candidates(query: &str) -> Vec<CommandSpec> {
             .then_with(|| left.label.cmp(right.label))
             .then_with(|| left.id.cmp(right.id))
     });
+    candidates
+}
+
+fn command_palette_candidates_with_history(
+    query: &str,
+    recent_commands: &[String],
+) -> Vec<CommandSpec> {
+    let mut candidates = command_palette_candidates(query);
+    if query.trim().is_empty() && !recent_commands.is_empty() {
+        candidates.sort_by_key(|command| {
+            recent_commands
+                .iter()
+                .position(|id| *id == command.id)
+                .map_or((1, usize::MAX), |position| (0, position))
+        });
+    }
     candidates
 }
 
@@ -8102,11 +8125,7 @@ impl AppState {
                         return Ok(());
                     }
                     self.menu = None;
-                    if spec.action == CommandAction::LegacyPalette {
-                        self.dispatch_registered_with_args(spec.action, spec.palette_prefix)?;
-                    } else {
-                        self.dispatch_registered(spec.action)?;
-                    }
+                    self.dispatch_registered_command_id(spec.id)?;
                     return Ok(());
                 }
                 return Ok(());
@@ -8152,7 +8171,7 @@ impl AppState {
                         return Ok(());
                     }
                     self.menu = None;
-                    self.dispatch_registered(spec.action)?;
+                    self.dispatch_registered_command_id(spec.id)?;
                     return Ok(());
                 }
             }
@@ -8168,18 +8187,61 @@ impl AppState {
         &mut self,
         command_id: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.dispatch_registered_command_id_with_args(command_id, None)
+    }
+    fn dispatch_registered_command_id_with_args(
+        &mut self,
+        command_id: &str,
+        arguments: Option<&str>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let command = command_by_id(command_id)
             .ok_or_else(|| format!("registered command disappeared: {command_id}"))?;
         if let Some(reason) = self.command_disabled_reason(command) {
             self.message = format!("{} unavailable: {reason}", command.label);
-        } else if command.takes_arguments {
+            return Ok(());
+        }
+        if command.takes_arguments && arguments.is_none() {
             self.prompt_for_registered_command(command)?;
         } else if command.action == CommandAction::LegacyPalette {
-            self.dispatch_registered_with_args(command.action, command.palette_prefix)?;
+            self.dispatch_registered_with_args(
+                command.action,
+                arguments.or(command.palette_prefix),
+            )?;
         } else {
-            self.dispatch_registered(command.action)?;
+            self.dispatch_registered_with_args(command.action, arguments)?;
         }
+        self.record_recent_command(command.id);
         Ok(())
+    }
+
+    fn record_recent_command(&mut self, command_id: &str) {
+        if command_id == "command.palette-open"
+            || command_id == "menu.main"
+            || command_id.starts_with("menu.")
+        {
+            return;
+        }
+        let mut recent_commands = match load_command_history(self.app.project_root()) {
+            Ok(commands) => commands,
+            Err(error) => {
+                self.message = format!("Command ran; recent-command history unavailable: {error}");
+                return;
+            }
+        };
+        recent_commands.retain(|id| id != command_id);
+        recent_commands.insert(0, command_id.to_owned());
+        recent_commands.truncate(12);
+        match save_command_history(self.app.project_root(), &recent_commands) {
+            Ok(()) => {
+                if let Some(palette) = self.command_palette.as_mut() {
+                    palette.recent_commands.clone_from(&recent_commands);
+                }
+            }
+            Err(error) => {
+                self.message =
+                    format!("Command ran; recent-command history was not saved: {error}");
+            }
+        }
     }
 
     fn handle_context_command_key(
@@ -8248,12 +8310,23 @@ impl AppState {
             CommandAction::OpenMainMenu => self.toggle_menu(),
             CommandAction::OpenCommandPalette => {
                 self.menu = None;
+                let recent_commands = match load_command_history(self.app.project_root()) {
+                    Ok(commands) => commands,
+                    Err(error) => {
+                        self.message = format!("Recent commands unavailable: {error}");
+                        Vec::new()
+                    }
+                };
                 self.command_palette = Some(CommandPaletteState {
                     query: String::new(),
                     selected: 0,
+                    recent_commands,
                 });
-                self.message =
-                    "Search registered commands by name, ID, alias, or description".into();
+                if self.message.is_empty()
+                    || !self.message.starts_with("Recent commands unavailable")
+                {
+                    self.message = "Search commands · recent commands appear first".into();
+                }
             }
             CommandAction::OpenMenuCategory(index) => self.open_menu_category(index),
             CommandAction::Save => self.save()?,
@@ -17241,7 +17314,13 @@ fn draw_command_palette_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     };
     f.render_widget(Clear, popup);
     let block = Block::default()
-        .title(" Command Palette · search registry · Esc closes ")
+        .title(
+            if palette.query.trim().is_empty() && !palette.recent_commands.is_empty() {
+                " Command Palette · recent commands first · Esc closes "
+            } else {
+                " Command Palette · search registry · Esc closes "
+            },
+        )
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup);
@@ -17262,7 +17341,8 @@ fn draw_command_palette_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         ),
         rows[0],
     );
-    let candidates = command_palette_candidates(&palette.query);
+    let candidates =
+        command_palette_candidates_with_history(&palette.query, &palette.recent_commands);
     let items = if candidates.is_empty() {
         vec![ListItem::new("No registered command matches this search")]
     } else {
@@ -18726,6 +18806,65 @@ fn write_json_atomically(
     Ok(())
 }
 
+fn command_history_path(project_root: &Path) -> PathBuf {
+    project_root
+        .join(".writers-ide")
+        .join("command-history.json")
+}
+
+fn load_command_history(project_root: &Path) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let project_root = project_root.canonicalize()?;
+    let directory = project_root.join(".writers-ide");
+    if fs::symlink_metadata(&directory).is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+    {
+        return Ok(Vec::new());
+    }
+    ensure_project_managed_directory(&project_root, &directory)?;
+    let path = command_history_path(&project_root);
+    let metadata = match fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("command history must be a regular project file".into());
+    }
+    let history: CommandHistoryFile = serde_json::from_slice(&fs::read(path)?)?;
+    if history.version != 1 {
+        return Err(format!("unsupported command history version {}", history.version).into());
+    }
+    let mut commands = Vec::new();
+    for id in history.commands {
+        if command_by_id(&id).is_some()
+            && id != "command.palette-open"
+            && id != "menu.main"
+            && !id.starts_with("menu.")
+            && !commands.contains(&id)
+            && commands.len() < 12
+        {
+            commands.push(id);
+        }
+    }
+    Ok(commands)
+}
+
+fn save_command_history(
+    project_root: &Path,
+    commands: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project_root = project_root.canonicalize()?;
+    let directory = project_root.join(".writers-ide");
+    ensure_project_managed_directory(&project_root, &directory)?;
+    let history = CommandHistoryFile {
+        version: 1,
+        commands: commands.to_vec(),
+    };
+    write_json_atomically(
+        &command_history_path(&project_root),
+        &serde_json::to_value(history)?,
+    )
+}
+
 fn writing_goal_graph_rows(app: &WriterApp) -> Vec<String> {
     let as_of = time::OffsetDateTime::now_utc().unix_timestamp();
     let goals = match app.list_writing_goals(false) {
@@ -19928,15 +20067,7 @@ fn invoke_palette_command(
     }
     s.command_palette = None;
     s.prompt.clear();
-    if command.action == CommandAction::LegacyPalette {
-        let invocation = arguments
-            .or(command.palette_prefix)
-            .ok_or("registered command has no invocation")?;
-        s.dispatch_registered_with_args(command.action, Some(invocation))?;
-    } else {
-        s.dispatch_registered_with_args(command.action, arguments)?;
-    }
-    Ok(())
+    s.dispatch_registered_command_id_with_args(command.id, arguments)
 }
 
 fn handle_command_palette_key(
@@ -19948,7 +20079,8 @@ fn handle_command_palette_key(
         .as_ref()
         .ok_or("command palette is closed")?;
     let query = palette.query.clone();
-    let candidates = command_palette_candidates(&query);
+    let recent_commands = palette.recent_commands.clone();
+    let candidates = command_palette_candidates_with_history(&query, &recent_commands);
     let selected = palette.selected.min(candidates.len().saturating_sub(1));
     match key.code {
         KeyCode::Esc => {
@@ -22426,6 +22558,7 @@ mod tests {
         state.command_palette = Some(CommandPaletteState {
             query: "scene.create".into(),
             selected: 0,
+            recent_commands: Vec::new(),
         });
         handle(
             &mut state,
@@ -22439,6 +22572,38 @@ mod tests {
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert_eq!(state.mode, None);
         assert!(state.prompt.is_empty());
+    }
+
+    #[test]
+    fn recent_commands_persist_and_precede_default_palette_suggestions() {
+        let root = tempfile::tempdir().unwrap();
+        let project_root = root.path().join("Novel");
+        let app = WriterApp::create_project(&project_root, "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .dispatch_registered_command_id("view.timeline")
+            .unwrap();
+        state
+            .dispatch_registered_command_id("view.characters")
+            .unwrap();
+
+        let history = load_command_history(&project_root).unwrap();
+        assert_eq!(history, ["view.characters", "view.timeline"]);
+        let reopened = WriterApp::open_project(&project_root).unwrap();
+        let mut reopened_state = AppState::new(reopened, default_bindings());
+        reopened_state
+            .dispatch_registered_command_id("command.palette-open")
+            .unwrap();
+        let palette = reopened_state.command_palette.as_ref().unwrap();
+        assert_eq!(palette.recent_commands, history);
+        let candidates = command_palette_candidates_with_history("", &palette.recent_commands);
+        assert_eq!(candidates[0].id, "view.characters");
+        assert_eq!(candidates[1].id, "view.timeline");
+        assert_eq!(
+            command_palette_candidates_with_history("view.timeline", &palette.recent_commands)[0]
+                .id,
+            "view.timeline"
+        );
     }
 
     #[test]
