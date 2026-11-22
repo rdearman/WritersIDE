@@ -11891,21 +11891,76 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 });
             (content, title)
         };
+        let editor_and_reference = if s.editor_focus_mode {
+            rows[1]
+        } else {
+            body[1]
+        };
+        let has_reference_panes =
+            !s.reference_panes.is_empty() && !s.reference_panes_hidden && !s.editor_focus_mode;
+        let compact_single_pane =
+            has_reference_panes && should_collapse_to_single_pane(editor_and_reference);
         let editor = Paragraph::new(content).wrap(Wrap { trim: false }).block(
             Block::default()
-                .title(if s.reference_focused {
+                .title(if compact_single_pane && !s.reference_focused {
+                    format!("{editor_title} · compact · Ctrl-Tab for references")
+                } else if s.reference_focused {
                     format!("{editor_title} · reference focused")
                 } else {
                     editor_title
                 })
                 .borders(Borders::ALL),
         );
-        let editor_and_reference = if s.editor_focus_mode {
-            rows[1]
-        } else {
-            body[1]
-        };
-        if !s.reference_panes.is_empty() && !s.reference_panes_hidden && !s.editor_focus_mode {
+        if has_reference_panes && compact_single_pane && s.reference_focused {
+            let index = s.active_reference.min(s.reference_panes.len() - 1);
+            let reference = &s.reference_panes[index];
+            let is_shared_scene = reference.shared_scene
+                && reference.scene_id == s.editing_scene
+                && s.assembly_draft.is_none();
+            let lines = if is_shared_scene {
+                s.editor.clone()
+            } else {
+                reference.content.lines().map(str::to_owned).collect()
+            };
+            let reference = Paragraph::new(
+                lines
+                    .iter()
+                    .enumerate()
+                    .skip(reference.scroll)
+                    .map(|(row, line)| {
+                        let prefix = if is_shared_scene && row == s.cursor.0 {
+                            "> "
+                        } else {
+                            "  "
+                        };
+                        Line::from(format!("{prefix}{line}"))
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(format!(
+                        "{} · {} · {} · {} · compact single pane · Ctrl-Tab",
+                        reference.title,
+                        index + 1,
+                        if reference.follow_context {
+                            "follow"
+                        } else {
+                            "pinned"
+                        },
+                        if is_shared_scene {
+                            "shared"
+                        } else {
+                            "read-only"
+                        }
+                    ))
+                    .borders(Borders::ALL),
+            );
+            f.render_widget(reference, editor_and_reference);
+        } else if has_reference_panes && compact_single_pane {
+            f.render_widget(editor, editor_and_reference);
+        } else if has_reference_panes {
             let panes = Layout::default()
                 .direction(s.reference_layout.direction(s.width))
                 .constraints([
@@ -11919,11 +11974,14 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 (panes[0], panes[1])
             };
             f.render_widget(editor, editor_area);
-            let reference_areas =
-                reference_pane_layout(reference_area, s.reference_panes.len(), s.width);
-            for (index, (reference, area)) in
-                s.reference_panes.iter().zip(reference_areas).enumerate()
-            {
+            let visible = visible_reference_indices(
+                s.reference_panes.len(),
+                s.active_reference,
+                reference_area.height,
+            );
+            let reference_areas = reference_pane_layout(reference_area, visible.len(), s.width);
+            for (index, area) in visible.into_iter().zip(reference_areas) {
+                let reference = &s.reference_panes[index];
                 let is_shared_scene = reference.shared_scene
                     && reference.scene_id == s.editing_scene
                     && s.assembly_draft.is_none();
@@ -12963,6 +13021,21 @@ fn reference_pane_layout(area: Rect, count: usize, terminal_width: usize) -> Vec
         .constraints(vec![Constraint::Ratio(1, count as u32); count])
         .split(area)
         .to_vec()
+}
+
+fn should_collapse_to_single_pane(area: Rect) -> bool {
+    area.width < 48 || area.height < 12
+}
+
+fn visible_reference_indices(count: usize, active: usize, available_height: u16) -> Vec<usize> {
+    if count == 0 {
+        return Vec::new();
+    }
+    if available_height / u16::try_from(count).unwrap_or(u16::MAX) < 5 {
+        vec![active.min(count - 1)]
+    } else {
+        (0..count).collect()
+    }
 }
 
 fn default_split_ratio() -> u16 {
@@ -18996,6 +19069,11 @@ mod tests {
                 .iter()
                 .all(|area| area.height > 0 && area.width == 70)
         );
+        assert_eq!(visible_reference_indices(3, 1, 10), [1]);
+        assert_eq!(visible_reference_indices(3, 1, 18), [0, 1, 2]);
+        assert!(should_collapse_to_single_pane(Rect::new(0, 0, 80, 11)));
+        assert!(should_collapse_to_single_pane(Rect::new(0, 0, 47, 24)));
+        assert!(!should_collapse_to_single_pane(Rect::new(0, 0, 80, 12)));
     }
     use crossterm::event::KeyModifiers;
 
