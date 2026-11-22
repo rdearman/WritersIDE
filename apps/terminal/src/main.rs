@@ -847,7 +847,7 @@ fn command_registry() -> Vec<CommandSpec> {
             "Open recent Compile runs, outputs and source-linked findings",
             "Compile",
             "compile-results",
-            false,
+            true,
         ),
         legacy_command(
             "review.merge",
@@ -3982,8 +3982,9 @@ impl AppState {
                         .ok()
                         .map(|content| (None, "Compile Diagnostics".into(), content))
                 }
-                "compile-results" if source_id == "project" => {
-                    compile_results_reference_text(&self.app)
+                "compile-results" if source_id.starts_with("project:") => {
+                    let filter = source_id.strip_prefix("project:").unwrap_or_default();
+                    compile_results_reference_text(&self.app, filter)
                         .ok()
                         .map(|content| (None, "Compile Results".into(), content))
                 }
@@ -5344,10 +5345,10 @@ impl AppState {
     }
     fn open_compile_results_reference(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.open_reference_buffer(
-            "compile-results:project".into(),
+            "compile-results:project:all".into(),
             None,
             "Compile Results".into(),
-            compile_results_reference_text(&self.app)?,
+            compile_results_reference_text(&self.app, "")?,
         );
         self.reference_focused = true;
         Ok(())
@@ -5358,7 +5359,7 @@ impl AppState {
         let Some(pane) = self.active_reference_pane() else {
             return Ok(false);
         };
-        if pane.source_key != "compile-results:project" {
+        if !pane.source_key.starts_with("compile-results:project:") {
             return Ok(false);
         }
         let Some(line) = pane.content.lines().nth(pane.scroll) else {
@@ -7626,12 +7627,20 @@ impl AppState {
                 .join(format!("assembly-{assembly}.md"));
             fs::write(&destination, text.as_bytes())?;
             self.message = format!("Compiled assembly to {}", destination.display());
-        } else if cmd == "compile-results" {
+        } else if cmd == "compile-results" || cmd.starts_with("compile-results ") {
+            let filter = cmd
+                .strip_prefix("compile-results")
+                .unwrap_or_default()
+                .trim();
             self.open_reference_buffer(
-                "compile-results:project".into(),
+                format!("compile-results:project:{filter}"),
                 None,
-                "Compile Results".into(),
-                compile_results_reference_text(&self.app)?,
+                if filter.is_empty() {
+                    "Compile Results".into()
+                } else {
+                    format!("Compile Results · {filter}")
+                },
+                compile_results_reference_text(&self.app, filter)?,
             );
             self.reference_focused = true;
         } else if let Some(arguments) = cmd.strip_prefix("compile-config ") {
@@ -12933,10 +12942,51 @@ fn compile_diagnostics_reference_text(
         .join("\n"))
 }
 
-fn compile_results_reference_text(app: &WriterApp) -> Result<String, Box<dyn std::error::Error>> {
+fn compile_results_reference_text(
+    app: &WriterApp,
+    filter: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let filter = if filter.is_empty() { "all" } else { filter };
+    if !matches!(
+        filter,
+        "all" | "errors" | "warnings" | "info" | "failed" | "success"
+    ) {
+        return Err(
+            "Compile Results filter must be all, errors, warnings, info, failed, or success".into(),
+        );
+    }
     let records = app.list_compile_results()?;
     if records.is_empty() {
         return Ok("No Compile runs have been recorded.".into());
+    }
+    let records = records
+        .into_iter()
+        .filter(|record| match filter {
+            "failed" => !record.succeeded,
+            "success" => record.succeeded,
+            "errors" => {
+                record.error.is_some()
+                    || record
+                        .diagnostics
+                        .iter()
+                        .any(|item| item.severity == story_document::DiagnosticSeverity::Error)
+            }
+            "warnings" => {
+                !record.warnings.is_empty()
+                    || record
+                        .diagnostics
+                        .iter()
+                        .any(|item| item.severity == story_document::DiagnosticSeverity::Warning)
+            }
+            "info" => record
+                .diagnostics
+                .iter()
+                .any(|item| item.severity == story_document::DiagnosticSeverity::Information),
+            _ => true,
+        })
+        .collect::<Vec<_>>();
+    if records.is_empty() {
+        return Ok(format!("No Compile results match the '{filter}' filter."));
     }
     let mut lines = Vec::new();
     for (index, record) in records.iter().enumerate() {
@@ -20069,6 +20119,15 @@ mod tests {
         .unwrap();
         assert_eq!(state.editing_scene, Some(scene));
         assert!(!state.reference_focused);
+        state
+            .execute_legacy_palette_command("compile-results errors")
+            .unwrap();
+        assert!(
+            state.reference_panes[1]
+                .content
+                .contains("No Compile results match")
+        );
+        assert!(state.reference_focused);
     }
 
     #[test]
