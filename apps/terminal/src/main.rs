@@ -120,6 +120,7 @@ struct AppState {
     mode: Option<char>,
     prompt: String,
     message: String,
+    help_panel: Option<HelpPanel>,
     history: Vec<Workspace>,
     history_index: usize,
     location_history: Vec<EditorBookmark>,
@@ -369,6 +370,13 @@ enum CursorMotion {
 struct MenuState {
     top: usize,
     selected: usize,
+}
+
+#[derive(Clone, Debug)]
+struct HelpPanel {
+    title: String,
+    lines: Vec<String>,
+    scroll: usize,
 }
 
 const MENU_CATEGORIES: [&str; 8] = [
@@ -4223,6 +4231,7 @@ impl AppState {
             mode: None,
             prompt: String::new(),
             message,
+            help_panel: None,
             history: vec![Workspace::Dashboard],
             history_index: 0,
             location_history: Vec::new(),
@@ -7355,6 +7364,12 @@ impl AppState {
             self.message = "Main menu · arrows navigate · Enter selects · Esc closes".into();
         }
     }
+    fn show_context_help(&mut self) {
+        self.help_panel = Some(context_help_panel(self));
+    }
+    fn close_context_help(&mut self) {
+        self.help_panel = None;
+    }
     fn open_menu_category(&mut self, index: usize) {
         self.pending_command_sequence = None;
         let top = index.min(MENU_CATEGORIES.len().saturating_sub(1));
@@ -7940,32 +7955,7 @@ impl AppState {
             CommandAction::OpenMainMenu => self.toggle_menu(),
             CommandAction::OpenMenuCategory(index) => self.open_menu_category(index),
             CommandAction::Save => self.save()?,
-            CommandAction::Help => {
-                self.message = command_registry()
-                    .into_iter()
-                    .map(|command| {
-                        let mnemonic = command
-                            .mnemonic
-                            .map(|key| format!(" [{key}]"))
-                            .unwrap_or_default();
-                        let shortcuts = effective_command_shortcuts(self, command);
-                        let shortcut_text = if shortcuts.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" ({})", shortcuts.join(", "))
-                        };
-                        format!(
-                            "{} > {}{}{} — {}",
-                            command.category,
-                            command.label,
-                            mnemonic,
-                            shortcut_text,
-                            command.description
-                        )
-                    })
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-            }
+            CommandAction::Help => self.show_context_help(),
             CommandAction::RestoreRevisionHunk => self.restore_selected_revision_hunk()?,
             CommandAction::Process {
                 expand_transclusions,
@@ -15510,6 +15500,111 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.snippet_preview.is_some() {
         draw_snippet_preview_overlay(f, s);
     }
+    if s.help_panel.is_some() {
+        draw_help_overlay(f, s);
+    }
+}
+
+fn context_help_panel(state: &AppState) -> HelpPanel {
+    let context = if state.mode.is_some() {
+        "Active dialogue".to_owned()
+    } else if let Some(menu) = state.menu {
+        format!("{} menu", MENU_CATEGORIES[menu.top])
+    } else if state.find_panel.is_some() {
+        "Search dialogue".to_owned()
+    } else if state.series_form.is_some() || state.keybinding_manager.is_some() {
+        "Dialogue".to_owned()
+    } else {
+        state.workspace.title().to_owned()
+    };
+    let mut lines = vec![
+        format!("Context: {context}"),
+        format!(
+            "Menu: {} · open with Ctrl+/ or F10",
+            effective_shortcut_label(state, "menu.main", "F10")
+        ),
+        "Help: F1 opens or closes this panel; Esc returns to the previous focus".to_owned(),
+        "Focus: Ctrl+G switches between the navigation pane and manuscript".to_owned(),
+        "Reference: Ctrl+Tab cycles reference panes when available".to_owned(),
+        "Navigation: Tab changes workspace outside text fields; Shift+Tab moves back".to_owned(),
+        format!(
+            "Save: {} · current buffer is {}",
+            effective_shortcut_label(state, "file.save", "Ctrl+S"),
+            if state.dirty { "unsaved" } else { "saved" }
+        ),
+    ];
+    if state.workspace == Workspace::Editor {
+        lines.push(
+            "Editing: / and ? are ordinary manuscript characters; Tab inserts indentation"
+                .to_owned(),
+        );
+        lines.push(
+            "Save conflicts: use the Review menu to inspect or recover divergent versions"
+                .to_owned(),
+        );
+    }
+    if state.mode == Some('q') {
+        lines.push("Quit choices: save, inspect recovery options, discard changes, or Esc to continue editing".to_owned());
+    }
+    if let Some(menu) = state.menu {
+        lines.push(
+            "Menu controls: ←/→ choose a menu · ↑/↓ choose a command · Enter runs · Esc closes"
+                .to_owned(),
+        );
+        let category = MENU_CATEGORIES[menu.top];
+        for command in command_registry()
+            .into_iter()
+            .filter(|command| command.category.eq_ignore_ascii_case(category))
+        {
+            let shortcuts = effective_command_shortcuts(state, command).join(", ");
+            lines.push(if shortcuts.is_empty() {
+                format!("{} — {}", command.label, command.description)
+            } else {
+                format!("{} ({shortcuts}) — {}", command.label, command.description)
+            });
+        }
+    } else {
+        lines.push(
+            "Available actions are listed in the current workspace and Help menus".to_owned(),
+        );
+    }
+    lines.push("Scroll: ↑/↓ or Page Up/Page Down · F10 opens menu".to_owned());
+    HelpPanel {
+        title: format!("Help · {context}"),
+        lines,
+        scroll: 0,
+    }
+}
+
+fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
+    let Some(panel) = &state.help_panel else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 88);
+    let height = area.height.saturating_sub(2).clamp(1, 22);
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, rect);
+    let text = panel
+        .lines
+        .iter()
+        .skip(panel.scroll)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n");
+    f.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title(format!(" {} · Esc closes ", panel.title))
+                .borders(Borders::ALL),
+        ),
+        rect,
+    );
 }
 
 fn draw_macro_preview_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
@@ -19313,6 +19408,53 @@ fn step_find_query_history(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if s.help_panel.is_some() {
+        match k.code {
+            KeyCode::Esc | KeyCode::F(1) => s.close_context_help(),
+            KeyCode::Up => {
+                if let Some(panel) = s.help_panel.as_mut() {
+                    panel.scroll = panel.scroll.saturating_sub(1);
+                }
+            }
+            KeyCode::Down => {
+                if let Some(panel) = s.help_panel.as_mut() {
+                    panel.scroll = panel.scroll.saturating_add(1);
+                }
+            }
+            KeyCode::PageUp => {
+                if let Some(panel) = s.help_panel.as_mut() {
+                    panel.scroll = panel.scroll.saturating_sub(10);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(panel) = s.help_panel.as_mut() {
+                    panel.scroll = panel.scroll.saturating_add(10);
+                }
+            }
+            KeyCode::F(10) => {
+                s.close_context_help();
+                s.toggle_menu();
+            }
+            KeyCode::Char('/') if k.modifiers.contains(KeyModifiers::CONTROL) => {
+                s.close_context_help();
+                s.toggle_menu();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    let modal_is_open = s.mode.is_some()
+        || s.menu.is_some()
+        || s.find_panel.is_some()
+        || s.keybinding_manager.is_some()
+        || s.series_form.is_some()
+        || s.macro_preview.is_some()
+        || s.multi_replace_preview.is_some()
+        || s.snippet_preview.is_some();
+    if k.code == KeyCode::F(1) && (s.workspace == Workspace::Editor || modal_is_open) {
+        s.show_context_help();
+        return Ok(false);
+    }
     if is_menu_shortcut(k) || k.code == KeyCode::F(10) {
         s.toggle_menu();
         return Ok(false);
@@ -23749,6 +23891,68 @@ mod tests {
     }
 
     #[test]
+    fn contextual_help_preserves_dialog_state_and_returns_to_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.mode = Some('q');
+        state.prompt = "quit".into();
+        state.message = "Unsaved changes".into();
+        let original_prompt = state.prompt.clone();
+        let original_message = state.message.clone();
+
+        handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.mode, Some('q'));
+        assert_eq!(state.prompt, original_prompt);
+        assert_eq!(state.message, original_message);
+        let panel = state.help_panel.as_ref().unwrap();
+        assert!(panel.title.contains("dialogue"));
+        assert!(panel.lines.iter().any(|line| line.contains("Quit choices")));
+
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.help_panel.is_none());
+        assert_eq!(state.mode, Some('q'));
+        assert_eq!(state.prompt, original_prompt);
+    }
+
+    #[test]
+    fn help_overlay_routes_to_menu_without_consuming_plain_slash() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Editor;
+        handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(state.help_panel.is_none());
+        assert!(state.menu.is_some());
+        assert!(!is_menu_shortcut(KeyEvent::new(
+            KeyCode::Char('/'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn question_mark_remains_manuscript_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 10).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "?");
+        assert!(state.dirty);
+    }
+
+    #[test]
     fn editor_slash_is_text_and_menu_invocation_preserves_edit_state() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -23770,6 +23974,7 @@ mod tests {
             mode: None,
             prompt: String::new(),
             message: String::new(),
+            help_panel: None,
             history: vec![Workspace::Editor],
             history_index: 0,
             location_history: Vec::new(),
@@ -23863,7 +24068,6 @@ mod tests {
         .unwrap();
         assert_eq!(state.editor, vec!["text/".to_owned()]);
         assert_eq!(state.cursor, (0, 5));
-
         state.editor_selection = Some((0, 1));
         let selection = state.editor_selection;
         handle(
@@ -26570,6 +26774,7 @@ mod tests {
             mode: None,
             prompt: String::new(),
             message: String::new(),
+            help_panel: None,
             history: vec![Workspace::Editor],
             history_index: 0,
             location_history: Vec::new(),
@@ -26697,6 +26902,7 @@ mod tests {
             mode: None,
             prompt: String::new(),
             message: String::new(),
+            help_panel: None,
             history: vec![Workspace::Editor],
             history_index: 0,
             location_history: Vec::new(),
@@ -26820,6 +27026,7 @@ mod tests {
             mode: None,
             prompt: String::new(),
             message: String::new(),
+            help_panel: None,
             history: vec![Workspace::Editor],
             history_index: 0,
             location_history: Vec::new(),
@@ -26951,6 +27158,7 @@ mod tests {
             mode: None,
             prompt: String::new(),
             message: String::new(),
+            help_panel: None,
             history: vec![Workspace::Outline],
             history_index: 0,
             location_history: Vec::new(),
@@ -27232,6 +27440,7 @@ mod tests {
             mode: None,
             prompt: String::new(),
             message: String::new(),
+            help_panel: None,
             history: vec![Workspace::Dashboard],
             history_index: 0,
             location_history: Vec::new(),
@@ -27363,6 +27572,7 @@ mod tests {
             mode: None,
             prompt: String::new(),
             message: String::new(),
+            help_panel: None,
             history: vec![Workspace::Outline],
             history_index: 0,
             location_history: Vec::new(),
@@ -27995,6 +28205,7 @@ mod tests {
             mode: None,
             prompt: String::new(),
             message: String::new(),
+            help_panel: None,
             history: vec![Workspace::Revisions],
             history_index: 0,
             location_history: Vec::new(),
@@ -28261,6 +28472,7 @@ mod tests {
             mode: None,
             prompt: String::new(),
             message: String::new(),
+            help_panel: None,
             history: vec![Workspace::Reading],
             history_index: 0,
             location_history: Vec::new(),
@@ -28662,6 +28874,7 @@ mod tests {
             mode: None,
             prompt: String::new(),
             message: String::new(),
+            help_panel: None,
             history: vec![Workspace::Search],
             history_index: 0,
             location_history: Vec::new(),
@@ -28804,6 +29017,7 @@ mod tests {
             mode: None,
             prompt: String::new(),
             message: String::new(),
+            help_panel: None,
             history: vec![Workspace::Search],
             history_index: 0,
             location_history: Vec::new(),
@@ -28998,6 +29212,7 @@ mod tests {
             mode: None,
             prompt: String::new(),
             message: String::new(),
+            help_panel: None,
             history: vec![Workspace::Outline],
             history_index: 0,
             location_history: Vec::new(),
