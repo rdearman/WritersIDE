@@ -1313,6 +1313,22 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "chronology.settings",
+            "Chronology Settings",
+            "Enable optional story-time analysis and missing-date prompts for this book",
+            "Plot",
+            "chronology",
+            true,
+        ),
+        legacy_command(
+            "scene.edit-time",
+            "Edit Scene Chronology",
+            "Set optional start and end story-time intervals for a scene",
+            "Plot",
+            "scene-time-set",
+            true,
+        ),
+        legacy_command(
             "event.link",
             "Link Event to Scene",
             "Associate a story event with a scene",
@@ -6619,6 +6635,11 @@ impl AppState {
                         self.successful_saves = self.successful_saves.saturating_add(1);
                     }
                     self.message = "Saved".into();
+                    if self.app.should_prompt_for_missing_scene_time(id)? {
+                        self.message = format!(
+                            "Optional chronology · Set date with `scene-time-set {id} | START | END`; Not yet: leave it unset; Don't ask again: `chronology never`"
+                        );
+                    }
                 }
                 Err(e) => self.message = format!("Save conflict/error: {e}"),
             }
@@ -9904,6 +9925,68 @@ impl AppState {
             let status = parts.next().ok_or("missing issue status")?;
             self.app.set_issue_status(issue, status)?;
             self.message = format!("Updated issue {issue} to {status}");
+        } else if let Some(rest) = cmd.strip_prefix("chronology ") {
+            let mut preferences = self.app.chronology_preferences()?;
+            match rest.trim() {
+                "show" => {
+                    self.message = format!(
+                        "Chronology {} · missing-date prompt {}{}",
+                        if preferences.enabled { "on" } else { "off" },
+                        if preferences.prompt_for_missing_scene_time {
+                            "on"
+                        } else {
+                            "off"
+                        },
+                        if preferences.missing_scene_time_prompt_dismissed {
+                            " · prompt dismissed"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+                "on" => {
+                    preferences.enabled = true;
+                    self.app.set_chronology_preferences(preferences)?;
+                    self.message = "Chronology enabled for this book".into();
+                }
+                "off" => {
+                    preferences.enabled = false;
+                    self.app.set_chronology_preferences(preferences)?;
+                    self.message =
+                        "Chronology disabled; recorded story times were preserved".into();
+                }
+                "prompt-on" => {
+                    preferences.prompt_for_missing_scene_time = true;
+                    preferences.missing_scene_time_prompt_dismissed = false;
+                    self.app.set_chronology_preferences(preferences)?;
+                    self.message = "Optional missing-date reminders enabled".into();
+                }
+                "prompt-off" => {
+                    preferences.prompt_for_missing_scene_time = false;
+                    self.app.set_chronology_preferences(preferences)?;
+                    self.message = "Optional missing-date reminders disabled".into();
+                }
+                "never" => {
+                    preferences.prompt_for_missing_scene_time = false;
+                    preferences.missing_scene_time_prompt_dismissed = true;
+                    self.app.set_chronology_preferences(preferences)?;
+                    self.message =
+                        "Missing-date reminders dismissed permanently for this book".into();
+                }
+                _ => return Err("use chronology show|on|off|prompt-on|prompt-off|never".into()),
+            }
+        } else if let Some(rest) = cmd.strip_prefix("scene-time-set ") {
+            let fields = rest.split('|').map(str::trim).collect::<Vec<_>>();
+            if fields.len() != 3 || fields[0].is_empty() {
+                return Err("use scene-time-set SCENE-UUID | START | END".into());
+            }
+            let id = SceneId(fields[0].parse()?);
+            self.app.update_scene_story_time(
+                id,
+                parse_story_time_input(fields[1])?,
+                parse_story_time_input(fields[2])?,
+            )?;
+            self.message = format!("Updated story-time bounds for scene {id}");
         } else if let Some(rest) = cmd.strip_prefix("event-time ") {
             let fields = rest.split('|').map(str::trim).collect::<Vec<_>>();
             if fields.len() != 4 || fields[0].is_empty() {
@@ -15695,11 +15778,16 @@ fn analytics_report_rows(
     target_words: Option<u64>,
     actual_words: u32,
     drafted_scenes: usize,
+    chronology_enabled: bool,
 ) -> Vec<String> {
     let heatmap = story_analysis::character_heatmap(data);
     let interactions = story_analysis::character_interactions(data);
     let gaps = story_analysis::subplot_gaps(data, 3);
-    let chronology = story_analysis::chronology_ambiguities(data);
+    let chronology = if chronology_enabled {
+        story_analysis::chronology_ambiguities(data)
+    } else {
+        Vec::new()
+    };
     let scenes_by_id = data
         .iter()
         .map(|scene| (scene.scene_id.as_str(), scene.title.as_str()))
@@ -15730,7 +15818,11 @@ fn analytics_report_rows(
         format!("{} plotlines", plotline_names.len()),
         format!("{} co-appearance pairs", interactions.len()),
         format!("{} subplot gaps of 3+ scenes", gaps.len()),
-        format!("{} uncertain chronology pairs", chronology.len()),
+        if chronology_enabled {
+            format!("{} uncertain chronology pairs", chronology.len())
+        } else {
+            "Chronology disabled for this book".into()
+        },
         "Character appearance heatmap · P=POV · M=major · m=minor · o=off-camera · ?=mentioned"
             .into(),
     ];
@@ -16451,24 +16543,35 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             );
             rows
         }
-        Workspace::Timeline => timeline_items(&s.app)
-            .into_iter()
-            .map(|item| match item {
-                TimelineItem::Scene(scene) => format!(
-                    "Scene · {} → {} · {}",
-                    format_story_interval(scene.scene.start_time),
-                    format_story_interval(scene.scene.end_time),
-                    scene.scene.title
-                ),
-                TimelineItem::Event(event) => format!(
-                    "Event · {} → {} · {} · {}",
-                    format_story_interval(event.start),
-                    format_story_interval(event.end),
-                    event.title,
-                    event.source_time
-                ),
-            })
-            .collect(),
+        Workspace::Timeline => {
+            if !s
+                .app
+                .chronology_preferences()
+                .map(|preferences| preferences.enabled)
+                .unwrap_or(false)
+            {
+                vec!["Chronology is disabled for this book · use `chronology on` to enable".into()]
+            } else {
+                timeline_items(&s.app)
+                    .into_iter()
+                    .map(|item| match item {
+                        TimelineItem::Scene(scene) => format!(
+                            "Scene · {} → {} · {}",
+                            format_story_interval(scene.scene.start_time),
+                            format_story_interval(scene.scene.end_time),
+                            scene.scene.title
+                        ),
+                        TimelineItem::Event(event) => format!(
+                            "Event · {} → {} · {} · {}",
+                            format_story_interval(event.start),
+                            format_story_interval(event.end),
+                            event.title,
+                            event.source_time
+                        ),
+                    })
+                    .collect()
+            }
+        }
         Workspace::Analytics => {
             let total = s.scenes.iter().map(|x| x.3).sum::<u32>();
             let draft = s
@@ -16478,7 +16581,12 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 .count();
             let data = s.app.analytics_dataset().unwrap_or_default();
             let target = s.app.get_project().ok().and_then(|p| p.target_words);
-            let mut rows = analytics_report_rows(&data, target, total, draft);
+            let chronology_enabled = s
+                .app
+                .chronology_preferences()
+                .map(|preferences| preferences.enabled)
+                .unwrap_or(false);
+            let mut rows = analytics_report_rows(&data, target, total, draft, chronology_enabled);
             rows.extend(writing_goal_graph_rows(&s.app));
             rows.extend(challenge_progress_rows(
                 &s.app.list_writing_challenges().unwrap_or_default(),
@@ -20906,6 +21014,69 @@ mod tests {
         assert_eq!(event.end.lower, Some(9));
         assert_eq!(event.end.upper, Some(12));
         assert_eq!(event.source_time, "during the storm");
+    }
+
+    #[test]
+    fn terminal_chronology_settings_and_scene_time_are_optional_and_persistent() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        let chapter = state.app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = state.app.create_scene(chapter, "Opening", 0).unwrap();
+        state
+            .execute_legacy_palette_command("chronology show")
+            .unwrap();
+        assert!(state.message.contains("Chronology off"));
+        assert!(
+            analytics_report_rows(&state.app.analytics_dataset().unwrap(), None, 0, 0, false)
+                .iter()
+                .any(|row| row == "Chronology disabled for this book")
+        );
+
+        state
+            .execute_legacy_palette_command("chronology on")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("chronology prompt-on")
+            .unwrap();
+        assert!(
+            state
+                .app
+                .should_prompt_for_missing_scene_time(scene)
+                .unwrap()
+        );
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["Draft prose remains canonical.".into()];
+        state.dirty = true;
+        state.save().unwrap();
+        assert!(state.message.contains("Set date"));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Draft prose remains canonical."
+        );
+        state
+            .execute_legacy_palette_command(&format!("scene-time-set {scene} | -86400 | 0"))
+            .unwrap();
+        let metadata = state.app.get_scene(scene).unwrap().scene;
+        assert_eq!(metadata.start_time, story_core::StoryTime::exact(-86_400));
+        assert_eq!(metadata.end_time, story_core::StoryTime::exact(0));
+        assert!(
+            !state
+                .app
+                .should_prompt_for_missing_scene_time(scene)
+                .unwrap()
+        );
+
+        state
+            .execute_legacy_palette_command("chronology never")
+            .unwrap();
+        assert!(
+            state
+                .app
+                .chronology_preferences()
+                .unwrap()
+                .missing_scene_time_prompt_dismissed
+        );
     }
 
     #[test]
@@ -25380,7 +25551,7 @@ mod tests {
                 events: Vec::new(),
             })
             .collect::<Vec<_>>();
-        let rows = analytics_report_rows(&scenes, Some(2_000), 500, 2);
+        let rows = analytics_report_rows(&scenes, Some(2_000), 500, 2, true);
         assert!(rows.iter().any(|row| row == "Heatmap · Scene 4 │ "));
         assert!(
             rows.iter()
@@ -25417,7 +25588,7 @@ mod tests {
             locations: vec![],
             events: vec![],
         };
-        let rows = analytics_report_rows(&[scene], Some(200), 50, 0);
+        let rows = analytics_report_rows(&[scene], Some(200), 50, 0, false);
         assert!(
             rows.iter()
                 .any(|row| row.contains("Manuscript progress · 50/200 words · 25%"))

@@ -75,6 +75,23 @@ pub struct CompileRunRecord {
     pub stale: bool,
 }
 
+/// Optional, per-book chronology behavior. Story-time fields remain stored even
+/// while the feature is disabled; disabling it only suppresses timeline analysis
+/// and any optional missing-time prompts.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ChronologyPreferences {
+    pub enabled: bool,
+    pub prompt_for_missing_scene_time: bool,
+    pub missing_scene_time_prompt_dismissed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ChronologyPreferencesFile {
+    version: u16,
+    preferences: ChronologyPreferences,
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 struct ManagedCompileManifest {
     version: u16,
@@ -1033,6 +1050,72 @@ impl WriterApp {
     }
     pub fn get_project(&self) -> Result<Project> {
         Ok(self.store.get_project()?)
+    }
+    pub fn chronology_preferences(&self) -> Result<ChronologyPreferences> {
+        let path = self
+            .store
+            .project_root()
+            .join(".writers-ide/chronology.toml");
+        let source = match fs::read_to_string(&path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ChronologyPreferences::default());
+            }
+            Err(error) => {
+                return Err(AppError::Preferences(format!(
+                    "read chronology preferences: {error}"
+                )));
+            }
+        };
+        let file: ChronologyPreferencesFile = toml::from_str(&source).map_err(|error| {
+            AppError::Preferences(format!("invalid chronology preferences: {error}"))
+        })?;
+        if file.version != 1 {
+            return Err(AppError::Preferences(format!(
+                "unsupported chronology preferences version {}",
+                file.version
+            )));
+        }
+        Ok(file.preferences)
+    }
+    pub fn set_chronology_preferences(&mut self, preferences: ChronologyPreferences) -> Result<()> {
+        let file = ChronologyPreferencesFile {
+            version: 1,
+            preferences,
+        };
+        let source = toml::to_string_pretty(&file).map_err(|error| {
+            AppError::Preferences(format!("serialize chronology preferences: {error}"))
+        })?;
+        write_project_file_atomically(
+            &self
+                .store
+                .project_root()
+                .join(".writers-ide/chronology.toml"),
+            source.as_bytes(),
+        )
+    }
+    pub fn update_scene_story_time(
+        &mut self,
+        id: SceneId,
+        start: StoryTime,
+        end: StoryTime,
+    ) -> Result<()> {
+        let mut scene = self.get_scene(id)?.scene;
+        scene.start_time = start;
+        scene.end_time = end;
+        self.update_scene_metadata(&scene)
+    }
+    pub fn should_prompt_for_missing_scene_time(&self, id: SceneId) -> Result<bool> {
+        let preferences = self.chronology_preferences()?;
+        if !preferences.enabled
+            || !preferences.prompt_for_missing_scene_time
+            || preferences.missing_scene_time_prompt_dismissed
+        {
+            return Ok(false);
+        }
+        let scene = self.get_scene(id)?.scene;
+        Ok(scene.start_time.precision == TimePrecision::Unknown
+            && scene.end_time.precision == TimePrecision::Unknown)
     }
     pub fn set_project_language(&mut self, language_code: &str) -> Result<()> {
         Ok(self.store.set_project_language(language_code)?)
@@ -2580,6 +2663,7 @@ impl WriterApp {
         expand_transclusions: bool,
     ) -> Result<story_pipeline::PipelineInput> {
         let project = self.get_project()?;
+        let chronology_enabled = self.chronology_preferences()?.enabled;
         let analytics = self.analytics_dataset()?;
         let groups = self
             .store
@@ -2718,6 +2802,7 @@ impl WriterApp {
             target_words: project.target_words,
             word_count_policy: project.word_count_policy,
             expand_transclusions,
+            chronology_enabled,
             groups,
             content_units,
             scenes,
@@ -5108,6 +5193,45 @@ fn _storage_result(_: StorageResult<()>) {}
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn chronology_is_disabled_by_default_and_preferences_survive_reopen_and_relocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        assert_eq!(
+            app.chronology_preferences().unwrap(),
+            ChronologyPreferences::default()
+        );
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene_id = app.create_scene(chapter, "Opening", 0).unwrap();
+        assert!(!app.should_prompt_for_missing_scene_time(scene_id).unwrap());
+        let scene_text = app.load_scene_text(scene_id).unwrap();
+        let prompt_preferences = ChronologyPreferences {
+            enabled: true,
+            prompt_for_missing_scene_time: true,
+            missing_scene_time_prompt_dismissed: false,
+        };
+        app.set_chronology_preferences(prompt_preferences).unwrap();
+        assert!(app.should_prompt_for_missing_scene_time(scene_id).unwrap());
+        app.update_scene_story_time(scene_id, StoryTime::exact(60), StoryTime::exact(120))
+            .unwrap();
+        assert!(!app.should_prompt_for_missing_scene_time(scene_id).unwrap());
+        assert_eq!(app.load_scene_text(scene_id).unwrap(), scene_text);
+        drop(app);
+
+        let app = WriterApp::open_project(&project).unwrap();
+        assert_eq!(app.chronology_preferences().unwrap(), prompt_preferences);
+        drop(app);
+
+        let relocated = dir.path().join("Relocated Novel");
+        fs::rename(&project, &relocated).unwrap();
+        let reopened = WriterApp::open_project(&relocated).unwrap();
+        assert_eq!(
+            reopened.chronology_preferences().unwrap(),
+            prompt_preferences
+        );
+    }
 
     #[test]
     fn emacs_tags_export_points_to_stable_symbol_index_entries_and_keeps_utf8_offsets() {

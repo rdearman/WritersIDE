@@ -1227,6 +1227,42 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             WriterApp::open_project(path)?.update_story_event_time(id, start, end, &source_time)?;
             println!("Updated story-time bounds for event {id}");
         }
+        "chronology-preferences" => {
+            let path = args.next().ok_or("missing project path")?;
+            let action = args.next().unwrap_or_else(|| "show".into());
+            let mut app = WriterApp::open_project(path)?;
+            let mut preferences = app.chronology_preferences()?;
+            match action.as_str() {
+                "show" => println!("{}", serde_json::to_string_pretty(&preferences)?),
+                "on" => preferences.enabled = true,
+                "off" => preferences.enabled = false,
+                "prompt-on" => {
+                    preferences.prompt_for_missing_scene_time = true;
+                    preferences.missing_scene_time_prompt_dismissed = false;
+                }
+                "prompt-off" => preferences.prompt_for_missing_scene_time = false,
+                "never" => {
+                    preferences.prompt_for_missing_scene_time = false;
+                    preferences.missing_scene_time_prompt_dismissed = true;
+                }
+                _ => return Err(
+                    "use chronology-preferences PROJECT [show|on|off|prompt-on|prompt-off|never]"
+                        .into(),
+                ),
+            }
+            if action != "show" {
+                app.set_chronology_preferences(preferences)?;
+                println!("Updated chronology preferences: {action}");
+            }
+        }
+        "scene-time-set" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = story_core::SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let start = parse_cli_story_time(&args.next().ok_or("missing start time")?)?;
+            let end = parse_cli_story_time(&args.next().ok_or("missing end time")?)?;
+            WriterApp::open_project(path)?.update_scene_story_time(id, start, end)?;
+            println!("Updated story-time bounds for scene {id}");
+        }
         "event-dependency-list" => {
             let path = args.next().ok_or("missing project path")?;
             println!(
@@ -3262,6 +3298,10 @@ fn usage() {
     eprintln!("writers-ide series-repair-memberships <series-directory>");
     eprintln!(
         "writers-ide event-time-set <project> <event-uuid> <start-tick|?|~nominal,lower,upper|lower..upper> <end-tick|?|~nominal,lower,upper|lower..upper> [source-time-text]"
+    );
+    eprintln!("writers-ide scene-time-set <project> <scene-uuid> <start-time> <end-time>");
+    eprintln!(
+        "writers-ide chronology-preferences <project> [show|on|off|prompt-on|prompt-off|never]"
     );
     eprintln!(
         "writers-ide review-resolve <project> <scene-uuid> <base-file> <reviewed-file> <base|local|external,...>"
