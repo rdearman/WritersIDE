@@ -15273,6 +15273,47 @@ fn menu_bar_line(s: &AppState, width: usize) -> Line<'static> {
     Line::from(spans)
 }
 
+fn menu_category_x(state: &AppState, category_index: usize) -> u16 {
+    let preceding = MENU_CATEGORIES
+        .iter()
+        .take(category_index.min(MENU_CATEGORIES.len()))
+        .enumerate()
+        .map(|(index, category)| {
+            let shortcut = effective_shortcut_label(state, MENU_CATEGORY_COMMAND_IDS[index], "");
+            let label = if shortcut.is_empty() {
+                (*category).to_owned()
+            } else {
+                format!("{category} {shortcut}")
+            };
+            UnicodeWidthStr::width(label.as_str()) + 2
+        })
+        .sum::<usize>();
+    // The menu bar starts with one leading cell; each root is separated by two.
+    (preceding + 1).min(u16::MAX as usize) as u16
+}
+
+fn menu_dropdown_rect(area: Rect, state: &AppState, menu: MenuState, entry_count: usize) -> Rect {
+    let width = area.width.min(48);
+    let y = area.y.saturating_add(1);
+    let height = area
+        .height
+        .saturating_sub(y.saturating_sub(area.y))
+        .min(entry_count.min(6).saturating_add(4).max(5) as u16);
+    let x = if area.width < 60 {
+        area.x
+    } else {
+        area.x
+            .saturating_add(menu_category_x(state, menu.top))
+            .min(area.x.saturating_add(area.width.saturating_sub(width)))
+    };
+    Rect {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
 fn effective_shortcut_label(state: &AppState, command_id: &str, fallback: &str) -> String {
     command_by_id(command_id)
         .map(|command| effective_command_shortcuts(state, command).join(" or "))
@@ -17371,54 +17412,34 @@ fn parse_challenge_tail(
 
 fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let area = f.area();
-    let width = area.width.min(64);
-    let height = area.height.saturating_sub(1).min(20);
-    if width == 0 || height == 0 {
-        return;
-    }
     let menu = s.menu.unwrap_or(MenuState {
         top: 0,
         selected: 0,
         all_commands: false,
         group: None,
     });
-    let category_offset = MENU_CATEGORIES
-        .iter()
-        .take(menu.top)
-        .map(|category| category.chars().count() + 2)
-        .sum::<usize>();
-    let popup = Rect {
-        x: area.x + (category_offset as u16).min(area.width.saturating_sub(width)),
-        y: area.y + 1,
-        width,
-        height,
-    };
+    let entries = s.menu_visible_entries();
+    let popup = menu_dropdown_rect(area, s, menu, entries.len());
+    if popup.width == 0 || popup.height == 0 {
+        return;
+    }
     f.render_widget(Clear, popup);
-    let direct_shortcut = effective_shortcut_label(s, MENU_CATEGORY_COMMAND_IDS[menu.top], "");
     let contents = if menu.all_commands && menu.group.is_none() {
-        "Command groups · Shift+Tab common"
+        "Groups · Enter opens · Esc closes"
     } else if let Some(group) = menu.group {
         group
     } else if menu.all_commands {
-        "Group commands · Shift+Tab common"
+        "Commands · Shift+Tab common"
     } else {
-        "Common actions · Tab all commands"
+        "Common · Tab all · Esc closes"
     };
-    let title = if direct_shortcut.is_empty() {
-        format!(" {} · {contents} · Esc close ", MENU_CATEGORIES[menu.top])
-    } else {
-        format!(
-            " {} · {contents} · {} · Esc close ",
-            MENU_CATEGORIES[menu.top], direct_shortcut
-        )
-    };
+    let title = format!(" {} · {contents} ", MENU_CATEGORIES[menu.top]);
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup);
     f.render_widget(block, popup);
-    let entries = s.menu_visible_entries();
     let row_width = inner.width.saturating_sub(2) as usize;
     let items = if entries.is_empty() {
         vec![ListItem::new("No commands available yet").style(Style::default().fg(Color::DarkGray))]
@@ -29503,6 +29524,50 @@ mod tests {
         let clipped = truncate_display_cells("e\u{301}😀Novel", 4);
         assert!(UnicodeWidthStr::width(clipped.as_str()) <= 4);
         assert!(!clipped.starts_with('\u{301}'));
+    }
+
+    #[test]
+    fn menu_dropdown_is_compact_and_anchors_to_the_active_menu_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let menu = MenuState {
+            top: 4,
+            selected: 0,
+            all_commands: false,
+            group: None,
+        };
+        let bar = menu_bar_line(&state, 80);
+        let expected_x = bar.spans[1..(1 + menu.top * 2)]
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum::<usize>()
+            + 1;
+        assert_eq!(menu_category_x(&state, menu.top) as usize, expected_x);
+
+        let wide = menu_dropdown_rect(Rect::new(0, 0, 80, 24), &state, menu, 30);
+        assert_eq!(wide.x as usize, expected_x);
+        assert_eq!(wide.y, 1);
+        assert_eq!(wide.width, 48);
+        assert!(wide.height <= 14);
+        assert!(wide.height < 20);
+
+        let narrow = menu_dropdown_rect(Rect::new(0, 0, 40, 24), &state, menu, 30);
+        assert_eq!(narrow.x, 0);
+        assert_eq!(narrow.width, 40);
+        assert!(narrow.width <= 48);
+
+        let resized = menu_dropdown_rect(Rect::new(0, 0, 30, 6), &state, menu, 1);
+        assert_eq!(resized.width, 30);
+        assert!(resized.height <= 5);
+        assert!(resized.y + resized.height <= 6);
+
+        state.command_bindings = vec![(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::ALT),
+            "menu.file".into(),
+        )];
+        let remapped_x = menu_category_x(&state, menu.top);
+        assert!(remapped_x > wide.x);
     }
 
     #[test]
