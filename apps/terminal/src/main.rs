@@ -106,6 +106,35 @@ impl Workspace {
         }
     }
 }
+const PRIMARY_DESTINATIONS: [Workspace; 3] =
+    [Workspace::Editor, Workspace::Outline, Workspace::Reading];
+
+fn next_primary_destination(current: Workspace, forward: bool) -> Workspace {
+    let Some(index) = PRIMARY_DESTINATIONS
+        .iter()
+        .position(|destination| *destination == current)
+    else {
+        return if forward {
+            PRIMARY_DESTINATIONS[0]
+        } else {
+            PRIMARY_DESTINATIONS[PRIMARY_DESTINATIONS.len() - 1]
+        };
+    };
+    let next = if forward {
+        (index + 1) % PRIMARY_DESTINATIONS.len()
+    } else {
+        (index + PRIMARY_DESTINATIONS.len() - 1) % PRIMARY_DESTINATIONS.len()
+    };
+    PRIMARY_DESTINATIONS[next]
+}
+
+fn destination_title(workspace: Workspace) -> &'static str {
+    match workspace {
+        Workspace::Editor => "Manuscript",
+        Workspace::Reading => "Reference",
+        _ => workspace.title(),
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OutlineRow {
     Chapter {
@@ -580,11 +609,9 @@ const MENU_COMMON_COMMANDS: [&[&str]; 8] = [
         "edit.snippet-insert",
     ],
     &[
-        "view.dashboard",
-        "view.outline",
         "view.editor",
-        "view.cards",
-        "view.search",
+        "view.outline",
+        "view.reading",
         "scene.open",
         "search.return-position",
     ],
@@ -1104,8 +1131,17 @@ fn command_registry() -> Vec<CommandSpec> {
                 Workspace::Assemblies => "view.assemblies",
                 Workspace::Series => "view.series",
             },
-            label: workspace.title(),
-            description: "Switch to this workspace",
+            label: match workspace {
+                Workspace::Editor => "Manuscript",
+                Workspace::Reading => "Reference",
+                _ => workspace.title(),
+            },
+            description: match workspace {
+                Workspace::Editor => "Write and revise manuscript text",
+                Workspace::Outline => "View and organise chapters and scenes",
+                Workspace::Reading => "Browse imported reference materials",
+                _ => "Open an advanced workspace",
+            },
             category: "View",
             default_shortcuts: workspace_default_shortcuts(workspace),
             mnemonic: None,
@@ -16012,6 +16048,16 @@ impl AppState {
     }
 }
 
+fn open_default_manuscript_if_unrestored(
+    state: &mut AppState,
+    has_saved_session: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !has_saved_session && let Some(scene) = state.scenes.first().map(|scene| scene.0) {
+        state.open_scene(scene)?;
+    }
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = env::args()
         .nth(1)
@@ -16043,8 +16089,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>()
         .join(" · ");
     }
+    let has_saved_session = state.session_path().exists();
     state.restore_session()?;
     state.refresh()?;
+    open_default_manuscript_if_unrestored(&mut state, has_saved_session)?;
     let onboarding_path = user_tutorial_preferences_path();
     match onboarding::load(&onboarding_path) {
         Ok(preferences) if !preferences.welcome_seen || preferences.active_tutorial.is_some() => {
@@ -17102,7 +17150,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             f.render_widget(
                 Paragraph::new(detail).wrap(Wrap { trim: false }).block(
                     Block::default()
-                        .title("Details / split pane")
+                        .title("Selected scene")
                         .borders(Borders::ALL),
                 ),
                 body[1],
@@ -17215,7 +17263,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     "Esc outline"
                 }
             } else {
-                "Tab workspaces"
+                "Tab destinations"
             };
             let status = format!(
                 " Active:{focus} · {} · Save {} · Menu {} · Help {} · {pane_hint}{}",
@@ -17292,7 +17340,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     .get_project()
                     .map(|project| project.title)
                     .unwrap_or_else(|_| "Book".into());
-                format!("{book} > {}", s.workspace.title())
+                format!("{book} > {}", destination_title(s.workspace))
             };
             let save_state = if s.message.starts_with("Save conflict/error:")
                 || s.message.starts_with("Autosave failed")
@@ -17331,7 +17379,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     "Esc: Outline"
                 }
             } else {
-                "Tab: next workspace"
+                "Tab: destinations"
             };
             let tutorial = s
                 .tutorial_progress_label
@@ -17425,7 +17473,7 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
             effective_shortcut_label(state, "help.context", "Help menu / command palette")
         ),
         "Writing: Ctrl+Tab switches to an open reference pane; Esc returns to the manuscript".to_owned(),
-        "Navigation: Tab moves to the next workspace and Shift+Tab to the previous workspace outside text fields".to_owned(),
+        "Navigation: outside manuscript editing, Tab cycles Manuscript → Outline → Reference and Shift+Tab goes back. In the editor, Tab inserts indentation; Esc returns to Outline.".to_owned(),
         format!(
             "Save: {} · current buffer is {}",
             effective_shortcut_label(state, "file.save", "Ctrl+S"),
@@ -22378,15 +22426,17 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
             _ => {}
         }
-        if s.reading_focus {
-            s.reading_offset = s
-                .reading_text
-                .split_inclusive('\n')
-                .take(s.scroll)
-                .map(str::len)
-                .sum::<usize>() as u64;
+        if !matches!(k.code, KeyCode::Tab | KeyCode::BackTab) {
+            if s.reading_focus {
+                s.reading_offset = s
+                    .reading_text
+                    .split_inclusive('\n')
+                    .take(s.scroll)
+                    .map(str::len)
+                    .sum::<usize>() as u64;
+            }
+            return Ok(false);
         }
-        return Ok(false);
     }
     if k.modifiers.contains(KeyModifiers::CONTROL) && k.code == KeyCode::Char('s') {
         if let Some(command) = command_by_id("file.save") {
@@ -22882,20 +22932,8 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.dispatch_registered(command.action)?;
             }
         }
-        KeyCode::Tab => {
-            let i = Workspace::ALL
-                .iter()
-                .position(|x| *x == s.workspace)
-                .unwrap_or(0);
-            s.switch(Workspace::ALL[(i + 1) % Workspace::ALL.len()]);
-        }
-        KeyCode::BackTab => {
-            let i = Workspace::ALL
-                .iter()
-                .position(|x| *x == s.workspace)
-                .unwrap_or(0);
-            s.switch(Workspace::ALL[(i + Workspace::ALL.len() - 1) % Workspace::ALL.len()]);
-        }
+        KeyCode::Tab => s.switch(next_primary_destination(s.workspace, true)),
+        KeyCode::BackTab => s.switch(next_primary_destination(s.workspace, false)),
         KeyCode::Up | KeyCode::Char('k')
             if s.workspace == Workspace::Research && s.proposal_review_active =>
         {
@@ -27435,7 +27473,7 @@ mod tests {
         )
         .unwrap();
         assert!(state.menu.is_none());
-        assert_eq!(state.workspace, Workspace::Dashboard);
+        assert_eq!(state.workspace, Workspace::Editor);
         assert_eq!(state.editor, vec!["text/".to_owned()]);
         assert_eq!(state.cursor, (0, 5));
 
@@ -32055,6 +32093,75 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(autosaved.contains("[AUTOSAVED]"));
+    }
+
+    #[test]
+    fn primary_destinations_are_easy_to_cycle_and_advanced_views_remain_in_navigate_menu() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        handle(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.workspace, Workspace::Reading);
+        assert_eq!(destination_title(state.workspace), "Reference");
+        handle(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        state.workspace = Workspace::Outline;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+
+        state.workspace = Workspace::Analytics;
+        handle(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+
+        let navigate = MENU_CATEGORIES
+            .iter()
+            .position(|name| *name == "Navigate")
+            .unwrap();
+        state.menu = Some(MenuState {
+            top: navigate,
+            selected: 0,
+            all_commands: false,
+            group: None,
+        });
+        let common = state
+            .menu_commands()
+            .into_iter()
+            .map(|command| command.label)
+            .collect::<Vec<_>>();
+        assert!(common.starts_with(&["Manuscript", "Outline", "Reference"]));
+
+        state.menu.as_mut().unwrap().all_commands = true;
+        let every_view = state
+            .menu_commands()
+            .into_iter()
+            .map(|command| command.id)
+            .collect::<Vec<_>>();
+        assert!(every_view.contains(&"view.analytics"));
+        assert!(every_view.contains(&"view.cards"));
+    }
+
+    #[test]
+    fn first_launch_opens_existing_manuscript_but_restores_saved_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        open_default_manuscript_if_unrestored(&mut state, false).unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert_eq!(state.editing_scene, Some(scene));
+
+        let mut resumed = AppState::new(state.app, default_bindings());
+        resumed.refresh().unwrap();
+        open_default_manuscript_if_unrestored(&mut resumed, true).unwrap();
+        assert_eq!(resumed.workspace, Workspace::Dashboard);
+        assert_eq!(resumed.editing_scene, None);
     }
 
     #[test]
