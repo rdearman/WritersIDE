@@ -543,6 +543,7 @@ struct MacroPreview {
     name: String,
     repetitions: usize,
     source: String,
+    proposed: String,
 }
 
 #[derive(Clone, Debug)]
@@ -2488,6 +2489,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("edit.register-insert", "Insert Editor Register", "Insert a named editor register", "Edit", "register-insert", true),
         legacy_command("edit.register-rotate", "Rotate Editor Registers", "Rotate values through two or more named registers", "Edit", "register-rotate", true),
         legacy_command("edit.multi-insert", "Multi-cursor Insert", "Insert text at multiple original UTF-8 byte offsets", "Edit", "multi-insert", true),
+        legacy_command("edit.multi-replace", "Replace Multiple Selections", "Replace grapheme-bounded ranges in the active buffer as one undoable edit", "Edit", "multi-replace", true),
         legacy_command("edit.macro", "Run Edit Macro", "Apply an undoable selection or line edit macro", "Edit", "macro", true),
         legacy_command("edit.macro-define", "Define Edit Macro", "Save a reusable, data-only edit macro", "Edit", "macro-define", true),
         legacy_command("edit.macro-run", "Run Named Edit Macro", "Apply a saved macro once or a bounded number of times", "Edit", "macro-run", true),
@@ -8413,6 +8415,51 @@ impl AppState {
                 "Inserted at {} distinct UTF-8 cursor anchors",
                 anchors.iter().collect::<BTreeSet<_>>().len()
             );
+        } else if let Some(rest) = cmd.strip_prefix("multi-replace ") {
+            let (ranges_text, replacement) = rest
+                .split_once(' ')
+                .ok_or("use multi-replace START:END[,START:END...] TEXT")?;
+            let ranges = ranges_text
+                .split(',')
+                .map(|item| {
+                    let (start, end) = item
+                        .split_once(':')
+                        .ok_or("multi-selection ranges must use START:END")?;
+                    Ok(start.parse::<usize>()?..end.parse::<usize>()?)
+                })
+                .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+            let original = self.editor.join("\n");
+            if self.narrowed_passage.is_some_and(|(start, end)| {
+                ranges
+                    .iter()
+                    .any(|range| range.start < start || range.end > end)
+            }) {
+                return Err(
+                    "all multi-selection ranges must stay inside the narrowed passage".into(),
+                );
+            }
+            let updated = story_core::replace_at_grapheme_ranges(&original, &ranges, replacement)?;
+            if updated != original {
+                self.push_undo();
+                let first = ranges
+                    .iter()
+                    .min_by_key(|range| (range.start, range.end))
+                    .expect("the core operation validated at least one range");
+                self.editor = updated.lines().map(str::to_owned).collect();
+                if self.editor.is_empty() {
+                    self.editor.push(String::new());
+                }
+                let cursor_byte = first.start + replacement.len();
+                self.cursor = editor_position_from_byte(&updated, cursor_byte).unwrap_or((0, 0));
+                self.editor_selection = None;
+                self.extra_cursors.clear();
+                self.dirty = true;
+                self.update_narrowed_passage(&original);
+            }
+            self.message = format!(
+                "Replaced {} grapheme-bounded selections as one undoable edit",
+                ranges.len()
+            );
         } else if let Some(rest) = cmd.strip_prefix("macro-define ") {
             let (name, recipe) = rest
                 .split_once(' ')
@@ -8453,9 +8500,10 @@ impl AppState {
                 name: name.to_owned(),
                 repetitions,
                 source: source.clone(),
+                proposed: output.clone(),
             });
             self.message = format!(
-                "Macro preview · {name} × {repetitions} · {} → {} bytes · run macro-run {name} {repetitions} to apply",
+                "Macro preview · {name} × {repetitions} · {} → {} bytes · Enter applies, Esc cancels",
                 source.len(),
                 output.len()
             );
@@ -8469,6 +8517,9 @@ impl AppState {
                 preview.name == name
                     && preview.repetitions == repetitions
                     && preview.source == source
+                    && self
+                        .preview_edit_macro(&repeated)
+                        .is_ok_and(|output| output == preview.proposed)
             });
             if needs_preview && !preview_is_current {
                 let output = self.preview_edit_macro(&repeated)?;
@@ -8476,9 +8527,10 @@ impl AppState {
                     name: name.to_owned(),
                     repetitions,
                     source: source.clone(),
+                    proposed: output.clone(),
                 });
                 self.message = format!(
-                    "Destructive macro preview · {} → {} bytes · repeat macro-run {name} {repetitions} to confirm",
+                    "Destructive macro preview · {} → {} bytes · Enter applies, Esc cancels",
                     source.len(),
                     output.len()
                 );
@@ -12827,7 +12879,7 @@ impl AppState {
         } else if cmd == "help" {
             self.message="F1-F9, F11-F14 workspaces; Ctrl+/ or F10 main menu; arrows navigate; Enter opens; : commands; / searches; Ctrl-S saves; q quits".into();
         } else {
-            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... | event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... | event-relationships EVENT-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expansion-user-set ABBREVIATION => REPLACEMENT | text-expansion-user on|off|list | text-expansion-user-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
+            self.message = "Commands: section TITLE | chapter TITLE | character NAME | location NAME | character-link SCENE UUID ROLE | scene-field SCENE FIELD | plotline NAME | plotline-link SCENE PLOTLINE overlap|equal [ROLE] | issue TITLE | event TITLE | research TITLE | scene CHAPTER-ID TITLE | move SCENE-ID CHAPTER-ID POSITION | rename SCENE-ID TITLE | scene-status SCENE-ID STATUS | open UUID | workspace NAME | search-all TERMS | find MODE current|all PATTERN | replace MODE current|all PATTERN => REPLACEMENT | query UUID | query-list | query-clear | query-evidence QUERY-UUID SCENE-UUID | query-save NAME filters... (before-definitely=TICK, before-possibly=TICK, after-definitely=TICK, after-possibly=TICK, meta-contains=FIELD:KIND:ENTITY, meta-exists=FIELD, meta-text=FIELD:TEXT, meta-number=FIELD:OP:int|decimal:VALUE) | query-assert-save QUERY-UUID RULE... | query-assert-check QUERY-UUID | event-characters-set EVENT-UUID UUID=participant|witness|cause|affected,... | event-locations-set EVENT-UUID UUID=occurred_at|starts_at|ends_at,... | event-relationships EVENT-UUID | event-dependency-add BEFORE-EVENT AFTER-EVENT precedes|requires [NOTES] | event-dependency-list | event-dependency-check | event-dependency-update BEFORE AFTER KIND NOTES | event-dependency-remove BEFORE AFTER KIND | location-rule-add LOCATION-A LOCATION-B DESCRIPTION | location-rule-list | location-rule-update RULE-UUID enabled|disabled DESCRIPTION | location-rule-check | location-rule-remove RULE-UUID | coverage-add ID DIMENSION ENTITY-UUID MIN LABEL | coverage-remove ID | coverage-list | coverage-check | spellcheck LANGUAGE [PROJECT-WORDLIST] [ASPELL] | spellcheck-hunspell LANGUAGE [PROJECT-WORDLIST] [HUNSPELL] | link SRC-KIND SRC-ID DST-KIND DST-ID TYPE [LABEL] | outgoing KIND UUID | backlinks KIND UUID | broken-links | anchors | transclude SCENE-ID | process | compile-format <text|markdown|latex|html|epub|docx|pdf> [OUTPUT] | compile-watch via CLI | snippet NAME TEMPLATE | snippet-insert NAME [key=value...] | register-save NAME | register-insert NAME | register-rotate NAME NAME [NAME...] | multi-insert BYTE,BYTE,... TEXT | multi-replace START:END[,START:END...] TEXT | macro-record NAME | macro-stop | macro-run NAME [REPETITIONS] | macro-preview NAME [REPETITIONS] | command-macro-record NAME | command-macro-stop | command-macro-run NAME | command-macro-list | keybinding-set CTRL+KEY COMMAND-ID | keybinding-remove CTRL+KEY | keybinding-list | macro insert TEXT|upper|lower|replace FROM=>TO | text-expansion-set ABBREVIATION => REPLACEMENT | text-expansion on|off|list | text-expansion-remove ABBREVIATION | text-expansion-user-set ABBREVIATION => REPLACEMENT | text-expansion-user on|off|list | text-expansion-user-remove ABBREVIATION | text-expand | editor-preferences show|line-ending|indentation|indent-width | kill-ring-list | kill-ring-insert INDEX | yank-pop | manuscript-bookmark-save NAME | manuscript-bookmark-list | manuscript-bookmark-jump NAME | challenge-start TARGET_WORDS SECONDS [pressure|kamikaze] [scene=UUID] | challenge-preset short|standard|long [pressure|kamikaze] [scene=UUID] | challenge-finish | challenge-list-drafts | challenge-save-new DRAFT-UUID CHAPTER-UUID TITLE | challenge-save-target DRAFT-UUID | challenge-discard DRAFT-UUID | challenge-idle SECONDS | challenge-pauses COUNT | challenge-delete-rate WORDS | challenge-taunt TEXT (use {words}/{deleted}) | writing-stats on|off|report|reset | goal-create START END TARGET BASELINE TIMEZONE raw|real project|SCENE_UUID TITLE | goal-list | goal-record GOAL TIME ORIGIN SOURCE FINGERPRINT SCENE|none RAW REAL DETAIL | goal-events UUID | goal-progress UUID | goal-weekly UUID | goal-archive UUID | goal-reconcile EVENT_UUID FINGERPRINT RAW REAL REASON | read-import PATH | read UUID | highlight start:end quote | note start:end quote | bookmarks | annotations | help".into();
         }
         Ok(())
     }
@@ -14809,6 +14861,58 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.keybinding_manager.is_some() {
         draw_keybinding_manager_overlay(f, s);
     }
+    if s.macro_preview.is_some() {
+        draw_macro_preview_overlay(f, s);
+    }
+}
+
+fn draw_macro_preview_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(preview) = &s.macro_preview else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.min(110);
+    let height = area.height.min(26);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(
+            " Macro Preview · {} × {} · Enter apply · Esc cancel ",
+            preview.name, preview.repetitions
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let panes = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(preview.source.as_str())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Current manuscript")
+                    .borders(Borders::ALL),
+            ),
+        panes[0],
+    );
+    f.render_widget(
+        Paragraph::new(preview.proposed.as_str())
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title("Proposed macro result")
+                    .borders(Borders::ALL),
+            ),
+        panes[1],
+    );
 }
 
 struct TerminalSpellingFinding {
@@ -18446,6 +18550,22 @@ fn step_find_query_history(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(preview) = s.macro_preview.clone() {
+        match k.code {
+            KeyCode::Enter => {
+                s.execute_legacy_palette_command(&format!(
+                    "macro-run {} {}",
+                    preview.name, preview.repetitions
+                ))?;
+            }
+            KeyCode::Esc => {
+                s.macro_preview = None;
+                s.message = format!("Cancelled preview for macro {}", preview.name);
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if s.keybinding_manager.is_some() {
         s.handle_keybinding_manager_key(k)?;
         return Ok(false);
@@ -21008,9 +21128,32 @@ mod tests {
         state.prompt = "macro-run trim 2".into();
         state.command().unwrap();
         assert_eq!(state.editor, ["word"]);
-        assert!(state.message.contains("repeat macro-run trim 2 to confirm"));
+        assert_eq!(state.macro_preview.as_ref().unwrap().proposed, "wo");
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(visible.contains("Current manuscript"));
+        assert!(visible.contains("Proposed macro result"));
+        assert!(visible.contains("word"));
+        assert!(visible.contains("wo"));
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.macro_preview.is_none());
+        assert_eq!(state.editor, ["word"]);
+
         state.prompt = "macro-run trim 2".into();
         state.command().unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
         assert_eq!(state.editor, ["wo"]);
         assert!(
             state
@@ -21400,6 +21543,53 @@ mod tests {
         assert_eq!(state.extra_cursors, [(1, 0)]);
         state.undo_edit();
         assert_eq!(state.editor, ["ab", "cd"]);
+    }
+
+    #[test]
+    fn multi_selection_replace_is_grapheme_safe_undoable_and_scene_local() {
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Book");
+        let mut project = WriterApp::create_project(&project_path, "Book").unwrap();
+        let chapter = project.create_chapter(None, "Chapter", 0).unwrap();
+        let first = project.create_scene(chapter, "First", 0).unwrap();
+        let second = project.create_scene(chapter, "Second", 1).unwrap();
+        for (scene, text) in [
+            (first, "É🙂e\u{301} here\nÉ🙂 there"),
+            (second, "other scene"),
+        ] {
+            let (_, hash) = project.load_scene_text(scene).unwrap();
+            project.save_scene_text(scene, Some(&hash), text).unwrap();
+        }
+        let mut state = AppState::new(project, default_bindings());
+        state.open_scene(first).unwrap();
+        let original = state.editor.join("\n");
+        let selections = original
+            .match_indices("É🙂")
+            .map(|(start, value)| format!("{start}:{}", start + value.len()))
+            .collect::<Vec<_>>()
+            .join(",");
+        state.prompt = format!("multi-replace {selections} Hero");
+        state.command().unwrap();
+        assert_eq!(state.editor, ["Heroe\u{301} here", "Hero there"]);
+        assert!(state.message.contains("2 grapheme-bounded selections"));
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), original);
+
+        let split_grapheme = original.find('e').unwrap() + 1;
+        state.prompt = format!("multi-replace {split_grapheme}:{} x", split_grapheme + 1);
+        assert!(state.command().is_err());
+        assert_eq!(state.editor.join("\n"), original);
+
+        state.prompt = format!("multi-replace {selections} Hero");
+        state.command().unwrap();
+        state.save().unwrap();
+        drop(state);
+        let reopened = WriterApp::open_project(project_path).unwrap();
+        assert_eq!(
+            reopened.load_scene_text(first).unwrap().0,
+            "Heroe\u{301} here\nHero there"
+        );
+        assert_eq!(reopened.load_scene_text(second).unwrap().0, "other scene");
     }
 
     #[test]

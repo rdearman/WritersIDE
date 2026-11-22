@@ -63,6 +63,44 @@ pub fn insert_at_anchors(
     Ok(result)
 }
 
+/// Replace several original-buffer selections in one edit. Ranges use UTF-8 byte offsets but
+/// must start and end at extended grapheme boundaries. Overlapping or repeated ranges are rejected.
+pub fn replace_at_grapheme_ranges(
+    source: &str,
+    ranges: &[std::ops::Range<usize>],
+    replacement: &str,
+) -> Result<String, String> {
+    if ranges.is_empty() {
+        return Err("multi-selection replacement needs at least one range".into());
+    }
+    let mut boundaries = source
+        .grapheme_indices(true)
+        .map(|(offset, _)| offset)
+        .collect::<BTreeSet<_>>();
+    boundaries.insert(source.len());
+    let mut ordered = ranges.to_vec();
+    ordered.sort_by_key(|range| (range.start, range.end));
+    if ordered.iter().any(|range| {
+        range.start > range.end
+            || range.end > source.len()
+            || !boundaries.contains(&range.start)
+            || !boundaries.contains(&range.end)
+    }) {
+        return Err("multi-selection range is outside the buffer or splits a grapheme".into());
+    }
+    if ordered
+        .windows(2)
+        .any(|pair| pair[1].start < pair[0].end || pair[1].start == pair[0].start)
+    {
+        return Err("multi-selection ranges overlap or repeat an insertion point".into());
+    }
+    let mut result = source.to_owned();
+    for range in ordered.into_iter().rev() {
+        result.replace_range(range, replacement);
+    }
+    Ok(result)
+}
+
 /// A small replayable edit macro. Operations are intentionally data-only and can be recorded,
 /// persisted or dispatched by any frontend without depending on a terminal UI.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -268,6 +306,28 @@ mod editor_tool_tests {
     fn multi_cursor_insert_applies_right_to_left_at_utf8_boundaries() {
         assert_eq!(insert_at_anchors("é ab", &[3, 0], "X").unwrap(), "Xé Xab");
         assert!(insert_at_anchors("é", &[1], "x").is_err());
+    }
+
+    #[test]
+    fn multi_selection_replace_is_grapheme_safe_and_rejects_ambiguous_ranges() {
+        let source = "É🙂e\u{301}x";
+        let ranges = [0.."É".len(), "É🙂".len()..source.len()];
+        assert_eq!(
+            replace_at_grapheme_ranges(source, &ranges, "word").unwrap(),
+            "word🙂word"
+        );
+        assert!(replace_at_grapheme_ranges(source, std::slice::from_ref(&(1..2)), "x").is_err());
+        assert!(
+            replace_at_grapheme_ranges(
+                source,
+                std::slice::from_ref(&("É🙂".len().."É🙂e".len())),
+                "x"
+            )
+            .is_err()
+        );
+        assert!(replace_at_grapheme_ranges("abcd", &[0..3, 2..4], "x").is_err());
+        assert!(replace_at_grapheme_ranges(source, &[0..0, 0..0], "x").is_err());
+        assert!(replace_at_grapheme_ranges("abcd", &[0..0, 0..2], "x").is_err());
     }
     #[test]
     fn edit_macros_transform_selection_without_touching_surrounding_text() {
