@@ -1571,6 +1571,14 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "git.snapshot-on-exit",
+            "Automatic Snapshot on Exit",
+            "Enable or disable a final local snapshot when closing Writer's IDE: git-auto-snapshot-exit <on|off>",
+            "File",
+            "git-auto-snapshot-exit",
+            true,
+        ),
+        legacy_command(
             "git.history",
             "Show Project History",
             "List local project snapshots",
@@ -9221,6 +9229,17 @@ impl AppState {
                     self.open_reading_selected()?;
                 }
             }
+        } else if let Some(setting) = cmd.strip_prefix("git-auto-snapshot-exit ") {
+            let enabled = match setting.trim().to_ascii_lowercase().as_str() {
+                "on" | "true" => true,
+                "off" | "false" => false,
+                _ => return Err("use git-auto-snapshot-exit <on|off>".into()),
+            };
+            self.app.set_git_snapshot_on_exit(enabled)?;
+            self.message = format!(
+                "Automatic project snapshot on exit {}",
+                if enabled { "enabled" } else { "disabled" }
+            );
         } else if let Some(label) = cmd.strip_prefix("git-snapshot ") {
             if self.dirty {
                 self.save()?;
@@ -12099,6 +12118,7 @@ fn run(
     if s.active_challenge.is_some() {
         s.finish_active_challenge("quit")?;
     }
+    s.app.git_auto_snapshot_on_exit()?;
     Ok(())
 }
 fn write_board_svg_export(
@@ -17489,6 +17509,13 @@ mod tests {
             "git.history"
         );
         assert_eq!(
+            command_palette_invocation("git-auto-snapshot-exit on")
+                .unwrap()
+                .0
+                .id,
+            "git.snapshot-on-exit"
+        );
+        assert_eq!(
             command_palette_invocation("git-snapshot Before edits")
                 .unwrap()
                 .0
@@ -17538,6 +17565,21 @@ mod tests {
         let (dismiss, dismiss_args) = command_palette_invocation("dismiss review.json 2").unwrap();
         assert_eq!(dismiss.id, "extract.dismiss");
         assert_eq!(dismiss_args, Some("review.json 2"));
+    }
+
+    #[test]
+    fn terminal_can_toggle_automatic_exit_snapshots_through_registry_command() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command("git-auto-snapshot-exit on")
+            .unwrap();
+        assert!(state.app.git_auto_snapshot_on_exit().unwrap().is_some());
+        state
+            .execute_legacy_palette_command("git-auto-snapshot-exit off")
+            .unwrap();
+        assert!(state.app.git_auto_snapshot_on_exit().unwrap().is_none());
     }
 
     #[test]

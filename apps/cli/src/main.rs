@@ -817,6 +817,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None => println!("Automatic Git snapshots disabled."),
             }
         }
+        "git-auto-snapshot-exit" => {
+            let path = args.next().ok_or("missing project path")?;
+            let setting = args.next().ok_or("missing on or off setting")?;
+            let enabled = match setting.to_ascii_lowercase().as_str() {
+                "on" | "true" => true,
+                "off" | "false" => false,
+                _ => return Err("exit snapshot setting must be on or off".into()),
+            };
+            let app = WriterApp::open_project(path)?;
+            app.set_git_snapshot_on_exit(enabled)?;
+            println!(
+                "Automatic project snapshot on exit {}.",
+                if enabled { "enabled" } else { "disabled" }
+            );
+        }
         "git-auto-snapshot-check" => {
             let path = PathBuf::from(args.next().ok_or("missing project path")?);
             let now = std::time::SystemTime::now()
@@ -3122,6 +3137,7 @@ fn usage() {
     );
     eprintln!("writers-ide passage-languages <project> <scene-uuid>");
     eprintln!("writers-ide git-auto-snapshot <project> <interval-minutes|off> (1–10080 minutes)");
+    eprintln!("writers-ide git-auto-snapshot-exit <project> <on|off>");
     eprintln!(
         "writers-ide git-auto-snapshot-check <project> (one-shot; suitable for cron/systemd timers)"
     );

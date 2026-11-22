@@ -51,6 +51,8 @@ pub struct BlamedLine {
 pub struct AutoSnapshotPolicy {
     pub interval_minutes: Option<u32>,
     #[serde(default)]
+    pub snapshot_on_exit: bool,
+    #[serde(default)]
     last_checked_unix: Option<i64>,
 }
 
@@ -63,8 +65,20 @@ impl AutoSnapshotPolicy {
         }
         Ok(Self {
             interval_minutes,
+            snapshot_on_exit: false,
             last_checked_unix: None,
         })
+    }
+
+    pub fn set_interval(&mut self, interval_minutes: Option<u32>) -> Result<()> {
+        if interval_minutes.is_some_and(|minutes| !(1..=10_080).contains(&minutes)) {
+            return Err(GitError::Command(
+                "automatic snapshot interval must be between 1 and 10080 minutes".into(),
+            ));
+        }
+        self.interval_minutes = interval_minutes;
+        self.last_checked_unix = None;
+        Ok(())
     }
 
     pub fn due(&self, now_unix: i64) -> bool {
@@ -89,6 +103,7 @@ pub fn load_auto_snapshot_policy(root: impl AsRef<Path>) -> Result<AutoSnapshotP
                 GitError::Command(format!("invalid Git snapshot policy: {error}"))
             })?;
             AutoSnapshotPolicy::new(policy.interval_minutes).map(|mut validated| {
+                validated.snapshot_on_exit = policy.snapshot_on_exit;
                 validated.last_checked_unix = policy.last_checked_unix;
                 validated
             })
@@ -547,6 +562,7 @@ mod tests {
     fn auto_snapshot_policy_round_trips_atomically() {
         let root = tempfile::tempdir().unwrap();
         let mut policy = AutoSnapshotPolicy::new(Some(30)).unwrap();
+        policy.snapshot_on_exit = true;
         policy.record_check(1234);
         save_auto_snapshot_policy(root.path(), &policy).unwrap();
         assert_eq!(load_auto_snapshot_policy(root.path()).unwrap(), policy);

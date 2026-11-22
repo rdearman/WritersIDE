@@ -4678,7 +4678,14 @@ impl WriterApp {
         })?)
     }
     pub fn set_git_auto_snapshot_interval(&self, minutes: Option<u32>) -> Result<()> {
-        let policy = story_git::AutoSnapshotPolicy::new(minutes)?;
+        let mut policy = story_git::load_auto_snapshot_policy(self.store.project_root())?;
+        policy.set_interval(minutes)?;
+        story_git::save_auto_snapshot_policy(self.store.project_root(), &policy)?;
+        Ok(())
+    }
+    pub fn set_git_snapshot_on_exit(&self, enabled: bool) -> Result<()> {
+        let mut policy = story_git::load_auto_snapshot_policy(self.store.project_root())?;
+        policy.snapshot_on_exit = enabled;
         story_git::save_auto_snapshot_policy(self.store.project_root(), &policy)?;
         Ok(())
     }
@@ -4692,6 +4699,14 @@ impl WriterApp {
         policy.record_check(now_unix);
         story_git::save_auto_snapshot_policy(self.store.project_root(), &policy)?;
         Ok(result)
+    }
+    /// Snapshot persisted project state on orderly application exit when enabled.
+    pub fn git_auto_snapshot_on_exit(&mut self) -> Result<Option<String>> {
+        let policy = story_git::load_auto_snapshot_policy(self.store.project_root())?;
+        if !policy.snapshot_on_exit {
+            return Ok(None);
+        }
+        self.git_snapshot("Automatic project snapshot on exit")
     }
     /// Restore one scene's prose from a local Git commit through the normal
     /// optimistic write journal. Current project state is snapshotted first.
@@ -5193,6 +5208,22 @@ unexpected_prose = "must not be silently discarded"
         assert!(app.git_auto_snapshot_if_due(1_120).unwrap().is_some());
         app.set_git_auto_snapshot_interval(None).unwrap();
         assert!(app.git_auto_snapshot_if_due(10_000).unwrap().is_none());
+    }
+
+    #[test]
+    fn exit_snapshots_are_opt_in_and_interval_changes_preserve_the_setting() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        assert!(app.git_auto_snapshot_on_exit().unwrap().is_none());
+        app.set_git_snapshot_on_exit(true).unwrap();
+        assert!(app.git_auto_snapshot_on_exit().unwrap().is_some());
+        assert!(app.git_auto_snapshot_on_exit().unwrap().is_none());
+        app.set_git_auto_snapshot_interval(Some(30)).unwrap();
+        assert!(app.git_auto_snapshot_on_exit().unwrap().is_none());
+        app.set_git_snapshot_on_exit(false).unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        app.create_scene(chapter, "Scene", 0).unwrap();
+        assert!(app.git_auto_snapshot_on_exit().unwrap().is_none());
     }
 
     #[test]

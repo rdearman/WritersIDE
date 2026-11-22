@@ -313,3 +313,7 @@ The application can capture an active project's document hierarchy, nested struc
 ## Issue #35 — Guided Series menu workflow
 
 Selecting Create Series, Select Series, Add Current Book, Import Scrivener, or New Book in the hierarchical terminal menu opens a guided text form for the required paths and titles. Enter advances, Backspace edits, and Esc cancels before project mutation. Scrivener import then opens the existing binder mapping preview; import commit remains staged and source-preserving. CLI commands remain available for scripts. The sanitized terminal integration test covers creating a series, previewing and importing a Scrivener project, creating Book 3, and drafting chapter-level prose without a scene. A native path picker remains deferred.
+
+## Issue #11 — Optional Git snapshot on exit
+
+Projects can enable an automatic local Git snapshot on orderly terminal exit with `git-auto-snapshot-exit <project> on|off` or the File menu. It is disabled by default and independent of interval scheduling. It runs through the same journal-consistent snapshot barrier; unchanged project state creates no commit. Crashes and forced termination do not run exit automation.
