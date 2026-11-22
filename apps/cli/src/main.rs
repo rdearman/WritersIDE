@@ -1644,9 +1644,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let project = args.next().ok_or("missing project path")?;
             let format_name = args
                 .next()
-                .ok_or("missing format (text, markdown, latex, html, epub, docx, pdf)")?;
+                .ok_or("missing format (text, markdown, latex, html, epub, docx, pdf, odt, rtf, azw3, mobi)")?;
             let format = story_document::CompileFormat::parse(&format_name)
-                .ok_or("format must be text, markdown, latex, html, epub, docx, or pdf")?;
+                .ok_or("format must be text, markdown, latex, html, epub, docx, pdf, odt, rtf, azw3, or mobi")?;
             let remaining = args.collect::<Vec<_>>();
             let expand = remaining
                 .iter()
@@ -1702,6 +1702,76 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 destination.display()
             );
             println!("Source map: {}", sidecar.display());
+        }
+        "compile-config" => {
+            let project = args.next().ok_or("missing project path")?;
+            let action = args
+                .next()
+                .ok_or("missing action (list|create|run|all|rebuild|clean)")?;
+            let app = WriterApp::open_project(project)?;
+            match action.as_str() {
+                "list" => {
+                    for name in app.list_compile_configurations()? {
+                        println!("{name}");
+                    }
+                }
+                "results" => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&app.list_compile_results()?)?
+                    );
+                }
+                "create" => {
+                    let preset = args.next().ok_or("missing preset name")?;
+                    let name = args.next().unwrap_or_else(|| preset.clone());
+                    let path = app.create_builtin_compile_configuration(&name, &preset)?;
+                    println!("Created Compile Configuration {name}: {}", path.display());
+                }
+                "run" | "rebuild" => {
+                    let name = args.next().ok_or("missing configuration name")?;
+                    let overwrite = action == "rebuild" || args.any(|value| value == "--overwrite");
+                    let result = app.compile_configuration(&name, overwrite)?;
+                    println!("{}", serde_json::to_string_pretty(&result)?);
+                }
+                "all" => {
+                    let overwrite = args.any(|value| value == "--overwrite");
+                    let mut failures = Vec::new();
+                    for name in app.list_compile_configurations()? {
+                        match app.compile_configuration(&name, overwrite) {
+                            Ok(result) => println!("{}", serde_json::to_string_pretty(&result)?),
+                            Err(error) => failures.push(format!("{name}: {error}")),
+                        }
+                    }
+                    if !failures.is_empty() {
+                        return Err(format!(
+                            "Compile All incomplete; {} configuration(s) failed: {}",
+                            failures.len(),
+                            failures.join("; ")
+                        )
+                        .into());
+                    }
+                }
+                "clean" => {
+                    let name = args.next().ok_or("missing configuration name or all")?;
+                    if !args.any(|value| value == "--yes") {
+                        return Err("Clean requires explicit --yes confirmation".into());
+                    }
+                    let names = if name == "all" {
+                        app.list_compile_configurations()?
+                    } else {
+                        vec![name]
+                    };
+                    for name in names {
+                        let outputs = app.clean_compile_configuration(&name)?;
+                        println!("Cleaned {name}: {} managed artefact(s)", outputs.len());
+                    }
+                }
+                _ => {
+                    return Err(
+                        "action must be list, results, create, run, all, rebuild, or clean".into(),
+                    );
+                }
+            }
         }
         "compile-check" => {
             let project = args.next().ok_or("missing project path")?;
@@ -1899,7 +1969,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let project = PathBuf::from(args.next().ok_or("missing project path")?);
             let format_name = args.next().ok_or("missing format")?;
             let format = story_document::CompileFormat::parse(&format_name)
-                .ok_or("format must be text, markdown, latex, html, epub, docx, or pdf")?;
+                .ok_or("format must be text, markdown, latex, html, epub, docx, pdf, odt, rtf, azw3, or mobi")?;
             let output = PathBuf::from(args.next().ok_or("missing output path")?);
             let poll_ms = args
                 .next()
@@ -2999,9 +3069,12 @@ fn parse_merge_choices(
 fn usage() {
     eprintln!("writers-ide writing-language-default [BCP-47-TAG]");
     eprintln!(
-        "writers-ide compile <project> <text|markdown|latex|html|epub|docx|pdf> [output] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"
+        "writers-ide compile <project> <text|markdown|latex|html|epub|docx|pdf|odt|rtf|azw3|mobi (legacy)> [output] [--expand-transclusions] [--design=preset|--design-file=project-relative.toml]"
     );
     eprintln!("writers-ide compile-check <project>");
+    eprintln!(
+        "writers-ide compile-config <project> <list|results|create <preset> [name>|run <name> [--overwrite]|all [--overwrite]|rebuild <name>|clean <name|all> --yes>"
+    );
     eprintln!("writers-ide word-count-policy <project> [unicode-words|script-graphemes]");
     eprintln!("writers-ide scene-language <project> <scene-uuid> [language-tag|inherit]");
     eprintln!(

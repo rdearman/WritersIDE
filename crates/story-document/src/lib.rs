@@ -536,6 +536,10 @@ pub enum CompileFormat {
     Epub,
     Docx,
     Pdf,
+    Odt,
+    Rtf,
+    Azw3,
+    Mobi,
 }
 
 impl CompileFormat {
@@ -548,6 +552,10 @@ impl CompileFormat {
             "epub" | "epub3" => Some(Self::Epub),
             "docx" => Some(Self::Docx),
             "pdf" => Some(Self::Pdf),
+            "odt" => Some(Self::Odt),
+            "rtf" => Some(Self::Rtf),
+            "azw3" => Some(Self::Azw3),
+            "mobi" => Some(Self::Mobi),
             _ => None,
         }
     }
@@ -560,6 +568,10 @@ impl CompileFormat {
             Self::Epub => "epub",
             Self::Docx => "docx",
             Self::Pdf => "pdf",
+            Self::Odt => "odt",
+            Self::Rtf => "rtf",
+            Self::Azw3 => "azw3",
+            Self::Mobi => "mobi",
         }
     }
     pub fn media_type(self) -> &'static str {
@@ -571,6 +583,10 @@ impl CompileFormat {
             Self::Epub => "application/epub+zip",
             Self::Docx => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             Self::Pdf => "application/pdf",
+            Self::Odt => "application/vnd.oasis.opendocument.text",
+            Self::Rtf => "application/rtf",
+            Self::Azw3 => "application/vnd.amazon.ebook",
+            Self::Mobi => "application/x-mobipocket-ebook",
         }
     }
 }
@@ -1038,12 +1054,14 @@ pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
 #[derive(Clone, Debug)]
 pub struct PandocRenderer {
     program: PathBuf,
+    converter: PathBuf,
 }
 
 impl Default for PandocRenderer {
     fn default() -> Self {
         Self {
             program: PathBuf::from("pandoc"),
+            converter: PathBuf::from("ebook-convert"),
         }
     }
 }
@@ -1052,6 +1070,17 @@ impl PandocRenderer {
     pub fn with_program(program: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
+            converter: PathBuf::from("ebook-convert"),
+        }
+    }
+
+    pub fn with_program_and_converter(
+        program: impl Into<PathBuf>,
+        converter: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            program: program.into(),
+            converter: converter.into(),
         }
     }
 
@@ -1130,6 +1159,12 @@ impl PandocRenderer {
             let output_path = temporary
                 .path()
                 .join(format!("output.{}", format.extension()));
+            let needs_calibre = matches!(format, CompileFormat::Azw3 | CompileFormat::Mobi);
+            let pandoc_output_path = if needs_calibre {
+                temporary.path().join("intermediate.epub")
+            } else {
+                output_path.clone()
+            };
             let mut command = Command::new(&self.program);
             command
                 .arg(
@@ -1142,6 +1177,9 @@ impl PandocRenderer {
                     CompileFormat::Epub => "--to=epub3",
                     CompileFormat::Docx => "--to=docx",
                     CompileFormat::Pdf => "--to=pdf",
+                    CompileFormat::Odt => "--to=odt",
+                    CompileFormat::Rtf => "--to=rtf",
+                    CompileFormat::Azw3 | CompileFormat::Mobi => "--to=epub3",
                     CompileFormat::Markdown => unreachable!(),
                 })
                 .arg("--standalone")
@@ -1149,7 +1187,7 @@ impl PandocRenderer {
                 .arg("--metadata")
                 .arg(format!("title={}", ir.title))
                 .arg("--output")
-                .arg(&output_path)
+                .arg(&pandoc_output_path)
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::piped());
@@ -1202,6 +1240,29 @@ impl PandocRenderer {
                         format!("\nLuaLaTeX log:\n{engine_log}")
                     }
                 ));
+            }
+            if needs_calibre {
+                let conversion = Command::new(&self.converter)
+                    .arg(&pandoc_output_path)
+                    .arg(&output_path)
+                    .current_dir(temporary.path())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::piped())
+                    .output()
+                    .map_err(|error| {
+                        format!(
+                            "{} compilation requires the optional Calibre 'ebook-convert' tool: {error}",
+                            format.extension().to_ascii_uppercase()
+                        )
+                    })?;
+                if !conversion.status.success() {
+                    return Err(format!(
+                        "Calibre ebook-convert failed for {} ({}): {}",
+                        format.extension().to_ascii_uppercase(),
+                        conversion.status,
+                        String::from_utf8_lossy(&conversion.stderr).trim()
+                    ));
+                }
             }
             if format == CompileFormat::Pdf {
                 let tex =
@@ -1650,6 +1711,8 @@ mod tests {
             CompileFormat::Html,
             CompileFormat::Docx,
             CompileFormat::Epub,
+            CompileFormat::Odt,
+            CompileFormat::Rtf,
         ] {
             let artifact = renderer.render(&ir, format, None).unwrap();
             assert!(!artifact.bytes.is_empty());
@@ -1729,6 +1792,43 @@ mod tests {
                 .bytes,
             b"## Scene\n\nProse.\n\n"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn odt_and_rtf_use_pandoc_and_kindle_formats_report_optional_calibre_dependency() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let pandoc = directory.path().join("pandoc-mock");
+        std::fs::write(
+            &pandoc,
+            "#!/bin/sh\nout=\nwhile [ $# -gt 0 ]; do if [ \"$1\" = \"--output\" ]; then shift; out=$1; fi; shift; done\ncat >/dev/null\nprintf 'rendered' > \"$out\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&pandoc, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut ir = CompileIr::new("Book");
+        ir.push(CompileUnit {
+            id: "scene".into(),
+            parent_id: None,
+            kind: ContentUnitKind::Scene,
+            title: "Scene".into(),
+            language_code: None,
+            segments: vec![CompileSegment::new("scene", "Prose.")],
+        });
+        let renderer = PandocRenderer::with_program(&pandoc);
+        for format in [CompileFormat::Odt, CompileFormat::Rtf] {
+            let artifact = renderer.render(&ir, format, None).unwrap();
+            assert_eq!(artifact.bytes, b"rendered");
+            assert_eq!(artifact.format.extension(), format.extension());
+        }
+        let missing_calibre = PandocRenderer::with_program_and_converter(
+            &pandoc,
+            directory.path().join("missing-ebook-convert"),
+        );
+        for format in [CompileFormat::Azw3, CompileFormat::Mobi] {
+            let error = missing_calibre.render(&ir, format, None).unwrap_err();
+            assert!(error.contains("optional Calibre 'ebook-convert'"));
+        }
     }
 
     #[test]

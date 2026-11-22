@@ -42,10 +42,46 @@ pub struct EmacsTagsExport {
     pub tags_file: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompileBuildResult {
+    pub configuration: String,
+    pub status: String,
+    pub outputs: Vec<String>,
+    pub elapsed_millis: u128,
+    pub warnings: Vec<String>,
+    pub log_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct CompileRunRecord {
+    pub version: u16,
+    pub configuration: String,
+    pub succeeded: bool,
+    pub created_unix_millis: u128,
+    pub elapsed_millis: u128,
+    pub outputs: Vec<String>,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+struct ManagedCompileManifest {
+    version: u16,
+    configurations: std::collections::BTreeMap<String, Vec<ManagedCompileArtifact>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct ManagedCompileArtifact {
+    path: String,
+    sha256: String,
+}
+
 fn write_project_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| AppError::Domain("project export path has no parent".into()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| AppError::Domain(format!("create project output directory: {error}")))?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .map_err(|error| AppError::Domain(format!("create symbol export temporary: {error}")))?;
     use std::io::Write;
@@ -60,6 +96,107 @@ fn write_project_file_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
         .and_then(|directory| directory.sync_all())
         .map_err(|error| AppError::Domain(format!("sync symbol export directory: {error}")))?;
     Ok(())
+}
+
+fn create_project_file_new(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| AppError::Domain("project file path has no parent".into()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| AppError::Domain(format!("create project directory: {error}")))?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)
+        .map_err(|error| AppError::Domain(format!("create project file temporary: {error}")))?;
+    use std::io::Write;
+    temporary
+        .write_all(bytes)
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|error| AppError::Domain(format!("write project file: {error}")))?;
+    temporary.persist_noclobber(path).map_err(|error| {
+        AppError::Domain(format!(
+            "create project file without replacement: {}",
+            error.error
+        ))
+    })?;
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| AppError::Domain(format!("sync project directory: {error}")))?;
+    Ok(())
+}
+
+fn validate_compile_configuration_name(name: &str) -> Result<()> {
+    if name.is_empty()
+        || name.len() > 48
+        || !name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || name.starts_with('-')
+        || name.ends_with('-')
+    {
+        return Err(AppError::Domain(
+            "compile configuration name must be a lowercase slug (letters, digits, hyphens)".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_managed_compile_output(name: &str, path: &str) -> Result<()> {
+    let required_prefix = format!("exports/compile/{name}/");
+    let candidate = Path::new(path);
+    if !path.starts_with(&required_prefix)
+        || candidate
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        return Err(AppError::Domain(format!(
+            "compile output must be inside {required_prefix}"
+        )));
+    }
+    Ok(())
+}
+
+fn reject_project_symlink_components(root: &Path, relative: &str) -> Result<()> {
+    let mut current = root.to_path_buf();
+    for component in Path::new(relative).components() {
+        let std::path::Component::Normal(part) = component else {
+            return Err(AppError::Domain(
+                "invalid project-relative compile path".into(),
+            ));
+        };
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(AppError::Domain(format!(
+                    "compile output path contains a symlink: {relative}"
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(AppError::Domain(format!(
+                    "inspect compile output path {relative}: {error}"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn write_compile_source_map(
+    destination: &Path,
+    format: story_document::CompileFormat,
+    entries: &[story_document::CompileSourceMapEntry],
+) -> Result<()> {
+    let sidecar = PathBuf::from(format!("{}.source-map.json", destination.display()));
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "schema_version": 1,
+        "output": destination.file_name().and_then(|name| name.to_str()).unwrap_or("compiled"),
+        "output_format": format,
+        "offset_space": "compile-ir-markdown-utf8",
+        "visual_layout_mapping": false,
+        "entries": entries,
+    }))
+    .map_err(|error| AppError::Domain(format!("serialize compile source map: {error}")))?;
+    write_project_file_atomically(&sidecar, &bytes)
 }
 
 fn copy_scrivener_source_tree(source: &Path, destination: &Path) -> Result<()> {
@@ -883,6 +1020,459 @@ impl WriterApp {
         renderer
             .render_with_profile(&ir, format, Some(self.store.project_root()), &design)
             .map_err(AppError::Domain)
+    }
+
+    fn compile_configurations_dir(&self) -> PathBuf {
+        self.store
+            .project_root()
+            .join(".writers-ide/compile-configurations")
+    }
+
+    fn compile_manifest_path(&self) -> PathBuf {
+        self.store
+            .project_root()
+            .join(".writers-ide/compile-artifacts.json")
+    }
+
+    pub fn list_compile_configurations(&self) -> Result<Vec<String>> {
+        let directory = self.compile_configurations_dir();
+        reject_project_symlink_components(
+            self.store.project_root(),
+            ".writers-ide/compile-configurations",
+        )?;
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => {
+                return Err(AppError::Domain(format!(
+                    "read compile configurations: {error}"
+                )));
+            }
+        };
+        let mut names = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                AppError::Domain(format!("read compile configuration entry: {error}"))
+            })?;
+            if entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry.path().extension().is_some_and(|ext| ext == "toml")
+                && let Some(name) = entry.path().file_stem().and_then(|name| name.to_str())
+            {
+                validate_compile_configuration_name(name)?;
+                names.push(name.to_owned());
+            }
+        }
+        names.sort();
+        Ok(names)
+    }
+
+    pub fn create_compile_configuration(
+        &self,
+        name: &str,
+        recipe: &story_document::EditionRecipe,
+    ) -> Result<PathBuf> {
+        validate_compile_configuration_name(name)?;
+        recipe.validate().map_err(AppError::Domain)?;
+        validate_managed_compile_output(name, &recipe.output)?;
+        let directory = self.compile_configurations_dir();
+        reject_project_symlink_components(
+            self.store.project_root(),
+            &format!(".writers-ide/compile-configurations/{name}.toml"),
+        )?;
+        fs::create_dir_all(&directory).map_err(|error| {
+            AppError::Domain(format!("create compile configuration directory: {error}"))
+        })?;
+        let path = directory.join(format!("{name}.toml"));
+        let bytes = recipe.to_toml().map_err(AppError::Domain)?;
+        create_project_file_new(&path, bytes.as_bytes())?;
+        Ok(path)
+    }
+
+    pub fn create_builtin_compile_configuration(
+        &self,
+        name: &str,
+        preset: &str,
+    ) -> Result<PathBuf> {
+        let (format, design) = match preset {
+            "submission" => (
+                story_document::CompileFormat::Docx,
+                story_document::BookDesign::Manuscript,
+            ),
+            "ebook" => (
+                story_document::CompileFormat::Epub,
+                story_document::BookDesign::TradePaperback,
+            ),
+            "paperback" => (
+                story_document::CompileFormat::Pdf,
+                story_document::BookDesign::TradePaperback,
+            ),
+            "proof" => (
+                story_document::CompileFormat::Pdf,
+                story_document::BookDesign::Manuscript,
+            ),
+            "plain" => (
+                story_document::CompileFormat::PlainText,
+                story_document::BookDesign::Manuscript,
+            ),
+            "markdown" => (
+                story_document::CompileFormat::Markdown,
+                story_document::BookDesign::Manuscript,
+            ),
+            "odt" => (
+                story_document::CompileFormat::Odt,
+                story_document::BookDesign::Manuscript,
+            ),
+            "rtf" => (
+                story_document::CompileFormat::Rtf,
+                story_document::BookDesign::Manuscript,
+            ),
+            "azw3" => (
+                story_document::CompileFormat::Azw3,
+                story_document::BookDesign::TradePaperback,
+            ),
+            "mobi" => (
+                story_document::CompileFormat::Mobi,
+                story_document::BookDesign::TradePaperback,
+            ),
+            _ => {
+                return Err(AppError::Domain(
+                    "preset must be submission, ebook, paperback, proof, plain, markdown, odt, rtf, azw3, or mobi".into(),
+                ));
+            }
+        };
+        let recipe = story_document::EditionRecipe {
+            version: 1,
+            name: name.replace('-', " "),
+            format,
+            output: format!("exports/compile/{name}/manuscript.{}", format.extension()),
+            design,
+            expand_transclusions: false,
+            spellcheck: false,
+            language: None,
+            dictionary: None,
+        };
+        self.create_compile_configuration(name, &recipe)
+    }
+
+    pub fn compile_configuration(
+        &self,
+        name: &str,
+        overwrite_managed_output: bool,
+    ) -> Result<CompileBuildResult> {
+        use std::time::Instant;
+        let timer = Instant::now();
+        let result = self.compile_configuration_inner(name, overwrite_managed_output);
+        let elapsed_millis = timer.elapsed().as_millis();
+        let created_unix_millis = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let (succeeded, outputs, warnings, error) = match &result {
+            Ok(build) => (true, build.outputs.clone(), build.warnings.clone(), None),
+            Err(error) => (false, Vec::new(), Vec::new(), Some(error.to_string())),
+        };
+        let record = CompileRunRecord {
+            version: 1,
+            configuration: name.to_owned(),
+            succeeded,
+            created_unix_millis,
+            elapsed_millis,
+            outputs,
+            warnings,
+            error: error.clone(),
+        };
+        let log_relative = format!(
+            ".writers-ide/compile-results/{}-{}.json",
+            created_unix_millis,
+            uuid::Uuid::new_v4()
+        );
+        reject_project_symlink_components(self.store.project_root(), &log_relative)?;
+        let log_path = self.store.project_root().join(&log_relative);
+        let log_bytes = serde_json::to_vec_pretty(&record)
+            .map_err(|error| AppError::Domain(format!("serialize Compile result: {error}")))?;
+        create_project_file_new(&log_path, &log_bytes)?;
+        match result {
+            Ok(mut build) => {
+                build.status = "success".into();
+                build.elapsed_millis = elapsed_millis;
+                build.log_path = log_relative;
+                Ok(build)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn compile_configuration_inner(
+        &self,
+        name: &str,
+        overwrite_managed_output: bool,
+    ) -> Result<CompileBuildResult> {
+        validate_compile_configuration_name(name)?;
+        let recipe_path = self
+            .compile_configurations_dir()
+            .join(format!("{name}.toml"));
+        reject_project_symlink_components(
+            self.store.project_root(),
+            &format!(".writers-ide/compile-configurations/{name}.toml"),
+        )?;
+        let source = fs::read_to_string(&recipe_path).map_err(|error| {
+            AppError::Domain(format!("read compile configuration '{name}': {error}"))
+        })?;
+        let recipe = story_document::EditionRecipe::from_toml(&source).map_err(AppError::Domain)?;
+        validate_managed_compile_output(name, &recipe.output)?;
+        let mut manifest = self.load_managed_compile_manifest()?;
+        let output = recipe.output.clone();
+        let mut output_paths = vec![output.clone()];
+        output_paths.push(format!("{output}.source-map.json"));
+        let artifact = self.compile_artifact_with_design(
+            recipe.format,
+            recipe.expand_transclusions,
+            recipe.design,
+        )?;
+        for auxiliary in &artifact.auxiliary_files {
+            let extension = Path::new(&auxiliary.name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("log");
+            output_paths.push(
+                Path::new(&output)
+                    .with_extension(extension)
+                    .to_string_lossy()
+                    .into(),
+            );
+        }
+        output_paths.sort();
+        output_paths.dedup();
+        let previously_managed = manifest.configurations.get(name);
+        for relative in &output_paths {
+            let path = self.store.project_root().join(relative);
+            reject_project_symlink_components(self.store.project_root(), relative)?;
+            if path.exists()
+                && !overwrite_managed_output
+                && !previously_managed
+                    .is_some_and(|items| items.iter().any(|item| item.path == *relative))
+            {
+                return Err(AppError::Domain(format!(
+                    "compile output already exists and is not managed by this configuration: {relative}; use explicit overwrite after review"
+                )));
+            }
+            if path.exists()
+                && !overwrite_managed_output
+                && let Some(managed) = previously_managed
+                    .and_then(|items| items.iter().find(|item| item.path == *relative))
+            {
+                let current_hash = format!(
+                    "{:x}",
+                    Sha256::digest(fs::read(&path).map_err(|error| AppError::Domain(format!(
+                        "read managed Compile output: {error}"
+                    )),)?)
+                );
+                if current_hash != managed.sha256 {
+                    return Err(AppError::Domain(format!(
+                        "managed Compile output was modified outside Writer's IDE: {relative}; use Rebuild only after reviewing the changed file"
+                    )));
+                }
+            }
+        }
+        let destination = self.store.project_root().join(&output);
+        write_project_file_atomically(&destination, &artifact.bytes)?;
+        write_compile_source_map(&destination, recipe.format, &artifact.source_map)?;
+        for auxiliary in &artifact.auxiliary_files {
+            let extension = Path::new(&auxiliary.name)
+                .extension()
+                .and_then(|value| value.to_str())
+                .unwrap_or("log");
+            write_project_file_atomically(
+                &destination.with_extension(extension),
+                &auxiliary.bytes,
+            )?;
+        }
+        manifest.version = 1;
+        let managed_files = output_paths
+            .iter()
+            .map(|path| {
+                let bytes = fs::read(self.store.project_root().join(path)).map_err(|error| {
+                    AppError::Domain(format!("read generated Compile artefact {path}: {error}"))
+                })?;
+                Ok(ManagedCompileArtifact {
+                    path: path.clone(),
+                    sha256: format!("{:x}", Sha256::digest(bytes)),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        manifest
+            .configurations
+            .insert(name.to_owned(), managed_files);
+        write_project_file_atomically(
+            &self.compile_manifest_path(),
+            &serde_json::to_vec_pretty(&manifest).map_err(|error| {
+                AppError::Domain(format!("serialize compile manifest: {error}"))
+            })?,
+        )?;
+        let warnings = self
+            .compile_diagnostics()?
+            .into_iter()
+            .filter(|diagnostic| diagnostic.severity != story_document::DiagnosticSeverity::Error)
+            .map(|diagnostic| format!("{}: {}", diagnostic.code, diagnostic.message))
+            .collect();
+        Ok(CompileBuildResult {
+            configuration: name.to_owned(),
+            status: "success".into(),
+            outputs: output_paths,
+            elapsed_millis: 0,
+            warnings,
+            log_path: String::new(),
+        })
+    }
+
+    pub fn list_compile_results(&self) -> Result<Vec<CompileRunRecord>> {
+        let directory = self
+            .store
+            .project_root()
+            .join(".writers-ide/compile-results");
+        reject_project_symlink_components(
+            self.store.project_root(),
+            ".writers-ide/compile-results",
+        )?;
+        let entries = match fs::read_dir(directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(AppError::Domain(format!("read Compile results: {error}"))),
+        };
+        let mut records = Vec::new();
+        for entry in entries {
+            let entry = entry
+                .map_err(|error| AppError::Domain(format!("read Compile result entry: {error}")))?;
+            if entry.file_type().is_ok_and(|kind| kind.is_file())
+                && entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+            {
+                let record: CompileRunRecord =
+                    serde_json::from_slice(&fs::read(entry.path()).map_err(|error| {
+                        AppError::Domain(format!("read Compile result file: {error}"))
+                    })?)
+                    .map_err(|error| {
+                        AppError::Domain(format!("invalid Compile result file: {error}"))
+                    })?;
+                if record.version != 1 {
+                    return Err(AppError::Domain(format!(
+                        "unsupported Compile result version {}",
+                        record.version
+                    )));
+                }
+                records.push(record);
+            }
+        }
+        records.sort_by_key(|record| record.created_unix_millis);
+        records.reverse();
+        Ok(records)
+    }
+
+    pub fn clean_compile_configuration(&self, name: &str) -> Result<Vec<String>> {
+        validate_compile_configuration_name(name)?;
+        let mut manifest = self.load_managed_compile_manifest()?;
+        let Some(outputs) = manifest.configurations.remove(name) else {
+            return Ok(Vec::new());
+        };
+        for artifact in &outputs {
+            validate_managed_compile_output(name, &artifact.path)?;
+            reject_project_symlink_components(self.store.project_root(), &artifact.path)?;
+            let path = self.store.project_root().join(&artifact.path);
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {
+                    let current_hash = format!(
+                        "{:x}",
+                        Sha256::digest(fs::read(&path).map_err(|error| {
+                            AppError::Domain(format!(
+                                "read managed compile output {}: {error}",
+                                artifact.path
+                            ))
+                        })?)
+                    );
+                    if current_hash != artifact.sha256 {
+                        return Err(AppError::Domain(format!(
+                            "refusing to clean modified Compile output: {}",
+                            artifact.path
+                        )));
+                    }
+                }
+                Ok(_) => {
+                    return Err(AppError::Domain(format!(
+                        "refusing to clean non-file compile output: {}",
+                        artifact.path
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(AppError::Domain(format!(
+                        "inspect managed compile output {}: {error}",
+                        artifact.path
+                    )));
+                }
+            }
+        }
+        for artifact in &outputs {
+            let path = self.store.project_root().join(&artifact.path);
+            match fs::symlink_metadata(&path) {
+                Ok(_) => fs::remove_file(&path).map_err(|error| {
+                    AppError::Domain(format!(
+                        "remove managed compile output {}: {error}",
+                        artifact.path
+                    ))
+                })?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(AppError::Domain(format!(
+                        "inspect managed compile output {}: {error}",
+                        artifact.path
+                    )));
+                }
+            }
+        }
+        write_project_file_atomically(
+            &self.compile_manifest_path(),
+            &serde_json::to_vec_pretty(&manifest).map_err(|error| {
+                AppError::Domain(format!("serialize compile manifest: {error}"))
+            })?,
+        )?;
+        Ok(outputs.into_iter().map(|artifact| artifact.path).collect())
+    }
+
+    fn load_managed_compile_manifest(&self) -> Result<ManagedCompileManifest> {
+        reject_project_symlink_components(
+            self.store.project_root(),
+            ".writers-ide/compile-artifacts.json",
+        )?;
+        match fs::read(self.compile_manifest_path()) {
+            Ok(bytes) => {
+                let manifest: ManagedCompileManifest =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        AppError::Domain(format!("invalid compile manifest: {error}"))
+                    })?;
+                if manifest.version != 1 {
+                    return Err(AppError::Domain(format!(
+                        "unsupported compile manifest version {}",
+                        manifest.version
+                    )));
+                }
+                for (name, paths) in &manifest.configurations {
+                    validate_compile_configuration_name(name)?;
+                    for artifact in paths {
+                        validate_managed_compile_output(name, &artifact.path)?;
+                    }
+                }
+                Ok(manifest)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(ManagedCompileManifest {
+                    version: 1,
+                    configurations: Default::default(),
+                })
+            }
+            Err(error) => Err(AppError::Domain(format!("read compile manifest: {error}"))),
+        }
     }
     pub fn compile_diagnostics(&self) -> Result<Vec<story_document::CompileDiagnostic>> {
         let input = self.processing_input()?;
@@ -3639,6 +4229,131 @@ unexpected_prose = "must not be silently discarded"
         let plain = String::from_utf8(plain.bytes).unwrap();
         assert!(plain.contains("Élodie arrives."));
         assert!(!plain.contains("{lang=it-IT}"));
+    }
+
+    #[test]
+    fn named_compile_configuration_tracks_only_managed_outputs_and_preserves_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Compile project");
+        let mut app = WriterApp::create_project(&project, "Compile project").unwrap();
+        let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+        let scene = app.create_scene(chapter, "First scene", 0).unwrap();
+        let (_, source_hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&source_hash), "Canonical prose remains here.")
+            .unwrap();
+        let (_, expected_hash) = app.load_scene_text(scene).unwrap();
+        let recipe = story_document::EditionRecipe {
+            version: 1,
+            name: "Plain Manuscript".into(),
+            format: story_document::CompileFormat::Markdown,
+            output: "exports/compile/plain/manuscript.md".into(),
+            design: story_document::BookDesign::Manuscript,
+            expand_transclusions: false,
+            spellcheck: false,
+            language: None,
+            dictionary: None,
+        };
+        app.create_compile_configuration("plain", &recipe).unwrap();
+        assert!(app.create_compile_configuration("plain", &recipe).is_err());
+        assert_eq!(app.list_compile_configurations().unwrap(), vec!["plain"]);
+
+        let output = project.join(&recipe.output);
+        fs::create_dir_all(output.parent().unwrap()).unwrap();
+        fs::write(output.parent().unwrap().join("author-note.txt"), "keep me").unwrap();
+        fs::write(&output, "unmanaged content").unwrap();
+        assert!(app.compile_configuration("plain", false).is_err());
+        assert_eq!(fs::read_to_string(&output).unwrap(), "unmanaged content");
+        let failed = app.list_compile_results().unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(!failed[0].succeeded);
+        assert!(
+            failed[0]
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("not managed"))
+        );
+
+        fs::remove_file(&output).unwrap();
+        let result = app.compile_configuration("plain", false).unwrap();
+        assert_eq!(result.configuration, "plain");
+        assert!(result.outputs.contains(&recipe.output));
+        assert!(output.exists());
+        assert!(Path::new(&format!("{}.source-map.json", output.display())).exists());
+        assert!(app.compile_configuration("plain", false).is_ok());
+        assert!(
+            app.list_compile_results()
+                .unwrap()
+                .iter()
+                .any(|record| record.succeeded && record.outputs.contains(&recipe.output))
+        );
+
+        fs::write(&output, "author edited generated output").unwrap();
+        assert!(app.clean_compile_configuration("plain").is_err());
+        assert_eq!(
+            fs::read_to_string(&output).unwrap(),
+            "author edited generated output"
+        );
+        assert!(app.compile_configuration("plain", false).is_err());
+        app.compile_configuration("plain", true).unwrap();
+
+        let cleaned = app.clean_compile_configuration("plain").unwrap();
+        assert!(cleaned.contains(&recipe.output));
+        assert!(!output.exists());
+        assert!(output.parent().unwrap().join("author-note.txt").exists());
+        let (source, actual_hash) = app.load_scene_text(scene).unwrap();
+        assert_eq!(source, "Canonical prose remains here.");
+        assert_eq!(actual_hash, expected_hash);
+    }
+
+    #[test]
+    fn compile_configuration_paths_cannot_escape_managed_output_or_follow_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let app = WriterApp::create_project(&project, "Novel").unwrap();
+        let mut recipe = story_document::EditionRecipe {
+            version: 1,
+            name: "Unsafe".into(),
+            format: story_document::CompileFormat::Markdown,
+            output: "exports/compile/unsafe/../../manuscript/scene.md".into(),
+            design: story_document::BookDesign::default(),
+            expand_transclusions: false,
+            spellcheck: false,
+            language: None,
+            dictionary: None,
+        };
+        assert!(app.create_compile_configuration("unsafe", &recipe).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = dir.path().join("outside");
+            fs::create_dir(&outside).unwrap();
+            let config_project = dir.path().join("Config symlink");
+            let config_app = WriterApp::create_project(&config_project, "Config symlink").unwrap();
+            symlink(
+                &outside,
+                config_project.join(".writers-ide/compile-configurations"),
+            )
+            .unwrap();
+            let safe_recipe = story_document::EditionRecipe {
+                output: "exports/compile/unsafe/manuscript.md".into(),
+                ..recipe.clone()
+            };
+            assert!(
+                config_app
+                    .create_compile_configuration("unsafe", &safe_recipe)
+                    .is_err()
+            );
+            assert!(fs::read_dir(&outside).unwrap().next().is_none());
+
+            let exports = project.join("exports");
+            fs::create_dir_all(&exports).unwrap();
+            symlink(&outside, exports.join("compile")).unwrap();
+            recipe.output = "exports/compile/unsafe/manuscript.md".into();
+            app.create_compile_configuration("unsafe", &recipe).unwrap();
+            assert!(app.compile_configuration("unsafe", false).is_err());
+            assert!(fs::read_dir(&outside).unwrap().next().is_none());
+        }
     }
 
     #[test]

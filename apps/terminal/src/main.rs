@@ -828,9 +828,17 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command(
             "compile.format",
             "Compile to a Document Format",
-            "Compile the manuscript to Markdown, TeX, HTML, EPUB, DOCX, or PDF",
+            "Compile the manuscript to text, Markdown, HTML, EPUB, DOCX, PDF, ODT, RTF, or optional AZW3/MOBI",
             "Compile",
             "compile-format",
+            true,
+        ),
+        legacy_command(
+            "compile.configuration",
+            "Compile Configuration",
+            "List, create, run, rebuild, or clean named project Compile Configurations",
+            "Compile",
+            "compile-config",
             true,
         ),
         legacy_command(
@@ -7541,11 +7549,118 @@ impl AppState {
                 .join(format!("assembly-{assembly}.md"));
             fs::write(&destination, text.as_bytes())?;
             self.message = format!("Compiled assembly to {}", destination.display());
+        } else if let Some(arguments) = cmd.strip_prefix("compile-config ") {
+            let mut parts = arguments.split_whitespace();
+            let action = parts
+                .next()
+                .ok_or("usage: compile-config <list|results|create|run|all|rebuild|clean> ...")?;
+            match action {
+                "list" => {
+                    let names = self.app.list_compile_configurations()?;
+                    self.message = if names.is_empty() {
+                        "No Compile Configurations are defined".into()
+                    } else {
+                        names.join(" · ")
+                    };
+                }
+                "results" => {
+                    let results = self.app.list_compile_results()?;
+                    self.message = if results.is_empty() {
+                        "No Compile result history".into()
+                    } else {
+                        results
+                            .iter()
+                            .take(10)
+                            .map(|record| {
+                                let detail = record
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| record.outputs.join(", "));
+                                format!(
+                                    "{} {} · {} ms · {}",
+                                    record.configuration,
+                                    if record.succeeded {
+                                        "success"
+                                    } else {
+                                        "failed"
+                                    },
+                                    record.elapsed_millis,
+                                    detail
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                }
+                "create" => {
+                    let preset = parts.next().ok_or("missing preset name")?;
+                    let name = parts.next().unwrap_or(preset);
+                    let path = self
+                        .app
+                        .create_builtin_compile_configuration(name, preset)?;
+                    self.message =
+                        format!("Created Compile Configuration {name}: {}", path.display());
+                }
+                "run" | "rebuild" => {
+                    let name = parts.next().ok_or("missing configuration name")?;
+                    let overwrite =
+                        action == "rebuild" || parts.any(|value| value == "--overwrite");
+                    let result = self.app.compile_configuration(name, overwrite)?;
+                    self.message = format!(
+                        "Compile {} complete in {} ms · {}",
+                        result.configuration,
+                        result.elapsed_millis,
+                        result.outputs.join(", ")
+                    );
+                    if !result.warnings.is_empty() {
+                        self.message
+                            .push_str(&format!(" · {} warning(s)", result.warnings.len()));
+                    }
+                }
+                "all" => {
+                    let overwrite = parts.any(|value| value == "--overwrite");
+                    let names = self.app.list_compile_configurations()?;
+                    let mut done = Vec::new();
+                    let mut failed = Vec::new();
+                    for name in names {
+                        match self.app.compile_configuration(&name, overwrite) {
+                            Ok(_) => done.push(name),
+                            Err(error) => failed.push(format!("{name}: {error}")),
+                        }
+                    }
+                    self.message = if failed.is_empty() {
+                        format!("Compile All complete · {} configuration(s)", done.len())
+                    } else {
+                        format!("Compile All incomplete · {}", failed.join("; "))
+                    };
+                }
+                "clean" => {
+                    let name = parts.next().ok_or("missing configuration name or all")?;
+                    if parts.next() != Some("--yes") {
+                        return Err("Clean requires explicit --yes confirmation".into());
+                    }
+                    let names = if name == "all" {
+                        self.app.list_compile_configurations()?
+                    } else {
+                        vec![name.to_owned()]
+                    };
+                    let mut count = 0usize;
+                    for name in names {
+                        count += self.app.clean_compile_configuration(&name)?.len();
+                    }
+                    self.message = format!("Clean removed {count} managed Compile artefact(s)");
+                }
+                _ => {
+                    return Err(
+                        "action must be list, results, create, run, all, rebuild, or clean".into(),
+                    );
+                }
+            }
         } else if let Some(arguments) = cmd.strip_prefix("compile-format ") {
             let mut parts = arguments.split_whitespace();
-            let format_name = parts.next().ok_or("usage: compile-format <text|markdown|latex|html|epub|docx|pdf> [output-path] [--expand-transclusions]")?;
+            let format_name = parts.next().ok_or("usage: compile-format <text|markdown|latex|html|epub|docx|pdf|odt|rtf|azw3|mobi> [output-path] [--expand-transclusions]")?;
             let format = story_document::CompileFormat::parse(format_name)
-                .ok_or("format must be text, markdown, latex, html, epub, docx, or pdf")?;
+                .ok_or("format must be text, markdown, latex, html, epub, docx, pdf, odt, rtf, azw3, or mobi")?;
             let rest = parts.collect::<Vec<_>>();
             let expand = rest.contains(&"--expand-transclusions");
             let design = rest
@@ -16550,6 +16665,10 @@ mod tests {
             "compile.format"
         );
         assert_eq!(
+            command_palette_invocation("compile-config").unwrap().0.id,
+            "compile.configuration"
+        );
+        assert_eq!(
             command_palette_invocation("review-merge").unwrap().0.id,
             "review.merge"
         );
@@ -16611,6 +16730,43 @@ mod tests {
         let (dismiss, dismiss_args) = command_palette_invocation("dismiss review.json 2").unwrap();
         assert_eq!(dismiss.id, "extract.dismiss");
         assert_eq!(dismiss_args, Some("review.json 2"));
+    }
+
+    #[test]
+    fn compile_configuration_menu_dispatch_creates_lists_and_runs_profile() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Compile"), "Compile").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Terminal compile configuration.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command("compile-config create markdown plain")
+            .unwrap();
+        assert!(
+            state
+                .message
+                .contains("Created Compile Configuration plain")
+        );
+        state
+            .execute_legacy_palette_command("compile-config list")
+            .unwrap();
+        assert_eq!(state.message, "plain");
+        state
+            .execute_legacy_palette_command("compile-config run plain")
+            .unwrap();
+        assert!(state.message.contains("Compile plain complete"));
+        state
+            .execute_legacy_palette_command("compile-config results")
+            .unwrap();
+        assert!(state.message.contains("plain success"));
+        assert!(
+            root.path()
+                .join("Compile/exports/compile/plain/manuscript.md")
+                .is_file()
+        );
     }
 
     #[test]
