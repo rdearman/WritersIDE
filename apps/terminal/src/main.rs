@@ -1329,6 +1329,22 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         legacy_command(
+            "scene.edit-time-boundaries",
+            "Set Scene Interval Boundaries",
+            "Choose inclusive or exclusive story-time interval endpoints",
+            "Plot",
+            "scene-time-boundaries",
+            true,
+        ),
+        legacy_command(
+            "event.edit-time-boundaries",
+            "Set Event Interval Boundaries",
+            "Choose inclusive or exclusive story-time interval endpoints",
+            "Plot",
+            "event-time-boundaries",
+            true,
+        ),
+        legacy_command(
             "event.link",
             "Link Event to Scene",
             "Associate a story event with a scene",
@@ -9987,6 +10003,44 @@ impl AppState {
                 parse_story_time_input(fields[2])?,
             )?;
             self.message = format!("Updated story-time bounds for scene {id}");
+        } else if let Some(rest) = cmd.strip_prefix("scene-time-boundaries ") {
+            let fields = rest.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 3 {
+                return Err(
+                    "use scene-time-boundaries SCENE-UUID inclusive|exclusive inclusive|exclusive"
+                        .into(),
+                );
+            }
+            let id = SceneId(fields[0].parse()?);
+            let interval = self.app.scene_story_interval(id)?;
+            self.app.update_scene_story_interval(
+                id,
+                story_core::StoryInterval {
+                    start_boundary: parse_interval_boundary(fields[1])?,
+                    end_boundary: parse_interval_boundary(fields[2])?,
+                    ..interval
+                },
+            )?;
+            self.message = format!("Updated story-time boundaries for scene {id}");
+        } else if let Some(rest) = cmd.strip_prefix("event-time-boundaries ") {
+            let fields = rest.split_whitespace().collect::<Vec<_>>();
+            if fields.len() != 3 {
+                return Err(
+                    "use event-time-boundaries EVENT-UUID inclusive|exclusive inclusive|exclusive"
+                        .into(),
+                );
+            }
+            let id = story_core::EventId(fields[0].parse()?);
+            let interval = self.app.story_event_interval(id)?;
+            self.app.update_story_event_interval(
+                id,
+                story_core::StoryInterval {
+                    start_boundary: parse_interval_boundary(fields[1])?,
+                    end_boundary: parse_interval_boundary(fields[2])?,
+                    ..interval
+                },
+            )?;
+            self.message = format!("Updated story-time boundaries for event {id}");
         } else if let Some(rest) = cmd.strip_prefix("event-time ") {
             let fields = rest.split('|').map(str::trim).collect::<Vec<_>>();
             if fields.len() != 4 || fields[0].is_empty() {
@@ -15976,6 +16030,16 @@ fn parse_story_time_input(
     Ok(StoryTime::exact(value.parse()?))
 }
 
+fn parse_interval_boundary(
+    value: &str,
+) -> Result<story_core::IntervalBoundary, Box<dyn std::error::Error>> {
+    match value {
+        "inclusive" => Ok(story_core::IntervalBoundary::Inclusive),
+        "exclusive" => Ok(story_core::IntervalBoundary::Exclusive),
+        _ => Err("boundary must be inclusive or exclusive".into()),
+    }
+}
+
 fn format_story_interval(time: story_core::StoryTime) -> String {
     use story_core::TimePrecision;
     match time.precision {
@@ -21057,9 +21121,22 @@ mod tests {
         state
             .execute_legacy_palette_command(&format!("scene-time-set {scene} | -86400 | 0"))
             .unwrap();
+        state
+            .execute_legacy_palette_command(&format!(
+                "scene-time-boundaries {scene} exclusive inclusive"
+            ))
+            .unwrap();
         let metadata = state.app.get_scene(scene).unwrap().scene;
         assert_eq!(metadata.start_time, story_core::StoryTime::exact(-86_400));
         assert_eq!(metadata.end_time, story_core::StoryTime::exact(0));
+        assert_eq!(
+            state
+                .app
+                .scene_story_interval(scene)
+                .unwrap()
+                .start_boundary,
+            story_core::IntervalBoundary::Exclusive
+        );
         assert!(
             !state
                 .app
@@ -21076,6 +21153,17 @@ mod tests {
                 .chronology_preferences()
                 .unwrap()
                 .missing_scene_time_prompt_dismissed
+        );
+
+        let event = state.app.add_event("Arrival", "late evening").unwrap();
+        state
+            .execute_legacy_palette_command(&format!(
+                "event-time-boundaries {event} inclusive exclusive"
+            ))
+            .unwrap();
+        assert_eq!(
+            state.app.story_event_interval(event).unwrap().end_boundary,
+            story_core::IntervalBoundary::Exclusive
         );
     }
 
@@ -25523,6 +25611,8 @@ mod tests {
                 target_words: None,
                 start_time: story_core::StoryTime::unknown(),
                 end_time: story_core::StoryTime::unknown(),
+                start_boundary: story_core::IntervalBoundary::Inclusive,
+                end_boundary: story_core::IntervalBoundary::Inclusive,
                 characters: if index == 0 {
                     vec![
                         story_analysis::CharacterOnScene {
@@ -25583,6 +25673,8 @@ mod tests {
             target_words: Some(100),
             start_time: story_core::StoryTime::unknown(),
             end_time: story_core::StoryTime::unknown(),
+            start_boundary: story_core::IntervalBoundary::Inclusive,
+            end_boundary: story_core::IntervalBoundary::Inclusive,
             characters: vec![],
             plotlines: vec![],
             locations: vec![],

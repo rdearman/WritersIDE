@@ -46,6 +46,8 @@ pub struct PipelineScene {
     pub plotlines: Vec<String>,
     pub start: story_core::StoryTime,
     pub end: story_core::StoryTime,
+    pub start_boundary: story_core::IntervalBoundary,
+    pub end_boundary: story_core::IntervalBoundary,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +74,8 @@ pub struct PipelineEvent {
     pub title: String,
     pub start: story_core::StoryTime,
     pub end: story_core::StoryTime,
+    pub start_boundary: story_core::IntervalBoundary,
+    pub end_boundary: story_core::IntervalBoundary,
 }
 
 #[derive(Clone, Debug)]
@@ -747,7 +751,7 @@ fn stage_fingerprint(
             input
                 .scenes
                 .iter()
-                .map(|s| (&s.id, s.start, s.end))
+                .map(|s| (&s.id, s.start, s.end, s.start_boundary, s.end_boundary,))
                 .collect::<Vec<_>>(),
             (&input.events, &input.event_dependencies)
         ),
@@ -890,7 +894,20 @@ fn render_stage(
                 for dependency in &input.event_dependencies {
                     let earlier = events.get(dependency.predecessor.as_str());
                     let later = events.get(dependency.successor.as_str());
-                    let comparison = earlier.zip(later).map(|(a, b)| a.end.compare(b.start));
+                    let comparison = earlier.zip(later).map(|(a, b)| {
+                        story_core::StoryInterval {
+                            start: a.end,
+                            end: a.end,
+                            start_boundary: a.end_boundary,
+                            end_boundary: a.end_boundary,
+                        }
+                        .compare(story_core::StoryInterval {
+                            start: b.start,
+                            end: b.start,
+                            start_boundary: b.start_boundary,
+                            end_boundary: b.start_boundary,
+                        })
+                    });
                     let finding = story_analysis::evaluate_event_precedence(
                         &dependency.predecessor,
                         &dependency.successor,
@@ -1123,6 +1140,8 @@ fn analysis_input(input: &PipelineInput) -> Vec<SceneAnalysisInput> {
             target_words: scene.target_words,
             start_time: scene.start,
             end_time: scene.end,
+            start_boundary: scene.start_boundary,
+            end_boundary: scene.end_boundary,
             characters: scene
                 .characters
                 .iter()
@@ -1208,6 +1227,8 @@ mod tests {
                 plotlines: vec!["Main".into()],
                 start: StoryTime::unknown(),
                 end: StoryTime::unknown(),
+                start_boundary: story_core::IntervalBoundary::Inclusive,
+                end_boundary: story_core::IntervalBoundary::Inclusive,
             }],
             events: vec![],
             event_dependencies: vec![],
@@ -1387,12 +1408,16 @@ mod tests {
                 title: "Arrival".into(),
                 start: StoryTime::exact(1),
                 end: StoryTime::exact(5),
+                start_boundary: story_core::IntervalBoundary::Inclusive,
+                end_boundary: story_core::IntervalBoundary::Inclusive,
             },
             PipelineEvent {
                 id: "event-b".into(),
                 title: "Departure".into(),
                 start: StoryTime::exact(2),
                 end: StoryTime::exact(3),
+                start_boundary: story_core::IntervalBoundary::Inclusive,
+                end_boundary: story_core::IntervalBoundary::Inclusive,
             },
         ];
         novel.event_dependencies.push(PipelineEventDependency {
@@ -1418,6 +1443,8 @@ mod tests {
                 title: "Arrival".into(),
                 start: StoryTime::exact(1),
                 end: StoryTime::exact(5),
+                start_boundary: story_core::IntervalBoundary::Inclusive,
+                end_boundary: story_core::IntervalBoundary::Inclusive,
             },
             PipelineEvent {
                 id: "event-b".into(),
@@ -1425,6 +1452,8 @@ mod tests {
                 start: StoryTime::new(None, Some(4), Some(8), story_core::TimePrecision::Bounded)
                     .unwrap(),
                 end: StoryTime::exact(9),
+                start_boundary: story_core::IntervalBoundary::Inclusive,
+                end_boundary: story_core::IntervalBoundary::Inclusive,
             },
         ];
         novel.event_dependencies.push(PipelineEventDependency {
@@ -1439,6 +1468,42 @@ mod tests {
             fs::read_to_string(dir.path().join(".writers-ide/processing/continuity.txt")).unwrap();
         assert!(report.contains("event-unknown\tprecedes\tevent-a\tevent-b"));
         assert!(report.contains("Ambiguous"));
+    }
+
+    #[test]
+    fn event_dependency_order_respects_explicit_endpoint_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut novel = input("Draft.");
+        novel.events = vec![
+            PipelineEvent {
+                id: "event-a".into(),
+                title: "Arrival".into(),
+                start: StoryTime::exact(1),
+                end: StoryTime::exact(5),
+                start_boundary: story_core::IntervalBoundary::Inclusive,
+                end_boundary: story_core::IntervalBoundary::Inclusive,
+            },
+            PipelineEvent {
+                id: "event-b".into(),
+                title: "Departure".into(),
+                start: StoryTime::exact(5),
+                end: StoryTime::exact(9),
+                start_boundary: story_core::IntervalBoundary::Exclusive,
+                end_boundary: story_core::IntervalBoundary::Inclusive,
+            },
+        ];
+        novel.event_dependencies.push(PipelineEventDependency {
+            predecessor: "event-a".into(),
+            successor: "event-b".into(),
+            kind: "precedes".into(),
+        });
+        PipelineRunner::new(&dir)
+            .run_selected(&novel, &[Stage::Continuity])
+            .unwrap();
+        let report =
+            fs::read_to_string(dir.path().join(".writers-ide/processing/continuity.txt")).unwrap();
+        assert!(report.contains("event-pass\tprecedes\tevent-a\tevent-b"));
+        assert!(report.contains("Before"));
     }
 
     #[test]

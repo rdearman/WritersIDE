@@ -1418,6 +1418,76 @@ pub struct StoryTime {
     pub upper: Option<i64>,
     pub precision: TimePrecision,
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntervalBoundary {
+    Inclusive,
+    Exclusive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct StoryInterval {
+    pub start: StoryTime,
+    pub end: StoryTime,
+    pub start_boundary: IntervalBoundary,
+    pub end_boundary: IntervalBoundary,
+}
+
+impl StoryInterval {
+    pub fn closed(start: StoryTime, end: StoryTime) -> Self {
+        Self {
+            start,
+            end,
+            start_boundary: IntervalBoundary::Inclusive,
+            end_boundary: IntervalBoundary::Inclusive,
+        }
+    }
+
+    /// Compare whole intervals only when their uncertainty bounds prove an
+    /// ordering. A shared endpoint overlaps only when both intervals include it.
+    pub fn compare(self, other: Self) -> TimeOrdering {
+        let a_end = self.end.upper;
+        let b_start = other.start.lower;
+        let b_end = other.end.upper;
+        let a_start = self.start.lower;
+        match (a_end, b_start) {
+            (Some(a), Some(b))
+                if a < b
+                    || (a == b
+                        && (self.end_boundary == IntervalBoundary::Exclusive
+                            || other.start_boundary == IntervalBoundary::Exclusive)) =>
+            {
+                return TimeOrdering::Before;
+            }
+            _ => {}
+        }
+        match (b_end, a_start) {
+            (Some(b), Some(a))
+                if b < a
+                    || (b == a
+                        && (other.end_boundary == IntervalBoundary::Exclusive
+                            || self.start_boundary == IntervalBoundary::Exclusive)) =>
+            {
+                return TimeOrdering::After;
+            }
+            _ => {}
+        }
+        if self.start == other.start
+            && self.end == other.end
+            && self.start_boundary == other.start_boundary
+            && self.end_boundary == other.end_boundary
+        {
+            TimeOrdering::Same
+        } else {
+            TimeOrdering::Ambiguous
+        }
+    }
+
+    pub fn duration(self) -> Result<Option<i64>, DomainError> {
+        self.start.duration_until(self.end)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TimeOrdering {
     Before,
@@ -2415,6 +2485,45 @@ mod tests {
         );
         let a = StoryTime::new(Some(5), Some(0), Some(10), TimePrecision::Bounded).unwrap();
         assert_eq!(a.compare(StoryTime::exact(7)), TimeOrdering::Ambiguous);
+    }
+
+    #[test]
+    fn story_intervals_handle_inclusive_exclusive_bounds_and_uncertainty() {
+        use IntervalBoundary::{Exclusive, Inclusive};
+
+        let earlier = StoryInterval::closed(StoryTime::exact(9), StoryTime::exact(10));
+        let touching = StoryInterval::closed(StoryTime::exact(10), StoryTime::exact(16));
+        assert_eq!(earlier.compare(touching), TimeOrdering::Ambiguous);
+
+        let exclusive_end = StoryInterval {
+            end_boundary: Exclusive,
+            ..earlier
+        };
+        assert_eq!(exclusive_end.compare(touching), TimeOrdering::Before);
+        let exclusive_start = StoryInterval {
+            start_boundary: Exclusive,
+            ..touching
+        };
+        assert_eq!(earlier.compare(exclusive_start), TimeOrdering::Before);
+
+        let point = StoryInterval::closed(
+            StoryTime::exact(15 * 3_600 + 13 * 60),
+            StoryTime::exact(15 * 3_600 + 13 * 60),
+        );
+        let day_range =
+            StoryInterval::closed(StoryTime::exact(9 * 3_600), StoryTime::exact(16 * 3_600));
+        assert_eq!(point.compare(day_range), TimeOrdering::Ambiguous);
+        assert_eq!(
+            StoryInterval::closed(StoryTime::exact(10), StoryTime::unknown()).compare(day_range),
+            TimeOrdering::Ambiguous
+        );
+
+        let overnight = StoryInterval::closed(
+            StoryTime::exact(23 * 3_600),
+            StoryTime::exact(STORY_TICKS_PER_DAY + 3_600),
+        );
+        assert_eq!(overnight.duration().unwrap(), Some(7_200));
+        assert_eq!(overnight.start_boundary, Inclusive);
     }
     #[test]
     fn duration_overflow_is_checked() {

@@ -402,10 +402,33 @@ pub struct SceneAnalysisInput {
     pub target_words: Option<u64>,
     pub start_time: story_core::StoryTime,
     pub end_time: story_core::StoryTime,
+    pub start_boundary: story_core::IntervalBoundary,
+    pub end_boundary: story_core::IntervalBoundary,
     pub characters: Vec<CharacterOnScene>,
     pub plotlines: Vec<PlotlineOnScene>,
     pub locations: Vec<StoryEntityOnScene>,
     pub events: Vec<StoryEntityOnScene>,
+}
+
+fn scene_interval(scene: &SceneAnalysisInput) -> story_core::StoryInterval {
+    story_core::StoryInterval {
+        start: scene.start_time,
+        end: scene.end_time,
+        start_boundary: scene.start_boundary,
+        end_boundary: scene.end_boundary,
+    }
+}
+
+fn interval_point(
+    time: story_core::StoryTime,
+    boundary: story_core::IntervalBoundary,
+) -> story_core::StoryInterval {
+    story_core::StoryInterval {
+        start: time,
+        end: time,
+        start_boundary: boundary,
+        end_boundary: boundary,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -665,6 +688,8 @@ mod inspection_tests {
             target_words: None,
             start_time: story_core::StoryTime::unknown(),
             end_time: story_core::StoryTime::unknown(),
+            start_boundary: story_core::IntervalBoundary::Inclusive,
+            end_boundary: story_core::IntervalBoundary::Inclusive,
             characters: vec![],
             plotlines: vec![],
             locations: vec![],
@@ -835,8 +860,10 @@ pub fn chronology_ambiguities(scenes: &[SceneAnalysisInput]) -> Vec<ChronologyFi
     let mut findings = Vec::new();
     for (i, a) in scenes.iter().enumerate() {
         for b in scenes.iter().skip(i + 1) {
-            let definitely_apart = matches!(a.end_time.compare(b.start_time), TimeOrdering::Before)
-                || matches!(b.end_time.compare(a.start_time), TimeOrdering::Before);
+            let a_interval = scene_interval(a);
+            let b_interval = scene_interval(b);
+            let definitely_apart = matches!(a_interval.compare(b_interval), TimeOrdering::Before)
+                || matches!(a_interval.compare(b_interval), TimeOrdering::After);
             if !definitely_apart {
                 findings.push(ChronologyFinding {
                     first_scene_id: a.scene_id.clone(),
@@ -877,16 +904,22 @@ pub fn character_chronology_findings(
                 continue;
             }
 
-            let first_before_second =
-                matches!(first.end_time.compare(second.start_time), Before | Same);
-            let second_before_first =
-                matches!(second.end_time.compare(first.start_time), Before | Same);
+            let first_interval = scene_interval(first);
+            let second_interval = scene_interval(second);
+            let first_before_second = matches!(first_interval.compare(second_interval), Before);
+            let second_before_first = matches!(first_interval.compare(second_interval), After);
             if first_before_second || second_before_first {
                 continue;
             }
 
-            let definite_overlap = matches!(first.start_time.compare(second.end_time), Before)
-                && matches!(second.start_time.compare(first.end_time), Before);
+            let first_starts_before_second_ends =
+                interval_point(first.start_time, first.start_boundary)
+                    .compare(interval_point(second.end_time, second.end_boundary));
+            let second_starts_before_first_ends =
+                interval_point(second.start_time, second.start_boundary)
+                    .compare(interval_point(first.end_time, first.end_boundary));
+            let definite_overlap = matches!(first_starts_before_second_ends, Before | Same)
+                && matches!(second_starts_before_first_ends, Before | Same);
             let has_unknown_endpoint = [
                 first.start_time,
                 first.end_time,
@@ -978,9 +1011,9 @@ pub fn location_incompatibility_findings(
                 if shared.is_empty() {
                     continue;
                 }
-                if matches!(first.end_time.compare(second.start_time), Before | Same)
-                    || matches!(second.end_time.compare(first.start_time), Before | Same)
-                {
+                let first_interval = scene_interval(first);
+                let second_interval = scene_interval(second);
+                if matches!(first_interval.compare(second_interval), Before | After) {
                     continue;
                 }
                 let bounded = [
@@ -991,8 +1024,15 @@ pub fn location_incompatibility_findings(
                 ]
                 .into_iter()
                 .all(|time| time.lower.is_some() && time.upper.is_some());
-                let definite = matches!(first.start_time.compare(second.end_time), Before)
-                    && matches!(second.start_time.compare(first.end_time), Before);
+                let definite = matches!(
+                    interval_point(first.start_time, first.start_boundary)
+                        .compare(interval_point(second.end_time, second.end_boundary)),
+                    Before | Same
+                ) && matches!(
+                    interval_point(second.start_time, second.start_boundary)
+                        .compare(interval_point(first.end_time, first.end_boundary)),
+                    Before | Same
+                );
                 let status = if definite {
                     DefiniteConflict
                 } else if bounded {
@@ -1032,6 +1072,8 @@ mod tests {
             target_words,
             start_time: story_core::StoryTime::unknown(),
             end_time: story_core::StoryTime::unknown(),
+            start_boundary: story_core::IntervalBoundary::Inclusive,
+            end_boundary: story_core::IntervalBoundary::Inclusive,
             characters: characters
                 .iter()
                 .map(|id| CharacterOnScene {
@@ -1143,6 +1185,7 @@ mod tests {
         adjacent.characters = vec![character("mara-id")];
         adjacent.start_time = story_core::StoryTime::exact(10);
         adjacent.end_time = story_core::StoryTime::exact(15);
+        adjacent.start_boundary = story_core::IntervalBoundary::Exclusive;
         assert!(character_chronology_findings(&[first.clone(), adjacent]).is_empty());
 
         let mut unrelated = scene("unrelated", None, &["Mara"], &[]);
@@ -1223,5 +1266,52 @@ mod tests {
             ..rule
         };
         assert!(location_incompatibility_findings(&[], &[disabled]).is_empty());
+    }
+
+    #[test]
+    fn location_rules_respect_exclusive_touching_bounds_and_ignore_same_location() {
+        let location_a = story_core::LocationId::new();
+        let location_b = story_core::LocationId::new();
+        let rule = story_core::LocationIncompatibilityRule {
+            id: story_core::ContinuityRuleId::new(),
+            first_location: location_a,
+            second_location: location_b,
+            description: "Cannot be at both places at once".into(),
+            enabled: true,
+        };
+        let mut first = scene("first", None, &["Mara"], &[]);
+        first.locations.push(StoryEntityOnScene {
+            id: location_a.to_string(),
+            name: "Harbour".into(),
+        });
+        first.start_time = story_core::StoryTime::exact(0);
+        first.end_time = story_core::StoryTime::exact(10);
+        let mut second = scene("second", None, &["Mara"], &[]);
+        second.locations.push(StoryEntityOnScene {
+            id: location_b.to_string(),
+            name: "Palace".into(),
+        });
+        second.start_time = story_core::StoryTime::exact(10);
+        second.end_time = story_core::StoryTime::exact(20);
+        second.start_boundary = story_core::IntervalBoundary::Exclusive;
+        assert!(
+            location_incompatibility_findings(
+                &[first.clone(), second.clone()],
+                std::slice::from_ref(&rule)
+            )
+            .is_empty()
+        );
+
+        second.start_boundary = story_core::IntervalBoundary::Inclusive;
+        assert_eq!(
+            location_incompatibility_findings(
+                &[first.clone(), second],
+                std::slice::from_ref(&rule)
+            )[0]
+            .status,
+            LocationRuleFindingStatus::DefiniteConflict
+        );
+
+        assert!(location_incompatibility_findings(&[first.clone(), first], &[rule]).is_empty());
     }
 }

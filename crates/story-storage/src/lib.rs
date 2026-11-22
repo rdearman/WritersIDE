@@ -53,6 +53,7 @@ const MIGRATION_36: &str = include_str!("../migrations/0036_passage_language_tag
 const MIGRATION_37: &str = include_str!("../migrations/0037_scene_word_count_policy.sql");
 const MIGRATION_38: &str = include_str!("../migrations/0038_content_unit_language.sql");
 const MIGRATION_39: &str = include_str!("../migrations/0039_reading_language.sql");
+const MIGRATION_40: &str = include_str!("../migrations/0040_story_interval_boundaries.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -1340,6 +1341,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_37}\nINSERT INTO schema_migrations(version,applied_at) VALUES(37,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_38}\nINSERT INTO schema_migrations(version,applied_at) VALUES(38,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_39}\nINSERT INTO schema_migrations(version,applied_at) VALUES(39,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_40}\nINSERT INTO schema_migrations(version,applied_at) VALUES(40,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1388,7 +1390,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 39 {
+        if version > 40 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1545,6 +1547,10 @@ impl ProjectStore {
         }
         if current_version == 38 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_39}\nINSERT INTO schema_migrations(version,applied_at) VALUES(39,'{}');\nCOMMIT;", now()))?;
+            current_version = 39;
+        }
+        if current_version == 39 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_40}\nINSERT INTO schema_migrations(version,applied_at) VALUES(40,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -2702,6 +2708,64 @@ impl ProjectStore {
             actual_words: actual,
             content_hash: row.21,
         })
+    }
+    pub fn scene_interval_boundaries(
+        &self,
+        id: SceneId,
+    ) -> Result<(IntervalBoundary, IntervalBoundary)> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT start_boundary,end_boundary FROM scene_interval_boundary WHERE scene_id=?1",
+                [id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        match row {
+            Some((start, end)) => Ok((parse_boundary(&start)?, parse_boundary(&end)?)),
+            None => Ok((IntervalBoundary::Inclusive, IntervalBoundary::Inclusive)),
+        }
+    }
+    pub fn set_scene_interval_boundaries(
+        &mut self,
+        id: SceneId,
+        start: IntervalBoundary,
+        end: IntervalBoundary,
+    ) -> Result<()> {
+        set_interval_boundaries(
+            &mut self.conn,
+            "scene_interval_boundary",
+            "scene_id",
+            &id.to_string(),
+            start,
+            end,
+        )
+    }
+    pub fn update_scene_story_interval(
+        &mut self,
+        id: SceneId,
+        interval: StoryInterval,
+    ) -> Result<()> {
+        validate_time(interval.start)?;
+        validate_time(interval.end)?;
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE scene SET start_nominal=?2,start_lower=?3,start_upper=?4,start_precision=?5,end_nominal=?6,end_lower=?7,end_upper=?8,end_precision=?9,updated_at=?10 WHERE id=?1",
+            params![id.to_string(), interval.start.nominal, interval.start.lower, interval.start.upper, precision(interval.start.precision), interval.end.nominal, interval.end.lower, interval.end.upper, precision(interval.end.precision), now()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        write_interval_boundaries(
+            &tx,
+            "scene_interval_boundary",
+            "scene_id",
+            &id.to_string(),
+            interval.start_boundary,
+            interval.end_boundary,
+        )?;
+        tx.commit()?;
+        Ok(())
     }
     pub fn list_scenes(&self, include_archived: bool) -> Result<Vec<SceneRecord>> {
         let sql = "WITH RECURSIVE node_order(id,path) AS (SELECT id,printf('%010d/',position) FROM structural_node WHERE parent_id IS NULL UNION ALL SELECT n.id,o.path||printf('%010d/',n.position) FROM structural_node n JOIN node_order o ON n.parent_id=o.id) SELECT s.id FROM scene s LEFT JOIN scene_placement p ON p.scene_id=s.id LEFT JOIN node_order n ON n.id=p.chapter_id WHERE (?1=1 OR s.archived=0) ORDER BY n.path,p.position,s.id";
@@ -5414,6 +5478,46 @@ impl ProjectStore {
         if changed == 0 {
             return Err(StorageError::NotFound(id.to_string()));
         }
+        Ok(())
+    }
+    pub fn story_event_interval_boundaries(
+        &self,
+        id: EventId,
+    ) -> Result<(IntervalBoundary, IntervalBoundary)> {
+        let row = self.conn.query_row(
+            "SELECT start_boundary,end_boundary FROM story_event_interval_boundary WHERE event_id=?1",
+            [id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        ).optional()?;
+        match row {
+            Some((start, end)) => Ok((parse_boundary(&start)?, parse_boundary(&end)?)),
+            None => Ok((IntervalBoundary::Inclusive, IntervalBoundary::Inclusive)),
+        }
+    }
+    pub fn update_story_event_interval(
+        &mut self,
+        id: EventId,
+        interval: StoryInterval,
+    ) -> Result<()> {
+        validate_time(interval.start)?;
+        validate_time(interval.end)?;
+        let tx = self.conn.transaction()?;
+        let changed = tx.execute(
+            "UPDATE story_event SET time_nominal=?2,time_lower=?3,time_upper=?4,time_precision=?5,end_nominal=?6,end_lower=?7,end_upper=?8,end_precision=?9 WHERE id=?1",
+            params![id.to_string(), interval.start.nominal, interval.start.lower, interval.start.upper, precision(interval.start.precision), interval.end.nominal, interval.end.lower, interval.end.upper, precision(interval.end.precision)],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        write_interval_boundaries(
+            &tx,
+            "story_event_interval_boundary",
+            "event_id",
+            &id.to_string(),
+            interval.start_boundary,
+            interval.end_boundary,
+        )?;
+        tx.commit()?;
         Ok(())
     }
     pub fn list_events(&self) -> Result<Vec<EventSummary>> {
@@ -9408,6 +9512,97 @@ fn precision(s: TimePrecision) -> &'static str {
         TimePrecision::Unknown => "unknown",
     }
 }
+
+fn boundary_name(boundary: IntervalBoundary) -> &'static str {
+    match boundary {
+        IntervalBoundary::Inclusive => "inclusive",
+        IntervalBoundary::Exclusive => "exclusive",
+    }
+}
+
+fn parse_boundary(value: &str) -> Result<IntervalBoundary> {
+    match value {
+        "inclusive" => Ok(IntervalBoundary::Inclusive),
+        "exclusive" => Ok(IntervalBoundary::Exclusive),
+        other => Err(StorageError::Config(format!(
+            "invalid story interval boundary {other}"
+        ))),
+    }
+}
+
+fn write_interval_boundaries(
+    conn: &Connection,
+    table: &str,
+    id_column: &str,
+    id: &str,
+    start: IntervalBoundary,
+    end: IntervalBoundary,
+) -> Result<()> {
+    let delete_sql = match table {
+        "scene_interval_boundary" => "DELETE FROM scene_interval_boundary WHERE scene_id=?1",
+        "story_event_interval_boundary" => {
+            "DELETE FROM story_event_interval_boundary WHERE event_id=?1"
+        }
+        _ => {
+            return Err(StorageError::Invalid(
+                "unknown interval-boundary table".into(),
+            ));
+        }
+    };
+    if start == IntervalBoundary::Inclusive && end == IntervalBoundary::Inclusive {
+        conn.execute(delete_sql, [id])?;
+        return Ok(());
+    }
+    let insert_sql = match (table, id_column) {
+        ("scene_interval_boundary", "scene_id") => {
+            "INSERT INTO scene_interval_boundary(scene_id,start_boundary,end_boundary) VALUES(?1,?2,?3) ON CONFLICT(scene_id) DO UPDATE SET start_boundary=excluded.start_boundary,end_boundary=excluded.end_boundary"
+        }
+        ("story_event_interval_boundary", "event_id") => {
+            "INSERT INTO story_event_interval_boundary(event_id,start_boundary,end_boundary) VALUES(?1,?2,?3) ON CONFLICT(event_id) DO UPDATE SET start_boundary=excluded.start_boundary,end_boundary=excluded.end_boundary"
+        }
+        _ => {
+            return Err(StorageError::Invalid(
+                "unknown interval-boundary entity key".into(),
+            ));
+        }
+    };
+    conn.execute(
+        insert_sql,
+        params![id, boundary_name(start), boundary_name(end)],
+    )?;
+    Ok(())
+}
+
+fn set_interval_boundaries(
+    conn: &mut Connection,
+    table: &str,
+    id_column: &str,
+    id: &str,
+    start: IntervalBoundary,
+    end: IntervalBoundary,
+) -> Result<()> {
+    let parent_table = match (table, id_column) {
+        ("scene_interval_boundary", "scene_id") => "scene",
+        ("story_event_interval_boundary", "event_id") => "story_event",
+        _ => {
+            return Err(StorageError::Invalid(
+                "unknown interval-boundary entity".into(),
+            ));
+        }
+    };
+    let tx = conn.transaction()?;
+    let exists: bool = tx.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM {parent_table} WHERE id=?1)"),
+        [id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Err(StorageError::NotFound(id.to_owned()));
+    }
+    write_interval_boundaries(&tx, table, id_column, id, start, end)?;
+    tx.commit()?;
+    Ok(())
+}
 fn read_time(n: Option<i64>, l: Option<i64>, u: Option<i64>, p: &str) -> Result<StoryTime> {
     let pr = match p {
         "exact" => TimePrecision::Exact,
@@ -9599,6 +9794,104 @@ fn query_ref_ids(conn: &Connection, field: FieldId, value: &str) -> Result<Vec<S
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn story_interval_boundaries_migrate_persist_and_reject_invalid_sql_values() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Opening").unwrap();
+        let event = EventId::new();
+        store
+            .add_story_event(&StoryEvent {
+                id: event,
+                title: "Train crash".into(),
+                description: String::new(),
+                start: StoryTime::exact(15 * 60 + 13),
+                end: StoryTime::exact(15 * 60 + 13),
+                source_time_text: "15:13".into(),
+            })
+            .unwrap();
+        let interval = StoryInterval {
+            start: StoryTime::exact(9 * 60),
+            end: StoryTime::exact(16 * 60),
+            start_boundary: IntervalBoundary::Inclusive,
+            end_boundary: IntervalBoundary::Exclusive,
+        };
+        store.update_scene_story_interval(scene, interval).unwrap();
+        store
+            .update_story_event_interval(
+                event,
+                StoryInterval::closed(
+                    StoryTime::exact(15 * 60 + 13),
+                    StoryTime::exact(15 * 60 + 13),
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            store.scene_interval_boundaries(scene).unwrap(),
+            (IntervalBoundary::Inclusive, IntervalBoundary::Exclusive)
+        );
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE scene_interval_boundary SET end_boundary='sometimes' WHERE scene_id=?1",
+                    [scene.to_string()],
+                )
+                .is_err()
+        );
+        drop(store);
+
+        let reopened = ProjectStore::open(&project).unwrap();
+        assert_eq!(
+            reopened.scene_interval_boundaries(scene).unwrap(),
+            (IntervalBoundary::Inclusive, IntervalBoundary::Exclusive)
+        );
+        assert_eq!(
+            reopened.story_event_interval_boundaries(event).unwrap(),
+            (IntervalBoundary::Inclusive, IntervalBoundary::Inclusive)
+        );
+        let current = reopened.get_scene(scene).unwrap().scene;
+        assert_eq!(current.start_time, interval.start);
+        assert_eq!(current.end_time, interval.end);
+    }
+    #[test]
+    fn schema_thirty_nine_projects_migrate_interval_boundary_tables() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let store = ProjectStore::create(&project, "Book").unwrap();
+        store.conn.execute_batch(
+            "DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version=40;",
+        ).unwrap();
+        drop(store);
+
+        let mut migrated = ProjectStore::open(&project).unwrap();
+        let chapter = migrated
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = migrated.create_scene(chapter, 0, "Opening").unwrap();
+        migrated
+            .set_scene_interval_boundaries(
+                scene,
+                IntervalBoundary::Exclusive,
+                IntervalBoundary::Inclusive,
+            )
+            .unwrap();
+        assert_eq!(
+            migrated.scene_interval_boundaries(scene).unwrap(),
+            (IntervalBoundary::Exclusive, IntervalBoundary::Inclusive)
+        );
+        let version: i64 = migrated
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 40);
+    }
     #[test]
     fn writing_challenges_are_validated_persisted_and_completed_once() {
         let d = tempdir().unwrap();
@@ -11297,7 +11590,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 39))
+            .map(|version| assert_eq!(version, 40))
             .unwrap();
     }
 
@@ -11578,7 +11871,7 @@ mod tests {
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch("DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code; DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
-        conn.execute_batch("DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -11588,7 +11881,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 39);
+        assert_eq!(version, 40);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -11673,6 +11966,8 @@ mod tests {
              ALTER TABLE scene DROP COLUMN language_code;
              DROP TABLE saved_query_expression;
              DROP TABLE location_incompatibility_rule;
+             DROP TABLE story_event_interval_boundary;
+             DROP TABLE scene_interval_boundary;
              DELETE FROM schema_migrations WHERE version>=9;",
         )
         .unwrap();

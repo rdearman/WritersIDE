@@ -39,6 +39,18 @@ fn cli_configures_optional_chronology_and_updates_scene_time() {
         .unwrap();
     assert!(timed.status.success());
 
+    let boundary = Command::new(executable)
+        .args([
+            "scene-time-boundaries",
+            project_path.to_str().unwrap(),
+            &scene.to_string(),
+            "exclusive",
+            "inclusive",
+        ])
+        .output()
+        .unwrap();
+    assert!(boundary.status.success());
+
     let reopened = story_app::WriterApp::open_project(&project_path).unwrap();
     assert!(reopened.chronology_preferences().unwrap().enabled);
     let record = reopened.get_scene(scene).unwrap();
@@ -47,6 +59,10 @@ fn cli_configures_optional_chronology_and_updates_scene_time() {
         story_core::StoryTime::exact(-86_400)
     );
     assert_eq!(record.scene.end_time, story_core::StoryTime::exact(0));
+    assert_eq!(
+        reopened.scene_story_interval(scene).unwrap().start_boundary,
+        story_core::IntervalBoundary::Exclusive
+    );
     assert_eq!(
         reopened.load_scene_text(scene).unwrap().0,
         "The manuscript remains intact."

@@ -1100,10 +1100,33 @@ impl WriterApp {
         start: StoryTime,
         end: StoryTime,
     ) -> Result<()> {
-        let mut scene = self.get_scene(id)?.scene;
-        scene.start_time = start;
-        scene.end_time = end;
-        self.update_scene_metadata(&scene)
+        let (start_boundary, end_boundary) = self.store.scene_interval_boundaries(id)?;
+        self.update_scene_story_interval(
+            id,
+            StoryInterval {
+                start,
+                end,
+                start_boundary,
+                end_boundary,
+            },
+        )
+    }
+    pub fn update_scene_story_interval(
+        &mut self,
+        id: SceneId,
+        interval: StoryInterval,
+    ) -> Result<()> {
+        Ok(self.store.update_scene_story_interval(id, interval)?)
+    }
+    pub fn scene_story_interval(&self, id: SceneId) -> Result<StoryInterval> {
+        let scene = self.get_scene(id)?.scene;
+        let (start_boundary, end_boundary) = self.store.scene_interval_boundaries(id)?;
+        Ok(StoryInterval {
+            start: scene.start_time,
+            end: scene.end_time,
+            start_boundary,
+            end_boundary,
+        })
     }
     pub fn should_prompt_for_missing_scene_time(&self, id: SceneId) -> Result<bool> {
         let preferences = self.chronology_preferences()?;
@@ -1682,6 +1705,8 @@ impl WriterApp {
                     id,
                 })
                 .collect();
+            let (start_boundary, end_boundary) =
+                self.store.scene_interval_boundaries(row.scene.id)?;
             result.push(story_analysis::SceneAnalysisInput {
                 scene_id: row.scene.id.to_string(),
                 title: row.scene.title,
@@ -1690,6 +1715,8 @@ impl WriterApp {
                 target_words: row.scene.target_words,
                 start_time: row.scene.start_time,
                 end_time: row.scene.end_time,
+                start_boundary,
+                end_boundary,
                 characters,
                 plotlines,
                 locations,
@@ -2739,6 +2766,8 @@ impl WriterApp {
                     .collect::<Vec<_>>()
                     .join("\n\n---\n\n")
             });
+            let (start_boundary, end_boundary) =
+                self.store.scene_interval_boundaries(row.scene.id)?;
             let linked = analytics
                 .iter()
                 .find(|data| data.scene_id == row.scene.id.to_string());
@@ -2772,19 +2801,27 @@ impl WriterApp {
                 plotlines,
                 start: row.scene.start_time,
                 end: row.scene.end_time,
+                start_boundary,
+                end_boundary,
             });
         }
         let events = self
             .store
             .list_events()?
             .into_iter()
-            .map(|event| story_pipeline::PipelineEvent {
-                id: event.id.to_string(),
-                title: event.title,
-                start: event.start,
-                end: event.end,
+            .map(|event| {
+                let (start_boundary, end_boundary) =
+                    self.store.story_event_interval_boundaries(event.id)?;
+                Ok(story_pipeline::PipelineEvent {
+                    id: event.id.to_string(),
+                    title: event.title,
+                    start: event.start,
+                    end: event.end,
+                    start_boundary,
+                    end_boundary,
+                })
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let event_dependencies = self
             .store
             .list_event_dependencies()?
@@ -3245,6 +3282,28 @@ impl WriterApp {
         Ok(self
             .store
             .update_story_event_time(id, start, end, source_time_text)?)
+    }
+    pub fn story_event_interval(&self, id: EventId) -> Result<StoryInterval> {
+        let event = self
+            .store
+            .list_events()?
+            .into_iter()
+            .find(|event| event.id == id)
+            .ok_or_else(|| AppError::Domain(format!("story event {id} does not exist")))?;
+        let (start_boundary, end_boundary) = self.store.story_event_interval_boundaries(id)?;
+        Ok(StoryInterval {
+            start: event.start,
+            end: event.end,
+            start_boundary,
+            end_boundary,
+        })
+    }
+    pub fn update_story_event_interval(
+        &mut self,
+        id: EventId,
+        interval: StoryInterval,
+    ) -> Result<()> {
+        Ok(self.store.update_story_event_interval(id, interval)?)
     }
     pub fn link_event(&mut self, scene: SceneId, event: EventId, kind: &str) -> Result<()> {
         Ok(self.store.link_event(scene, event, kind)?)

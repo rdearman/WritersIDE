@@ -1263,6 +1263,44 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             WriterApp::open_project(path)?.update_scene_story_time(id, start, end)?;
             println!("Updated story-time bounds for scene {id}");
         }
+        "scene-time-boundaries" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = story_core::SceneId(args.next().ok_or("missing scene UUID")?.parse()?);
+            let start_boundary =
+                parse_cli_interval_boundary(&args.next().ok_or("missing start boundary")?)?;
+            let end_boundary =
+                parse_cli_interval_boundary(&args.next().ok_or("missing end boundary")?)?;
+            let mut app = WriterApp::open_project(path)?;
+            let interval = app.scene_story_interval(id)?;
+            app.update_scene_story_interval(
+                id,
+                story_core::StoryInterval {
+                    start_boundary,
+                    end_boundary,
+                    ..interval
+                },
+            )?;
+            println!("Updated story-time boundaries for scene {id}");
+        }
+        "event-time-boundaries" => {
+            let path = args.next().ok_or("missing project path")?;
+            let id = story_core::EventId(args.next().ok_or("missing event UUID")?.parse()?);
+            let start_boundary =
+                parse_cli_interval_boundary(&args.next().ok_or("missing start boundary")?)?;
+            let end_boundary =
+                parse_cli_interval_boundary(&args.next().ok_or("missing end boundary")?)?;
+            let mut app = WriterApp::open_project(path)?;
+            let interval = app.story_event_interval(id)?;
+            app.update_story_event_interval(
+                id,
+                story_core::StoryInterval {
+                    start_boundary,
+                    end_boundary,
+                    ..interval
+                },
+            )?;
+            println!("Updated story-time boundaries for event {id}");
+        }
         "event-dependency-list" => {
             let path = args.next().ok_or("missing project path")?;
             println!(
@@ -3232,6 +3270,16 @@ fn parse_cli_story_time(value: &str) -> Result<story_core::StoryTime, Box<dyn st
     Ok(StoryTime::exact(value.parse()?))
 }
 
+fn parse_cli_interval_boundary(
+    value: &str,
+) -> Result<story_core::IntervalBoundary, Box<dyn std::error::Error>> {
+    match value {
+        "inclusive" => Ok(story_core::IntervalBoundary::Inclusive),
+        "exclusive" => Ok(story_core::IntervalBoundary::Exclusive),
+        _ => Err("boundary must be inclusive or exclusive".into()),
+    }
+}
+
 fn parse_merge_choices(
     value: &str,
 ) -> Result<Vec<story_import::MergeConflictChoice>, Box<dyn std::error::Error>> {
@@ -3300,6 +3348,12 @@ fn usage() {
         "writers-ide event-time-set <project> <event-uuid> <start-tick|?|~nominal,lower,upper|lower..upper> <end-tick|?|~nominal,lower,upper|lower..upper> [source-time-text]"
     );
     eprintln!("writers-ide scene-time-set <project> <scene-uuid> <start-time> <end-time>");
+    eprintln!(
+        "writers-ide scene-time-boundaries <project> <scene-uuid> <inclusive|exclusive> <inclusive|exclusive>"
+    );
+    eprintln!(
+        "writers-ide event-time-boundaries <project> <event-uuid> <inclusive|exclusive> <inclusive|exclusive>"
+    );
     eprintln!(
         "writers-ide chronology-preferences <project> [show|on|off|prompt-on|prompt-off|never]"
     );
