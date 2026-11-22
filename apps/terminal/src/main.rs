@@ -151,6 +151,7 @@ struct AppState {
     function_bindings: Vec<(u8, Workspace)>,
     command_bindings: CommandBindings,
     context_command_bindings: Vec<ContextCommandBinding>,
+    quit_requested: bool,
     pending_command_sequence: Option<PendingCommandSequence>,
     keybinding_manager: Option<KeybindingManagerState>,
     revision_diff: Option<story_core::SnapshotId>,
@@ -418,6 +419,7 @@ const MENU_CATEGORY_COMMAND_IDS: [&str; 8] = [
 const MENU_COMMON_COMMANDS: [&[&str]; 8] = [
     &[
         "file.save",
+        "file.quit",
         "series.import-scrivener",
         "series.create",
         "series.open",
@@ -911,6 +913,7 @@ enum CommandAction {
     OpenCommandPalette,
     OpenMenuCategory(usize),
     Save,
+    RequestQuit,
     Help,
     ResolveSaveConflict,
     RestoreRevisionHunk,
@@ -1049,6 +1052,21 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 100,
             advanced: true,
             action: CommandAction::Save,
+        },
+        CommandSpec {
+            id: "file.quit",
+            label: "Quit",
+            description: "Leave Writer's IDE; unsaved text offers Save and Quit, Quit Without Saving, or Cancel",
+            category: "File",
+            default_shortcuts: &["Ctrl+Q"],
+            mnemonic: Some('q'),
+            palette_aliases: &["exit"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Project & Files",
+            menu_priority: 5,
+            advanced: false,
+            action: CommandAction::RequestQuit,
         },
         CommandSpec {
             id: "edit.resolve-save-conflict",
@@ -4648,6 +4666,7 @@ impl AppState {
             function_bindings,
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -8571,6 +8590,7 @@ impl AppState {
             }
             CommandAction::OpenMenuCategory(index) => self.open_menu_category(index),
             CommandAction::Save => self.save()?,
+            CommandAction::RequestQuit => self.request_quit(),
             CommandAction::Help => self.show_context_help(),
             CommandAction::ResolveSaveConflict => {
                 self.mode = Some('R');
@@ -8617,6 +8637,20 @@ impl AppState {
             }
         }
         Ok(())
+    }
+
+    fn request_quit(&mut self) {
+        if self.active_challenge.is_some() {
+            self.mode = Some('c');
+            self.prompt = "Save and quit (s) · Discard and quit (d) · Esc continues".into();
+            self.message = "Choose whether to keep the isolated challenge draft".into();
+        } else if self.dirty {
+            self.mode = Some('q');
+            self.prompt = "Save and Quit (s) · Quit Without Saving (d) · Cancel (Esc)".into();
+            self.message = "Choose how to leave the current unsaved text".into();
+        } else {
+            self.quit_requested = true;
+        }
     }
     fn prompt_for_registered_command(
         &mut self,
@@ -15054,7 +15088,7 @@ fn run(
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(k) => {
-                    let should_quit = handle(s, k)?;
+                    let should_quit = handle(s, k)? || std::mem::take(&mut s.quit_requested);
                     if s.active_challenge.as_ref().is_some_and(|challenge| {
                         s.count_words_for_project(&s.editor.join("\n")) >= challenge.target_words
                     }) {
@@ -16266,6 +16300,10 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
             "Save: {} · current buffer is {}",
             effective_shortcut_label(state, "file.save", "Ctrl+S"),
             if state.dirty { "unsaved" } else { "saved" }
+        ),
+        format!(
+            "Quit: {} · in the manuscript editor, q is text; Esc returns to navigation",
+            effective_shortcut_label(state, "file.quit", "Ctrl+Q")
         ),
     ];
     if state.workspace == Workspace::Editor {
@@ -25352,6 +25390,58 @@ mod tests {
     }
 
     #[test]
+    fn registered_quit_command_is_global_and_uses_safe_dialogue() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut clean = AppState::new(app, default_bindings());
+        clean.workspace = Workspace::Editor;
+        let quit = command_by_id("file.quit").unwrap();
+        assert_eq!(quit.default_shortcuts, &["Ctrl+Q"]);
+        assert_eq!(quit.category, "File");
+        let file_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "File")
+            .unwrap();
+        assert!(MENU_COMMON_COMMANDS[file_menu].contains(&"file.quit"));
+        assert_eq!(
+            effective_shortcut_label(&clean, "file.quit", "unbound"),
+            "Ctrl+Q"
+        );
+        assert!(
+            !handle(
+                &mut clean,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            )
+            .unwrap()
+        );
+        assert!(clean.quit_requested);
+
+        let chapter = clean.app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = clean.app.create_scene(chapter, "Scene", 0).unwrap();
+        clean.open_scene(scene).unwrap();
+        clean.editor = vec!["unsaved draft".into()];
+        clean.dirty = true;
+        clean.quit_requested = false;
+        assert!(
+            !handle(
+                &mut clean,
+                KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            )
+            .unwrap()
+        );
+        assert_eq!(clean.mode, Some('q'));
+        assert!(clean.prompt.contains("Quit Without Saving"));
+        assert!(clean.dirty);
+        assert!(
+            handle(
+                &mut clean,
+                KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
     fn editor_slash_is_text_and_menu_invocation_preserves_edit_state() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -25408,6 +25498,7 @@ mod tests {
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -28209,6 +28300,7 @@ mod tests {
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -28338,6 +28430,7 @@ mod tests {
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -28463,6 +28556,7 @@ mod tests {
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -28596,6 +28690,7 @@ mod tests {
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -28879,6 +28974,7 @@ mod tests {
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -29012,6 +29108,7 @@ mod tests {
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -30013,6 +30110,7 @@ mod tests {
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -30281,6 +30379,7 @@ mod tests {
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -30684,6 +30783,7 @@ mod tests {
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -30828,6 +30928,7 @@ mod tests {
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -31024,6 +31125,7 @@ mod tests {
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
+            quit_requested: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
