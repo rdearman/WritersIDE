@@ -287,6 +287,8 @@ enum SeriesFormKind {
     AddCurrentBook,
     ImportScrivener,
     NewBook,
+    CreateStoryLink,
+    DeleteStoryLink,
 }
 
 impl SeriesFormKind {
@@ -299,6 +301,17 @@ impl SeriesFormKind {
                 &["Scrivener .scriv project path", "Book folder", "Book title"]
             }
             Self::NewBook => &["Book folder", "Book title"],
+            Self::CreateStoryLink => &[
+                "Source entity name",
+                "Target entity name",
+                "Relationship type",
+                "Label (optional)",
+            ],
+            Self::DeleteStoryLink => &[
+                "Source entity name",
+                "Target entity name",
+                "Relationship type",
+            ],
         }
     }
 }
@@ -1626,6 +1639,14 @@ fn command_registry() -> Vec<CommandSpec> {
             "Create a typed link between stable entities",
             "Edit",
             "link",
+            true,
+        ),
+        legacy_command(
+            "link.delete",
+            "Remove Story Link",
+            "Remove a typed connection by selecting its endpoints and type",
+            "Edit",
+            "link-delete",
             true,
         ),
         legacy_command(
@@ -4820,11 +4841,16 @@ impl AppState {
             "series.add-current" => SeriesFormKind::AddCurrentBook,
             "series.import-scrivener" => SeriesFormKind::ImportScrivener,
             "series.new-book" => SeriesFormKind::NewBook,
+            "link.create" => SeriesFormKind::CreateStoryLink,
+            "link.delete" => SeriesFormKind::DeleteStoryLink,
             _ => return Err("unknown Series form action".into()),
         };
         if !matches!(
             kind,
-            SeriesFormKind::CreateSeries | SeriesFormKind::SelectSeries
+            SeriesFormKind::CreateSeries
+                | SeriesFormKind::SelectSeries
+                | SeriesFormKind::CreateStoryLink
+                | SeriesFormKind::DeleteStoryLink
         ) {
             self.series_root()?;
         }
@@ -4843,10 +4869,12 @@ impl AppState {
         };
         match key.code {
             KeyCode::Esc => {
-                self.message = "Series action cancelled; no project or source was changed".into();
+                self.message = "Action cancelled; no project or source was changed".into();
             }
             KeyCode::Enter => {
-                if form.input.trim().is_empty() {
+                let optional_label = form.kind == SeriesFormKind::CreateStoryLink
+                    && form.values.len() + 1 == form.kind.fields().len();
+                if form.input.trim().is_empty() && !optional_label {
                     self.message = "This field is required".into();
                     self.series_form = Some(form);
                     return Ok(());
@@ -4855,7 +4883,7 @@ impl AppState {
                 form.input.clear();
                 if form.values.len() == form.kind.fields().len() {
                     if let Err(error) = self.complete_series_form(form.kind, &form.values) {
-                        self.message = format!("Series action failed: {error}");
+                        self.message = format!("Action failed: {error}");
                     }
                 } else {
                     self.series_form = Some(form);
@@ -4915,6 +4943,46 @@ impl AppState {
                 values[2].clone(),
             )?,
             SeriesFormKind::NewBook => self.create_series_book(&values[0], &values[1])?,
+            SeriesFormKind::CreateStoryLink => {
+                let source = resolve_named_link_entity(&self.app, &values[0])?;
+                let target = resolve_named_link_entity(&self.app, &values[1])?;
+                let kind = parse_terminal_link_kind(&values[2])?;
+                self.app.create_story_link(&story_core::StoryLink {
+                    id: story_core::LinkId::new(),
+                    source,
+                    source_anchor: None,
+                    target,
+                    target_anchor: None,
+                    kind,
+                    label: values[3].clone(),
+                })?;
+                self.message = format!(
+                    "Created {} relationship: {} → {}",
+                    kind.as_str(),
+                    source.id(),
+                    target.id()
+                );
+            }
+            SeriesFormKind::DeleteStoryLink => {
+                let source = resolve_named_link_entity(&self.app, &values[0])?;
+                let target = resolve_named_link_entity(&self.app, &values[1])?;
+                let kind = parse_terminal_link_kind(&values[2])?;
+                let matching = self
+                    .app
+                    .outgoing_links(source)?
+                    .into_iter()
+                    .filter(|link| link.target == target && link.kind == kind)
+                    .collect::<Vec<_>>();
+                let [link] = matching.as_slice() else {
+                    return Err(if matching.is_empty() {
+                        "no matching story relationship exists".into()
+                    } else {
+                        "multiple matching links exist; inspect them by link ID in the CLI".into()
+                    });
+                };
+                self.app.delete_story_link(link.id)?;
+                self.message = format!("Removed {} relationship", kind.as_str());
+            }
         }
         Ok(())
     }
@@ -7215,7 +7283,9 @@ impl AppState {
                         return Ok(());
                     }
                     if spec.takes_arguments {
-                        if spec.category == "Series" {
+                        if spec.category == "Series"
+                            || matches!(spec.id, "link.create" | "link.delete")
+                        {
                             self.start_series_form(spec.id)?;
                             return Ok(());
                         }
@@ -7262,7 +7332,9 @@ impl AppState {
                         return Ok(());
                     }
                     if spec.takes_arguments {
-                        if spec.category == "Series" {
+                        if spec.category == "Series"
+                            || matches!(spec.id, "link.create" | "link.delete")
+                        {
                             self.start_series_form(spec.id)?;
                             return Ok(());
                         }
@@ -15557,6 +15629,11 @@ fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     };
     let fields = form.kind.fields();
     let field = fields.get(form.values.len()).copied().unwrap_or("Value");
+    let title = match form.kind {
+        SeriesFormKind::CreateStoryLink => " Create Story Relationship ",
+        SeriesFormKind::DeleteStoryLink => " Remove Story Relationship ",
+        _ => " Series setup ",
+    };
     f.render_widget(Clear, popup);
     f.render_widget(
         Paragraph::new(vec![
@@ -15581,7 +15658,7 @@ fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         ])
         .block(
             Block::default()
-                .title(" Series setup ")
+                .title(title)
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::Cyan)),
         ),
@@ -17710,6 +17787,62 @@ fn parse_entity(kind: &str, id: &str) -> Result<story_core::EntityRef, Box<dyn s
         _ => return Err(format!("unknown entity kind: {kind}").into()),
     })
 }
+
+fn resolve_named_link_entity(
+    app: &WriterApp,
+    input: &str,
+) -> Result<story_core::EntityRef, Box<dyn std::error::Error>> {
+    let (kind_filter, name) = input
+        .split_once(':')
+        .map(|(kind, name)| (Some(kind.trim()), name.trim()))
+        .unwrap_or((None, input.trim()));
+    let mut candidates = Vec::new();
+    if kind_filter.is_none() || kind_filter == Some("scene") {
+        candidates.extend(
+            app.list_scenes(false)?
+                .into_iter()
+                .filter(|item| item.scene.title.eq_ignore_ascii_case(name))
+                .map(|item| ("scene", story_core::EntityRef::Scene(item.scene.id))),
+        );
+    }
+    if kind_filter.is_none() || kind_filter == Some("character") {
+        candidates.extend(
+            app.list_characters()?
+                .into_iter()
+                .filter(|item| item.name.eq_ignore_ascii_case(name))
+                .map(|item| ("character", story_core::EntityRef::Character(item.id))),
+        );
+    }
+    if kind_filter.is_none() || kind_filter == Some("plotline") {
+        candidates.extend(
+            app.list_plotlines()?
+                .into_iter()
+                .filter(|item| item.name.eq_ignore_ascii_case(name))
+                .map(|item| ("plotline", story_core::EntityRef::Plotline(item.id))),
+        );
+    }
+    if kind_filter.is_none() || kind_filter == Some("research") {
+        candidates.extend(
+            app.list_research_items()?
+                .into_iter()
+                .filter(|item| item.title.eq_ignore_ascii_case(name))
+                .map(|item| ("research", story_core::EntityRef::Research(item.id))),
+        );
+    }
+    if kind_filter.is_none() || kind_filter == Some("reading") {
+        candidates.extend(
+            app.list_reading_documents()?
+                .into_iter()
+                .filter(|item| item.title.eq_ignore_ascii_case(name))
+                .map(|item| ("reading", story_core::EntityRef::Reading(item.id))),
+        );
+    }
+    match candidates.as_slice() {
+        [(_, entity)] => Ok(*entity),
+        [] => Err(format!("no story entity matches '{input}'").into()),
+        _ => Err(format!("'{name}' is ambiguous; prefix it with scene:, character:, plotline:, research:, or reading:").into()),
+    }
+}
 fn parse_terminal_status(value: &str) -> Result<SceneStatus, Box<dyn std::error::Error>> {
     Ok(match value {
         "idea" => SceneStatus::Idea,
@@ -19104,6 +19237,71 @@ mod tests {
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert!(state.series_form.is_none());
         assert!(!series_path.exists());
+    }
+
+    #[test]
+    fn edit_menu_creates_story_link_from_named_entities_without_uuid_syntax() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let character = app.create_character("Mara").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let top = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Edit")
+            .unwrap();
+        state.menu = Some(MenuState { top, selected: 0 });
+        let selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "link.create")
+            .unwrap();
+        state.menu = Some(MenuState { top, selected });
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.menu.is_none());
+        assert_eq!(
+            state.series_form.as_ref().unwrap().kind,
+            SeriesFormKind::CreateStoryLink
+        );
+        enter_series_form_values(
+            &mut state,
+            &["Opening", "Mara", "related", "Opening witness"],
+        )
+        .unwrap();
+        let links = state
+            .app
+            .outgoing_links(story_core::EntityRef::Scene(scene))
+            .unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target, story_core::EntityRef::Character(character));
+        assert_eq!(links[0].label, "Opening witness");
+        assert!(state.message.contains("Created related relationship"));
+        state.menu = Some(MenuState { top, selected: 0 });
+        let selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "link.delete")
+            .unwrap();
+        state.menu = Some(MenuState { top, selected });
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        enter_series_form_values(&mut state, &["Opening", "Mara", "related"]).unwrap();
+        assert!(
+            state
+                .app
+                .outgoing_links(story_core::EntityRef::Scene(scene))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(state.message.contains("Removed related relationship"));
     }
 
     fn select_series_menu_action(

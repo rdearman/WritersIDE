@@ -214,6 +214,8 @@ The browser graph can now create and remove typed links between scene, character
 
 The loopback HTTP server now requires a same-origin `Origin` header on non-GET/HEAD requests, validates any supplied Origin against Host, continues to require the loopback Host, and sends no permissive CORS headers. Originless navigation requests remain available. This reduces cross-site request forgery risk; project ownership and revision-token synchronization across concurrently opened processes remain open.
 
+The terminal Edit menu's Create Story Link and Remove Story Link actions now use guided name-based forms, with optional kind prefixes for ambiguous names; no endpoint UUID syntax is needed for common link creation/removal. Existing CLI commands remain available for precise link operations.
+
 ### Issue #10 — Configurable deterministic diagnostics foundation
 
 Mechanical proofing now loads an optional project-local `.writers-ide/diagnostics.toml` rule set. It supports the existing repeated-word, double-space, and space-before-punctuation checks plus bounded Rust-regex rules; each rule has a stable ID, enabled flag, severity and message. Invalid config and regex patterns fail visibly. CLI `proofread-config` writes a default file without overwriting an existing one; CLI and terminal proofread commands use the project config and return UTF-8 byte ranges. Both reports accept a severity filter (`severity=error,warning,information`). CLI and terminal scopes now include the current scene, explicit scene UUID, chapter UUID, or all scenes; invalid chapter IDs fail visibly. Findings remain advisory and do not modify prose. Broader publishing rule families, dictionary-backed spelling, and configurable rule-specific scopes remain incomplete.
