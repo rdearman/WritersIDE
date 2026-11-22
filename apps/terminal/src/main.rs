@@ -6953,6 +6953,55 @@ impl AppState {
         }
         Ok(())
     }
+    fn start_writing(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.refresh()?;
+        if self.app.get_project()?.book_type == story_core::BookType::Nonfiction {
+            if let Some(unit) = self
+                .app
+                .list_content_units(false)?
+                .into_iter()
+                .find(|unit| unit.kind == story_core::ContentUnitKind::ChapterBody)
+            {
+                self.open_content_unit(unit.id)?;
+                return Ok(());
+            }
+            let nodes = self.app.list_structural_nodes()?;
+            let chapter = if let Some(chapter) = nodes.iter().find(|node| node.kind == "chapter") {
+                chapter.id
+            } else {
+                let position = nodes.iter().filter(|node| node.parent_id.is_none()).count() as u32;
+                self.app.create_chapter(None, "Chapter 1", position)?
+            };
+            let unit = self.app.create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "Chapter 1 prose",
+                Some(chapter),
+                0,
+                None,
+            )?;
+            self.refresh()?;
+            self.open_content_unit(unit)?;
+            self.message = "Your first chapter document is ready. Type to draft.".into();
+            return Ok(());
+        }
+        if let Some((scene, _, _, _)) = self.scenes.first().cloned() {
+            return self.open_scene(scene);
+        }
+        let nodes = self.app.list_structural_nodes()?;
+        let chapter = if let Some(chapter) = nodes.iter().find(|node| node.kind == "chapter") {
+            chapter.id
+        } else {
+            let position = nodes.iter().filter(|node| node.parent_id.is_none()).count() as u32;
+            self.app.create_chapter(None, "Chapter 1", position)?
+        };
+        let scene = self.app.create_scene(chapter, "Scene 1", 0)?;
+        self.refresh()?;
+        self.open_scene(scene)?;
+        self.message =
+            "Your first scene is ready. Type to draft; rename it later from the command palette."
+                .into();
+        Ok(())
+    }
     fn open_content_unit(
         &mut self,
         id: story_core::ContentUnitId,
@@ -15230,7 +15279,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         } else {
             let detail = if s.workspace == Workspace::Dashboard && s.scenes.is_empty() {
                 format!(
-                    "Welcome to Writer's IDE\n\nStart Writing: choose Insert → Create Chapter. Open or Import: choose File → Import. For first steps, press ? for offline help.\n\n{}",
+                    "Welcome to Writer's IDE\n\nSelect Start Writing to create a chapter and first scene, then start drafting. Select Open or Import to continue an existing manuscript. Offline Help is available with ? .\n\n{}",
                     s.message
                 )
             } else if s.workspace == Workspace::Outline {
@@ -17624,12 +17673,11 @@ fn workspace_items(s: &AppState) -> Vec<String> {
     }
     match s.workspace {
         Workspace::Dashboard if s.scenes.is_empty() => vec![
-            "Welcome — your manuscript is ready to start".into(),
-            "Start Writing: create a chapter, then add a scene".into(),
-            "Open or Import: bring in an existing manuscript".into(),
-            "Guided Tutorial: unavailable · Help is available offline".into(),
-            "Advanced Tools: press : to search registered commands".into(),
-            "Help: press ? · Main menu: Ctrl+/ or F10".into(),
+            "Start Writing · create a chapter and first scene".into(),
+            "Open or Import · bring in an existing manuscript".into(),
+            "Guided Tutorial · not available yet".into(),
+            "Advanced Tools · search registered commands".into(),
+            "Offline Help · workflows and shortcuts".into(),
         ],
         Workspace::Dashboard => vec![
             format!("{} scenes", s.scenes.len()),
@@ -20150,6 +20198,39 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         {
             s.proposal_review_index =
                 next_list_selection(s.proposal_review_index, workspace_items(s).len());
+        }
+        KeyCode::Enter if s.workspace == Workspace::Dashboard && s.scenes.is_empty() => {
+            match s.selected {
+                0 => s.start_writing()?,
+                1 => {
+                    let top = MENU_CATEGORIES
+                        .iter()
+                        .position(|category| *category == "File")
+                        .unwrap_or(0);
+                    s.menu = Some(MenuState { top, selected: 0 });
+                    let selected = s
+                        .menu_commands()
+                        .iter()
+                        .position(|command| command.id.contains("import"))
+                        .unwrap_or(0);
+                    s.menu.as_mut().unwrap().selected = selected;
+                    s.message = "Choose an Import command from File, or open a project from the command palette".into();
+                }
+                2 => {
+                    s.message = "The interactive tutorial is not available yet. Offline help is ready with ?".into();
+                }
+                3 => {
+                    s.mode = Some(':');
+                    s.prompt.clear();
+                    s.message =
+                        "Search registered commands; type a command or press Esc to return".into();
+                }
+                _ => {
+                    if let Some(command) = command_by_id("help.context") {
+                        s.dispatch_registered(command.action)?;
+                    }
+                }
+            }
         }
         KeyCode::Enter if s.workspace == Workspace::Research && s.proposal_review_active => {}
         KeyCode::Esc if s.workspace == Workspace::Revisions && s.revision_diff.is_some() => {
@@ -27685,6 +27766,58 @@ mod tests {
         assert!(rendered.contains("A sentence ready for drafting."));
         assert!(rendered.contains("manuscript"));
         assert!(!rendered.contains("Scenes"));
+    }
+
+    #[test]
+    fn blank_dashboard_start_writing_creates_the_right_first_document_for_each_book_type() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut fiction =
+            WriterApp::create_project(directory.path().join("Fiction"), "Fiction").unwrap();
+        let mut state = AppState::new(fiction, default_bindings());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.editing_scene.is_some());
+        assert!(state.editing_content_unit.is_none());
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert_eq!(state.editor, [""]);
+
+        fiction = WriterApp::create_project_with_type(
+            directory.path().join("Nonfiction"),
+            "Nonfiction",
+            story_core::BookType::Nonfiction,
+        )
+        .unwrap();
+        let mut nonfiction = AppState::new(fiction, default_bindings());
+        handle(
+            &mut nonfiction,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(nonfiction.editing_scene.is_none());
+        assert!(nonfiction.editing_content_unit.is_some());
+        assert!(nonfiction.app.list_scenes(false).unwrap().is_empty());
+        assert_eq!(nonfiction.workspace, Workspace::Editor);
+
+        let mut import_state = AppState::new(
+            WriterApp::create_project(directory.path().join("Import"), "Import").unwrap(),
+            default_bindings(),
+        );
+        import_state.selected = 1;
+        handle(
+            &mut import_state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(MENU_CATEGORIES[import_state.menu.unwrap().top], "File");
+        assert!(
+            import_state
+                .menu_commands()
+                .get(import_state.menu.unwrap().selected)
+                .is_some_and(|command| command.id.contains("import"))
+        );
     }
 
     #[test]
