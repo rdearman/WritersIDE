@@ -1253,15 +1253,13 @@ impl PandocRenderer {
             markdown_to_plain_text(&plain_source).into_bytes()
         } else if format == CompileFormat::Markdown {
             markdown.into_bytes()
+        } else if format == CompileFormat::Pdf {
+            let (bytes, files) = self.render_lualatex_pdf(ir, resource_root, design, metadata)?;
+            auxiliary_files = files;
+            bytes
         } else {
             let temporary =
                 tempfile::tempdir().map_err(|e| format!("create renderer workspace: {e}"))?;
-            let texmf_var = temporary.path().join("texmf-var");
-            let texmf_config = temporary.path().join("texmf-config");
-            std::fs::create_dir_all(&texmf_var)
-                .map_err(|e| format!("create writable TeX cache: {e}"))?;
-            std::fs::create_dir_all(&texmf_config)
-                .map_err(|e| format!("create writable TeX config: {e}"))?;
             let output_path = temporary
                 .path()
                 .join(format!("output.{}", format.extension()));
@@ -1282,7 +1280,7 @@ impl PandocRenderer {
                     CompileFormat::Latex => "--to=latex",
                     CompileFormat::Epub => "--to=epub3",
                     CompileFormat::Docx => "--to=docx",
-                    CompileFormat::Pdf => "--to=pdf",
+                    CompileFormat::Pdf => unreachable!(),
                     CompileFormat::Odt => "--to=odt",
                     CompileFormat::Rtf => "--to=rtf",
                     CompileFormat::Azw3 | CompileFormat::Mobi => "--to=epub3",
@@ -1308,15 +1306,6 @@ impl PandocRenderer {
             }
             if let Some(cover) = &cover_path {
                 command.arg("--epub-cover-image").arg(cover);
-            }
-            if format == CompileFormat::Pdf {
-                command
-                    .arg("--pdf-engine=lualatex")
-                    .arg("--pdf-engine-opt=-interaction=nonstopmode")
-                    .arg("--pdf-engine-opt=-halt-on-error")
-                    .env("TEXMFVAR", &texmf_var)
-                    .env("TEXMFCACHE", &texmf_var)
-                    .env("TEXMFCONFIG", &texmf_config);
             }
             if matches!(format, CompileFormat::Latex | CompileFormat::Pdf) {
                 for variable in design.pandoc_variables() {
@@ -1379,42 +1368,6 @@ impl PandocRenderer {
                     ));
                 }
             }
-            if format == CompileFormat::Pdf {
-                let tex =
-                    self.render_with_profile(ir, CompileFormat::Latex, resource_root, design)?;
-                let tex_path = temporary.path().join("compiled.tex");
-                std::fs::write(&tex_path, &tex.bytes)
-                    .map_err(|error| format!("preserve generated TeX source: {error}"))?;
-                auxiliary_files.push(CompileAuxiliaryFile {
-                    name: "compiled.tex".into(),
-                    bytes: tex.bytes,
-                });
-                let mut tex_command = Command::new("lualatex");
-                tex_command
-                    .arg("--interaction=nonstopmode")
-                    .arg("--halt-on-error")
-                    .arg(format!("--output-directory={}", temporary.path().display()))
-                    .arg(&tex_path)
-                    .current_dir(resource_root.unwrap_or(temporary.path()))
-                    .env("TEXMFVAR", &texmf_var)
-                    .env("TEXMFCACHE", &texmf_var)
-                    .env("TEXMFCONFIG", &texmf_config)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::piped());
-                let inspection = tex_command.output();
-                let log =
-                    std::fs::read(temporary.path().join("compiled.log")).unwrap_or_else(|_| {
-                        inspection
-                            .map(|output| output.stderr)
-                            .unwrap_or_else(|error| {
-                                format!("LuaLaTeX log unavailable: {error}").into_bytes()
-                            })
-                    });
-                auxiliary_files.push(CompileAuxiliaryFile {
-                    name: "lualatex.log".into(),
-                    bytes: log,
-                });
-            }
             std::fs::read(&output_path).map_err(|e| format!("read rendered output: {e}"))?
         };
         Ok(CompileArtifact {
@@ -1424,6 +1377,75 @@ impl PandocRenderer {
             source_map,
             auxiliary_files,
         })
+    }
+
+    fn render_lualatex_pdf(
+        &self,
+        ir: &CompileIr,
+        resource_root: Option<&Path>,
+        design: &BookDesignProfile,
+        metadata: &CompileMetadata,
+    ) -> Result<(Vec<u8>, Vec<CompileAuxiliaryFile>), String> {
+        let temporary =
+            tempfile::tempdir().map_err(|error| format!("create PDF workspace: {error}"))?;
+        let texmf_var = temporary.path().join("texmf-var");
+        let texmf_config = temporary.path().join("texmf-config");
+        std::fs::create_dir_all(&texmf_var)
+            .map_err(|error| format!("create writable TeX cache: {error}"))?;
+        std::fs::create_dir_all(&texmf_config)
+            .map_err(|error| format!("create writable TeX config: {error}"))?;
+
+        let tex = self.render_with_profile_and_metadata(
+            ir,
+            CompileFormat::Latex,
+            resource_root,
+            design,
+            metadata,
+        )?;
+        let tex_path = temporary.path().join("compiled.tex");
+        std::fs::write(&tex_path, &tex.bytes)
+            .map_err(|error| format!("write generated TeX source: {error}"))?;
+        let output = Command::new("lualatex")
+            .arg("--interaction=nonstopmode")
+            .arg("--halt-on-error")
+            .arg(format!("--output-directory={}", temporary.path().display()))
+            .arg(&tex_path)
+            .current_dir(resource_root.unwrap_or(temporary.path()))
+            .env("TEXMFVAR", &texmf_var)
+            .env("TEXMFCACHE", &texmf_var)
+            .env("TEXMFCONFIG", &texmf_config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()
+            .map_err(|error| format!("cannot start LuaLaTeX: {error}"))?;
+        let log_path = temporary.path().join("compiled.log");
+        let log = std::fs::read(&log_path).unwrap_or_else(|_| output.stderr.clone());
+        if !output.status.success() {
+            return Err(format!(
+                "LuaLaTeX failed ({}): {}\nLuaLaTeX log:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim(),
+                String::from_utf8_lossy(&log).trim()
+            ));
+        }
+        let pdf = std::fs::read(temporary.path().join("compiled.pdf"))
+            .map_err(|error| format!("read LuaLaTeX PDF output: {error}"))?;
+        if !pdf.starts_with(b"%PDF-") {
+            return Err("LuaLaTeX output is not a PDF file".into());
+        }
+        Ok((
+            pdf,
+            vec![
+                CompileAuxiliaryFile {
+                    name: "compiled.tex".into(),
+                    bytes: tex.bytes,
+                },
+                CompileAuxiliaryFile {
+                    name: "lualatex.log".into(),
+                    bytes: log,
+                },
+            ],
+        ))
     }
 }
 
