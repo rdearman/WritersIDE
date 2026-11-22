@@ -2915,11 +2915,35 @@ fn command_palette_candidates(query: &str) -> Vec<CommandSpec> {
                 command.palette_prefix.unwrap_or_default()
             )
             .to_lowercase();
-            tokens.iter().all(|token| searchable.contains(token))
+            let compact = searchable
+                .chars()
+                .filter(|character| character.is_alphanumeric())
+                .collect::<String>();
+            tokens.iter().all(|token| {
+                if searchable.contains(token) {
+                    true
+                } else {
+                    let compact_token = token
+                        .chars()
+                        .filter(|character| character.is_alphanumeric())
+                        .collect::<String>();
+                    !compact_token.is_empty()
+                        && subsequence_matches(compact_token.chars(), compact.chars())
+                }
+            })
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
         let score = |command: &CommandSpec| {
+            let searchable = format!(
+                "{} {} {} {} {}",
+                command.id,
+                command.label,
+                command.description,
+                command.palette_aliases.join(" "),
+                command.palette_prefix.unwrap_or_default()
+            )
+            .to_lowercase();
             if query.is_empty() {
                 3
             } else if command.id.eq_ignore_ascii_case(&query)
@@ -2936,8 +2960,10 @@ fn command_palette_candidates(query: &str) -> Vec<CommandSpec> {
                 || command.label.to_lowercase().starts_with(&query)
             {
                 1
-            } else {
+            } else if tokens.iter().all(|token| searchable.contains(token)) {
                 2
+            } else {
+                3
             }
         };
         score(left)
@@ -2946,6 +2972,19 @@ fn command_palette_candidates(query: &str) -> Vec<CommandSpec> {
             .then_with(|| left.id.cmp(right.id))
     });
     candidates
+}
+
+fn subsequence_matches(
+    query: impl Iterator<Item = char>,
+    candidate: impl Iterator<Item = char>,
+) -> bool {
+    let mut candidate = candidate.peekable();
+    query.into_iter().all(|wanted| {
+        while candidate.peek().is_some_and(|current| *current != wanted) {
+            candidate.next();
+        }
+        candidate.next().is_some()
+    })
 }
 
 fn menu_category(spec: &CommandSpec) -> &'static str {
@@ -22259,6 +22298,16 @@ mod tests {
         assert_eq!(
             matches.first().map(|command| command.id),
             Some("view.timeline")
+        );
+        assert!(
+            command_palette_candidates("vwtim")
+                .iter()
+                .any(|command| command.id == "view.timeline")
+        );
+        assert!(
+            !command_palette_candidates("+++")
+                .iter()
+                .any(|command| command.id == "view.timeline")
         );
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
