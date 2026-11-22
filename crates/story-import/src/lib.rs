@@ -83,6 +83,12 @@ pub struct ManuscriptStaging {
     pub unsupported: Vec<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DocxExtractedDocument {
+    blocks: Vec<(String, bool)>,
+    unsupported: Vec<String>,
+}
+
 /// Read-only inventory of a Scrivener package. This records what the detected
 /// manifest says; a version string alone is not a compatibility guarantee.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -854,8 +860,10 @@ pub fn inspect_manuscript(path: impl AsRef<Path>) -> Result<ManuscriptStaging, I
     match source_type {
         SourceType::Docx => {
             let xml = read_zip_text(&bytes, "word/document.xml")?;
-            let blocks = extract_docx_blocks(&xml)?;
-            split_blocks_into_units(&mut staging, blocks, "docx");
+            let relationships = read_docx_relationships(&bytes)?;
+            let extracted = extract_docx_blocks(&xml, &relationships)?;
+            split_blocks_into_units(&mut staging, extracted.blocks, "docx");
+            staging.unsupported.extend(extracted.unsupported);
             if xml.contains("<w:tbl") {
                 staging
                     .unsupported
@@ -880,11 +888,6 @@ pub fn inspect_manuscript(path: impl AsRef<Path>) -> Result<ManuscriptStaging, I
                         .unsupported
                         .push(format!("DOCX {description} formatting is not preserved"));
                 }
-            }
-            if xml.contains("<w:hyperlink") {
-                staging
-                    .unsupported
-                    .push("DOCX hyperlink destinations are flattened to their anchor text".into());
             }
             for feature in [
                 "<w:ins",
@@ -1476,6 +1479,65 @@ fn read_zip_text(bytes: &[u8], member: &str) -> Result<String, ImportError> {
     Ok(text)
 }
 
+fn read_optional_zip_text(bytes: &[u8], member: &str) -> Result<Option<String>, ImportError> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|error| ImportError::Archive(error.to_string()))?;
+    let mut file = match archive.by_name(member) {
+        Ok(file) => file,
+        Err(zip::result::ZipError::FileNotFound) => return Ok(None),
+        Err(error) => return Err(ImportError::Archive(error.to_string())),
+    };
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut file, &mut text)
+        .map_err(|error| ImportError::Archive(error.to_string()))?;
+    Ok(Some(text))
+}
+
+fn read_docx_relationships(bytes: &[u8]) -> Result<BTreeMap<String, (String, bool)>, ImportError> {
+    let Some(xml) = read_optional_zip_text(bytes, "word/_rels/document.xml.rels")? else {
+        return Ok(BTreeMap::new());
+    };
+    let mut reader = quick_xml::Reader::from_str(&xml);
+    let mut relationships = BTreeMap::new();
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::Start(event) | quick_xml::events::Event::Empty(event))
+                if event.local_name().as_ref() == b"Relationship" =>
+            {
+                let id = xml_event_attribute(&event, "Id", reader.decoder())?;
+                let target = xml_event_attribute(&event, "Target", reader.decoder())?;
+                let external = xml_event_attribute(&event, "TargetMode", reader.decoder())?
+                    .is_some_and(|mode| mode.eq_ignore_ascii_case("external"));
+                if let (Some(id), Some(target)) = (id, target) {
+                    relationships.insert(id, (target, external));
+                }
+            }
+            Ok(quick_xml::events::Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(ImportError::Archive(error.to_string())),
+        }
+    }
+    Ok(relationships)
+}
+
+fn encode_markdown_link_target(target: &str) -> String {
+    let mut encoded = String::new();
+    for byte in target.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~:/?#[]@!$&'()*+,;=%".contains(&byte) {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+fn escape_markdown_link_label(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('[', "\\[")
+        .replace(']', "\\]")
+}
+
 fn docx_toggle_enabled(
     event: &quick_xml::events::BytesStart<'_>,
     decoder: quick_xml::encoding::Decoder,
@@ -1525,7 +1587,10 @@ fn flush_docx_run(
     run_text.clear();
 }
 
-fn extract_docx_blocks(xml: &str) -> Result<Vec<(String, bool)>, ImportError> {
+fn extract_docx_blocks(
+    xml: &str,
+    relationships: &BTreeMap<String, (String, bool)>,
+) -> Result<DocxExtractedDocument, ImportError> {
     let mut blocks = Vec::new();
     let mut reader = quick_xml::Reader::from_str(xml);
     reader.config_mut().trim_text(false);
@@ -1534,9 +1599,35 @@ fn extract_docx_blocks(xml: &str) -> Result<Vec<(String, bool)>, ImportError> {
     let mut paragraph = String::new();
     let mut run_text = String::new();
     let (mut bold, mut italic, mut strike) = (false, false, false);
+    let mut active_hyperlink: Option<(usize, String)> = None;
+    let mut unsupported_hyperlink = false;
     loop {
         match reader.read_event() {
             Ok(quick_xml::events::Event::Start(event)) => match event.local_name().as_ref() {
+                b"hyperlink" if in_paragraph => {
+                    flush_docx_run(&mut paragraph, &mut run_text, bold, italic, strike);
+                    let anchor = xml_event_attribute(&event, "anchor", reader.decoder())?;
+                    let target = if let Some(anchor) = anchor {
+                        Some(format!("#{anchor}"))
+                    } else if let Some(id) = xml_event_attribute(&event, "id", reader.decoder())? {
+                        relationships.get(&id).and_then(|(target, external)| {
+                            let lower = target.to_ascii_lowercase();
+                            (*external
+                                && (lower.starts_with("http://")
+                                    || lower.starts_with("https://")
+                                    || lower.starts_with("mailto:")))
+                            .then(|| target.clone())
+                        })
+                    } else {
+                        None
+                    };
+                    if let Some(target) = target {
+                        active_hyperlink =
+                            Some((paragraph.len(), encode_markdown_link_target(&target)));
+                    } else {
+                        unsupported_hyperlink = true;
+                    }
+                }
                 b"r" => {
                     flush_docx_run(&mut paragraph, &mut run_text, bold, italic, strike);
                     (bold, italic, strike) = (false, false, false);
@@ -1638,6 +1729,19 @@ fn extract_docx_blocks(xml: &str) -> Result<Vec<(String, bool)>, ImportError> {
                     });
                 }
             }
+            Ok(quick_xml::events::Event::End(event))
+                if event.local_name().as_ref() == b"hyperlink" =>
+            {
+                flush_docx_run(&mut paragraph, &mut run_text, bold, italic, strike);
+                if let Some((start, target)) = active_hyperlink.take()
+                    && start <= paragraph.len()
+                {
+                    let label = escape_markdown_link_label(&paragraph[start..]);
+                    if !label.is_empty() {
+                        paragraph.replace_range(start.., &format!("[{label}](<{target}>)"));
+                    }
+                }
+            }
             Ok(quick_xml::events::Event::End(event)) if event.local_name().as_ref() == b"r" => {
                 flush_docx_run(&mut paragraph, &mut run_text, bold, italic, strike);
                 (bold, italic, strike) = (false, false, false);
@@ -1662,7 +1766,17 @@ fn extract_docx_blocks(xml: &str) -> Result<Vec<(String, bool)>, ImportError> {
             Err(error) => return Err(ImportError::Archive(error.to_string())),
         }
     }
-    Ok(blocks)
+    let unsupported = unsupported_hyperlink
+        .then(|| {
+            "DOCX hyperlink with an unresolved or unsupported destination is flattened to anchor text"
+                .into()
+        })
+        .into_iter()
+        .collect();
+    Ok(DocxExtractedDocument {
+        blocks,
+        unsupported,
+    })
 }
 
 fn extract_odt_blocks(xml: &str) -> Vec<(String, bool)> {
@@ -2228,10 +2342,18 @@ mod tests {
     fn docx_and_odt_staging_extract_prose_and_leave_source_unchanged() {
         let directory = tempfile::tempdir().unwrap();
         let docx = directory.path().join("draft.docx");
-        archive(
+        archive_with_members(
             &docx,
-            "word/document.xml",
-            "<w:document><w:body><w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:r><w:t>Chapter One</w:t></w:r></w:p><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Élodie &amp; Sam.</w:t><w:tab/><w:t>Still here.</w:t><w:br/><w:t>New line.</w:t></w:r><w:r><w:rPr><w:i/></w:rPr><w:t>italic text</w:t></w:r><w:r><w:rPr><w:strike/></w:rPr><w:t>struck text</w:t></w:r><w:r><w:rPr><w:u w:val=\"single\"/></w:rPr><w:t>underlined text</w:t></w:r></w:p></w:body></w:document>",
+            &[
+                (
+                    "word/document.xml",
+                    "<w:document><w:body><w:p><w:pPr><w:pStyle w:val=\"Heading1\"/></w:pPr><w:r><w:t>Chapter One</w:t></w:r></w:p><w:p><w:r><w:rPr><w:b/></w:rPr><w:t>Élodie &amp; Sam.</w:t><w:tab/><w:t>Still here.</w:t><w:br/><w:t>New line.</w:t></w:r><w:r><w:rPr><w:i/></w:rPr><w:t>italic text</w:t></w:r><w:r><w:rPr><w:strike/></w:rPr><w:t>struck text</w:t></w:r><w:r><w:rPr><w:u w:val=\"single\"/></w:rPr><w:t>underlined text</w:t></w:r><w:hyperlink r:id=\"rId1\"><w:r><w:t>External link</w:t></w:r></w:hyperlink><w:hyperlink w:anchor=\"chapter-one\"><w:r><w:t>Internal link</w:t></w:r></w:hyperlink><w:hyperlink r:id=\"rId2\"><w:r><w:t>Local file link</w:t></w:r></w:hyperlink></w:p></w:body></w:document>",
+                ),
+                (
+                    "word/_rels/document.xml.rels",
+                    "<Relationships><Relationship Id=\"rId1\" Target=\"https://example.test/a b?q=one two\" TargetMode=\"External\"/><Relationship Id=\"rId2\" Target=\"file:///private/document.docx\" TargetMode=\"External\"/></Relationships>",
+                ),
+            ],
         );
         let source_before = std::fs::read(&docx).unwrap();
         let staged = inspect_manuscript(&docx).unwrap();
@@ -2250,6 +2372,23 @@ mod tests {
         );
         assert!(staged.units[0].body_markdown.contains("*italic text*"));
         assert!(staged.units[0].body_markdown.contains("~~struck text~~"));
+        assert!(
+            staged.units[0]
+                .body_markdown
+                .contains("[External link](<https://example.test/a%20b?q=one%20two>)")
+        );
+        assert!(
+            staged.units[0]
+                .body_markdown
+                .contains("[Internal link](<#chapter-one>)")
+        );
+        assert!(staged.units[0].body_markdown.contains("Local file link"));
+        assert!(
+            staged
+                .unsupported
+                .iter()
+                .any(|item| item.contains("unsupported destination"))
+        );
         assert!(
             staged
                 .unsupported
