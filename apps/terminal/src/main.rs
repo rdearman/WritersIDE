@@ -602,6 +602,7 @@ struct FindPanel {
     mode: story_core::FindMode,
     case_sensitive: bool,
     whole_word: bool,
+    accent_sensitive: bool,
     scope: String,
     pattern: String,
     replacement: String,
@@ -617,6 +618,7 @@ struct FindPanelSession {
     replacement: String,
     case_sensitive: bool,
     whole_word: bool,
+    accent_sensitive: bool,
     history: Vec<String>,
 }
 
@@ -627,6 +629,7 @@ impl Default for FindPanelSession {
             replacement: String::new(),
             case_sensitive: true,
             whole_word: false,
+            accent_sensitive: false,
             history: Vec::new(),
         }
     }
@@ -3957,6 +3960,7 @@ impl AppState {
         session.replacement = panel.replacement.clone();
         session.case_sensitive = panel.case_sensitive;
         session.whole_word = panel.whole_word;
+        session.accent_sensitive = panel.accent_sensitive;
         save_find_panel_session(self.app.project_root(), &session)
     }
     fn remember_find_panel_query(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -3975,6 +3979,7 @@ impl AppState {
         session.replacement = panel.replacement.clone();
         session.case_sensitive = panel.case_sensitive;
         session.whole_word = panel.whole_word;
+        session.accent_sensitive = panel.accent_sensitive;
         save_find_panel_session(self.app.project_root(), &session)
     }
     fn record_command_macro_step(
@@ -5273,7 +5278,7 @@ impl AppState {
                     whole_word: panel.whole_word,
                 },
                 record.scene.effective_language_code(&project),
-                false,
+                panel.accent_sensitive,
             )?;
             if !matches.is_empty() {
                 for matched in &matches {
@@ -5485,18 +5490,12 @@ impl AppState {
     }
     fn stage_replace_preview(
         &mut self,
-        mode: story_core::FindMode,
         scope: &str,
         pattern: &str,
         replacement: &str,
-        case_sensitive: bool,
-        whole_word: bool,
+        options: story_core::FindOptions,
+        accent_sensitive: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let options = story_core::FindOptions {
-            mode,
-            case_sensitive,
-            whole_word,
-        };
         let scenes = self.scenes_for_scope(scope)?;
         if let Some(panel) = self.find_panel.as_ref()
             && panel.pattern == pattern
@@ -5514,7 +5513,7 @@ impl AppState {
                 pattern,
                 options,
                 &language_tag,
-                false,
+                accent_sensitive,
             )?;
             let (updated, count) = story_core::replace_selected_matches_with_locale(
                 &source,
@@ -5523,7 +5522,7 @@ impl AppState {
                 options,
                 &vec![true; matches.len()],
                 &language_tag,
-                false,
+                accent_sensitive,
             )?;
             if count > 0 {
                 total += count;
@@ -5538,7 +5537,7 @@ impl AppState {
                     replacement: replacement.into(),
                     options,
                     language_tag,
-                    accent_sensitive: false,
+                    accent_sensitive,
                     selected_file: true,
                     selected_matches: vec![true; matches.len()],
                 });
@@ -5588,7 +5587,7 @@ impl AppState {
             &panel.pattern,
             options,
             &language_tag,
-            false,
+            panel.accent_sensitive,
         )?;
         if matches.is_empty() {
             self.message = "No match in the current scene".into();
@@ -5608,7 +5607,7 @@ impl AppState {
             options,
             &selected,
             &language_tag,
-            false,
+            panel.accent_sensitive,
         )?;
         if count == 0 {
             self.message = "No match selected; manuscript unchanged".into();
@@ -11888,6 +11887,7 @@ impl AppState {
                 mode: story_core::FindMode::Normal,
                 case_sensitive: false,
                 whole_word: true,
+                accent_sensitive: false,
                 scope: "all".into(),
                 pattern: query.into(),
                 replacement: String::new(),
@@ -11955,7 +11955,17 @@ impl AppState {
             let mode = parse_find_mode(parts.next().ok_or("missing replace mode")?)?;
             let scope = parts.next().ok_or("missing replace scope")?;
             let pattern = parts.next().ok_or("missing replace pattern")?;
-            self.stage_replace_preview(mode, scope, pattern, replacement, true, false)?;
+            self.stage_replace_preview(
+                scope,
+                pattern,
+                replacement,
+                story_core::FindOptions {
+                    mode,
+                    case_sensitive: true,
+                    whole_word: false,
+                },
+                false,
+            )?;
         } else if cmd == "replace-cancel" {
             if self.pending_replace.take().is_some() {
                 self.message = "Replacement preview discarded; manuscript unchanged".into();
@@ -14109,14 +14119,19 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         let help = if panel.replacing && s.pending_replace.is_some() {
             "F3 next match · F6 toggle match · F8 toggle file · F5 apply selected · Esc cancel"
         } else if panel.replacing {
-            "F9 replace next · Enter preview all · F5 apply · F3 match · F6 toggle · F8 file · F11 older query · F12 newer query · Esc"
+            "F9 replace next · Enter preview all · F5 apply · F3 match · F6 case · F7 word · F8 accent · F11 older query · F12 newer query · Esc"
         } else {
-            "Enter find · F3 next · F2 mode · F4 scope · F6 case · F7 word · F11 older query · F12 newer query · Tab · Ctrl+H replace · Esc"
+            "Enter find · F3 next · F2 mode · F4 scope · F6 case · F7 word · F8 accent · F11 older query · F12 newer query · Tab · Ctrl+H replace · Esc"
         };
         let options = format!(
-            "Case {} · whole word {}",
+            "Case {} · whole word {} · accents {}",
             if panel.case_sensitive { "on" } else { "off" },
-            if panel.whole_word { "on" } else { "off" }
+            if panel.whole_word { "on" } else { "off" },
+            if panel.accent_sensitive {
+                "sensitive"
+            } else {
+                "folded"
+            }
         );
         let lines = vec![
             Line::from(vec![
@@ -17350,6 +17365,7 @@ fn open_find_panel(s: &mut AppState, replacing: bool) {
             replacement: session.replacement,
             case_sensitive: session.case_sensitive,
             whole_word: session.whole_word,
+            accent_sensitive: session.accent_sensitive,
             field: FindPanelField::Pattern,
             history_position: None,
             history_draft: None,
@@ -17476,12 +17492,15 @@ fn handle_find_panel_key(
         let panel = s.find_panel.as_ref().ok_or("find panel is closed")?.clone();
         if panel.replacing {
             if let Err(error) = s.stage_replace_preview(
-                panel.mode,
                 &panel.scope,
                 &panel.pattern,
                 &panel.replacement,
-                panel.case_sensitive,
-                panel.whole_word,
+                story_core::FindOptions {
+                    mode: panel.mode,
+                    case_sensitive: panel.case_sensitive,
+                    whole_word: panel.whole_word,
+                },
+                panel.accent_sensitive,
             ) {
                 s.message = error.to_string();
             }
@@ -17505,6 +17524,7 @@ fn handle_find_panel_key(
         }
         KeyCode::F(6) => panel.case_sensitive = !panel.case_sensitive,
         KeyCode::F(7) => panel.whole_word = !panel.whole_word,
+        KeyCode::F(8) => panel.accent_sensitive = !panel.accent_sensitive,
         KeyCode::Tab | KeyCode::BackTab => {
             let forward = key.code == KeyCode::Tab;
             panel.field = match (panel.replacing, forward, panel.field) {
@@ -17551,7 +17571,7 @@ fn handle_find_panel_key(
     }
     let edits_preview_inputs = matches!(
         key.code,
-        KeyCode::F(2) | KeyCode::F(7) | KeyCode::Backspace | KeyCode::Char(_)
+        KeyCode::F(2) | KeyCode::F(7) | KeyCode::F(8) | KeyCode::Backspace | KeyCode::Char(_)
     );
     if edits_preview_inputs && s.pending_replace.take().is_some() {
         s.message = "Replacement preview cancelled because its settings changed".into();
@@ -17569,6 +17589,7 @@ fn handle_find_panel_key(
                     | KeyCode::F(2)
                     | KeyCode::F(6)
                     | KeyCode::F(7)
+                    | KeyCode::F(8)
             )
     });
     if incremental && let Err(error) = s.run_find_panel_search() {
@@ -23205,11 +23226,14 @@ mod tests {
 
         state
             .stage_replace_preview(
-                story_core::FindMode::Normal,
                 "current",
                 "istanbul",
                 "Ankara",
-                false,
+                story_core::FindOptions {
+                    mode: story_core::FindMode::Normal,
+                    case_sensitive: false,
+                    whole_word: false,
+                },
                 false,
             )
             .unwrap();
@@ -23224,6 +23248,34 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "Ankara and Iskenderun."
         );
+    }
+
+    #[test]
+    fn find_panel_can_toggle_and_persist_accent_sensitive_matching() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "café cafe")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        open_find_panel(&mut state, false);
+        let panel = state.find_panel.as_mut().unwrap();
+        panel.pattern = "cafe".into();
+        panel.case_sensitive = false;
+        state.run_find_panel_search().unwrap();
+        assert_eq!(state.search_locations.len(), 2);
+
+        handle(&mut state, KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.search_locations.len(), 1);
+        assert_eq!(
+            &state.app.load_scene_text(scene).unwrap().0
+                [state.search_locations[0].1..state.search_locations[0].2],
+            "cafe"
+        );
+        assert!(load_find_panel_session(state.app.project_root()).accent_sensitive);
     }
 
     #[test]
@@ -23371,6 +23423,7 @@ mod tests {
             replacement: String::new(),
             case_sensitive: true,
             whole_word: false,
+            accent_sensitive: false,
             field: FindPanelField::Pattern,
             history_position: None,
             history_draft: None,
@@ -23414,6 +23467,7 @@ mod tests {
             replacement: String::new(),
             case_sensitive: true,
             whole_word: false,
+            accent_sensitive: false,
             field: FindPanelField::Pattern,
             history_position: None,
             history_draft: None,
@@ -23423,11 +23477,14 @@ mod tests {
         assert_eq!(state.search_locations[0].0, scene);
         state
             .stage_replace_preview(
-                story_core::FindMode::Normal,
                 "open",
                 "cat",
                 "fox",
-                true,
+                story_core::FindOptions {
+                    mode: story_core::FindMode::Normal,
+                    case_sensitive: true,
+                    whole_word: false,
+                },
                 false,
             )
             .unwrap();
@@ -23506,11 +23563,14 @@ mod tests {
         let mut state = AppState::new(app, default_bindings());
         state
             .stage_replace_preview(
-                story_core::FindMode::Normal,
                 "all",
                 "cat",
                 "fox",
-                true,
+                story_core::FindOptions {
+                    mode: story_core::FindMode::Normal,
+                    case_sensitive: true,
+                    whole_word: false,
+                },
                 false,
             )
             .unwrap();
@@ -23647,6 +23707,7 @@ mod tests {
             mode: story_core::FindMode::Normal,
             case_sensitive: true,
             whole_word: false,
+            accent_sensitive: false,
             scope: "current".into(),
             pattern: "cat".into(),
             replacement: "fox".into(),

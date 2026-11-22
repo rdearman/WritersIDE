@@ -582,6 +582,15 @@ pub fn replace_selected_matches_with_locale(
     language_tag: &str,
     accent_sensitive: bool,
 ) -> Result<(String, usize), String> {
+    if options.case_sensitive || options.mode == FindMode::Regex {
+        return replace_selected_matches_with_options(
+            text,
+            pattern,
+            replacement,
+            options,
+            selected,
+        );
+    }
     let matches = find_matches_with_locale(text, pattern, options, language_tag, accent_sensitive)?;
     if matches.len() != selected.len() {
         return Err(
@@ -816,6 +825,23 @@ mod multilingual_tests {
             )
             .unwrap(),
             ("tea CAFÉ tea".into(), 2)
+        );
+        assert_eq!(
+            replace_selected_matches_with_locale(
+                "cat CAT",
+                r"(cat)",
+                "<$1>",
+                FindOptions {
+                    mode: FindMode::Regex,
+                    case_sensitive: false,
+                    whole_word: false,
+                },
+                &[true, true],
+                "tr-TR",
+                false,
+            )
+            .unwrap(),
+            ("<cat> <CAT>".into(), 2)
         );
     }
 
