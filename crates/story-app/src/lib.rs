@@ -3328,6 +3328,16 @@ impl WriterApp {
     ) -> Result<()> {
         Ok(self.store.set_event_locations(event, locations)?)
     }
+    pub fn set_event_relationships(
+        &mut self,
+        event: EventId,
+        participants: &[EventCharacterParticipation],
+        locations: &[EventLocationAssociation],
+    ) -> Result<()> {
+        Ok(self
+            .store
+            .set_event_relationships(event, participants, locations)?)
+    }
     pub fn event_locations(&self, event: EventId) -> Result<Vec<EventLocationAssociation>> {
         Ok(self.store.event_locations(event)?)
     }

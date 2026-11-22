@@ -37,6 +37,11 @@ struct EventTimeUpdateRequest {
     source_time: String,
 }
 #[derive(Deserialize)]
+struct EventRelationshipsUpdateRequest {
+    characters: Vec<story_core::EventCharacterParticipation>,
+    locations: Vec<story_core::EventLocationAssociation>,
+}
+#[derive(Deserialize)]
 struct SceneTimeUpdateRequest {
     start: String,
     end: String,
@@ -62,7 +67,7 @@ body{font:16px system-ui;margin:0;color:#20242a;background:#f3f5f7}header{paddin
 <script>
 let plan,selected;async function api(path,method='GET',data){const r=await fetch(path,{method,headers:data?{'Content-Type':'application/json'}:{},body:data?JSON.stringify(data):undefined});const j=await r.json().catch(()=>({}));if(!r.ok)throw Error(j.error||r.statusText);return j}
 function renderScenes(){const query=document.querySelector('#scene-filter-text').value.trim().toLocaleLowerCase();const status=document.querySelector('#scene-filter-status').value;const character=document.querySelector('#scene-filter-character').value;const plot=document.querySelector('#scene-filter-plot').value;const matches=plan.scenes.filter(s=>(!query||`${s.title} ${s.synopsis||''}`.toLocaleLowerCase().includes(query))&&(!status||s.status===status)&&(!character||s.characters.some(x=>x.id===character))&&(!plot||s.plotlines.some(x=>x.id===plot)));document.querySelector('#scenes').innerHTML=matches.map(s=>`<button class="scene" data-id="${s.id}"><b>${esc(s.title)}</b><br><small>${esc(s.chapter||'Unplaced')} · ${s.actual_words} words · ${esc(s.status)}</small><p>${esc(s.synopsis||'')}</p></button>`).join('')||'No matching scenes';document.querySelectorAll('#scenes [data-id]').forEach(b=>b.onclick=()=>openScene(b.dataset.id))}
-async function load(){plan=await api('/api/plan');document.querySelector('#title').textContent=plan.project.title;document.querySelector('#scene-filter-character').innerHTML='<option value="">Any character</option>'+plan.characters.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');document.querySelector('#scene-filter-plot').innerHTML='<option value="">Any plotline</option>'+plan.plotlines.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');renderScenes();document.querySelector('#characters').innerHTML=plan.characters.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No characters';document.querySelector('#plotlines').innerHTML=plan.plotlines.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No plotlines';document.querySelector('#world').innerHTML=[...plan.locations.map(x=>`<p>Location · ${esc(x.name)}</p>`),...plan.events.map(x=>`<p><button data-event="${esc(x.id)}" data-start="${esc(timeLabel(x.start))}" data-end="${esc(timeLabel(x.end))}" data-source="${esc(x.source_time)}">Edit time · ${esc(x.title)}</button> <small>${esc(x.source_time)} · ${esc(timeLabel(x.start))} → ${esc(timeLabel(x.end))}</small></p>`)].join('')||'No locations or events';document.querySelector('#work').innerHTML=[...plan.research.map(x=>`<p>Research · ${esc(x.title)}</p>`),...plan.issues.map(x=>`<p>Issue · ${esc(x.title)} <small>${esc(x.status)}</small><select data-issue-status="${esc(x.id)}"><option value="open" ${x.status==='open'?'selected':''}>Open</option><option value="in_progress" ${x.status==='in_progress'?'selected':''}>In progress</option><option value="resolved" ${x.status==='resolved'?'selected':''}>Resolved</option><option value="deferred" ${x.status==='deferred'?'selected':''}>Deferred</option><option value="closed" ${x.status==='closed'?'selected':''}>Closed</option></select></p>`)].join('')||'No research or issues';document.querySelector('#structure').innerHTML=plan.groups.map(x=>`<p>${'　'.repeat(x.depth)}${esc(x.title)} <small>${esc(x.kind)}</small></p>`).join('')||'No structure';drawGraph();document.querySelector('#edges').innerHTML=`<small>${plan.edges.length} stable-ID relationships in the project graph</small>`;document.querySelector('#knowledge').innerHTML=plan.claims.map(x=>`<p><b>${esc(x.name)}</b> · ${esc(x.claim)}<br><small>Evidence: ${esc(x.evidence_quote)} · ${esc(x.source_kind)} ${esc(x.source_id)}:${x.evidence_start_byte}..${x.evidence_end_byte}</small></p>`).join('')||'No approved knowledge claims';const chapters=plan.groups.filter(x=>x.kind==='chapter');for(const id of ['new-chapter','move-chapter'])document.querySelector('#'+id).innerHTML=chapters.map(c=>`<option value="${c.id}">${esc(c.title)}</option>`).join('');document.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>openScene(b.dataset.id))}
+async function load(){plan=await api('/api/plan');document.querySelector('#title').textContent=plan.project.title;document.querySelector('#scene-filter-character').innerHTML='<option value="">Any character</option>'+plan.characters.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');document.querySelector('#scene-filter-plot').innerHTML='<option value="">Any plotline</option>'+plan.plotlines.map(x=>`<option value="${esc(x.id)}">${esc(x.name)}</option>`).join('');renderScenes();document.querySelector('#characters').innerHTML=plan.characters.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No characters';document.querySelector('#plotlines').innerHTML=plan.plotlines.map(x=>`<p>${esc(x.name)} <small>(${x.scene_count} scenes)</small></p>`).join('')||'No plotlines';document.querySelector('#world').innerHTML=[...plan.locations.map(x=>`<p>Location · ${esc(x.name)}</p>`),...plan.events.map(x=>`<p><button data-event="${esc(x.id)}" data-start="${esc(timeLabel(x.start))}" data-end="${esc(timeLabel(x.end))}" data-source="${esc(x.source_time)}">Edit time · ${esc(x.title)}</button> <button data-event-rel="${esc(x.id)}" data-characters="${esc(JSON.stringify(x.characters||[]))}" data-locations="${esc(JSON.stringify(x.locations||[]))}">Edit relationships</button> <small>${esc(x.source_time)} · ${esc(timeLabel(x.start))} → ${esc(timeLabel(x.end))} · ${(x.characters||[]).length} people · ${(x.locations||[]).length} locations</small></p>`)].join('')||'No locations or events';document.querySelector('#work').innerHTML=[...plan.research.map(x=>`<p>Research · ${esc(x.title)}</p>`),...plan.issues.map(x=>`<p>Issue · ${esc(x.title)} <small>${esc(x.status)}</small><select data-issue-status="${esc(x.id)}"><option value="open" ${x.status==='open'?'selected':''}>Open</option><option value="in_progress" ${x.status==='in_progress'?'selected':''}>In progress</option><option value="resolved" ${x.status==='resolved'?'selected':''}>Resolved</option><option value="deferred" ${x.status==='deferred'?'selected':''}>Deferred</option><option value="closed" ${x.status==='closed'?'selected':''}>Closed</option></select></p>`)].join('')||'No research or issues';document.querySelector('#structure').innerHTML=plan.groups.map(x=>`<p>${'　'.repeat(x.depth)}${esc(x.title)} <small>${esc(x.kind)}</small></p>`).join('')||'No structure';drawGraph();document.querySelector('#edges').innerHTML=`<small>${plan.edges.length} stable-ID relationships in the project graph</small>`;document.querySelector('#knowledge').innerHTML=plan.claims.map(x=>`<p><b>${esc(x.name)}</b> · ${esc(x.claim)}<br><small>Evidence: ${esc(x.evidence_quote)} · ${esc(x.source_kind)} ${esc(x.source_id)}:${x.evidence_start_byte}..${x.evidence_end_byte}</small></p>`).join('')||'No approved knowledge claims';const chapters=plan.groups.filter(x=>x.kind==='chapter');for(const id of ['new-chapter','move-chapter'])document.querySelector('#'+id).innerHTML=chapters.map(c=>`<option value="${c.id}">${esc(c.title)}</option>`).join('');document.querySelectorAll('[data-id]').forEach(b=>b.onclick=()=>openScene(b.dataset.id))}
 function drawGraph(){const columns=[['group',plan.groups.map(n=>({...n,label:n.title}))],['scene',plan.scenes.map(n=>({...n,label:n.title}))],['character',plan.characters.map(n=>({...n,label:n.name}))],['plotline',plan.plotlines.map(n=>({...n,label:n.name}))],['world',[...plan.locations.map(n=>({...n,label:'Location · '+n.name})),...plan.events.map(n=>({...n,label:'Event · '+n.title}))]],['knowledge',plan.claims.map(n=>({...n,label:'Fact · '+n.name}))]];const nodes=[],positions=new Map();let height=180;columns.forEach(([kind,items],col)=>{items.forEach((n,row)=>{const x=20+col*190,y=24+row*54;const node={id:String(n.id),kind,label:n.label,x,y};nodes.push(node);if(!positions.has(node.id))positions.set(node.id,node);height=Math.max(height,y+52)})});const lines=plan.edges.map(e=>{const a=positions.get(String(e.from)),b=positions.get(String(e.to));return a&&b?`<line x1="${a.x+160}" y1="${a.y+16}" x2="${b.x}" y2="${b.y+16}"><title>${esc(e.kind)}</title></line>`:''}).join('');const cards=nodes.map(n=>`<g class="${n.kind}" ${n.kind==='scene'?`data-scene-id="${esc(n.id)}"`:''}><rect x="${n.x}" y="${n.y}" width="160" height="32"></rect><text x="${n.x+8}" y="${n.y+21}">${esc(n.label.slice(0,22))}</text><title>${esc(n.label)}</title></g>`).join('');const svg=document.querySelector('#graph');svg.setAttribute('viewBox',`0 0 ${20+columns.length*190} ${height}`);svg.setAttribute('height',height);svg.innerHTML=lines+cards;svg.querySelectorAll('[data-scene-id]').forEach(node=>node.onclick=()=>openScene(node.dataset.sceneId))}
 async function openScene(id){selected=id;const s=await api('/api/scenes/'+encodeURIComponent(id));document.querySelector('#scene-title').textContent=s.title;document.querySelector('#scene-meta').textContent=`${s.actual_words} words · ${s.status} · POV ${s.pov||'unset'}`;document.querySelector('#scene-name').value=s.title;document.querySelector('#synopsis').value=s.synopsis;document.querySelector('#status').value=s.status;document.querySelector('#scene-start-time').value=timeLabel(s.start_time);document.querySelector('#scene-end-time').value=timeLabel(s.end_time);document.querySelector('#prose').textContent=s.text}
 document.querySelector('#create-issue').onsubmit=async e=>{e.preventDefault();try{await api('/api/issues','POST',{title:document.querySelector('#new-issue-title').value,scene_id:selected||null});document.querySelector('#new-issue-title').value='';await load();notice('Issue created')}catch(e){notice(e.message)}};document.querySelector('#work').addEventListener('change',async e=>{const select=e.target.closest('[data-issue-status]');if(!select)return;try{await api('/api/issues/'+encodeURIComponent(select.dataset.issueStatus)+'/status','POST',{status:select.value});await load();notice('Issue status saved')}catch(error){notice(error.message)}});
@@ -71,9 +76,10 @@ document.querySelector('#create-chapter').onsubmit=async e=>{e.preventDefault();
 document.querySelector('#save-planning').onclick=async()=>{if(!selected)return;try{await api('/api/scenes/'+selected+'/planning','POST',{title:document.querySelector('#scene-name').value,synopsis:document.querySelector('#synopsis').value,status:document.querySelector('#status').value});await load();await openScene(selected);notice('Planning metadata saved')}catch(e){notice(e.message)}};
 document.querySelector('#save-scene-time').onclick=async()=>{if(!selected)return;try{await api('/api/scenes/'+selected+'/time','POST',{start:document.querySelector('#scene-start-time').value,end:document.querySelector('#scene-end-time').value});await load();await openScene(selected);notice('Scene chronology saved')}catch(e){notice(e.message)}};
 document.querySelector('#move-scene').onclick=async()=>{if(!selected)return;try{await api('/api/scenes/'+selected+'/move','POST',{chapter_id:document.querySelector('#move-chapter').value,position:Number(document.querySelector('#move-position').value)});await load();await openScene(selected);notice('Scene moved; prose and story chronology are unchanged')}catch(e){notice(e.message)}};
-function notice(s){document.querySelector('#notice').textContent=s}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}document.querySelector('#world').addEventListener('click',e=>{const b=e.target.closest('[data-event]');if(b)editEventTime(b)});
+function notice(s){document.querySelector('#notice').textContent=s}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}document.querySelector('#world').addEventListener('click',e=>{const rel=e.target.closest('[data-event-rel]');if(rel){editEventRelationships(rel);return}const b=e.target.closest('[data-event]');if(b)editEventTime(b)});
 function timeLabel(t){if(t.precision==='Unknown')return '?';if(t.precision==='Bounded')return `${t.lower}..${t.upper}`;if(t.precision==='Approximate')return `~${t.nominal},${t.lower},${t.upper}`;return String(t.nominal)}
 async function editEventTime(b){const start=prompt('Start: tick, ?, ~nominal,lower,upper, or lower..upper',b.dataset.start);if(start===null)return;const end=prompt('End: tick, ?, ~nominal,lower,upper, or lower..upper',b.dataset.end);if(end===null)return;const source=prompt('Source time label',b.dataset.source);if(source===null)return;try{await api(`/api/events/${encodeURIComponent(b.dataset.event)}/time`,'POST',{start,end,source_time:source});await load();notice('Event chronology saved')}catch(e){notice(e.message)}}
+async function editEventRelationships(b){const people=JSON.parse(b.dataset.characters||'[]');const places=JSON.parse(b.dataset.locations||'[]');const peopleText=prompt('Characters as UUID=participant|witness|cause|affected, ... or none',people.map(x=>`${x.character_id}=${x.role}`).join(',')||'none');if(peopleText===null)return;const placesText=prompt('Locations as UUID=occurred_at|starts_at|ends_at, ... or none',places.map(x=>`${x.location_id}=${x.role}`).join(',')||'none');if(placesText===null)return;const parse=(text,key)=>text==='none'?[]:text.split(',').map(value=>{const [id,role]=value.split('=');return {[key]:id,role}});try{await api(`/api/events/${encodeURIComponent(b.dataset.eventRel)}/relationships`,'POST',{characters:parse(peopleText,'character_id'),locations:parse(placesText,'location_id')});await load();notice('Event relationships saved')}catch(e){notice(e.message)}}
 for(const id of ['scene-filter-text','scene-filter-status','scene-filter-character','scene-filter-plot'])document.querySelector('#'+id).addEventListener(id==='scene-filter-text'?'input':'change',renderScenes);load().catch(e=>notice(e.message));
 </script></html>"#;
 
@@ -562,6 +568,25 @@ fn route(app: &mut WriterApp, method: &str, path: &str, body: &str) -> (u16, &'s
     }
     if let Some(id) = path.strip_prefix("/api/events/") {
         let (id, action) = id.split_once('/').unwrap_or((id, ""));
+        if method == "POST" && action == "relationships" {
+            let id = match uuid::Uuid::from_str(id) {
+                Ok(id) => story_core::EventId(id),
+                Err(error) => return api_error(error.to_string()),
+            };
+            return match serde_json::from_str::<EventRelationshipsUpdateRequest>(body) {
+                Ok(request) => {
+                    match app.set_event_relationships(id, &request.characters, &request.locations) {
+                        Ok(()) => (
+                            200,
+                            "application/json; charset=utf-8",
+                            serde_json::json!({"saved":true,"id":id}).to_string(),
+                        ),
+                        Err(error) => api_error(error.to_string()),
+                    }
+                }
+                Err(error) => api_error(error.to_string()),
+            };
+        }
         if method == "POST" && action == "time" {
             let id = match uuid::Uuid::from_str(id) {
                 Ok(id) => story_core::EventId(id),
@@ -982,6 +1007,8 @@ mod tests {
                 .any(|issue| { issue.id.to_string() == issue_id && issue.status == "in_progress" })
         );
         let event_id = story_core::EventId::new();
+        let event_character = app.create_character("Mara").unwrap();
+        let event_location = app.create_location("North Station").unwrap();
         app.add_story_event(&story_core::StoryEvent {
             id: event_id,
             title: "The bridge falls".into(),
@@ -991,6 +1018,44 @@ mod tests {
             source_time_text: "day one".into(),
         })
         .unwrap();
+        let relationships = serde_json::json!({
+            "characters":[{"character_id":event_character,"role":"witness"}],
+            "locations":[{"location_id":event_location,"role":"occurred_at"}],
+        })
+        .to_string();
+        assert_eq!(
+            route(
+                &mut app,
+                "POST",
+                &format!("/api/events/{event_id}/relationships"),
+                &relationships
+            )
+            .0,
+            200
+        );
+        let invalid_relationships = serde_json::json!({
+            "characters":[],
+            "locations":[{"location_id":story_core::LocationId::new(),"role":"occurred_at"}],
+        })
+        .to_string();
+        assert_eq!(
+            route(
+                &mut app,
+                "POST",
+                &format!("/api/events/{event_id}/relationships"),
+                &invalid_relationships
+            )
+            .0,
+            400
+        );
+        assert_eq!(
+            app.event_characters(event_id).unwrap()[0].character_id,
+            event_character
+        );
+        assert_eq!(
+            app.event_locations(event_id).unwrap()[0].location_id,
+            event_location
+        );
         let (_, hash) = app.load_scene_text(scene).unwrap();
         app.save_scene_text(scene, Some(&hash), "Canonical prose.")
             .unwrap();

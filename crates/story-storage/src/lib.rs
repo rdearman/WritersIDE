@@ -5713,6 +5713,54 @@ impl ProjectStore {
         tx.commit()?;
         Ok(())
     }
+    pub fn set_event_relationships(
+        &mut self,
+        event: EventId,
+        participants: &[EventCharacterParticipation],
+        locations: &[EventLocationAssociation],
+    ) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM story_event WHERE id=?1)",
+            [event.to_string()],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StorageError::NotFound(event.to_string()));
+        }
+        tx.execute(
+            "DELETE FROM story_event_character WHERE event_id=?1",
+            [event.to_string()],
+        )?;
+        tx.execute(
+            "DELETE FROM story_event_location WHERE event_id=?1",
+            [event.to_string()],
+        )?;
+        for participant in participants {
+            tx.execute(
+                "INSERT INTO story_event_character(event_id,character_id,role) VALUES(?1,?2,?3)",
+                params![
+                    event.to_string(),
+                    participant.character_id.to_string(),
+                    participant.role.as_str()
+                ],
+            )?;
+        }
+        for location in locations {
+            tx.execute(
+                "INSERT INTO story_event_location(event_id,location_id,role) VALUES(?1,?2,?3)",
+                params![
+                    event.to_string(),
+                    location.location_id.to_string(),
+                    location.role.as_str()
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
     pub fn event_locations(&self, event: EventId) -> Result<Vec<EventLocationAssociation>> {
         let mut query = self.conn.prepare(
             "SELECT location_id,role FROM story_event_location WHERE event_id=?1 ORDER BY location_id,role",
