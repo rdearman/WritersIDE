@@ -6588,7 +6588,7 @@ impl AppState {
             entries,
             selected: 0,
             tree_selected,
-            focus: 1,
+            focus: 0,
             name,
             overwrite_confirmed: false,
         });
@@ -6598,7 +6598,7 @@ impl AppState {
                 | FileBrowserPurpose::ImportScrivenerCurrent
                 | FileBrowserPurpose::ImportScrivenerSeries
         ) {
-            "Select .scriv/.scrivx · Enter opens a manifest preview · F5 inspects/imports · Esc cancels".into()
+            "Directory tree focused · Tab: Folder contents · Enter opens folders/previews manifests · F5 inspects/imports · Esc cancels".into()
         } else {
             "Choose a folder or filename · F5 confirms · F7 creates folder · Esc cancels".into()
         };
@@ -6698,6 +6698,22 @@ impl AppState {
                     match set_file_browser_directory(&mut browser, path) {
                         Ok(()) => browser.overwrite_confirmed = false,
                         Err(error) => self.message = format!("Could not open folder: {error}"),
+                    }
+                }
+            }
+            KeyCode::Enter
+                if browser.focus == 2
+                    && matches!(
+                        browser.purpose,
+                        FileBrowserPurpose::ImportScrivenerSource
+                            | FileBrowserPurpose::ImportScrivenerCurrent
+                            | FileBrowserPurpose::ImportScrivenerSeries
+                    ) =>
+            {
+                match self.start_scrivener_import_from_browser(&browser) {
+                    Ok(()) => close = true,
+                    Err(error) => {
+                        self.message = format!("Scrivener import was not started: {error}");
                     }
                 }
             }
@@ -20301,6 +20317,7 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             Constraint::Min(5),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(2),
         ])
         .split(inner);
@@ -20322,7 +20339,11 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         List::new(left)
             .block(
                 Block::default()
-                    .title("Directory tree · Home/root")
+                    .title(if browser.focus == 0 {
+                        "Directory tree · focused · Home/root"
+                    } else {
+                        "Directory tree · Home/root"
+                    })
                     .borders(Borders::ALL),
             )
             .highlight_symbol("▸ ")
@@ -20343,19 +20364,35 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
             .block(
                 Block::default()
-                    .title("Folder contents")
+                    .title(if browser.focus == 1 {
+                        "Folder contents · focused"
+                    } else {
+                        "Folder contents"
+                    })
                     .borders(Borders::ALL),
             ),
         columns[1],
         &mut ListState::default()
             .with_selected((!browser.entries.is_empty()).then_some(browser.selected)),
     );
+    let selected_path = if matches!(
+        browser.purpose,
+        FileBrowserPurpose::ImportScrivenerSource
+            | FileBrowserPurpose::ImportScrivenerCurrent
+            | FileBrowserPurpose::ImportScrivenerSeries
+            | FileBrowserPurpose::OpenProject
+    ) {
+        browser
+            .entries
+            .get(browser.selected)
+            .map(|(name, _)| browser.current_dir.join(name))
+            .unwrap_or_else(|| browser.current_dir.join(&browser.name))
+    } else {
+        browser.current_dir.join(&browser.name)
+    };
     f.render_widget(
-        Paragraph::new(format!(
-            "Selected path: {}",
-            browser.current_dir.join(&browser.name).display()
-        ))
-        .wrap(Wrap { trim: true }),
+        Paragraph::new(format!("Selected path: {}", selected_path.display()))
+            .wrap(Wrap { trim: true }),
         chunks[1],
     );
     f.render_widget(
@@ -20366,6 +20403,11 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         ))
         .style(Style::default().fg(Color::Yellow)),
         chunks[2],
+    );
+    f.render_widget(
+        Paragraph::new(truncate_display_cells(&s.message, chunks[3].width as usize))
+            .style(Style::default().fg(Color::Yellow)),
+        chunks[3],
     );
     let (primary_action, navigation) = if browser.overwrite_confirmed {
         let action = if browser.purpose == FileBrowserPurpose::NewProject {
@@ -20391,8 +20433,8 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             | FileBrowserPurpose::ImportScrivenerSeries
     ) {
         (
-            "Enter Preview .scrivx · F5 Inspect/Import · F7 New Folder · Esc Cancel",
-            "Tab/Shift+Tab: panes · Home: Home · /: Root · Backspace: Parent",
+            "Enter Preview manifest / browse folder · F5 Inspect/Import · F7 New Folder · Esc Cancel",
+            "Tab/Shift+Tab: tree → contents → name · Home: Home · /: Root · Backspace: Parent",
         )
     } else {
         (
@@ -20404,11 +20446,11 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         Paragraph::new(vec![
             Line::from(truncate_display_cells(
                 primary_action,
-                chunks[3].width as usize,
+                chunks[4].width as usize,
             )),
-            Line::from(truncate_display_cells(navigation, chunks[3].width as usize)),
+            Line::from(truncate_display_cells(navigation, chunks[4].width as usize)),
         ]),
-        chunks[3],
+        chunks[4],
     );
 }
 
@@ -25496,7 +25538,11 @@ mod tests {
             state.file_browser.as_ref().unwrap().purpose,
             FileBrowserPurpose::ImportScrivenerSource
         );
-        assert!(state.message.contains("Enter opens a manifest preview"));
+        assert!(
+            state
+                .message
+                .contains("Enter opens folders/previews manifests")
+        );
     }
 
     #[test]
@@ -25530,7 +25576,7 @@ mod tests {
         browser.current_dir = root.path().to_owned();
         browser.entries = vec![("Windows Regression.scriv".into(), true)];
         browser.selected = 0;
-        browser.focus = 1;
+        browser.focus = 0;
 
         handle(&mut state, KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)).unwrap();
 
@@ -25575,7 +25621,21 @@ mod tests {
             .iter()
             .position(|entry| entry.0 == manifest_name)
             .unwrap();
-        browser.focus = 1;
+        // Reproduce the name-field focus shown in the Alpha UAT screenshot.
+        browser.focus = 2;
+        state.message = "Enter previews the selected Scrivener manifest".into();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains(manifest_name));
+        assert!(screen.contains("Enter previews the selected Scrivener manifest"));
 
         handle(
             &mut state,
@@ -25589,6 +25649,46 @@ mod tests {
         assert!(!preview.inventory.items.is_empty());
         assert!(state.message.contains("Add to current project preview"));
         assert!(source.join(manifest_name).is_file());
+    }
+
+    #[test]
+    fn scrivener_browser_reports_selection_errors_inside_the_file_dialog() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("notes.txt"), "not a Scrivener project").unwrap();
+        let app = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .dispatch_registered_command_id("file.import-scrivener")
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = root.path().to_owned();
+        browser.entries = file_browser_entries(root.path()).unwrap();
+        browser.selected = browser
+            .entries
+            .iter()
+            .position(|entry| entry.0 == "notes.txt")
+            .unwrap();
+        browser.focus = 1;
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.file_browser.is_some());
+        assert!(state.message.contains("Select a .scrivx manifest"));
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Select a .scrivx manifest"));
     }
 
     #[test]
@@ -36259,6 +36359,7 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("Directory tree"));
+        assert!(rendered.contains("Directory tree · focused"));
         assert!(rendered.contains("Folder contents"));
         assert!(rendered.contains("Selected path:"));
         assert!(rendered.contains("F4 Select Folder"));
@@ -36275,8 +36376,12 @@ mod tests {
         state
             .start_file_browser(FileBrowserPurpose::NewProject)
             .unwrap();
-        assert_eq!(state.file_browser.as_ref().unwrap().focus, 1);
+        assert_eq!(state.file_browser.as_ref().unwrap().focus, 0);
 
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.file_browser.as_ref().unwrap().focus, 1);
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
