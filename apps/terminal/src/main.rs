@@ -439,6 +439,7 @@ enum FileBrowserPurpose {
     NewProject,
     OpenProject,
     OpenTextFile,
+    ImportDocument,
     ImportScrivenerSource,
     ImportScrivenerCurrent,
     ImportScrivenerSeries,
@@ -455,6 +456,9 @@ struct FileBrowserState {
     focus: u8,
     name: String,
     overwrite_confirmed: bool,
+    org_import_mode: story_import::OrgImportMode,
+    text_import_preview: Option<story_import::TextDocumentPreview>,
+    preview_scroll: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -600,7 +604,7 @@ fn tutorial_panel_at(
         });
     let mut lines = vec![body.into()];
     if lesson_complete {
-        lines.push("Lesson 1 complete — Press Enter: Continue to Lesson 2".into());
+        lines.push("Lesson 1 complete".into());
     } else {
         let completed = verified.map_or(0, |actions| {
             required
@@ -633,10 +637,10 @@ fn tutorial_panel_at(
         lines.push(task);
     }
     if lesson_complete {
-        lines.push("Enter: continue · Esc: pause".into());
+        lines.push("Enter: continue to Lesson 2 · Esc: return to navigation".into());
     } else {
         lines.push(
-            "Enter: continue when complete · Esc: pause · Help > Resume Tutorial: return here"
+            "Enter: continue when complete · Esc: return to navigation · Help > Resume Tutorial: return here"
                 .into(),
         );
     }
@@ -695,6 +699,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 9] = [
         "file.import-scrivener",
         "series.import-scrivener",
         "file.open-text",
+        "file.import-document",
         "file.save",
         "file.quit",
     ],
@@ -1205,6 +1210,7 @@ enum CommandAction {
     NewProject,
     OpenProject,
     OpenTextFile,
+    ImportDocument,
     ImportScrivenerNew,
     ImportScrivenerCurrent,
     Save,
@@ -1393,6 +1399,21 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 8,
             advanced: false,
             action: CommandAction::OpenTextFile,
+        },
+        CommandSpec {
+            id: "file.import-document",
+            label: "Import Document…",
+            description: "Preview and import plain text, Markdown, or Org-mode as editable manuscript content",
+            category: "File",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["import text", "import org", "import markdown"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Projects & Files",
+            menu_priority: 9,
+            advanced: false,
+            action: CommandAction::ImportDocument,
         },
         CommandSpec {
             id: "file.import-scrivener",
@@ -6624,6 +6645,7 @@ impl AppState {
             FileBrowserPurpose::NewProject
             | FileBrowserPurpose::OpenProject
             | FileBrowserPurpose::OpenTextFile
+            | FileBrowserPurpose::ImportDocument
             | FileBrowserPurpose::ImportScrivenerSource
             | FileBrowserPurpose::ImportScrivenerCurrent
             | FileBrowserPurpose::ImportScrivenerSeries => std::env::var_os("HOME")
@@ -6635,6 +6657,7 @@ impl AppState {
             FileBrowserPurpose::NewProject => "My Novel".to_owned(),
             FileBrowserPurpose::OpenProject
             | FileBrowserPurpose::OpenTextFile
+            | FileBrowserPurpose::ImportDocument
             | FileBrowserPurpose::ImportScrivenerSource
             | FileBrowserPurpose::ImportScrivenerCurrent
             | FileBrowserPurpose::ImportScrivenerSeries => String::new(),
@@ -6660,6 +6683,9 @@ impl AppState {
             focus: 0,
             name,
             overwrite_confirmed: false,
+            org_import_mode: story_import::OrgImportMode::SingleDocument,
+            text_import_preview: None,
+            preview_scroll: 0,
         });
         self.message = if matches!(
             purpose,
@@ -6670,6 +6696,8 @@ impl AppState {
             "Directory tree focused · Tab: Folder contents · Enter opens folders/previews manifests · F5 inspects/imports · Esc cancels".into()
         } else if purpose == FileBrowserPurpose::OpenTextFile {
             "Choose a text file · F5 opens a read-only reference · Esc cancels".into()
+        } else if purpose == FileBrowserPurpose::ImportDocument {
+            "Choose a text, Markdown, or Org file · F5 previews import options".into()
         } else {
             "Choose a folder or filename · F5 confirms · F7 creates folder · Esc cancels".into()
         };
@@ -6680,6 +6708,125 @@ impl AppState {
         let Some(mut browser) = self.file_browser.take() else {
             return Ok(());
         };
+        if let Some(preview) = browser.text_import_preview.as_ref() {
+            match key.code {
+                KeyCode::Esc => {
+                    browser.text_import_preview = None;
+                    browser.preview_scroll = 0;
+                    self.message = "Import preview closed · source file remains unchanged".into();
+                }
+                KeyCode::Up => browser.preview_scroll = browser.preview_scroll.saturating_sub(1),
+                KeyCode::Down => browser.preview_scroll = browser.preview_scroll.saturating_add(1),
+                KeyCode::PageUp => {
+                    browser.preview_scroll = browser.preview_scroll.saturating_sub(10)
+                }
+                KeyCode::PageDown => {
+                    browser.preview_scroll = browser.preview_scroll.saturating_add(10)
+                }
+                KeyCode::F(2) if preview.format == story_import::TextDocumentFormat::Org => {
+                    browser.org_import_mode = match browser.org_import_mode {
+                        story_import::OrgImportMode::SingleDocument => {
+                            story_import::OrgImportMode::HeadingHierarchy
+                        }
+                        story_import::OrgImportMode::HeadingHierarchy => {
+                            story_import::OrgImportMode::SingleDocument
+                        }
+                    };
+                    let source = browser
+                        .entries
+                        .get(browser.selected)
+                        .map(|(name, _)| browser.current_dir.join(name));
+                    match source {
+                        Some(source) => match story_import::inspect_text_document(
+                            source,
+                            browser.org_import_mode,
+                        ) {
+                            Ok(next) => {
+                                browser.text_import_preview = Some(next);
+                                browser.preview_scroll = 0;
+                            }
+                            Err(error) => {
+                                self.message = format!("Could not rebuild preview: {error}")
+                            }
+                        },
+                        None => self.message = "Import source is no longer selected".into(),
+                    }
+                }
+                KeyCode::F(5) | KeyCode::Enter => {
+                    let original_preview = browser
+                        .text_import_preview
+                        .as_ref()
+                        .cloned()
+                        .ok_or("import preview disappeared")?;
+                    let preview = browser
+                        .text_import_preview
+                        .take()
+                        .ok_or("import preview disappeared")?;
+                    let story_import::TextDocumentPreview {
+                        format,
+                        source_path,
+                        source_fingerprint,
+                        title,
+                        units,
+                        warnings,
+                        unsupported,
+                    } = preview;
+                    let source_type = match format {
+                        story_import::TextDocumentFormat::PlainText => {
+                            story_import::SourceType::PlainText
+                        }
+                        story_import::TextDocumentFormat::Markdown => {
+                            story_import::SourceType::Markdown
+                        }
+                        story_import::TextDocumentFormat::Org => story_import::SourceType::Org,
+                    };
+                    let staging = story_import::ManuscriptStaging {
+                        source_type,
+                        source_path,
+                        source_fingerprint,
+                        title,
+                        units: units
+                            .into_iter()
+                            .map(|unit| story_import::ManuscriptUnit {
+                                source_document_id: unit.source_document_id,
+                                title: unit.title,
+                                heading_level: unit.heading_level,
+                                body_markdown: unit.body_markdown,
+                                unsupported: Vec::new(),
+                            })
+                            .collect(),
+                        warnings,
+                        unsupported,
+                    };
+                    match self.app.import_staged_manuscript(&staging) {
+                        Ok((run, scenes)) => {
+                            self.refresh()?;
+                            self.file_browser = None;
+                            self.workspace = Workspace::Outline;
+                            self.selected = scenes
+                                .first()
+                                .and_then(|scene| {
+                                    self.scenes.iter().position(|row| row.0 == *scene)
+                                })
+                                .unwrap_or(0);
+                            self.message = format!(
+                                "Imported {} unit(s) · {} scene(s) · run {run} · source unchanged",
+                                staging.units.len(),
+                                scenes.len()
+                            );
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            browser.text_import_preview = Some(original_preview);
+                            self.message = format!("Document import failed: {error}");
+                        }
+                    }
+                }
+                _ => {}
+            }
+            self.file_browser = Some(browser);
+            return Ok(());
+        }
         let mut close = false;
         match key.code {
             KeyCode::Esc => {
@@ -6864,6 +7011,7 @@ impl AppState {
                     browser.purpose,
                     FileBrowserPurpose::OpenProject
                         | FileBrowserPurpose::OpenTextFile
+                        | FileBrowserPurpose::ImportDocument
                         | FileBrowserPurpose::ImportScrivenerSource
                         | FileBrowserPurpose::ImportScrivenerCurrent
                         | FileBrowserPurpose::ImportScrivenerSeries
@@ -6920,6 +7068,41 @@ impl AppState {
                                 self.message = format!("Could not open text file: {error}");
                                 self.file_browser = Some(browser);
                                 return Ok(());
+                            }
+                        }
+                    }
+                    FileBrowserPurpose::ImportDocument => {
+                        let Some(source) =
+                            browser
+                                .entries
+                                .get(browser.selected)
+                                .and_then(|(item, is_dir)| {
+                                    (!is_dir).then(|| browser.current_dir.join(item))
+                                })
+                        else {
+                            self.message =
+                                "Select a text, Markdown, or Org file, then press F5".into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        };
+                        match story_import::inspect_text_document(&source, browser.org_import_mode)
+                        {
+                            Ok(preview) => {
+                                let words = preview
+                                    .units
+                                    .iter()
+                                    .map(|unit| unit.body_markdown.split_whitespace().count())
+                                    .sum::<usize>();
+                                self.message = format!(
+                                    "Import preview: {} unit(s), about {words} words, {} item(s) need review · F5 imports · F2 changes Org mode · Esc returns",
+                                    preview.units.len(),
+                                    preview.unsupported.len()
+                                );
+                                browser.text_import_preview = Some(preview);
+                                browser.preview_scroll = 0;
+                            }
+                            Err(error) => {
+                                self.message = format!("Could not preview document: {error}");
                             }
                         }
                     }
@@ -10557,6 +10740,11 @@ impl AppState {
             CommandAction::OpenTextFile => {
                 if let Err(error) = self.start_file_browser(FileBrowserPurpose::OpenTextFile) {
                     self.message = format!("Could not open the text file browser: {error}");
+                }
+            }
+            CommandAction::ImportDocument => {
+                if let Err(error) = self.start_file_browser(FileBrowserPurpose::ImportDocument) {
+                    self.message = format!("Could not open the document import browser: {error}");
                 }
             }
             CommandAction::ImportScrivenerNew => {
@@ -17317,6 +17505,23 @@ fn editor_grapheme_is_mentioned(byte_offset: u64, byte_len: u64, ranges: &[(u64,
         .any(|(start, finish)| *start < end && *finish > byte_offset)
 }
 
+fn push_editor_span_run(spans: &mut Vec<Span<'static>>, run: &mut String, style: u8) {
+    if run.is_empty() {
+        return;
+    }
+    let text = std::mem::take(run);
+    spans.push(match style {
+        1 => Span::styled(text, Style::default().fg(Color::White).bg(Color::Blue)),
+        2 => Span::styled(
+            text,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::UNDERLINED),
+        ),
+        _ => Span::raw(text),
+    });
+}
+
 fn ensure_project_managed_directory(
     project_root: &Path,
     directory: &Path,
@@ -17798,6 +18003,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     };
                     let mut spans = vec![Span::raw(prefix)];
                     let mut byte_offset = line_start_byte;
+                    let mut run_style = None;
+                    let mut run = String::new();
                     for (col, ch) in line.graphemes(true).enumerate() {
                         let shown = if s.editor_preferences.show_formatting_marks && ch == "\t" {
                             "→"
@@ -17813,23 +18020,21 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                             ch.len() as u64,
                             &mention_ranges,
                         );
-                        if selected {
-                            spans.push(Span::styled(
-                                shown.to_owned(),
-                                Style::default().fg(Color::White).bg(Color::Blue),
-                            ));
+                        let style = if selected {
+                            1
                         } else if decorated {
-                            spans.push(Span::styled(
-                                shown.to_owned(),
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::UNDERLINED),
-                            ));
+                            2
                         } else {
-                            spans.push(Span::raw(shown.to_owned()));
+                            0
+                        };
+                        if run_style.is_some_and(|current| current != style) {
+                            push_editor_span_run(&mut spans, &mut run, run_style.unwrap_or(0));
                         }
+                        run_style = Some(style);
+                        run.push_str(shown);
                         byte_offset += ch.len() as u64;
                     }
+                    push_editor_span_run(&mut spans, &mut run, run_style.unwrap_or(0));
                     if s.editor_preferences.show_formatting_marks
                         && let Some(marker) =
                             formatting_line_marker(line, view_lines.get(row + 1).copied())
@@ -20413,6 +20618,10 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let Some(browser) = s.file_browser.as_ref() else {
         return;
     };
+    if let Some(preview) = browser.text_import_preview.as_ref() {
+        draw_text_import_preview(f, browser, preview);
+        return;
+    }
     let area = f.area();
     if area.width < 30 || area.height < 12 {
         return;
@@ -20428,6 +20637,7 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         FileBrowserPurpose::NewProject => "New Project · choose parent folder and project name",
         FileBrowserPurpose::OpenProject => "Open Project · choose a Writer's IDE project folder",
         FileBrowserPurpose::OpenTextFile => "Open Text File · read-only reference",
+        FileBrowserPurpose::ImportDocument => "Import Document · choose a source file",
         FileBrowserPurpose::ImportScrivenerSource => {
             "Import Scrivener · choose a .scriv folder or .scrivx manifest"
         }
@@ -20603,6 +20813,105 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             Line::from(truncate_display_cells(navigation, chunks[4].width as usize)),
         ]),
         chunks[4],
+    );
+}
+
+fn draw_text_import_preview(
+    frame: &mut ratatui::Frame<'_>,
+    browser: &FileBrowserState,
+    preview: &story_import::TextDocumentPreview,
+) {
+    let area = frame.area();
+    if area.width < 30 || area.height < 8 {
+        return;
+    }
+    let popup = Rect {
+        x: area.x + 1,
+        y: area.y + 1,
+        width: area.width.saturating_sub(2),
+        height: area.height.saturating_sub(2),
+    };
+    frame.render_widget(Clear, popup);
+    let mode = match browser.org_import_mode {
+        story_import::OrgImportMode::SingleDocument => "single document",
+        story_import::OrgImportMode::HeadingHierarchy => "heading hierarchy",
+    };
+    let words = preview
+        .units
+        .iter()
+        .map(|unit| unit.body_markdown.split_whitespace().count())
+        .sum::<usize>();
+    let mut lines = vec![
+        format!("Source: {}", preview.source_path),
+        format!(
+            "Format: {:?} · {} unit(s) · about {words} words",
+            preview.format,
+            preview.units.len()
+        ),
+        format!(
+            "SHA-256: {}",
+            preview
+                .source_fingerprint
+                .chars()
+                .take(16)
+                .collect::<String>()
+        ),
+    ];
+    if preview.format == story_import::TextDocumentFormat::Org {
+        lines.push(format!("Org import mode: {mode} · F2 changes mode"));
+    }
+    lines.push("Proposed content".into());
+    for unit in &preview.units {
+        let depth = unit.heading_level.map_or_else(String::new, |level| {
+            format!("{} ", "*".repeat(level as usize))
+        });
+        let count = unit.body_markdown.split_whitespace().count();
+        lines.push(format!("{depth}{} · {count} words", unit.title));
+        if !unit.body_markdown.trim().is_empty() {
+            let excerpt = unit
+                .body_markdown
+                .lines()
+                .take(2)
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .collect::<Vec<_>>()
+                .join(" / ");
+            lines.push(format!("  {excerpt}"));
+        }
+    }
+    if !preview.warnings.is_empty() {
+        lines.push("Warnings".into());
+        lines.extend(
+            preview
+                .warnings
+                .iter()
+                .map(|warning| format!("• {warning}")),
+        );
+    }
+    if !preview.unsupported.is_empty() {
+        lines.push("Needs review · source is unchanged".into());
+        lines.extend(preview.unsupported.iter().map(|item| format!("• {item}")));
+    }
+    let block = Block::default()
+        .title(" Import Document · Preview ")
+        .borders(Borders::ALL);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(inner);
+    frame.render_widget(
+        Paragraph::new(lines.join("\n"))
+            .scroll((browser.preview_scroll.min(u16::MAX as usize) as u16, 0))
+            .wrap(Wrap { trim: true }),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new("F5/Enter Import · ↑/↓ scroll · F2 Org mode · Esc back to files")
+            .wrap(Wrap { trim: true })
+            .style(Style::default().fg(Color::Yellow)),
+        chunks[1],
     );
 }
 
@@ -23468,8 +23777,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 KeyCode::Esc => {
                     s.help_panel = None;
                     s.message =
-                        "Tutorial paused · choose Guided Tutorial on the dashboard to resume"
-                            .into();
+                        "Tutorial lesson hidden · choose Help > Resume Tutorial to continue".into();
                     return Ok(false);
                 }
                 _ => s.help_panel = None,
@@ -33983,6 +34291,7 @@ mod tests {
                 "file.import-scrivener",
                 "series.import-scrivener",
                 "file.open-text",
+                "file.import-document",
                 "file.save",
                 "file.quit",
             ]
@@ -34018,7 +34327,7 @@ mod tests {
             });
             let entries = state.menu_visible_entries();
             assert!(
-                entries.len() <= 9,
+                entries.len() <= 10,
                 "{category} menu has {} direct actions",
                 entries.len()
             );
@@ -34574,7 +34883,10 @@ mod tests {
             state.reading_text.clear();
             state.help_panel = Some(HelpPanel {
                 title: "Tutorial · Find your way around · 1/6".into(),
-                lines: vec!["Lesson 1 complete — Press Enter: Continue to Lesson 2".into()],
+                lines: vec![
+                    "Lesson 1 complete".into(),
+                    "Enter: continue to Lesson 2 · Esc: return to navigation".into(),
+                ],
                 scroll: 0,
             });
             assert_ne!(render_context_key(&state), editor_surface);
@@ -34586,10 +34898,8 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert!(
-                tutorial_screen.contains("Lesson 1 complete — Press Enter: Continue to Lesson 2"),
-                "{width}x{height}: {tutorial_screen:?}"
-            );
+            assert!(tutorial_screen.contains("Lesson 1 complete"));
+            assert!(tutorial_screen.contains("Enter: continue to Lesson 2"));
             state.help_panel = None;
             state.menu = Some(MenuState {
                 top: 0,
@@ -36140,6 +36450,43 @@ mod tests {
     }
 
     #[test]
+    fn completed_tutorial_lesson_has_spaced_and_unambiguous_continue_instructions() {
+        let directory = tempfile::tempdir().unwrap();
+        let preferences_path = directory.path().join("tutorial.json");
+        let preferences = onboarding::Preferences {
+            version: onboarding::PREFERENCES_VERSION,
+            active_tutorial: Some(onboarding::TutorialProgress {
+                track: onboarding::TutorialTrack::GuidedTour,
+                step: 0,
+                demo_project: directory.path().join("demo").to_string_lossy().into_owned(),
+                return_project: directory
+                    .path()
+                    .join("original")
+                    .to_string_lossy()
+                    .into_owned(),
+                verified_actions: [
+                    "menu", "outline", "scene", "write", "save", "return", "resume",
+                ]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+            }),
+            ..onboarding::Preferences::default()
+        };
+        onboarding::store(&preferences_path, &preferences).unwrap();
+
+        let panel = tutorial_panel_at(onboarding::TutorialTrack::GuidedTour, 0, &preferences_path);
+        assert!(panel.lines.iter().any(|line| line == "Lesson 1 complete"));
+        assert!(
+            panel
+                .lines
+                .iter()
+                .any(|line| line == "Enter: continue to Lesson 2 · Esc: return to navigation")
+        );
+        assert!(!panel.lines.iter().any(|line| line.contains("Continueto")));
+    }
+
+    #[test]
     fn navigation_tutorial_requires_verified_menu_write_save_return_and_resume_actions() {
         let directory = tempfile::tempdir().unwrap();
         let original_path = directory.path().join("Original");
@@ -36292,9 +36639,13 @@ mod tests {
             0,
             &preferences_path,
         ));
-        assert!(state.help_panel.as_ref().unwrap().lines.iter().any(|line| {
-            line.contains("Lesson 1 complete — Press Enter: Continue to Lesson 2")
-        }));
+        let lines = &state.help_panel.as_ref().unwrap().lines;
+        assert!(lines.iter().any(|line| line == "Lesson 1 complete"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "Enter: continue to Lesson 2 · Esc: return to navigation")
+        );
     }
 
     #[test]
@@ -36360,7 +36711,7 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect::<String>();
             assert!(screen.contains("Lesson 1 complete"));
-            assert!(screen.contains("Press Enter"));
+            assert!(screen.contains("Enter: continue to Lesson 2"));
         }
 
         handle(
@@ -36904,6 +37255,89 @@ mod tests {
     }
 
     #[test]
+    fn org_import_previews_single_or_heading_mode_before_creating_any_content() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let app = WriterApp::create_project(&project, "Novel").unwrap();
+        let source = directory.path().join("outline.org");
+        let source_text = "* Act One\nIntroduction prose.\n** Opening\nThe door opens.\n** Decision\nMara chooses.";
+        fs::write(&source, source_text).unwrap();
+        let original = fs::read(&source).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .dispatch_registered_command_id("file.import-document")
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = directory.path().to_owned();
+        browser.entries = file_browser_entries(directory.path()).unwrap();
+        browser.selected = browser
+            .entries
+            .iter()
+            .position(|(name, is_dir)| name == "outline.org" && !is_dir)
+            .unwrap();
+        let initial_nodes = state.app.list_structural_nodes().unwrap();
+
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            state
+                .file_browser
+                .as_ref()
+                .unwrap()
+                .text_import_preview
+                .is_some()
+        );
+        assert_eq!(
+            state.app.list_structural_nodes().unwrap().len(),
+            initial_nodes.len()
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Import Document · Preview"));
+        assert!(screen.contains("F5/Enter Import"));
+
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
+        let preview = state
+            .file_browser
+            .as_ref()
+            .unwrap()
+            .text_import_preview
+            .as_ref()
+            .unwrap();
+        assert_eq!(preview.units.len(), 3);
+        assert_eq!(preview.units[0].heading_level, Some(1));
+        assert_eq!(preview.units[1].heading_level, Some(2));
+        assert!(state.app.list_structural_nodes().unwrap().is_empty());
+
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.file_browser.is_none());
+        let chapters = state
+            .app
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|node| node.kind == "chapter")
+            .collect::<Vec<_>>();
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].title, "Act One");
+        assert_eq!(state.scenes.len(), 3);
+        assert_eq!(fs::read(source).unwrap(), original);
+    }
+
+    #[test]
     fn welcome_and_command_search_help_actions_dispatch_through_registry() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -37018,6 +37452,65 @@ mod tests {
         );
         assert_eq!(state.editor, ["Unsaved sentence stays here."]);
         assert!(state.dirty);
+    }
+
+    #[test]
+    fn tutorial_can_be_hidden_and_resumed_from_the_visible_help_menu() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let preferences_path = directory.path().join("preferences/tutorial-state.json");
+        let demo_path = directory.path().join("tutorial-sample");
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .begin_tutorial_at(
+                onboarding::TutorialTrack::GuidedTour,
+                demo_path,
+                preferences_path.clone(),
+            )
+            .unwrap();
+
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.help_panel.is_none());
+        assert!(state.message.contains("Help > Resume Tutorial"));
+        assert!(!state.message.contains("paused"));
+        let progress = onboarding::load(&preferences_path)
+            .unwrap()
+            .active_tutorial
+            .unwrap();
+        assert_eq!(progress.step, 0);
+
+        let help_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Help")
+            .unwrap();
+        state.menu = Some(MenuState {
+            top: help_menu,
+            selected: 0,
+            all_commands: false,
+        });
+        let command = state.menu_commands()[0];
+        assert_eq!(command.id, "help.resume-tutorial");
+        assert_eq!(displayed_command_label(&state, command), "Resume Tutorial");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.help_panel.as_ref().map(|panel| panel.title.as_str()),
+            Some("Tutorial · Find your way around · 1/6")
+        );
+        let resumed = onboarding::load(&preferences_path)
+            .unwrap()
+            .active_tutorial
+            .unwrap();
+        assert_eq!(resumed.step, progress.step);
+        assert!(resumed.verified_actions.contains("resume"));
+        assert_eq!(
+            tutorial_footer_status(&state).as_deref(),
+            Some("Tutorial 1/6 · Help > Resume Tutorial")
+        );
     }
 
     #[test]

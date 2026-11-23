@@ -4115,13 +4115,48 @@ impl WriterApp {
             .iter()
             .filter(|node| node.parent_id.is_none())
             .count() as u32;
+        let mut current_chapter = None;
+        let mut scene_position = 0u32;
         for (position, unit) in staging.units.iter().enumerate() {
-            let chapter_title = format!("Chapter {}", position + 1);
-            let chapter = self.create_chapter(None, &chapter_title, chapter_position)?;
-            chapter_position = chapter_position
+            let nested_org_heading = source_type == "org"
+                && unit
+                    .heading_level
+                    .is_some_and(|heading_level| heading_level >= 2);
+            let chapter = if nested_org_heading {
+                if current_chapter.is_none() {
+                    let chapter = self.create_chapter(None, "Imported Text", chapter_position)?;
+                    chapter_position = chapter_position
+                        .checked_add(1)
+                        .ok_or_else(|| AppError::Domain("chapter position overflow".into()))?;
+                    current_chapter = Some(chapter);
+                    scene_position = 0;
+                }
+                current_chapter.ok_or_else(|| {
+                    AppError::Domain("Org heading could not be assigned to a chapter".into())
+                })?
+            } else {
+                let chapter_title = if source_type == "org" && unit.heading_level == Some(1) {
+                    unit.title.clone()
+                } else {
+                    format!("Chapter {}", position + 1)
+                };
+                let chapter = self.create_chapter(None, &chapter_title, chapter_position)?;
+                chapter_position = chapter_position
+                    .checked_add(1)
+                    .ok_or_else(|| AppError::Domain("chapter position overflow".into()))?;
+                current_chapter = Some(chapter);
+                scene_position = 0;
+                chapter
+            };
+            let scene_title = if source_type == "org" && unit.heading_level == Some(1) {
+                format!("{} — opening", unit.title)
+            } else {
+                unit.title.clone()
+            };
+            let scene = self.create_scene(chapter, &scene_title, scene_position)?;
+            scene_position = scene_position
                 .checked_add(1)
-                .ok_or_else(|| AppError::Domain("chapter position overflow".into()))?;
-            let scene = self.create_scene(chapter, &unit.title, 0)?;
+                .ok_or_else(|| AppError::Domain("scene position overflow".into()))?;
             let (_, current_hash) = self.load_scene_text(scene)?;
             self.save_scene_text(scene, Some(&current_hash), &unit.body_markdown)?;
             let source_item = SourceItemId::new();
@@ -7562,6 +7597,7 @@ unexpected_prose = "must not be silently discarded"
             units: vec![story_import::ManuscriptUnit {
                 source_document_id: "source.rtf:unit:0".into(),
                 title: "Opening scene".into(),
+                heading_level: None,
                 body_markdown: "Imported prose.".into(),
                 unsupported: vec!["Formatting needs review".into()],
             }],
@@ -7615,6 +7651,67 @@ unexpected_prose = "must not be silently discarded"
         );
         assert_eq!(fs::read(plain).unwrap(), plain_before);
         assert_eq!(fs::read(org).unwrap(), org_before);
+    }
+
+    #[test]
+    fn org_heading_import_maps_level_one_to_chapters_and_level_two_to_scenes() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("outline.org");
+        fs::write(
+            &source,
+            "* Act One\nIntroduction prose.\n** Opening\nThe door opens.\n** Decision\nMara chooses.",
+        )
+        .unwrap();
+        let preview = story_import::inspect_text_document(
+            &source,
+            story_import::OrgImportMode::HeadingHierarchy,
+        )
+        .unwrap();
+        let staging = story_import::ManuscriptStaging {
+            source_type: story_import::SourceType::Org,
+            source_path: preview.source_path,
+            source_fingerprint: preview.source_fingerprint,
+            title: preview.title,
+            units: preview
+                .units
+                .into_iter()
+                .map(|unit| story_import::ManuscriptUnit {
+                    source_document_id: unit.source_document_id,
+                    title: unit.title,
+                    heading_level: unit.heading_level,
+                    body_markdown: unit.body_markdown,
+                    unsupported: Vec::new(),
+                })
+                .collect(),
+            warnings: preview.warnings,
+            unsupported: preview.unsupported,
+        };
+        let mut app = WriterApp::create_project(dir.path().join("Imported"), "Imported").unwrap();
+        let (_, scenes) = app.import_staged_manuscript(&staging).unwrap();
+        let chapters = app
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|node| node.kind == "chapter")
+            .collect::<Vec<_>>();
+        assert_eq!(chapters.len(), 1);
+        assert_eq!(chapters[0].title, "Act One");
+        assert_eq!(scenes.len(), 3);
+        assert!(
+            scenes
+                .iter()
+                .all(|scene| app.get_scene(*scene).unwrap().chapter_id == Some(chapters[0].id))
+        );
+        assert!(
+            scenes
+                .iter()
+                .any(|scene| { app.get_scene(*scene).unwrap().scene.title == "Opening" })
+        );
+        assert!(
+            scenes
+                .iter()
+                .any(|scene| { app.get_scene(*scene).unwrap().scene.title == "Decision" })
+        );
     }
 
     #[test]

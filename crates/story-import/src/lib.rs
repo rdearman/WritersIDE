@@ -73,6 +73,8 @@ pub enum ImportError {
 pub struct ManuscriptUnit {
     pub source_document_id: String,
     pub title: String,
+    #[serde(default)]
+    pub heading_level: Option<u8>,
     pub body_markdown: String,
     pub unsupported: Vec<String>,
 }
@@ -95,8 +97,9 @@ pub enum TextDocumentFormat {
     Org,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum OrgImportMode {
+    #[default]
     SingleDocument,
     HeadingHierarchy,
 }
@@ -202,6 +205,11 @@ fn parse_org_hierarchy(
     let mut index = 0usize;
     for line in source.lines() {
         if let Some((heading_level, heading)) = parse_org_heading(line) {
+            if heading_level > 2 {
+                unsupported.push(format!(
+                    "Org heading level {heading_level} is retained as a scene under its nearest chapter"
+                ));
+            }
             if title.is_some() || body.iter().any(|part: &String| !part.is_empty()) {
                 let unit_title = title.take().unwrap_or_else(|| "Preamble".into());
                 units.push(TextDocumentUnit {
@@ -1270,6 +1278,7 @@ pub fn inspect_manuscript(path: impl AsRef<Path>) -> Result<ManuscriptStaging, I
                 .map(|unit| ManuscriptUnit {
                     source_document_id: unit.source_document_id,
                     title: unit.title,
+                    heading_level: unit.heading_level,
                     body_markdown: unit.body_markdown,
                     unsupported: preview.unsupported.clone(),
                 })
@@ -1373,6 +1382,7 @@ pub fn inspect_manuscript(path: impl AsRef<Path>) -> Result<ManuscriptStaging, I
             staging.units.push(ManuscriptUnit {
                 source_document_id: format!("rtf:{}:0", &fingerprint[..16]),
                 title: staging.title.clone(),
+                heading_level: None,
                 body_markdown: text,
                 unsupported: vec!["RTF character and paragraph styling is not preserved".into()],
             });
@@ -1414,6 +1424,7 @@ pub fn inspect_manuscript(path: impl AsRef<Path>) -> Result<ManuscriptStaging, I
                 staging.units.push(ManuscriptUnit {
                     source_document_id: format!("epub:{}:{index}", &fingerprint[..16]),
                     title: chapter_title,
+                    heading_level: None,
                     body_markdown: body,
                     unsupported: vec![
                         "EPUB layout, CSS, embedded fonts, and page breaks are not preserved"
@@ -2318,6 +2329,7 @@ fn split_blocks_into_units(
                     &staging.source_fingerprint[..16]
                 ),
                 title: title.clone(),
+                heading_level: None,
                 body_markdown: body.join("\n\n"),
                 unsupported: Vec::new(),
             });
@@ -2334,6 +2346,7 @@ fn split_blocks_into_units(
         staging.units.push(ManuscriptUnit {
             source_document_id: format!("{prefix}:{}:{index}", &staging.source_fingerprint[..16]),
             title,
+            heading_level: None,
             body_markdown: body.join("\n\n"),
             unsupported: Vec::new(),
         });
