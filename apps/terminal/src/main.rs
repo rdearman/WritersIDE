@@ -20350,9 +20350,9 @@ fn draw_command_palette_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let block = Block::default()
         .title(
             if palette.query.trim().is_empty() && !palette.recent_commands.is_empty() {
-                " Command Palette · recent commands first · Esc closes "
+                " Command Palette · recent actions first · Esc closes "
             } else {
-                " Command Palette · search registry · Esc closes "
+                " Command Palette · search actions · Esc closes "
             },
         )
         .borders(Borders::ALL)
@@ -20395,15 +20395,13 @@ fn draw_command_palette_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
                 };
                 let availability =
                     disabled.map_or(String::new(), |reason| format!(" · unavailable: {reason}"));
-                ListItem::new(format!(
-                    "{} · {}{}{}",
-                    command.label, command.id, shortcut, availability
-                ))
-                .style(if disabled.is_some() {
-                    Style::default().fg(Color::DarkGray)
-                } else {
-                    Style::default()
-                })
+                ListItem::new(format!("{}{}{}", command.label, shortcut, availability)).style(
+                    if disabled.is_some() {
+                        Style::default().fg(Color::DarkGray)
+                    } else {
+                        Style::default()
+                    },
+                )
             })
             .collect()
     };
@@ -20969,7 +20967,7 @@ fn draw_keybinding_manager_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
                         .collect::<Vec<_>>()
                         .join(", ")
                 };
-                ListItem::new(format!("{}  [{}]  {}", command.label, command.id, binding))
+                ListItem::new(format!("{}  [{}]", command.label, binding))
             })
             .collect()
     };
@@ -23630,7 +23628,7 @@ fn handle_command_palette_key(
                 if command.takes_arguments {
                     begin_command_arguments(s, command)?;
                 } else if let Some(palette) = s.command_palette.as_mut() {
-                    palette.query = command.id.to_owned();
+                    palette.query = command.label.to_owned();
                     palette.selected = 0;
                 }
             }
@@ -26558,6 +26556,32 @@ mod tests {
     }
 
     #[test]
+    fn keybinding_manager_shows_author_facing_command_names() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state
+            .execute_legacy_palette_command("keybinding-manager")
+            .unwrap();
+        let manager = state.keybinding_manager.as_mut().unwrap();
+        manager.filter = "Timeline".into();
+        manager.filtering = true;
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Timeline"));
+        assert!(!screen.contains("view.timeline"), "{screen:?}");
+    }
+
+    #[test]
     fn context_sequences_allow_configured_menu_chords_but_reject_unknowns_and_prefix_conflicts() {
         let root = tempfile::tempdir().unwrap();
         let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
@@ -26909,14 +26933,14 @@ mod tests {
         .unwrap();
         assert!(state.command_palette.is_some());
 
-        for character in "view.timeline".chars() {
+        for character in "timeline".chars() {
             handle(
                 &mut state,
                 KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
             )
             .unwrap();
         }
-        let matches = command_palette_candidates("view.timeline");
+        let matches = command_palette_candidates("timeline");
         assert_eq!(
             matches.first().map(|command| command.id),
             Some("view.timeline")
@@ -26942,7 +26966,10 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("Command Palette"));
-        assert!(screen.contains("view.timeline"));
+        assert!(screen.contains("Timeline"));
+        assert!(!screen.contains("view.timeline"), "{screen:?}");
+        handle(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.command_palette.as_ref().unwrap().query, "Timeline");
         for (width, height) in [(20, 6), (40, 10), (80, 24), (93, 36), (142, 60)] {
             let mut resized =
                 ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
