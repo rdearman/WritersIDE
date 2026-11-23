@@ -4,6 +4,8 @@ use std::{
     env, fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::mpsc::{self, Receiver, Sender},
+    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -257,6 +259,29 @@ struct AppState {
     recent_project_picker: Option<RecentProjectPicker>,
     recent_projects_path: Option<PathBuf>,
     file_browser: Option<FileBrowserState>,
+    grammar_worker: Option<GrammarBackgroundWorker>,
+}
+
+struct GrammarBackgroundWorker {
+    sender: Sender<GrammarBackgroundJob>,
+    receiver: Receiver<GrammarBackgroundResult>,
+}
+
+struct GrammarBackgroundJob {
+    scene_id: SceneId,
+    scene_title: String,
+    language: String,
+    source_hash: String,
+    text: String,
+    config: story_analysis::GrammarProofreadingConfig,
+}
+
+struct GrammarBackgroundResult {
+    scene_id: SceneId,
+    scene_title: String,
+    language: String,
+    source_hash: String,
+    result: Result<Vec<story_analysis::ProofreadingFinding>, String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5331,6 +5356,141 @@ fn read_user_keymap() -> Result<KeymapFile, Box<dyn std::error::Error>> {
     }
 }
 impl AppState {
+    fn queue_background_grammar_check(
+        &mut self,
+        scene_id: SceneId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let settings = self.app.proofreading_config()?;
+        if !settings.grammar.background_enabled {
+            return Ok(());
+        }
+        let record = self.app.get_scene(scene_id)?;
+        let project = self.app.get_project()?;
+        let (text, source_hash) = self.app.load_scene_text(scene_id)?;
+        if self.grammar_worker.is_none() {
+            let (job_tx, job_rx) = mpsc::channel::<GrammarBackgroundJob>();
+            let (result_tx, result_rx) = mpsc::channel::<GrammarBackgroundResult>();
+            thread::spawn(move || {
+                while let Ok(job) = job_rx.recv() {
+                    let result = story_analysis::grammar_check_with_config(
+                        &job.text,
+                        &job.language,
+                        &job.config,
+                    );
+                    if result_tx
+                        .send(GrammarBackgroundResult {
+                            scene_id: job.scene_id,
+                            scene_title: job.scene_title,
+                            language: job.language,
+                            source_hash: job.source_hash,
+                            result,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            self.grammar_worker = Some(GrammarBackgroundWorker {
+                sender: job_tx,
+                receiver: result_rx,
+            });
+        }
+        if let Some(worker) = &self.grammar_worker {
+            worker
+                .sender
+                .send(GrammarBackgroundJob {
+                    scene_id,
+                    language: record.scene.effective_language_code(&project).to_owned(),
+                    scene_title: record.scene.title,
+                    source_hash,
+                    text,
+                    config: settings.grammar,
+                })
+                .map_err(|error| format!("queue background grammar check: {error}"))?;
+        }
+        Ok(())
+    }
+
+    fn poll_background_grammar(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(worker) = &self.grammar_worker else {
+            return Ok(());
+        };
+        let results = worker.receiver.try_iter().collect::<Vec<_>>();
+        for result in results {
+            if self.editing_scene == Some(result.scene_id) && self.dirty {
+                continue;
+            }
+            let Ok((_, current_hash)) = self.app.load_scene_text(result.scene_id) else {
+                continue;
+            };
+            if current_hash != result.source_hash {
+                continue;
+            }
+            let mut actions = Vec::new();
+            let mut notes = Vec::new();
+            match result.result {
+                Ok(findings) => {
+                    for finding in findings {
+                        let expected_text = self
+                            .app
+                            .load_scene_text(result.scene_id)
+                            .ok()
+                            .and_then(|(text, _)| {
+                                text.get(finding.byte_range.clone()).map(str::to_owned)
+                            })
+                            .unwrap_or_default();
+                        actions.push(ProofreadingAction {
+                            scene_id: result.scene_id,
+                            scene_title: result.scene_title.clone(),
+                            language: result.language.clone(),
+                            source_hash: result.source_hash.clone(),
+                            byte_range: finding.byte_range,
+                            expected_text,
+                            suggestion: finding.suggestions.into_iter().next(),
+                            category: finding.category,
+                            message: finding.message,
+                            status: ProofreadingActionStatus::Pending,
+                        });
+                    }
+                }
+                Err(error) => notes.push(error),
+            }
+            let count = actions.len();
+            let review = ProofreadingReview {
+                findings: actions,
+                selected: 0,
+                notes,
+            };
+            let body = if count == 0 && review.notes.is_empty() {
+                "Background grammar check complete. No findings.".to_owned()
+            } else {
+                proofreading_review_text(&review)
+            };
+            self.open_reference_buffer(
+                format!("grammar-background:{}", result.scene_id),
+                Some(result.scene_id),
+                format!("Grammar · {}", result.scene_title),
+                body,
+            );
+            if let Some(pane) = self.active_reference_pane_mut() {
+                pane.proofreading = Some(review);
+            }
+            self.message = if count == 0 {
+                format!(
+                    "Background grammar check complete · {} · no findings",
+                    result.scene_title
+                )
+            } else {
+                format!(
+                    "Background grammar check complete · {} · {count} finding(s) in reference pane",
+                    result.scene_title
+                )
+            };
+        }
+        Ok(())
+    }
+
     fn record_tutorial_action(&mut self, action: &str) {
         let path = self.tutorial_preferences_path.clone();
         let Ok(mut preferences) = onboarding::load(&path) else {
@@ -5578,6 +5738,7 @@ impl AppState {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings,
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -9679,6 +9840,7 @@ impl AppState {
                 Ok(hash) => {
                     self.saved_hash = hash;
                     self.dirty = false;
+                    self.queue_background_grammar_check(id)?;
                     self.record_tutorial_action("save");
                     if self.writing_stats_enabled {
                         self.successful_saves = self.successful_saves.saturating_add(1);
@@ -15758,9 +15920,20 @@ impl AppState {
                             .iter()
                             .map(|term| format!("Excluded: {term}")),
                     )
+                    .chain(std::iter::once(format!(
+                        "Background checks: {}",
+                        if config.grammar.background_enabled {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    )))
                     .chain(std::iter::once(String::new()))
                     .chain(std::iter::once(
                         "Usage: grammar-settings CATEGORY on|off|severity LEVEL".into(),
+                    ))
+                    .chain(std::iter::once(
+                        "       grammar-settings background on|off".into(),
                     ))
                     .chain(std::iter::once(
                         "       grammar-settings exclude add|remove TERM".into(),
@@ -15780,7 +15953,22 @@ impl AppState {
             let Some(action) = parts.next() else {
                 return Err("usage: grammar-settings CATEGORY on|off|severity LEVEL | grammar-settings exclude add|remove TERM".into());
             };
-            if category == "exclude" {
+            if category == "background" {
+                config.grammar.background_enabled = match action {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("use grammar-settings background on|off".into()),
+                };
+                self.app.save_proofreading_config(&config)?;
+                self.message = format!(
+                    "Background grammar checks {} · run after a scene is saved",
+                    if config.grammar.background_enabled {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+            } else if category == "exclude" {
                 let operation = action;
                 let term = parts.collect::<Vec<_>>().join(" ");
                 if term.trim().is_empty() {
@@ -18063,6 +18251,7 @@ fn run(
     let mut autosave_deadline: Option<Instant> = None;
     let mut auto_snapshot_check = Instant::now();
     loop {
+        s.poll_background_grammar()?;
         if auto_snapshot_check.elapsed() >= Duration::from_secs(10) {
             auto_snapshot_check = Instant::now();
             let now = std::time::SystemTime::now()
@@ -30975,6 +31164,7 @@ mod tests {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -34285,6 +34475,7 @@ mod tests {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -34421,6 +34612,7 @@ mod tests {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -34553,6 +34745,7 @@ mod tests {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -34693,6 +34886,7 @@ mod tests {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -34983,6 +35177,7 @@ mod tests {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -35123,6 +35318,7 @@ mod tests {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -36662,6 +36858,7 @@ mod tests {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -36937,6 +37134,7 @@ mod tests {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -37347,6 +37545,7 @@ mod tests {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -37498,6 +37697,7 @@ mod tests {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -37701,6 +37901,7 @@ mod tests {
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
+            grammar_worker: None,
             function_bindings: default_bindings(),
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
@@ -38640,11 +38841,46 @@ mod tests {
         state
             .execute_legacy_palette_command("grammar-settings exclude add Acme Corp")
             .unwrap();
+        state
+            .execute_legacy_palette_command("grammar-settings background on")
+            .unwrap();
         let config = state.app.proofreading_config().unwrap();
         let agreement = &config.grammar.categories["Agreement"];
         assert!(!agreement.enabled);
         assert_eq!(agreement.severity, "warning");
         assert!(config.grammar.excluded_terms.contains("Acme Corp"));
+        assert!(config.grammar.background_enabled);
+    }
+
+    #[test]
+    fn background_grammar_check_runs_off_thread_after_a_successful_save() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        app.set_project_language("en-GB").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut config = app.proofreading_config().unwrap();
+        config.grammar.background_enabled = true;
+        app.save_proofreading_config(&config).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["They is ready.".into()];
+        state.dirty = true;
+        state.save().unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            state.poll_background_grammar().unwrap();
+            if !state.reference_panes.is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(state.reference_panes[0].content.contains("Agreement"));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "They is ready."
+        );
     }
 
     #[test]

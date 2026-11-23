@@ -27,6 +27,9 @@ pub struct GrammarProofreadingConfig {
     pub categories: BTreeMap<String, GrammarCategorySetting>,
     /// Exact words or phrases that the author wants omitted from grammar review.
     pub excluded_terms: BTreeSet<String>,
+    /// Run an offline grammar pass after a scene is successfully saved.
+    #[serde(default)]
+    pub background_enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -116,6 +119,7 @@ impl Default for GrammarProofreadingConfig {
         Self {
             categories,
             excluded_terms: BTreeSet::new(),
+            background_enabled: false,
         }
     }
 }

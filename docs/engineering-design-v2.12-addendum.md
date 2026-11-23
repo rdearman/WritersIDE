@@ -33,7 +33,7 @@ The application service `apply_scene_text_suggestion` requires the source SHA-25
 - The checker runs locally and does not make HTTP or cloud requests.
 - Suggestions remain provisional; each change requires an explicit author keypress.
 - Harper's Markdown parser skips code blocks and tables. Current passage-language anchors are honored; stale anchors are skipped and disclosed. Other Markdown syntax still requires further verification.
-- On-demand checking is implemented; idle-time, incremental, compile-time and cancellation behavior are not.
+- On-demand checking is implemented. Optional background checks run on a worker thread after a scene save, so they do not block the editor; results are discarded if the source hash has changed before receipt. Checks currently operate per saved scene rather than incrementally by edited passage. Compile-time checking and cancellation are not implemented.
 - Aspell/Hunspell remain separate spelling workflows. Missing dictionaries do not prevent application startup.
 - This is a foundation for #33, not completion of its multilingual acceptance criteria.
 
@@ -47,4 +47,4 @@ The existing `.writers-ide/diagnostics.toml` is also the source of grammar-check
 
 `Review → Grammar Settings` opens a reference pane listing categories and excluded terms. The command accepts `grammar-settings CATEGORY on|off|severity LEVEL` and `grammar-settings exclude add|remove TERM`; edits are validated and atomically saved using a same-directory temporary file, file sync, rename and directory sync. The grammar service filters by enabled category, applies the configured severity, and omits findings whose matched text exactly equals an excluded term (case-insensitive). Exclusions do not alter manuscript text or dictionary data. Grammar checks continue to be explicitly invoked; background checking and idle scheduling remain outstanding.
 
-Regression coverage verifies category filtering, severity configuration, exclusions, invalid settings, settings-pane visibility and project-local persistence. The workspace verification for this update passed formatting, Clippy and all tests; the Ollama loopback test required the already-authorized local socket permission in this environment.
+Regression coverage verifies category filtering, severity configuration, exclusions, invalid settings, settings-pane visibility, project-local persistence, and asynchronous post-save results that leave manuscript prose unchanged. The workspace verification for this update passed formatting, Clippy and all tests; the Ollama loopback test required the already-authorized local socket permission in this environment.
