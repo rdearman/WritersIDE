@@ -597,10 +597,10 @@ struct RecentProjectPicker {
     selected: usize,
 }
 
-const MENU_CATEGORIES: [&str; 8] = [
-    "File", "Edit", "Insert", "Navigate", "Review", "Publish", "Tools", "Help",
+const MENU_CATEGORIES: [&str; 9] = [
+    "File", "Edit", "Insert", "Navigate", "Review", "Publish", "Tools", "Help", "View",
 ];
-const MENU_CATEGORY_COMMAND_IDS: [&str; 8] = [
+const MENU_CATEGORY_COMMAND_IDS: [&str; 9] = [
     "menu.file",
     "menu.edit",
     "menu.insert",
@@ -609,8 +609,9 @@ const MENU_CATEGORY_COMMAND_IDS: [&str; 8] = [
     "menu.publish",
     "menu.tools",
     "menu.help",
+    "menu.view",
 ];
-const MENU_COMMON_COMMANDS: [&[&str]; 8] = [
+const MENU_COMMON_COMMANDS: [&[&str]; 9] = [
     &[
         "file.new-project",
         "file.open-project",
@@ -672,6 +673,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 8] = [
         "story-template-list",
     ],
     &["help.resume-tutorial", "help.context"],
+    &["view.formatting-marks"],
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1012,6 +1014,8 @@ struct EditorPreferences {
     line_ending: String,
     indentation: String,
     indent_width: usize,
+    #[serde(default)]
+    show_formatting_marks: bool,
 }
 
 impl Default for EditorPreferences {
@@ -1020,6 +1024,7 @@ impl Default for EditorPreferences {
             line_ending: "lf".into(),
             indentation: "tabs".into(),
             indent_width: 4,
+            show_formatting_marks: false,
         }
     }
 }
@@ -1121,6 +1126,7 @@ enum CommandAction {
     ProcessSelected { expand_transclusions: bool },
     LegacyPalette,
     CompileWorkflow,
+    ToggleFormattingMarks,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1202,6 +1208,7 @@ fn command_registry() -> Vec<CommandSpec> {
                     "Publish" => "Open Publish Menu",
                     "Tools" => "Open Tools Menu",
                     "Help" => "Open Help Menu",
+                    "View" => "Open View Menu",
                     _ => "Open Menu",
                 },
                 description: "Open this top-level menu directly",
@@ -1528,6 +1535,21 @@ fn command_registry() -> Vec<CommandSpec> {
         },
     ]);
     commands.extend([
+        CommandSpec {
+            id: "view.formatting-marks",
+            label: "Show Formatting Marks",
+            description: "Toggle display-only paragraph, line-break and tab marks",
+            category: "View",
+            default_shortcuts: &[],
+            mnemonic: Some('m'),
+            palette_aliases: &["formatting marks", "whitespace marks"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ToggleFormattingMarks,
+            task_group: "Editor View",
+            menu_priority: 1,
+            advanced: false,
+        },
         CommandSpec {
             id: "compile.format",
             label: "Compile / Export…",
@@ -3635,7 +3657,9 @@ fn subsequence_matches(
 
 fn menu_category(spec: &CommandSpec) -> &'static str {
     let id = spec.id;
-    if spec.category == "Help" || id.starts_with("help.") {
+    if id == "view.formatting-marks" {
+        "View"
+    } else if spec.category == "Help" || id.starts_with("help.") {
         "Help"
     } else if spec.category == "Compile" || id.starts_with("compile.") || id.starts_with("export.")
     {
@@ -4246,6 +4270,16 @@ fn validate_editor_preferences(
         return Err("editor preferences require line_ending=lf|crlf, indentation=tabs|spaces, and indent_width=1..8".into());
     }
     Ok(())
+}
+
+fn formatting_line_marker(line: &str, next_line: Option<&str>) -> Option<&'static str> {
+    next_line.map(|next| {
+        if line.is_empty() || next.is_empty() {
+            "¶"
+        } else {
+            "↵"
+        }
+    })
 }
 
 fn parse_macro_recipe(
@@ -10156,6 +10190,16 @@ impl AppState {
                 )) {
                     self.message = format!("Could not open the Compile browser: {error}");
                 }
+            }
+            CommandAction::ToggleFormattingMarks => {
+                self.editor_preferences.show_formatting_marks =
+                    !self.editor_preferences.show_formatting_marks;
+                save_editor_preferences(self.app.project_root(), &self.editor_preferences)?;
+                self.message = if self.editor_preferences.show_formatting_marks {
+                    "Formatting marks shown · manuscript text is unchanged".into()
+                } else {
+                    "Formatting marks hidden · manuscript text is unchanged".into()
+                };
             }
             CommandAction::Save => self.save()?,
             CommandAction::RequestQuit => self.request_quit(),
@@ -17260,6 +17304,11 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     let mut spans = vec![Span::raw(prefix)];
                     let mut byte_offset = line_start_byte;
                     for (col, ch) in line.graphemes(true).enumerate() {
+                        let shown = if s.editor_preferences.show_formatting_marks && ch == "\t" {
+                            "→"
+                        } else {
+                            ch
+                        };
                         let selected = selection.is_some_and(|((sr, sc), (er, ec))| {
                             (row > sr || (row == sr && col >= sc))
                                 && (row < er || (row == er && col < ec))
@@ -17271,20 +17320,26 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         );
                         if selected {
                             spans.push(Span::styled(
-                                ch.to_string(),
+                                shown.to_owned(),
                                 Style::default().fg(Color::White).bg(Color::Blue),
                             ));
                         } else if decorated {
                             spans.push(Span::styled(
-                                ch.to_string(),
+                                shown.to_owned(),
                                 Style::default()
                                     .fg(Color::Cyan)
                                     .add_modifier(Modifier::UNDERLINED),
                             ));
                         } else {
-                            spans.push(Span::raw(ch.to_string()));
+                            spans.push(Span::raw(shown.to_owned()));
                         }
                         byte_offset += ch.len() as u64;
+                    }
+                    if s.editor_preferences.show_formatting_marks
+                        && let Some(marker) =
+                            formatting_line_marker(line, view_lines.get(row + 1).copied())
+                    {
+                        spans.push(Span::styled(marker, Style::default().fg(Color::DarkGray)));
                     }
                     line_start_byte = byte_offset + 1;
                     Line::from(spans)
@@ -19486,6 +19541,13 @@ fn menu_command_row(state: &AppState, command: CommandSpec, width: usize) -> Str
 }
 
 fn displayed_command_label(state: &AppState, command: CommandSpec) -> String {
+    if command.id == "view.formatting-marks" {
+        return if state.editor_preferences.show_formatting_marks {
+            "Hide Formatting Marks".into()
+        } else {
+            "Show Formatting Marks".into()
+        };
+    }
     if command.id != "help.resume-tutorial" {
         return command.label.to_owned();
     }
@@ -32818,7 +32880,7 @@ mod tests {
         assert_eq!(
             MENU_CATEGORIES,
             [
-                "File", "Edit", "Insert", "Navigate", "Review", "Publish", "Tools", "Help",
+                "File", "Edit", "Insert", "Navigate", "Review", "Publish", "Tools", "Help", "View",
             ]
         );
         for category in MENU_CATEGORIES {
@@ -35160,8 +35222,12 @@ mod tests {
         let mut state = AppState::new(app, default_bindings());
         state.tutorial_preferences_path = preferences_path.clone();
 
+        let help_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Help")
+            .unwrap();
         state.menu = Some(MenuState {
-            top: MENU_CATEGORIES.len() - 1,
+            top: help_menu,
             selected: 0,
             all_commands: false,
             group: None,
@@ -35194,7 +35260,7 @@ mod tests {
         state.editor = vec!["Unsaved sentence stays here.".into()];
         state.dirty = true;
         state.menu = Some(MenuState {
-            top: MENU_CATEGORIES.len() - 1,
+            top: help_menu,
             selected: 0,
             all_commands: false,
             group: None,
@@ -35278,14 +35344,18 @@ mod tests {
         assert!(state.menu.is_some());
         assert_eq!(state.mode, Some('q'));
 
-        for _ in 0..MENU_CATEGORIES.len() - 1 {
+        let help_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Help")
+            .unwrap();
+        for _ in 0..help_menu {
             handle(
                 &mut state,
                 KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
             )
             .unwrap();
         }
-        assert_eq!(state.menu.unwrap().top, MENU_CATEGORIES.len() - 1);
+        assert_eq!(state.menu.unwrap().top, help_menu);
         assert_eq!(state.menu_commands()[1].id, "help.context");
         state.menu.as_mut().unwrap().selected = 1;
         handle(
@@ -35300,5 +35370,60 @@ mod tests {
         assert!(state.help_panel.is_none());
         assert_eq!(state.mode, Some('q'));
         assert_eq!(state.prompt, "Save and Quit · Quit Without Saving · Cancel");
+    }
+
+    #[test]
+    fn formatting_marks_are_display_only_toggle_and_persist() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 10).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["A line".into(), String::new(), "\tB line".into()];
+        state.dirty = true;
+        let original = state.editor.clone();
+
+        let view_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "View")
+            .unwrap();
+        assert!(MENU_COMMON_COMMANDS[view_menu].contains(&"view.formatting-marks"));
+        let command = command_by_id("view.formatting-marks").unwrap();
+        assert_eq!(command.category, "View");
+        assert_eq!(
+            displayed_command_label(&state, command),
+            "Show Formatting Marks"
+        );
+        assert_eq!(formatting_line_marker("A line", Some("")), Some("¶"));
+        assert_eq!(formatting_line_marker("", Some("B line")), Some("¶"));
+        assert_eq!(formatting_line_marker("A line", Some("B line")), Some("↵"));
+        assert_eq!(formatting_line_marker("last line", None), None);
+
+        state
+            .dispatch_registered(CommandAction::ToggleFormattingMarks)
+            .unwrap();
+        assert!(state.editor_preferences.show_formatting_marks);
+        assert_eq!(
+            displayed_command_label(&state, command),
+            "Hide Formatting Marks"
+        );
+        assert_eq!(state.editor, original);
+        assert!(state.dirty);
+        assert!(!state.message.contains("unsaved"));
+
+        let stored = load_editor_preferences(state.app.project_root()).unwrap();
+        assert!(stored.show_formatting_marks);
+        state
+            .dispatch_registered(CommandAction::ToggleFormattingMarks)
+            .unwrap();
+        assert!(!state.editor_preferences.show_formatting_marks);
+        assert_eq!(state.editor, original);
+        assert!(state.dirty);
+        assert!(
+            !load_editor_preferences(state.app.project_root())
+                .unwrap()
+                .show_formatting_marks
+        );
     }
 }
