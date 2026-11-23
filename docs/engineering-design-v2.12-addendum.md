@@ -24,7 +24,9 @@ Ratatui is advanced to 0.30 because its Unicode-width dependency range can be un
 
 The supported grammar dialects are explicitly `en-GB`, `en-US`, `en-CA`, `en-AU` and `en-IN`. Any other language returns an unsupported-language error; the caller can continue with existing Aspell/Hunspell spelling checks. No British rules are silently applied to another language. Project and scene language inheritance already provides the effective language used by the terminal action.
 
-The command `Review → Grammar Check` checks the selected scene by default and opens findings in a read-only reference pane. The optional scope syntax accepts `all`, `chapter:<UUID>` and `scene:<UUID>`. Findings include original UTF-8 byte offsets and the first suggestion where available. No manuscript bytes are changed. The pane currently offers inspection only; applying, ignoring and custom-dictionary actions are not implemented in this slice.
+The command `Review → Grammar Check` checks the selected scene by default and opens findings in a read-only reference pane. The optional scope syntax accepts `all`, `chapter:<UUID>` and `scene:<UUID>`. Findings include original UTF-8 byte offsets and the first suggestion where available. Checking does not change manuscript bytes. The pane currently offers inspection only; applying a finding from that pane, ignoring rules and custom-dictionary actions are not implemented in this slice.
+
+The application service now exposes `apply_scene_text_suggestion`. It requires the source SHA-256, expected passage bytes and UTF-8 byte range from the analysis result, rejects stale hashes or changed passage text, and persists an accepted replacement through the existing journalled save path. It is deliberately a service foundation: the terminal does not yet present an accept/ignore workflow, and this operation is not yet connected to the editor's in-memory undo stack.
 
 ## Safety and boundaries
 
@@ -37,4 +39,4 @@ The command `Review → Grammar Check` checks the selected scene by default and 
 
 ## Verification
 
-Automated tests cover supported-language reporting, unsupported-language rejection, British English execution, a grammar finding after multibyte UTF-8 text, Markdown code exclusion, terminal report opening and manuscript immutability. Real-terminal interaction and practical language quality still require author verification; automated checks do not establish usability or proofing quality.
+Automated tests cover supported-language reporting, unsupported-language rejection, British English execution, a grammar finding after multibyte UTF-8 text, Markdown code exclusion, terminal report opening and manuscript immutability. The application suggestion service is tested for journalled persistence, reopen, Unicode offsets and rejection of stale hashes, stale passages and invalid UTF-8 boundaries. Real-terminal interaction and practical language quality still require author verification; automated checks do not establish usability or proofing quality.

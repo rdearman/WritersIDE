@@ -4765,6 +4765,42 @@ impl WriterApp {
     ) -> Result<String> {
         Ok(self.store.save_text(id, expected_hash, text)?)
     }
+    /// Apply a single explicit editor suggestion to a scene only if the source
+    /// revision and selected passage still match the values shown to the author.
+    /// The replacement is persisted through the normal journalled save path.
+    pub fn apply_scene_text_suggestion(
+        &mut self,
+        id: SceneId,
+        expected_hash: &str,
+        byte_range: std::ops::Range<usize>,
+        expected_text: &str,
+        replacement: &str,
+    ) -> Result<String> {
+        let (mut text, current_hash) = self.load_scene_text(id)?;
+        if current_hash != expected_hash {
+            return Err(StorageError::Conflict(
+                "suggestion is stale because the manuscript changed after analysis".into(),
+            )
+            .into());
+        }
+        if byte_range.start > byte_range.end
+            || byte_range.end > text.len()
+            || !text.is_char_boundary(byte_range.start)
+            || !text.is_char_boundary(byte_range.end)
+        {
+            return Err(AppError::Domain(
+                "suggestion range is not a valid UTF-8 byte range".into(),
+            ));
+        }
+        if &text[byte_range.clone()] != expected_text {
+            return Err(StorageError::Conflict(
+                "suggestion is stale because the selected passage no longer matches".into(),
+            )
+            .into());
+        }
+        text.replace_range(byte_range, replacement);
+        self.save_scene_text(id, Some(expected_hash), &text)
+    }
     pub fn create_story_object(&mut self, name: &str, description: &str) -> Result<StoryObjectId> {
         Ok(self.store.create_story_object(name, description)?)
     }
@@ -6085,6 +6121,80 @@ unexpected_prose = "must not be silently discarded"
         assert_eq!(
             app.inspect_event_dependencies().unwrap()[0].1.status,
             story_analysis::InspectionStatus::Unknown
+        );
+    }
+    #[test]
+    fn suggestion_replacement_is_journalled_unicode_safe_and_rejects_stale_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, initial_hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&initial_hash), "Mara said teh word.")
+            .unwrap();
+        let (source, analyzed_hash) = app.load_scene_text(scene).unwrap();
+        let start = source.find("teh").unwrap();
+        let replacement_hash = app
+            .apply_scene_text_suggestion(
+                scene,
+                &analyzed_hash,
+                start..start + "teh".len(),
+                "teh",
+                "the",
+            )
+            .unwrap();
+        assert_eq!(app.load_scene_text(scene).unwrap().0, "Mara said the word.");
+
+        assert!(matches!(
+            app.apply_scene_text_suggestion(scene, &analyzed_hash, start..start + 3, "teh", "the",),
+            Err(AppError::Storage(StorageError::Conflict(_)))
+        ));
+        assert!(matches!(
+            app.apply_scene_text_suggestion(
+                scene,
+                &replacement_hash,
+                start..start + 3,
+                "teh",
+                "the",
+            ),
+            Err(AppError::Storage(StorageError::Conflict(_)))
+        ));
+        assert!(matches!(
+            app.apply_scene_text_suggestion(
+                scene,
+                &replacement_hash,
+                1..2,
+                "not the selected passage",
+                "á",
+            ),
+            Err(AppError::Storage(StorageError::Conflict(_)))
+        ));
+        assert_eq!(app.load_scene_text(scene).unwrap().0, "Mara said the word.");
+    }
+    #[test]
+    fn suggestion_replacement_preserves_grapheme_bytes_and_persists_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Élodie has teh map.")
+            .unwrap();
+        let (source, analyzed_hash) = app.load_scene_text(scene).unwrap();
+        let start = source.find("teh").unwrap();
+        let updated_hash = app
+            .apply_scene_text_suggestion(scene, &analyzed_hash, start..start + 3, "teh", "the")
+            .unwrap();
+        assert!(matches!(
+            app.apply_scene_text_suggestion(scene, &updated_hash, 1..2, "", "x"),
+            Err(AppError::Domain(_))
+        ));
+        drop(app);
+        let reopened = WriterApp::open_project(&project).unwrap();
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "Élodie has the map."
         );
     }
     #[test]
