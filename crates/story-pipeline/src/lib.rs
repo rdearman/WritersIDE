@@ -985,7 +985,13 @@ pub fn compile_ir(input: &PipelineInput) -> story_document::CompileIr {
         });
     }
     let mut scenes = Vec::new();
-    for scene in &input.scenes {
+    // Unplaced scenes are valid planning documents, but are not yet in the
+    // ordered manuscript and therefore must not leak into published output.
+    for scene in input
+        .scenes
+        .iter()
+        .filter(|scene| scene.chapter_id.is_some())
+    {
         let segments = if input.expand_transclusions {
             scene
                 .expanded_passages
@@ -1253,6 +1259,26 @@ mod tests {
             &markdown[source_map[0].output.start..source_map[0].output.end],
             "Bonjour."
         );
+    }
+
+    #[test]
+    fn compile_ir_omits_unplaced_scenes_until_they_join_a_chapter() {
+        let mut manuscript = input("Placed prose.");
+        let mut unplaced = manuscript.scenes[0].clone();
+        unplaced.id = "scene-unplaced".into();
+        unplaced.chapter_id = None;
+        unplaced.title = "Planning note".into();
+        unplaced.text = "This is not in manuscript order yet.".into();
+        manuscript.scenes.push(unplaced);
+
+        let ir = compile_ir(&manuscript);
+        assert_eq!(ir.units.len(), 1);
+        assert_eq!(ir.units[0].id, "scene-1");
+
+        manuscript.scenes[1].chapter_id = Some("chapter-1".into());
+        let ir = compile_ir(&manuscript);
+        assert_eq!(ir.units.len(), 2);
+        assert_eq!(ir.units[1].id, "scene-unplaced");
     }
 
     #[test]

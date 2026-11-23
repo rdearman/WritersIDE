@@ -556,7 +556,7 @@ fn tutorial_panel_at(
             ),
             (
                 "Your sample book",
-                "This separate sample book is disposable. Your opened novel is unchanged. Outline and Scene Cards show the same scenes.",
+                "This separate sample book is disposable. Your opened novel is unchanged. Open Navigate > Scene Cards for Included and Excluded scene cards; Up/Down selects, Ctrl+Up/Down reorders within a chapter, Space excludes or restores, Enter opens, and Edit > Move Scene assigns a chapter.",
             ),
             (
                 "Write and save",
@@ -711,6 +711,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 9] = [
         "search.replace-panel",
         "scene.rename",
         "scene.status",
+        "scene.move",
         "scene.toggle-inclusion",
         "scene.field",
         "comment.create",
@@ -1822,16 +1823,16 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command(
             "scene.create",
             "New Scene",
-            "Create a scene in a chapter",
+            "Create a scene without choosing a chapter; assign its manuscript position later",
             "Insert",
             "scene",
-            true,
+            false,
         ),
         legacy_command(
             "scene.move",
             "Move Scene",
             "Move a scene to a chapter and position",
-            "Scene",
+            "Edit",
             "move",
             true,
         ),
@@ -6528,6 +6529,8 @@ impl AppState {
         let title = self.app.get_scene(scene)?.scene.title;
         self.message = if included {
             format!("Moved “{title}” to Excluded · its text and metadata are retained")
+        } else if self.app.get_scene(scene)?.chapter_id.is_none() {
+            format!("Moved “{title}” to Included → Unplaced · assign a chapter before Compile")
         } else {
             format!("Moved “{title}” to Included · it will appear in Compile")
         };
@@ -6536,9 +6539,11 @@ impl AppState {
     fn move_scene_card(&mut self, direction: isize) -> Result<(), Box<dyn std::error::Error>> {
         let scene = selected_scene_for_workspace(self).ok_or("select a scene card first")?;
         let record = self.app.get_scene(scene)?;
-        let chapter = record
-            .chapter_id
-            .ok_or("the scene has no chapter placement")?;
+        let Some(chapter) = record.chapter_id else {
+            self.message =
+                "This scene is Unplaced · use Scene → Move Scene to choose a chapter".into();
+            return Ok(());
+        };
         let included = self.app.scene_is_included(scene)?;
         let candidates = self
             .app
@@ -10564,6 +10569,16 @@ impl AppState {
                         self.open_snippet_chooser();
                         return Ok(());
                     }
+                    if spec.id == "scene.create" {
+                        self.menu = None;
+                        self.start_scene_creation()?;
+                        return Ok(());
+                    }
+                    if spec.id == "scene.move" {
+                        self.menu = None;
+                        self.start_scene_move()?;
+                        return Ok(());
+                    }
                     if spec.takes_arguments {
                         if spec.category == "Series"
                             || matches!(spec.id, "link.create" | "link.delete")
@@ -10607,6 +10622,16 @@ impl AppState {
                     if let Some(reason) = self.command_disabled_reason(spec) {
                         self.message = format!("{} unavailable: {reason}", spec.label);
                         self.menu = Some(menu);
+                        return Ok(());
+                    }
+                    if spec.id == "scene.create" {
+                        self.menu = None;
+                        self.start_scene_creation()?;
+                        return Ok(());
+                    }
+                    if spec.id == "scene.move" {
+                        self.menu = None;
+                        self.start_scene_move()?;
                         return Ok(());
                     }
                     if spec.takes_arguments {
@@ -10663,6 +10688,9 @@ impl AppState {
         if command_id == "scene.create" && arguments.is_none() {
             return self.start_scene_creation();
         }
+        if command_id == "scene.move" && arguments.is_none() {
+            return self.start_scene_move();
+        }
         if command_id == "edit.snippet-insert" && arguments.is_none() {
             self.open_snippet_chooser();
             return Ok(());
@@ -10698,31 +10726,41 @@ impl AppState {
     }
 
     fn start_scene_creation(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let nodes = self.app.list_structural_nodes()?;
-        let selected_chapter = match outline_rows(self).get(self.selected) {
-            Some(OutlineRow::Chapter { id, .. }) => Some(*id),
-            Some(OutlineRow::Scene(id)) => self.app.get_scene(*id)?.chapter_id,
-            _ => None,
-        };
-        let chapter = selected_chapter
-            .filter(|id| {
-                nodes
-                    .iter()
-                    .any(|node| node.id == *id && node.kind == "chapter")
-            })
-            .or_else(|| {
-                nodes
-                    .iter()
-                    .find(|node| node.kind == "chapter")
-                    .map(|node| node.id)
-            });
-        let Some(chapter) = chapter else {
-            self.message = "Create a chapter before adding a scene · Insert → New Chapter".into();
+        self.mode = Some('N');
+        self.prompt.clear();
+        self.message =
+            "New scene · Enter a title · it will remain Unplaced until you choose a chapter".into();
+        Ok(())
+    }
+
+    fn start_scene_move(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(scene) = selected_scene_for_workspace(self) else {
+            self.message = "Select a scene card before choosing Move Scene".into();
             return Ok(());
         };
-        self.mode = Some(':');
-        self.prompt = format!("scene {chapter} ");
-        self.message = "Type the new scene title, then press Enter · Esc cancels".into();
+        let chapters = self
+            .app
+            .list_structural_nodes()?
+            .into_iter()
+            .filter(|node| node.kind == "chapter")
+            .collect::<Vec<_>>();
+        if chapters.is_empty() {
+            self.message =
+                "There are no chapters yet · create a chapter, then move this scene".into();
+            return Ok(());
+        }
+        self.mode = Some('M');
+        self.prompt.clear();
+        self.message = format!(
+            "Move “{}” · enter destination chapter number: {}",
+            self.app.get_scene(scene)?.scene.title,
+            chapters
+                .iter()
+                .enumerate()
+                .map(|(index, chapter)| format!("{} {}", index + 1, chapter.title))
+                .collect::<Vec<_>>()
+                .join(" · ")
+        );
         Ok(())
     }
 
@@ -11001,6 +11039,63 @@ impl AppState {
         let cmd = self.prompt.trim().to_owned();
         self.prompt.clear();
         let mode = self.mode.take();
+        if mode == Some('N') {
+            if cmd.is_empty() {
+                self.message = "Scene not created · enter a title or press Esc to cancel".into();
+                return Ok(());
+            }
+            match self.app.create_unplaced_scene(&cmd) {
+                Ok(scene) => {
+                    self.refresh()?;
+                    self.workspace = Workspace::Cards;
+                    self.selected = scene_card_ids(self)
+                        .iter()
+                        .position(|id| *id == scene)
+                        .unwrap_or(0);
+                    self.message = format!(
+                        "Created “{cmd}” in Included → Unplaced · choose Move Scene to assign a chapter"
+                    );
+                }
+                Err(error) => self.message = format!("Could not create scene: {error}"),
+            }
+            return Ok(());
+        }
+        if mode == Some('M') {
+            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                let scene =
+                    selected_scene_for_workspace(self).ok_or("select a scene card first")?;
+                let chapters = self
+                    .app
+                    .list_structural_nodes()?
+                    .into_iter()
+                    .filter(|node| node.kind == "chapter")
+                    .collect::<Vec<_>>();
+                let index = cmd
+                    .parse::<usize>()
+                    .map_err(|_| "enter the number of the destination chapter")?;
+                let chapter = chapters
+                    .get(index.checked_sub(1).ok_or("chapter numbers start at 1")?)
+                    .ok_or("choose a chapter number shown in the prompt")?;
+                let position = self
+                    .app
+                    .list_scenes(false)?
+                    .iter()
+                    .filter(|record| record.chapter_id == Some(chapter.id))
+                    .count() as u32;
+                self.app.move_scene(scene, chapter.id, position)?;
+                self.refresh()?;
+                self.selected = scene_card_ids(self)
+                    .iter()
+                    .position(|id| *id == scene)
+                    .unwrap_or(0);
+                self.message = format!("Moved scene to the end of {}", chapter.title);
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.message = format!("Scene was not moved: {error}");
+            }
+            return Ok(());
+        }
         if mode == Some('n') {
             self.create_reading_selection("note", &cmd)?;
             return Ok(());
@@ -17773,14 +17868,14 @@ fn display_shortcut_label(label: String) -> String {
 fn workspace_action_hint(workspace: Workspace) -> &'static str {
     match workspace {
         Workspace::Cards => {
-            "↑/↓ select · Ctrl+↑/↓ reorder · Space include/exclude · Shift+Space select · Enter open · Edit > Move Scene for another chapter"
+            "↑/↓ select · Ctrl+↑/↓ reorder · Space include/exclude · Enter open · Edit > Move Scene chooses a chapter"
         }
         Workspace::Editor => "Esc: Outline",
         _ => "Tab: destinations",
     }
 }
 
-fn scene_card_rows(s: &AppState, included: bool) -> Vec<(SceneId, String)> {
+fn scene_card_rows(s: &AppState, included: bool) -> Vec<(Option<SceneId>, String)> {
     let excluded = s
         .app
         .list_excluded_scene_ids()
@@ -17788,7 +17883,8 @@ fn scene_card_rows(s: &AppState, included: bool) -> Vec<(SceneId, String)> {
         .into_iter()
         .collect::<BTreeSet<_>>();
     let nodes = s.app.list_structural_nodes().unwrap_or_default();
-    s.scenes
+    let scenes = s
+        .scenes
         .iter()
         .filter(|(id, _, _, _)| excluded.contains(id) != included)
         .filter_map(|(id, title, status, words)| {
@@ -17796,32 +17892,50 @@ fn scene_card_rows(s: &AppState, included: bool) -> Vec<(SceneId, String)> {
             let chapter = record
                 .chapter_id
                 .and_then(|chapter| nodes.iter().find(|node| node.id == chapter))
-                .map_or_else(|| "Unplaced".to_owned(), |node| node.title.clone());
+                .map(|node| (node.id, node.title.clone()));
             Some((
                 *id,
-                format!(
-                    "┌─ [{}] {title}\n│ {chapter} · {} · {words} words\n{}└────────────────────",
-                    if included { "Included" } else { "Excluded" },
-                    status.as_str(),
-                    if record.scene.synopsis.trim().is_empty() {
-                        String::new()
-                    } else {
-                        format!("│ {}\n", record.scene.synopsis.trim())
-                    }
-                ),
+                chapter,
+                title,
+                status.as_str().to_owned(),
+                *words,
+                record.scene.synopsis,
             ))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    let mut rows = Vec::new();
+    let mut last_chapter = None;
+    let mut first_group = true;
+    for (id, chapter, title, status, words, synopsis) in scenes {
+        let chapter_key = chapter.as_ref().map(|(id, _)| *id);
+        if first_group || chapter_key != last_chapter {
+            let heading = chapter.map_or_else(|| "Unplaced".to_owned(), |(_, title)| title);
+            rows.push((None, format!("── {heading} ──")));
+            last_chapter = chapter_key;
+            first_group = false;
+        }
+        let preview = synopsis.trim();
+        let card = if preview.is_empty() {
+            format!("┌─ {title}\n│ {status} · {words} words\n└────────────────────")
+        } else {
+            format!("┌─ {title}\n│ {status} · {words} words\n│ {preview}\n└────────────────────")
+        };
+        rows.push((Some(id), card));
+    }
+    rows
 }
 
 fn draw_scene_card_column(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     title: &str,
-    rows: &[(SceneId, String)],
+    rows: &[(Option<SceneId>, String)],
     selected_scene: Option<SceneId>,
 ) {
-    let selected = selected_scene.and_then(|scene| rows.iter().position(|row| row.0 == scene));
+    let selected = selected_scene.and_then(|scene| {
+        rows.iter()
+            .position(|row| row.0.is_some_and(|row_scene| row_scene == scene))
+    });
     let items = if rows.is_empty() {
         vec![ListItem::new(format!("No {} scenes", title.to_lowercase()))]
     } else {
@@ -27397,8 +27511,9 @@ mod tests {
         )
         .unwrap();
         assert!(state.command_palette.is_none());
-        assert_eq!(state.mode, Some(':'));
-        assert_eq!(state.prompt, "scene ");
+        assert_eq!(state.mode, Some('N'));
+        assert!(state.prompt.is_empty());
+        assert!(state.message.contains("Unplaced"));
 
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert_eq!(state.mode, None);
@@ -27406,29 +27521,97 @@ mod tests {
     }
 
     #[test]
-    fn new_scene_command_prompts_for_a_title_in_the_selected_chapter() {
+    fn new_scene_command_creates_an_unplaced_scene_from_a_title_only_prompt() {
         let root = tempfile::tempdir().unwrap();
-        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
-        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
         let mut state = AppState::new(app, default_bindings());
 
-        state
-            .dispatch_registered_command_id("scene.create")
+        let insert = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Insert")
             .unwrap();
-        assert_eq!(state.mode, Some(':'));
-        assert!(state.prompt.starts_with(&format!("scene {chapter} ")));
-        assert!(state.message.contains("new scene title"));
+        state.open_menu_category(insert);
+        let command = state
+            .menu_visible_entries()
+            .iter()
+            .position(|spec| spec.id == "scene.create")
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = command;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.mode, Some('N'));
+        assert!(state.prompt.is_empty());
+        assert!(state.message.contains("Unplaced"));
 
-        state.prompt.push_str("A Room with a View");
-        state.command().unwrap();
+        for character in "A Room with a View".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
         let created = state
             .app
             .list_scenes(false)
             .unwrap()
             .into_iter()
             .find(|scene| scene.scene.title == "A Room with a View")
-            .expect("scene title should be accepted without treating it as a chapter ID");
-        assert_eq!(created.chapter_id, Some(chapter));
+            .expect("scene title should create an independent scene document");
+        assert_eq!(created.chapter_id, None);
+        assert_eq!(state.workspace, Workspace::Cards);
+        assert!(state.message.contains("Included → Unplaced"));
+        let input = state.app.processing_input().unwrap();
+        assert!(
+            !story_pipeline::compile_ir(&input)
+                .units
+                .iter()
+                .any(|unit| unit.id == created.scene.id.to_string())
+        );
+
+        let chapter = state.app.create_chapter(None, "Chapter One", 0).unwrap();
+        let edit = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Edit")
+            .unwrap();
+        state.open_menu_category(edit);
+        let command = state
+            .menu_visible_entries()
+            .iter()
+            .position(|spec| spec.id == "scene.move")
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = command;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.mode, Some('M'));
+        assert!(state.prompt.is_empty());
+        assert!(state.message.contains("1 Chapter One"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.app.get_scene(created.scene.id).unwrap().chapter_id,
+            Some(chapter)
+        );
+        assert!(
+            story_pipeline::compile_ir(&state.app.processing_input().unwrap())
+                .units
+                .iter()
+                .any(|unit| unit.id == created.scene.id.to_string())
+        );
     }
 
     #[test]
@@ -30206,8 +30389,13 @@ mod tests {
         )
         .unwrap();
         assert!(state.menu.is_none());
-        assert_eq!(state.mode, Some(':'));
-        assert_eq!(state.prompt, "scene ");
+        assert_eq!(state.mode, Some('N'));
+        assert!(state.prompt.is_empty());
+        assert_eq!(state.editor, vec!["text/".to_owned()]);
+        assert_eq!(state.editing_scene, Some(scene));
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.mode, None);
+        assert_eq!(state.editor, vec!["text/".to_owned()]);
         state
             .execute_legacy_palette_command("writing-stats on")
             .unwrap();
@@ -32734,8 +32922,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
         let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let second_chapter = app.create_chapter(None, "Later Chapter", 1).unwrap();
         let included = app.create_scene(chapter, "Included Card", 0).unwrap();
         let excluded = app.create_scene(chapter, "Excluded Card", 1).unwrap();
+        let later = app.create_scene(second_chapter, "Later Card", 0).unwrap();
+        let unplaced = app.create_unplaced_scene("Unplaced Card").unwrap();
         app.set_scene_included(excluded, false).unwrap();
         let mut state = AppState::new(app, default_bindings());
         state.refresh().unwrap();
@@ -32758,6 +32949,19 @@ mod tests {
             assert!(screen.contains("Excluded Card"));
         }
         assert!(state.app.scene_is_included(included).unwrap());
+        let included_rows = scene_card_rows(&state, true);
+        for expected in [
+            "── Unplaced ──",
+            "Unplaced Card",
+            "── Chapter ──",
+            "Included Card",
+            "── Later Chapter ──",
+            "Later Card",
+        ] {
+            assert!(included_rows.iter().any(|(_, row)| row.contains(expected)));
+        }
+        assert!(included_rows.iter().any(|(id, _)| *id == Some(unplaced)));
+        assert!(included_rows.iter().any(|(id, _)| *id == Some(later)));
     }
 
     #[test]

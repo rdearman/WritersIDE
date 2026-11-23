@@ -2426,18 +2426,34 @@ impl ProjectStore {
         Ok(())
     }
     pub fn create_scene(&mut self, chapter: NodeId, position: u32, title: &str) -> Result<SceneId> {
-        let kind: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT kind FROM structural_node WHERE id=?1",
-                [chapter.to_string()],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if kind.as_deref() != Some("chapter") {
-            return Err(StorageError::Invalid(
-                "scene destination must be an existing chapter".into(),
-            ));
+        self.create_scene_record(Some((chapter, position)), title)
+    }
+
+    /// Create a stable scene document before the author decides where it belongs.
+    /// Scene placement is optional in the schema; unplaced scenes stay out of Compile.
+    pub fn create_unplaced_scene(&mut self, title: &str) -> Result<SceneId> {
+        self.create_scene_record(None, title)
+    }
+
+    fn create_scene_record(
+        &mut self,
+        placement: Option<(NodeId, u32)>,
+        title: &str,
+    ) -> Result<SceneId> {
+        if let Some((chapter, _)) = placement {
+            let kind: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT kind FROM structural_node WHERE id=?1",
+                    [chapter.to_string()],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if kind.as_deref() != Some("chapter") {
+                return Err(StorageError::Invalid(
+                    "scene destination must be an existing chapter".into(),
+                ));
+            }
         }
         let id = SceneId::new();
         let now = now();
@@ -2446,33 +2462,35 @@ impl ProjectStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing = query_scene_ids(&tx, &chapter.to_string())?;
-        if position as usize > existing.len() {
-            return Err(StorageError::Invalid(
-                "scene position beyond sibling count".into(),
-            ));
-        }
-        let max: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(position),0) FROM scene_placement",
-            [],
-            |r| r.get(0),
-        )?;
-        let base = max
-            .checked_mul(3)
-            .and_then(|x| x.checked_add(existing.len() as i64 + 100))
-            .ok_or_else(|| StorageError::Invalid("position space exhausted".into()))?;
-        for sid in &existing {
-            tx.execute(
-                "UPDATE scene_placement SET position=position+?2 WHERE scene_id=?1",
-                params![sid, base],
+        if let Some((chapter, position)) = placement {
+            let existing = query_scene_ids(&tx, &chapter.to_string())?;
+            if position as usize > existing.len() {
+                return Err(StorageError::Invalid(
+                    "scene position beyond sibling count".into(),
+                ));
+            }
+            let max: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(position),0) FROM scene_placement",
+                [],
+                |r| r.get(0),
             )?;
-        }
-        for (i, sid) in existing.iter().enumerate() {
-            let p = i as i64 + if i as u32 >= position { 1 } else { 0 };
-            tx.execute(
-                "UPDATE scene_placement SET position=?2 WHERE scene_id=?1",
-                params![sid, p],
-            )?;
+            let base = max
+                .checked_mul(3)
+                .and_then(|x| x.checked_add(existing.len() as i64 + 100))
+                .ok_or_else(|| StorageError::Invalid("position space exhausted".into()))?;
+            for sid in &existing {
+                tx.execute(
+                    "UPDATE scene_placement SET position=position+?2 WHERE scene_id=?1",
+                    params![sid, base],
+                )?;
+            }
+            for (i, sid) in existing.iter().enumerate() {
+                let p = i as i64 + if i as u32 >= position { 1 } else { 0 };
+                tx.execute(
+                    "UPDATE scene_placement SET position=?2 WHERE scene_id=?1",
+                    params![sid, p],
+                )?;
+            }
         }
         atomic_write(&scene_path, b"")?;
         let hash = hash_bytes(b"");
@@ -2480,10 +2498,12 @@ impl ProjectStore {
             "INSERT INTO scene(id,title,created_at,updated_at) VALUES(?1,?2,?3,?3)",
             params![id.to_string(), title, now],
         )?;
-        tx.execute(
-            "INSERT INTO scene_placement(scene_id,chapter_id,position) VALUES(?1,?2,?3)",
-            params![id.to_string(), chapter.to_string(), i64::from(position)],
-        )?;
+        if let Some((chapter, position)) = placement {
+            tx.execute(
+                "INSERT INTO scene_placement(scene_id,chapter_id,position) VALUES(?1,?2,?3)",
+                params![id.to_string(), chapter.to_string(), i64::from(position)],
+            )?;
+        }
         tx.execute("INSERT INTO scene_content(scene_id,relative_path,sha256,byte_length) VALUES(?1,?2,?3,0)",params![id.to_string(),rel,hash])?;
         let defaults: Vec<CustomDefaultRow> = {
             let mut q=tx.prepare("SELECT id,field_type,default_text,default_integer,default_decimal,default_boolean,reference_kind FROM custom_field_definition WHERE default_text IS NOT NULL OR default_integer IS NOT NULL OR default_decimal IS NOT NULL OR default_boolean IS NOT NULL")?;
@@ -2884,7 +2904,7 @@ impl ProjectStore {
         Ok(())
     }
     pub fn list_scenes(&self, include_archived: bool) -> Result<Vec<SceneRecord>> {
-        let sql = "WITH RECURSIVE node_order(id,path) AS (SELECT id,printf('%010d/',position) FROM structural_node WHERE parent_id IS NULL UNION ALL SELECT n.id,o.path||printf('%010d/',n.position) FROM structural_node n JOIN node_order o ON n.parent_id=o.id) SELECT s.id FROM scene s LEFT JOIN scene_placement p ON p.scene_id=s.id LEFT JOIN node_order n ON n.id=p.chapter_id WHERE (?1=1 OR s.archived=0) ORDER BY n.path,p.position,s.id";
+        let sql = "WITH RECURSIVE node_order(id,path) AS (SELECT id,printf('%010d/',position) FROM structural_node WHERE parent_id IS NULL UNION ALL SELECT n.id,o.path||printf('%010d/',n.position) FROM structural_node n JOIN node_order o ON n.parent_id=o.id) SELECT s.id FROM scene s LEFT JOIN scene_placement p ON p.scene_id=s.id LEFT JOIN node_order n ON n.id=p.chapter_id WHERE (?1=1 OR s.archived=0) ORDER BY CASE WHEN p.scene_id IS NULL THEN 0 ELSE 1 END,n.path,p.position,s.created_at,s.id";
         let ids: Vec<String> = {
             let mut q = self.conn.prepare(sql)?;
             q.query_map([include_archived], |r| r.get(0))?
@@ -3158,7 +3178,44 @@ impl ProjectStore {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        let (src, old) = source.ok_or_else(|| StorageError::NotFound(id.to_string()))?;
+        let Some((src, old)) = source else {
+            let mut dest_ids = query_scene_ids(&tx, &dest.to_string())?;
+            if position as usize > dest_ids.len() {
+                return Err(StorageError::Invalid(
+                    "position beyond sibling count".into(),
+                ));
+            }
+            dest_ids.insert(position as usize, id.to_string());
+            let max: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(position),0) FROM scene_placement",
+                [],
+                |r| r.get(0),
+            )?;
+            let base = max
+                .checked_mul(3)
+                .and_then(|value| value.checked_add(dest_ids.len() as i64 + 100))
+                .ok_or_else(|| StorageError::Invalid("position space exhausted".into()))?;
+            for (index, scene_id) in dest_ids.iter().enumerate() {
+                if scene_id != &id.to_string() {
+                    tx.execute(
+                        "UPDATE scene_placement SET position=?2 WHERE scene_id=?1",
+                        params![scene_id, base + index as i64],
+                    )?;
+                }
+            }
+            tx.execute(
+                "INSERT INTO scene_placement(scene_id,chapter_id,position) VALUES(?1,?2,?3)",
+                params![id.to_string(), dest.to_string(), base + position as i64],
+            )?;
+            for (index, scene_id) in dest_ids.iter().enumerate() {
+                tx.execute(
+                    "UPDATE scene_placement SET position=?2 WHERE scene_id=?1",
+                    params![scene_id, index as i64],
+                )?;
+            }
+            tx.commit()?;
+            return Ok(());
+        };
         let mut src_ids: Vec<String> = query_scene_ids(&tx, &src)?;
         let mut dest_ids = if src == dest.to_string() {
             src_ids.clone()
@@ -12570,6 +12627,28 @@ mod tests {
         assert_eq!(reopened.get_scene(scene).unwrap().scene.title, "Draft");
         assert!(reopened.load_text(scene).unwrap().0.is_empty());
         assert!(reopened.set_scene_included(SceneId::new(), false).is_err());
+    }
+
+    #[test]
+    fn scenes_can_exist_without_chapter_placement_and_survive_reopen() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut store = ProjectStore::create(&project, "Novel").unwrap();
+        let scene = store.create_unplaced_scene("Unplaced idea").unwrap();
+        assert_eq!(store.get_scene(scene).unwrap().chapter_id, None);
+        assert!(
+            project
+                .join("manuscript")
+                .join(format!("{scene}.md"))
+                .is_file()
+        );
+        drop(store);
+
+        let reopened = ProjectStore::open(&project).unwrap();
+        let record = reopened.get_scene(scene).unwrap();
+        assert_eq!(record.scene.title, "Unplaced idea");
+        assert_eq!(record.chapter_id, None);
+        assert_eq!(reopened.list_scenes(false).unwrap()[0].scene.id, scene);
     }
 
     #[test]

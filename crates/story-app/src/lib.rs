@@ -1222,6 +1222,9 @@ impl WriterApp {
     pub fn create_scene(&mut self, chapter: NodeId, title: &str, position: u32) -> Result<SceneId> {
         Ok(self.store.create_scene(chapter, position, title)?)
     }
+    pub fn create_unplaced_scene(&mut self, title: &str) -> Result<SceneId> {
+        Ok(self.store.create_unplaced_scene(title)?)
+    }
     pub fn create_content_unit(
         &mut self,
         kind: ContentUnitKind,
@@ -6783,6 +6786,48 @@ unexpected_prose = "must not be silently discarded"
             String::from_utf8(compiled.bytes)
                 .unwrap()
                 .contains("This draft is set aside.")
+        );
+    }
+
+    #[test]
+    fn unplaced_scene_is_persistent_but_omitted_until_explicitly_placed() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let scene = app.create_unplaced_scene("Unplaced idea").unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Drafted before choosing a chapter.")
+            .unwrap();
+        assert_eq!(app.get_scene(scene).unwrap().chapter_id, None);
+
+        let compiled = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        assert!(
+            !String::from_utf8(compiled.bytes)
+                .unwrap()
+                .contains("Drafted before choosing a chapter.")
+        );
+
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        app.move_scene(scene, chapter, 0).unwrap();
+        let compiled = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        assert!(
+            String::from_utf8(compiled.bytes)
+                .unwrap()
+                .contains("Drafted before choosing a chapter.")
+        );
+        drop(app);
+
+        let reopened = WriterApp::open_project(project).unwrap();
+        let record = reopened.get_scene(scene).unwrap();
+        assert_eq!(record.scene.title, "Unplaced idea");
+        assert_eq!(record.chapter_id, Some(chapter));
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "Drafted before choosing a chapter."
         );
     }
 
