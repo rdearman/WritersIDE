@@ -4088,6 +4088,9 @@ impl WriterApp {
     ) -> Result<(ImportRunId, Vec<SceneId>)> {
         let source_type = match &staging.source_type {
             story_import::SourceType::Scrivener => "scrivener",
+            story_import::SourceType::PlainText => "plain-text",
+            story_import::SourceType::Markdown => "markdown",
+            story_import::SourceType::Org => "org",
             story_import::SourceType::Docx => "docx",
             story_import::SourceType::Rtf => "rtf",
             story_import::SourceType::Odt => "odt",
@@ -4107,9 +4110,17 @@ impl WriterApp {
         )?;
         let mut imported = Vec::new();
         let mut unsupported = staging.unsupported.clone();
+        let mut chapter_position = self
+            .list_structural_nodes()?
+            .iter()
+            .filter(|node| node.parent_id.is_none())
+            .count() as u32;
         for (position, unit) in staging.units.iter().enumerate() {
             let chapter_title = format!("Chapter {}", position + 1);
-            let chapter = self.create_chapter(None, &chapter_title, position as u32)?;
+            let chapter = self.create_chapter(None, &chapter_title, chapter_position)?;
+            chapter_position = chapter_position
+                .checked_add(1)
+                .ok_or_else(|| AppError::Domain("chapter position overflow".into()))?;
             let scene = self.create_scene(chapter, &unit.title, 0)?;
             let (_, current_hash) = self.load_scene_text(scene)?;
             self.save_scene_text(scene, Some(&current_hash), &unit.body_markdown)?;
@@ -7564,6 +7575,46 @@ unexpected_prose = "must not be silently discarded"
         assert_eq!(summary.source_items, 1);
         assert_eq!(summary.provenance_records, 2);
         assert_eq!(summary.status, "incomplete");
+    }
+
+    #[test]
+    fn text_and_org_staging_import_into_scenes_without_touching_source_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("outside.txt");
+        let org = dir.path().join("outline.org");
+        fs::write(&plain, "Outside reference prose.\n\nSecond paragraph.").unwrap();
+        fs::write(&org, "* Opening\n\nAn /important/ beat.").unwrap();
+        let plain_before = fs::read(&plain).unwrap();
+        let org_before = fs::read(&org).unwrap();
+        let plain_staging = story_import::inspect_manuscript(&plain).unwrap();
+        let org_staging = story_import::inspect_manuscript(&org).unwrap();
+        let mut app = WriterApp::create_project(dir.path().join("Imported"), "Imported").unwrap();
+
+        let (plain_run, plain_scenes) = app.import_staged_manuscript(&plain_staging).unwrap();
+        let (org_run, org_scenes) = app.import_staged_manuscript(&org_staging).unwrap();
+
+        assert_eq!(plain_scenes.len(), 1);
+        assert_eq!(org_scenes.len(), 1);
+        assert_eq!(
+            app.load_scene_text(plain_scenes[0]).unwrap().0,
+            "Outside reference prose.\n\nSecond paragraph."
+        );
+        assert!(
+            app.load_scene_text(org_scenes[0])
+                .unwrap()
+                .0
+                .contains("*important*")
+        );
+        assert_eq!(
+            app.get_import_run_summary(plain_run).unwrap().status,
+            "completed"
+        );
+        assert_eq!(
+            app.get_import_run_summary(org_run).unwrap().status,
+            "completed"
+        );
+        assert_eq!(fs::read(plain).unwrap(), plain_before);
+        assert_eq!(fs::read(org).unwrap(), org_before);
     }
 
     #[test]

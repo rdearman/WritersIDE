@@ -9,6 +9,9 @@ use thiserror::Error;
 pub enum SourceType {
     Scrivener,
     Spreadsheet,
+    PlainText,
+    Markdown,
+    Org,
     Docx,
     Rtf,
     Odt,
@@ -58,6 +61,8 @@ pub enum ImportError {
     UnsupportedFormat(String),
     #[error("cannot read manuscript source: {0}")]
     Io(String),
+    #[error("text source is not valid UTF-8: {0}")]
+    InvalidEncoding(String),
     #[error("invalid manuscript archive: {0}")]
     Archive(String),
     #[error("invalid Scrivener import mapping: {0}")]
@@ -81,6 +86,300 @@ pub struct ManuscriptStaging {
     pub units: Vec<ManuscriptUnit>,
     pub warnings: Vec<String>,
     pub unsupported: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum TextDocumentFormat {
+    PlainText,
+    Markdown,
+    Org,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OrgImportMode {
+    SingleDocument,
+    HeadingHierarchy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextDocumentUnit {
+    pub source_document_id: String,
+    pub title: String,
+    /// Org heading depth (1–6), or `None` for a single document/prose before
+    /// the first heading. This is preview metadata; it does not change source.
+    pub heading_level: Option<u8>,
+    pub body_markdown: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TextDocumentPreview {
+    pub format: TextDocumentFormat,
+    pub source_path: String,
+    pub source_fingerprint: String,
+    pub title: String,
+    pub units: Vec<TextDocumentUnit>,
+    pub warnings: Vec<String>,
+    pub unsupported: Vec<String>,
+}
+
+/// Reads a text, Markdown, or Org-mode source without modifying it. Org
+/// hierarchy mode groups prose under its source headings and preserves the
+/// heading depth for a later destination-mapping step.
+pub fn inspect_text_document(
+    path: impl AsRef<Path>,
+    org_mode: OrgImportMode,
+) -> Result<TextDocumentPreview, ImportError> {
+    let path = path.as_ref();
+    let bytes = fs::read(path).map_err(|error| ImportError::Io(error.to_string()))?;
+    let fingerprint = format!("{:x}", Sha256::digest(&bytes));
+    let source = String::from_utf8(bytes)
+        .map_err(|error| ImportError::InvalidEncoding(error.to_string()))?;
+    let extension = path
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let format = match extension.as_str() {
+        "txt" | "text" => TextDocumentFormat::PlainText,
+        "md" | "markdown" | "mdown" => TextDocumentFormat::Markdown,
+        "org" => TextDocumentFormat::Org,
+        _ => return Err(ImportError::UnsupportedFormat(extension)),
+    };
+    let title = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("Imported Text")
+        .to_owned();
+    let mut warnings = Vec::new();
+    let mut unsupported = if format == TextDocumentFormat::Org {
+        org_unsupported_constructs(&source)
+    } else {
+        Vec::new()
+    };
+    let units = if format == TextDocumentFormat::Org && org_mode == OrgImportMode::HeadingHierarchy
+    {
+        parse_org_hierarchy(&source, &fingerprint, &mut unsupported)
+    } else {
+        let body_markdown = if format == TextDocumentFormat::Org {
+            source
+                .lines()
+                .map(org_line_to_markdown)
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            source.clone()
+        };
+        vec![TextDocumentUnit {
+            source_document_id: format!("text:{fingerprint}:0"),
+            title: title.clone(),
+            heading_level: None,
+            body_markdown,
+        }]
+    };
+    if units.is_empty() {
+        warnings.push("No text units were found in the source".into());
+    }
+    Ok(TextDocumentPreview {
+        format,
+        source_path: path.to_string_lossy().into_owned(),
+        source_fingerprint: fingerprint,
+        title,
+        units,
+        warnings,
+        unsupported,
+    })
+}
+
+fn parse_org_hierarchy(
+    source: &str,
+    fingerprint: &str,
+    unsupported: &mut Vec<String>,
+) -> Vec<TextDocumentUnit> {
+    let mut units = Vec::new();
+    let mut title: Option<String> = None;
+    let mut level = None;
+    let mut body = Vec::new();
+    let mut index = 0usize;
+    for line in source.lines() {
+        if let Some((heading_level, heading)) = parse_org_heading(line) {
+            if title.is_some() || body.iter().any(|part: &String| !part.is_empty()) {
+                let unit_title = title.take().unwrap_or_else(|| "Preamble".into());
+                units.push(TextDocumentUnit {
+                    source_document_id: format!("org:{fingerprint}:{index}"),
+                    title: unit_title,
+                    heading_level: level,
+                    body_markdown: body.join("\n"),
+                });
+                index += 1;
+                body.clear();
+            }
+            title = Some(org_inline_to_markdown(heading.trim()));
+            level = Some(heading_level);
+        } else {
+            if let Some(description) = org_unsupported_line(line) {
+                unsupported.push(description);
+            }
+            body.push(org_line_to_markdown(line));
+        }
+    }
+    if title.is_some() || !body.is_empty() {
+        units.push(TextDocumentUnit {
+            source_document_id: format!("org:{fingerprint}:{index}"),
+            title: title.unwrap_or_else(|| "Preamble".into()),
+            heading_level: level,
+            body_markdown: body.join("\n"),
+        });
+    }
+    if units.is_empty() && !source.is_empty() {
+        units.push(TextDocumentUnit {
+            source_document_id: format!("org:{fingerprint}:0"),
+            title: "Preamble".into(),
+            heading_level: None,
+            body_markdown: source
+                .lines()
+                .map(org_line_to_markdown)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+    }
+    unsupported.sort();
+    unsupported.dedup();
+    units
+}
+
+fn parse_org_heading(line: &str) -> Option<(u8, &str)> {
+    let level = line.bytes().take_while(|byte| *byte == b'*').count();
+    if level == 0
+        || !line
+            .as_bytes()
+            .get(level)
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        return None;
+    }
+    Some((
+        level.min(u8::MAX as usize) as u8,
+        line[level..].trim_start(),
+    ))
+}
+
+fn org_unsupported_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.starts_with("#+begin_") || trimmed.starts_with("#+BEGIN_") {
+        Some(format!("Org block needs review: {trimmed}"))
+    } else if trimmed.starts_with(':')
+        && trimmed.ends_with(':')
+        && trimmed.matches(':').count() >= 2
+    {
+        Some(format!("Org drawer/property line needs review: {trimmed}"))
+    } else if trimmed.starts_with("#+") {
+        Some(format!("Org directive needs review: {trimmed}"))
+    } else {
+        None
+    }
+}
+
+fn org_unsupported_constructs(source: &str) -> Vec<String> {
+    let mut unsupported = Vec::new();
+    for line in source.lines() {
+        if let Some(description) = org_unsupported_line(line) {
+            unsupported.push(description);
+        }
+        if parse_org_heading(line).is_some()
+            && line.split_whitespace().nth(1).is_some_and(|word| {
+                matches!(word, "TODO" | "DONE" | "NEXT" | "WAITING" | "CANCELLED")
+            })
+        {
+            unsupported.push(format!("Org task state needs review: {}", line.trim()));
+        }
+    }
+    if source.contains("[[") {
+        unsupported.push("Org links are converted to Markdown links; review their targets".into());
+    }
+    unsupported.sort();
+    unsupported.dedup();
+    unsupported
+}
+
+fn org_line_to_markdown(line: &str) -> String {
+    if let Some((level, heading)) = parse_org_heading(line) {
+        return format!(
+            "{} {}",
+            "#".repeat(level.min(6) as usize),
+            org_inline_to_markdown(heading)
+        );
+    }
+    org_inline_to_markdown(line)
+}
+
+fn org_inline_to_markdown(line: &str) -> String {
+    // Keep URL path separators inside Org links untouched while converting the
+    // link syntax itself. Emphasis on the same link-bearing line is left as Org
+    // syntax rather than risking a lossy rewrite.
+    if line.contains("[[") {
+        return convert_org_links(line);
+    }
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.char_indices().peekable();
+    while let Some((start, character)) = chars.next() {
+        let delimiter = match character {
+            '*' => Some("**"),
+            '/' => Some("*"),
+            '~' | '=' => Some("`"),
+            '+' => Some("~~"),
+            _ => None,
+        };
+        if let Some(markdown) = delimiter {
+            let close = line[start + character.len_utf8()..]
+                .find(character)
+                .map(|offset| start + character.len_utf8() + offset);
+            if let Some(end) = close {
+                let content_start = start + character.len_utf8();
+                let content = &line[content_start..end];
+                if !content.is_empty()
+                    && !content.chars().next().is_some_and(char::is_whitespace)
+                    && !content.chars().next_back().is_some_and(char::is_whitespace)
+                    && !(character == '/'
+                        && (line[..start].ends_with(':') || line[..start].contains("://")))
+                {
+                    out.push_str(markdown);
+                    out.push_str(content);
+                    out.push_str(markdown);
+                    while chars.peek().is_some_and(|(offset, _)| *offset <= end) {
+                        chars.next();
+                    }
+                    continue;
+                }
+            }
+        }
+        out.push(character);
+    }
+    convert_org_links(&out)
+}
+
+fn convert_org_links(source: &str) -> String {
+    let mut output = String::new();
+    let mut rest = source;
+    while let Some(start) = rest.find("[[") {
+        output.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("]]") else {
+            output.push_str(&rest[start..]);
+            return output;
+        };
+        let inner = &after[..end];
+        let (target, label) = inner
+            .split_once("][")
+            .map_or((inner, inner), |(target, label)| (target, label));
+        output.push('[');
+        output.push_str(label);
+        output.push_str("](");
+        output.push_str(target);
+        output.push(')');
+        rest = &after[end + 2..];
+    }
+    output.push_str(rest);
+    output
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -945,13 +1244,42 @@ fn line_edits<'a>(base: &[&'a str], changed: &[&'a str]) -> Vec<LineEdit<'a>> {
 /// are fingerprinted and never rewritten; formatting losses are reported.
 pub fn inspect_manuscript(path: impl AsRef<Path>) -> Result<ManuscriptStaging, ImportError> {
     let path = path.as_ref();
-    let bytes = std::fs::read(path).map_err(|error| ImportError::Io(error.to_string()))?;
-    let fingerprint = format!("{:x}", Sha256::digest(&bytes));
     let extension = path
         .extension()
         .and_then(|value| value.to_str())
         .unwrap_or_default()
         .to_ascii_lowercase();
+    if matches!(
+        extension.as_str(),
+        "txt" | "text" | "md" | "markdown" | "mdown" | "org"
+    ) {
+        let preview = inspect_text_document(path, OrgImportMode::SingleDocument)?;
+        let source_type = match preview.format {
+            TextDocumentFormat::PlainText => SourceType::PlainText,
+            TextDocumentFormat::Markdown => SourceType::Markdown,
+            TextDocumentFormat::Org => SourceType::Org,
+        };
+        return Ok(ManuscriptStaging {
+            source_type,
+            source_path: preview.source_path,
+            source_fingerprint: preview.source_fingerprint,
+            title: preview.title,
+            units: preview
+                .units
+                .into_iter()
+                .map(|unit| ManuscriptUnit {
+                    source_document_id: unit.source_document_id,
+                    title: unit.title,
+                    body_markdown: unit.body_markdown,
+                    unsupported: preview.unsupported.clone(),
+                })
+                .collect(),
+            warnings: preview.warnings,
+            unsupported: preview.unsupported,
+        });
+    }
+    let bytes = std::fs::read(path).map_err(|error| ImportError::Io(error.to_string()))?;
+    let fingerprint = format!("{:x}", Sha256::digest(&bytes));
     let source_type = match extension.as_str() {
         "docx" => SourceType::Docx,
         "rtf" => SourceType::Rtf,
@@ -2393,6 +2721,103 @@ mod tests {
             decisions: BTreeMap::new(),
         };
         assert_eq!(inv.apply_mapping_plan(&plan).unwrap(), 1);
+    }
+
+    #[test]
+    fn org_hierarchy_preview_keeps_heading_depth_prose_order_and_unsupported_features() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("notes.org");
+        let contents = "Before headings.\n\n* Part One\nOpening *bright* prose.\n** TODO First scene\n- Keep this list.\nA [[https://example.test/path][useful link]].\n#+begin_src rust\nprintln!(\"kept\");\n#+end_src\n:PROPERTIES:\n:ID: scene-1\n:END:\n*** Later beat\nA final paragraph.";
+        fs::write(&source, contents).unwrap();
+        let original = fs::read(&source).unwrap();
+
+        let preview = inspect_text_document(&source, OrgImportMode::HeadingHierarchy).unwrap();
+
+        assert_eq!(preview.format, TextDocumentFormat::Org);
+        assert_eq!(preview.units.len(), 4);
+        assert_eq!(preview.units[0].title, "Preamble");
+        assert_eq!(preview.units[1].heading_level, Some(1));
+        assert_eq!(preview.units[1].title, "Part One");
+        assert!(preview.units[1].body_markdown.contains("**bright**"));
+        assert_eq!(preview.units[2].heading_level, Some(2));
+        assert_eq!(preview.units[2].title, "TODO First scene");
+        assert!(preview.units[2].body_markdown.contains("- Keep this list."));
+        assert!(
+            preview.units[2]
+                .body_markdown
+                .contains("[useful link](https://example.test/path)")
+        );
+        assert!(
+            preview.units[2]
+                .body_markdown
+                .contains("println!(\"kept\");")
+        );
+        assert_eq!(preview.units[3].heading_level, Some(3));
+        assert_eq!(preview.units[4 - 1].title, "Later beat");
+        assert!(
+            preview
+                .unsupported
+                .iter()
+                .any(|item| item.contains("Org block needs review"))
+        );
+        assert!(
+            preview
+                .unsupported
+                .iter()
+                .any(|item| item.contains("Org drawer/property"))
+        );
+        assert!(
+            preview
+                .unsupported
+                .iter()
+                .any(|item| item.contains("task state"))
+        );
+        assert_eq!(fs::read(source).unwrap(), original);
+    }
+
+    #[test]
+    fn plain_text_preview_preserves_utf8_paragraphs_and_crlf_and_rejects_invalid_utf8() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("draft.txt");
+        let contents = "Élodie wrote a line.\r\n\r\n안녕하세요, world.\r\n";
+        fs::write(&source, contents.as_bytes()).unwrap();
+        let preview = inspect_text_document(&source, OrgImportMode::SingleDocument).unwrap();
+        assert_eq!(preview.format, TextDocumentFormat::PlainText);
+        assert_eq!(preview.units.len(), 1);
+        assert_eq!(preview.units[0].body_markdown, contents);
+
+        fs::write(&source, [0xf0, 0x28, 0x8c, 0x28]).unwrap();
+        assert!(matches!(
+            inspect_text_document(&source, OrgImportMode::SingleDocument),
+            Err(ImportError::InvalidEncoding(_))
+        ));
+    }
+
+    #[test]
+    fn manuscript_inspector_accepts_markdown_and_org_without_modifying_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let markdown = dir.path().join("draft.md");
+        let org = dir.path().join("draft.org");
+        fs::write(&markdown, "# Opening\n\nMarkdown prose.").unwrap();
+        fs::write(&org, "* Opening\n\nOrg prose with /emphasis/.").unwrap();
+        let markdown_staging = inspect_manuscript(&markdown).unwrap();
+        let org_staging = inspect_manuscript(&org).unwrap();
+        assert_eq!(markdown_staging.source_type, SourceType::Markdown);
+        assert!(
+            markdown_staging.units[0]
+                .body_markdown
+                .contains("Markdown prose.")
+        );
+        assert_eq!(org_staging.source_type, SourceType::Org);
+        assert!(org_staging.units[0].body_markdown.contains("*emphasis*"));
+        assert_eq!(
+            fs::read_to_string(markdown).unwrap(),
+            "# Opening\n\nMarkdown prose."
+        );
+        assert_eq!(
+            fs::read_to_string(org).unwrap(),
+            "* Opening\n\nOrg prose with /emphasis/."
+        );
     }
     #[test]
     fn duplicate_source_items_are_rejected() {
