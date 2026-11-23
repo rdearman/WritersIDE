@@ -25,6 +25,9 @@ pub struct TutorialProgress {
     pub step: usize,
     pub demo_project: String,
     pub return_project: String,
+    /// Stable sample scene restored when a resumed lesson requires the editor.
+    #[serde(default)]
+    pub demo_scene: Option<String>,
     /// Verified user actions for the current tutorial route. Older preference
     /// files deserialize with an empty set so progress remains resumable.
     #[serde(default)]
@@ -122,6 +125,7 @@ mod tests {
             step: 1,
             demo_project: "demo".into(),
             return_project: "book".into(),
+            demo_scene: None,
             verified_actions: BTreeSet::new(),
         });
         store(&path, &preferences).unwrap();
@@ -151,6 +155,7 @@ mod tests {
                 step: 3,
                 demo_project: "/tutorial/demo".into(),
                 return_project: "/books/novel".into(),
+                demo_scene: None,
                 verified_actions: BTreeSet::new(),
             }),
         };

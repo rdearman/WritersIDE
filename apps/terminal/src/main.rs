@@ -589,7 +589,15 @@ fn tutorial_panel_at(
     let lesson_complete = step == 0
         && verified.is_some_and(|actions| {
             [
-                "menu", "outline", "scene", "write", "save", "return", "resume",
+                "menu",
+                "navigate-menu",
+                "outline-select",
+                "outline",
+                "scene",
+                "write",
+                "save",
+                "return",
+                "resume",
             ]
             .iter()
             .all(|action| actions.contains(*action))
@@ -599,7 +607,7 @@ fn tutorial_panel_at(
         lines.push(body.into());
     }
     if lesson_complete {
-        lines.push("Lesson 1 complete".into());
+        lines.push("Navigation lesson complete · Enter continues".into());
     } else {
         let completed = verified.map_or(0, |actions| {
             required
@@ -613,30 +621,22 @@ fn tutorial_panel_at(
         let task = next_task.map_or(
             "All practice tasks verified. Resume the lesson to continue.".to_owned(),
             |(key, _)| match *key {
-                "menu" => "1/7 · Press F10 to open the menu".into(),
-                "outline" => "2/7 · Right to Navigate · Down to Outline · Enter".into(),
-                "scene" => "3/7 · Select the sample scene · Enter".into(),
-                "write" => "4/7 · Type a few words in the sample scene".into(),
-                "save" => "5/7 · Choose File > Save".into(),
-                "return" => "6/7 · Press Esc to return to Outline".into(),
-                "resume" => "7/7 · Choose Help > Resume Tutorial".into(),
+                "menu" => "1/9 · Press F10 to open the menu".into(),
+                "navigate-menu" => "2/9 · Press → until Navigate is highlighted".into(),
+                "outline-select" => "3/9 · Press ↓ until Outline is highlighted".into(),
+                "outline" => "4/9 · Press Enter to open Outline".into(),
+                "scene" => "5/9 · Select the sample scene and press Enter".into(),
+                "write" => "6/9 · Type a few words in the sample scene".into(),
+                "save" => "7/9 · Save your writing from File > Save".into(),
+                "return" => "8/9 · Press Esc to return to Outline".into(),
+                "resume" => "9/9 · Choose Help > Resume Tutorial".into(),
                 _ => "Continue the practice in the sample book.".into(),
             },
         );
-        lines.push(format!(
-            "Practice {completed}/{} tasks complete",
-            required.len()
-        ));
-        lines.push(task);
+        lines.push(format!("{completed}/{} verified · {task}", required.len()));
     }
-    if lesson_complete {
-        lines.push("Lesson 1 complete".into());
-        lines.push("▶ Continue to Lesson 2 · press Enter".into());
-        lines.push("F4 Back · F5 Retry · F7 Skip · F8 Exit · Esc Pause".into());
-    } else {
-        lines.push("F4 Back · F5 Retry · F7 Skip · F8 Exit".into());
-        lines.push("Esc Pause · Help > Resume Tutorial".into());
-    }
+    lines.push("F4 Back · F5 Retry · F7 Skip · F8 Exit · Esc Pause".into());
+    lines.push("Help > Resume Tutorial returns to this step".into());
     HelpPanel {
         title: format!("Tutorial · {title} · {}/{}", step + 1, lessons.len()),
         lines,
@@ -644,8 +644,10 @@ fn tutorial_panel_at(
     }
 }
 
-const TUTORIAL_NAVIGATION_ACTIONS: [(&str, &str); 7] = [
+const TUTORIAL_NAVIGATION_ACTIONS: [(&str, &str); 9] = [
     ("menu", "Open the menu"),
+    ("navigate-menu", "Move the menu highlight to Navigate"),
+    ("outline-select", "Highlight Outline"),
     ("outline", "Visit Outline"),
     ("scene", "Open the sample scene"),
     ("write", "Write in the scene"),
@@ -5308,6 +5310,36 @@ impl AppState {
         let Some(progress) = preferences.active_tutorial.as_mut() else {
             return;
         };
+        let demo_path = PathBuf::from(&progress.demo_project).canonicalize().ok();
+        let current_path = self.app.project_root().canonicalize().ok();
+        let state_verified = match action {
+            "menu" => self.menu.is_some(),
+            "navigate-menu" => self
+                .menu
+                .is_some_and(|menu| MENU_CATEGORIES[menu.top] == "Navigate"),
+            "outline-select" => self.menu.is_some_and(|menu| {
+                MENU_CATEGORIES[menu.top] == "Navigate"
+                    && self
+                        .menu_visible_entries()
+                        .get(menu.selected)
+                        .is_some_and(|command| command.id == "view.outline")
+            }),
+            "outline" => self.workspace == Workspace::Outline,
+            "scene" => self.workspace == Workspace::Editor && self.editing_scene.is_some(),
+            "write" => self.workspace == Workspace::Editor && self.dirty,
+            "save" => self.workspace == Workspace::Editor && !self.dirty,
+            "return" => self.workspace == Workspace::Outline,
+            "resume" => self
+                .help_panel
+                .as_ref()
+                .is_some_and(|panel| panel.title.starts_with("Tutorial ·")),
+            _ => true,
+        } && demo_path.is_some()
+            && current_path == demo_path;
+        if !state_verified {
+            self.message = "That step is not complete yet · your tutorial progress is safe".into();
+            return;
+        }
         if progress.step == 0 {
             let next = TUTORIAL_NAVIGATION_ACTIONS
                 .iter()
@@ -5330,14 +5362,15 @@ impl AppState {
                 }
             }
         }
-        if progress_saved
-            && let Some(progress) = preferences.active_tutorial.as_ref()
-            && self
+        if progress_saved && let Some(progress) = preferences.active_tutorial.as_ref() {
+            if self
                 .help_panel
                 .as_ref()
                 .is_some_and(|panel| panel.title.starts_with("Tutorial ·"))
-        {
-            self.help_panel = Some(tutorial_panel_at(progress.track, progress.step, &path));
+            {
+                self.help_panel = Some(tutorial_panel_at(progress.track, progress.step, &path));
+            }
+            self.message = format!("Tutorial step verified · {}", action.replace('-', " "));
         }
     }
 
@@ -9575,9 +9608,6 @@ impl AppState {
         if self.workspace != w {
             let previous = self.workspace;
             let current_scene = self.editing_scene.or_else(|| self.active_scene());
-            if w == Workspace::Outline {
-                self.record_tutorial_action("outline");
-            }
             if self.history_index + 1 < self.history.len() {
                 self.history.truncate(self.history_index + 1);
             }
@@ -9612,6 +9642,9 @@ impl AppState {
                 self.proposal_review_index = 0;
             }
             self.workspace = w;
+            if w == Workspace::Outline {
+                self.record_tutorial_action("outline");
+            }
         }
     }
     fn selected_scene(&self) -> String {
@@ -9691,13 +9724,13 @@ impl AppState {
         if self.menu.take().is_some() {
             self.message = "Menu closed; editor focus restored".into();
         } else {
-            self.record_tutorial_action("menu");
             self.menu = Some(MenuState {
                 top: 0,
                 selected: 0,
                 all_commands: false,
             });
             self.message = "Main menu · arrows navigate · Enter selects · Esc closes".into();
+            self.record_tutorial_action("menu");
         }
     }
     fn show_context_help(&mut self) {
@@ -9783,6 +9816,10 @@ impl AppState {
                 )?;
             }
         }
+        let demo_scene_id = demo
+            .list_scenes(false)?
+            .first()
+            .map(|record| record.scene.id.to_string());
         demo.recover_interrupted_writing_challenges()?;
         let mut preferences = onboarding::load(&preferences_path)?;
         preferences.version = onboarding::PREFERENCES_VERSION;
@@ -9794,6 +9831,7 @@ impl AppState {
             step: 0,
             demo_project: demo_path.canonicalize()?.to_string_lossy().into_owned(),
             return_project: return_project.to_string_lossy().into_owned(),
+            demo_scene: demo_scene_id,
             verified_actions: BTreeSet::new(),
         });
         onboarding::store(&preferences_path, &preferences)?;
@@ -9848,23 +9886,98 @@ impl AppState {
         let preferences_path = self.tutorial_preferences_path.clone();
         self.resume_tutorial_at(&preferences_path)
     }
+    fn restore_tutorial_context(
+        &mut self,
+        next_action: Option<&str>,
+        demo_scene: Option<&str>,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        self.menu = None;
+        match next_action {
+            Some("menu") => self.switch(Workspace::Dashboard),
+            Some("navigate-menu") => {
+                self.open_menu_category(0);
+            }
+            Some("outline-select") | Some("outline") => {
+                let navigate = MENU_CATEGORIES
+                    .iter()
+                    .position(|category| *category == "Navigate")
+                    .unwrap_or(3);
+                self.open_menu_category(navigate);
+                if next_action == Some("outline") {
+                    let selected = self
+                        .menu_visible_entries()
+                        .iter()
+                        .position(|command| command.id == "view.outline")
+                        .unwrap_or(0);
+                    self.menu.as_mut().unwrap().selected = selected;
+                }
+            }
+            Some("scene") => {
+                self.switch(Workspace::Outline);
+                self.refresh()?;
+                if let Some(scene) = demo_scene
+                    && let Some(row) =
+                        scene
+                            .parse::<uuid::Uuid>()
+                            .ok()
+                            .map(SceneId)
+                            .and_then(|id| {
+                                outline_rows(self)
+                                    .iter()
+                                    .position(|row| *row == OutlineRow::Scene(id))
+                            })
+                {
+                    self.selected = row;
+                }
+            }
+            Some("write") | Some("save") | Some("return") => {
+                let scenes = self.app.list_scenes(false)?;
+                let target = demo_scene
+                    .and_then(|expected| {
+                        scenes
+                            .iter()
+                            .find(|record| record.scene.id.to_string() == expected)
+                    })
+                    .or_else(|| scenes.first());
+                let Some(target) = target else {
+                    self.message =
+                        "Tutorial sample scene is missing · restart the tutorial to restore it"
+                            .into();
+                    return Ok(false);
+                };
+                if self.dirty && self.editing_scene != Some(target.scene.id) {
+                    self.message =
+                        "Save your current tutorial text before restoring the lesson".into();
+                    return Ok(false);
+                }
+                if self.editing_scene != Some(target.scene.id) {
+                    self.open_scene(target.scene.id)?;
+                } else {
+                    self.switch(Workspace::Editor);
+                }
+            }
+            Some("resume") => self.switch(Workspace::Outline),
+            _ => {}
+        }
+        Ok(true)
+    }
     fn resume_tutorial_at(
         &mut self,
         preferences_path: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let preferences_path = preferences_path.to_owned();
         self.tutorial_preferences_path = preferences_path.clone();
-        let mut preferences = onboarding::load(&preferences_path)?;
-        if let Some(progress) = preferences.active_tutorial.as_mut() {
-            let expected = progress.step == 0
-                && TUTORIAL_NAVIGATION_ACTIONS
-                    .iter()
-                    .find(|(required, _)| !progress.verified_actions.contains(*required))
-                    .is_some_and(|(action, _)| *action == "resume");
-            if expected && progress.verified_actions.insert("resume".into()) {
-                onboarding::store(&preferences_path, &preferences)?;
-            }
-        }
+        let preferences = onboarding::load(&preferences_path)?;
+        let should_record_resume = preferences
+            .active_tutorial
+            .as_ref()
+            .is_some_and(|progress| {
+                progress.step == 0
+                    && TUTORIAL_NAVIGATION_ACTIONS
+                        .iter()
+                        .find(|(required, _)| !progress.verified_actions.contains(*required))
+                        .is_some_and(|(action, _)| *action == "resume")
+            });
         let Some(progress) = preferences.active_tutorial else {
             return self.begin_tutorial_at(
                 onboarding::TutorialTrack::GuidedTour,
@@ -9873,6 +9986,11 @@ impl AppState {
             );
         };
         let demo_path = PathBuf::from(&progress.demo_project);
+        let next_action = TUTORIAL_NAVIGATION_ACTIONS
+            .iter()
+            .find(|(action, _)| !progress.verified_actions.contains(*action))
+            .map(|(action, _)| *action);
+        let demo_scene = progress.demo_scene.clone();
         let current_path = self.app.project_root().canonicalize().ok();
         let target_path = demo_path.canonicalize()?;
         if current_path.as_ref() != Some(&target_path) {
@@ -9882,12 +10000,20 @@ impl AppState {
             self.recent_projects_path = recent_projects_path;
             switched?;
         }
+        if progress.step == 0
+            && !self.restore_tutorial_context(next_action, demo_scene.as_deref())?
+        {
+            return Ok(());
+        }
         self.tutorial_preferences_path = preferences_path.clone();
         self.help_panel = Some(tutorial_panel_at(
             progress.track,
             progress.step,
             &self.tutorial_preferences_path,
         ));
+        if should_record_resume {
+            self.record_tutorial_action("resume");
+        }
         self.refresh_tutorial_progress_label();
         Ok(())
     }
@@ -9899,9 +10025,7 @@ impl AppState {
             return Ok(());
         };
         if direction == 1 && progress.step == 0 {
-            let required = [
-                "menu", "outline", "scene", "write", "save", "return", "resume",
-            ];
+            let required = TUTORIAL_NAVIGATION_ACTIONS.map(|(action, _)| action);
             let missing: Vec<_> = required
                 .iter()
                 .copied()
@@ -9912,7 +10036,9 @@ impl AppState {
                     .iter()
                     .map(|action| match *action {
                         "menu" => "open the menu",
-                        "outline" => "visit Outline",
+                        "navigate-menu" => "move the menu highlight to Navigate",
+                        "outline-select" => "highlight Outline",
+                        "outline" => "open Outline",
                         "scene" => "open the sample scene",
                         "write" => "write in the scene",
                         "save" => "save your writing",
@@ -10535,6 +10661,12 @@ impl AppState {
                 menu.selected = 0;
                 menu.all_commands = false;
                 self.menu = Some(menu);
+                if self
+                    .menu
+                    .is_some_and(|menu| MENU_CATEGORIES[menu.top] == "Navigate")
+                {
+                    self.record_tutorial_action("navigate-menu");
+                }
                 return Ok(());
             }
             KeyCode::Right => {
@@ -10542,6 +10674,12 @@ impl AppState {
                 menu.selected = 0;
                 menu.all_commands = false;
                 self.menu = Some(menu);
+                if self
+                    .menu
+                    .is_some_and(|menu| MENU_CATEGORIES[menu.top] == "Navigate")
+                {
+                    self.record_tutorial_action("navigate-menu");
+                }
                 return Ok(());
             }
             KeyCode::Up => {
@@ -10672,6 +10810,17 @@ impl AppState {
             .selected
             .min(self.menu_visible_entries().len().saturating_sub(1));
         self.menu = Some(menu);
+        if matches!(key.code, KeyCode::Up | KeyCode::Down)
+            && self
+                .menu
+                .is_some_and(|menu| MENU_CATEGORIES[menu.top] == "Navigate")
+            && self
+                .menu_visible_entries()
+                .get(menu.selected)
+                .is_some_and(|command| command.id == "view.outline")
+        {
+            self.record_tutorial_action("outline-select");
+        }
         Ok(())
     }
     fn dispatch_registered_command_id(
@@ -16653,7 +16802,6 @@ impl AppState {
         Ok(())
     }
     fn insert(&mut self, ch: char) {
-        self.record_tutorial_action("write");
         self.last_yank = None;
         let insertion = if ch == '\t' && self.editor_preferences.indentation == "spaces" {
             " ".repeat(self.editor_preferences.indent_width)
@@ -16673,6 +16821,9 @@ impl AppState {
             self.expand_text_before_cursor("space", &insertion, false);
         } else if ch == '\t' {
             self.expand_text_before_cursor("tab", &insertion, false);
+        }
+        if self.dirty {
+            self.record_tutorial_action("write");
         }
         if let Some(challenge) = &mut self.active_challenge {
             challenge.last_activity = Instant::now();
@@ -18022,11 +18173,13 @@ fn tutorial_expected_action_hint(state: &AppState) -> String {
             "Press {} to open the menu",
             effective_shortcut_label(state, "menu.main", "F10")
         ),
-        Some("outline") => "Use Right, Down, Enter for Navigate > Outline".into(),
+        Some("navigate-menu") => "Press Right until Navigate is highlighted".into(),
+        Some("outline-select") => "Press Down until Outline is highlighted".into(),
+        Some("outline") => "Press Enter to open Outline".into(),
         Some("scene") => "Select the sample scene and press Enter".into(),
         Some("write") => "Write a few words in the sample scene".into(),
         Some("save") => format!(
-            "Save your writing with {}",
+            "Choose File > Save (or press {})",
             effective_shortcut_label(state, "file.save", "Ctrl+S")
         ),
         Some("return") => "Press Esc to return to Outline".into(),
@@ -18040,28 +18193,64 @@ fn tutorial_key_is_expected(state: &AppState, key: KeyEvent) -> bool {
         return true;
     }
     if state.menu.is_some() {
-        return matches!(
-            key.code,
-            KeyCode::Left
-                | KeyCode::Right
-                | KeyCode::Up
-                | KeyCode::Down
-                | KeyCode::Enter
-                | KeyCode::Esc
-                | KeyCode::Char(_)
-        );
+        return match tutorial_next_action(state) {
+            Some("navigate-menu") => {
+                matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Esc)
+            }
+            Some("outline-select") => {
+                state
+                    .menu
+                    .is_some_and(|menu| MENU_CATEGORIES[menu.top] == "Navigate")
+                    && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Esc)
+            }
+            Some("outline") => {
+                state.menu.is_some_and(|menu| {
+                    MENU_CATEGORIES[menu.top] == "Navigate"
+                        && state
+                            .menu_visible_entries()
+                            .get(menu.selected)
+                            .is_some_and(|command| command.id == "view.outline")
+                }) && matches!(key.code, KeyCode::Enter | KeyCode::Esc)
+            }
+            Some("scene") => matches!(
+                key.code,
+                KeyCode::Up | KeyCode::Down | KeyCode::Enter | KeyCode::Esc
+            ),
+            Some("write") => matches!(key.code, KeyCode::Esc),
+            Some("save") => {
+                matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Esc)
+                    || (state.menu.is_some_and(|menu| {
+                        let selected_is_save = state
+                            .menu_visible_entries()
+                            .get(menu.selected)
+                            .is_some_and(|command| command.id == "file.save");
+                        MENU_CATEGORIES[menu.top] == "File"
+                            && (matches!(key.code, KeyCode::Up | KeyCode::Down)
+                                || (key.code == KeyCode::Enter && selected_is_save))
+                    }))
+                    || (state.menu.is_none()
+                        && tutorial_key_matches_command(state, "file.save", key))
+            }
+            Some("return") => key.code == KeyCode::Esc,
+            Some("resume") => {
+                matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Esc)
+                    || (state.menu.is_some_and(|menu| {
+                        MENU_CATEGORIES[menu.top] == "Help"
+                            && state
+                                .menu_visible_entries()
+                                .get(menu.selected)
+                                .is_some_and(|command| command.id == "help.resume-tutorial")
+                    }) && key.code == KeyCode::Enter)
+            }
+            Some("menu") | None => key.code == KeyCode::Esc,
+            _ => key.code == KeyCode::Esc,
+        };
     }
     match tutorial_next_action(state) {
         Some("menu") | Some("resume") => false,
-        Some("outline") => command_for_workspace(Workspace::Outline).is_some_and(|command| {
-            effective_command_shortcuts(state, command)
-                .iter()
-                .any(|shortcut| {
-                    parse_shortcut(shortcut).is_ok_and(|event| {
-                        same_keycode(event.code, key.code) && event.modifiers == key.modifiers
-                    })
-                })
-        }),
+        Some("navigate-menu") => false,
+        Some("outline-select") => false,
+        Some("outline") => false,
         Some("scene") => {
             state.workspace == Workspace::Outline
                 && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter)
@@ -19287,7 +19476,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
         area.width.saturating_sub(4).clamp(1, 88)
     };
     let height = if tutorial {
-        area.height.min(7)
+        area.height.min(5)
     } else {
         area.height.saturating_sub(2).clamp(1, 22)
     };
@@ -25207,7 +25396,6 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.insert(c)
             }
             KeyCode::Esc => {
-                s.record_tutorial_action("return");
                 let previous = s
                     .history
                     .get(s.history_index)
@@ -25216,6 +25404,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     .filter(|workspace| *workspace != Workspace::Dashboard)
                     .unwrap_or(Workspace::Outline);
                 s.switch(previous);
+                s.record_tutorial_action("return");
             }
             _ => {}
         }
@@ -26914,13 +27103,13 @@ mod tests {
         fs::create_dir_all(user_path.parent().unwrap()).unwrap();
         fs::write(
             &user_path,
-            "[contexts.editor]\n\"Ctrl+X Ctrl+S\" = \"view.analytics\"\n[contexts.navigation]\n\"Ctrl+X Ctrl+S\" = \"view.outline\"\n",
+            "[contexts.editor]\n\"Ctrl+X Ctrl+T\" = \"view.analytics\"\n[contexts.navigation]\n\"Ctrl+X Ctrl+T\" = \"view.outline\"\n",
         )
         .unwrap();
         let project_path = project.project_root().join(".writers-ide/keybindings.toml");
         fs::write(
             &project_path,
-            "[contexts.editor]\n\"Ctrl+X Ctrl+S\" = \"view.timeline\"\n",
+            "[contexts.editor]\n\"Ctrl+X Ctrl+T\" = \"view.timeline\"\n",
         )
         .unwrap();
         let effective =
@@ -26944,7 +27133,7 @@ mod tests {
         assert!(state.pending_command_sequence.is_some());
         handle(
             &mut state,
-            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
         )
         .unwrap();
         assert_eq!(state.workspace, Workspace::Timeline);
@@ -37095,8 +37284,17 @@ mod tests {
                     .join("original")
                     .to_string_lossy()
                     .into_owned(),
+                demo_scene: None,
                 verified_actions: [
-                    "menu", "outline", "scene", "write", "save", "return", "resume",
+                    "menu",
+                    "navigate-menu",
+                    "outline-select",
+                    "outline",
+                    "scene",
+                    "write",
+                    "save",
+                    "return",
+                    "resume",
                 ]
                 .into_iter()
                 .map(str::to_owned)
@@ -37107,12 +37305,11 @@ mod tests {
         onboarding::store(&preferences_path, &preferences).unwrap();
 
         let panel = tutorial_panel_at(onboarding::TutorialTrack::GuidedTour, 0, &preferences_path);
-        assert!(panel.lines.iter().any(|line| line == "Lesson 1 complete"));
         assert!(
             panel
                 .lines
                 .iter()
-                .any(|line| line == "▶ Continue to Lesson 2 · press Enter")
+                .any(|line| { line == "Navigation lesson complete · Enter continues" })
         );
         assert!(!panel.lines.iter().any(|line| line.contains("Continueto")));
     }
@@ -37146,7 +37343,7 @@ mod tests {
         assert!(state.message.contains("Finish the navigation practice"));
 
         state.record_tutorial_action("write");
-        assert!(state.message.contains("One step at a time: Open the menu"));
+        assert!(state.message.contains("step is not complete"));
         assert!(
             onboarding::load(&preferences_path)
                 .unwrap()
@@ -37166,6 +37363,18 @@ mod tests {
             state.help_panel.is_some(),
             "practice card stays visible in menu"
         );
+        assert_eq!(tutorial_next_action(&state), Some("navigate-menu"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Dashboard);
+        assert_eq!(
+            state.menu.unwrap().top,
+            0,
+            "wrong action keeps menu context"
+        );
         for _ in 0..3 {
             handle(
                 &mut state,
@@ -37173,7 +37382,16 @@ mod tests {
             )
             .unwrap();
         }
+        assert_eq!(tutorial_next_action(&state), Some("outline-select"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Dashboard);
+        assert_eq!(state.menu.unwrap().top, 3);
         handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        assert_eq!(tutorial_next_action(&state), Some("outline"));
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
@@ -37204,14 +37422,30 @@ mod tests {
         assert!(!state.dirty);
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert_eq!(state.workspace, Workspace::Outline);
-        let help_menu = MENU_CATEGORIES
-            .iter()
-            .position(|category| *category == "Help")
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        )
+        .unwrap();
+        for _ in 0..8 {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            )
             .unwrap();
-        state.open_menu_category(help_menu);
-        state
-            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
+        }
+        assert_eq!(MENU_CATEGORIES[state.menu.unwrap().top], "Help");
+        assert!(
+            state
+                .menu_visible_entries()
+                .get(state.menu.unwrap().selected)
+                .is_some_and(|command| command.id == "help.resume-tutorial")
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
         assert!(
             state
                 .tutorial_progress_label
@@ -37269,7 +37503,7 @@ mod tests {
             panel
                 .lines
                 .iter()
-                .any(|line| line.contains("1/7 · Press F10 to open the menu"))
+                .any(|line| line.contains("1/9 · Press F10 to open the menu"))
         );
         assert!(panel.lines.iter().any(|line| {
             line.contains("F4 Back")
@@ -37302,7 +37536,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(screen.contains("1/7 · Press F10 to open the menu"));
+        assert!(screen.contains("1/9 · Press F10 to open the menu"));
         assert!(screen.contains("Dashboard"), "workspace remains visible");
 
         let mut preferences = onboarding::load(&preferences_path).unwrap();
@@ -37319,9 +37553,13 @@ mod tests {
             &preferences_path,
         ));
         assert!(
-            state.help_panel.as_ref().unwrap().lines.iter().any(|line| {
-                line.contains("2/7 · Right to Navigate · Down to Outline · Enter")
-            })
+            state
+                .help_panel
+                .as_ref()
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| { line.contains("2/9 · Press → until Navigate is highlighted") })
         );
 
         preferences = onboarding::load(&preferences_path).unwrap();
@@ -37330,7 +37568,15 @@ mod tests {
             .as_mut()
             .unwrap()
             .verified_actions = [
-            "menu", "outline", "scene", "write", "save", "return", "resume",
+            "menu",
+            "navigate-menu",
+            "outline-select",
+            "outline",
+            "scene",
+            "write",
+            "save",
+            "return",
+            "resume",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -37342,12 +37588,52 @@ mod tests {
             &preferences_path,
         ));
         let lines = &state.help_panel.as_ref().unwrap().lines;
-        assert!(lines.iter().any(|line| line == "Lesson 1 complete"));
         assert!(
             lines
                 .iter()
-                .any(|line| line == "▶ Continue to Lesson 2 · press Enter")
+                .any(|line| line == "Navigation lesson complete · Enter continues")
         );
+    }
+
+    #[test]
+    fn tutorial_resume_restores_the_menu_context_for_the_next_unverified_action() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Original"), "Original").unwrap();
+        let preferences_path = directory.path().join("prefs/tutorial.json");
+        let demo_path = directory.path().join("Tutorial");
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .begin_tutorial_at(
+                onboarding::TutorialTrack::GuidedTour,
+                demo_path,
+                preferences_path.clone(),
+            )
+            .unwrap();
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        assert_eq!(tutorial_next_action(&state), Some("outline-select"));
+
+        state.menu = None;
+        state.switch(Workspace::Dashboard);
+        state.resume_tutorial_at(&preferences_path).unwrap();
+
+        let menu = state
+            .menu
+            .expect("menu restored at the expected lesson step");
+        assert_eq!(MENU_CATEGORIES[menu.top], "Navigate");
+        assert_eq!(tutorial_next_action(&state), Some("outline-select"));
+        assert!(state.help_panel.is_some());
     }
 
     #[test]
@@ -37368,7 +37654,11 @@ mod tests {
 
         handle(&mut state, KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE)).unwrap();
         assert!(state.message.contains("first tutorial step"));
-        state.record_tutorial_action("menu");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        )
+        .unwrap();
         assert!(
             onboarding::load(&preferences_path)
                 .unwrap()
@@ -37426,7 +37716,15 @@ mod tests {
         let mut preferences = onboarding::load(&preferences_path).unwrap();
         let progress = preferences.active_tutorial.as_mut().unwrap();
         progress.verified_actions = [
-            "menu", "outline", "scene", "write", "save", "return", "resume",
+            "menu",
+            "navigate-menu",
+            "outline-select",
+            "outline",
+            "scene",
+            "write",
+            "save",
+            "return",
+            "resume",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -37444,7 +37742,7 @@ mod tests {
                 .unwrap()
                 .lines
                 .iter()
-                .any(|line| line.contains("Lesson 1 complete"))
+                .any(|line| line.contains("Navigation lesson complete"))
         );
 
         let workspace_before_f6 = state.workspace;
@@ -37470,8 +37768,7 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert!(screen.contains("Lesson 1 complete"));
-            assert!(screen.contains("▶ Continue to Lesson 2 · press Enter"));
+            assert!(screen.contains("Navigation lesson complete · Enter continues"));
         }
 
         handle(
