@@ -30,7 +30,7 @@ The command `Review → Grammar Check` checks the selected scene by default and 
 
 - The checker runs locally and does not make HTTP or cloud requests.
 - Suggestions remain provisional; there is no auto-apply path.
-- Harper's Markdown parser skips code blocks and tables. Other syntax and passage-level language overrides require further verification.
+- Harper's Markdown parser skips code blocks and tables. Current passage-language anchors are honored; stale anchors are skipped and disclosed. Other Markdown syntax still requires further verification.
 - On-demand checking is implemented; idle-time, incremental, compile-time and cancellation behavior are not.
 - Aspell/Hunspell remain separate spelling workflows. Missing dictionaries do not prevent application startup.
 - This is a foundation for #33, not completion of its multilingual acceptance criteria.

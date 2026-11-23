@@ -207,6 +207,18 @@ pub struct GrammarCapability {
     pub markup_aware: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalizedGrammarFinding {
+    pub language: String,
+    pub finding: ProofreadingFinding,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrammarCheckReport {
+    pub findings: Vec<LocalizedGrammarFinding>,
+    pub unsupported_languages: Vec<String>,
+}
+
 pub fn grammar_capability() -> GrammarCapability {
     GrammarCapability {
         engine: "Harper",
@@ -235,6 +247,74 @@ pub fn grammar_check(text: &str, language: &str) -> Result<Vec<ProofreadingFindi
         .collect::<Result<Vec<_>, _>>()?;
     findings.sort_by_key(|finding| (finding.byte_range.start, finding.byte_range.end));
     Ok(findings)
+}
+
+/// Check the untagged parts of a document using its effective language and check each
+/// explicit language override independently. Unsupported overrides are returned for a
+/// spelling-only fallback; they are never checked using the base language by mistake.
+pub fn grammar_check_with_passage_languages(
+    text: &str,
+    base_language: &str,
+    overrides: &[(std::ops::Range<usize>, String)],
+) -> Result<GrammarCheckReport, String> {
+    let mut overrides = overrides.to_vec();
+    overrides.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut previous_end = 0;
+    for (range, _) in &overrides {
+        if range.start >= range.end
+            || range.end > text.len()
+            || !text.is_char_boundary(range.start)
+            || !text.is_char_boundary(range.end)
+            || range.start < previous_end
+        {
+            return Err(
+                "passage language ranges must be valid, non-overlapping UTF-8 spans".into(),
+            );
+        }
+        previous_end = range.end;
+    }
+
+    let mut report = GrammarCheckReport {
+        findings: Vec::new(),
+        unsupported_languages: Vec::new(),
+    };
+    let mut run_segment = |range: std::ops::Range<usize>, language: &str| {
+        if range.is_empty() {
+            return;
+        }
+        match grammar_check(&text[range.clone()], language) {
+            Ok(findings) => report
+                .findings
+                .extend(findings.into_iter().map(|mut finding| {
+                    finding.byte_range.start += range.start;
+                    finding.byte_range.end += range.start;
+                    LocalizedGrammarFinding {
+                        language: language.to_owned(),
+                        finding,
+                    }
+                })),
+            Err(_) => {
+                report.unsupported_languages.push(language.to_owned());
+            }
+        }
+    };
+
+    let mut cursor = 0;
+    for (range, language) in overrides {
+        run_segment(cursor..range.start, base_language);
+        run_segment(range.clone(), &language);
+        cursor = range.end;
+    }
+    run_segment(cursor..text.len(), base_language);
+    report.findings.sort_by_key(|localized| {
+        (
+            localized.finding.byte_range.start,
+            localized.finding.byte_range.end,
+        )
+    });
+    report.unsupported_languages.sort();
+    report.unsupported_languages.dedup();
+    Ok(report)
 }
 
 fn map_harper_finding(text: &str, lint: Lint) -> Result<ProofreadingFinding, String> {
@@ -369,7 +449,8 @@ pub fn typography_suggestions(text: &str, language: &str) -> Vec<TypographySugge
 mod proofread_tests {
     use super::{
         ProofreadingConfig, ProofreadingPreset, ProofreadingRule, grammar_capability,
-        grammar_check, proofread, proofread_with_config, typography_suggestions,
+        grammar_check, grammar_check_with_passage_languages, proofread, proofread_with_config,
+        typography_suggestions,
     };
 
     #[test]
@@ -490,6 +571,54 @@ mod proofread_tests {
                 .iter()
                 .all(|finding| finding.byte_range.end <= code_start),
             "code block should not be linted: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn grammar_check_uses_passage_language_overrides_and_reports_fallbacks() {
+        let text = "They is ready. Bonjour.";
+        let french_start = text.find("Bonjour").unwrap();
+        let report = grammar_check_with_passage_languages(
+            text,
+            "en-GB",
+            &[(french_start..text.len(), "fr-FR".into())],
+        )
+        .unwrap();
+        assert_eq!(report.unsupported_languages, ["fr-FR"]);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.language == "en-GB")
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.finding.category == "Agreement")
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.finding.byte_range.end <= french_start)
+        );
+    }
+
+    #[test]
+    fn grammar_check_rejects_overlapping_or_non_boundary_language_ranges() {
+        let text = "Élodie writes.";
+        assert!(
+            grammar_check_with_passage_languages(
+                text,
+                "en-GB",
+                &[(0..7, "fr-FR".into()), (6..text.len(), "en-US".into())],
+            )
+            .is_err()
+        );
+        assert!(
+            grammar_check_with_passage_languages(text, "en-GB", &[(1..3, "fr-FR".into())],)
+                .is_err()
         );
     }
 

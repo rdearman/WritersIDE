@@ -15635,9 +15635,28 @@ impl AppState {
             for record in selected {
                 let (text, _) = self.app.load_scene_text(record.scene.id)?;
                 let language = record.scene.effective_language_code(&project);
-                match story_analysis::grammar_check(&text, language) {
-                    Ok(findings) => {
-                        for finding in findings {
+                let language_tags = self.app.list_passage_language_tags(record.scene.id)?;
+                let stale_tags = language_tags
+                    .iter()
+                    .filter(|tag| tag.anchor.state != "current")
+                    .count();
+                let overrides = language_tags
+                    .iter()
+                    .filter(|tag| tag.anchor.state == "current")
+                    .map(|tag| {
+                        let start = usize::try_from(tag.anchor.start_byte)
+                            .map_err(|_| std::io::Error::other("passage start offset overflow"))?;
+                        let end = usize::try_from(tag.anchor.end_byte)
+                            .map_err(|_| std::io::Error::other("passage end offset overflow"))?;
+                        Ok((start..end, tag.language_code.clone()))
+                    })
+                    .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+                match story_analysis::grammar_check_with_passage_languages(
+                    &text, language, &overrides,
+                ) {
+                    Ok(grammar_report) => {
+                        for localized in grammar_report.findings {
+                            let finding = localized.finding;
                             let suggestion = finding
                                 .suggestions
                                 .first()
@@ -15646,12 +15665,24 @@ impl AppState {
                             report.push(format!(
                                 "{} [{}] bytes {}..{} · {}: {}{}",
                                 record.scene.title,
-                                language,
+                                localized.language,
                                 finding.byte_range.start,
                                 finding.byte_range.end,
                                 finding.category,
                                 finding.message,
                                 suggestion
+                            ));
+                        }
+                        for unsupported_language in grammar_report.unsupported_languages {
+                            unsupported.push(format!(
+                                "{} [{unsupported_language}]: offline grammar is unavailable; use local spelling tools",
+                                record.scene.title,
+                            ));
+                        }
+                        if stale_tags > 0 {
+                            unsupported.push(format!(
+                                "{}: skipped {stale_tags} passage language tag(s) that need re-anchoring",
+                                record.scene.title
                             ));
                         }
                     }
