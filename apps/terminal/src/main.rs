@@ -487,7 +487,7 @@ fn tutorial_panel_at(
         onboarding::TutorialTrack::QuickStart => &[
             (
                 "Find your way around",
-                "Practice this route: press F10 to open the menu; on supported terminals you can hold Ctrl and press /. Use Left/Right to change menus, Up/Down to choose an action, Enter to run it and Esc to close. Open Outline, choose the sample scene, type a few words, save with File > Save or its shown shortcut, then press Esc to return to Outline. Open Help > Resume Tutorial to return here.",
+                "Practice one task at a time. The sample book is disposable; your project stays unchanged.",
             ),
             (
                 "Write and save",
@@ -501,7 +501,7 @@ fn tutorial_panel_at(
         onboarding::TutorialTrack::GuidedTour => &[
             (
                 "Find your way around",
-                "Practice this route: press F10 to open the menu; on supported terminals you can hold Ctrl and press /. Use Left/Right to change menus, Up/Down to choose an action, Enter to run it and Esc to close. Open Outline, choose the sample scene, type a few words, save with File > Save or its shown shortcut, then press Esc to return to Outline. Open Help > Resume Tutorial to return here.",
+                "Practice one task at a time. The sample book is disposable; your project stays unchanged.",
             ),
             (
                 "Your sample book",
@@ -555,9 +555,30 @@ fn tutorial_panel_at(
     if lesson_complete {
         lines.push("Lesson 1 complete — Enter or F6: Continue to Lesson 2".into());
     } else {
-        lines.push(
-            "Practice the route in the sample book. Your progress is saved; finish the checklist before moving on.".into(),
+        let completed = verified.map_or(0, |actions| {
+            required
+                .iter()
+                .filter(|(key, _)| actions.contains(*key))
+                .count()
+        });
+        let next_task = required
+            .iter()
+            .find(|(key, _)| !verified.is_some_and(|actions| actions.contains(*key)));
+        let task = next_task.map_or(
+            "All practice tasks verified. Resume the lesson to continue.".to_owned(),
+            |(key, _)| match *key {
+                "menu" => "Task: Press F10 to open the menu. This is the main command list.".into(),
+                "outline" => "Task: Choose Navigate > Outline to return to your story plan.".into(),
+                "scene" => "Task: Select the sample scene and press Enter to open it.".into(),
+                "write" => "Task: Type a few words. This sample is separate from your book.".into(),
+                "save" => "Task: Save using File > Save (Ctrl+S by default).".into(),
+                "return" => "Task: Press Esc once to return to Outline.".into(),
+                "resume" => "Task: Choose Help > Resume Tutorial to return here.".into(),
+                _ => "Continue the practice in the sample book.".into(),
+            },
         );
+        lines.push(format!("Practice {completed}/{}", required.len()));
+        lines.push(task);
     }
     if step == 0 {
         lines.extend(required.iter().map(|(key, label)| {
@@ -569,10 +590,11 @@ fn tutorial_panel_at(
             format!("{mark} {label}")
         }));
     }
-    lines.push(
-        "Enter/F6 next · Shift+F6 previous · Esc pause · Help > Resume Tutorial continues here"
-            .into(),
-    );
+    if lesson_complete {
+        lines.push("Enter or F6: continue · Shift+F6: previous · Esc: pause".into());
+    } else {
+        lines.push("Esc: pause · Help > Resume Tutorial: return here".into());
+    }
     HelpPanel {
         title: format!("Tutorial · {title} · {}/{}", step + 1, lessons.len()),
         lines,
@@ -35308,6 +35330,86 @@ mod tests {
             "verified actions: {:?}; message: {}",
             progress.verified_actions, state.message
         );
+    }
+
+    #[test]
+    fn tutorial_shows_one_actionable_task_and_only_offers_next_when_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let original =
+            WriterApp::create_project(directory.path().join("Original"), "Original").unwrap();
+        let preferences_path = directory.path().join("prefs/tutorial.json");
+        let mut state = AppState::new(original, default_bindings());
+        state
+            .begin_tutorial_at(
+                onboarding::TutorialTrack::GuidedTour,
+                directory.path().join("Tutorial"),
+                preferences_path.clone(),
+            )
+            .unwrap();
+
+        let panel = state.help_panel.as_ref().unwrap();
+        assert!(
+            panel
+                .lines
+                .iter()
+                .any(|line| line.contains("Press F10 to open the menu"))
+        );
+        assert!(
+            !panel
+                .lines
+                .iter()
+                .any(|line| line.contains("Practice this route:"))
+        );
+        assert!(
+            !panel
+                .lines
+                .iter()
+                .any(|line| line.contains("Enter/F6 next"))
+        );
+
+        let mut preferences = onboarding::load(&preferences_path).unwrap();
+        preferences
+            .active_tutorial
+            .as_mut()
+            .unwrap()
+            .verified_actions
+            .insert("menu".into());
+        onboarding::store(&preferences_path, &preferences).unwrap();
+        state.help_panel = Some(tutorial_panel_at(
+            onboarding::TutorialTrack::GuidedTour,
+            0,
+            &preferences_path,
+        ));
+        assert!(
+            state
+                .help_panel
+                .as_ref()
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| { line.contains("Choose Navigate > Outline") })
+        );
+
+        preferences = onboarding::load(&preferences_path).unwrap();
+        preferences
+            .active_tutorial
+            .as_mut()
+            .unwrap()
+            .verified_actions = [
+            "menu", "outline", "scene", "write", "save", "return", "resume",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        onboarding::store(&preferences_path, &preferences).unwrap();
+        state.help_panel = Some(tutorial_panel_at(
+            onboarding::TutorialTrack::GuidedTour,
+            0,
+            &preferences_path,
+        ));
+        assert!(state.help_panel.as_ref().unwrap().lines.iter().any(|line| {
+            line.contains("Lesson 1 complete — Enter or F6: Continue to Lesson 2")
+        }));
     }
 
     #[test]
