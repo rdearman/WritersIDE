@@ -553,7 +553,7 @@ fn tutorial_panel_at(
         });
     let mut lines = vec![body.into()];
     if lesson_complete {
-        lines.push("Lesson 1 complete — Enter or F6: Continue to Lesson 2".into());
+        lines.push("Lesson 1 complete — Press Enter: Continue to Lesson 2".into());
     } else {
         let completed = verified.map_or(0, |actions| {
             required
@@ -567,33 +567,31 @@ fn tutorial_panel_at(
         let task = next_task.map_or(
             "All practice tasks verified. Resume the lesson to continue.".to_owned(),
             |(key, _)| match *key {
-                "menu" => "Task: Press F10 to open the menu. This is the main command list.".into(),
-                "outline" => "Task: Choose Navigate > Outline to return to your story plan.".into(),
-                "scene" => "Task: Select the sample scene and press Enter to open it.".into(),
-                "write" => "Task: Type a few words. This sample is separate from your book.".into(),
-                "save" => "Task: Save using File > Save (Ctrl+S by default).".into(),
-                "return" => "Task: Press Esc once to return to Outline.".into(),
-                "resume" => "Task: Choose Help > Resume Tutorial to return here.".into(),
+                "menu" => "Task 1/7: Press F10 to open the menu and see the main commands.".into(),
+                "outline" => {
+                    "Task 2/7: Press F2, or choose Navigate > Outline, to view your story plan."
+                        .into()
+                }
+                "scene" => "Task 3/7: Select the sample scene and press Enter to open it.".into(),
+                "write" => {
+                    "Task 4/7: Type a few words. This sample is separate from your book.".into()
+                }
+                "save" => "Task 5/7: Save using File > Save (Ctrl+S by default).".into(),
+                "return" => "Task 6/7: Press Esc once to return to Outline.".into(),
+                "resume" => "Task 7/7: Choose Help > Resume Tutorial to return here.".into(),
                 _ => "Continue the practice in the sample book.".into(),
             },
         );
         lines.push(format!("Practice {completed}/{}", required.len()));
         lines.push(task);
     }
-    if step == 0 {
-        lines.extend(required.iter().map(|(key, label)| {
-            let mark = if verified.is_some_and(|actions| actions.contains(*key)) {
-                "[x]"
-            } else {
-                "[ ]"
-            };
-            format!("{mark} {label}")
-        }));
-    }
     if lesson_complete {
-        lines.push("Enter or F6: continue · Shift+F6: previous · Esc: pause".into());
+        lines.push("Enter: continue · Esc: pause".into());
     } else {
-        lines.push("Esc: pause · Help > Resume Tutorial: return here".into());
+        lines.push(
+            "Enter: continue when complete · Esc: pause · Help > Resume Tutorial: return here"
+                .into(),
+        );
     }
     HelpPanel {
         title: format!("Tutorial · {title} · {}/{}", step + 1, lessons.len()),
@@ -23181,13 +23179,13 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         .help_panel
         .as_ref()
         .is_some_and(|panel| panel.title.starts_with("Tutorial ·"));
-    if tutorial_has_focus && (k.code == KeyCode::F(6) || k.code == KeyCode::Enter) {
-        let direction = if k.code == KeyCode::F(6) && k.modifiers.contains(KeyModifiers::SHIFT) {
-            -1
-        } else {
-            1
-        };
-        s.advance_tutorial(direction)?;
+    if tutorial_has_focus && k.code == KeyCode::F(6) {
+        s.message =
+            "The tutorial uses Enter to continue · F6 remains assigned to your workspace".into();
+        return Ok(false);
+    }
+    if tutorial_has_focus && k.code == KeyCode::Enter {
+        s.advance_tutorial(1)?;
         return Ok(false);
     }
     if s.file_browser.is_some() {
@@ -23266,10 +23264,9 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         if panel_title.is_some_and(|title| title.starts_with("Tutorial ·")) {
             match k.code {
-                KeyCode::F(6) if k.modifiers.contains(KeyModifiers::SHIFT) => {
-                    s.advance_tutorial(-1)?
+                KeyCode::F(6) => {
+                    s.message = "The tutorial uses Enter to continue · F6 remains assigned to your workspace".into();
                 }
-                KeyCode::F(6) => s.advance_tutorial(1)?,
                 KeyCode::Char('q' | 'Q') if s.workspace != Workspace::Editor => {
                     s.exit_tutorial()?;
                     return Ok(false);
@@ -35818,7 +35815,13 @@ mod tests {
             !panel
                 .lines
                 .iter()
-                .any(|line| line.contains("Enter/F6 next"))
+                .any(|line| line.starts_with("[ ]") || line.starts_with("[x]"))
+        );
+        assert!(
+            panel
+                .lines
+                .iter()
+                .any(|line| line.contains("Task 1/7: Press F10"))
         );
 
         let mut preferences = onboarding::load(&preferences_path).unwrap();
@@ -35841,7 +35844,7 @@ mod tests {
                 .unwrap()
                 .lines
                 .iter()
-                .any(|line| { line.contains("Choose Navigate > Outline") })
+                .any(|line| { line.contains("Press F2, or choose Navigate > Outline") })
         );
 
         preferences = onboarding::load(&preferences_path).unwrap();
@@ -35862,12 +35865,12 @@ mod tests {
             &preferences_path,
         ));
         assert!(state.help_panel.as_ref().unwrap().lines.iter().any(|line| {
-            line.contains("Lesson 1 complete — Enter or F6: Continue to Lesson 2")
+            line.contains("Lesson 1 complete — Press Enter: Continue to Lesson 2")
         }));
     }
 
     #[test]
-    fn tutorial_modal_owns_f6_and_enter_before_workspace_shortcuts() {
+    fn tutorial_modal_uses_enter_for_progress_and_never_leaks_f6_to_workspace() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Original"), "Original").unwrap();
         let demo_path = directory.path().join("Tutorial");
@@ -35905,7 +35908,38 @@ mod tests {
                 .any(|line| line.contains("Lesson 1 complete"))
         );
 
+        let workspace_before_f6 = state.workspace;
         handle(&mut state, KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)).unwrap();
+
+        let progress = onboarding::load(&preferences_path)
+            .unwrap()
+            .active_tutorial
+            .unwrap();
+        assert_eq!(progress.step, 0);
+        assert_eq!(state.workspace, workspace_before_f6);
+        assert!(state.help_panel.is_some());
+        assert!(state.message.contains("uses Enter to continue"));
+
+        for (width, height) in [(80, 24), (236, 60)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(screen.contains("Lesson 1 complete"));
+            assert!(screen.contains("Press Enter"));
+        }
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
 
         let progress = onboarding::load(&preferences_path)
             .unwrap()
