@@ -31,6 +31,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub mod onboarding;
+pub mod pane_layout;
 
 type SceneRow = (SceneId, String, SceneStatus, u32);
 
