@@ -35280,6 +35280,15 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
         let mut state = AppState::new(app, default_bindings());
+        let registered_ids = command_registry()
+            .iter()
+            .map(|command| command.id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            command_registry().len(),
+            registered_ids.len(),
+            "command registry IDs must remain unique for a complete menu inventory"
+        );
 
         for (top, category) in MENU_CATEGORIES.iter().enumerate() {
             for id in MENU_COMMON_COMMANDS[top] {
@@ -35300,6 +35309,12 @@ mod tests {
                 entries.len()
             );
             let ids = entries.iter().map(|command| command.id).collect::<Vec<_>>();
+            let unique_ids = ids.iter().copied().collect::<BTreeSet<_>>();
+            assert_eq!(
+                ids.len(),
+                unique_ids.len(),
+                "{category} menu duplicates an action"
+            );
             let mut expected = MENU_COMMON_COMMANDS[top].to_vec();
             if category != &"Tools" && category != &"Help" {
                 expected.push("command.palette-open");
@@ -35308,6 +35323,13 @@ mod tests {
                 ids, expected,
                 "{category} must show one concise action list"
             );
+            if *category == "Publish" {
+                assert_eq!(
+                    ids.iter().filter(|id| **id == "compile.run").count(),
+                    1,
+                    "Publish should offer Compile once"
+                );
+            }
 
             let all_commands = state.menu_all_commands();
             let expected_all = command_registry()

@@ -2,7 +2,9 @@
 
 Open a menu with **Ctrl+/** or **F10**. Use **Left/Right** to change top-level menus, **Up/Down** to choose an action, **Enter** to run it, and **Esc** to close. Shortcuts shown by the application reflect your keymap. Menus are flat lists; there are no expandable command groups.
 
-Less frequently used actions remain in the command registry. Choose **Search All Commands…** from a menu, **Tools > Search All Commands…**, or **Help > Search Commands** to find them.
+Other registered actions remain in the command registry. Choose **Search All Commands…** from a menu, **Tools > Search All Commands…**, or **Help > Search Commands** to find them.
+
+The complete current/proposed placement and disposition audit for every registered command is in [docs/menu-audit-v0.1.md](docs/menu-audit-v0.1.md). Command-use frequency is not measured; the audit labels its visibility tiers as qualitative.
 
 ## File
 
