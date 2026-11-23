@@ -349,3 +349,11 @@ The terminal displays File, Edit, Insert, Navigate, Review, Publish, Tools and H
 ## Alpha save-conflict recovery — Issue #38
 
 When Save and Quit encounters a conflict, the same three choices remain available. Quit Without Saving terminates and leaves the on-disk manuscript unchanged. The dialogue does not force recovery or add a second confirmation. The Review menu opens Resolve Save Conflict for side-by-side comparison, recovery-copy save, Use Saved, and confirmed Keep My Changes. Messages identify the project/document and on-disk modified time where available. Real-terminal, no-document, full/read-only storage, and interrupted-session acceptance remain. See [Engineering Design v1.92](engineering-design-v1.92.md).
+
+## Fiction and non-fiction project entry — Issue #20
+
+New Project requires an explicit Fiction or Non-fiction choice in the terminal project browser. Fiction projects open directly in Scene Cards, with Insert available to create scenes rapidly. Non-fiction projects open in the chapter outline without synthetic scenes. The outline displays section and chapter hierarchy; selecting a section and choosing Insert → New Chapter in Section creates a child chapter without asking for an internal identifier. Selecting a chapter and choosing Edit → Write Selected Chapter opens or creates its direct-prose document in the shared editor. This workflow is covered by persistence and Markdown compilation tests. Further non-fiction templates, richer chapter/section editing, and human workflow acceptance remain.
+
+## First launch without a project argument
+
+Running the terminal application without a project path creates a temporary startup project under the system temporary directory and opens the New Project browser. The temporary startup project is removed on exit and is not added to recent-project history. Supplying a project path retains the normal project-opening behavior. This avoids requiring a raw command-line path or leaving a hidden sample project in the user's home directory.

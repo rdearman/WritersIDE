@@ -143,6 +143,11 @@ fn destination_title(workspace: Workspace) -> &'static str {
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OutlineRow {
+    Section {
+        id: story_core::NodeId,
+        title: String,
+        collapsed: bool,
+    },
     Chapter {
         id: story_core::NodeId,
         title: String,
@@ -1320,6 +1325,7 @@ enum CommandAction {
     CompileWorkflow,
     ToggleFormattingMarks,
     ToggleSceneInclusion,
+    WriteSelectedChapter,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2109,6 +2115,21 @@ fn command_registry() -> Vec<CommandSpec> {
             "chapter",
             true,
         ),
+        CommandSpec {
+            id: "document.write-selected-chapter",
+            label: "Write Selected Chapter",
+            description: "Open or create direct chapter prose without requiring scenes",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &[],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::WriteSelectedChapter,
+            task_group: "",
+            menu_priority: 15,
+            advanced: false,
+        },
         legacy_command(
             "character.create",
             "New Character",
@@ -9527,6 +9548,7 @@ impl AppState {
     fn open_selected(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.workspace == Workspace::Outline {
             match outline_rows(self).get(self.selected).cloned() {
+                Some(OutlineRow::Section { id, .. }) => return self.toggle_outline_node(id),
                 Some(OutlineRow::Chapter { id, .. }) => return self.toggle_outline_node(id),
                 Some(OutlineRow::Scene(id)) => {
                     self.selected = self
@@ -9562,7 +9584,7 @@ impl AppState {
                     let id = story_core::NodeId(hit.entity_id.parse()?);
                     let row = outline_rows(self)
                         .iter()
-                        .position(|row| matches!(row, OutlineRow::Chapter { id: row_id, .. } if *row_id == id))
+                        .position(|row| matches!(row, OutlineRow::Chapter { id: row_id, .. } | OutlineRow::Section { id: row_id, .. } if *row_id == id))
                         .ok_or("symbol chapter no longer exists in the current outline")?;
                     self.selected = row;
                     self.switch(Workspace::Outline);
@@ -9853,6 +9875,43 @@ impl AppState {
                 .into();
         Ok(())
     }
+    fn write_selected_chapter(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let selected = outline_rows(self).get(self.selected).cloned();
+        let Some(OutlineRow::Chapter {
+            id: chapter, title, ..
+        }) = selected
+        else {
+            self.message = "Select a chapter in Outline to write its prose".into();
+            return Ok(());
+        };
+        if self.dirty {
+            self.message = "Save the open document before switching to chapter prose".into();
+            return Ok(());
+        }
+        let existing = self
+            .app
+            .list_content_units(false)?
+            .into_iter()
+            .find(|unit| {
+                unit.kind == story_core::ContentUnitKind::ChapterBody
+                    && unit.parent_id == Some(chapter)
+            });
+        let unit = if let Some(unit) = existing {
+            unit.id
+        } else {
+            let unit = self.app.create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                &format!("{title} prose"),
+                Some(chapter),
+                0,
+                None,
+            )?;
+            self.refresh()?;
+            unit
+        };
+        self.open_content_unit(unit)?;
+        Ok(())
+    }
     fn open_content_unit(
         &mut self,
         id: story_core::ContentUnitId,
@@ -10115,13 +10174,14 @@ impl AppState {
         &mut self,
         node: story_core::NodeId,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !self
+        let valid_group = self
             .app
             .list_structural_nodes()?
             .iter()
-            .any(|item| item.id == node && item.kind == "chapter")
-        {
-            return Err("outline toggle target must be a chapter".into());
+            .find(|item| item.id == node)
+            .is_some_and(|item| matches!(item.kind.as_str(), "chapter" | "section"));
+        if !valid_group {
+            return Err("outline toggle target must be a chapter or section".into());
         }
         let selected_scene = match outline_rows(self).get(self.selected) {
             Some(OutlineRow::Scene(scene)) => Some(*scene),
@@ -10129,16 +10189,16 @@ impl AppState {
         };
         if !self.collapsed_outline_nodes.insert(node) {
             self.collapsed_outline_nodes.remove(&node);
-            self.message = "Chapter expanded".into();
+            self.message = "Outline group expanded".into();
         } else {
-            self.message = "Chapter collapsed".into();
+            self.message = "Outline group collapsed".into();
         }
         let rows = outline_rows(self);
         self.selected = selected_scene
             .and_then(|scene| rows.iter().position(|row| *row == OutlineRow::Scene(scene)))
             .or_else(|| {
                 rows.iter()
-                    .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == node))
+                    .position(|row| matches!(row, OutlineRow::Chapter { id, .. } | OutlineRow::Section { id, .. } if *id == node))
             })
             .unwrap_or_else(|| self.selected.min(rows.len().saturating_sub(1)));
         self.save_session()?;
@@ -10700,6 +10760,15 @@ impl AppState {
                     && self.assembly_draft.is_none() =>
             {
                 Some("Open a scene or assembly draft first")
+            }
+            CommandAction::WriteSelectedChapter
+                if self.workspace != Workspace::Outline
+                    || !matches!(
+                        outline_rows(self).get(self.selected),
+                        Some(OutlineRow::Chapter { .. })
+                    ) =>
+            {
+                Some("Select a chapter in Outline first")
             }
             CommandAction::ResolveSaveConflict if !self.dirty => {
                 Some("There are no unsaved manuscript changes to resolve")
@@ -11509,6 +11578,7 @@ impl AppState {
                 };
             }
             CommandAction::ToggleSceneInclusion => self.toggle_scene_card_inclusion()?,
+            CommandAction::WriteSelectedChapter => self.write_selected_chapter()?,
             CommandAction::Save => self.save()?,
             CommandAction::RequestQuit => self.request_quit(),
             CommandAction::Help => {
@@ -11602,6 +11672,10 @@ impl AppState {
         &mut self,
         command: CommandSpec,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if command.id == "scene.subchapter" {
+            self.execute_legacy_palette_command("subchapter")?;
+            return Ok(());
+        }
         let prefix = command
             .palette_prefix
             .or_else(|| command.palette_aliases.first().copied())
@@ -11615,6 +11689,37 @@ impl AppState {
         let cmd = self.prompt.trim().to_owned();
         self.prompt.clear();
         let mode = self.mode.take();
+        if mode == Some('h') {
+            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                if cmd.is_empty() {
+                    return Err("Chapter not created · enter a title or press Esc to cancel".into());
+                }
+                let Some(OutlineRow::Section { id: section, .. }) =
+                    outline_rows(self).get(self.selected).cloned()
+                else {
+                    return Err("Select a section in Outline before adding a chapter".into());
+                };
+                let position = self
+                    .app
+                    .list_structural_nodes()?
+                    .iter()
+                    .filter(|node| node.parent_id == Some(section))
+                    .count() as u32;
+                let chapter = self.app.create_chapter(Some(section), &cmd, position)?;
+                self.refresh()?;
+                self.workspace = Workspace::Outline;
+                self.selected = outline_rows(self)
+                    .iter()
+                    .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+                    .unwrap_or(0);
+                self.message = format!("Created chapter “{cmd}” in the selected section");
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.message = error.to_string();
+            }
+            return Ok(());
+        }
         if mode == Some('N') {
             if cmd.is_empty() {
                 self.message = "Scene not created · enter a title or press Esc to cancel".into();
@@ -11717,6 +11822,19 @@ impl AppState {
         &mut self,
         cmd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if cmd == "subchapter" {
+            if !matches!(
+                outline_rows(self).get(self.selected),
+                Some(OutlineRow::Section { .. })
+            ) {
+                self.message = "Select a section in Outline before adding a chapter".into();
+                return Ok(());
+            }
+            self.mode = Some('h');
+            self.prompt.clear();
+            self.message = "New chapter in selected section · enter a title".into();
+            return Ok(());
+        }
         if let Some(arguments) = cmd.strip_prefix("content-open ") {
             let id = story_core::ContentUnitId(arguments.trim().parse()?);
             return self.open_content_unit(id);
@@ -18317,10 +18435,8 @@ fn open_default_manuscript_if_unrestored(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let path = env::args()
-        .nth(1)
-        .ok_or("usage: writers-ide-tui <project-path>")?;
-    let project_path = std::path::PathBuf::from(path);
+    let (project_path, startup_scratch) =
+        prepare_startup_project(env::args().nth(1).map(Into::into))?;
     let (function_bindings, function_warning) = load_bindings_or_default(&project_path);
     let (command_bindings, command_warning) = load_command_bindings_or_default(&project_path);
     let (context_command_bindings, context_command_warning) =
@@ -18337,7 +18453,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .flatten()
         .collect::<Vec<_>>()
         .join(" · ");
-    if let Err(error) = remember_recent_project(&recent_projects_path, &project_path) {
+    if startup_scratch.is_none()
+        && let Err(error) = remember_recent_project(&recent_projects_path, &project_path)
+    {
         state.message = [
             state.message.clone(),
             format!("Recent-project history was not saved: {error}"),
@@ -18352,7 +18470,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.refresh()?;
     open_default_manuscript_if_unrestored(&mut state, has_saved_session)?;
     let onboarding_path = user_tutorial_preferences_path();
+    if startup_scratch.is_some() {
+        state.start_file_browser(FileBrowserPurpose::NewProject)?;
+        state.message = "Choose Fiction or Non-fiction, then select a folder and project name · Esc opens the temporary start screen".into();
+    }
     match onboarding::load(&onboarding_path) {
+        _ if startup_scratch.is_some() => {}
         Ok(preferences) if !preferences.welcome_seen || preferences.active_tutorial.is_some() => {
             state.help_panel = Some(welcome_panel(preferences.active_tutorial.is_some()));
         }
@@ -18367,6 +18490,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let result = run(&mut terminal, &mut state);
     restore(&mut terminal)?;
     result
+}
+
+fn prepare_startup_project(
+    explicit_path: Option<std::path::PathBuf>,
+) -> Result<(std::path::PathBuf, Option<tempfile::TempDir>), Box<dyn std::error::Error>> {
+    if let Some(path) = explicit_path {
+        return Ok((path, None));
+    }
+    let scratch = tempfile::Builder::new()
+        .prefix("writers-ide-startup-")
+        .tempdir()?;
+    let path = scratch.path().join("Temporary Start Project");
+    WriterApp::create_project(&path, "Temporary Start Project")?;
+    Ok((path, Some(scratch)))
 }
 fn setup() -> Result<Terminal<CrosstermBackend<io::Stdout>>, io::Error> {
     enable_raw_mode()?;
@@ -18720,6 +18857,9 @@ fn workspace_action_hint(workspace: Workspace) -> &'static str {
     match workspace {
         Workspace::Cards => {
             "Insert: New Scene · ↑/↓ select · Ctrl+↑/↓ reorder · Space include/exclude · Enter open · Edit > Move Scene chooses a chapter"
+        }
+        Workspace::Outline => {
+            "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section · Edit > Write Selected Chapter"
         }
         Workspace::Editor => "Esc: Outline",
         _ => "Tab: next primary view · Shift+Tab: previous",
@@ -23079,54 +23219,91 @@ fn outline_rows(s: &AppState) -> Vec<OutlineRow> {
         .iter()
         .map(|scene| scene.0)
         .collect::<BTreeSet<_>>();
-    let all_scene_count = scenes.len();
     let scenes = scenes
         .into_iter()
         .filter(|scene| visible_ids.contains(&scene.scene.id))
         .collect::<Vec<_>>();
     let content_units = s.app.list_content_units(false).unwrap_or_default();
-    let is_hoisted = scenes.len() < all_scene_count;
     let mut rows = Vec::new();
-    for chapter in nodes.iter().filter(|node| node.kind == "chapter") {
-        let children = scenes
-            .iter()
-            .filter(|scene| scene.chapter_id == Some(chapter.id))
-            .collect::<Vec<_>>();
-        if is_hoisted && children.is_empty() {
-            continue;
+    fn append_node(
+        node: &story_storage::StructuralNodeSummary,
+        nodes: &[story_storage::StructuralNodeSummary],
+        scenes: &[story_storage::SceneRecord],
+        content_units: &[story_storage::ContentUnitRecord],
+        collapsed_nodes: &BTreeSet<story_core::NodeId>,
+        rows: &mut Vec<OutlineRow>,
+    ) {
+        let collapsed = collapsed_nodes.contains(&node.id);
+        match node.kind.as_str() {
+            "section" => rows.push(OutlineRow::Section {
+                id: node.id,
+                title: node.title.clone(),
+                collapsed,
+            }),
+            "chapter" => rows.push(OutlineRow::Chapter {
+                id: node.id,
+                title: node.title.clone(),
+                scene_count: scenes
+                    .iter()
+                    .filter(|scene| scene.chapter_id == Some(node.id))
+                    .count(),
+                collapsed,
+            }),
+            _ => return,
         }
-        let mut path = vec![chapter.title.clone()];
-        let mut parent = chapter.parent_id;
-        while let Some(id) = parent {
-            let Some(node) = nodes.iter().find(|node| node.id == id) else {
-                break;
-            };
-            path.push(node.title.clone());
-            parent = node.parent_id;
+        if collapsed {
+            return;
         }
-        path.reverse();
-        rows.push(OutlineRow::Chapter {
-            id: chapter.id,
-            title: path.join(" / "),
-            scene_count: children.len(),
-            collapsed: s.collapsed_outline_nodes.contains(&chapter.id),
-        });
-        if !s.collapsed_outline_nodes.contains(&chapter.id) {
+        if node.kind == "chapter" {
             rows.extend(
                 content_units
                     .iter()
                     .filter(|unit| {
                         unit.kind == story_core::ContentUnitKind::ChapterBody
-                            && unit.parent_id == Some(chapter.id)
+                            && unit.parent_id == Some(node.id)
                     })
                     .map(|unit| OutlineRow::ContentUnit(unit.id)),
             );
             rows.extend(
-                children
-                    .into_iter()
+                scenes
+                    .iter()
+                    .filter(|scene| scene.chapter_id == Some(node.id))
                     .map(|scene| OutlineRow::Scene(scene.scene.id)),
             );
+        } else {
+            rows.extend(
+                content_units
+                    .iter()
+                    .filter(|unit| {
+                        unit.kind == story_core::ContentUnitKind::SectionBody
+                            && unit.parent_id == Some(node.id)
+                    })
+                    .map(|unit| OutlineRow::ContentUnit(unit.id)),
+            );
+            let mut children = nodes
+                .iter()
+                .filter(|child| child.parent_id == Some(node.id))
+                .collect::<Vec<_>>();
+            children.sort_by_key(|child| child.position);
+            for child in children {
+                append_node(child, nodes, scenes, content_units, collapsed_nodes, rows);
+            }
         }
+    }
+    let mut roots = nodes
+        .iter()
+        .filter(|node| node.parent_id.is_none())
+        .collect::<Vec<_>>();
+    roots.sort_by_key(|node| node.position);
+    for node in roots {
+        append_node(
+            node,
+            &nodes,
+            &scenes,
+            &content_units,
+            &s.collapsed_outline_nodes,
+            &mut rows,
+        );
     }
     rows.extend(
         content_units
@@ -23281,13 +23458,16 @@ fn workspace_items(s: &AppState) -> Vec<String> {
         Workspace::Outline => outline_rows(s)
             .into_iter()
             .map(|row| match row {
+                OutlineRow::Section {
+                    title, collapsed, ..
+                } => format!("{} {}", if collapsed { "▸" } else { "▾" }, title),
                 OutlineRow::Chapter {
                     title,
                     scene_count,
                     collapsed,
                     ..
                 } => format!(
-                    "{} {} · {} scene(s)",
+                    "  {} {} · {} scene(s)",
                     if collapsed { "▸" } else { "▾" },
                     title,
                     scene_count
@@ -26577,7 +26757,7 @@ mod tests {
         assert_eq!(detail_panel_title(&state), "Selected outline item");
         assert_eq!(
             workspace_action_hint(state.workspace),
-            "Tab: next primary view · Shift+Tab: previous"
+            "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section · Edit > Write Selected Chapter"
         );
 
         state.workspace = Workspace::StoryBible;
@@ -27019,6 +27199,96 @@ mod tests {
             "Argument with evidence."
         );
         assert!(reopened_state.app.list_scenes(false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn nonfiction_outline_shows_sections_and_writes_selected_chapters_without_scene_ids() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project_with_type(
+            root.path().join("Book"),
+            "Book",
+            story_core::BookType::Nonfiction,
+        )
+        .unwrap();
+        let section = app.create_section("Part One", 0).unwrap();
+        let chapter = app.create_chapter(Some(section), "Research", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+
+        let rows = outline_rows(&state);
+        assert!(matches!(rows.first(), Some(OutlineRow::Section { id, .. }) if *id == section));
+        let chapter_row = rows
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+            .unwrap();
+        assert_eq!(workspace_items(&state)[0], "▾ Part One");
+
+        state.selected = chapter_row;
+        state
+            .dispatch_registered_command_id("document.write-selected-chapter")
+            .unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        let unit = state.editing_content_unit.unwrap();
+        for ch in "Evidence belongs in the chapter.".chars() {
+            state.insert(ch);
+        }
+        state.save().unwrap();
+        assert_eq!(
+            state.app.load_content_unit_text(unit).unwrap().0,
+            "Evidence belongs in the chapter."
+        );
+        assert!(state.app.list_scenes(false).unwrap().is_empty());
+
+        let compile = state
+            .app
+            .compile_artifact(story_document::CompileFormat::Markdown, false);
+        assert!(compile.is_ok(), "chapter-based compile failed: {compile:?}");
+        assert!(
+            String::from_utf8(compile.unwrap().bytes)
+                .unwrap()
+                .contains("Evidence belongs in the chapter.")
+        );
+    }
+
+    #[test]
+    fn selected_section_creates_nested_chapter_without_uuid_prompt() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project_with_type(
+            root.path().join("Book"),
+            "Book",
+            story_core::BookType::Nonfiction,
+        )
+        .unwrap();
+        let section = app.create_section("Part One", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Section { id, .. } if *id == section))
+            .unwrap();
+
+        state
+            .dispatch_registered_command_id("scene.subchapter")
+            .unwrap();
+        assert_eq!(state.mode, Some('h'));
+        assert!(state.prompt.is_empty());
+        assert!(state.message.contains("selected section"));
+        state.prompt = "Background".into();
+        state.command().unwrap();
+
+        let chapter = state
+            .app
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|node| node.title == "Background")
+            .unwrap();
+        assert_eq!(chapter.parent_id, Some(section));
+        assert!(outline_rows(&state).iter().any(|row| matches!(
+            row,
+            OutlineRow::Chapter { id, .. } if *id == chapter.id
+        )));
+        assert!(state.app.list_scenes(false).unwrap().is_empty());
     }
 
     #[test]
@@ -39553,6 +39823,33 @@ mod tests {
         assert!(state.message.contains("Choose Fiction or Non-fiction"));
         assert!(!directory.path().join("Unchosen").exists());
         assert!(state.file_browser.is_some());
+    }
+
+    #[test]
+    fn launch_without_project_argument_uses_disposable_startup_project_outside_home() {
+        let (path, guard) = prepare_startup_project(None).unwrap();
+        assert!(guard.is_some());
+        assert!(path.starts_with(std::env::temp_dir()));
+        assert_eq!(
+            WriterApp::open_project(&path)
+                .unwrap()
+                .get_project()
+                .unwrap()
+                .title,
+            "Temporary Start Project"
+        );
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn launch_with_project_argument_uses_that_project_without_startup_scratch() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Existing");
+        WriterApp::create_project(&path, "Existing").unwrap();
+        let (selected, guard) = prepare_startup_project(Some(path.clone())).unwrap();
+        assert_eq!(selected, path);
+        assert!(guard.is_none());
     }
 
     #[test]
