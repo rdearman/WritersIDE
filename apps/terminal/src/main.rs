@@ -17094,7 +17094,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(if s.find_panel.is_some() {
-                6
+                7
             } else if s.mode.is_some() {
                 5
             } else if s.workspace == Workspace::Editor {
@@ -17840,11 +17840,20 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             "Ctrl+H to show this field"
         };
         let help = if panel.replacing && s.pending_replace.is_some() {
-            "F3: Next match · F6: Include/exclude match · F8: Include/exclude scene · F5: Apply reviewed changes · Esc: Back to fields"
+            [
+                "F3: Next/Skip · F6: Include/exclude match · F8: Include/exclude scene",
+                "F5: Apply Replace All · Esc: Back to fields",
+            ]
         } else if panel.replacing {
-            "Tab: Replace field · Shift+Tab: Find field · Enter: Preview all · F9: Replace next match · F4: Change search area · Esc: Close"
+            [
+                "Tab/Shift+Tab: fields · Enter: Preview all · F3: Next/Skip · F4: Scope",
+                "F9: Replace This · F2: Mode · F6: Case · F7: Whole · F8: Accents · Esc: Close",
+            ]
         } else {
-            "Enter: Find · F3/Shift+F3: Next/previous · F4: Change search area · Ctrl+H: Show Replace with · Esc: Close"
+            [
+                "Enter: Find · F3/Shift+F3: Next/Previous · F4: Scope · Ctrl+H: Replace",
+                "F2: Mode · F6: Case · F7: Whole word · F8: Accents · Esc: Close",
+            ]
         };
         let options = format!(
             "Case {} · whole words {} · accents {}",
@@ -17878,9 +17887,11 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 Span::styled(replace_text, focused(FindPanelField::Replacement)),
             ]),
             Line::from(format!(
-                " Search in: {scope} · {mode} · {match_count} match(es) · {options}"
+                " Search in: {scope} · {mode} · {match_count} match(es)"
             )),
-            Line::from(help),
+            Line::from(format!(" {options}")),
+            Line::from(format!(" {}", help[0])),
+            Line::from(format!(" {}", help[1])),
             Line::from(format!(
                 " {}",
                 truncate_display_cells(&s.message, rows[2].width.saturating_sub(2) as usize)
@@ -22438,6 +22449,14 @@ fn handle_find_panel_key(
     {
         if let Err(error) = s.replace_next_in_current_scene() {
             s.message = error.to_string();
+        } else if s.message.starts_with("Replaced the next match in scene") {
+            let result = "Replaced one match · Find and Replace closed · Ctrl+S to save";
+            if let Err(error) = s.persist_find_panel_session() {
+                s.message = format!("{result} · Find preferences could not be saved: {error}");
+            } else {
+                s.message = result.into();
+            }
+            s.find_panel = None;
         }
         return Ok(());
     }
@@ -30725,7 +30744,7 @@ mod tests {
             .unwrap();
         }
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut state)).unwrap();
         let rendered = terminal
             .backend()
@@ -30735,7 +30754,11 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Wildcards (*, ?)") || rendered.contains("Wildcards"));
-        assert!(rendered.contains("Replace field"));
+        assert!(rendered.contains("Tab/Shift+Tab: fields"));
+        assert!(rendered.contains("F9: Replace This"));
+        assert!(
+            rendered.contains("F5: Apply Replace All") || rendered.contains("Enter: Preview all")
+        );
     }
 
     #[test]
@@ -30820,6 +30843,90 @@ mod tests {
         assert!(state.find_panel.is_none());
         assert!(state.message.contains("Applied 2 replacement"));
         assert_eq!(state.app.load_scene_text(scene).unwrap().0, "term term");
+    }
+
+    #[test]
+    fn replace_this_is_one_shot_closes_panel_and_remains_undoable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "word word")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        open_find_panel(&mut state, true);
+        {
+            let panel = state.find_panel.as_mut().unwrap();
+            panel.pattern = "word".into();
+            panel.replacement = "term".into();
+        }
+
+        handle(&mut state, KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE)).unwrap();
+        assert!(state.find_panel.is_none());
+        assert!(state.dirty);
+        assert!(state.message.contains("Replaced one match"));
+        assert_eq!(state.editor.join("\n"), "term word");
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "word word");
+    }
+
+    #[test]
+    fn regex_replace_preview_uses_capture_groups_and_keeps_invalid_patterns_editable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "color=blue")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        open_find_panel(&mut state, true);
+        {
+            let panel = state.find_panel.as_mut().unwrap();
+            panel.mode = story_core::FindMode::Regex;
+            panel.pattern = r"color=(\w+)".into();
+            panel.replacement = "shade=$1".into();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.pending_replace.as_ref().unwrap()[0].proposed,
+            "shade=blue"
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)).unwrap();
+        assert!(state.find_panel.is_none());
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, "shade=blue");
+
+        open_find_panel(&mut state, true);
+        {
+            let panel = state.find_panel.as_mut().unwrap();
+            panel.mode = story_core::FindMode::Regex;
+            panel.pattern = "(".into();
+            panel.replacement = "still editable".into();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.find_panel.is_some());
+        assert!(state.pending_replace.is_none());
+        assert_eq!(
+            state.find_panel.as_ref().unwrap().replacement,
+            "still editable"
+        );
+        assert!(!state.message.is_empty());
     }
 
     #[test]
