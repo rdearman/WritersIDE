@@ -38564,6 +38564,40 @@ mod tests {
         assert_eq!(chapters.len(), 1);
         assert_eq!(chapters[0].title, "Act One");
         assert_eq!(state.scenes.len(), 3);
+        let imported = state.app.list_scenes(false).unwrap();
+        let opening = imported
+            .iter()
+            .find(|record| record.scene.title == "Act One — opening")
+            .unwrap();
+        assert!(
+            state
+                .app
+                .load_scene_text(opening.scene.id)
+                .unwrap()
+                .0
+                .contains("Introduction prose.")
+        );
+        let first_scene = imported
+            .iter()
+            .find(|record| record.scene.title == "Opening")
+            .unwrap();
+        assert_eq!(
+            state.app.load_scene_text(first_scene.scene.id).unwrap().0,
+            "The door opens."
+        );
+        let second_scene = imported
+            .iter()
+            .find(|record| record.scene.title == "Decision")
+            .unwrap();
+        assert_eq!(
+            state.app.load_scene_text(second_scene.scene.id).unwrap().0,
+            "Mara chooses."
+        );
+        let reopened = WriterApp::open_project(&project).unwrap();
+        assert_eq!(
+            reopened.load_scene_text(first_scene.scene.id).unwrap().0,
+            "The door opens."
+        );
         assert_eq!(fs::read(source).unwrap(), original);
     }
 
