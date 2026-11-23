@@ -22888,6 +22888,14 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         s.advance_tutorial(direction)?;
         return Ok(false);
     }
+    if s.file_browser.is_some() {
+        let previous_browser = s.file_browser.clone();
+        if let Err(error) = s.handle_file_browser_key(k) {
+            s.file_browser = previous_browser;
+            s.message = format!("File browser error: {error}");
+        }
+        return Ok(false);
+    }
     if let Some(command) = registered_global_command_for_key(s, k) {
         if matches!(
             command.action,
@@ -23144,14 +23152,6 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     }
     if s.keybinding_manager.is_some() {
         s.handle_keybinding_manager_key(k)?;
-        return Ok(false);
-    }
-    if s.file_browser.is_some() {
-        let previous_browser = s.file_browser.clone();
-        if let Err(error) = s.handle_file_browser_key(k) {
-            s.file_browser = previous_browser;
-            s.message = format!("File browser error: {error}");
-        }
         return Ok(false);
     }
     if s.series_form.is_some() {
@@ -25165,6 +25165,48 @@ mod tests {
             FileBrowserPurpose::ImportScrivenerSource
         );
         assert!(state.message.contains("Choose a folder or filename"));
+    }
+
+    #[test]
+    fn scrivener_browser_f5_inspects_selected_project_before_workspace_shortcuts() {
+        fn copy_tree(source: &Path, destination: &Path) {
+            fs::create_dir_all(destination).unwrap();
+            for entry in fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let output = destination.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &output);
+                } else {
+                    fs::copy(entry.path(), output).unwrap();
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../cli/tests/fixtures/scrivener-windows-311/Windows Regression.scriv");
+        let source = root.path().join("Windows Regression.scriv");
+        copy_tree(&fixture, &source);
+        let app = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Editor;
+        state.function_bindings.push((5, Workspace::Characters));
+        state
+            .dispatch_registered_command_id("file.import-scrivener")
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = root.path().to_owned();
+        browser.entries = vec![("Windows Regression.scriv".into(), true)];
+        browser.selected = 0;
+        browser.focus = 1;
+
+        handle(&mut state, KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)).unwrap();
+
+        assert!(state.file_browser.is_none());
+        let preview = state.scrivener_import.as_ref().unwrap();
+        assert_eq!(preview.target, ScrivenerImportTarget::Standalone);
+        assert!(!preview.inventory.items.is_empty());
+        assert!(state.message.contains("Standalone Scrivener preview"));
     }
 
     #[test]
