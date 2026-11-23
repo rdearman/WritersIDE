@@ -19842,8 +19842,10 @@ fn file_browser_entries(path: &Path) -> io::Result<Vec<(String, bool)>> {
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let kind = entry.file_type().ok()?;
-            Some((name, kind.is_dir()))
+            // Follow directory symlinks so they remain navigable in the
+            // browser; broken links and unreadable entries are omitted.
+            let metadata = fs::metadata(entry.path()).ok()?;
+            Some((name, metadata.is_dir()))
         })
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| {
@@ -35342,6 +35344,21 @@ mod tests {
         assert_eq!(state.app.project_root(), root.join("New Novel"));
         assert!(root.join("New Novel/project.toml").is_file());
         assert!(state.file_browser.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_browser_recognizes_directory_symlinks_as_navigable_folders() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("target");
+        let link = directory.path().join("linked-folder");
+        fs::create_dir(&target).unwrap();
+        symlink(&target, &link).unwrap();
+
+        let entries = file_browser_entries(directory.path()).unwrap();
+        assert!(entries.contains(&("linked-folder".into(), true)));
     }
 
     #[test]
