@@ -541,6 +541,7 @@ struct FileBrowserState {
     tree_selected: usize,
     focus: u8,
     name: String,
+    new_project_book_type: Option<story_core::BookType>,
     overwrite_confirmed: bool,
     org_import_mode: story_import::OrgImportMode,
     text_import_preview: Option<story_import::TextDocumentPreview>,
@@ -1450,7 +1451,7 @@ fn command_registry() -> Vec<CommandSpec> {
         CommandSpec {
             id: "file.new-project",
             label: "New Project",
-            description: "Create and open a new novel project",
+            description: "Choose Fiction or Non-fiction, then create and open a book project",
             category: "File",
             default_shortcuts: &["Ctrl+N"],
             mnemonic: Some('n'),
@@ -7025,12 +7026,15 @@ impl AppState {
             tree_selected,
             focus: 0,
             name,
+            new_project_book_type: None,
             overwrite_confirmed: false,
             org_import_mode: story_import::OrgImportMode::SingleDocument,
             text_import_preview: None,
             preview_scroll: 0,
         });
-        self.message = if matches!(
+        self.message = if purpose == FileBrowserPurpose::NewProject {
+            "Choose Fiction or Non-fiction with F2 · select a parent folder and project name · F5 creates".into()
+        } else if matches!(
             purpose,
             FileBrowserPurpose::ImportScrivenerSource
                 | FileBrowserPurpose::ImportScrivenerCurrent
@@ -7211,7 +7215,34 @@ impl AppState {
                 }
             }
             KeyCode::F(2) => {
-                if let FileBrowserPurpose::Compile(current) = browser.purpose {
+                if browser.purpose == FileBrowserPurpose::NewProject {
+                    let selected_type = match browser.new_project_book_type {
+                        None => story_core::BookType::Fiction,
+                        Some(story_core::BookType::Fiction) => story_core::BookType::Nonfiction,
+                        Some(story_core::BookType::Nonfiction | story_core::BookType::Custom) => {
+                            story_core::BookType::Fiction
+                        }
+                    };
+                    if browser.name == "My Novel" {
+                        browser.name = match selected_type {
+                            story_core::BookType::Nonfiction => "My Book",
+                            story_core::BookType::Fiction | story_core::BookType::Custom => {
+                                "My Novel"
+                            }
+                        }
+                        .to_owned();
+                    }
+                    browser.new_project_book_type = Some(selected_type);
+                    browser.overwrite_confirmed = false;
+                    self.message = format!(
+                        "Book type: {} · press F2 to change",
+                        match browser.new_project_book_type {
+                            Some(story_core::BookType::Fiction) => "Fiction",
+                            Some(story_core::BookType::Nonfiction) => "Non-fiction",
+                            Some(story_core::BookType::Custom) | None => "Custom",
+                        }
+                    );
+                } else if let FileBrowserPurpose::Compile(current) = browser.purpose {
                     let formats = [
                         story_document::CompileFormat::PlainText,
                         story_document::CompileFormat::Markdown,
@@ -7555,6 +7586,11 @@ impl AppState {
                             self.file_browser = Some(browser);
                             return Ok(());
                         }
+                        let Some(book_type) = browser.new_project_book_type else {
+                            self.message = "Choose Fiction or Non-fiction first · press F2".into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        };
                         if !browser.overwrite_confirmed {
                             browser.overwrite_confirmed = true;
                             self.message = format!(
@@ -7572,7 +7608,9 @@ impl AppState {
                             self.file_browser = Some(browser);
                             return Ok(());
                         }
-                        if let Err(error) = WriterApp::create_project(&destination, name) {
+                        if let Err(error) =
+                            WriterApp::create_project_with_type(&destination, name, book_type)
+                        {
                             let _ = fs::remove_dir(&destination);
                             self.message = format!("Project creation failed: {error}");
                             return Ok(());
@@ -7581,6 +7619,12 @@ impl AppState {
                             destination,
                             format!("Created and opened project: {name}"),
                         )?;
+                        self.switch(match book_type {
+                            story_core::BookType::Fiction => Workspace::Cards,
+                            story_core::BookType::Nonfiction | story_core::BookType::Custom => {
+                                Workspace::Outline
+                            }
+                        });
                         close = true;
                     }
                     FileBrowserPurpose::Compile(format) => {
@@ -18675,7 +18719,7 @@ fn display_shortcut_label(label: String) -> String {
 fn workspace_action_hint(workspace: Workspace) -> &'static str {
     match workspace {
         Workspace::Cards => {
-            "↑/↓ select · Ctrl+↑/↓ reorder · Space include/exclude · Enter open · Edit > Move Scene chooses a chapter"
+            "Insert: New Scene · ↑/↓ select · Ctrl+↑/↓ reorder · Space include/exclude · Enter open · Edit > Move Scene chooses a chapter"
         }
         Workspace::Editor => "Esc: Outline",
         _ => "Tab: next primary view · Shift+Tab: previous",
@@ -21989,6 +22033,7 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(2),
         ])
         .split(inner);
@@ -22076,10 +22121,22 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         .style(Style::default().fg(Color::Yellow)),
         chunks[2],
     );
+    if browser.purpose == FileBrowserPurpose::NewProject {
+        let book_type = match browser.new_project_book_type {
+            Some(story_core::BookType::Fiction) => "Fiction",
+            Some(story_core::BookType::Nonfiction) => "Non-fiction",
+            Some(story_core::BookType::Custom) | None => "Choose Fiction or Non-fiction",
+        };
+        f.render_widget(
+            Paragraph::new(format!("Book type: {book_type} · F2 Change"))
+                .style(Style::default().fg(Color::Cyan)),
+            chunks[3],
+        );
+    }
     f.render_widget(
-        Paragraph::new(truncate_display_cells(&s.message, chunks[3].width as usize))
+        Paragraph::new(truncate_display_cells(&s.message, chunks[4].width as usize))
             .style(Style::default().fg(Color::Yellow)),
-        chunks[3],
+        chunks[4],
     );
     let (primary_action, navigation) = if browser.overwrite_confirmed {
         let action = if browser.purpose == FileBrowserPurpose::NewProject {
@@ -22113,9 +22170,14 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             "Enter Preview manifest / browse folder · F5 Inspect/Import · F7 New Folder · Esc Cancel",
             "Tab/Shift+Tab: tree → contents → name · Home: Home · /: Root · Backspace: Parent",
         )
-    } else {
+    } else if browser.purpose == FileBrowserPurpose::NewProject {
         (
             "F4 Select Folder · F5 Create Project · F7 New Folder · Esc Cancel",
+            "F2 Choose Fiction/Non-fiction · Tab: panes/name · Parent = current folder",
+        )
+    } else {
+        (
+            "F4 Select Folder · F5 Confirm · F7 New Folder · Esc Cancel",
             "Parent = current folder · Tab/Shift+Tab: panes and project name",
         )
     };
@@ -22123,11 +22185,11 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         Paragraph::new(vec![
             Line::from(truncate_display_cells(
                 primary_action,
-                chunks[4].width as usize,
+                chunks[5].width as usize,
             )),
-            Line::from(truncate_display_cells(navigation, chunks[4].width as usize)),
+            Line::from(truncate_display_cells(navigation, chunks[5].width as usize)),
         ]),
-        chunks[4],
+        chunks[5],
     );
 }
 
@@ -26316,6 +26378,11 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             s.resume_tutorial()?;
         }
         KeyCode::Enter if s.workspace == Workspace::Research && s.proposal_review_active => {}
+        KeyCode::Insert if s.workspace == Workspace::Cards => {
+            if let Err(error) = s.dispatch_registered_command_id("scene.create") {
+                s.message = error.to_string();
+            }
+        }
         KeyCode::Up
             if s.workspace == Workspace::Cards && k.modifiers.contains(KeyModifiers::CONTROL) =>
         {
@@ -26717,6 +26784,9 @@ mod tests {
             browser.entries = file_browser_entries(root.path()).unwrap();
         }
         state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
+        state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE))
             .unwrap();
         for _ in 0.."My Novel".chars().count() {
@@ -26744,6 +26814,11 @@ mod tests {
         assert_eq!(state.app.get_project().unwrap().title, "A New Project");
         assert_eq!(state.app.project_root(), root.path().join("A New Project"));
         assert!(state.message.contains("Created and opened project"));
+        assert_eq!(
+            state.app.get_project().unwrap().book_type,
+            story_core::BookType::Fiction
+        );
+        assert_eq!(state.workspace, Workspace::Cards);
     }
 
     #[test]
@@ -28638,6 +28713,48 @@ mod tests {
                 .iter()
                 .any(|unit| unit.id == created.scene.id.to_string())
         );
+    }
+
+    #[test]
+    fn scene_cards_insert_key_creates_sixty_titleable_scenes_without_menu_navigation() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.switch(Workspace::Cards);
+
+        for index in 1..=60 {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Insert, KeyModifiers::NONE),
+            )
+            .unwrap();
+            assert_eq!(state.mode, Some('N'));
+            for character in format!("Scene {index:02}").chars() {
+                handle(
+                    &mut state,
+                    KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+                )
+                .unwrap();
+            }
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            )
+            .unwrap();
+            assert_eq!(state.workspace, Workspace::Cards);
+        }
+
+        let scenes = state.app.list_scenes(false).unwrap();
+        assert_eq!(scenes.len(), 60);
+        assert_eq!(
+            scenes
+                .iter()
+                .map(|scene| scene.scene.id)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            60
+        );
+        assert!(scenes.iter().any(|scene| scene.scene.title == "Scene 60"));
     }
 
     #[test]
@@ -39316,6 +39433,9 @@ mod tests {
         browser.current_dir = root.clone();
         browser.entries = file_browser_entries(&root).unwrap();
         state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
+        state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE))
             .unwrap();
         assert_eq!(state.file_browser.as_ref().unwrap().focus, 2);
@@ -39338,6 +39458,12 @@ mod tests {
         assert_eq!(state.app.project_root(), root.join("New Novel"));
         assert!(root.join("New Novel/project.toml").is_file());
         assert!(state.file_browser.is_none());
+        assert_eq!(
+            state.app.get_project().unwrap().book_type,
+            story_core::BookType::Fiction
+        );
+        assert_eq!(state.workspace, Workspace::Cards);
+        assert!(state.app.list_scenes(false).unwrap().is_empty());
     }
 
     #[test]
@@ -39354,6 +39480,9 @@ mod tests {
         browser.name = "Cancelled Novel".into();
 
         state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
+        state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
         assert!(state.message.contains("Create project at"));
@@ -39364,6 +39493,66 @@ mod tests {
 
         assert!(!directory.path().join("Cancelled Novel").exists());
         assert_eq!(state.app.get_project().unwrap().title, "Current");
+    }
+
+    #[test]
+    fn new_nonfiction_project_opens_chapter_outline_without_scenes() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .start_file_browser(FileBrowserPurpose::NewProject)
+            .unwrap();
+        {
+            let browser = state.file_browser.as_mut().unwrap();
+            browser.current_dir = directory.path().to_owned();
+            browser.entries = file_browser_entries(directory.path()).unwrap();
+        }
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.message.contains("Non-fiction"));
+        assert_eq!(state.file_browser.as_ref().unwrap().name, "My Book");
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(
+            state.app.get_project().unwrap().book_type,
+            story_core::BookType::Nonfiction
+        );
+        assert_eq!(state.app.project_root(), directory.path().join("My Book"));
+        assert_eq!(state.workspace, Workspace::Outline);
+        assert!(state.app.list_scenes(false).unwrap().is_empty());
+        assert!(state.app.list_content_units(false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn new_project_requires_an_explicit_book_type_choice() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .start_file_browser(FileBrowserPurpose::NewProject)
+            .unwrap();
+        {
+            let browser = state.file_browser.as_mut().unwrap();
+            browser.current_dir = directory.path().to_owned();
+            browser.name = "Unchosen".into();
+        }
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(state.message.contains("Choose Fiction or Non-fiction"));
+        assert!(!directory.path().join("Unchosen").exists());
+        assert!(state.file_browser.is_some());
     }
 
     #[test]
@@ -39389,6 +39578,9 @@ mod tests {
         assert!(rendered.contains("Directory tree · focused"));
         assert!(rendered.contains("Folder contents"));
         assert!(rendered.contains("Selected path:"));
+        assert!(rendered.contains("Book type: Choose Fiction or Non-fiction"));
+        assert!(rendered.contains("F2 Change"));
+        assert!(rendered.contains("Choose Fiction/Non-fiction"));
         assert!(rendered.contains("F4 Select Folder"));
         assert!(rendered.contains("F5 Create Project"));
         assert!(rendered.contains("F7 New Folder"));

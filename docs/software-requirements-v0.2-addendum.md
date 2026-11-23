@@ -37,6 +37,10 @@ This addendum extends SRS v0.1 without replacing its scene-centred, local-first 
 - LLM output is an untrusted proposal with source evidence and provenance. Approval is an explicit application operation; inferred facts remain separate from author-defined records.
 - Pipeline stages declare inputs, outputs and dependencies. A failed or skipped stage is visible and cannot be reported as a successful complete manuscript build.
 
+## First-run book-type selection and destination workflow
+
+The terminal New Project browser requires an explicit Fiction or Non-fiction choice before creating a project. The selected type is stored through the existing immutable `BookType` project field. Fiction projects open in Scene Cards; Non-fiction projects open in the chapter Outline. The project destination remains a parent folder plus project name, and the operation continues to refuse existing folders. Creating a project does not synthesize manuscript documents: the first scene or chapter prose remains an explicit author action.
+
 ## Phase allocation
 
 | Slice | Requirements |
