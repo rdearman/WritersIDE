@@ -594,7 +594,10 @@ fn tutorial_panel_at(
             .iter()
             .all(|action| actions.contains(*action))
         });
-    let mut lines = vec![body.into()];
+    let mut lines = Vec::new();
+    if step != 0 {
+        lines.push(body.into());
+    }
     if lesson_complete {
         lines.push("Lesson 1 complete".into());
     } else {
@@ -610,30 +613,29 @@ fn tutorial_panel_at(
         let task = next_task.map_or(
             "All practice tasks verified. Resume the lesson to continue.".to_owned(),
             |(key, _)| match *key {
-                "menu" => "Task 1/7: Press F10 to open the menu and see the main commands.".into(),
-                "outline" => {
-                    "Task 2/7: Press F2, or choose Navigate > Outline, to view your story plan."
-                        .into()
-                }
-                "scene" => "Task 3/7: Select the sample scene and press Enter to open it.".into(),
-                "write" => {
-                    "Task 4/7: Type a few words. This sample is separate from your book.".into()
-                }
-                "save" => "Task 5/7: Save using File > Save (Ctrl+S by default).".into(),
-                "return" => "Task 6/7: Press Esc once to return to Outline.".into(),
-                "resume" => "Task 7/7: Choose Help > Resume Tutorial to return here.".into(),
+                "menu" => "1/7 · Press F10 to open the menu".into(),
+                "outline" => "2/7 · Right to Navigate · Down to Outline · Enter".into(),
+                "scene" => "3/7 · Select the sample scene · Enter".into(),
+                "write" => "4/7 · Type a few words in the sample scene".into(),
+                "save" => "5/7 · Choose File > Save".into(),
+                "return" => "6/7 · Press Esc to return to Outline".into(),
+                "resume" => "7/7 · Choose Help > Resume Tutorial".into(),
                 _ => "Continue the practice in the sample book.".into(),
             },
         );
-        lines.push(format!("Practice {completed}/{}", required.len()));
+        lines.push(format!(
+            "Practice {completed}/{} tasks complete",
+            required.len()
+        ));
         lines.push(task);
     }
     if lesson_complete {
+        lines.push("Lesson 1 complete".into());
         lines.push("▶ Continue to Lesson 2 · press Enter".into());
         lines.push("F4 Back · F5 Retry · F7 Skip · F8 Exit · Esc Pause".into());
     } else {
-        lines.push("Enter: continue when complete · F4 Back · F5 Retry · F7 Skip · F8 Exit".into());
-        lines.push("Esc Pause · Help > Resume Tutorial returns here".into());
+        lines.push("F4 Back · F5 Retry · F7 Skip · F8 Exit".into());
+        lines.push("Esc Pause · Help > Resume Tutorial".into());
     }
     HelpPanel {
         title: format!("Tutorial · {title} · {}/{}", step + 1, lessons.len()),
@@ -9836,8 +9838,14 @@ impl AppState {
         self.tutorial_preferences_path = preferences_path.clone();
         let mut preferences = onboarding::load(&preferences_path)?;
         if let Some(progress) = preferences.active_tutorial.as_mut() {
-            progress.verified_actions.insert("resume".into());
-            onboarding::store(&preferences_path, &preferences)?;
+            let expected = progress.step == 0
+                && TUTORIAL_NAVIGATION_ACTIONS
+                    .iter()
+                    .find(|(required, _)| !progress.verified_actions.contains(*required))
+                    .is_some_and(|(action, _)| *action == "resume");
+            if expected && progress.verified_actions.insert("resume".into()) {
+                onboarding::store(&preferences_path, &preferences)?;
+            }
         }
         let Some(progress) = preferences.active_tutorial else {
             return self.begin_tutorial_at(
@@ -17833,7 +17841,7 @@ fn tutorial_footer_status(state: &AppState) -> Option<String> {
             "Next: Open menu ({})",
             effective_shortcut_label(state, "menu.main", "F10")
         ),
-        Some("outline") => "Next: Visit Outline (F2 or Navigate > Outline)".into(),
+        Some("outline") => "Next: Navigate > Outline (Right · Down · Enter; F2)".into(),
         Some("scene") => "Next: Select the sample scene and press Enter".into(),
         Some("write") => "Next: Write a few words".into(),
         Some("save") => format!(
@@ -17883,7 +17891,7 @@ fn tutorial_expected_action_hint(state: &AppState) -> String {
             "Press {} to open the menu",
             effective_shortcut_label(state, "menu.main", "F10")
         ),
-        Some("outline") => "Visit Outline with F2 or Navigate > Outline".into(),
+        Some("outline") => "Use Right, Down, Enter for Navigate > Outline".into(),
         Some("scene") => "Select the sample scene and press Enter".into(),
         Some("write") => "Write a few words in the sample scene".into(),
         Some("save") => format!(
@@ -19133,11 +19141,24 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
         return;
     };
     let area = f.area();
-    let width = area.width.saturating_sub(4).clamp(1, 88);
-    let height = area.height.saturating_sub(2).clamp(1, 22);
+    let tutorial = panel.title.starts_with("Tutorial ·");
+    let width = if tutorial {
+        area.width.saturating_sub(2).clamp(1, 78)
+    } else {
+        area.width.saturating_sub(4).clamp(1, 88)
+    };
+    let height = if tutorial {
+        area.height.min(7)
+    } else {
+        area.height.saturating_sub(2).clamp(1, 22)
+    };
     let rect = Rect::new(
         area.x + (area.width - width) / 2,
-        area.y + (area.height - height) / 2,
+        if tutorial {
+            area.y + area.height - height
+        } else {
+            area.y + (area.height - height) / 2
+        },
         width,
         height,
     );
@@ -19202,7 +19223,11 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
     f.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: true }).block(
             Block::default()
-                .title(format!(" {} · Esc closes ", panel.title))
+                .title(if tutorial {
+                    format!(" {} ", panel.title)
+                } else {
+                    format!(" {} · Esc closes ", panel.title)
+                })
                 .borders(Borders::ALL),
         ),
         rect,
@@ -23926,7 +23951,6 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             s.message = format!("Next: {}", tutorial_expected_action_hint(s));
             return Ok(false);
         }
-        s.help_panel = None;
     } else if tutorial_has_focus
         && k.code != KeyCode::Esc
         && !matches!(k.code, KeyCode::F(4 | 5 | 7 | 8))
@@ -23936,14 +23960,14 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if tutorial_has_focus
+        && s.menu.is_none()
         && k.code == KeyCode::Esc
         && tutorial_next_action(s) == Some("return")
         && s.workspace == Workspace::Editor
     {
         // At this point Esc is the lesson action, so let the editor return to
         // Outline instead of treating the same key as Pause.
-        s.help_panel = None;
-    } else if tutorial_has_focus && k.code == KeyCode::Esc {
+    } else if tutorial_has_focus && s.menu.is_none() && k.code == KeyCode::Esc {
         s.help_panel = None;
         s.message = "Tutorial paused · Help > Resume Tutorial returns to this step".into();
         return Ok(false);
@@ -23960,13 +23984,14 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         if matches!(
             command.action,
             CommandAction::OpenMainMenu | CommandAction::OpenMenuCategory(_)
-        ) {
+        ) && !tutorial_has_focus
+        {
             s.help_panel = None;
         }
         dispatch_key_command(s, command)?;
         return Ok(false);
     }
-    if s.help_panel.is_some() {
+    if s.help_panel.is_some() && !tutorial_has_focus {
         let panel_title = s.help_panel.as_ref().map(|panel| panel.title.as_str());
         if panel_title == Some("Welcome to Writer's IDE") {
             match k.code {
@@ -36867,9 +36892,28 @@ mod tests {
         )
         .unwrap();
         assert!(state.menu.is_some());
-        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
-        handle(&mut state, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)).unwrap();
+        assert!(
+            state.help_panel.is_some(),
+            "practice card stays visible in menu"
+        );
+        for _ in 0..3 {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
         assert_eq!(state.workspace, Workspace::Outline);
+        assert!(
+            state.help_panel.is_some(),
+            "practice card follows navigation"
+        );
         handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
         handle(
             &mut state,
@@ -36955,7 +36999,7 @@ mod tests {
             panel
                 .lines
                 .iter()
-                .any(|line| line.contains("Task 1/7: Press F10"))
+                .any(|line| line.contains("1/7 · Press F10 to open the menu"))
         );
         assert!(panel.lines.iter().any(|line| {
             line.contains("F4 Back")
@@ -36977,6 +37021,19 @@ mod tests {
             "{}",
             state.message
         );
+        assert!(state.help_panel.as_ref().unwrap().lines.len() <= 4);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("1/7 · Press F10 to open the menu"));
+        assert!(screen.contains("Dashboard"), "workspace remains visible");
 
         let mut preferences = onboarding::load(&preferences_path).unwrap();
         preferences
@@ -36992,13 +37049,9 @@ mod tests {
             &preferences_path,
         ));
         assert!(
-            state
-                .help_panel
-                .as_ref()
-                .unwrap()
-                .lines
-                .iter()
-                .any(|line| { line.contains("Press F2, or choose Navigate > Outline") })
+            state.help_panel.as_ref().unwrap().lines.iter().any(|line| {
+                line.contains("2/7 · Right to Navigate · Down to Outline · Enter")
+            })
         );
 
         preferences = onboarding::load(&preferences_path).unwrap();
@@ -37217,7 +37270,10 @@ mod tests {
 
         assert_eq!(state.editor.join("\n"), "q");
         assert!(state.dirty);
-        assert!(state.help_panel.is_none());
+        assert!(
+            state.help_panel.is_some(),
+            "tutorial guidance remains visible"
+        );
     }
 
     #[test]
@@ -37964,7 +38020,10 @@ mod tests {
             .active_tutorial
             .unwrap();
         assert_eq!(resumed.step, progress.step);
-        assert!(resumed.verified_actions.contains("resume"));
+        assert!(
+            !resumed.verified_actions.contains("resume"),
+            "resuming early restores the lesson but cannot count its final practice step"
+        );
         let footer = tutorial_footer_status(&state).unwrap();
         assert!(footer.contains("Tutorial 1/6"), "{footer}");
         assert!(footer.contains("Next: Open menu"), "{footer}");
