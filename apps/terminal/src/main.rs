@@ -9504,9 +9504,9 @@ impl AppState {
                     }
                     self.message = manual_save_confirmation();
                     if self.app.should_prompt_for_missing_scene_time(id)? {
-                        self.message = format!(
-                            "Optional chronology · Set date with `scene-time-set {id} | START | END`; Not yet: leave it unset; Don't ask again: `chronology never`"
-                        );
+                        self.message =
+                            "Saved. Story dates are optional; add them in Timeline when useful."
+                                .into();
                     }
                 }
                 Err(e) => self.message = format!("Save conflict/error: {e}"),
@@ -18218,16 +18218,31 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     Line::from(spans)
                 })
                 .collect::<Vec<_>>();
-            let title = s
-                .assembly_draft
-                .map(|id| format!("Assembly Draft {id} · stable scene markers required"))
-                .unwrap_or_else(|| {
+            let title = s.assembly_draft.map_or_else(
+                || {
                     if s.narrowed_passage.is_some() {
                         format!("Editor — {} · narrowed passage", s.selected_scene())
                     } else {
                         format!("Editor — {}", s.selected_scene())
                     }
-                });
+                },
+                |id| {
+                    let title = s
+                        .app
+                        .load_assembly_draft(id)
+                        .ok()
+                        .and_then(|draft| {
+                            s.app
+                                .list_assemblies()
+                                .ok()?
+                                .into_iter()
+                                .find(|assembly| assembly.id == draft.assembly_id)
+                                .map(|assembly| assembly.title)
+                        })
+                        .unwrap_or_else(|| "Manuscript assembly".into());
+                    format!("Drafting assembly · {title}")
+                },
+            );
             (content, title)
         };
         let editor_and_reference = if s.editor_focus_mode {
@@ -29316,7 +29331,8 @@ mod tests {
         state.editor = vec!["Draft prose remains canonical.".into()];
         state.dirty = true;
         state.save().unwrap();
-        assert!(state.message.contains("Set date"));
+        assert!(state.message.contains("Story dates are optional"));
+        assert!(!state.message.contains(&scene.to_string()));
         assert_eq!(
             state.app.load_scene_text(scene).unwrap().0,
             "Draft prose remains canonical."
@@ -31017,6 +31033,15 @@ mod tests {
         assert_eq!(state.workspace, Workspace::Editor);
         assert!(state.assembly_draft.is_some());
         assert!(state.editor.join("\n").contains(&scene.to_string()));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let title_row = (0..160)
+            .map(|x| buffer[(x, 1)].symbol())
+            .collect::<String>();
+        assert!(title_row.contains("Drafting assembly · Alternate edition"));
+        assert!(!title_row.contains(&state.assembly_draft.unwrap().to_string()));
     }
 
     #[test]
