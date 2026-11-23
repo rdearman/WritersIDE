@@ -543,10 +543,22 @@ fn tutorial_panel_at(
         .as_ref()
         .and_then(|prefs| prefs.active_tutorial.as_ref())
         .map(|progress| &progress.verified_actions);
-    let mut lines = vec![
-        body.into(),
-        "Practice the route in the sample book. Your progress is saved; F6 moves on after the navigation steps are verified.".into(),
-    ];
+    let lesson_complete = step == 0
+        && verified.is_some_and(|actions| {
+            [
+                "menu", "outline", "scene", "write", "save", "return", "resume",
+            ]
+            .iter()
+            .all(|action| actions.contains(*action))
+        });
+    let mut lines = vec![body.into()];
+    if lesson_complete {
+        lines.push("Lesson 1 complete — Enter or F6: Continue to Lesson 2".into());
+    } else {
+        lines.push(
+            "Practice the route in the sample book. Your progress is saved; finish the checklist before moving on.".into(),
+        );
+    }
     if step == 0 {
         lines.extend(required.iter().map(|(key, label)| {
             let mark = if verified.is_some_and(|actions| actions.contains(*key)) {
@@ -558,7 +570,8 @@ fn tutorial_panel_at(
         }));
     }
     lines.push(
-        "F6 next · Shift+F6 previous · Esc pause · Help > Resume Tutorial continues here".into(),
+        "Enter/F6 next · Shift+F6 previous · Esc pause · Help > Resume Tutorial continues here"
+            .into(),
     );
     HelpPanel {
         title: format!("Tutorial · {title} · {}/{}", step + 1, lessons.len()),
@@ -22862,6 +22875,19 @@ fn handle_command_palette_key(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    let tutorial_has_focus = s
+        .help_panel
+        .as_ref()
+        .is_some_and(|panel| panel.title.starts_with("Tutorial ·"));
+    if tutorial_has_focus && (k.code == KeyCode::F(6) || k.code == KeyCode::Enter) {
+        let direction = if k.code == KeyCode::F(6) && k.modifiers.contains(KeyModifiers::SHIFT) {
+            -1
+        } else {
+            1
+        };
+        s.advance_tutorial(direction)?;
+        return Ok(false);
+    }
     if let Some(command) = registered_global_command_for_key(s, k) {
         if matches!(
             command.action,
@@ -35239,6 +35265,85 @@ mod tests {
             progress.step, 1,
             "verified actions: {:?}; message: {}",
             progress.verified_actions, state.message
+        );
+    }
+
+    #[test]
+    fn tutorial_modal_owns_f6_and_enter_before_workspace_shortcuts() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Original"), "Original").unwrap();
+        let demo_path = directory.path().join("Tutorial");
+        let preferences_path = directory.path().join("prefs/tutorial.json");
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .begin_tutorial_at(
+                onboarding::TutorialTrack::GuidedTour,
+                demo_path,
+                preferences_path.clone(),
+            )
+            .unwrap();
+
+        let mut preferences = onboarding::load(&preferences_path).unwrap();
+        let progress = preferences.active_tutorial.as_mut().unwrap();
+        progress.verified_actions = [
+            "menu", "outline", "scene", "write", "save", "return", "resume",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        onboarding::store(&preferences_path, &preferences).unwrap();
+        state.help_panel = Some(tutorial_panel_at(
+            onboarding::TutorialTrack::GuidedTour,
+            0,
+            &preferences_path,
+        ));
+        assert!(
+            state
+                .help_panel
+                .as_ref()
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| line.contains("Lesson 1 complete"))
+        );
+
+        handle(&mut state, KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)).unwrap();
+
+        let progress = onboarding::load(&preferences_path)
+            .unwrap()
+            .active_tutorial
+            .unwrap();
+        assert_eq!(progress.step, 1);
+        assert!(
+            state
+                .help_panel
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("Your sample book")
+        );
+        assert_ne!(state.workspace, Workspace::Characters);
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .step,
+            2
+        );
+        assert!(
+            state
+                .help_panel
+                .as_ref()
+                .unwrap()
+                .title
+                .contains("Write and save")
         );
     }
 
