@@ -27292,6 +27292,26 @@ mod tests {
     }
 
     #[test]
+    fn documented_keybinding_example_parses_and_resolves_registry_commands() {
+        let config: KeymapFile =
+            toml::from_str(include_str!("../../../docs/keybindings.example.toml")).unwrap();
+        let bindings = validate_command_binding_config(&config).unwrap();
+        assert_eq!(bindings.len(), 6);
+        let contexts = merge_context_keymap_configs(vec![config]).unwrap();
+        assert_eq!(contexts.len(), 3);
+        assert!(contexts.iter().any(|binding| {
+            binding.context == "editor"
+                && binding.command_id == "file.save"
+                && binding.sequence.len() == 2
+        }));
+        assert!(
+            contexts
+                .iter()
+                .all(|binding| command_by_id(&binding.command_id).is_some())
+        );
+    }
+
+    #[test]
     fn context_sequences_allow_configured_menu_chords_but_reject_unknowns_and_prefix_conflicts() {
         let root = tempfile::tempdir().unwrap();
         let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();

@@ -43,7 +43,7 @@ The current terminal prototype is launched with `cargo run -p writers-ide-termin
 
 Each project is a directory containing one `story.db`, `project.toml`, portable Markdown files under `manuscript/`, and application recovery data under `.writers-ide/recovery/`. Close the project before copying it manually; use `backup` for a consistent application-managed copy.
 
-Terminal function-key targets can be overridden in `.writers-ide/keybindings.toml`, for example `[bindings]` with `F1 = "Analytics"` and `F4 = "Reading"`; unspecified keys retain their defaults.
+Terminal function-key targets and command shortcuts can be overridden in the user or project keymap. See the [keybinding guide and checked example](docs/keybindings.md).
 
 The terminal command palette can run `extract scene|reading <UUID> <model> [endpoint]` to save an unapproved evidence-linked proposal. The optional Ollama client only accepts localhost HTTP endpoints; the model request runs only after the author invokes it.
 
@@ -67,7 +67,7 @@ In the Reading workspace, `:annotations` and `:bookmarks` show zero-based indice
 
 Reading references expose their story links with `reading-links`; `reading-follow <index>` navigates to the linked scene or switches to the character, plotline, or research workspace.
 
-The SRS and engineering design are the product baselines. The SRS was supplied in the project brief and is not yet present as a repository file. The active engineering history now includes the [menu rationalisation addendum](docs/engineering-design-v2.10-addendum.md). No Ranperen spreadsheets or substantial multi-chapter Scrivener fixture are present, so broad importer compatibility has not been claimed.
+The SRS and engineering design are the product baselines. The SRS was supplied in the project brief and is not yet present as a repository file. The active engineering history includes the [menu rationalisation addendum](docs/engineering-design-v2.10-addendum.md) and [keymap configuration addendum](docs/engineering-design-v2.11-addendum.md). No Ranperen spreadsheets or substantial multi-chapter Scrivener fixture are present, so broad importer compatibility has not been claimed.
 
 
 `writers-ide browse <project> [port]` starts the local loopback browser for planning and read-only review. Its header links to a standalone HTML Compile preview (`/preview`), generated on request through local Pandoc without changing manuscript files. The preview blocks scripts and remote resources.

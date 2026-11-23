@@ -1,0 +1,35 @@
+# Writer's IDE keybinding override example.
+# Copy this file to:
+#   $XDG_CONFIG_HOME/writers-ide/keybindings.toml
+# or to a project's .writers-ide/keybindings.toml
+#
+# These are overrides, not editor profiles. The built-in Writer's IDE defaults
+# remain active for bindings you do not replace. Project bindings take
+# precedence over user bindings for the same key/context.
+
+[bindings]
+# Function-key workspace navigation; unspecified workspace keys keep defaults.
+F1 = "Analytics"
+F4 = "Reading"
+
+[commands]
+# Direct aliases for top-level menus. Ctrl+/ and F10 remain the menu fallback.
+"Alt+F" = "menu.file"
+"Alt+E" = "menu.edit"
+"Alt+I" = "menu.insert"
+
+# Commands can be reassigned by stable registry ID. Add more entries as needed.
+"Ctrl+Alt+S" = "file.save"
+"Ctrl+Alt+F" = "search.find-panel"
+"Ctrl+Alt+P" = "command.palette-open"
+
+[contexts.editor]
+# Multi-stroke sequences are available in a specific interaction context.
+"Ctrl+X Ctrl+S" = "file.save"
+
+[contexts.navigation]
+"Ctrl+X Ctrl+F" = "file.open-project"
+
+[contexts.menu]
+# The same key may be used in distinct contexts when sequences do not conflict.
+"Ctrl+X Ctrl+H" = "help.context"
