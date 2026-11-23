@@ -50,6 +50,12 @@ fn fiction_book_workflow_creates_orders_excludes_edits_reopens_and_compiles() {
     assert!(manuscript.contains("The story opens here."));
     assert!(!manuscript.contains("Scene 01"));
     assert!(manuscript.find("Scene 02").unwrap() < manuscript.find("Scene 00").unwrap());
+    if pandoc_available() {
+        let epub = reopened
+            .compile_artifact(CompileFormat::Epub, false)
+            .unwrap();
+        assert_epub(&epub.bytes);
+    }
 }
 
 #[test]
@@ -106,14 +112,129 @@ fn nonfiction_book_workflow_writes_chapter_prose_without_scenes_and_compiles() {
             < manuscript.find("Foundational evidence.").unwrap()
     );
 
-    if std::process::Command::new("pandoc")
-        .arg("--version")
-        .output()
-        .is_ok_and(|result| result.status.success())
-    {
+    if pandoc_available() {
         let docx = reopened
             .compile_artifact(CompileFormat::Docx, false)
             .unwrap();
         assert!(docx.bytes.starts_with(b"PK"));
+        let epub = reopened
+            .compile_artifact(CompileFormat::Epub, false)
+            .unwrap();
+        assert_epub(&epub.bytes);
     }
+}
+
+#[test]
+fn scrivener_manuscript_workflow_imports_edits_reopens_and_compiles_standalone() {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../cli/tests/fixtures/scrivener-starter/test.scriv");
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("Source.scriv");
+    copy_tree(&fixture, &source);
+    let original_fingerprint = story_import::inspect_scrivener_project(&source)
+        .unwrap()
+        .source_fingerprint;
+    let inventory = story_import::inspect_scrivener_project(&source).unwrap();
+    let mut plan = story_import::ScrivenerImportPlan::proposed(&inventory);
+    for item in &inventory.items {
+        let decision = plan
+            .decisions
+            .iter_mut()
+            .find(|decision| decision.source_document_id == item.source_document_id)
+            .unwrap();
+        match item.type_code.as_deref() {
+            Some("DraftFolder") => {
+                decision.destination_kind = story_import::ScrivenerDestinationKind::Chapter;
+            }
+            Some("Text") => {
+                decision.destination_kind = story_import::ScrivenerDestinationKind::Scene;
+                if item.title.is_empty() {
+                    decision.title_override = Some("Opening".into());
+                }
+            }
+            Some("ResearchFolder") => {
+                decision.destination_kind = story_import::ScrivenerDestinationKind::Research;
+            }
+            Some("TrashFolder") => {
+                decision.destination_kind = story_import::ScrivenerDestinationKind::Skip;
+                decision.include_in_import = false;
+            }
+            other => panic!("unexpected fixture binder type: {other:?}"),
+        }
+    }
+
+    let destination = root.path().join("Imported Fiction");
+    let mut app =
+        WriterApp::create_project_with_type(&destination, "Imported Fiction", BookType::Fiction)
+            .unwrap();
+    let (_, imported) = app
+        .import_scrivener_inventory(&inventory, &plan, story_import::ScrivenerImportMode::Both)
+        .unwrap();
+    assert_eq!(imported.len(), 2);
+    let scenes = app.list_scenes(false).unwrap();
+    assert_eq!(scenes.len(), 2);
+    assert_eq!(
+        app.load_scene_text(scenes[0].scene.id).unwrap().0,
+        "Test\n\nThis is an addition to the old file."
+    );
+    let first = scenes[0].scene.id;
+    let (_, hash) = app.load_scene_text(first).unwrap();
+    app.save_scene_text(first, Some(&hash), "Continued imported scene.")
+        .unwrap();
+    let last_chapter = app
+        .list_structural_nodes()
+        .unwrap()
+        .into_iter()
+        .find(|node| node.kind == "chapter")
+        .unwrap()
+        .id;
+    app.move_scene(first, last_chapter, 1).unwrap();
+    let compiled = app
+        .compile_artifact(CompileFormat::Markdown, false)
+        .unwrap();
+    let manuscript = String::from_utf8(compiled.bytes).unwrap();
+    assert!(manuscript.contains("Continued imported scene."));
+    drop(app);
+
+    let reopened = WriterApp::open_project(&destination).unwrap();
+    assert_eq!(reopened.list_scenes(false).unwrap().len(), 2);
+    assert_eq!(
+        reopened.load_scene_text(first).unwrap().0,
+        "Continued imported scene."
+    );
+    assert_eq!(
+        story_import::inspect_scrivener_project(&source)
+            .unwrap()
+            .source_fingerprint,
+        original_fingerprint
+    );
+}
+
+fn copy_tree(source: &std::path::Path, destination: &std::path::Path) {
+    std::fs::create_dir_all(destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        let target = destination.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+fn pandoc_available() -> bool {
+    std::process::Command::new("pandoc")
+        .arg("--version")
+        .output()
+        .is_ok_and(|result| result.status.success())
+}
+
+fn assert_epub(bytes: &[u8]) {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut mimetype = String::new();
+    std::io::Read::read_to_string(&mut archive.by_name("mimetype").unwrap(), &mut mimetype)
+        .unwrap();
+    assert_eq!(mimetype, "application/epub+zip");
+    assert!(archive.file_names().any(|name| name.ends_with(".opf")));
 }

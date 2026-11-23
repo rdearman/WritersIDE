@@ -34,7 +34,8 @@ The terminal binary continues to accept an explicit project path. When none is p
 - Fiction project creation opens Scene Cards; sixty unique scenes can be created through Insert without menu navigation.
 - Non-fiction project creation opens Outline without scenes.
 - Section/chapter outline selection, UUID-free nested chapter creation, direct chapter prose editing, journalled save, and Markdown compilation are covered by terminal tests.
+- A dedicated author-workflow integration suite exercises 60-scene fiction persistence, ordering, exclusion and compilation; non-fiction sections, direct prose, reorder and Markdown/DOCX/EPUB compilation; and sanitized Scrivener import, continuation, reopen, compile and source-fingerprint preservation.
 
 ## Limitations and remaining workflow work
 
-The current change establishes author-facing entry points; it does not complete the full UAT package. Non-fiction section/chapter keyboard reordering, richer hierarchy commands, large-manuscript fixture coverage, PTY-driven end-to-end journeys, timed challenge integration into the fiction journey, Scrivener import journey automation, and EPUB/DOCX checks across each journey remain to be completed or explicitly verified. Human usability must still be evaluated in a frozen build.
+The current change establishes author-facing entry points and integration tests; it does not complete the full UAT package. Non-fiction section/chapter keyboard reordering, richer hierarchy commands, PTY-driven end-to-end journeys, timed challenge integration into the fiction journey, PDF acceptance, and opening compiled files in a desktop reader remain to be completed or explicitly verified. Human usability must still be evaluated in a frozen build.
