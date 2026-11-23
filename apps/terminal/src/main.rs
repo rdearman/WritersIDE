@@ -630,12 +630,10 @@ fn tutorial_panel_at(
     }
     if lesson_complete {
         lines.push("▶ Continue to Lesson 2 · press Enter".into());
-        lines.push("Esc: return to navigation".into());
+        lines.push("F4 Back · F5 Retry · F7 Skip · F8 Exit · Esc Pause".into());
     } else {
-        lines.push(
-            "Enter: continue when complete · Esc: return to navigation · Help > Resume Tutorial: return here"
-                .into(),
-        );
+        lines.push("Enter: continue when complete · F4 Back · F5 Retry · F7 Skip · F8 Exit".into());
+        lines.push("Esc Pause · Help > Resume Tutorial returns here".into());
     }
     HelpPanel {
         title: format!("Tutorial · {title} · {}/{}", step + 1, lessons.len()),
@@ -9776,7 +9774,7 @@ impl AppState {
         Ok(())
     }
     fn exit_tutorial(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let preferences = onboarding::load(&user_tutorial_preferences_path())?;
+        let preferences = onboarding::load(&self.tutorial_preferences_path)?;
         let Some(progress) = preferences.active_tutorial else {
             self.help_panel = None;
             return Ok(());
@@ -9787,12 +9785,30 @@ impl AppState {
         let recent_projects_path = self.recent_projects_path.take();
         let switched = self.switch_to_project(
             PathBuf::from(progress.return_project),
-            "Tutorial paused · choose Guided Tutorial to resume".into(),
+            "Tutorial paused · Help > Resume Tutorial returns to this step".into(),
         );
         self.recent_projects_path = recent_projects_path;
         switched?;
         self.refresh_tutorial_progress_label();
         self.help_panel = None;
+        Ok(())
+    }
+    fn retry_tutorial_step(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let path = self.tutorial_preferences_path.clone();
+        let mut preferences = onboarding::load(&path)?;
+        let Some(progress) = preferences.active_tutorial.as_mut() else {
+            self.help_panel = None;
+            self.message = "There is no active tutorial to retry".into();
+            return Ok(());
+        };
+        if progress.step == 0 {
+            progress.verified_actions.clear();
+        }
+        let (track, step) = (progress.track, progress.step);
+        onboarding::store(&path, &preferences)?;
+        self.help_panel = Some(tutorial_panel_at(track, step, &path));
+        self.message = "Restarted this tutorial step · your manuscript is unchanged".into();
+        self.refresh_tutorial_progress_label();
         Ok(())
     }
     fn resume_tutorial(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -9843,7 +9859,7 @@ impl AppState {
             self.help_panel = None;
             return Ok(());
         };
-        if direction > 0 && progress.step == 0 {
+        if direction == 1 && progress.step == 0 {
             let required = [
                 "menu", "outline", "scene", "write", "save", "return", "resume",
             ];
@@ -9881,7 +9897,11 @@ impl AppState {
             onboarding::TutorialTrack::GuidedTour => 5,
         };
         if direction < 0 {
-            progress.step = progress.step.saturating_sub(1);
+            if progress.step == 0 {
+                self.message = "You are at the first tutorial step".into();
+            } else {
+                progress.step -= 1;
+            }
         } else if progress.step >= last {
             if self.dirty {
                 self.save()?;
@@ -9910,6 +9930,10 @@ impl AppState {
             step,
             &self.tutorial_preferences_path,
         ));
+        if direction == 2 {
+            self.message =
+                "Skipped this tutorial step · choose Help > Resume Tutorial to return".into();
+        }
         self.refresh_tutorial_progress_label();
         Ok(())
     }
@@ -23729,6 +23753,27 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             "The tutorial uses Enter to continue · F6 remains assigned to your workspace".into();
         return Ok(false);
     }
+    if tutorial_has_focus {
+        match k.code {
+            KeyCode::F(4) => {
+                s.advance_tutorial(-1)?;
+                return Ok(false);
+            }
+            KeyCode::F(5) => {
+                s.retry_tutorial_step()?;
+                return Ok(false);
+            }
+            KeyCode::F(7) => {
+                s.advance_tutorial(2)?;
+                return Ok(false);
+            }
+            KeyCode::F(8) => {
+                s.exit_tutorial()?;
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
     if tutorial_has_focus && k.code == KeyCode::Enter {
         s.advance_tutorial(1)?;
         return Ok(false);
@@ -36742,6 +36787,12 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Task 1/7: Press F10"))
         );
+        assert!(panel.lines.iter().any(|line| {
+            line.contains("F4 Back")
+                && line.contains("F5 Retry")
+                && line.contains("F7 Skip")
+                && line.contains("F8 Exit")
+        }));
 
         let mut preferences = onboarding::load(&preferences_path).unwrap();
         preferences
@@ -36789,6 +36840,64 @@ mod tests {
             lines
                 .iter()
                 .any(|line| line == "▶ Continue to Lesson 2 · press Enter")
+        );
+    }
+
+    #[test]
+    fn tutorial_retry_skip_exit_and_resume_controls_restore_saved_step() {
+        let directory = tempfile::tempdir().unwrap();
+        let original_path = directory.path().join("Original");
+        let app = WriterApp::create_project(&original_path, "Original").unwrap();
+        let demo_path = directory.path().join("Tutorial");
+        let preferences_path = directory.path().join("prefs/tutorial.json");
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .begin_tutorial_at(
+                onboarding::TutorialTrack::GuidedTour,
+                demo_path.clone(),
+                preferences_path.clone(),
+            )
+            .unwrap();
+
+        handle(&mut state, KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE)).unwrap();
+        assert!(state.message.contains("first tutorial step"));
+        state.record_tutorial_action("menu");
+        assert!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .verified_actions
+                .contains("menu")
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)).unwrap();
+        assert!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .verified_actions
+                .is_empty()
+        );
+
+        handle(&mut state, KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .step,
+            1
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::F(8), KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.app.project_root(), original_path);
+        assert!(state.help_panel.is_none());
+
+        state.resume_tutorial_at(&preferences_path).unwrap();
+        assert_eq!(state.app.project_root(), demo_path);
+        assert_eq!(
+            state.help_panel.as_ref().unwrap().title,
+            "Tutorial · Your sample book · 2/6"
         );
     }
 
