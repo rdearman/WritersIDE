@@ -657,6 +657,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 9] = [
         "search.replace-panel",
         "scene.rename",
         "scene.status",
+        "scene.toggle-inclusion",
         "scene.field",
         "comment.create",
     ],
@@ -1172,6 +1173,7 @@ enum CommandAction {
     LegacyPalette,
     CompileWorkflow,
     ToggleFormattingMarks,
+    ToggleSceneInclusion,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1580,6 +1582,21 @@ fn command_registry() -> Vec<CommandSpec> {
         },
     ]);
     commands.extend([
+        CommandSpec {
+            id: "scene.toggle-inclusion",
+            label: "Move Scene Between Included and Excluded",
+            description: "Keep a scene safely while excluding it from the planned manuscript and compile",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: Some('i'),
+            palette_aliases: &["exclude scene", "include scene", "include/exclude scene"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Scene Cards",
+            menu_priority: 8,
+            advanced: false,
+            action: CommandAction::ToggleSceneInclusion,
+        },
         CommandSpec {
             id: "view.formatting-marks",
             label: "Show Formatting Marks",
@@ -6380,6 +6397,75 @@ impl AppState {
         }
         Ok(())
     }
+    fn toggle_scene_card_inclusion(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace != Workspace::Cards {
+            return Err("open Scene Cards to move a scene between Included and Excluded".into());
+        }
+        let scene = selected_scene_for_workspace(self).ok_or("select a scene card first")?;
+        let included = self.app.scene_is_included(scene)?;
+        self.app.set_scene_included(scene, !included)?;
+        let order = scene_card_ids(self);
+        self.selected = order.iter().position(|id| *id == scene).unwrap_or(0);
+        let title = self.app.get_scene(scene)?.scene.title;
+        self.message = if included {
+            format!("Moved “{title}” to Excluded · its text and metadata are retained")
+        } else {
+            format!("Moved “{title}” to Included · it will appear in Compile")
+        };
+        Ok(())
+    }
+    fn move_scene_card(&mut self, direction: isize) -> Result<(), Box<dyn std::error::Error>> {
+        let scene = selected_scene_for_workspace(self).ok_or("select a scene card first")?;
+        let record = self.app.get_scene(scene)?;
+        let chapter = record
+            .chapter_id
+            .ok_or("the scene has no chapter placement")?;
+        let included = self.app.scene_is_included(scene)?;
+        let candidates = self
+            .app
+            .list_scenes(false)?
+            .into_iter()
+            .filter(|candidate| candidate.chapter_id == Some(chapter))
+            .filter(|candidate| {
+                self.app
+                    .scene_is_included(candidate.scene.id)
+                    .unwrap_or(true)
+                    == included
+            })
+            .collect::<Vec<_>>();
+        let current = candidates
+            .iter()
+            .position(|candidate| candidate.scene.id == scene)
+            .ok_or("selected card is missing from its chapter")?;
+        let target = if direction < 0 {
+            current.checked_sub(1)
+        } else {
+            (current + 1 < candidates.len()).then_some(current + 1)
+        };
+        let Some(target) = target else {
+            self.message = "No card in that direction within this chapter · use Move Scene to choose another chapter".into();
+            return Ok(());
+        };
+        let position = candidates[target]
+            .position
+            .ok_or("target scene has no manuscript position")?;
+        self.app.move_scene(scene, chapter, position)?;
+        self.refresh()?;
+        self.selected = scene_card_ids(self)
+            .iter()
+            .position(|id| *id == scene)
+            .unwrap_or(0);
+        self.message = format!(
+            "Moved scene to position {} in {}",
+            position + 1,
+            self.app
+                .list_structural_nodes()?
+                .into_iter()
+                .find(|node| node.id == chapter)
+                .map_or_else(|| "chapter".to_owned(), |node| node.title)
+        );
+        Ok(())
+    }
     fn open_series_book(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.dirty {
             return Err(
@@ -7515,6 +7601,9 @@ impl AppState {
                 Some(OutlineRow::Scene(id)) => Some(*id),
                 _ => None,
             };
+        }
+        if self.workspace == Workspace::Cards {
+            return scene_card_ids(self).get(self.selected).copied();
         }
         self.scenes.get(self.selected).map(|x| x.0)
     }
@@ -8880,7 +8969,7 @@ impl AppState {
         self.last_yank = None;
         self.assembly_draft = None;
         self.dirty = false;
-        self.workspace = Workspace::Editor;
+        self.switch(Workspace::Editor);
         self.record_tutorial_action("scene");
         for pane in &mut self.reference_panes {
             let is_scene_document = pane.source_key.starts_with("scene:");
@@ -9132,6 +9221,8 @@ impl AppState {
     }
     fn switch(&mut self, w: Workspace) {
         if self.workspace != w {
+            let previous = self.workspace;
+            let current_scene = self.editing_scene.or_else(|| self.active_scene());
             if w == Workspace::Outline {
                 self.record_tutorial_action("outline");
             }
@@ -9140,18 +9231,22 @@ impl AppState {
             }
             self.history.push(self.workspace);
             self.history_index = self.history.len() - 1;
-            if w == Workspace::Outline {
-                let current = self
-                    .editing_scene
-                    .or_else(|| self.scenes.get(self.selected).map(|row| row.0));
-                if let Some(scene) = current {
-                    self.selected = outline_rows(self)
-                        .iter()
-                        .position(|row| *row == OutlineRow::Scene(scene))
-                        .unwrap_or(0);
-                } else {
-                    self.selected = 0;
-                }
+            if w == Workspace::Cards {
+                self.selected = current_scene
+                    .and_then(|scene| scene_card_ids(self).iter().position(|id| *id == scene))
+                    .unwrap_or(0);
+            } else if w == Workspace::Outline {
+                self.selected = current_scene
+                    .and_then(|scene| {
+                        outline_rows(self)
+                            .iter()
+                            .position(|row| *row == OutlineRow::Scene(scene))
+                    })
+                    .unwrap_or(0);
+            } else if previous == Workspace::Cards {
+                self.selected = current_scene
+                    .and_then(|scene| self.scenes.iter().position(|row| row.0 == scene))
+                    .unwrap_or(0);
             }
             if w == Workspace::Revisions {
                 self.revision_index = 0;
@@ -10360,6 +10455,7 @@ impl AppState {
                     "Formatting marks hidden · manuscript text is unchanged".into()
                 };
             }
+            CommandAction::ToggleSceneInclusion => self.toggle_scene_card_inclusion()?,
             CommandAction::Save => self.save()?,
             CommandAction::RequestQuit => self.request_quit(),
             CommandAction::Help => {
@@ -17208,6 +17304,101 @@ fn display_shortcut_label(label: String) -> String {
     label.replace("Ctrl+/", "hold Ctrl, press /")
 }
 
+fn workspace_action_hint(workspace: Workspace) -> &'static str {
+    match workspace {
+        Workspace::Cards => {
+            "↑/↓ select · Ctrl+↑/↓ reorder · Space include/exclude · Shift+Space select · Enter open · Edit > Move Scene for another chapter"
+        }
+        Workspace::Editor => "Esc: Outline",
+        _ => "Tab: destinations",
+    }
+}
+
+fn scene_card_rows(s: &AppState, included: bool) -> Vec<(SceneId, String)> {
+    let excluded = s
+        .app
+        .list_excluded_scene_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let nodes = s.app.list_structural_nodes().unwrap_or_default();
+    s.scenes
+        .iter()
+        .filter(|(id, _, _, _)| excluded.contains(id) != included)
+        .filter_map(|(id, title, status, words)| {
+            let record = s.app.get_scene(*id).ok()?;
+            let chapter = record
+                .chapter_id
+                .and_then(|chapter| nodes.iter().find(|node| node.id == chapter))
+                .map_or_else(|| "Unplaced".to_owned(), |node| node.title.clone());
+            Some((
+                *id,
+                format!(
+                    "┌─ [{}] {title}\n│ {chapter} · {} · {words} words\n{}└────────────────────",
+                    if included { "Included" } else { "Excluded" },
+                    status.as_str(),
+                    if record.scene.synopsis.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("│ {}\n", record.scene.synopsis.trim())
+                    }
+                ),
+            ))
+        })
+        .collect()
+}
+
+fn draw_scene_card_column(
+    frame: &mut ratatui::Frame<'_>,
+    area: Rect,
+    title: &str,
+    rows: &[(SceneId, String)],
+    selected_scene: Option<SceneId>,
+) {
+    let selected = selected_scene.and_then(|scene| rows.iter().position(|row| row.0 == scene));
+    let items = if rows.is_empty() {
+        vec![ListItem::new(format!("No {} scenes", title.to_lowercase()))]
+    } else {
+        rows.iter()
+            .map(|(_, card)| ListItem::new(card.clone()))
+            .collect()
+    };
+    let mut state = ListState::default().with_selected(selected);
+    frame.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::default().fg(Color::White).bg(Color::Blue))
+            .block(
+                Block::default()
+                    .title(format!("{title} · {}", rows.len()))
+                    .borders(Borders::ALL),
+            ),
+        area,
+        &mut state,
+    );
+}
+
+fn draw_scene_cards_workspace(frame: &mut ratatui::Frame<'_>, state: &AppState, area: Rect) {
+    let included = scene_card_rows(state, true);
+    let excluded = scene_card_rows(state, false);
+    let selected = selected_scene_for_workspace(state);
+    if area.width >= 100 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+        draw_scene_card_column(frame, columns[0], "Included", &included, selected);
+        draw_scene_card_column(frame, columns[1], "Excluded", &excluded, selected);
+    } else {
+        let columns = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(area);
+        draw_scene_card_column(frame, columns[0], "Included", &included, selected);
+        draw_scene_card_column(frame, columns[1], "Excluded", &excluded, selected);
+    }
+}
+
 fn tutorial_footer_status(state: &AppState) -> Option<String> {
     state.tutorial_progress_label.as_ref().map(|progress| {
         format!(
@@ -17256,7 +17447,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             ])
             .split(rows[1])
     };
-    if s.workspace == Workspace::Editor {
+    if s.workspace == Workspace::Cards {
+        draw_scene_cards_workspace(f, s, rows[1]);
+    } else if s.workspace == Workspace::Editor {
         if !s.editor_focus_mode {
             let (items, title, selected) = if let Some(targets) = &s.pending_replace {
                 (
@@ -18074,7 +18267,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     "Esc outline"
                 }
             } else {
-                "Tab destinations"
+                workspace_action_hint(s.workspace)
             };
             let status = if let Some(tutorial) = tutorial_footer_status(s) {
                 format!(
@@ -18113,7 +18306,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             };
             if let Some(tutorial) = tutorial_footer_status(s) {
                 format!(
-                    " {tutorial} · F10 Menu · Tab: destinations · {}{}",
+                    " {tutorial} · F10 Menu · {} · {}{}",
+                    workspace_action_hint(s.workspace),
                     if s.dirty { "unsaved" } else { "saved" },
                     if s.message.is_empty() {
                         String::new()
@@ -18206,7 +18400,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     "Esc: Outline"
                 }
             } else {
-                "Tab: destinations"
+                workspace_action_hint(s.workspace)
             };
             let menu_hint = display_shortcut_label(effective_shortcut_label(s, "menu.main", "F10"));
             let actions = if let Some(tutorial) = tutorial_footer_status(s) {
@@ -20904,7 +21098,7 @@ fn selected_scene_for_workspace(s: &AppState) -> Option<SceneId> {
             Some(OutlineRow::Scene(scene)) => Some(*scene),
             _ => None,
         },
-        Workspace::Cards => s.scenes.get(s.selected).map(|scene| scene.0),
+        Workspace::Cards => scene_card_ids(s).get(s.selected).copied(),
         Workspace::Search if !s.search_hits.is_empty() => s
             .search_hits
             .get(s.selected)
@@ -21071,6 +21265,25 @@ fn outline_rows(s: &AppState) -> Vec<OutlineRow> {
     rows
 }
 
+fn scene_card_ids(s: &AppState) -> Vec<SceneId> {
+    let excluded = s
+        .app
+        .list_excluded_scene_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    s.scenes
+        .iter()
+        .filter(|(id, _, _, _)| !excluded.contains(id))
+        .chain(
+            s.scenes
+                .iter()
+                .filter(|(id, _, _, _)| excluded.contains(id)),
+        )
+        .map(|(id, _, _, _)| *id)
+        .collect()
+}
+
 fn workspace_items(s: &AppState) -> Vec<String> {
     if s.workspace == Workspace::Series {
         if let Some(wizard) = s.scrivener_import.as_ref() {
@@ -21230,19 +21443,29 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 ),
             })
             .collect(),
-        Workspace::Cards => s
-            .scenes
-            .iter()
-            .map(|(id, title, status, words)| {
-                format!(
-                    "{} {title}   {}   {words} words",
-                    if s.selected_scenes.contains(id) {
-                        "[x]"
-                    } else {
-                        "[ ]"
-                    },
-                    status.as_str()
-                )
+        Workspace::Cards => scene_card_ids(s)
+            .into_iter()
+            .filter_map(|id| {
+                let row = s.app.get_scene(id).ok()?;
+                let included = s.app.scene_is_included(id).unwrap_or(true);
+                let chapter = row
+                    .chapter_id
+                    .and_then(|id| {
+                        s.app
+                            .list_structural_nodes()
+                            .ok()?
+                            .into_iter()
+                            .find(|node| node.id == id)
+                    })
+                    .map_or_else(|| "Unplaced".to_owned(), |node| node.title);
+                Some(format!(
+                    "{} · {}\n{} · {} · {} words",
+                    if included { "Included" } else { "Excluded" },
+                    chapter,
+                    row.scene.title,
+                    row.scene.status.as_str(),
+                    row.actual_words
+                ))
             })
             .collect(),
         Workspace::Search if !s.search_hits.is_empty() => s
@@ -24031,7 +24254,14 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
             KeyCode::Esc => {
                 s.record_tutorial_action("return");
-                s.switch(Workspace::Outline);
+                let previous = s
+                    .history
+                    .get(s.history_index)
+                    .copied()
+                    .filter(|workspace| *workspace != Workspace::Editor)
+                    .filter(|workspace| *workspace != Workspace::Dashboard)
+                    .unwrap_or(Workspace::Outline);
+                s.switch(previous);
             }
             _ => {}
         }
@@ -24151,6 +24381,32 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             s.resume_tutorial()?;
         }
         KeyCode::Enter if s.workspace == Workspace::Research && s.proposal_review_active => {}
+        KeyCode::Up
+            if s.workspace == Workspace::Cards && k.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            if let Err(error) = s.move_scene_card(-1) {
+                s.message = error.to_string();
+            }
+        }
+        KeyCode::Down
+            if s.workspace == Workspace::Cards && k.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            if let Err(error) = s.move_scene_card(1) {
+                s.message = error.to_string();
+            }
+        }
+        KeyCode::Char(' ') if s.workspace == Workspace::Cards && k.modifiers.is_empty() => {
+            if let Err(error) = s.toggle_scene_card_inclusion() {
+                s.message = error.to_string();
+            }
+        }
+        KeyCode::Char(' ')
+            if s.workspace == Workspace::Cards && k.modifiers == KeyModifiers::SHIFT =>
+        {
+            if let Some(scene) = selected_scene_for_workspace(s) {
+                toggle_scene_selection(s, scene);
+            }
+        }
         KeyCode::Esc if s.workspace == Workspace::Revisions && s.revision_diff.is_some() => {
             s.revision_diff = None;
             s.revision_scene = None;
@@ -31406,6 +31662,97 @@ mod tests {
     }
 
     #[test]
+    fn scene_cards_reorder_toggle_preserve_text_and_return_to_cards() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        for scene in [first, second] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), &format!("Text for {scene}"))
+                .unwrap();
+        }
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.switch(Workspace::Cards);
+        state.selected = 1;
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Up, KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        let order = state.app.list_scenes(false).unwrap();
+        assert_eq!(order[0].scene.id, second);
+        assert_eq!(order[1].scene.id, first);
+        assert_eq!(
+            state.app.load_scene_text(second).unwrap().0,
+            format!("Text for {second}")
+        );
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!state.app.scene_is_included(second).unwrap());
+        assert_eq!(
+            state.app.load_scene_text(second).unwrap().0,
+            format!("Text for {second}")
+        );
+        assert!(state.message.contains("text and metadata are retained"));
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.workspace, Workspace::Cards);
+
+        let reopened = WriterApp::open_project(state.app.project_root()).unwrap();
+        assert!(!reopened.scene_is_included(second).unwrap());
+        assert_eq!(
+            reopened.load_scene_text(second).unwrap().0,
+            format!("Text for {second}")
+        );
+        assert_eq!(reopened.get_scene(second).unwrap().scene.title, "Second");
+    }
+
+    #[test]
+    fn scene_cards_render_in_stacked_and_side_by_side_layouts() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let included = app.create_scene(chapter, "Included Card", 0).unwrap();
+        let excluded = app.create_scene(chapter, "Excluded Card", 1).unwrap();
+        app.set_scene_included(excluded, false).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.switch(Workspace::Cards);
+
+        for (width, height) in [(80, 24), (120, 30)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(screen.contains("Included"));
+            assert!(screen.contains("Excluded"));
+            assert!(screen.contains("Included Card"));
+            assert!(screen.contains("Excluded Card"));
+        }
+        assert!(state.app.scene_is_included(included).unwrap());
+    }
+
+    #[test]
     fn open_and_selected_scopes_include_unsaved_and_explicitly_selected_scenes() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -31423,7 +31770,7 @@ mod tests {
         state.selected = 1;
         handle(
             &mut state,
-            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::SHIFT),
         )
         .unwrap();
         assert_eq!(state.selected_scenes, BTreeSet::from([second]));

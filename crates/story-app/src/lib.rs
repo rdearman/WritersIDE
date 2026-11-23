@@ -1424,6 +1424,15 @@ impl WriterApp {
     pub fn list_scenes(&self, include_archived: bool) -> Result<Vec<SceneRecord>> {
         Ok(self.store.list_scenes(include_archived)?)
     }
+    pub fn scene_is_included(&self, id: SceneId) -> Result<bool> {
+        Ok(self.store.scene_is_included(id)?)
+    }
+    pub fn set_scene_included(&mut self, id: SceneId, included: bool) -> Result<()> {
+        Ok(self.store.set_scene_included(id, included)?)
+    }
+    pub fn list_excluded_scene_ids(&self) -> Result<Vec<SceneId>> {
+        Ok(self.store.list_excluded_scene_ids()?)
+    }
     pub fn list_project_symbols(&self) -> Result<Vec<ProjectSymbolDefinition>> {
         let mut symbols = Vec::new();
         for scene in self.list_scenes(false)? {
@@ -3143,6 +3152,9 @@ impl WriterApp {
         }
         let mut snapshots = 0usize;
         for row in self.store.list_scenes(false)? {
+            if !self.store.scene_is_included(row.scene.id)? {
+                continue;
+            }
             let (text, _) = self.store.load_text(row.scene.id)?;
             let language_code = Some(row.scene.effective_language_code(&project).to_owned());
             let language_spans = self
@@ -6687,6 +6699,45 @@ unexpected_prose = "must not be silently discarded"
         let plain = String::from_utf8(plain.bytes).unwrap();
         assert!(plain.contains("Élodie arrives."));
         assert!(!plain.contains("{lang=it-IT}"));
+    }
+
+    #[test]
+    fn excluded_scenes_remain_editable_but_are_absent_from_default_compile() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let included = app.create_scene(chapter, "Included", 0).unwrap();
+        let excluded = app.create_scene(chapter, "Set Aside", 1).unwrap();
+        for (scene, text) in [
+            (included, "This stays in the book."),
+            (excluded, "This draft is set aside."),
+        ] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), text).unwrap();
+        }
+
+        app.set_scene_included(excluded, false).unwrap();
+        assert!(!app.scene_is_included(excluded).unwrap());
+        assert_eq!(
+            app.load_scene_text(excluded).unwrap().0,
+            "This draft is set aside."
+        );
+        let compiled = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        let compiled = String::from_utf8(compiled.bytes).unwrap();
+        assert!(compiled.contains("This stays in the book."));
+        assert!(!compiled.contains("This draft is set aside."));
+
+        app.set_scene_included(excluded, true).unwrap();
+        let compiled = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        assert!(
+            String::from_utf8(compiled.bytes)
+                .unwrap()
+                .contains("This draft is set aside.")
+        );
     }
 
     #[test]
