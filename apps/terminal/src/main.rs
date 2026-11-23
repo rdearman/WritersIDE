@@ -36502,9 +36502,11 @@ mod tests {
         state.open_scene(scene).unwrap();
         let editor_surface = render_context_key(&state);
 
-        for (width, height) in [(201, 60), (80, 24)] {
-            let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(201, 60)).unwrap();
+        for (width, height) in [(177, 60), (80, 24), (201, 60)] {
+            terminal.backend_mut().resize(width, height);
+            terminal.clear().unwrap();
             terminal.draw(|frame| draw(frame, &mut state)).unwrap();
             let screen = terminal
                 .backend()
@@ -36513,15 +36515,29 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert!(
-                screen.contains("Maqrara opened the old book and found a note"),
-                "{width}x{height}: {screen:?}"
-            );
-            assert!(screen.contains("inside."), "{width}x{height}: {screen:?}");
-            assert!(
-                screen.contains("A longer paragraph wraps without separating"),
-                "{width}x{height}: {screen:?}"
-            );
+            // Narrow side-by-side layouts legitimately wrap sentences between words.
+            // Check that words remain contiguous in terminal cells, which catches the
+            // reported letter-spacing corruption without assuming a particular pane width.
+            for word in [
+                "Maqrara",
+                "opened",
+                "book",
+                "found",
+                "inside.",
+                "longer",
+                "paragraph",
+                "wraps",
+                "separating",
+                "individual",
+                "words",
+                "leaking",
+                "pane.",
+            ] {
+                assert!(
+                    screen.contains(word),
+                    "{width}x{height}, missing {word}: {screen:?}"
+                );
+            }
 
             state.open_reference_buffer(
                 "test:reference-render".into(),
@@ -36601,10 +36617,12 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert!(
-                after_menu_close.contains("Maqrara opened the old book and found a note"),
-                "{width}x{height}: {after_menu_close:?}"
-            );
+            for word in ["Maqrara", "opened", "book", "found", "note"] {
+                assert!(
+                    after_menu_close.contains(word),
+                    "{width}x{height}, missing {word}: {after_menu_close:?}"
+                );
+            }
         }
 
         let (_, saved_hash) = state.app.load_scene_text(scene).unwrap();
