@@ -6508,8 +6508,16 @@ impl AppState {
             name,
             overwrite_confirmed: false,
         });
-        self.message =
-            "Choose a folder or filename · F5 confirms · F7 creates folder · Esc cancels".into();
+        self.message = if matches!(
+            purpose,
+            FileBrowserPurpose::ImportScrivenerSource
+                | FileBrowserPurpose::ImportScrivenerCurrent
+                | FileBrowserPurpose::ImportScrivenerSeries
+        ) {
+            "Select .scriv/.scrivx · Enter opens a manifest preview · F5 inspects/imports · Esc cancels".into()
+        } else {
+            "Choose a folder or filename · F5 confirms · F7 creates folder · Esc cancels".into()
+        };
         Ok(())
     }
 
@@ -6626,6 +6634,27 @@ impl AppState {
                         match set_file_browser_directory(&mut browser, path) {
                             Ok(()) => browser.overwrite_confirmed = false,
                             Err(error) => self.message = format!("Could not open folder: {error}"),
+                        }
+                    } else if matches!(
+                        browser.purpose,
+                        FileBrowserPurpose::ImportScrivenerSource
+                            | FileBrowserPurpose::ImportScrivenerCurrent
+                            | FileBrowserPurpose::ImportScrivenerSeries
+                    ) {
+                        if !name.ends_with(".scrivx") {
+                            self.message = "Select a .scrivx manifest and press Enter for preview, or F5 to inspect/import".into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        } else {
+                            match self.start_scrivener_import_from_browser(&browser) {
+                                Ok(()) => close = true,
+                                Err(error) => {
+                                    self.message =
+                                        format!("Scrivener import was not started: {error}");
+                                    self.file_browser = Some(browser);
+                                    return Ok(());
+                                }
+                            }
                         }
                     } else {
                         browser.name = name;
@@ -7213,6 +7242,34 @@ impl AppState {
             "Add to current project preview: {item_count} binder items · no existing content is replaced · ←/→ map · Space include/skip · Ctrl-Enter confirm import · Esc cancel"
         );
         Ok(())
+    }
+    fn start_scrivener_import_from_browser(
+        &mut self,
+        browser: &FileBrowserState,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let source = browser
+            .entries
+            .get(browser.selected)
+            .map(|(item, _)| browser.current_dir.join(item))
+            .filter(|path| {
+                (path.is_dir() && path.extension().is_some_and(|ext| ext == "scriv"))
+                    || (path.is_file() && path.extension().is_some_and(|ext| ext == "scrivx"))
+            })
+            .ok_or("Select a readable .scriv project folder or .scrivx manifest")?;
+        match browser.purpose {
+            FileBrowserPurpose::ImportScrivenerSource => {
+                self.start_scrivener_import_standalone(source)
+            }
+            FileBrowserPurpose::ImportScrivenerCurrent => {
+                self.start_scrivener_import_current(source)
+            }
+            FileBrowserPurpose::ImportScrivenerSeries => {
+                let inventory = story_import::inspect_scrivener_project(&source)?;
+                let folder = safe_filename(&inventory.title);
+                self.start_scrivener_import(source, folder, inventory.title)
+            }
+            _ => Err("the active file browser is not selecting a Scrivener source".into()),
+        }
     }
     fn cycle_scrivener_mapping(&mut self, direction: i8) -> Result<(), Box<dyn std::error::Error>> {
         use story_import::ScrivenerDestinationKind as Kind;
@@ -20142,7 +20199,7 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             | FileBrowserPurpose::ImportScrivenerSeries
     ) {
         (
-            "F5 Inspect/Import · F7 New Folder · Enter Browse · Esc Cancel",
+            "Enter Preview .scrivx · F5 Inspect/Import · F7 New Folder · Esc Cancel",
             "Tab/Shift+Tab: panes · Home: Home · /: Root · Backspace: Parent",
         )
     } else {
@@ -25186,7 +25243,7 @@ mod tests {
             state.file_browser.as_ref().unwrap().purpose,
             FileBrowserPurpose::ImportScrivenerSource
         );
-        assert!(state.message.contains("Choose a folder or filename"));
+        assert!(state.message.contains("Enter opens a manifest preview"));
     }
 
     #[test]
@@ -25229,6 +25286,56 @@ mod tests {
         assert_eq!(preview.target, ScrivenerImportTarget::Standalone);
         assert!(!preview.inventory.items.is_empty());
         assert!(state.message.contains("Standalone Scrivener preview"));
+    }
+
+    #[test]
+    fn pressing_enter_on_scrivener_manifest_opens_import_preview() {
+        fn copy_tree(source: &Path, destination: &Path) {
+            fs::create_dir_all(destination).unwrap();
+            for entry in fs::read_dir(source).unwrap() {
+                let entry = entry.unwrap();
+                let output = destination.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &output);
+                } else {
+                    fs::copy(entry.path(), output).unwrap();
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../cli/tests/fixtures/scrivener-windows-311/Windows Regression.scriv");
+        let source = root.path().join("Regression.scriv");
+        copy_tree(&fixture, &source);
+        let current = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(current, default_bindings());
+        state
+            .dispatch_registered_command_id("file.import-scrivener-current")
+            .unwrap();
+        let manifest_name = "Windows Regression.scrivx";
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = source.clone();
+        browser.entries = file_browser_entries(&source).unwrap();
+        browser.selected = browser
+            .entries
+            .iter()
+            .position(|entry| entry.0 == manifest_name)
+            .unwrap();
+        browser.focus = 1;
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert!(state.file_browser.is_none());
+        let preview = state.scrivener_import.as_ref().unwrap();
+        assert_eq!(preview.target, ScrivenerImportTarget::CurrentProject);
+        assert!(!preview.inventory.items.is_empty());
+        assert!(state.message.contains("Add to current project preview"));
+        assert!(source.join(manifest_name).is_file());
     }
 
     #[test]
