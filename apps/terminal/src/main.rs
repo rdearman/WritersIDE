@@ -33138,6 +33138,15 @@ mod tests {
             format!("Text for {second}")
         );
         assert!(state.message.contains("text and metadata are retained"));
+        let compiled = story_pipeline::compile_ir(&state.app.processing_input().unwrap());
+        assert_eq!(
+            compiled
+                .units
+                .iter()
+                .map(|unit| unit.id.clone())
+                .collect::<Vec<_>>(),
+            vec![first.to_string()]
+        );
 
         handle(
             &mut state,
@@ -33155,6 +33164,26 @@ mod tests {
             format!("Text for {second}")
         );
         assert_eq!(reopened.get_scene(second).unwrap().scene.title, "Second");
+
+        state.selected = scene_card_ids(&state)
+            .iter()
+            .position(|id| *id == second)
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.app.scene_is_included(second).unwrap());
+        let recompiled = story_pipeline::compile_ir(&state.app.processing_input().unwrap());
+        assert_eq!(
+            recompiled
+                .units
+                .iter()
+                .map(|unit| unit.id.clone())
+                .collect::<Vec<_>>(),
+            vec![second.to_string(), first.to_string()]
+        );
     }
 
     #[test]
@@ -33215,6 +33244,62 @@ mod tests {
             .filter_map(|(id, _)| *id)
             .collect::<Vec<_>>();
         assert_eq!(visible_order, scene_card_ids(&state));
+    }
+
+    #[test]
+    fn scene_cards_move_between_chapters_without_losing_content_or_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let first_chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let second_chapter = app.create_chapter(None, "Chapter Two", 1).unwrap();
+        let scene = app
+            .create_scene(first_chapter, "Travelling Scene", 0)
+            .unwrap();
+        let mut metadata = app.get_scene(scene).unwrap().scene;
+        metadata.synopsis = "Cross-chapter synopsis".into();
+        metadata.purpose = "Preserve metadata".into();
+        app.update_scene_metadata(&metadata).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "The scene stays intact.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.switch(Workspace::Cards);
+        state.selected = scene_card_ids(&state)
+            .iter()
+            .position(|id| *id == scene)
+            .unwrap();
+
+        state.dispatch_registered_command_id("scene.move").unwrap();
+        assert!(state.message.contains("Chapter Two"));
+        state.prompt = "2".into();
+        state.command().unwrap();
+
+        let moved = state.app.get_scene(scene).unwrap();
+        assert_eq!(moved.chapter_id, Some(second_chapter));
+        assert_eq!(moved.scene.synopsis, "Cross-chapter synopsis");
+        assert_eq!(moved.scene.purpose, "Preserve metadata");
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "The scene stays intact."
+        );
+        let reloaded = WriterApp::open_project(state.app.project_root()).unwrap();
+        assert_eq!(
+            reloaded.get_scene(scene).unwrap().chapter_id,
+            Some(second_chapter)
+        );
+        assert_eq!(
+            reloaded.get_scene(scene).unwrap().scene.synopsis,
+            "Cross-chapter synopsis"
+        );
+        assert_eq!(
+            reloaded.get_scene(scene).unwrap().scene.purpose,
+            "Preserve metadata"
+        );
+        assert_eq!(
+            reloaded.load_scene_text(scene).unwrap().0,
+            "The scene stays intact."
+        );
     }
 
     #[test]
