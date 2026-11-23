@@ -259,6 +259,51 @@ struct AppState {
     file_browser: Option<FileBrowserState>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RenderContextKey {
+    workspace: Workspace,
+    menu: Option<usize>,
+    help_title: Option<String>,
+    command_palette: bool,
+    recent_projects: bool,
+    file_browser: bool,
+    series_form: bool,
+    find_panel: bool,
+    macro_preview: bool,
+    replace_preview: bool,
+    snippet_chooser: bool,
+    snippet_preview: bool,
+    reference_focused: bool,
+    editor_focus_mode: bool,
+    references_hidden: bool,
+    reference_layout: ReferenceLayout,
+    active_reference: usize,
+    reference_count: usize,
+}
+
+fn render_context_key(state: &AppState) -> RenderContextKey {
+    RenderContextKey {
+        workspace: state.workspace,
+        menu: state.menu.map(|menu| menu.top),
+        help_title: state.help_panel.as_ref().map(|panel| panel.title.clone()),
+        command_palette: state.command_palette.is_some(),
+        recent_projects: state.recent_project_picker.is_some(),
+        file_browser: state.file_browser.is_some(),
+        series_form: state.series_form.is_some(),
+        find_panel: state.find_panel.is_some(),
+        macro_preview: state.macro_preview.is_some(),
+        replace_preview: state.multi_replace_preview.is_some(),
+        snippet_chooser: state.snippet_chooser.is_some(),
+        snippet_preview: state.snippet_preview.is_some(),
+        reference_focused: state.reference_focused,
+        editor_focus_mode: state.editor_focus_mode,
+        references_hidden: state.reference_panes_hidden,
+        reference_layout: state.reference_layout,
+        active_reference: state.active_reference,
+        reference_count: state.reference_panes.len(),
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ActiveWritingChallenge {
     id: String,
@@ -1455,7 +1500,9 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Resume Tutorial",
             description: "Start the tutorial or return to the saved lesson in its disposable sample project",
             category: "Help",
-            default_shortcuts: &["Ctrl+Shift+R"],
+            // Keep the visible Help menu item as the dependable resume route until a
+            // portable shortcut has been verified in the supported terminal environments.
+            default_shortcuts: &[],
             mnemonic: Some('t'),
             palette_aliases: &["tutorial", "resume-tutorial"],
             palette_prefix: None,
@@ -17047,7 +17094,14 @@ fn run(
         if event::poll(Duration::from_millis(200))? {
             match event::read()? {
                 Event::Key(k) => {
+                    let previous_render_context = render_context_key(s);
                     let should_quit = handle(s, k)? || std::mem::take(&mut s.quit_requested);
+                    if render_context_key(s) != previous_render_context {
+                        // Clear the physical terminal as well as Ratatui's diff buffers when
+                        // changing screens. This prevents stale pane contents on terminals
+                        // that miss or defer partial cell updates.
+                        t.clear()?;
+                    }
                     if s.active_challenge.as_ref().is_some_and(|challenge| {
                         s.count_words_for_project(&s.editor.join("\n")) >= challenge.target_words
                     }) {
@@ -17092,7 +17146,10 @@ fn run(
                         s.message = format!("Session state could not be saved: {error}");
                     }
                 }
-                Event::Resize(_, _) => s.pause_challenge_inactivity(),
+                Event::Resize(_, _) => {
+                    s.pause_challenge_inactivity();
+                    t.clear()?;
+                }
                 Event::Mouse(mouse) => {
                     let save_view = matches!(
                         mouse.kind,
@@ -17414,12 +17471,10 @@ fn draw_scene_cards_workspace(frame: &mut ratatui::Frame<'_>, state: &AppState, 
 }
 
 fn tutorial_footer_status(state: &AppState) -> Option<String> {
-    state.tutorial_progress_label.as_ref().map(|progress| {
-        format!(
-            "{progress} · Resume {}",
-            effective_shortcut_label(state, "help.resume-tutorial", "Ctrl+Shift+R")
-        )
-    })
+    state
+        .tutorial_progress_label
+        .as_ref()
+        .map(|progress| format!("{progress} · Help > Resume Tutorial"))
 }
 
 fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
@@ -19855,7 +19910,10 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     } else {
         Some(menu.selected.min(entries.len() - 1))
     };
-    let (command_list_area, description_area) = if !entries.is_empty() && inner.height >= 6 {
+    let selected_reason = entries
+        .get(menu.selected.min(entries.len().saturating_sub(1)))
+        .and_then(|command| s.command_disabled_reason(*command));
+    let (command_list_area, description_area) = if selected_reason.is_some() && inner.height >= 6 {
         let split = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Min(3), Constraint::Length(2)])
@@ -19877,16 +19935,8 @@ fn draw_menu_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         &mut ListState::default().with_selected(selected),
     );
     if let Some(description_area) = description_area {
-        let detail = match entries.get(menu.selected.min(entries.len() - 1)) {
-            Some(command) => {
-                if let Some(reason) = s.command_disabled_reason(*command) {
-                    format!("{} · unavailable: {reason}", command.description)
-                } else {
-                    command.description.to_owned()
-                }
-            }
-            None => String::new(),
-        };
+        let detail =
+            selected_reason.map_or_else(String::new, |reason| format!("Unavailable: {reason}"));
         f.render_widget(
             Paragraph::new(detail).wrap(Wrap { trim: true }),
             description_area,
@@ -34025,6 +34075,35 @@ mod tests {
     }
 
     #[test]
+    fn primary_menu_shows_action_labels_without_redundant_descriptions() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let file = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "File")
+            .unwrap();
+        state.menu = Some(MenuState {
+            top: file,
+            selected: 2,
+            all_commands: false,
+        });
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Recent Projects"));
+        assert!(!screen.contains("Open a project from a portable list of recently used projects"));
+    }
+
+    #[test]
     fn insert_menu_offers_a_snippet_chooser_and_moves_configuration_to_tools() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -34288,6 +34367,127 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(autosaved.contains("[AUTOSAVED]"));
+    }
+
+    #[test]
+    fn manuscript_and_reference_text_stay_contiguous_across_resizes_and_view_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let manuscript = "Maqrara opened the old book and found a note inside.\nA longer paragraph wraps without separating individual words or leaking past its pane.\n\nThe final paragraph remains visible after the blank line.";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), manuscript).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        let editor_surface = render_context_key(&state);
+
+        for (width, height) in [(201, 60), (80, 24)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            let screen = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                screen.contains("Maqrara opened the old book and found a note"),
+                "{width}x{height}: {screen:?}"
+            );
+            assert!(screen.contains("inside."), "{width}x{height}: {screen:?}");
+            assert!(
+                screen.contains("A longer paragraph wraps without separating"),
+                "{width}x{height}: {screen:?}"
+            );
+
+            state.open_reference_buffer(
+                "test:reference-render".into(),
+                None,
+                "Reference Test".into(),
+                "Reference text remains together on resize.".into(),
+            );
+            state.reference_focused = true;
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            let reference_screen = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                reference_screen.contains("Reference text remains together on resize."),
+                "{width}x{height}: {reference_screen:?}"
+            );
+
+            state.reference_focused = false;
+            state.workspace = Workspace::Reading;
+            state.reading_text = "Library-only text appears in its own reading pane.".into();
+            state.message.clear();
+            assert_ne!(render_context_key(&state), editor_surface);
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            let reading_screen = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(reading_screen.contains("Library-only text appears in its own reading pane."));
+            assert!(
+                !reading_screen.contains(manuscript),
+                "{width}x{height}: {reading_screen:?}"
+            );
+
+            state.workspace = Workspace::Editor;
+            state.reading_text.clear();
+            state.help_panel = Some(HelpPanel {
+                title: "Tutorial · Find your way around · 1/6".into(),
+                lines: vec!["Lesson 1 complete — Press Enter: Continue to Lesson 2".into()],
+                scroll: 0,
+            });
+            assert_ne!(render_context_key(&state), editor_surface);
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            let tutorial_screen = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                tutorial_screen.contains("Lesson 1 complete — Press Enter: Continue to Lesson 2"),
+                "{width}x{height}: {tutorial_screen:?}"
+            );
+            state.help_panel = None;
+            state.menu = Some(MenuState {
+                top: 0,
+                selected: 0,
+                all_commands: false,
+            });
+            assert_ne!(render_context_key(&state), editor_surface);
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            state.menu = None;
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            let after_menu_close = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(
+                after_menu_close.contains("Maqrara opened the old book and found a note"),
+                "{width}x{height}: {after_menu_close:?}"
+            );
+        }
+
+        let (_, saved_hash) = state.app.load_scene_text(scene).unwrap();
+        assert_eq!(saved_hash, state.saved_hash);
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, manuscript);
     }
 
     #[test]
@@ -36121,11 +36321,11 @@ mod tests {
         ] {
             assert_eq!(command_by_id(id).unwrap().category, "Help");
         }
-        assert_eq!(
+        assert!(
             command_by_id("help.resume-tutorial")
                 .unwrap()
-                .default_shortcuts,
-            &["Ctrl+Shift+R"]
+                .default_shortcuts
+                .is_empty()
         );
 
         handle(&mut state, KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE)).unwrap();
@@ -36521,7 +36721,7 @@ mod tests {
     }
 
     #[test]
-    fn help_menu_resumes_active_tutorial_by_command_and_shortcut_without_losing_edits() {
+    fn help_menu_resumes_active_tutorial_without_losing_edits() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
         let preferences_path = directory.path().join("preferences/tutorial-state.json");
@@ -36543,7 +36743,7 @@ mod tests {
         assert_eq!(displayed_command_label(&state, command), "Start Tutorial");
         let row = menu_command_row(&state, command, 56);
         assert!(row.contains("Start Tutorial"), "{row}");
-        assert!(row.contains("Ctrl+Shift+R"), "{row}");
+        assert!(!row.contains("Ctrl+Shift+R"), "{row}");
 
         let completed = onboarding::Preferences {
             version: onboarding::PREFERENCES_VERSION,
@@ -36572,7 +36772,7 @@ mod tests {
         });
         let resume = state.menu_commands()[0];
         assert_eq!(displayed_command_label(&state, resume), "Resume Tutorial");
-        assert!(menu_command_row(&state, resume, 56).contains("Ctrl+Shift+R"));
+        assert!(!menu_command_row(&state, resume, 56).contains("Ctrl+Shift+R"));
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut state)).unwrap();
@@ -36584,7 +36784,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(menu_screen.contains("Resume Tutorial"));
-        assert!(menu_screen.contains("Ctrl+Shift+R"));
+        assert!(!menu_screen.contains("Start the tutorial or return to the saved lesson"));
 
         handle(
             &mut state,
@@ -36604,7 +36804,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(tutorial_screen.contains("Resume Ctrl+Shift+R"));
+        assert!(tutorial_screen.contains("Help > Resume Tutorial"));
         assert!(!tutorial_screen.contains("Help/Resume"));
         assert_eq!(
             state.help_panel.as_ref().unwrap().title,
@@ -36612,21 +36812,7 @@ mod tests {
         );
         assert_eq!(
             tutorial_footer_status(&state).as_deref(),
-            Some("Tutorial 1/6 · Resume Ctrl+Shift+R")
-        );
-
-        state.help_panel = None;
-        handle(
-            &mut state,
-            KeyEvent::new(
-                KeyCode::Char('r'),
-                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-            ),
-        )
-        .unwrap();
-        assert_eq!(
-            state.help_panel.as_ref().unwrap().title,
-            "Tutorial · Find your way around · 1/6"
+            Some("Tutorial 1/6 · Help > Resume Tutorial")
         );
         assert_eq!(state.editor, ["Unsaved sentence stays here."]);
         assert!(state.dirty);
