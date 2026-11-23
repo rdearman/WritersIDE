@@ -4230,6 +4230,13 @@ impl WriterApp {
         )?;
         let mut structural_ids = std::collections::BTreeMap::<String, (NodeId, Target)>::new();
         let mut structural_positions = std::collections::BTreeMap::<Option<NodeId>, u32>::new();
+        for existing in self.list_structural_nodes()? {
+            let next = existing.position.checked_add(1).ok_or_else(|| {
+                AppError::Domain("structural ordering has no available position".into())
+            })?;
+            let position = structural_positions.entry(existing.parent_id).or_default();
+            *position = (*position).max(next);
+        }
         let mut scene_positions = std::collections::BTreeMap::<NodeId, u32>::new();
         let mut imported_scenes = Vec::new();
         let mut unsupported = preview.unsupported.clone();
