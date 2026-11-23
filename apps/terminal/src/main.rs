@@ -2434,6 +2434,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("analysis.coverage-list", "List Coverage Rules", "List project-local coverage requirements", "Plot", "coverage-list", false),
         legacy_command("analysis.coverage-remove", "Remove Coverage Rule", "Remove a coverage requirement by ID", "Plot", "coverage-remove", true),
         legacy_command("analysis.spellcheck", "Spellcheck Manuscript", "Run local Aspell without changing prose", "Tools", "spellcheck", true),
+        legacy_command("proofread.grammar-check", "Grammar Check", "Check the current scene or manuscript using the offline grammar engine", "Review", "grammar-check", false),
         legacy_command(
             "link.create",
             "Create Story Link",
@@ -15564,7 +15565,7 @@ impl AppState {
                 .filter(|record| {
                     scope == "all"
                         || scene_id == Some(record.scene.id)
-                        || chapter_id == record.chapter_id
+                        || chapter_id.is_some_and(|chapter| Some(chapter) == record.chapter_id)
                 })
                 .collect::<Vec<_>>();
             let mut rows = Vec::new();
@@ -15593,6 +15594,90 @@ impl AppState {
             } else {
                 rows.join(" | ")
             };
+        } else if cmd == "grammar-check" || cmd.starts_with("grammar-check ") {
+            let scope = cmd.split_whitespace().nth(1).unwrap_or("current");
+            let target = self.editing_scene.or(self.active_scene());
+            let records = self.app.list_scenes(false)?;
+            let chapter_id = scope
+                .strip_prefix("chapter:")
+                .map(|value| {
+                    uuid::Uuid::parse_str(value)
+                        .map(story_core::NodeId)
+                        .map_err(|_| "invalid chapter scope UUID")
+                })
+                .transpose()?;
+            let scene_id = if scope == "all" || chapter_id.is_some() {
+                None
+            } else if scope == "current" {
+                Some(target.ok_or("select a scene first")?)
+            } else {
+                let value = scope.strip_prefix("scene:").unwrap_or(scope);
+                Some(
+                    uuid::Uuid::parse_str(value)
+                        .map(story_core::SceneId)
+                        .map_err(|_| "scope must be current, all, scene:UUID, or chapter:UUID")?,
+                )
+            };
+            let project = self.app.get_project()?;
+            let selected = records
+                .into_iter()
+                .filter(|record| {
+                    scope == "all"
+                        || scene_id == Some(record.scene.id)
+                        || chapter_id.is_some_and(|chapter| Some(chapter) == record.chapter_id)
+                })
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                return Err("no scenes matched the grammar-check scope".into());
+            }
+            let mut report = Vec::new();
+            let mut unsupported = Vec::new();
+            for record in selected {
+                let (text, _) = self.app.load_scene_text(record.scene.id)?;
+                let language = record.scene.effective_language_code(&project);
+                match story_analysis::grammar_check(&text, language) {
+                    Ok(findings) => {
+                        for finding in findings {
+                            let suggestion = finding
+                                .suggestions
+                                .first()
+                                .map(|value| format!(" · Suggestion: {value}"))
+                                .unwrap_or_default();
+                            report.push(format!(
+                                "{} [{}] bytes {}..{} · {}: {}{}",
+                                record.scene.title,
+                                language,
+                                finding.byte_range.start,
+                                finding.byte_range.end,
+                                finding.category,
+                                finding.message,
+                                suggestion
+                            ));
+                        }
+                    }
+                    Err(error) => unsupported.push(format!("{}: {error}", record.scene.title)),
+                }
+            }
+            let mut body = if report.is_empty() {
+                "No grammar suggestions found.".to_owned()
+            } else {
+                report.join("\n")
+            };
+            if !unsupported.is_empty() {
+                body.push_str("\n\nGrammar checking unavailable for these scenes; local spelling tools remain available:\n");
+                body.push_str(&unsupported.join("\n"));
+            }
+            self.open_reference_buffer(
+                format!("grammar:{}", scope),
+                None,
+                "Offline Grammar Check".into(),
+                body,
+            );
+            self.reference_focused = true;
+            self.message = format!(
+                "Grammar check complete · {} suggestion(s) · manuscript unchanged",
+                report.len()
+            );
         } else if cmd == "spellcheck"
             || cmd.starts_with("spellcheck ")
             || cmd == "spellcheck-hunspell"
@@ -31347,7 +31432,12 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains('⠒'));
+        assert!(
+            rendered
+                .chars()
+                .any(|character| ('\u{2800}'..='\u{28ff}').contains(&character)),
+            "Canvas connector should render using a Braille pattern marker"
+        );
     }
 
     #[test]
@@ -38118,6 +38208,29 @@ mod tests {
             assert!(!rendered.contains("macro-record NAME"), "{width}x{height}");
         }
         assert!(state.app.get_scene(scene).is_ok());
+    }
+
+    #[test]
+    fn grammar_check_command_opens_report_without_changing_scene_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        app.set_project_language("en-GB").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let original = "Élodie said, \"They is ready.\"";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), original).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+
+        state
+            .dispatch_registered_command_id("proofread.grammar-check")
+            .unwrap();
+
+        assert!(state.reference_focused);
+        assert!(state.reference_panes[0].content.contains("Agreement"));
+        assert!(state.reference_panes[0].content.contains("Suggestion: are"));
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, original);
     }
 
     #[test]

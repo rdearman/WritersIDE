@@ -9,5 +9,6 @@ story-core = { path = "../story-core" }
 story-storage = { path = "../story-storage" }
 unicode-segmentation.workspace = true
 regex.workspace = true
+harper-core.workspace = true
 serde.workspace = true
 toml.workspace = true

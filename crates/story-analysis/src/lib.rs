@@ -1,4 +1,10 @@
 //! Read-only analytical projections over the canonical story model.
+use harper_core::{
+    Dialect, Document,
+    linting::{Lint, LintGroup, Linter, Suggestion},
+    parsers::MarkdownOptions,
+    spell::FstDictionary,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use story_core::{ParticipationRole, TimeOrdering};
@@ -186,6 +192,87 @@ pub struct ProofreadingFinding {
     pub category: String,
     pub severity: String,
     pub message: String,
+    /// Suggested replacement strings. Applying a suggestion is always an explicit editor action.
+    pub suggestions: Vec<String>,
+}
+
+/// Offline grammar and spelling capability provided by the embedded Harper engine.
+/// Harper currently supplies grammar rules for English dialects only; the existing
+/// Aspell/Hunspell integrations remain responsible for other project languages.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GrammarCapability {
+    pub engine: &'static str,
+    pub supported_language_tags: &'static [&'static str],
+    pub offline: bool,
+    pub markup_aware: bool,
+}
+
+pub fn grammar_capability() -> GrammarCapability {
+    GrammarCapability {
+        engine: "Harper",
+        supported_language_tags: &["en-GB", "en-US", "en-CA", "en-AU", "en-IN"],
+        offline: true,
+        markup_aware: true,
+    }
+}
+
+/// Run Harper's curated offline English grammar and spelling rules over Markdown.
+/// The caller supplies the effective BCP 47 language tag. Unsupported languages return
+/// a clear error so the UI can offer spelling-only checking instead of silently using
+/// British English rules on unrelated prose.
+pub fn grammar_check(text: &str, language: &str) -> Result<Vec<ProofreadingFinding>, String> {
+    let dialect = Dialect::try_from_bcp47(language).ok_or_else(|| {
+        format!(
+            "offline grammar checking does not support {language}; supported dialects: en-GB, en-US, en-CA, en-AU, en-IN"
+        )
+    })?;
+    let document = Document::new_markdown_curated(text, MarkdownOptions::default());
+    let mut group = LintGroup::new_curated(FstDictionary::curated(), dialect);
+    let mut findings = group
+        .lint(&document)
+        .into_iter()
+        .map(|lint| map_harper_finding(text, lint))
+        .collect::<Result<Vec<_>, _>>()?;
+    findings.sort_by_key(|finding| (finding.byte_range.start, finding.byte_range.end));
+    Ok(findings)
+}
+
+fn map_harper_finding(text: &str, lint: Lint) -> Result<ProofreadingFinding, String> {
+    let char_to_byte = text
+        .char_indices()
+        .map(|(byte, _)| byte)
+        .chain(std::iter::once(text.len()))
+        .collect::<Vec<_>>();
+    let start = *char_to_byte
+        .get(lint.span.start)
+        .ok_or_else(|| "grammar engine returned an invalid character offset".to_owned())?;
+    let end = *char_to_byte
+        .get(lint.span.end)
+        .ok_or_else(|| "grammar engine returned an invalid character range".to_owned())?;
+    if start > end {
+        return Err("grammar engine returned a reversed character range".into());
+    }
+    let original = &text[start..end];
+    let suggestions = lint
+        .suggestions
+        .into_iter()
+        .map(|suggestion| match suggestion {
+            Suggestion::ReplaceWith(chars) => chars.into_iter().collect(),
+            Suggestion::InsertAfter(chars) => {
+                let mut value = original.to_owned();
+                value.extend(chars);
+                value
+            }
+            Suggestion::Remove => String::new(),
+        })
+        .collect();
+    Ok(ProofreadingFinding {
+        byte_range: start..end,
+        category: lint.lint_kind.to_string(),
+        severity: "suggestion".into(),
+        message: lint.message,
+        suggestions,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -281,8 +368,8 @@ pub fn typography_suggestions(text: &str, language: &str) -> Vec<TypographySugge
 #[cfg(test)]
 mod proofread_tests {
     use super::{
-        ProofreadingConfig, ProofreadingPreset, ProofreadingRule, proofread, proofread_with_config,
-        typography_suggestions,
+        ProofreadingConfig, ProofreadingPreset, ProofreadingRule, grammar_capability,
+        grammar_check, proofread, proofread_with_config, typography_suggestions,
     };
 
     #[test]
@@ -364,6 +451,46 @@ mod proofread_tests {
                 config
             );
         }
+    }
+
+    #[test]
+    fn embedded_grammar_checker_is_offline_and_advertises_supported_dialects() {
+        let capability = grammar_capability();
+        assert_eq!(capability.engine, "Harper");
+        assert!(capability.offline);
+        assert!(capability.markup_aware);
+        assert!(capability.supported_language_tags.contains(&"en-GB"));
+        assert!(capability.supported_language_tags.contains(&"en-US"));
+        assert!(grammar_check("Colour and organise the centre.", "en-GB").is_ok());
+        assert!(grammar_check("Bonjour tout le monde.", "fr-FR").is_err());
+    }
+
+    #[test]
+    fn grammar_check_maps_unicode_markdown_spans_to_utf8_bytes() {
+        let text = "Élodie said, \"They is ready.\"";
+        let findings = grammar_check(text, "en-GB").unwrap();
+        let finding = findings
+            .iter()
+            .find(|finding| finding.category == "Agreement")
+            .expect("grammar issue after multibyte text");
+        assert!(text.is_char_boundary(finding.byte_range.start));
+        assert!(text.is_char_boundary(finding.byte_range.end));
+        assert!(!finding.suggestions.is_empty());
+        assert!(text[finding.byte_range.clone()].contains("is"));
+    }
+
+    #[test]
+    fn grammar_check_respects_markdown_code_regions() {
+        let findings =
+            grammar_check("They is ready.\n\n```text\nThey is ready.\n```\n", "en-GB").unwrap();
+        let text = "They is ready.\n\n```text\nThey is ready.\n```\n";
+        let code_start = text.find("```").unwrap();
+        assert!(
+            findings
+                .iter()
+                .all(|finding| finding.byte_range.end <= code_start),
+            "code block should not be linted: {findings:?}"
+        );
     }
 
     #[test]
@@ -498,6 +625,7 @@ fn finding(
             rule.severity.clone()
         },
         message,
+        suggestions: Vec::new(),
     }
 }
 
