@@ -4,7 +4,10 @@ use std::{
     env, fs, io,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc, Mutex,
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -265,13 +268,16 @@ struct AppState {
 struct GrammarBackgroundWorker {
     sender: Sender<GrammarBackgroundJob>,
     receiver: Receiver<GrammarBackgroundResult>,
+    generations: Arc<Mutex<BTreeMap<String, u64>>>,
 }
 
 struct GrammarBackgroundJob {
     scene_id: SceneId,
     scene_title: String,
+    project_root: String,
     language: String,
     source_hash: String,
+    generation: u64,
     text: String,
     config: story_analysis::GrammarProofreadingConfig,
 }
@@ -279,9 +285,35 @@ struct GrammarBackgroundJob {
 struct GrammarBackgroundResult {
     scene_id: SceneId,
     scene_title: String,
+    project_root: String,
     language: String,
     source_hash: String,
+    generation: u64,
     result: Result<Vec<story_analysis::ProofreadingFinding>, String>,
+}
+
+fn next_grammar_job_generation(
+    generations: &Mutex<BTreeMap<String, u64>>,
+    project_scene_key: &str,
+) -> Result<u64, String> {
+    let mut generations = generations
+        .lock()
+        .map_err(|_| "background grammar cancellation state is unavailable".to_owned())?;
+    let generation = generations.entry(project_scene_key.to_owned()).or_default();
+    *generation = generation
+        .checked_add(1)
+        .ok_or_else(|| "background grammar job generation overflow".to_owned())?;
+    Ok(*generation)
+}
+
+fn grammar_job_generation_is_current(
+    generations: &Mutex<BTreeMap<String, u64>>,
+    project_scene_key: &str,
+    generation: u64,
+) -> bool {
+    generations
+        .lock()
+        .is_ok_and(|generations| generations.get(project_scene_key) == Some(&generation))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -5366,23 +5398,48 @@ impl AppState {
         }
         let record = self.app.get_scene(scene_id)?;
         let project = self.app.get_project()?;
+        let project_root = self
+            .app
+            .project_root()
+            .canonicalize()?
+            .to_string_lossy()
+            .into_owned();
         let (text, source_hash) = self.app.load_scene_text(scene_id)?;
         if self.grammar_worker.is_none() {
             let (job_tx, job_rx) = mpsc::channel::<GrammarBackgroundJob>();
             let (result_tx, result_rx) = mpsc::channel::<GrammarBackgroundResult>();
+            let generations = Arc::new(Mutex::new(BTreeMap::new()));
+            let worker_generations = Arc::clone(&generations);
             thread::spawn(move || {
                 while let Ok(job) = job_rx.recv() {
+                    let project_scene_key = format!("{}:{}", job.project_root, job.scene_id);
+                    if !grammar_job_generation_is_current(
+                        &worker_generations,
+                        &project_scene_key,
+                        job.generation,
+                    ) {
+                        continue;
+                    }
                     let result = story_analysis::grammar_check_with_config(
                         &job.text,
                         &job.language,
                         &job.config,
                     );
+                    if !grammar_job_generation_is_current(
+                        &worker_generations,
+                        &project_scene_key,
+                        job.generation,
+                    ) {
+                        continue;
+                    }
                     if result_tx
                         .send(GrammarBackgroundResult {
                             scene_id: job.scene_id,
                             scene_title: job.scene_title,
+                            project_root: job.project_root,
                             language: job.language,
                             source_hash: job.source_hash,
+                            generation: job.generation,
                             result,
                         })
                         .is_err()
@@ -5394,16 +5451,21 @@ impl AppState {
             self.grammar_worker = Some(GrammarBackgroundWorker {
                 sender: job_tx,
                 receiver: result_rx,
+                generations,
             });
         }
         if let Some(worker) = &self.grammar_worker {
+            let project_scene_key = format!("{project_root}:{scene_id}");
+            let generation = next_grammar_job_generation(&worker.generations, &project_scene_key)?;
             worker
                 .sender
                 .send(GrammarBackgroundJob {
                     scene_id,
+                    project_root,
                     language: record.scene.effective_language_code(&project).to_owned(),
                     scene_title: record.scene.title,
                     source_hash,
+                    generation,
                     text,
                     config: settings.grammar,
                 })
@@ -5417,7 +5479,24 @@ impl AppState {
             return Ok(());
         };
         let results = worker.receiver.try_iter().collect::<Vec<_>>();
+        let generations = Arc::clone(&worker.generations);
         for result in results {
+            let project_scene_key = format!("{}:{}", result.project_root, result.scene_id);
+            let current_project_root = self
+                .app
+                .project_root()
+                .canonicalize()
+                .ok()
+                .map(|path| path.to_string_lossy().into_owned());
+            if current_project_root.as_deref() != Some(result.project_root.as_str())
+                || !grammar_job_generation_is_current(
+                    &generations,
+                    &project_scene_key,
+                    result.generation,
+                )
+            {
+                continue;
+            }
             if self.editing_scene == Some(result.scene_id) && self.dirty {
                 continue;
             }
@@ -38899,6 +38978,77 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "They is ready."
         );
+    }
+
+    #[test]
+    fn superseded_background_grammar_results_are_discarded_by_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project_path, "Novel").unwrap();
+        app.set_project_language("en-GB").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, source_hash) = app.load_scene_text(scene).unwrap();
+        let source_hash = app
+            .save_scene_text(scene, Some(&source_hash), "They is ready.")
+            .unwrap();
+        let project_root = project_path.canonicalize().unwrap();
+        let project_root_text = project_root.to_string_lossy().into_owned();
+        let project_scene_key = format!("{project_root_text}:{scene}");
+        let generations = Arc::new(Mutex::new(BTreeMap::new()));
+        let stale_generation =
+            next_grammar_job_generation(&generations, &project_scene_key).unwrap();
+        let current_generation =
+            next_grammar_job_generation(&generations, &project_scene_key).unwrap();
+        assert!(!grammar_job_generation_is_current(
+            &generations,
+            &project_scene_key,
+            stale_generation
+        ));
+        assert!(grammar_job_generation_is_current(
+            &generations,
+            &project_scene_key,
+            current_generation
+        ));
+
+        let (job_sender, _job_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let mut state = AppState::new(app, default_bindings());
+        state.grammar_worker = Some(GrammarBackgroundWorker {
+            sender: job_sender,
+            receiver: result_receiver,
+            generations: Arc::clone(&generations),
+        });
+        let make_result = |result_project_root: String, generation| GrammarBackgroundResult {
+            scene_id: scene,
+            scene_title: "Scene".into(),
+            project_root: result_project_root,
+            language: "en-GB".into(),
+            source_hash: source_hash.clone(),
+            generation,
+            result: Ok(Vec::new()),
+        };
+        result_sender
+            .send(make_result(project_root_text.clone(), stale_generation))
+            .unwrap();
+        state.poll_background_grammar().unwrap();
+        assert!(state.reference_panes.is_empty());
+
+        let other_project_root = format!("{project_root_text}-other");
+        let other_project_scene_key = format!("{other_project_root}:{scene}");
+        let other_project_generation =
+            next_grammar_job_generation(&generations, &other_project_scene_key).unwrap();
+        result_sender
+            .send(make_result(other_project_root, other_project_generation))
+            .unwrap();
+        state.poll_background_grammar().unwrap();
+        assert!(state.reference_panes.is_empty());
+
+        result_sender
+            .send(make_result(project_root_text.clone(), current_generation))
+            .unwrap();
+        state.poll_background_grammar().unwrap();
+        assert_eq!(state.reference_panes.len(), 1);
     }
 
     #[test]
