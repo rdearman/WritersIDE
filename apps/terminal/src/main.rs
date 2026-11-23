@@ -16007,12 +16007,23 @@ impl AppState {
                             "off"
                         }
                     )))
+                    .chain(std::iter::once(format!(
+                        "Compile grammar checks: {}",
+                        if config.grammar.compile_enabled {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    )))
                     .chain(std::iter::once(String::new()))
                     .chain(std::iter::once(
                         "Usage: grammar-settings CATEGORY on|off|severity LEVEL".into(),
                     ))
                     .chain(std::iter::once(
                         "       grammar-settings background on|off".into(),
+                    ))
+                    .chain(std::iter::once(
+                        "       grammar-settings compile on|off".into(),
                     ))
                     .chain(std::iter::once(
                         "       grammar-settings exclude add|remove TERM".into(),
@@ -16042,6 +16053,21 @@ impl AppState {
                 self.message = format!(
                     "Background grammar checks {} · run after a scene is saved",
                     if config.grammar.background_enabled {
+                        "on"
+                    } else {
+                        "off"
+                    }
+                );
+            } else if category == "compile" {
+                config.grammar.compile_enabled = match action {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err("use grammar-settings compile on|off".into()),
+                };
+                self.app.save_proofreading_config(&config)?;
+                self.message = format!(
+                    "Compile-time grammar checks {}",
+                    if config.grammar.compile_enabled {
                         "on"
                     } else {
                         "off"
@@ -38941,12 +38967,16 @@ mod tests {
         state
             .execute_legacy_palette_command("grammar-settings background on")
             .unwrap();
+        state
+            .execute_legacy_palette_command("grammar-settings compile on")
+            .unwrap();
         let config = state.app.proofreading_config().unwrap();
         let agreement = &config.grammar.categories["Agreement"];
         assert!(!agreement.enabled);
         assert_eq!(agreement.severity, "warning");
         assert!(config.grammar.excluded_terms.contains("Acme Corp"));
         assert!(config.grammar.background_enabled);
+        assert!(config.grammar.compile_enabled);
     }
 
     #[test]

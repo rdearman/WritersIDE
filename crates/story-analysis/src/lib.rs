@@ -30,6 +30,9 @@ pub struct GrammarProofreadingConfig {
     /// Run an offline grammar pass after a scene is successfully saved.
     #[serde(default)]
     pub background_enabled: bool,
+    /// Include grammar findings in compile diagnostics when explicitly enabled.
+    #[serde(default)]
+    pub compile_enabled: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -120,6 +123,7 @@ impl Default for GrammarProofreadingConfig {
             categories,
             excluded_terms: BTreeSet::new(),
             background_enabled: false,
+            compile_enabled: false,
         }
     }
 }

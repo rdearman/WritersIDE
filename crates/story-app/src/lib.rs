@@ -2840,6 +2840,90 @@ impl WriterApp {
                 }
             }
         }
+        if proofreading.grammar.compile_enabled {
+            let project_language = ir.language_code.as_deref().unwrap_or("en-GB");
+            for unit in &ir.units {
+                for segment in &unit.segments {
+                    let base_language = unit.language_code.as_deref().unwrap_or(project_language);
+                    let overrides = segment
+                        .language_spans
+                        .iter()
+                        .map(|span| {
+                            let start = usize::try_from(span.start_byte).map_err(|_| {
+                                AppError::Domain(
+                                    "compile language span exceeds address space".into(),
+                                )
+                            })?;
+                            let end = usize::try_from(span.end_byte).map_err(|_| {
+                                AppError::Domain(
+                                    "compile language span exceeds address space".into(),
+                                )
+                            })?;
+                            Ok((start..end, span.language_code.clone()))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    let report = story_analysis::grammar_check_with_passage_languages_and_config(
+                        &segment.document.source,
+                        base_language,
+                        &overrides,
+                        &proofreading.grammar,
+                    )
+                    .map_err(AppError::Domain)?;
+                    for localized in report.findings {
+                        let finding = localized.finding;
+                        let severity = match finding.severity.as_str() {
+                            "error" => story_document::DiagnosticSeverity::Error,
+                            "warning" => story_document::DiagnosticSeverity::Warning,
+                            "information" | "info" => {
+                                story_document::DiagnosticSeverity::Information
+                            }
+                            "suggestion" => story_document::DiagnosticSeverity::Information,
+                            "off" => continue,
+                            other => {
+                                return Err(AppError::Domain(format!(
+                                    "unsupported grammar severity {other}"
+                                )));
+                            }
+                        };
+                        diagnostics.push(story_document::CompileDiagnostic {
+                            code: finding.category,
+                            category: "grammar".into(),
+                            severity,
+                            effective_level: None,
+                            message: format!("{} [{}]", finding.message, localized.language),
+                            remediation_hint: finding.suggestions.first().cloned(),
+                            source_entity_id: Some(segment.source_entity_id.clone()),
+                            source_range: Some(story_document::SourceRange {
+                                start: finding.byte_range.start,
+                                end: finding.byte_range.end,
+                            }),
+                            generated_file: None,
+                            generated_line: None,
+                            suppressed_by: None,
+                            suppressed: false,
+                        });
+                    }
+                    for language in report.unsupported_languages {
+                        diagnostics.push(story_document::CompileDiagnostic {
+                            code: "grammar-language-unsupported".into(),
+                            category: "grammar-capability".into(),
+                            severity: story_document::DiagnosticSeverity::Information,
+                            effective_level: None,
+                            message: format!(
+                                "Grammar check unavailable for {language}; spelling checks remain available"
+                            ),
+                            remediation_hint: None,
+                            source_entity_id: Some(segment.source_entity_id.clone()),
+                            source_range: None,
+                            generated_file: None,
+                            generated_line: None,
+                            suppressed_by: None,
+                            suppressed: false,
+                        });
+                    }
+                }
+            }
+        }
         let chronology_enabled = self.chronology_preferences()?.enabled;
         let plotline_gap_threshold = policy.minimum_plotline_gap_scenes.or(match policy.preset {
             story_document::DiagnosticPreset::Thorough => Some(8),
@@ -7188,6 +7272,50 @@ unexpected_prose = "must not be silently discarded"
         let quiet = app.compile_configuration("quiet", false).unwrap();
         assert_eq!(quiet.status, "success");
         assert!(quiet.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn compile_time_grammar_is_opt_in_language_aware_and_source_mapped() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        let source = "They is ready.";
+        app.save_scene_text(scene, Some(&hash), source).unwrap();
+
+        assert!(
+            app.compile_diagnostics()
+                .unwrap()
+                .iter()
+                .all(|item| item.category != "grammar")
+        );
+
+        let mut config = app.proofreading_config().unwrap();
+        config.grammar.compile_enabled = true;
+        app.save_proofreading_config(&config).unwrap();
+        let diagnostics = app.compile_diagnostics().unwrap();
+        let grammar = diagnostics
+            .iter()
+            .find(|item| item.category == "grammar")
+            .expect("enabled compile grammar pass reports the sentence error");
+        assert_eq!(
+            grammar.source_entity_id.as_deref(),
+            Some(scene.to_string().as_str())
+        );
+        let range = grammar.source_range.as_ref().unwrap();
+        assert!(source.is_char_boundary(range.start));
+        assert!(source.is_char_boundary(range.end));
+        assert_eq!(source.get(range.start..range.end).unwrap(), "is");
+
+        app.set_project_language("fr-FR").unwrap();
+        let diagnostics = app.compile_diagnostics().unwrap();
+        assert!(diagnostics.iter().any(|item| {
+            item.code == "grammar-language-unsupported"
+                && item.message.contains("fr-FR")
+                && item.message.contains("spelling checks remain available")
+        }));
     }
 
     #[test]
