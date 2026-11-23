@@ -6403,12 +6403,15 @@ impl AppState {
                 close = true;
                 self.message = "File selection cancelled".into();
             }
-            KeyCode::Tab | KeyCode::BackTab => browser.focus = (browser.focus + 1) % 3,
+            KeyCode::Tab => browser.focus = (browser.focus + 1) % 3,
+            KeyCode::BackTab => browser.focus = (browser.focus + 2) % 3,
             KeyCode::Up => {
                 if browser.focus == 0 {
                     browser.tree_selected = browser.tree_selected.saturating_sub(1);
+                    browser.overwrite_confirmed = false;
                 } else if browser.focus == 1 && !browser.entries.is_empty() {
                     browser.selected = browser.selected.saturating_sub(1);
+                    browser.overwrite_confirmed = false;
                 }
             }
             KeyCode::Down => {
@@ -6418,20 +6421,20 @@ impl AppState {
                             .len()
                             .saturating_sub(1),
                     );
+                    browser.overwrite_confirmed = false;
                 } else if browser.focus == 1 && !browser.entries.is_empty() {
                     browser.selected = (browser.selected + 1).min(browser.entries.len() - 1);
+                    browser.overwrite_confirmed = false;
                 }
             }
             KeyCode::Home if browser.focus == 0 => {
                 if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
                     && home.is_dir()
                 {
-                    browser.current_dir = home;
-                    browser.entries = file_browser_entries(&browser.current_dir)?;
-                    browser.selected = 0;
-                    browser.tree_selected = file_browser_ancestors(&browser.current_dir)
-                        .len()
-                        .saturating_sub(1);
+                    match set_file_browser_directory(&mut browser, home) {
+                        Ok(()) => browser.overwrite_confirmed = false,
+                        Err(error) => self.message = format!("Could not open folder: {error}"),
+                    }
                 }
             }
             KeyCode::F(2) => {
@@ -6462,45 +6465,52 @@ impl AppState {
                     browser.overwrite_confirmed = false;
                 }
             }
+            KeyCode::F(4) if browser.purpose == FileBrowserPurpose::NewProject => {
+                browser.focus = 2;
+                browser.overwrite_confirmed = false;
+                self.message = format!(
+                    "Selected parent folder {} · enter a project name",
+                    browser.current_dir.display()
+                );
+            }
             KeyCode::Char('/') if browser.focus == 0 => {
-                browser.current_dir = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
-                browser.entries = file_browser_entries(&browser.current_dir)?;
-                browser.selected = 0;
-                browser.tree_selected = 0;
+                let root = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
+                match set_file_browser_directory(&mut browser, root) {
+                    Ok(()) => browser.overwrite_confirmed = false,
+                    Err(error) => self.message = format!("Could not open filesystem root: {error}"),
+                }
             }
             KeyCode::Enter if browser.focus == 0 => {
                 let ancestors = file_browser_ancestors(&browser.current_dir);
                 if let Some(path) = ancestors.get(browser.tree_selected).cloned() {
-                    browser.current_dir = path;
-                    browser.entries = file_browser_entries(&browser.current_dir)?;
-                    browser.selected = 0;
-                    browser.tree_selected = file_browser_ancestors(&browser.current_dir)
-                        .len()
-                        .saturating_sub(1);
+                    match set_file_browser_directory(&mut browser, path) {
+                        Ok(()) => browser.overwrite_confirmed = false,
+                        Err(error) => self.message = format!("Could not open folder: {error}"),
+                    }
                 }
             }
             KeyCode::Backspace | KeyCode::Left if browser.focus != 2 => {
-                if let Some(parent) = browser.current_dir.parent() {
-                    browser.current_dir = parent.to_owned();
-                    browser.entries = file_browser_entries(&browser.current_dir)?;
-                    browser.selected = 0;
-                    browser.tree_selected = file_browser_ancestors(&browser.current_dir)
-                        .len()
-                        .saturating_sub(1);
+                if let Some(parent) = browser.current_dir.parent().map(Path::to_owned) {
+                    match set_file_browser_directory(&mut browser, parent) {
+                        Ok(()) => browser.overwrite_confirmed = false,
+                        Err(error) => {
+                            self.message = format!("Could not open parent folder: {error}")
+                        }
+                    }
                 }
             }
             KeyCode::Enter if browser.focus == 1 => {
                 if let Some((name, is_dir)) = browser.entries.get(browser.selected).cloned() {
                     if is_dir {
-                        browser.current_dir.push(name);
-                        browser.entries = file_browser_entries(&browser.current_dir)?;
-                        browser.selected = 0;
-                        browser.tree_selected = file_browser_ancestors(&browser.current_dir)
-                            .len()
-                            .saturating_sub(1);
+                        let path = browser.current_dir.join(name);
+                        match set_file_browser_directory(&mut browser, path) {
+                            Ok(()) => browser.overwrite_confirmed = false,
+                            Err(error) => self.message = format!("Could not open folder: {error}"),
+                        }
                     } else {
                         browser.name = name;
                         browser.focus = 2;
+                        browser.overwrite_confirmed = false;
                     }
                 }
             }
@@ -6512,8 +6522,17 @@ impl AppState {
                     let path = browser.current_dir.join(folder);
                     match fs::create_dir(&path) {
                         Ok(()) => {
-                            browser.entries = file_browser_entries(&browser.current_dir)?;
-                            self.message = format!("Created folder {}", path.display());
+                            let current_dir = browser.current_dir.clone();
+                            match set_file_browser_directory(&mut browser, current_dir) {
+                                Ok(()) => {
+                                    self.message = format!("Created folder {}", path.display())
+                                }
+                                Err(error) => {
+                                    self.message = format!(
+                                        "Created folder, but could not refresh the browser: {error}"
+                                    )
+                                }
+                            }
                         }
                         Err(error) => self.message = format!("Could not create folder: {error}"),
                     }
@@ -6667,7 +6686,23 @@ impl AppState {
                             self.file_browser = Some(browser);
                             return Ok(());
                         }
-                        fs::create_dir(&destination)?;
+                        if !browser.overwrite_confirmed {
+                            browser.overwrite_confirmed = true;
+                            self.message = format!(
+                                "Create project at {}? Press F5 again to confirm, or Esc to cancel",
+                                destination.display()
+                            );
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        }
+                        if let Err(error) = fs::create_dir(&destination) {
+                            self.message = format!(
+                                "Could not create project folder {}: {error}",
+                                destination.display()
+                            );
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        }
                         if let Err(error) = WriterApp::create_project(&destination, name) {
                             let _ = fs::remove_dir(&destination);
                             self.message = format!("Project creation failed: {error}");
@@ -19857,6 +19892,17 @@ fn file_browser_entries(path: &Path) -> io::Result<Vec<(String, bool)>> {
     Ok(entries)
 }
 
+fn set_file_browser_directory(browser: &mut FileBrowserState, path: PathBuf) -> io::Result<()> {
+    let entries = file_browser_entries(&path)?;
+    browser.current_dir = path;
+    browser.entries = entries;
+    browser.selected = 0;
+    browser.tree_selected = file_browser_ancestors(&browser.current_dir)
+        .len()
+        .saturating_sub(1);
+    Ok(())
+}
+
 fn file_browser_ancestors(path: &Path) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     let mut cursor = Some(path);
@@ -20015,25 +20061,47 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         .style(Style::default().fg(Color::Yellow)),
         chunks[2],
     );
-    let message = if browser.overwrite_confirmed {
-        "F5 again: confirm overwrite · Esc: Cancel"
+    let (primary_action, navigation) = if browser.overwrite_confirmed {
+        let action = if browser.purpose == FileBrowserPurpose::NewProject {
+            "F5 Confirm Create · Esc Cancel"
+        } else {
+            "F5 Confirm Overwrite · Esc Cancel"
+        };
+        (action, "Review the selected destination before confirming")
     } else if matches!(browser.purpose, FileBrowserPurpose::Compile(_)) {
-        "↑/↓ browse · Enter Open · Home home · / root · Tab filename · F2 format · F5 Save/Compile · F7 New Folder · Backspace parent · Esc Cancel"
+        (
+            "F5 Compile · F2 Format · F7 New Folder · Enter Browse · Esc Cancel",
+            "Tab/Shift+Tab: panes and filename · Home: Home · /: Root · Backspace: Parent",
+        )
     } else if browser.purpose == FileBrowserPurpose::OpenProject {
-        "↑/↓ browse · Enter Open folder · Home home · / root · F5 Open Project · Backspace parent · Esc Cancel"
+        (
+            "F5 Open Project · Enter Browse/Open · Esc Cancel",
+            "Tab/Shift+Tab: panes · Home: Home · /: Root · Backspace: Parent",
+        )
     } else if matches!(
         browser.purpose,
         FileBrowserPurpose::ImportScrivenerSource
             | FileBrowserPurpose::ImportScrivenerCurrent
             | FileBrowserPurpose::ImportScrivenerSeries
     ) {
-        "↑/↓ browse · Enter Open folder · Home home · / root · F5 Inspect selected Scrivener project · Backspace parent · Esc Cancel"
+        (
+            "F5 Inspect/Import · F7 New Folder · Enter Browse · Esc Cancel",
+            "Tab/Shift+Tab: panes · Home: Home · /: Root · Backspace: Parent",
+        )
     } else {
-        "↑/↓ browse · Enter Open · Home home · / root · Tab project name · F5 Create Project · F7 New Folder · Backspace parent · Esc Cancel"
+        (
+            "F4 Select Folder · F5 Create Project · F7 New Folder · Esc Cancel",
+            "Parent = current folder · Tab/Shift+Tab: panes and project name",
+        )
     };
     f.render_widget(
-        Paragraph::new(truncate_display_cells(message, chunks[3].width as usize))
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(vec![
+            Line::from(truncate_display_cells(
+                primary_action,
+                chunks[3].width as usize,
+            )),
+            Line::from(truncate_display_cells(navigation, chunks[3].width as usize)),
+        ]),
         chunks[3],
     );
 }
@@ -24295,8 +24363,28 @@ mod tests {
             let browser = state.file_browser.as_mut().unwrap();
             browser.current_dir = root.path().to_owned();
             browser.entries = file_browser_entries(root.path()).unwrap();
-            browser.name = "A New Project".into();
         }
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE))
+            .unwrap();
+        for _ in 0.."My Novel".chars().count() {
+            state
+                .handle_file_browser_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+                .unwrap();
+        }
+        for character in "A New Project".chars() {
+            state
+                .handle_file_browser_key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))
+                .unwrap();
+        }
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.file_browser.is_some());
+        assert!(!root.path().join("A New Project").exists());
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
@@ -35337,13 +35425,107 @@ mod tests {
         let browser = state.file_browser.as_mut().unwrap();
         browser.current_dir = root.clone();
         browser.entries = file_browser_entries(&root).unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.file_browser.as_ref().unwrap().focus, 2);
+        assert!(state.message.contains(&root.display().to_string()));
+        let browser = state.file_browser.as_mut().unwrap();
         browser.name = "New Novel".into();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.file_browser.is_some());
+        assert!(
+            state
+                .message
+                .contains(&root.join("New Novel").display().to_string())
+        );
+        assert!(!root.join("New Novel").exists());
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
         assert_eq!(state.app.project_root(), root.join("New Novel"));
         assert!(root.join("New Novel/project.toml").is_file());
         assert!(state.file_browser.is_none());
+    }
+
+    #[test]
+    fn cancelling_confirmed_new_project_does_not_create_its_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .start_file_browser(FileBrowserPurpose::NewProject)
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = directory.path().to_owned();
+        browser.entries = file_browser_entries(directory.path()).unwrap();
+        browser.name = "Cancelled Novel".into();
+
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.message.contains("Create project at"));
+        assert!(!directory.path().join("Cancelled Novel").exists());
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(!directory.path().join("Cancelled Novel").exists());
+        assert_eq!(state.app.get_project().unwrap().title, "Current");
+    }
+
+    #[test]
+    fn new_project_browser_explains_actions_and_path_at_compact_terminal_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .start_file_browser(FileBrowserPurpose::NewProject)
+            .unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Directory tree"));
+        assert!(rendered.contains("Folder contents"));
+        assert!(rendered.contains("Selected path:"));
+        assert!(rendered.contains("F4 Select Folder"));
+        assert!(rendered.contains("F5 Create Project"));
+        assert!(rendered.contains("F7 New Folder"));
+        assert!(rendered.contains("Esc Cancel"));
+    }
+
+    #[test]
+    fn file_browser_tab_and_shift_tab_cycle_focus_in_opposite_directions() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .start_file_browser(FileBrowserPurpose::NewProject)
+            .unwrap();
+        assert_eq!(state.file_browser.as_ref().unwrap().focus, 1);
+
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.file_browser.as_ref().unwrap().focus, 2);
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(state.file_browser.as_ref().unwrap().focus, 1);
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(state.file_browser.as_ref().unwrap().focus, 0);
     }
 
     #[cfg(unix)]
@@ -35359,6 +35541,27 @@ mod tests {
 
         let entries = file_browser_entries(directory.path()).unwrap();
         assert!(entries.contains(&("linked-folder".into(), true)));
+    }
+
+    #[test]
+    fn file_browser_keeps_the_current_folder_and_reports_navigation_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let current = directory.path().join("current");
+        fs::create_dir(&current).unwrap();
+        let not_a_folder = directory.path().join("document.txt");
+        fs::write(&not_a_folder, "text").unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .start_file_browser(FileBrowserPurpose::NewProject)
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        set_file_browser_directory(browser, current.clone()).unwrap();
+
+        let error = set_file_browser_directory(browser, not_a_folder.clone()).unwrap_err();
+
+        assert_eq!(browser.current_dir, current);
+        assert_eq!(error.kind(), io::ErrorKind::NotADirectory);
     }
 
     #[test]
