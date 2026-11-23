@@ -637,7 +637,8 @@ fn tutorial_panel_at(
         lines.push(task);
     }
     if lesson_complete {
-        lines.push("Enter: continue to Lesson 2 · Esc: return to navigation".into());
+        lines.push("▶ Continue to Lesson 2 · press Enter".into());
+        lines.push("Esc: return to navigation".into());
     } else {
         lines.push(
             "Enter: continue when complete · Esc: return to navigation · Help > Resume Tutorial: return here"
@@ -18977,16 +18978,34 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
                     line.clone()
                 }
             })
-            .collect::<Vec<_>>()
-            .join("\n")
+            .map(Line::from)
+            .collect::<Text>()
+    } else if panel.title.starts_with("Tutorial ·") {
+        panel
+            .lines
+            .iter()
+            .skip(panel.scroll)
+            .map(|line| {
+                if line.starts_with("▶ Continue to Lesson") {
+                    Line::styled(
+                        line.clone(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                } else {
+                    Line::from(line.clone())
+                }
+            })
+            .collect::<Text>()
     } else {
         panel
             .lines
             .iter()
             .skip(panel.scroll)
             .cloned()
-            .collect::<Vec<_>>()
-            .join("\n")
+            .map(Line::from)
+            .collect::<Text>()
     };
     f.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: true }).block(
@@ -34912,7 +34931,8 @@ mod tests {
                 title: "Tutorial · Find your way around · 1/6".into(),
                 lines: vec![
                     "Lesson 1 complete".into(),
-                    "Enter: continue to Lesson 2 · Esc: return to navigation".into(),
+                    "▶ Continue to Lesson 2 · press Enter".into(),
+                    "Esc: return to navigation".into(),
                 ],
                 scroll: 0,
             });
@@ -34926,7 +34946,7 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect::<String>();
             assert!(tutorial_screen.contains("Lesson 1 complete"));
-            assert!(tutorial_screen.contains("Enter: continue to Lesson 2"));
+            assert!(tutorial_screen.contains("▶ Continue to Lesson 2 · press Enter"));
             state.help_panel = None;
             state.menu = Some(MenuState {
                 top: 0,
@@ -36508,7 +36528,7 @@ mod tests {
             panel
                 .lines
                 .iter()
-                .any(|line| line == "Enter: continue to Lesson 2 · Esc: return to navigation")
+                .any(|line| line == "▶ Continue to Lesson 2 · press Enter")
         );
         assert!(!panel.lines.iter().any(|line| line.contains("Continueto")));
     }
@@ -36671,7 +36691,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line == "Enter: continue to Lesson 2 · Esc: return to navigation")
+                .any(|line| line == "▶ Continue to Lesson 2 · press Enter")
         );
     }
 
@@ -36738,7 +36758,7 @@ mod tests {
                 .map(|cell| cell.symbol())
                 .collect::<String>();
             assert!(screen.contains("Lesson 1 complete"));
-            assert!(screen.contains("Enter: continue to Lesson 2"));
+            assert!(screen.contains("▶ Continue to Lesson 2 · press Enter"));
         }
 
         handle(
