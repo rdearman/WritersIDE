@@ -17821,42 +17821,14 @@ fn draw_scene_cards_workspace(frame: &mut ratatui::Frame<'_>, state: &AppState, 
 }
 
 fn tutorial_footer_status(state: &AppState) -> Option<String> {
-    let progress = onboarding::load(&state.tutorial_preferences_path)
+    onboarding::load(&state.tutorial_preferences_path)
         .ok()?
         .active_tutorial?;
     let label = state
         .tutorial_progress_label
         .as_deref()
         .unwrap_or("Tutorial in progress");
-    let action = if progress.step == 0 {
-        TUTORIAL_NAVIGATION_ACTIONS
-            .iter()
-            .find(|(required, _)| !progress.verified_actions.contains(*required))
-            .map(|(action, _)| *action)
-    } else {
-        None
-    };
-    let next = match action {
-        Some("menu") => format!(
-            "Next: Open menu ({})",
-            effective_shortcut_label(state, "menu.main", "F10")
-        ),
-        Some("outline") => "Next: Navigate > Outline (Right · Down · Enter; F2)".into(),
-        Some("scene") => "Next: Select the sample scene and press Enter".into(),
-        Some("write") => "Next: Write a few words".into(),
-        Some("save") => format!(
-            "Next: Save ({})",
-            effective_shortcut_label(state, "file.save", "Ctrl+S")
-        ),
-        Some("return") => "Next: Press Esc to return to Outline".into(),
-        Some("resume") => "Next: Help > Resume Tutorial".into(),
-        _ => String::new(),
-    };
-    Some(if next.is_empty() {
-        format!("{label} · Help > Resume Tutorial")
-    } else {
-        format!("{label} · {next} · Help > Resume Tutorial")
-    })
+    Some(format!("{label} · Resume: Help > Resume Tutorial"))
 }
 
 fn tutorial_key_matches_command(state: &AppState, command_id: &str, key: KeyEvent) -> bool {
@@ -37962,7 +37934,10 @@ mod tests {
         );
         let footer = tutorial_footer_status(&state).unwrap();
         assert!(footer.contains("Tutorial 1/6"), "{footer}");
-        assert!(footer.contains("Next: Open menu"), "{footer}");
+        assert!(
+            footer.contains("Resume: Help > Resume Tutorial"),
+            "{footer}"
+        );
         assert!(footer.contains("Help > Resume Tutorial"), "{footer}");
         assert_eq!(state.editor, ["Unsaved sentence stays here."]);
         assert!(state.dirty);
@@ -38026,7 +38001,10 @@ mod tests {
         );
         let footer = tutorial_footer_status(&state).unwrap();
         assert!(footer.contains("Tutorial 1/6"), "{footer}");
-        assert!(footer.contains("Next: Open menu"), "{footer}");
+        assert!(
+            footer.contains("Resume: Help > Resume Tutorial"),
+            "{footer}"
+        );
         assert!(footer.contains("Help > Resume Tutorial"), "{footer}");
     }
 
