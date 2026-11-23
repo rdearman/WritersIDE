@@ -3112,6 +3112,42 @@ impl WriterApp {
             .map_err(|error| AppError::Domain(format!("write diagnostics config: {error}")))?;
         Ok(path)
     }
+    /// Persist validated project proofreading settings by replacing the TOML file atomically.
+    pub fn save_proofreading_config(
+        &self,
+        config: &story_analysis::ProofreadingConfig,
+    ) -> Result<std::path::PathBuf> {
+        let source = config.to_toml().map_err(AppError::Domain)?;
+        let path = self
+            .store
+            .project_root()
+            .join(".writers-ide/diagnostics.toml");
+        let parent = path
+            .parent()
+            .ok_or_else(|| AppError::Domain("invalid diagnostics configuration path".into()))?;
+        fs::create_dir_all(parent)
+            .map_err(|error| AppError::Domain(format!("create diagnostics directory: {error}")))?;
+        let temp = parent.join(format!(".diagnostics-{}.tmp", uuid::Uuid::new_v4()));
+        let write_result = (|| -> std::io::Result<()> {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp)?;
+            file.write_all(source.as_bytes())?;
+            file.sync_all()?;
+            fs::rename(&temp, &path)?;
+            fs::File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&temp);
+            return Err(AppError::Domain(format!(
+                "save diagnostics configuration: {error}"
+            )));
+        }
+        Ok(path)
+    }
     fn processing_input_mode(
         &self,
         expand_transclusions: bool,
@@ -8011,6 +8047,22 @@ unexpected_prose = "must not be silently discarded"
         let drafting = std::fs::read_to_string(&config_path).unwrap();
         assert!(drafting.contains("severity = \"information\""));
         assert!(app.write_default_proofreading_config().is_err());
+        let mut updated = app.proofreading_config().unwrap();
+        updated
+            .grammar
+            .excluded_terms
+            .insert("writer's name".into());
+        app.save_proofreading_config(&updated).unwrap();
+        assert_eq!(app.proofreading_config().unwrap(), updated);
+        let mut invalid = updated.clone();
+        invalid.grammar.categories.insert(
+            "Unknown".into(),
+            story_analysis::GrammarCategorySetting {
+                enabled: true,
+                severity: "warning".into(),
+            },
+        );
+        assert!(app.save_proofreading_config(&invalid).is_err());
         let default_findings = app.proofread_text("Mara was followed.").unwrap();
         assert!(default_findings.is_empty());
         std::fs::write(

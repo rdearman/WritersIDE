@@ -40,3 +40,11 @@ The application service `apply_scene_text_suggestion` requires the source SHA-25
 ## Verification
 
 Automated tests cover supported-language reporting, unsupported-language rejection, British English execution, a grammar finding after multibyte UTF-8 text, Markdown code exclusion, report immutability, keyboard ignore-once, explicit acceptance, editor undo, stale-source rejection and journalled persistence. Real-terminal interaction and practical language quality still require author verification; automated checks do not establish usability or proofing quality.
+
+## Project-local grammar controls (23 November 2026)
+
+The existing `.writers-ide/diagnostics.toml` is also the source of grammar-check preferences. Its versioned `grammar` table stores explicit Harper category enablement and severity plus excluded exact words/phrases. An omitted grammar table in an older configuration receives the default settings, so earlier project configurations remain readable. Unknown categories, unsupported severities and empty exclusions fail validation rather than being ignored.
+
+`Review → Grammar Settings` opens a reference pane listing categories and excluded terms. The command accepts `grammar-settings CATEGORY on|off|severity LEVEL` and `grammar-settings exclude add|remove TERM`; edits are validated and atomically saved using a same-directory temporary file, file sync, rename and directory sync. The grammar service filters by enabled category, applies the configured severity, and omits findings whose matched text exactly equals an excluded term (case-insensitive). Exclusions do not alter manuscript text or dictionary data. Grammar checks continue to be explicitly invoked; background checking and idle scheduling remain outstanding.
+
+Regression coverage verifies category filtering, severity configuration, exclusions, invalid settings, settings-pane visibility and project-local persistence. The workspace verification for this update passed formatting, Clippy and all tests; the Ollama loopback test required the already-authorized local socket permission in this environment.

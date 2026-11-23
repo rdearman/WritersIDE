@@ -2464,6 +2464,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("analysis.coverage-remove", "Remove Coverage Rule", "Remove a coverage requirement by ID", "Plot", "coverage-remove", true),
         legacy_command("analysis.spellcheck", "Spellcheck Manuscript", "Run local Aspell without changing prose", "Tools", "spellcheck", true),
         legacy_command("proofread.grammar-check", "Grammar Check", "Check the current scene or manuscript using the offline grammar engine", "Review", "grammar-check", false),
+        legacy_command("proofread.grammar-settings", "Grammar Settings", "Enable or disable proofreading categories, change severity, or exclude terms", "Review", "grammar-settings", false),
         legacy_command(
             "link.create",
             "Create Story Link",
@@ -15734,6 +15735,106 @@ impl AppState {
             } else {
                 rows.join(" | ")
             };
+        } else if cmd == "grammar-settings" || cmd.starts_with("grammar-settings ") {
+            let mut config = self.app.proofreading_config()?;
+            let mut parts = cmd.split_whitespace().skip(1);
+            let Some(category) = parts.next() else {
+                let content = config
+                    .grammar
+                    .categories
+                    .iter()
+                    .map(|(name, setting)| {
+                        format!(
+                            "{name:<18} {:<5} {}",
+                            if setting.enabled { "on" } else { "off" },
+                            setting.severity
+                        )
+                    })
+                    .chain(std::iter::once(String::new()))
+                    .chain(
+                        config
+                            .grammar
+                            .excluded_terms
+                            .iter()
+                            .map(|term| format!("Excluded: {term}")),
+                    )
+                    .chain(std::iter::once(String::new()))
+                    .chain(std::iter::once(
+                        "Usage: grammar-settings CATEGORY on|off|severity LEVEL".into(),
+                    ))
+                    .chain(std::iter::once(
+                        "       grammar-settings exclude add|remove TERM".into(),
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.open_reference_buffer(
+                    "proofreading-settings".into(),
+                    None,
+                    "Grammar Settings".into(),
+                    content,
+                );
+                self.reference_focused = true;
+                return Ok(());
+            };
+            let category = category.to_owned();
+            let Some(action) = parts.next() else {
+                return Err("usage: grammar-settings CATEGORY on|off|severity LEVEL | grammar-settings exclude add|remove TERM".into());
+            };
+            if category == "exclude" {
+                let operation = action;
+                let term = parts.collect::<Vec<_>>().join(" ");
+                if term.trim().is_empty() {
+                    return Err("excluded term cannot be empty".into());
+                }
+                match operation {
+                    "add" => {
+                        config.grammar.excluded_terms.insert(term.clone());
+                    }
+                    "remove" => {
+                        config
+                            .grammar
+                            .excluded_terms
+                            .retain(|existing| !existing.eq_ignore_ascii_case(&term));
+                    }
+                    _ => return Err("operation must be add or remove".into()),
+                }
+                self.app.save_proofreading_config(&config)?;
+                self.message = format!("Proofreading exclusion {}: {term}", operation);
+            } else {
+                let setting = config
+                    .grammar
+                    .categories
+                    .get_mut(&category)
+                    .ok_or_else(|| format!("unknown grammar category: {category}"))?;
+                match action {
+                    "on" => setting.enabled = true,
+                    "off" => setting.enabled = false,
+                    "severity" => {
+                        let level = parts.next().ok_or(
+                            "provide severity: error, warning, information, suggestion, or off",
+                        )?;
+                        if !matches!(
+                            level,
+                            "error" | "warning" | "information" | "suggestion" | "off"
+                        ) {
+                            return Err("invalid severity".into());
+                        }
+                        setting.severity = level.to_owned();
+                        if level == "off" {
+                            setting.enabled = false;
+                        }
+                    }
+                    _ => return Err("action must be on, off, or severity".into()),
+                }
+                let enabled = setting.enabled;
+                let severity = setting.severity.clone();
+                self.app.save_proofreading_config(&config)?;
+                self.message = format!(
+                    "Grammar category {category}: {} ({}) · saved",
+                    if enabled { "on" } else { "off" },
+                    severity
+                );
+            }
         } else if cmd == "grammar-check" || cmd.starts_with("grammar-check ") {
             if self.dirty {
                 return Err("save the manuscript before running Grammar Check so suggestions match the saved source".into());
@@ -15794,8 +15895,12 @@ impl AppState {
                         Ok((start..end, tag.language_code.clone()))
                     })
                     .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
-                match story_analysis::grammar_check_with_passage_languages(
-                    &text, language, &overrides,
+                let config = self.app.proofreading_config()?;
+                match story_analysis::grammar_check_with_passage_languages_and_config(
+                    &text,
+                    language,
+                    &overrides,
+                    &config.grammar,
                 ) {
                     Ok(grammar_report) => {
                         for localized in grammar_report.findings {
@@ -38513,6 +38618,33 @@ mod tests {
         assert!(state.reference_panes[0].content.contains("Agreement"));
         assert!(state.reference_panes[0].content.contains("Suggestion: are"));
         assert_eq!(state.app.load_scene_text(scene).unwrap().0, original);
+    }
+
+    #[test]
+    fn grammar_settings_are_visible_editable_and_persisted_per_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .execute_legacy_palette_command("grammar-settings")
+            .unwrap();
+        assert!(state.reference_focused);
+        assert!(state.reference_panes[0].content.contains("Agreement"));
+
+        state
+            .execute_legacy_palette_command("grammar-settings Agreement off")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("grammar-settings Agreement severity warning")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("grammar-settings exclude add Acme Corp")
+            .unwrap();
+        let config = state.app.proofreading_config().unwrap();
+        let agreement = &config.grammar.categories["Agreement"];
+        assert!(!agreement.enabled);
+        assert_eq!(agreement.severity, "warning");
+        assert!(config.grammar.excluded_terms.contains("Acme Corp"));
     }
 
     #[test]

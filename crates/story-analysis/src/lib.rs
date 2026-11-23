@@ -15,6 +15,24 @@ use unicode_segmentation::UnicodeSegmentation;
 pub struct ProofreadingConfig {
     pub version: u16,
     pub rules: Vec<ProofreadingRule>,
+    #[serde(default)]
+    pub grammar: GrammarProofreadingConfig,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GrammarProofreadingConfig {
+    /// Harper lint categories enabled for this project. The set is explicit so
+    /// new categories in a later engine version do not silently change policy.
+    pub categories: BTreeMap<String, GrammarCategorySetting>,
+    /// Exact words or phrases that the author wants omitted from grammar review.
+    pub excluded_terms: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct GrammarCategorySetting {
+    pub enabled: bool,
+    pub severity: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -68,8 +86,64 @@ impl ProofreadingPreset {
 
 impl Default for ProofreadingConfig {
     fn default() -> Self {
-        Self::preset(ProofreadingPreset::Drafting)
+        let mut config = Self::preset(ProofreadingPreset::Drafting);
+        config.grammar = GrammarProofreadingConfig::default();
+        config
     }
+}
+
+impl Default for GrammarProofreadingConfig {
+    fn default() -> Self {
+        let mut categories = harper_category_names()
+            .iter()
+            .map(|category| {
+                (
+                    (*category).to_owned(),
+                    GrammarCategorySetting {
+                        enabled: !matches!(
+                            *category,
+                            "Enhancement" | "Readability" | "Redundancy" | "Style"
+                        ),
+                        severity: "suggestion".into(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        // Keep potentially dialect-prescriptive checks off until requested.
+        if let Some(regional) = categories.get_mut("Regionalism") {
+            regional.enabled = false;
+        }
+        Self {
+            categories,
+            excluded_terms: BTreeSet::new(),
+        }
+    }
+}
+
+fn harper_category_names() -> &'static [&'static str] {
+    &[
+        "Agreement",
+        "BoundaryError",
+        "Capitalization",
+        "Eggcorn",
+        "Enhancement",
+        "Formatting",
+        "Grammar",
+        "Malapropism",
+        "Miscellaneous",
+        "Nonstandard",
+        "Punctuation",
+        "Readability",
+        "Redundancy",
+        "Regionalism",
+        "Repetition",
+        "Spelling",
+        "Style",
+        "Typo",
+        "Usage",
+        "WordChoice",
+        "WordOrder",
+    ]
 }
 
 impl ProofreadingConfig {
@@ -102,6 +176,7 @@ impl ProofreadingConfig {
                     message: "Space before punctuation".into(),
                 },
             ],
+            grammar: GrammarProofreadingConfig::default(),
         };
         match preset {
             ProofreadingPreset::Drafting => {}
@@ -173,6 +248,7 @@ impl ProofreadingConfig {
                 other => return Err(format!("unknown diagnostic rule kind: {other}")),
             }
         }
+        validate_grammar_config(&self.grammar)?;
         Ok(())
     }
     pub fn to_toml(&self) -> Result<String, String> {
@@ -233,6 +309,15 @@ pub fn grammar_capability() -> GrammarCapability {
 /// a clear error so the UI can offer spelling-only checking instead of silently using
 /// British English rules on unrelated prose.
 pub fn grammar_check(text: &str, language: &str) -> Result<Vec<ProofreadingFinding>, String> {
+    grammar_check_with_config(text, language, &GrammarProofreadingConfig::default())
+}
+
+pub fn grammar_check_with_config(
+    text: &str,
+    language: &str,
+    config: &GrammarProofreadingConfig,
+) -> Result<Vec<ProofreadingFinding>, String> {
+    validate_grammar_config(config)?;
     let dialect = Dialect::try_from_bcp47(language).ok_or_else(|| {
         format!(
             "offline grammar checking does not support {language}; supported dialects: en-GB, en-US, en-CA, en-AU, en-IN"
@@ -245,8 +330,48 @@ pub fn grammar_check(text: &str, language: &str) -> Result<Vec<ProofreadingFindi
         .into_iter()
         .map(|lint| map_harper_finding(text, lint))
         .collect::<Result<Vec<_>, _>>()?;
+    findings.retain_mut(|finding| {
+        let Some(setting) = config.categories.get(&finding.category) else {
+            return false;
+        };
+        if !setting.enabled || setting.severity == "off" {
+            return false;
+        }
+        let matched = &text[finding.byte_range.clone()];
+        if config
+            .excluded_terms
+            .iter()
+            .any(|term| term.eq_ignore_ascii_case(matched.trim()))
+        {
+            return false;
+        }
+        finding.severity = setting.severity.clone();
+        true
+    });
     findings.sort_by_key(|finding| (finding.byte_range.start, finding.byte_range.end));
     Ok(findings)
+}
+
+fn validate_grammar_config(config: &GrammarProofreadingConfig) -> Result<(), String> {
+    for (category, setting) in &config.categories {
+        if !harper_category_names().contains(&category.as_str()) {
+            return Err(format!("unknown grammar category: {category}"));
+        }
+        if !matches!(
+            setting.severity.as_str(),
+            "off" | "error" | "warning" | "information" | "suggestion"
+        ) {
+            return Err(format!("invalid grammar severity in category {category}"));
+        }
+    }
+    if config
+        .excluded_terms
+        .iter()
+        .any(|term| term.trim().is_empty())
+    {
+        return Err("grammar excluded terms cannot be empty".into());
+    }
+    Ok(())
 }
 
 /// Check the untagged parts of a document using its effective language and check each
@@ -257,6 +382,21 @@ pub fn grammar_check_with_passage_languages(
     base_language: &str,
     overrides: &[(std::ops::Range<usize>, String)],
 ) -> Result<GrammarCheckReport, String> {
+    grammar_check_with_passage_languages_and_config(
+        text,
+        base_language,
+        overrides,
+        &GrammarProofreadingConfig::default(),
+    )
+}
+
+pub fn grammar_check_with_passage_languages_and_config(
+    text: &str,
+    base_language: &str,
+    overrides: &[(std::ops::Range<usize>, String)],
+    config: &GrammarProofreadingConfig,
+) -> Result<GrammarCheckReport, String> {
+    validate_grammar_config(config)?;
     let mut overrides = overrides.to_vec();
     overrides.sort_by_key(|(range, _)| (range.start, range.end));
     let mut previous_end = 0;
@@ -282,7 +422,7 @@ pub fn grammar_check_with_passage_languages(
         if range.is_empty() {
             return;
         }
-        match grammar_check(&text[range.clone()], language) {
+        match grammar_check_with_config(&text[range.clone()], language, config) {
             Ok(findings) => report
                 .findings
                 .extend(findings.into_iter().map(|mut finding| {
@@ -448,8 +588,9 @@ pub fn typography_suggestions(text: &str, language: &str) -> Vec<TypographySugge
 #[cfg(test)]
 mod proofread_tests {
     use super::{
-        ProofreadingConfig, ProofreadingPreset, ProofreadingRule, grammar_capability,
-        grammar_check, grammar_check_with_passage_languages, proofread, proofread_with_config,
+        GrammarCategorySetting, GrammarProofreadingConfig, ProofreadingConfig, ProofreadingPreset,
+        ProofreadingRule, grammar_capability, grammar_check, grammar_check_with_config,
+        grammar_check_with_passage_languages, proofread, proofread_with_config,
         typography_suggestions,
     };
 
@@ -572,6 +713,45 @@ mod proofread_tests {
                 .all(|finding| finding.byte_range.end <= code_start),
             "code block should not be linted: {findings:?}"
         );
+    }
+
+    #[test]
+    fn grammar_configuration_filters_categories_exclusions_and_sets_severity() {
+        let text = "They is ready.";
+        let mut config = GrammarProofreadingConfig::default();
+        let agreement = config.categories.get_mut("Agreement").unwrap();
+        agreement.severity = "warning".into();
+        let findings = grammar_check_with_config(text, "en-GB", &config).unwrap();
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.category == "Agreement" && finding.severity == "warning")
+        );
+
+        config.categories.get_mut("Agreement").unwrap().enabled = false;
+        assert!(
+            grammar_check_with_config(text, "en-GB", &config)
+                .unwrap()
+                .iter()
+                .all(|finding| finding.category != "Agreement")
+        );
+
+        config.categories.get_mut("Agreement").unwrap().enabled = true;
+        config.excluded_terms.insert("They is".into());
+        assert!(
+            grammar_check_with_config(text, "en-GB", &config)
+                .unwrap()
+                .iter()
+                .all(|finding| &text[finding.byte_range.clone()] != "They is")
+        );
+        config.categories.insert(
+            "Unknown".into(),
+            GrammarCategorySetting {
+                enabled: true,
+                severity: "warning".into(),
+            },
+        );
+        assert!(grammar_check_with_config(text, "en-GB", &config).is_err());
     }
 
     #[test]
