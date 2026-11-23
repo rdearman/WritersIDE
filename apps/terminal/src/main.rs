@@ -37145,13 +37145,34 @@ mod tests {
             .position(|command| command.id == "compile.format")
             .unwrap();
         state.menu.as_mut().unwrap().selected = compile_index;
-        state
-            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
         assert!(matches!(
             state.file_browser.as_ref().unwrap().purpose,
             FileBrowserPurpose::Compile(story_document::CompileFormat::Docx)
         ));
+        assert_eq!(state.file_browser.as_ref().unwrap().name, "Novel.docx");
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
+        assert!(matches!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::Compile(story_document::CompileFormat::Pdf)
+        ));
+        assert_eq!(state.file_browser.as_ref().unwrap().name, "Novel.pdf");
+        for _ in 0..8 {
+            state
+                .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+                .unwrap();
+        }
+        assert!(matches!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::Compile(story_document::CompileFormat::Docx)
+        ));
+        assert_eq!(state.file_browser.as_ref().unwrap().name, "Novel.docx");
         let mut narrow =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         narrow.draw(|frame| draw(frame, &mut state)).unwrap();
