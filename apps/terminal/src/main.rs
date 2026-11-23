@@ -10509,19 +10509,14 @@ impl AppState {
                 }
                 return Ok(());
             }
-            KeyCode::Char(ch) => {
-                if let Some(index) = MENU_CATEGORIES.iter().position(|category| {
-                    category
-                        .chars()
-                        .next()
-                        .is_some_and(|first| first.eq_ignore_ascii_case(&ch))
-                }) {
-                    menu.top = index;
-                    menu.selected = 0;
-                    menu.all_commands = false;
-                    self.menu = Some(menu);
-                    return Ok(());
-                } else if let Some((index, spec)) = self
+            KeyCode::Char(ch)
+                if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+            {
+                // Resolve an action mnemonic in the current menu before a
+                // same-letter top-level category. File > New Project [n] must
+                // not jump to Navigate [n]. Categories remain reachable with
+                // Left/Right and the menu shortcuts.
+                if let Some((index, spec)) = self
                     .menu_visible_entries()
                     .iter()
                     .enumerate()
@@ -10555,6 +10550,17 @@ impl AppState {
                     }
                     self.menu = None;
                     self.dispatch_registered_command_id(spec.id)?;
+                    return Ok(());
+                } else if let Some(index) = MENU_CATEGORIES.iter().position(|category| {
+                    category
+                        .chars()
+                        .next()
+                        .is_some_and(|first| first.eq_ignore_ascii_case(&ch))
+                }) {
+                    menu.top = index;
+                    menu.selected = 0;
+                    menu.all_commands = false;
+                    self.menu = Some(menu);
                     return Ok(());
                 }
             }
@@ -23833,6 +23839,15 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
     }
     if s.menu.is_some() {
+        // Explicit modified shortcuts continue to work while a menu is open.
+        // Do not let their character component fall through as an unmodified
+        // menu/category mnemonic (for example Ctrl+N must stay New Project).
+        if !k.modifiers.is_empty()
+            && let Some(command) = command_for_effective_shortcut(s, k)
+        {
+            dispatch_key_command(s, command)?;
+            return Ok(false);
+        }
         if let Some((_, command_id)) = s
             .command_bindings
             .iter()
@@ -25340,6 +25355,44 @@ mod tests {
         .unwrap();
 
         assert!(state.file_browser.is_some());
+    }
+
+    #[test]
+    fn file_menu_new_project_mnemonic_and_shortcut_do_not_route_to_navigate() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let file_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "File")
+            .unwrap();
+
+        state.open_menu_category(file_menu);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.file_browser.is_some());
+        assert!(state.menu.is_none());
+        assert!(matches!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::NewProject
+        ));
+
+        state.file_browser = None;
+        state.open_menu_category(file_menu);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(state.file_browser.is_some());
+        assert!(state.menu.is_none());
+        assert!(matches!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::NewProject
+        ));
     }
 
     #[test]
@@ -29806,12 +29859,9 @@ mod tests {
             KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE),
         )
         .unwrap();
-        assert_eq!(state.menu.unwrap().top, 3);
-        handle(
-            &mut state,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
-        )
-        .unwrap();
+        assert_eq!(MENU_CATEGORIES[state.menu.unwrap().top], "File");
+        assert!(state.message.contains("Save the manuscript buffer"));
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert!(state.menu.is_none());
         assert_eq!(state.workspace, Workspace::Editor);
         assert_eq!(state.editor, vec!["text/".to_owned()]);
@@ -29820,7 +29870,12 @@ mod tests {
         state.toggle_menu();
         handle(
             &mut state,
-            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
         )
         .unwrap();
         assert_eq!(MENU_CATEGORIES[state.menu.unwrap().top], "Insert");
