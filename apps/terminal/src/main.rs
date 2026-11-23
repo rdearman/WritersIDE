@@ -10660,6 +10660,9 @@ impl AppState {
         command_id: &str,
         arguments: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if command_id == "scene.create" && arguments.is_none() {
+            return self.start_scene_creation();
+        }
         if command_id == "edit.snippet-insert" && arguments.is_none() {
             self.open_snippet_chooser();
             return Ok(());
@@ -10691,6 +10694,35 @@ impl AppState {
             self.dispatch_registered_with_args(command.action, arguments)?;
         }
         self.record_recent_command(command.id);
+        Ok(())
+    }
+
+    fn start_scene_creation(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let nodes = self.app.list_structural_nodes()?;
+        let selected_chapter = match outline_rows(self).get(self.selected) {
+            Some(OutlineRow::Chapter { id, .. }) => Some(*id),
+            Some(OutlineRow::Scene(id)) => self.app.get_scene(*id)?.chapter_id,
+            _ => None,
+        };
+        let chapter = selected_chapter
+            .filter(|id| {
+                nodes
+                    .iter()
+                    .any(|node| node.id == *id && node.kind == "chapter")
+            })
+            .or_else(|| {
+                nodes
+                    .iter()
+                    .find(|node| node.kind == "chapter")
+                    .map(|node| node.id)
+            });
+        let Some(chapter) = chapter else {
+            self.message = "Create a chapter before adding a scene · Insert → New Chapter".into();
+            return Ok(());
+        };
+        self.mode = Some(':');
+        self.prompt = format!("scene {chapter} ");
+        self.message = "Type the new scene title, then press Enter · Esc cancels".into();
         Ok(())
     }
 
@@ -27371,6 +27403,32 @@ mod tests {
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert_eq!(state.mode, None);
         assert!(state.prompt.is_empty());
+    }
+
+    #[test]
+    fn new_scene_command_prompts_for_a_title_in_the_selected_chapter() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+
+        state
+            .dispatch_registered_command_id("scene.create")
+            .unwrap();
+        assert_eq!(state.mode, Some(':'));
+        assert!(state.prompt.starts_with(&format!("scene {chapter} ")));
+        assert!(state.message.contains("new scene title"));
+
+        state.prompt.push_str("A Room with a View");
+        state.command().unwrap();
+        let created = state
+            .app
+            .list_scenes(false)
+            .unwrap()
+            .into_iter()
+            .find(|scene| scene.scene.title == "A Room with a View")
+            .expect("scene title should be accepted without treating it as a chapter ID");
+        assert_eq!(created.chapter_id, Some(chapter));
     }
 
     #[test]
