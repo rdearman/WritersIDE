@@ -556,7 +556,7 @@ fn tutorial_panel_at(
             ),
             (
                 "Your sample book",
-                "This separate sample book is disposable. Your opened novel is unchanged. Open Navigate > Scene Cards for Included and Excluded scene cards; Up/Down selects, Ctrl+Up/Down reorders within a chapter, Space excludes or restores, Enter opens, and Edit > Move Scene assigns a chapter.",
+                "This separate sample book is disposable. Your opened novel is unchanged. Scene Cards shows one ordered list grouped by chapter; Up/Down selects, Ctrl+Up/Down reorders, Space includes or excludes, Enter opens, and Edit > Move Scene changes chapter.",
             ),
             (
                 "Write and save",
@@ -6563,7 +6563,7 @@ impl AppState {
         self.message = if included {
             format!("Moved “{title}” to Excluded · its text and metadata are retained")
         } else if self.app.get_scene(scene)?.chapter_id.is_none() {
-            format!("Moved “{title}” to Included → Unplaced · assign a chapter before Compile")
+            format!("Moved “{title}” to Included · unplaced; assign a chapter before Compile")
         } else {
             format!("Moved “{title}” to Included · it will appear in Compile")
         };
@@ -11202,7 +11202,7 @@ impl AppState {
                         .position(|id| *id == scene)
                         .unwrap_or(0);
                     self.message = format!(
-                        "Created “{cmd}” in Included → Unplaced · choose Move Scene to assign a chapter"
+                        "Created “{cmd}” as Included · unplaced; choose Move Scene to assign a chapter"
                     );
                 }
                 Err(error) => self.message = format!("Could not create scene: {error}"),
@@ -18075,6 +18075,7 @@ fn scene_card_rows(s: &AppState, included: bool) -> Vec<(Option<SceneId>, String
     let mut rows = Vec::new();
     let mut last_chapter = None;
     let mut first_group = true;
+    let mut card_number = 0;
     for (id, chapter, title, status, words, synopsis) in scenes {
         let chapter_key = chapter.as_ref().map(|(id, _)| *id);
         if first_group || chapter_key != last_chapter {
@@ -18082,19 +18083,26 @@ fn scene_card_rows(s: &AppState, included: bool) -> Vec<(Option<SceneId>, String
             rows.push((None, format!("── {heading} ──")));
             last_chapter = chapter_key;
             first_group = false;
+            card_number = 0;
         }
+        card_number += 1;
+        let inclusion = if included { "Included" } else { "Excluded" };
         let preview = synopsis.trim();
         let card = if preview.is_empty() {
-            format!("┌─ {title}\n│ {status} · {words} words\n└────────────────────")
+            format!(
+                "┌─ {card_number}  {title}\n│ {inclusion} · {status} · {words} words\n└────────────────────────────"
+            )
         } else {
-            format!("┌─ {title}\n│ {status} · {words} words\n│ {preview}\n└────────────────────")
+            format!(
+                "┌─ {card_number}  {title}\n│ {inclusion} · {status} · {words} words\n│ {preview}\n└────────────────────────────"
+            )
         };
         rows.push((Some(id), card));
     }
     rows
 }
 
-fn draw_scene_card_column(
+fn draw_scene_card_collection(
     frame: &mut ratatui::Frame<'_>,
     area: Rect,
     title: &str,
@@ -18106,7 +18114,7 @@ fn draw_scene_card_column(
             .position(|row| row.0.is_some_and(|row_scene| row_scene == scene))
     });
     let items = if rows.is_empty() {
-        vec![ListItem::new(format!("No {} scenes", title.to_lowercase()))]
+        vec![ListItem::new("No scenes yet · Insert > New Scene")]
     } else {
         rows.iter()
             .map(|(_, card)| ListItem::new(card.clone()))
@@ -18136,15 +18144,15 @@ fn draw_scene_cards_workspace(frame: &mut ratatui::Frame<'_>, state: &AppState, 
             .direction(Direction::Horizontal)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(area);
-        draw_scene_card_column(frame, columns[0], "Included", &included, selected);
-        draw_scene_card_column(frame, columns[1], "Excluded", &excluded, selected);
+        draw_scene_card_collection(frame, columns[0], "Included", &included, selected);
+        draw_scene_card_collection(frame, columns[1], "Excluded", &excluded, selected);
     } else {
         let columns = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(area);
-        draw_scene_card_column(frame, columns[0], "Included", &included, selected);
-        draw_scene_card_column(frame, columns[1], "Excluded", &excluded, selected);
+        draw_scene_card_collection(frame, columns[0], "Included", &included, selected);
+        draw_scene_card_collection(frame, columns[1], "Excluded", &excluded, selected);
     }
 }
 
@@ -27797,7 +27805,7 @@ mod tests {
             .expect("scene title should create an independent scene document");
         assert_eq!(created.chapter_id, None);
         assert_eq!(state.workspace, Workspace::Cards);
-        assert!(state.message.contains("Included → Unplaced"));
+        assert!(state.message.contains("Included · unplaced"));
         let input = state.app.processing_input().unwrap();
         assert!(
             !story_pipeline::compile_ir(&input)
@@ -33150,7 +33158,7 @@ mod tests {
     }
 
     #[test]
-    fn scene_cards_render_in_stacked_and_side_by_side_layouts() {
+    fn scene_cards_render_two_ordered_collections_at_all_widths() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
         let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
@@ -33175,13 +33183,15 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert!(screen.contains("Included"));
-            assert!(screen.contains("Excluded"));
+            assert!(screen.contains("Included ·"));
+            assert!(screen.contains("Excluded ·"));
             assert!(screen.contains("Included Card"));
             assert!(screen.contains("Excluded Card"));
+            assert!(screen.contains("Chapter"));
         }
         assert!(state.app.scene_is_included(included).unwrap());
         let included_rows = scene_card_rows(&state, true);
+        let excluded_rows = scene_card_rows(&state, false);
         for expected in [
             "── Unplaced ──",
             "Unplaced Card",
@@ -33194,6 +33204,17 @@ mod tests {
         }
         assert!(included_rows.iter().any(|(id, _)| *id == Some(unplaced)));
         assert!(included_rows.iter().any(|(id, _)| *id == Some(later)));
+        assert!(
+            excluded_rows
+                .iter()
+                .any(|(id, row)| *id == Some(excluded) && row.contains("Excluded ·"))
+        );
+        let visible_order = included_rows
+            .iter()
+            .chain(&excluded_rows)
+            .filter_map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        assert_eq!(visible_order, scene_card_ids(&state));
     }
 
     #[test]
