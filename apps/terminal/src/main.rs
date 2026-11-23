@@ -364,6 +364,7 @@ struct ReferencePane {
     follow_context: bool,
     shared_scene: bool,
     cursor: (usize, usize),
+    selection_anchor: Option<usize>,
 }
 
 #[derive(Clone, Debug)]
@@ -437,6 +438,7 @@ struct SeriesActionForm {
 enum FileBrowserPurpose {
     NewProject,
     OpenProject,
+    OpenTextFile,
     ImportScrivenerSource,
     ImportScrivenerCurrent,
     ImportScrivenerSeries,
@@ -692,6 +694,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 9] = [
         "file.recent-projects",
         "file.import-scrivener",
         "series.import-scrivener",
+        "file.open-text",
         "file.save",
         "file.quit",
     ],
@@ -1201,6 +1204,7 @@ enum CommandAction {
     OpenRecentProjects,
     NewProject,
     OpenProject,
+    OpenTextFile,
     ImportScrivenerNew,
     ImportScrivenerCurrent,
     Save,
@@ -1374,6 +1378,21 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 2,
             advanced: false,
             action: CommandAction::OpenProject,
+        },
+        CommandSpec {
+            id: "file.open-text",
+            label: "Open Text File…",
+            description: "Open a UTF-8 text, Markdown, or Org file read-only in a reference pane",
+            category: "File",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["open external text", "reference file"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Projects & Files",
+            menu_priority: 8,
+            advanced: false,
+            action: CommandAction::OpenTextFile,
         },
         CommandSpec {
             id: "file.import-scrivener",
@@ -6330,6 +6349,7 @@ impl AppState {
                         .get(index)
                         .copied()
                         .unwrap_or((0, 0)),
+                    selection_anchor: None,
                 });
             } else {
                 stale_reference = true;
@@ -6603,6 +6623,7 @@ impl AppState {
             FileBrowserPurpose::Compile(_) => self.app.project_root().to_owned(),
             FileBrowserPurpose::NewProject
             | FileBrowserPurpose::OpenProject
+            | FileBrowserPurpose::OpenTextFile
             | FileBrowserPurpose::ImportScrivenerSource
             | FileBrowserPurpose::ImportScrivenerCurrent
             | FileBrowserPurpose::ImportScrivenerSeries => std::env::var_os("HOME")
@@ -6613,6 +6634,7 @@ impl AppState {
         let name = match purpose {
             FileBrowserPurpose::NewProject => "My Novel".to_owned(),
             FileBrowserPurpose::OpenProject
+            | FileBrowserPurpose::OpenTextFile
             | FileBrowserPurpose::ImportScrivenerSource
             | FileBrowserPurpose::ImportScrivenerCurrent
             | FileBrowserPurpose::ImportScrivenerSeries => String::new(),
@@ -6646,6 +6668,8 @@ impl AppState {
                 | FileBrowserPurpose::ImportScrivenerSeries
         ) {
             "Directory tree focused · Tab: Folder contents · Enter opens folders/previews manifests · F5 inspects/imports · Esc cancels".into()
+        } else if purpose == FileBrowserPurpose::OpenTextFile {
+            "Choose a text file · F5 opens a read-only reference · Esc cancels".into()
         } else {
             "Choose a folder or filename · F5 confirms · F7 creates folder · Esc cancels".into()
         };
@@ -6839,6 +6863,7 @@ impl AppState {
                 if !matches!(
                     browser.purpose,
                     FileBrowserPurpose::OpenProject
+                        | FileBrowserPurpose::OpenTextFile
                         | FileBrowserPurpose::ImportScrivenerSource
                         | FileBrowserPurpose::ImportScrivenerCurrent
                         | FileBrowserPurpose::ImportScrivenerSeries
@@ -6871,6 +6896,28 @@ impl AppState {
                             Ok(()) => close = true,
                             Err(error) => {
                                 self.message = format!("Could not open project: {error}");
+                                self.file_browser = Some(browser);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    FileBrowserPurpose::OpenTextFile => {
+                        let Some(source) =
+                            browser
+                                .entries
+                                .get(browser.selected)
+                                .and_then(|(item, is_dir)| {
+                                    (!is_dir).then(|| browser.current_dir.join(item))
+                                })
+                        else {
+                            self.message = "Select a text file, then press F5".into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        };
+                        match self.open_external_text_file(&source) {
+                            Ok(()) => close = true,
+                            Err(error) => {
+                                self.message = format!("Could not open text file: {error}");
                                 self.file_browser = Some(browser);
                                 return Ok(());
                             }
@@ -8568,6 +8615,7 @@ impl AppState {
                 follow_context: false,
                 shared_scene,
                 cursor,
+                selection_anchor: None,
             };
             self.active_reference = index;
         } else {
@@ -8580,9 +8628,30 @@ impl AppState {
                 follow_context: false,
                 shared_scene,
                 cursor: if shared_scene { self.cursor } else { (0, 0) },
+                selection_anchor: None,
             });
             self.active_reference = self.reference_panes.len() - 1;
         }
+    }
+    fn open_external_text_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let canonical_path = path.canonicalize()?;
+        let text = fs::read_to_string(&canonical_path)
+            .map_err(|error| format!("{} is not readable UTF-8 text: {error}", path.display()))?;
+        let title = canonical_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("External text")
+            .to_owned();
+        self.workspace = Workspace::Editor;
+        self.open_reference_buffer(
+            format!("external-text:{}", canonical_path.display()),
+            None,
+            format!("External · {title} · read-only"),
+            text,
+        );
+        self.reference_focused = true;
+        self.message = "External file is read-only · Ctrl+C copies the visible line to the internal clipboard · Ctrl+Tab returns to the manuscript".into();
+        Ok(())
     }
     fn open_compile_results_reference(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         self.open_reference_buffer(
@@ -10483,6 +10552,11 @@ impl AppState {
             CommandAction::OpenProject => {
                 if let Err(error) = self.start_file_browser(FileBrowserPurpose::OpenProject) {
                     self.message = format!("Could not open the project browser: {error}");
+                }
+            }
+            CommandAction::OpenTextFile => {
+                if let Err(error) = self.start_file_browser(FileBrowserPurpose::OpenTextFile) {
+                    self.message = format!("Could not open the text file browser: {error}");
                 }
             }
             CommandAction::ImportScrivenerNew => {
@@ -17820,7 +17894,16 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         } else {
                             "  "
                         };
-                        Line::from(format!("{prefix}{line}"))
+                        let line = format!("{prefix}{line}");
+                        if reference.selection_anchor.is_some_and(|anchor| {
+                            (anchor.min(reference.scroll)..=anchor.max(reference.scroll))
+                                .contains(&row)
+                        }) && !is_shared_scene
+                        {
+                            Line::styled(line, Style::default().fg(Color::White).bg(Color::Blue))
+                        } else {
+                            Line::from(line)
+                        }
                     })
                     .collect::<Vec<_>>(),
             )
@@ -17894,7 +17977,19 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                             } else {
                                 "  "
                             };
-                            Line::from(format!("{prefix}{line}"))
+                            let line = format!("{prefix}{line}");
+                            if reference.selection_anchor.is_some_and(|anchor| {
+                                (anchor.min(reference.scroll)..=anchor.max(reference.scroll))
+                                    .contains(&row)
+                            }) && !is_shared_scene
+                            {
+                                Line::styled(
+                                    line,
+                                    Style::default().fg(Color::White).bg(Color::Blue),
+                                )
+                            } else {
+                                Line::from(line)
+                            }
                         })
                         .collect::<Vec<_>>(),
                 )
@@ -20332,6 +20427,7 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let purpose = match browser.purpose {
         FileBrowserPurpose::NewProject => "New Project · choose parent folder and project name",
         FileBrowserPurpose::OpenProject => "Open Project · choose a Writer's IDE project folder",
+        FileBrowserPurpose::OpenTextFile => "Open Text File · read-only reference",
         FileBrowserPurpose::ImportScrivenerSource => {
             "Import Scrivener · choose a .scriv folder or .scrivx manifest"
         }
@@ -20431,6 +20527,7 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             | FileBrowserPurpose::ImportScrivenerCurrent
             | FileBrowserPurpose::ImportScrivenerSeries
             | FileBrowserPurpose::OpenProject
+            | FileBrowserPurpose::OpenTextFile
     ) {
         browser
             .entries
@@ -20474,6 +20571,11 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     } else if browser.purpose == FileBrowserPurpose::OpenProject {
         (
             "F5 Open Project · Enter Browse/Open · Esc Cancel",
+            "Tab/Shift+Tab: panes · Home: Home · /: Root · Backspace: Parent",
+        )
+    } else if browser.purpose == FileBrowserPurpose::OpenTextFile {
+        (
+            "F5 Open Read-only Reference · Enter Browse · Esc Cancel",
             "Tab/Shift+Tab: panes · Home: Home · /: Root · Backspace: Parent",
         )
     } else if matches!(
@@ -24171,8 +24273,33 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             if k.code == KeyCode::Enter && s.navigate_compile_result_source_at_scroll()? {
                 return Ok(false);
             }
+            if k.modifiers.contains(KeyModifiers::CONTROL)
+                && k.code == KeyCode::Char('c')
+                && let Some(reference) = s.active_reference_pane()
+            {
+                let current_line = reference.scroll;
+                let anchor = reference.selection_anchor.unwrap_or(current_line);
+                let start = anchor.min(current_line);
+                let end = anchor.max(current_line);
+                s.clipboard = reference
+                    .content
+                    .lines()
+                    .skip(start)
+                    .take(end.saturating_sub(start).saturating_add(1))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                let copied = s.clipboard.clone();
+                s.remember_kill(copied)?;
+                s.message =
+                    "Copied reference passage · focus the manuscript and press Ctrl+V".into();
+                return Ok(false);
+            }
             if let Some(reference) = s.active_reference_pane_mut() {
                 match k.code {
+                    KeyCode::Char('v') if k.modifiers.is_empty() => {
+                        reference.selection_anchor = Some(reference.scroll);
+                        s.message = "Reference passage start marked · move to the final line and press Ctrl+C".into();
+                    }
                     KeyCode::Up => reference.scroll = reference.scroll.saturating_sub(1),
                     KeyCode::Down => {
                         reference.scroll = reference
@@ -33855,6 +33982,7 @@ mod tests {
                 "file.recent-projects",
                 "file.import-scrivener",
                 "series.import-scrivener",
+                "file.open-text",
                 "file.save",
                 "file.quit",
             ]
@@ -36699,6 +36827,80 @@ mod tests {
         assert_eq!(state.app.project_root(), target);
         assert_eq!(state.app.get_project().unwrap().title, "Target");
         assert!(state.file_browser.is_none());
+    }
+
+    #[test]
+    fn external_text_file_opens_read_only_and_copies_visible_line_into_manuscript() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let external = directory.path().join("outside.org");
+        let external_text = "* Research note\n\nA copied paragraph stays external.";
+        fs::write(&external, external_text).unwrap();
+        let original = fs::read(&external).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state
+            .start_file_browser(FileBrowserPurpose::OpenTextFile)
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = directory.path().to_owned();
+        browser.entries = file_browser_entries(directory.path()).unwrap();
+        browser.selected = browser
+            .entries
+            .iter()
+            .position(|(name, is_dir)| name == "outside.org" && !is_dir)
+            .unwrap();
+
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(state.file_browser.is_none());
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert!(state.reference_focused);
+        assert_eq!(
+            state.active_reference_pane().unwrap().content,
+            external_text
+        );
+        assert_eq!(state.app.list_reading_documents().unwrap().len(), 0);
+        assert!(!state.dirty);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(
+            state.clipboard,
+            "* Research note\n\nA copied paragraph stays external."
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(
+            state
+                .editor
+                .join("\n")
+                .contains("* Research note\n\nA copied paragraph stays external.")
+        );
+        state.save().unwrap();
+        assert_eq!(fs::read(&external).unwrap(), original);
     }
 
     #[test]
