@@ -24,14 +24,14 @@ Ratatui is advanced to 0.30 because its Unicode-width dependency range can be un
 
 The supported grammar dialects are explicitly `en-GB`, `en-US`, `en-CA`, `en-AU` and `en-IN`. Any other language returns an unsupported-language error; the caller can continue with existing Aspell/Hunspell spelling checks. No British rules are silently applied to another language. Project and scene language inheritance already provides the effective language used by the terminal action.
 
-The command `Review → Grammar Check` checks the selected scene by default and opens findings in a read-only reference pane. The optional scope syntax accepts `all`, `chapter:<UUID>` and `scene:<UUID>`. Findings include original UTF-8 byte offsets and the first suggestion where available. Checking does not change manuscript bytes. The pane currently offers inspection only; applying a finding from that pane, ignoring rules and custom-dictionary actions are not implemented in this slice.
+The command `Review → Grammar Check` checks the selected scene by default and opens findings in a reference pane. The optional scope syntax accepts `all`, `chapter:<UUID>` and `scene:<UUID>`. Findings include original UTF-8 byte offsets and the first suggestion where available. The report supports keyboard selection, **A** to apply a suggested replacement, and **I** to ignore a finding for that review. Applying first opens the source scene if needed, requires a clean editor buffer, validates the analysis hash and passage, and persists through the durable write journal. The normal editor undo stack receives the pre-change buffer; after undo, Ctrl+S writes the reverted text through the same optimistic save path. Ignore-once is session-local and does not suppress future checks.
 
-The application service now exposes `apply_scene_text_suggestion`. It requires the source SHA-256, expected passage bytes and UTF-8 byte range from the analysis result, rejects stale hashes or changed passage text, and persists an accepted replacement through the existing journalled save path. It is deliberately a service foundation: the terminal does not yet present an accept/ignore workflow, and this operation is not yet connected to the editor's in-memory undo stack.
+The application service `apply_scene_text_suggestion` requires the source SHA-256, expected passage bytes and UTF-8 byte range from the analysis result, rejects stale hashes or changed passage text, and persists approved edits through the existing journalled save path. It is connected to the terminal report and editor undo stack. After an accepted edit, other findings from that source revision are intentionally rejected as stale; rerun Grammar Check to obtain current ranges before applying another suggestion.
 
 ## Safety and boundaries
 
 - The checker runs locally and does not make HTTP or cloud requests.
-- Suggestions remain provisional; there is no auto-apply path.
+- Suggestions remain provisional; each change requires an explicit author keypress.
 - Harper's Markdown parser skips code blocks and tables. Current passage-language anchors are honored; stale anchors are skipped and disclosed. Other Markdown syntax still requires further verification.
 - On-demand checking is implemented; idle-time, incremental, compile-time and cancellation behavior are not.
 - Aspell/Hunspell remain separate spelling workflows. Missing dictionaries do not prevent application startup.
@@ -39,4 +39,4 @@ The application service now exposes `apply_scene_text_suggestion`. It requires t
 
 ## Verification
 
-Automated tests cover supported-language reporting, unsupported-language rejection, British English execution, a grammar finding after multibyte UTF-8 text, Markdown code exclusion, terminal report opening and manuscript immutability. The application suggestion service is tested for journalled persistence, reopen, Unicode offsets and rejection of stale hashes, stale passages and invalid UTF-8 boundaries. Real-terminal interaction and practical language quality still require author verification; automated checks do not establish usability or proofing quality.
+Automated tests cover supported-language reporting, unsupported-language rejection, British English execution, a grammar finding after multibyte UTF-8 text, Markdown code exclusion, report immutability, keyboard ignore-once, explicit acceptance, editor undo, stale-source rejection and journalled persistence. Real-terminal interaction and practical language quality still require author verification; automated checks do not establish usability or proofing quality.

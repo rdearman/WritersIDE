@@ -365,6 +365,35 @@ struct ReferencePane {
     shared_scene: bool,
     cursor: (usize, usize),
     selection_anchor: Option<usize>,
+    proofreading: Option<ProofreadingReview>,
+}
+
+#[derive(Clone, Debug)]
+struct ProofreadingReview {
+    findings: Vec<ProofreadingAction>,
+    selected: usize,
+    notes: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ProofreadingAction {
+    scene_id: SceneId,
+    scene_title: String,
+    language: String,
+    source_hash: String,
+    byte_range: std::ops::Range<usize>,
+    expected_text: String,
+    suggestion: Option<String>,
+    category: String,
+    message: String,
+    status: ProofreadingActionStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProofreadingActionStatus {
+    Pending,
+    Accepted,
+    Ignored,
 }
 
 #[derive(Clone, Debug)]
@@ -6439,6 +6468,7 @@ impl AppState {
                         .copied()
                         .unwrap_or((0, 0)),
                     selection_anchor: None,
+                    proofreading: None,
                 });
             } else {
                 stale_reference = true;
@@ -8734,6 +8764,114 @@ impl AppState {
     fn active_reference_pane_mut(&mut self) -> Option<&mut ReferencePane> {
         self.reference_panes.get_mut(self.active_reference)
     }
+    fn select_proofreading_finding(&mut self, forward: bool) -> bool {
+        let Some(pane) = self.active_reference_pane_mut() else {
+            return false;
+        };
+        let Some(review) = &mut pane.proofreading else {
+            return false;
+        };
+        if review.findings.is_empty() {
+            return true;
+        }
+        review.selected = if forward {
+            (review.selected + 1) % review.findings.len()
+        } else {
+            (review.selected + review.findings.len() - 1) % review.findings.len()
+        };
+        pane.scroll = review
+            .selected
+            .min(pane.content.lines().count().saturating_sub(1));
+        true
+    }
+    fn refresh_proofreading_pane(&mut self) {
+        let Some(pane) = self.active_reference_pane_mut() else {
+            return;
+        };
+        let Some(review) = &pane.proofreading else {
+            return;
+        };
+        pane.content = proofreading_review_text(review);
+        pane.scroll = review
+            .selected
+            .min(pane.content.lines().count().saturating_sub(1));
+    }
+    fn accept_selected_proofreading_finding(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(pane) = self.active_reference_pane() else {
+            return Ok(());
+        };
+        let Some(review) = &pane.proofreading else {
+            return Ok(());
+        };
+        let Some(action) = review.findings.get(review.selected).cloned() else {
+            self.message = "No proofreading suggestion is selected".into();
+            return Ok(());
+        };
+        let Some(replacement) = action.suggestion.as_deref() else {
+            self.message = "This finding has no automatic replacement suggestion".into();
+            return Ok(());
+        };
+        if self.dirty {
+            self.message =
+                "Save or discard the current edit before applying a proofreading suggestion".into();
+            return Ok(());
+        }
+        if self.editing_scene != Some(action.scene_id) {
+            self.open_scene(action.scene_id)?;
+        }
+        if self.saved_hash != action.source_hash {
+            self.message =
+                "Suggestion is stale · run Grammar Check again for the current text".into();
+            return Ok(());
+        }
+        self.push_undo();
+        let hash = match self.app.apply_scene_text_suggestion(
+            action.scene_id,
+            &action.source_hash,
+            action.byte_range.clone(),
+            &action.expected_text,
+            replacement,
+        ) {
+            Ok(hash) => hash,
+            Err(error) => {
+                self.undo_stack.pop();
+                self.message = format!("Suggestion was not applied: {error}");
+                return Ok(());
+            }
+        };
+        let (text, _) = self.app.load_scene_text(action.scene_id)?;
+        self.editor = text.split('\n').map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        self.saved_hash = hash;
+        self.dirty = false;
+        if let Some(pane) = self.active_reference_pane_mut()
+            && let Some(review) = &mut pane.proofreading
+            && let Some(finding) = review.findings.get_mut(review.selected)
+        {
+            finding.status = ProofreadingActionStatus::Accepted;
+        }
+        self.refresh_proofreading_pane();
+        self.focus_main_editor();
+        self.message = "Suggestion applied · Ctrl+Z undoes it; Ctrl+S saves the undo".into();
+        Ok(())
+    }
+    fn ignore_selected_proofreading_finding(&mut self) -> bool {
+        let Some(pane) = self.active_reference_pane_mut() else {
+            return false;
+        };
+        let Some(review) = &mut pane.proofreading else {
+            return false;
+        };
+        if let Some(finding) = review.findings.get_mut(review.selected) {
+            finding.status = ProofreadingActionStatus::Ignored;
+        }
+        let selected = review.selected;
+        pane.content = proofreading_review_text(review);
+        pane.scroll = selected.min(pane.content.lines().count().saturating_sub(1));
+        true
+    }
     fn active_reference_shares_open_scene(&self) -> bool {
         self.active_reference_pane().is_some_and(|pane| {
             pane.shared_scene && pane.scene_id.is_some() && pane.scene_id == self.editing_scene
@@ -8871,6 +9009,7 @@ impl AppState {
                 shared_scene,
                 cursor,
                 selection_anchor: None,
+                proofreading: None,
             };
             self.active_reference = index;
         } else {
@@ -8884,6 +9023,7 @@ impl AppState {
                 shared_scene,
                 cursor: if shared_scene { self.cursor } else { (0, 0) },
                 selection_anchor: None,
+                proofreading: None,
             });
             self.active_reference = self.reference_panes.len() - 1;
         }
@@ -15595,6 +15735,9 @@ impl AppState {
                 rows.join(" | ")
             };
         } else if cmd == "grammar-check" || cmd.starts_with("grammar-check ") {
+            if self.dirty {
+                return Err("save the manuscript before running Grammar Check so suggestions match the saved source".into());
+            }
             let scope = cmd.split_whitespace().nth(1).unwrap_or("current");
             let target = self.editing_scene.or(self.active_scene());
             let records = self.app.list_scenes(false)?;
@@ -15630,10 +15773,10 @@ impl AppState {
             if selected.is_empty() {
                 return Err("no scenes matched the grammar-check scope".into());
             }
-            let mut report = Vec::new();
+            let mut findings = Vec::new();
             let mut unsupported = Vec::new();
             for record in selected {
-                let (text, _) = self.app.load_scene_text(record.scene.id)?;
+                let (text, source_hash) = self.app.load_scene_text(record.scene.id)?;
                 let language = record.scene.effective_language_code(&project);
                 let language_tags = self.app.list_passage_language_tags(record.scene.id)?;
                 let stale_tags = language_tags
@@ -15657,21 +15800,19 @@ impl AppState {
                     Ok(grammar_report) => {
                         for localized in grammar_report.findings {
                             let finding = localized.finding;
-                            let suggestion = finding
-                                .suggestions
-                                .first()
-                                .map(|value| format!(" · Suggestion: {value}"))
-                                .unwrap_or_default();
-                            report.push(format!(
-                                "{} [{}] bytes {}..{} · {}: {}{}",
-                                record.scene.title,
-                                localized.language,
-                                finding.byte_range.start,
-                                finding.byte_range.end,
-                                finding.category,
-                                finding.message,
-                                suggestion
-                            ));
+                            let expected_text = text[finding.byte_range.clone()].to_owned();
+                            findings.push(ProofreadingAction {
+                                scene_id: record.scene.id,
+                                scene_title: record.scene.title.clone(),
+                                language: localized.language,
+                                source_hash: source_hash.clone(),
+                                byte_range: finding.byte_range,
+                                expected_text,
+                                suggestion: finding.suggestions.into_iter().next(),
+                                category: finding.category,
+                                message: finding.message,
+                                status: ProofreadingActionStatus::Pending,
+                            });
                         }
                         for unsupported_language in grammar_report.unsupported_languages {
                             unsupported.push(format!(
@@ -15689,25 +15830,25 @@ impl AppState {
                     Err(error) => unsupported.push(format!("{}: {error}", record.scene.title)),
                 }
             }
-            let mut body = if report.is_empty() {
-                "No grammar suggestions found.".to_owned()
-            } else {
-                report.join("\n")
+            let finding_count = findings.len();
+            let review = ProofreadingReview {
+                findings,
+                selected: 0,
+                notes: unsupported,
             };
-            if !unsupported.is_empty() {
-                body.push_str("\n\nGrammar checking unavailable for these scenes; local spelling tools remain available:\n");
-                body.push_str(&unsupported.join("\n"));
-            }
+            let body = proofreading_review_text(&review);
             self.open_reference_buffer(
                 format!("grammar:{}", scope),
                 None,
                 "Offline Grammar Check".into(),
                 body,
             );
+            if let Some(pane) = self.active_reference_pane_mut() {
+                pane.proofreading = Some(review);
+            }
             self.reference_focused = true;
             self.message = format!(
-                "Grammar check complete · {} suggestion(s) · manuscript unchanged",
-                report.len()
+                "Grammar check complete · {finding_count} finding(s) · A applies a suggestion, I ignores once · manuscript unchanged"
             );
         } else if cmd == "spellcheck"
             || cmd.starts_with("spellcheck ")
@@ -18777,6 +18918,14 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         }) && !is_shared_scene
                         {
                             Line::styled(line, Style::default().fg(Color::White).bg(Color::Blue))
+                        } else if s.reference_focused
+                            && reference.proofreading.as_ref().is_some_and(|review| {
+                                review.selected == row
+                                    && row >= reference.scroll
+                                    && row < reference.scroll.saturating_add(1)
+                            })
+                        {
+                            Line::styled(line, Style::default().fg(Color::Black).bg(Color::Yellow))
                         } else {
                             Line::from(line)
                         }
@@ -18862,6 +19011,17 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                                 Line::styled(
                                     line,
                                     Style::default().fg(Color::White).bg(Color::Blue),
+                                )
+                            } else if s.reference_focused
+                                && reference.proofreading.as_ref().is_some_and(|review| {
+                                    review.selected == row
+                                        && row >= reference.scroll
+                                        && row < reference.scroll.saturating_add(1)
+                                })
+                            {
+                                Line::styled(
+                                    line,
+                                    Style::default().fg(Color::Black).bg(Color::Yellow),
                                 )
                             } else {
                                 Line::from(line)
@@ -19301,7 +19461,12 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 "navigation"
             };
             let pane_hint = if s.workspace == Workspace::Editor {
-                if !s.reference_panes.is_empty() && !s.reference_panes_hidden {
+                if s.reference_focused
+                    && s.active_reference_pane()
+                        .is_some_and(|pane| pane.proofreading.is_some())
+                {
+                    "↑/↓ finding · a apply · i ignore · Esc manuscript"
+                } else if !s.reference_panes.is_empty() && !s.reference_panes_hidden {
                     "Ctrl+Tab panes"
                 } else {
                     "Esc outline"
@@ -19434,7 +19599,12 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 top[1],
             );
             let pane_hint = if s.workspace == Workspace::Editor {
-                if !s.reference_panes.is_empty() && !s.reference_panes_hidden {
+                if s.reference_focused
+                    && s.active_reference_pane()
+                        .is_some_and(|pane| pane.proofreading.is_some())
+                {
+                    "↑/↓ finding · a apply · i ignore · Esc manuscript"
+                } else if !s.reference_panes.is_empty() && !s.reference_panes_hidden {
                     "Ctrl+Tab: Reference · Esc: Outline"
                 } else {
                     "Esc: Outline"
@@ -20291,6 +20461,48 @@ fn format_character_reference(character: &story_core::Character) -> String {
             lines.push(format!("\n## {label}\n{value}"));
         }
     }
+    lines.join("\n")
+}
+
+fn proofreading_review_text(review: &ProofreadingReview) -> String {
+    let mut lines = review
+        .findings
+        .iter()
+        .map(|finding| {
+            let marker = match finding.status {
+                ProofreadingActionStatus::Pending => "○",
+                ProofreadingActionStatus::Accepted => "✓",
+                ProofreadingActionStatus::Ignored => "–",
+            };
+            let suggestion = finding
+                .suggestion
+                .as_ref()
+                .map(|value| format!(" · Suggestion: {value}"))
+                .unwrap_or_default();
+            format!(
+                "{marker} {} [{}] bytes {}..{} · {}: {}{}",
+                finding.scene_title,
+                finding.language,
+                finding.byte_range.start,
+                finding.byte_range.end,
+                finding.category,
+                finding.message,
+                suggestion
+            )
+        })
+        .collect::<Vec<_>>();
+    if lines.is_empty() {
+        lines.push("No grammar suggestions found.".into());
+    }
+    if !review.notes.is_empty() {
+        lines.push(String::new());
+        lines.push("Grammar checking notes:".into());
+        lines.extend(review.notes.iter().cloned());
+    }
+    lines.push(String::new());
+    lines.push(
+        "↑/↓ Select finding · A Apply suggestion · I Ignore once · Esc Return to manuscript".into(),
+    );
     lines.join("\n")
 }
 
@@ -25126,6 +25338,45 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         s.focus_main_editor();
         s.message = "Manuscript editor focused".into();
         return Ok(false);
+    }
+    if s.workspace == Workspace::Editor
+        && s.reference_focused
+        && s.active_reference_pane()
+            .is_some_and(|pane| pane.proofreading.is_some())
+    {
+        match k.code {
+            KeyCode::Up | KeyCode::Down => {
+                s.select_proofreading_finding(k.code == KeyCode::Down);
+                let selected = s
+                    .active_reference_pane()
+                    .and_then(|pane| pane.proofreading.as_ref())
+                    .map(|review| review.selected + 1)
+                    .unwrap_or(0);
+                s.message = format!(
+                    "Proofreading finding {selected} selected · A apply · I ignore once · Esc manuscript"
+                );
+                return Ok(false);
+            }
+            KeyCode::Char('a' | 'A')
+                if !k
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                s.accept_selected_proofreading_finding()?;
+                return Ok(false);
+            }
+            KeyCode::Char('i' | 'I')
+                if !k
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if s.ignore_selected_proofreading_finding() {
+                    s.message = "Finding ignored for this review · prose unchanged".into();
+                }
+                return Ok(false);
+            }
+            _ => {}
+        }
     }
     if s.workspace == Workspace::Editor
         && s.reference_focused
@@ -38262,6 +38513,121 @@ mod tests {
         assert!(state.reference_panes[0].content.contains("Agreement"));
         assert!(state.reference_panes[0].content.contains("Suggestion: are"));
         assert_eq!(state.app.load_scene_text(scene).unwrap().0, original);
+    }
+
+    #[test]
+    fn grammar_report_acceptance_uses_the_editor_undo_stack_and_ignores_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        app.set_project_language("en-GB").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let original = "Mara said, \"They is ready.\"";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), original).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state
+            .dispatch_registered_command_id("proofread.grammar-check")
+            .unwrap();
+
+        assert!(
+            !state.reference_panes[0]
+                .proofreading
+                .as_ref()
+                .unwrap()
+                .findings
+                .is_empty()
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        let accepted = state.app.load_scene_text(scene).unwrap().0;
+        assert!(accepted.contains("They are ready."), "{accepted}");
+        assert!(!state.reference_focused);
+        assert_eq!(state.undo_stack.len(), 1);
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), original);
+        assert!(state.dirty);
+        // Undo is the normal in-memory editor operation; saving it restores
+        // the pre-suggestion manuscript through the journalled write path.
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, original);
+    }
+
+    #[test]
+    fn grammar_report_ignore_once_keeps_prose_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        app.set_project_language("en-GB").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let original = "They is ready.";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), original).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state
+            .dispatch_registered_command_id("proofread.grammar-check")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.reference_panes[0]
+                .proofreading
+                .as_ref()
+                .unwrap()
+                .findings[0]
+                .status,
+            ProofreadingActionStatus::Ignored
+        );
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, original);
+    }
+
+    #[test]
+    fn grammar_report_rejects_stale_suggestion_after_external_revision() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        app.set_project_language("en-GB").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let original = "They is ready.";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), original).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state
+            .dispatch_registered_command_id("proofread.grammar-check")
+            .unwrap();
+        let (_, current_hash) = state.app.load_scene_text(scene).unwrap();
+        state
+            .app
+            .save_scene_text(scene, Some(&current_hash), "They were ready.")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "They were ready."
+        );
+        assert!(state.message.contains("stale") || state.message.contains("not applied"));
     }
 
     #[test]
