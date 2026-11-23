@@ -5318,10 +5318,23 @@ impl AppState {
                 return;
             }
         }
-        if progress.verified_actions.insert(action.to_owned())
-            && let Err(error) = onboarding::store(&path, &preferences)
+        let mut progress_saved = false;
+        if progress.verified_actions.insert(action.to_owned()) {
+            match onboarding::store(&path, &preferences) {
+                Ok(()) => progress_saved = true,
+                Err(error) => {
+                    self.message = format!("Tutorial progress could not be saved: {error}")
+                }
+            }
+        }
+        if progress_saved
+            && let Some(progress) = preferences.active_tutorial.as_ref()
+            && self
+                .help_panel
+                .as_ref()
+                .is_some_and(|panel| panel.title.starts_with("Tutorial ·"))
         {
-            self.message = format!("Tutorial progress could not be saved: {error}");
+            self.help_panel = Some(tutorial_panel_at(progress.track, progress.step, &path));
         }
     }
 
@@ -17800,10 +17813,140 @@ fn draw_scene_cards_workspace(frame: &mut ratatui::Frame<'_>, state: &AppState, 
 }
 
 fn tutorial_footer_status(state: &AppState) -> Option<String> {
-    state
+    let progress = onboarding::load(&state.tutorial_preferences_path)
+        .ok()?
+        .active_tutorial?;
+    let label = state
         .tutorial_progress_label
-        .as_ref()
-        .map(|progress| format!("{progress} · Help > Resume Tutorial"))
+        .as_deref()
+        .unwrap_or("Tutorial in progress");
+    let action = if progress.step == 0 {
+        TUTORIAL_NAVIGATION_ACTIONS
+            .iter()
+            .find(|(required, _)| !progress.verified_actions.contains(*required))
+            .map(|(action, _)| *action)
+    } else {
+        None
+    };
+    let next = match action {
+        Some("menu") => format!(
+            "Next: Open menu ({})",
+            effective_shortcut_label(state, "menu.main", "F10")
+        ),
+        Some("outline") => "Next: Visit Outline (F2 or Navigate > Outline)".into(),
+        Some("scene") => "Next: Select the sample scene and press Enter".into(),
+        Some("write") => "Next: Write a few words".into(),
+        Some("save") => format!(
+            "Next: Save ({})",
+            effective_shortcut_label(state, "file.save", "Ctrl+S")
+        ),
+        Some("return") => "Next: Press Esc to return to Outline".into(),
+        Some("resume") => "Next: Help > Resume Tutorial".into(),
+        _ => String::new(),
+    };
+    Some(if next.is_empty() {
+        format!("{label} · Help > Resume Tutorial")
+    } else {
+        format!("{label} · {next} · Help > Resume Tutorial")
+    })
+}
+
+fn tutorial_key_matches_command(state: &AppState, command_id: &str, key: KeyEvent) -> bool {
+    command_by_id(command_id).is_some_and(|command| {
+        effective_command_shortcuts(state, command)
+            .iter()
+            .any(|shortcut| {
+                parse_shortcut(shortcut).is_ok_and(|event| {
+                    same_keycode(event.code, key.code) && event.modifiers == key.modifiers
+                })
+            })
+    })
+}
+
+fn tutorial_next_action(state: &AppState) -> Option<&'static str> {
+    let progress = onboarding::load(&state.tutorial_preferences_path)
+        .ok()?
+        .active_tutorial?;
+    (progress.step == 0)
+        .then(|| {
+            TUTORIAL_NAVIGATION_ACTIONS
+                .iter()
+                .find(|(required, _)| !progress.verified_actions.contains(*required))
+                .map(|(action, _)| *action)
+        })
+        .flatten()
+}
+
+fn tutorial_expected_action_hint(state: &AppState) -> String {
+    match tutorial_next_action(state) {
+        Some("menu") => format!(
+            "Press {} to open the menu",
+            effective_shortcut_label(state, "menu.main", "F10")
+        ),
+        Some("outline") => "Visit Outline with F2 or Navigate > Outline".into(),
+        Some("scene") => "Select the sample scene and press Enter".into(),
+        Some("write") => "Write a few words in the sample scene".into(),
+        Some("save") => format!(
+            "Save your writing with {}",
+            effective_shortcut_label(state, "file.save", "Ctrl+S")
+        ),
+        Some("return") => "Press Esc to return to Outline".into(),
+        Some("resume") => "Choose Help > Resume Tutorial".into(),
+        _ => "Continue the current tutorial lesson".into(),
+    }
+}
+
+fn tutorial_key_is_expected(state: &AppState, key: KeyEvent) -> bool {
+    if tutorial_key_matches_command(state, "menu.main", key) {
+        return true;
+    }
+    if state.menu.is_some() {
+        return matches!(
+            key.code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Enter
+                | KeyCode::Esc
+                | KeyCode::Char(_)
+        );
+    }
+    match tutorial_next_action(state) {
+        Some("menu") | Some("resume") => false,
+        Some("outline") => command_for_workspace(Workspace::Outline).is_some_and(|command| {
+            effective_command_shortcuts(state, command)
+                .iter()
+                .any(|shortcut| {
+                    parse_shortcut(shortcut).is_ok_and(|event| {
+                        same_keycode(event.code, key.code) && event.modifiers == key.modifiers
+                    })
+                })
+        }),
+        Some("scene") => {
+            state.workspace == Workspace::Outline
+                && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter)
+        }
+        Some("write") => {
+            state.workspace == Workspace::Editor
+                && (matches!(
+                    key.code,
+                    KeyCode::Enter
+                        | KeyCode::Backspace
+                        | KeyCode::Delete
+                        | KeyCode::Left
+                        | KeyCode::Right
+                        | KeyCode::Up
+                        | KeyCode::Down
+                        | KeyCode::Home
+                        | KeyCode::End
+                ) || (matches!(key.code, KeyCode::Char(_))
+                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)))
+        }
+        Some("save") => tutorial_key_matches_command(state, "file.save", key),
+        Some("return") => state.workspace == Workspace::Editor && key.code == KeyCode::Esc,
+        _ => true,
+    }
 }
 
 fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
@@ -23775,7 +23918,34 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
     }
     if tutorial_has_focus && k.code == KeyCode::Enter {
-        s.advance_tutorial(1)?;
+        if tutorial_next_action(s).is_none() {
+            s.advance_tutorial(1)?;
+            return Ok(false);
+        }
+        if !tutorial_key_is_expected(s, k) {
+            s.message = format!("Next: {}", tutorial_expected_action_hint(s));
+            return Ok(false);
+        }
+        s.help_panel = None;
+    } else if tutorial_has_focus
+        && k.code != KeyCode::Esc
+        && !matches!(k.code, KeyCode::F(4 | 5 | 7 | 8))
+        && !tutorial_key_is_expected(s, k)
+    {
+        s.message = format!("Next: {}", tutorial_expected_action_hint(s));
+        return Ok(false);
+    }
+    if tutorial_has_focus
+        && k.code == KeyCode::Esc
+        && tutorial_next_action(s) == Some("return")
+        && s.workspace == Workspace::Editor
+    {
+        // At this point Esc is the lesson action, so let the editor return to
+        // Outline instead of treating the same key as Pause.
+        s.help_panel = None;
+    } else if tutorial_has_focus && k.code == KeyCode::Esc {
+        s.help_panel = None;
+        s.message = "Tutorial paused · Help > Resume Tutorial returns to this step".into();
         return Ok(false);
     }
     if s.file_browser.is_some() {
@@ -36794,6 +36964,20 @@ mod tests {
                 && line.contains("F8 Exit")
         }));
 
+        let initial_workspace = state.workspace;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.help_panel.is_some(), "wrong key must retain tutorial");
+        assert_eq!(state.workspace, initial_workspace);
+        assert!(
+            state.message.contains("to open the menu"),
+            "{}",
+            state.message
+        );
+
         let mut preferences = onboarding::load(&preferences_path).unwrap();
         preferences
             .active_tutorial
@@ -37720,10 +37904,10 @@ mod tests {
             state.help_panel.as_ref().unwrap().title,
             "Tutorial · Find your way around · 1/6"
         );
-        assert_eq!(
-            tutorial_footer_status(&state).as_deref(),
-            Some("Tutorial 1/6 · Help > Resume Tutorial")
-        );
+        let footer = tutorial_footer_status(&state).unwrap();
+        assert!(footer.contains("Tutorial 1/6"), "{footer}");
+        assert!(footer.contains("Next: Open menu"), "{footer}");
+        assert!(footer.contains("Help > Resume Tutorial"), "{footer}");
         assert_eq!(state.editor, ["Unsaved sentence stays here."]);
         assert!(state.dirty);
     }
@@ -37746,7 +37930,7 @@ mod tests {
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert!(state.help_panel.is_none());
         assert!(state.message.contains("Help > Resume Tutorial"));
-        assert!(!state.message.contains("paused"));
+        assert!(state.message.contains("paused"));
         let progress = onboarding::load(&preferences_path)
             .unwrap()
             .active_tutorial
@@ -37781,10 +37965,10 @@ mod tests {
             .unwrap();
         assert_eq!(resumed.step, progress.step);
         assert!(resumed.verified_actions.contains("resume"));
-        assert_eq!(
-            tutorial_footer_status(&state).as_deref(),
-            Some("Tutorial 1/6 · Help > Resume Tutorial")
-        );
+        let footer = tutorial_footer_status(&state).unwrap();
+        assert!(footer.contains("Tutorial 1/6"), "{footer}");
+        assert!(footer.contains("Next: Open menu"), "{footer}");
+        assert!(footer.contains("Help > Resume Tutorial"), "{footer}");
     }
 
     #[test]
