@@ -9441,8 +9441,8 @@ impl AppState {
         self.dirty = false;
         self.workspace = Workspace::Editor;
         self.message = format!(
-            "Assembly buffer: {} scene files · scene markers must remain intact",
-            draft.items.len()
+            "Editing {} · save to update its included scenes",
+            self.assembly_title(draft.assembly_id)
         );
         Ok(())
     }
@@ -9481,8 +9481,9 @@ impl AppState {
                     }
                 },
                 Err(error) => {
-                    self.message =
-                        format!("Assembly markers are invalid; no files changed: {error}")
+                    self.message = format!(
+                        "The assembly draft structure changed; no files were replaced: {error}"
+                    )
                 }
             }
             return Ok(());
@@ -9632,6 +9633,18 @@ impl AppState {
             || format!("{book} > {}", record.scene.title),
             |chapter| format!("{book} > {chapter} > {}", record.scene.title),
         )
+    }
+    fn assembly_title(&self, id: story_core::AssemblyId) -> String {
+        self.app
+            .list_assemblies()
+            .ok()
+            .and_then(|assemblies| {
+                assemblies
+                    .into_iter()
+                    .find(|assembly| assembly.id == id)
+                    .map(|assembly| assembly.title)
+            })
+            .unwrap_or_else(|| "Manuscript assembly".into())
     }
     fn toggle_outline_node(
         &mut self,
@@ -18231,16 +18244,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         .app
                         .load_assembly_draft(id)
                         .ok()
-                        .and_then(|draft| {
-                            s.app
-                                .list_assemblies()
-                                .ok()?
-                                .into_iter()
-                                .find(|assembly| assembly.id == draft.assembly_id)
-                                .map(|assembly| assembly.title)
-                        })
+                        .map(|draft| s.assembly_title(draft.assembly_id))
                         .unwrap_or_else(|| "Manuscript assembly".into());
-                    format!("Drafting assembly · {title}")
+                    format!("Editor — {title}")
                 },
             );
             (content, title)
@@ -31032,6 +31038,11 @@ mod tests {
         .unwrap();
         assert_eq!(state.workspace, Workspace::Editor);
         assert!(state.assembly_draft.is_some());
+        assert!(
+            !state.message.contains("scene markers"),
+            "{}",
+            state.message
+        );
         assert!(state.editor.join("\n").contains(&scene.to_string()));
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
@@ -31040,7 +31051,7 @@ mod tests {
         let title_row = (0..160)
             .map(|x| buffer[(x, 1)].symbol())
             .collect::<String>();
-        assert!(title_row.contains("Drafting assembly · Alternate edition"));
+        assert!(title_row.contains("Editor — Alternate edition"));
         assert!(!title_row.contains(&state.assembly_draft.unwrap().to_string()));
     }
 
