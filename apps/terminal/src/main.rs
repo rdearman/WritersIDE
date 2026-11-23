@@ -580,15 +580,7 @@ fn tutorial_panel_at(
         .get(step)
         .copied()
         .unwrap_or(("Complete", "The tutorial route is complete."));
-    let required = [
-        ("menu", "Open the menu"),
-        ("outline", "Visit Outline"),
-        ("scene", "Open the sample scene"),
-        ("write", "Write in the scene"),
-        ("save", "Save your writing"),
-        ("return", "Return to Outline with Esc"),
-        ("resume", "Resume this tutorial from Help"),
-    ];
+    let required = TUTORIAL_NAVIGATION_ACTIONS;
     let preferences = onboarding::load(preferences_path).ok();
     let verified = preferences
         .as_ref()
@@ -651,6 +643,16 @@ fn tutorial_panel_at(
         scroll: 0,
     }
 }
+
+const TUTORIAL_NAVIGATION_ACTIONS: [(&str, &str); 7] = [
+    ("menu", "Open the menu"),
+    ("outline", "Visit Outline"),
+    ("scene", "Open the sample scene"),
+    ("write", "Write in the scene"),
+    ("save", "Save your writing"),
+    ("return", "Return to Outline with Esc"),
+    ("resume", "Resume this tutorial from Help"),
+];
 
 #[derive(Clone, Debug)]
 struct CommandPaletteState {
@@ -5298,13 +5300,30 @@ impl AppState {
     fn record_tutorial_action(&mut self, action: &str) {
         let path = self.tutorial_preferences_path.clone();
         let Ok(mut preferences) = onboarding::load(&path) else {
+            self.message =
+                "Tutorial progress could not be loaded; your manuscript action was kept".into();
             return;
         };
         let Some(progress) = preferences.active_tutorial.as_mut() else {
             return;
         };
-        if progress.verified_actions.insert(action.to_owned()) {
-            let _ = onboarding::store(&path, &preferences);
+        if progress.step == 0 {
+            let next = TUTORIAL_NAVIGATION_ACTIONS
+                .iter()
+                .find(|(required, _)| !progress.verified_actions.contains(*required));
+            if let Some((required, label)) = next
+                && action != *required
+            {
+                self.message = format!(
+                    "One step at a time: {label}. Your tutorial is available from Help > Resume Tutorial."
+                );
+                return;
+            }
+        }
+        if progress.verified_actions.insert(action.to_owned())
+            && let Err(error) = onboarding::store(&path, &preferences)
+        {
+            self.message = format!("Tutorial progress could not be saved: {error}");
         }
     }
 
@@ -36616,6 +36635,17 @@ mod tests {
         );
         assert!(state.message.contains("Finish the navigation practice"));
 
+        state.record_tutorial_action("write");
+        assert!(state.message.contains("One step at a time: Open the menu"));
+        assert!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .verified_actions
+                .is_empty()
+        );
+
         handle(
             &mut state,
             KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
@@ -36623,10 +36653,15 @@ mod tests {
         .unwrap();
         assert!(state.menu.is_some());
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
-        state.switch(Workspace::Outline);
-        state.help_panel = None;
-        let scene = state.app.list_scenes(false).unwrap()[0].scene.id;
-        state.open_scene(scene).unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.workspace, Workspace::Outline);
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
@@ -36640,7 +36675,14 @@ mod tests {
         assert!(!state.dirty);
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert_eq!(state.workspace, Workspace::Outline);
-        state.resume_tutorial_at(&preferences_path).unwrap();
+        let help_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Help")
+            .unwrap();
+        state.open_menu_category(help_menu);
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
         assert!(
             state
                 .tutorial_progress_label
