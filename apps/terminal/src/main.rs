@@ -18022,7 +18022,25 @@ fn workspace_action_hint(workspace: Workspace) -> &'static str {
             "↑/↓ select · Ctrl+↑/↓ reorder · Space include/exclude · Enter open · Edit > Move Scene chooses a chapter"
         }
         Workspace::Editor => "Esc: Outline",
-        _ => "Tab: destinations",
+        _ => "Tab: next primary view · Shift+Tab: previous",
+    }
+}
+
+fn detail_panel_title(state: &AppState) -> &'static str {
+    if state.workspace == Workspace::Dashboard && state.scenes.is_empty() {
+        "Welcome"
+    } else if state.workspace == Workspace::Outline {
+        "Selected outline item"
+    } else if state.workspace == Workspace::Research && state.proposal_review_active {
+        "Proposed story information"
+    } else {
+        match state.workspace {
+            Workspace::StoryBible => "Selected story record",
+            Workspace::Issues => "Selected issue",
+            Workspace::Research => "Selected research item",
+            _ if state.scenes.get(state.selected).is_some() => "Selected scene",
+            _ => state.workspace.title(),
+        }
     }
 }
 
@@ -19033,7 +19051,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             f.render_widget(
                 Paragraph::new(detail).wrap(Wrap { trim: false }).block(
                     Block::default()
-                        .title("Selected scene")
+                        .title(detail_panel_title(s))
                         .borders(Borders::ALL),
                 ),
                 body[1],
@@ -25706,6 +25724,31 @@ mod tests {
             assert_eq!(command.category, "Series");
             assert!(matches!(command.action, CommandAction::LegacyPalette));
         }
+    }
+
+    #[test]
+    fn context_labels_name_the_selected_content_and_tab_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Labels"), "Labels").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+
+        state.workspace = Workspace::Outline;
+        assert_eq!(detail_panel_title(&state), "Selected outline item");
+        assert_eq!(
+            workspace_action_hint(state.workspace),
+            "Tab: next primary view · Shift+Tab: previous"
+        );
+
+        state.workspace = Workspace::StoryBible;
+        assert_eq!(detail_panel_title(&state), "Selected story record");
+        state.workspace = Workspace::Issues;
+        assert_eq!(detail_panel_title(&state), "Selected issue");
+        state.workspace = Workspace::Research;
+        assert_eq!(detail_panel_title(&state), "Selected research item");
+        state.proposal_review_active = true;
+        assert_eq!(detail_panel_title(&state), "Proposed story information");
+
+        assert_eq!(workspace_action_hint(Workspace::Editor), "Esc: Outline");
     }
 
     #[test]
