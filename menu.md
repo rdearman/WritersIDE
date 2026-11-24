@@ -13,6 +13,7 @@ On a normal launch without a project argument, the start screen offers **New Pro
 - New Project
 - Open Project
 - Recent Projects
+- Close Project
 - Import Scrivener as New Project…
 - Import Scrivener Book into Series
 - Open Text File…

@@ -48,6 +48,7 @@ No capability or command ID is removed. Primary menus remain concise, single-lev
 | `file.import-scrivener` | Import Scrivener as New Project… | File menu; command palette / Search All Commands | File menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
 | `file.import-scrivener-current` | Import Scrivener into Current Project… | Search All Commands… / command palette → File | Search All Commands… / command palette → File | Searchable-only candidate; not measured | Retain in searchable registry |
 | `file.recent-projects` | Recent Projects | File menu; command palette / Search All Commands | File menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
+| `file.close-project` | Close Project | File menu; command palette / Search All Commands | File menu; command palette / Search All Commands | Routine project action | Close safely and return to the start screen; dirty or temporary work requires Save, Discard, or Cancel |
 | `file.save` | Save Project | File menu; command palette / Search All Commands | File menu; command palette / Search All Commands | Routine candidate; not measured | Save the current book; prompts for a permanent location on a temporary start project |
 | `file.save-as` | Save Project As… | Not registered in the prior audit | File menu; command palette / Search All Commands | Routine project action | Create and validate an independent project copy; never overwrite |
 | `file.quit` | Quit | File menu; command palette / Search All Commands | File menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
@@ -337,7 +338,7 @@ No capability or command ID is removed. Primary menus remain concise, single-lev
 | `series.new-book` | New Book in Series | Search All Commands… / command palette → File | Search All Commands… / command palette → File | Searchable-only candidate; not measured | Retain in searchable registry |
 | `series.references` | Read Series References | Search All Commands… / command palette → File | Search All Commands… / command palette → File | Searchable-only candidate; not measured | Retain in searchable registry |
 
-**Current registry:** 323 registered commands, including top-level menu headings. **Baseline curated direct command IDs:** 56. The contextual Scene menu adds one registered menu command and nine curated contextual menu slots (some reuse baseline command IDs); Save Project As adds one project action.
+**Registry at flat-menu baseline:** 323 registered commands, including top-level menu headings. **Baseline curated direct command IDs:** 56. The contextual Scene menu adds one registered menu command and nine curated contextual menu slots (some reuse baseline command IDs); Save Project As and Close Project add two project actions, bringing the current registry to 326 commands.
 
 ## Alpha UAT 18 contextual-menu supplement
 
@@ -358,5 +359,15 @@ recovery/settings directories and local `.git` history; validates the copy
 before switching to it; and refuses existing destinations (including symlinks).
 The source remains active if the operation is cancelled or fails. Automated
 checks cover manuscript persistence, attachments, Git metadata, collision
-protection and cancellation. The broader UAT request for Close Project and a
-normal-launch project-selection welcome screen remains outstanding.
+protection and cancellation. A no-argument launch shows a project-selection
+welcome screen; explicit project arguments still open directly.
+
+## Close Project workflow
+
+**File → Close Project** closes the active project and returns to the start
+screen. Dirty text offers Save and Close, Close Without Saving, or Cancel.
+Temporary start projects always prompt to save a permanent copy, discard, or
+cancel. The temporary directory is owned by the running application and is
+removed only when discarded/closed or when another project replaces it.
+Automated tests verify that the old project can be reopened, saved text persists
+before closing, and cancellation leaves the current buffer intact.

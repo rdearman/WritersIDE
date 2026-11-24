@@ -172,6 +172,7 @@ enum OutlineRow {
 struct AppState {
     app: WriterApp,
     temporary_project: bool,
+    scratch_guard: Option<tempfile::TempDir>,
     workspace: Workspace,
     scenes: Vec<(SceneId, String, SceneStatus, u32)>,
     selected: usize,
@@ -220,6 +221,7 @@ struct AppState {
     context_command_bindings: Vec<ContextCommandBinding>,
     quit_requested: bool,
     quit_after_project_save: bool,
+    close_after_project_save: bool,
     pending_command_sequence: Option<PendingCommandSequence>,
     keybinding_manager: Option<KeybindingManagerState>,
     revision_diff: Option<story_core::SnapshotId>,
@@ -851,6 +853,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "file.new-project",
         "file.open-project",
         "file.recent-projects",
+        "file.close-project",
         "file.import-scrivener",
         "series.import-scrivener",
         "file.open-text",
@@ -1401,6 +1404,7 @@ enum CommandAction {
     OpenRecentProjects,
     NewProject,
     OpenProject,
+    CloseProject,
     OpenTextFile,
     ImportDocument,
     ImportScrivenerNew,
@@ -1581,6 +1585,21 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 2,
             advanced: false,
             action: CommandAction::OpenProject,
+        },
+        CommandSpec {
+            id: "file.close-project",
+            label: "Close Project",
+            description: "Safely close this project and return to the project start screen",
+            category: "File",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["close book", "return to start screen"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Projects & Files",
+            menu_priority: 5,
+            advanced: false,
+            action: CommandAction::CloseProject,
         },
         CommandSpec {
             id: "file.open-text",
@@ -5942,6 +5961,7 @@ impl AppState {
         Self {
             app,
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Dashboard,
             scenes: Vec::new(),
             selected: 0,
@@ -6008,6 +6028,7 @@ impl AppState {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -7477,6 +7498,15 @@ impl AppState {
                     self.prompt =
                         "Save Project and Quit (s) · Quit Without Saving (d) · Cancel (Esc)".into();
                     self.message = "Project copy cancelled; no permanent copy was created. Your temporary project remains open.".into();
+                } else if browser.purpose == FileBrowserPurpose::SaveProjectAs
+                    && self.close_after_project_save
+                {
+                    self.close_after_project_save = false;
+                    self.mode = Some('X');
+                    self.prompt =
+                        "Save Project and Close (s) · Discard and Close (d) · Cancel (Esc)".into();
+                    self.message =
+                        "Project copy cancelled; your temporary project remains open.".into();
                 } else {
                     self.message = "File selection cancelled".into();
                 }
@@ -7949,6 +7979,7 @@ impl AppState {
                             return Ok(());
                         }
                         let quit_after_save = self.quit_after_project_save;
+                        let close_after_save = self.close_after_project_save;
                         match self.save_project_copy(&destination) {
                             Ok(()) => {
                                 close = true;
@@ -7956,6 +7987,10 @@ impl AppState {
                                     self.quit_after_project_save = false;
                                     self.mode = None;
                                     self.quit_requested = true;
+                                }
+                                if close_after_save {
+                                    self.close_after_project_save = false;
+                                    self.close_project_to_start_screen()?;
                                 }
                             }
                             Err(error) => {
@@ -12093,6 +12128,7 @@ impl AppState {
                     self.message = format!("Could not open the project browser: {error}");
                 }
             }
+            CommandAction::CloseProject => self.request_close_project()?,
             CommandAction::OpenTextFile => {
                 if let Err(error) = self.start_file_browser(FileBrowserPurpose::OpenTextFile) {
                     self.message = format!("Could not open the text file browser: {error}");
@@ -12252,6 +12288,65 @@ impl AppState {
         } else {
             self.quit_requested = true;
         }
+    }
+    fn request_close_project(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.active_challenge.is_some() {
+            self.message =
+                "Finish or save the active writing challenge before closing this project".into();
+            return Ok(());
+        }
+        self.menu = None;
+        self.command_palette = None;
+        self.help_panel = None;
+        if self.dirty || self.temporary_project {
+            self.mode = Some('X');
+            self.prompt = if self.temporary_project {
+                "Save Project and Close (s) · Discard and Close (d) · Cancel (Esc)".into()
+            } else {
+                "Save and Close (s) · Close Without Saving (d) · Cancel (Esc)".into()
+            };
+            self.message = if self.temporary_project {
+                "This temporary project will be removed when closed unless you save a permanent copy.".into()
+            } else {
+                "Choose whether to save the current manuscript text before closing this project."
+                    .into()
+            };
+            return Ok(());
+        }
+        self.close_project_to_start_screen()
+    }
+
+    fn close_project_to_start_screen(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err("save or discard the manuscript buffer before closing the project".into());
+        }
+        if self.active_challenge.is_some() {
+            return Err(
+                "finish or save the active writing challenge before closing the project".into(),
+            );
+        }
+        self.save_session()?;
+        let _closed_scratch_guard = self.scratch_guard.take();
+        let scratch = tempfile::Builder::new()
+            .prefix("writers-ide-startup-")
+            .tempdir()?;
+        let path = scratch.path().join("Temporary Start Project");
+        let app = WriterApp::create_project(&path, "Temporary Start Project")?;
+        let tutorial_preferences_path = self.tutorial_preferences_path.clone();
+        let tutorial_active = onboarding::load(&tutorial_preferences_path)
+            .ok()
+            .is_some_and(|preferences| preferences.active_tutorial.is_some());
+        let mut next = Self::new(app, self.function_bindings.clone());
+        next.temporary_project = true;
+        next.scratch_guard = Some(scratch);
+        next.recent_projects_path = self.recent_projects_path.clone();
+        next.tutorial_preferences_path = tutorial_preferences_path;
+        next.command_bindings = self.command_bindings.clone();
+        next.context_command_bindings = self.context_command_bindings.clone();
+        next.help_panel = Some(welcome_panel(tutorial_active));
+        next.message = "Project closed · choose New Project, Open Project, Recent Projects, Import, or a tutorial".into();
+        *self = next;
+        Ok(())
     }
     fn prompt_for_registered_command(
         &mut self,
@@ -19074,6 +19169,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .to_owned();
         }
     }
+    state.scratch_guard = startup_scratch;
     let mut terminal = setup()?;
     let result = run(&mut terminal, &mut state);
     restore(&mut terminal)?;
@@ -26362,7 +26458,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     } else {
         "navigation"
     };
-    if !matches!(s.mode, Some('q' | 'R' | 'K')) && s.handle_context_command_key(k, context)? {
+    if !matches!(s.mode, Some('q' | 'R' | 'K' | 'X')) && s.handle_context_command_key(k, context)? {
         return Ok(false);
     }
     if s.find_panel.is_some() {
@@ -26370,6 +26466,52 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if s.mode.is_some() {
+        if s.mode == Some('X') {
+            match k.code {
+                KeyCode::Esc => {
+                    s.mode = None;
+                    s.prompt.clear();
+                    s.message = "Close Project cancelled · the project remains open".into();
+                }
+                KeyCode::Char('s' | 'S') => {
+                    if s.temporary_project {
+                        s.close_after_project_save = true;
+                        if let Err(error) = s.start_save_project_as() {
+                            s.close_after_project_save = false;
+                            s.message = format!("Project remains open; it was not saved: {error}");
+                        }
+                    } else {
+                        match s.save() {
+                            Ok(()) if !s.dirty => {
+                                s.mode = None;
+                                s.prompt.clear();
+                                if let Err(error) = s.close_project_to_start_screen() {
+                                    s.message = format!("Project remains open: {error}");
+                                }
+                            }
+                            Ok(()) => {
+                                s.message =
+                                    "Project remains open because the manuscript is still unsaved"
+                                        .into();
+                            }
+                            Err(error) => {
+                                s.message = format!("Project remains open; save failed: {error}");
+                            }
+                        }
+                    }
+                }
+                KeyCode::Char('d' | 'D') => {
+                    s.dirty = false;
+                    s.mode = None;
+                    s.prompt.clear();
+                    if let Err(error) = s.close_project_to_start_screen() {
+                        s.message = format!("Project remains open: {error}");
+                    }
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
         if s.mode == Some('M') {
             let chapters = s
                 .app
@@ -27943,6 +28085,168 @@ mod tests {
         assert_eq!(state.app.get_project().unwrap().title, "Target Novel");
         assert_eq!(state.app.project_root(), target_path);
         assert!(state.message.contains("Opened project"));
+    }
+
+    #[test]
+    fn close_project_safely_returns_to_start_and_preserves_the_closed_project() {
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Novel");
+        let mut app = WriterApp::create_project(&project_path, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "The manuscript remains here.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let file = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "File")
+            .unwrap();
+        state.open_menu_category(file);
+        let close_index = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| command.id == "file.close-project")
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = close_index;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(state.temporary_project);
+        assert!(state.help_panel.is_some());
+        assert!(state.message.contains("Project closed"));
+        assert_eq!(
+            state.app.get_project().unwrap().title,
+            "Temporary Start Project"
+        );
+        let reopened = WriterApp::open_project(&project_path).unwrap();
+        assert_eq!(reopened.get_scene(scene).unwrap().scene.title, "Opening");
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "The manuscript remains here."
+        );
+    }
+
+    #[test]
+    fn close_project_cancel_and_discard_are_explicit_for_dirty_text() {
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Novel");
+        let mut app = WriterApp::create_project(&project_path, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Saved prose.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.dirty);
+
+        state
+            .dispatch_registered_command_id("file.close-project")
+            .unwrap();
+        assert_eq!(state.mode, Some('X'));
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.dirty);
+        assert_eq!(state.app.get_project().unwrap().title, "Novel");
+
+        state
+            .dispatch_registered_command_id("file.close-project")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.temporary_project);
+        assert!(!state.dirty);
+        let reopened = WriterApp::open_project(&project_path).unwrap();
+        assert_eq!(reopened.load_scene_text(scene).unwrap().0, "Saved prose.");
+    }
+
+    #[test]
+    fn close_project_saves_dirty_text_before_returning_to_start() {
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Novel");
+        let mut app = WriterApp::create_project(&project_path, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Before editing.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.cursor = (0, state.editor[0].graphemes(true).count());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('!'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        state
+            .dispatch_registered_command_id("file.close-project")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert!(state.temporary_project);
+        let reopened = WriterApp::open_project(&project_path).unwrap();
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "Before editing.!"
+        );
+    }
+
+    #[test]
+    fn closing_temporary_project_saves_a_permanent_copy_before_returning_to_start() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app =
+            WriterApp::create_project(root.path().join("Temporary"), "Temporary").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Keep this temporary draft.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.temporary_project = true;
+
+        state
+            .dispatch_registered_command_id("file.close-project")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        let destination = root.path().join("Saved Novel");
+        {
+            let browser = state.file_browser.as_mut().unwrap();
+            browser.current_dir = root.path().to_owned();
+            browser.entries = file_browser_entries(root.path()).unwrap();
+            browser.name = "Saved Novel".into();
+        }
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+
+        assert!(state.temporary_project);
+        assert!(state.file_browser.is_none());
+        let reopened = WriterApp::open_project(destination).unwrap();
+        assert_eq!(reopened.get_project().unwrap().title, "Temporary");
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "Keep this temporary draft."
+        );
     }
 
     #[test]
@@ -32768,6 +33072,7 @@ mod tests {
         let mut state = AppState {
             app,
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Editor,
             scenes: Vec::new(),
             selected: 1,
@@ -32825,6 +33130,7 @@ mod tests {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -36087,6 +36393,7 @@ mod tests {
         let mut state = AppState {
             app,
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Editor,
             scenes: Vec::new(),
             selected: 0,
@@ -36144,6 +36451,7 @@ mod tests {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -36228,6 +36536,7 @@ mod tests {
             app: WriterApp::create_project(tempfile::tempdir().unwrap().path().join("N"), "N")
                 .unwrap(),
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Editor,
             scenes: Vec::new(),
             selected: 0,
@@ -36285,6 +36594,7 @@ mod tests {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -36365,6 +36675,7 @@ mod tests {
         let mut state = AppState {
             app,
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Editor,
             scenes: Vec::new(),
             selected: 0,
@@ -36422,6 +36733,7 @@ mod tests {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -36510,6 +36822,7 @@ mod tests {
         let mut state = AppState {
             app,
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Outline,
             scenes,
             selected: 1,
@@ -36567,6 +36880,7 @@ mod tests {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -36805,6 +37119,7 @@ mod tests {
             app: WriterApp::create_project(tempfile::tempdir().unwrap().path().join("N"), "N")
                 .unwrap(),
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Dashboard,
             scenes: Vec::new(),
             selected: 0,
@@ -36862,6 +37177,7 @@ mod tests {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -36950,6 +37266,7 @@ mod tests {
         let mut state = AppState {
             app,
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Outline,
             scenes,
             selected: 1,
@@ -37007,6 +37324,7 @@ mod tests {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -37639,6 +37957,7 @@ mod tests {
                 "file.new-project",
                 "file.open-project",
                 "file.recent-projects",
+                "file.close-project",
                 "file.import-scrivener",
                 "series.import-scrivener",
                 "file.open-text",
@@ -38525,6 +38844,7 @@ mod tests {
         let mut state = AppState {
             app,
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Revisions,
             scenes,
             selected: 1,
@@ -38582,6 +38902,7 @@ mod tests {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -38805,6 +39126,7 @@ mod tests {
         let mut state = AppState {
             app,
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Reading,
             scenes: Vec::new(),
             selected: 0,
@@ -38862,6 +39184,7 @@ mod tests {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -39220,6 +39543,7 @@ mod tests {
         let mut state = AppState {
             app,
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Search,
             scenes: scenes.into_iter().take(1).collect(),
             selected: 0,
@@ -39277,6 +39601,7 @@ mod tests {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -39376,6 +39701,7 @@ mod tests {
         let mut state = AppState {
             app,
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Search,
             scenes: Vec::new(),
             selected: 0,
@@ -39433,6 +39759,7 @@ mod tests {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -39584,6 +39911,7 @@ mod tests {
         let mut state = AppState {
             app,
             temporary_project: false,
+            scratch_guard: None,
             workspace: Workspace::Outline,
             scenes: Vec::new(),
             selected: 0,
@@ -39641,6 +39969,7 @@ mod tests {
             context_command_bindings: Vec::new(),
             quit_requested: false,
             quit_after_project_save: false,
+            close_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
