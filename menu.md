@@ -16,9 +16,6 @@ On a normal launch without a project argument, the start screen offers **New Pro
 - Close Project
 - Import Scrivener as New Project…
 - Import Scrivener Book into Series
-- Remove Selected Book from Series…
-- Show Removed Books
-- Restore Selected Book to Series
 - Open Text File…
 - Import Document…
 - Save Project
@@ -26,7 +23,7 @@ On a normal launch without a project argument, the start screen offers **New Pro
 - Quit
 - Search All Commands…
 
-When the Series Books workspace is active, File also offers **Remove Selected Book from Series…** and **Show Removed Books**. The Removed Books view offers **Restore Selected Book to Series**. These actions are hidden elsewhere so the general File menu stays compact.
+When the Series Books workspace is active, File also offers **Remove Selected Book from Series…** and **Show Removed Books**. The Removed Books view offers **Restore Selected Book to Series**. These contextual actions are hidden elsewhere so the general File menu stays compact.
 
 ## Edit
 
