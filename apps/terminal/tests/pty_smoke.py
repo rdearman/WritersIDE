@@ -27,6 +27,7 @@ def main():
     previous_position = modes == ["previous-position"]
     removal_dialogs = modes == ["removal-dialogs"]
     chapter_creation = modes == ["chapter-creation"]
+    reference_removal = modes == ["reference-removal"]
     chapter_removal = modes in (
         ["chapter-removal"],
         ["chapter-removal-target"],
@@ -154,6 +155,47 @@ def main():
             print(
                 "PTY chapter-creation workflow passed: Insert > New Chapter displays and persists multiple empty chapters."
             )
+            return
+
+        if reference_removal:
+            # Navigate > Reference Library and confirm the read-only source-aware
+            # removal dialogue. The source file itself must remain untouched.
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 3 + b"\r")
+            if not wait_for_fragments(
+                (b"Field", b"Notes", b"ReferenceLibrary"), timeout=3.0
+            ):
+                raise AssertionError("Reference Library did not open for removal")
+            dialog_start = len(output)
+            os.write(master, b"\x1b[3~")  # Delete
+            if not wait_for_fragments(
+                (b"Remove", b"Reference", b"source", b"preserved", b"Esc/N cancels"),
+                dialog_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "reference removal did not explain its source-preserving effect; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"\r")  # confirm recoverable project removal
+            if not wait_for_fragments(
+                (b"Removed", b"reference"), dialog_start, timeout=3.0
+            ):
+                raise AssertionError(
+                    "confirmed reference removal did not report success; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after reference removal")
+            print("PTY reference removal passed: explicit confirmation removes only the project-owned reference.")
             return
 
         if create_fiction:

@@ -203,6 +203,60 @@ fn scene_and_reference_removal_dialogues_are_cancellable_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn confirmed_reference_removal_never_modifies_its_source_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Reference Removal Project");
+    let source = root.path().join("Field Notes.txt");
+    std::fs::write(&source, "A read-only field reference.").unwrap();
+    let mut app = WriterApp::create_project(&project, "Reference Removal Project").unwrap();
+    let reference = story_reading::import_reference(&source).unwrap();
+    let reference_id = app
+        .import_reading_document(&reference, source.to_str().unwrap())
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY reference-removal workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("reference-removal")
+        .output()
+        .expect("run the Linux PTY reference-removal workflow");
+    assert!(
+        result.status.success(),
+        "PTY reference-removal workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let mut reopened = WriterApp::open_project(&project).unwrap();
+    assert!(reopened.list_reading_documents().unwrap().is_empty());
+    let removed = reopened.list_removed_reading_documents().unwrap();
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].id, reference_id);
+    assert_eq!(
+        std::fs::read_to_string(&source).unwrap(),
+        "A read-only field reference."
+    );
+    reopened.restore_reading_document(reference_id).unwrap();
+    assert_eq!(
+        reopened.list_reading_documents().unwrap()[0].id,
+        reference_id
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn populated_chapter_removal_retains_scenes_through_the_real_terminal_workflow() {
     let _guard = lock_pty_test();
     use std::process::Command;
