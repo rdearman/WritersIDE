@@ -101,11 +101,23 @@ def main():
             read_for(0.4)
             os.write(master, b"First passage.")
             read_for(0.15)
+            save_request_offset = len(output)
             os.write(master, b"\x13")  # Ctrl+S
-            read_for(0.35)
+            save_deadline = time.monotonic() + 5.0
+            while (
+                b"[SAVED]" not in output[save_request_offset:]
+                and time.monotonic() < save_deadline
+            ):
+                read_for(0.1)
+            if b"[SAVED]" not in output[save_request_offset:]:
+                raise AssertionError("Ctrl+S did not produce visible saved feedback")
             os.write(master, b"\x11")  # Ctrl+Q
-            read_for(1.0)
-            finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
             if (
                 finished_pid != child_pid
                 or not os.WIFEXITED(status)

@@ -10786,11 +10786,8 @@ impl AppState {
             })
             .collect();
         let descendant_nodes = subtree_ids.len().saturating_sub(1) as u32;
-        let can_rehome_scenes = !restoring
-            && node.kind == "chapter"
-            && descendant_nodes == 0
-            && units.is_empty()
-            && !scenes.is_empty();
+        let can_rehome_scenes =
+            !restoring && node.kind == "chapter" && descendant_nodes == 0 && !scenes.is_empty();
         let direct_children = active_nodes
             .iter()
             .filter(|candidate| candidate.parent_id == Some(id))
@@ -24529,7 +24526,11 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
                 if dialog.choice == 2 { ">" } else { " " }
             )));
             lines.push(Line::from(
-                "Unplaced scenes are omitted from Compile. Delete retains the full subtree in Removed Documents.",
+                if dialog.content_unit_count > 0 {
+                    "Chapter prose is retained in Removed Documents; removed prose and Unplaced scenes are omitted from Compile."
+                } else {
+                    "Unplaced scenes are omitted from Compile. Delete retains the full subtree in Removed Documents."
+                },
             ));
             lines.push(Line::from(
                 "Up/Down choose · Left/Right destination · Enter confirm · Esc cancel",
@@ -41883,6 +41884,22 @@ mod tests {
         let (_, hash) = app.load_scene_text(scene).unwrap();
         app.save_scene_text(scene, Some(&hash), "Retained manuscript text.")
             .unwrap();
+        let chapter_prose = app
+            .create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "Chapter prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, prose_hash) = app.load_content_unit_text(chapter_prose).unwrap();
+        app.save_content_unit_text(
+            chapter_prose,
+            Some(&prose_hash),
+            "Direct chapter prose remains recoverable.",
+        )
+        .unwrap();
         let mut state = AppState::new(app, default_bindings());
         state.workspace = Workspace::Outline;
         state.refresh().unwrap();
@@ -41896,6 +41913,7 @@ mod tests {
         assert!(dialog.can_rehome_scenes);
         assert_eq!(dialog.choice, 0);
         assert_eq!(dialog.scene_count, 1);
+        assert_eq!(dialog.content_unit_count, 1);
         state
             .finish_structural_node_removal(dialog.clone())
             .unwrap();
@@ -41916,6 +41934,11 @@ mod tests {
                 .any(|node| node.id == chapter)
         );
         assert_eq!(state.app.get_scene(scene).unwrap().chapter_id, None);
+        assert!(state.app.get_content_unit(chapter_prose).unwrap().archived);
+        assert_eq!(
+            state.app.load_content_unit_text(chapter_prose).unwrap().0,
+            "Direct chapter prose remains recoverable."
+        );
         assert_eq!(
             state.app.load_scene_text(scene).unwrap().0,
             "Retained manuscript text."
@@ -41939,6 +41962,7 @@ mod tests {
             state.app.get_scene(scene).unwrap().chapter_id,
             Some(chapter)
         );
+        assert!(!state.app.get_content_unit(chapter_prose).unwrap().archived);
         let mut state = AppState::new(state.app, default_bindings());
         state.workspace = Workspace::Outline;
         state.refresh().unwrap();

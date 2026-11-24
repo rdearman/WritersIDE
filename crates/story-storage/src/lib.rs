@@ -4213,17 +4213,6 @@ impl ProjectStore {
                 "only an active chapter can rehome its scenes".into(),
             ));
         }
-        let content_units: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM content_unit WHERE parent_node_id=?1 AND archived=0",
-            [chapter_id.to_string()],
-            |row| row.get(0),
-        )?;
-        if content_units != 0 {
-            return Err(StorageError::Invalid(
-                "this chapter contains prose; choose recoverable deletion so its prose is retained"
-                    .into(),
-            ));
-        }
         if let Some(destination) = destination {
             let kind: Option<String> = self
                 .conn
@@ -4252,6 +4241,15 @@ impl ProjectStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let content_units: Vec<(String, bool)> = {
+            let mut statement =
+                tx.prepare("SELECT id,archived FROM content_unit WHERE parent_node_id=?1")?;
+            statement
+                .query_map([chapter_id.to_string()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
         let removal_id = Uuid::new_v4();
         let mode = if destination.is_some() {
             "move_scenes_chapter"
@@ -4308,6 +4306,18 @@ impl ProjectStore {
                 "INSERT INTO structural_removal_scene(removal_id,scene_id,original_chapter_id,original_position,was_archived,previous_status,applied_chapter_id,applied_position,applied_unplaced_position) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
                 params![removal_id.to_string(),scene_id,chapter_id.to_string(),position,was_archived,status,applied_chapter,applied_position,applied_unplaced],
             )?;
+        }
+        for (unit_id, was_archived) in content_units {
+            tx.execute(
+                "INSERT INTO structural_removal_content_unit(removal_id,content_unit_id,was_archived) VALUES(?1,?2,?3)",
+                params![removal_id.to_string(), unit_id, was_archived],
+            )?;
+            if !was_archived {
+                tx.execute(
+                    "UPDATE content_unit SET archived=1,updated_at=?2 WHERE id=?1",
+                    params![unit_id, now()],
+                )?;
+            }
         }
         tx.execute(
             "UPDATE structural_node SET archived=1,updated_at=?2 WHERE id=?1",
@@ -15532,7 +15542,21 @@ mod tests {
             .unwrap();
         let first = store.create_scene(chapter, 0, "First").unwrap();
         let second = store.create_scene(chapter, 1, "Second").unwrap();
+        let prose = store
+            .create_content_unit(
+                ContentUnitKind::ChapterBody,
+                "Chapter prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, hash) = store.load_content_unit_text(prose).unwrap();
+        store
+            .save_content_unit_text(prose, Some(&hash), "Direct chapter prose is retained.")
+            .unwrap();
         let removal = store.remove_chapter_rehome_scenes(chapter, None).unwrap();
+        assert!(store.get_content_unit(prose).unwrap().archived);
         assert!(store.list_structural_nodes().unwrap().is_empty());
         assert!(
             store
@@ -15563,6 +15587,11 @@ mod tests {
         );
         assert_eq!(restored[0].position, Some(0));
         assert_eq!(restored[1].position, Some(1));
+        assert!(!reopened.get_content_unit(prose).unwrap().archived);
+        assert_eq!(
+            reopened.load_content_unit_text(prose).unwrap().0,
+            "Direct chapter prose is retained."
+        );
     }
 
     #[test]
