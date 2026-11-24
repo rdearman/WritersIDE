@@ -6652,6 +6652,7 @@ dependencies = [
 name = "writers-ide-terminal"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "crossterm 0.28.1",
  "ratatui",
  "serde",

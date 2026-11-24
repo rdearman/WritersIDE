@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -39,6 +40,16 @@ pub mod onboarding;
 pub mod pane_layout;
 
 type SceneRow = (SceneId, String, SceneStatus, u32);
+
+const MAX_OSC52_PAYLOAD_BYTES: usize = 100 * 1024;
+
+fn terminal_clipboard_sequence(text: &str) -> Option<String> {
+    let encoded = STANDARD.encode(text.as_bytes());
+    if encoded.len() > MAX_OSC52_PAYLOAD_BYTES {
+        return None;
+    }
+    Some(format!("\x1b]52;c;{encoded}\x07"))
+}
 
 fn manual_save_confirmation() -> String {
     let minutes = SystemTime::now()
@@ -226,6 +237,7 @@ struct AppState {
     undo_stack: Vec<EditorSnapshot>,
     redo_stack: Vec<EditorSnapshot>,
     clipboard: String,
+    pending_terminal_clipboard: Option<String>,
     snippets: BTreeMap<String, String>,
     user_snippets: BTreeMap<String, String>,
     user_snippets_path: PathBuf,
@@ -5901,6 +5913,7 @@ impl AppState {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: tools.snippets,
             user_snippets,
             user_snippets_path,
@@ -9388,7 +9401,7 @@ impl AppState {
             text,
         );
         self.reference_focused = true;
-        self.message = "External file is read-only · Ctrl+C copies the visible line to the internal clipboard · Ctrl+Tab returns to the manuscript".into();
+        self.message = "External file is read-only · mark a passage with v, then Ctrl+C copies it to the terminal clipboard where supported and Writer's IDE clipboard · Ctrl+Tab returns to the manuscript".into();
         Ok(())
     }
     fn open_compile_results_reference(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -18655,6 +18668,16 @@ fn run(
                 Event::Key(k) => {
                     let previous_render_context = render_context_key(s);
                     let should_quit = handle(s, k)? || std::mem::take(&mut s.quit_requested);
+                    if let Some(text) = s.pending_terminal_clipboard.take() {
+                        if let Some(sequence) = terminal_clipboard_sequence(&text) {
+                            execute!(t.backend_mut(), crossterm::style::Print(sequence))?;
+                        } else {
+                            s.message = format!(
+                                "Copied to Writer's IDE clipboard; terminal clipboard skipped because its encoded passage exceeds {} KiB",
+                                MAX_OSC52_PAYLOAD_BYTES / 1024
+                            );
+                        }
+                    }
                     if render_context_key(s) != previous_render_context {
                         // Clear the physical terminal as well as Ratatui's diff buffers when
                         // changing screens. This prevents stale pane contents on terminals
@@ -26347,10 +26370,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     .take(end.saturating_sub(start).saturating_add(1))
                     .collect::<Vec<_>>()
                     .join("\n");
+                s.pending_terminal_clipboard = Some(s.clipboard.clone());
                 let copied = s.clipboard.clone();
                 s.remember_kill(copied)?;
-                s.message =
-                    "Copied reference passage · focus the manuscript and press Ctrl+V".into();
+                s.message = "Copied to Writer's IDE clipboard and terminal clipboard if supported · Ctrl+V also works here".into();
                 return Ok(false);
             }
             if let Some(reference) = s.active_reference_pane_mut() {
@@ -31875,6 +31898,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: BTreeMap::new(),
             user_snippets: BTreeMap::new(),
             user_snippets_path: PathBuf::new(),
@@ -35186,6 +35210,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: BTreeMap::new(),
             user_snippets: BTreeMap::new(),
             user_snippets_path: PathBuf::new(),
@@ -35323,6 +35348,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: BTreeMap::new(),
             user_snippets: BTreeMap::new(),
             user_snippets_path: PathBuf::new(),
@@ -35456,6 +35482,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: BTreeMap::new(),
             user_snippets: BTreeMap::new(),
             user_snippets_path: PathBuf::new(),
@@ -35597,6 +35624,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: BTreeMap::new(),
             user_snippets: BTreeMap::new(),
             user_snippets_path: PathBuf::new(),
@@ -35888,6 +35916,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: BTreeMap::new(),
             user_snippets: BTreeMap::new(),
             user_snippets_path: PathBuf::new(),
@@ -36029,6 +36058,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: BTreeMap::new(),
             user_snippets: BTreeMap::new(),
             user_snippets_path: PathBuf::new(),
@@ -37587,6 +37617,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: BTreeMap::new(),
             user_snippets: BTreeMap::new(),
             user_snippets_path: PathBuf::new(),
@@ -37863,6 +37894,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: BTreeMap::new(),
             user_snippets: BTreeMap::new(),
             user_snippets_path: PathBuf::new(),
@@ -38274,6 +38306,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: BTreeMap::new(),
             user_snippets: BTreeMap::new(),
             user_snippets_path: PathBuf::new(),
@@ -38426,6 +38459,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: BTreeMap::new(),
             user_snippets: BTreeMap::new(),
             user_snippets_path: PathBuf::new(),
@@ -38630,6 +38664,7 @@ mod tests {
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             clipboard: String::new(),
+            pending_terminal_clipboard: None,
             snippets: BTreeMap::new(),
             user_snippets: BTreeMap::new(),
             user_snippets_path: PathBuf::new(),
@@ -40264,6 +40299,17 @@ mod tests {
         assert_eq!(
             state.clipboard,
             "* Research note\n\nA copied paragraph stays external."
+        );
+        assert_eq!(
+            state.pending_terminal_clipboard.as_deref(),
+            Some("* Research note\n\nA copied paragraph stays external.")
+        );
+        assert_eq!(
+            terminal_clipboard_sequence("A ✓"),
+            Some("\x1b]52;c;QSDinJM=\x07".into())
+        );
+        assert!(
+            terminal_clipboard_sequence(&"x".repeat(MAX_OSC52_PAYLOAD_BYTES * 3 / 4 + 1)).is_none()
         );
         handle(
             &mut state,
