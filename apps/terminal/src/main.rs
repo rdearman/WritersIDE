@@ -10649,8 +10649,8 @@ impl AppState {
         Ok(())
     }
     fn begin_scene_removal(&mut self, restoring: bool) -> Result<(), Box<dyn std::error::Error>> {
-        if self.workspace != Workspace::Cards {
-            self.message = "Open Scene Cards and select a scene first".into();
+        if !matches!(self.workspace, Workspace::Cards | Workspace::Outline) {
+            self.message = "Open the Outline or Scene Cards and select a scene first".into();
             return Ok(());
         }
         if restoring != self.removed_scenes_list {
@@ -29088,6 +29088,44 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         return Ok(false);
     }
+    if k.code == KeyCode::Delete && k.modifiers.is_empty() {
+        match s.workspace {
+            Workspace::Cards if !s.removed_scenes_list => {
+                s.begin_scene_removal(false)?;
+                return Ok(false);
+            }
+            Workspace::Cards => {
+                s.message =
+                    "Removed scenes can be restored; permanent deletion is unavailable".into();
+                return Ok(false);
+            }
+            Workspace::Outline => {
+                match outline_rows(s).get(s.selected) {
+                    Some(OutlineRow::Section { .. } | OutlineRow::Chapter { .. }) => {
+                        s.begin_structural_node_removal(false)?;
+                    }
+                    Some(OutlineRow::Scene(_)) => s.begin_scene_removal(false)?,
+                    Some(OutlineRow::ContentUnit(_)) => s.begin_content_unit_removal(false)?,
+                    None => {
+                        s.message = "Select an outline item to move to Removed Documents".into()
+                    }
+                }
+                return Ok(false);
+            }
+            Workspace::Series if !s.series_reference_view && !s.series_removed_books_view => {
+                if let Err(error) = s.execute_legacy_palette_command("series-remove-selected-book")
+                {
+                    s.message = error.to_string();
+                }
+                return Ok(false);
+            }
+            Workspace::Series if s.series_removed_books_view => {
+                s.message = "Removed books can be restored; the book project is preserved".into();
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
     if k.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(k.code, KeyCode::Char('f' | 'F' | 'h' | 'H'))
     {
@@ -42508,6 +42546,57 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "Retained manuscript text."
         );
+    }
+
+    #[test]
+    fn delete_key_routes_to_recoverable_list_removal_but_edits_text_in_editor() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut app = WriterApp::create_project(&project, "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| *row == OutlineRow::Scene(scene))
+            .unwrap();
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.pending_scene_removal.is_some());
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.pending_scene_removal.is_none());
+        assert_eq!(state.app.get_scene(scene).unwrap().scene.title, "Opening");
+
+        state.workspace = Workspace::Cards;
+        state.refresh().unwrap();
+        state.selected = scene_card_ids(&state)
+            .iter()
+            .position(|candidate| *candidate == scene)
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.pending_scene_removal.is_some());
+
+        state.pending_scene_removal = None;
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["abc".into()];
+        state.cursor = (0, 1);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor, vec!["ac"]);
+        assert!(state.pending_scene_removal.is_none());
     }
 
     #[test]
