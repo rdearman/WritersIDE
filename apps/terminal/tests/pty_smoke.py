@@ -353,8 +353,12 @@ def main():
                 (b"Included", b"Arrival"), scene_workspace_start, timeout=3.0
             ):
                 raise AssertionError("Navigate > Scene Cards did not open the card list")
-            os.write(master, b"\x1b[B")  # move from the chapter boundary onto its scene card
-            read_for(0.2)
+            # Cards may preserve selection on a chapter boundary when the
+            # workspace opens. Two idempotent Downs ensure the one-scene
+            # fixture ends with the actual scene selected.
+            for _ in range(2):
+                os.write(master, b"\x1b[B")
+                read_for(0.15)
             scene_dialog_start = len(output)
             os.write(master, b"\x1b[3~")  # Delete
             if not wait_for_fragments(
