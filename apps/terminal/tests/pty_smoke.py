@@ -26,6 +26,7 @@ def main():
     create_fiction = modes == ["create-fiction"]
     previous_position = modes == ["previous-position"]
     removal_dialogs = modes == ["removal-dialogs"]
+    chapter_removal = modes == ["chapter-removal"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
     child_pid, master = pty.fork()
@@ -205,6 +206,59 @@ def main():
             ):
                 raise AssertionError("application did not remain usable and quit cleanly")
             print("PTY navigation regression passed: empty Previous Position is nonfatal; menu and quit remain usable.")
+            return
+
+        if chapter_removal:
+            # Remove the selected populated chapter through Navigate > Outline.
+            # The default is the explicitly documented retain-and-unplace path.
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" + b"\r")
+            read_for(0.3)
+            if not wait_for_fragments((b"Outline", b"Opening", b"Arrival"), timeout=3.0):
+                raise AssertionError("Navigate > Outline did not show the populated chapter")
+            # Workspace selection may be preserved on the last child row;
+            # explicitly select the parent chapter before invoking Delete.
+            os.write(master, b"\x1b[A" * 3)
+            read_for(0.2)
+            dialog_start = len(output)
+            os.write(master, b"\x1b[3~")  # Delete selected chapter heading
+            if not wait_for_fragments(
+                (
+                    b"Delete",
+                    b"Chapter",
+                    b"Opening",
+                    b"Contains",
+                    b"scene(s)",
+                    b"prose",
+                    b"Removed",
+                    b"Move",
+                    b"Unplaced",
+                    b"another",
+                    b"recoverably",
+                    b"Compile",
+                    b"Esc",
+                    b"cancel",
+                ),
+                dialog_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "populated chapter removal did not show the explicit recoverable choices; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
+                )
+            os.write(master, b"\r")  # confirm the default: retain scenes as Unplaced
+            read_for(0.4)
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after the chapter removal")
+            print("PTY chapter removal passed: choices are visible and the default retains scenes as Unplaced.")
             return
 
         if removal_dialogs:

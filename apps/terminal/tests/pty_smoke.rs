@@ -187,3 +187,108 @@ fn scene_and_reference_removal_dialogues_are_cancellable_in_a_real_pty() {
         "A read-only field reference."
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn populated_chapter_removal_retains_scenes_through_the_real_terminal_workflow() {
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Chapter Removal Project");
+    let mut app = WriterApp::create_project(&project, "Chapter Removal Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "The traveler arrives.")
+        .unwrap();
+    let prose = app
+        .create_content_unit(
+            story_core::ContentUnitKind::ChapterBody,
+            "Chapter prose",
+            Some(chapter),
+            0,
+            None,
+        )
+        .unwrap();
+    let (_, prose_hash) = app.load_content_unit_text(prose).unwrap();
+    app.save_content_unit_text(
+        prose,
+        Some(&prose_hash),
+        "Direct chapter prose remains recoverable.",
+    )
+    .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY chapter-removal workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("chapter-removal")
+        .output()
+        .expect("run the Linux PTY populated-chapter removal workflow");
+    assert!(
+        result.status.success(),
+        "PTY chapter-removal workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let mut reopened = WriterApp::open_project(&project).unwrap();
+    let moved_scene = reopened.get_scene(scene).unwrap();
+    assert!(!moved_scene.scene.archived);
+    assert_eq!(moved_scene.chapter_id, None);
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "The traveler arrives."
+    );
+    assert!(reopened.get_content_unit(prose).unwrap().archived);
+    assert_eq!(
+        reopened.load_content_unit_text(prose).unwrap().0,
+        "Direct chapter prose remains recoverable."
+    );
+    assert!(
+        reopened
+            .list_archived_structural_nodes()
+            .unwrap()
+            .iter()
+            .any(|node| node.id == chapter)
+    );
+    let compiled = reopened
+        .compile_artifact(story_document::CompileFormat::Markdown, false)
+        .unwrap();
+    assert!(
+        !String::from_utf8(compiled.bytes)
+            .unwrap()
+            .contains("The traveler arrives.")
+    );
+    assert!(
+        !String::from_utf8(
+            reopened
+                .compile_artifact(story_document::CompileFormat::Markdown, false)
+                .unwrap()
+                .bytes
+        )
+        .unwrap()
+        .contains("Direct chapter prose remains recoverable.")
+    );
+
+    reopened.restore_latest_structural_removal(chapter).unwrap();
+    assert_eq!(reopened.get_scene(scene).unwrap().chapter_id, Some(chapter));
+    assert!(!reopened.get_content_unit(prose).unwrap().archived);
+    assert!(!reopened.get_content_unit(prose).unwrap().archived);
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "The traveler arrives."
+    );
+    assert_eq!(
+        reopened.load_content_unit_text(prose).unwrap().0,
+        "Direct chapter prose remains recoverable."
+    );
+}
