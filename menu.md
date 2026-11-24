@@ -118,8 +118,13 @@ The Scene menu appears only while Scene Cards is active; Publish is available
 from manuscript workspaces and command search. The Scene Cards footer shows the
 effective Include / Exclude shortcut (Space by default).
 Use Up/Down to select a card and Left/Right to reorder it, including across a
-chapter boundary. The Scene menu provides the chapter chooser; Up/Down chooses
-the destination, Enter moves, and Esc cancels.
+chapter boundary. Tab switches between Included and Excluded. Shift+Left and
+Shift+Right move the selected scene's chapter block while preserving its scenes.
+Insert creates a scene; Shift+Insert creates a chapter at the selected scene.
+The Scene menu also exposes Move Scene Earlier and Move Scene Later. Move Scene
+to Chapter opens the chapter chooser; Up/Down chooses the destination, Enter
+moves, and Esc cancels. Unplaced scenes can be reordered before chapter
+assignment and remain outside the compiled manuscript until placed.
 
 On a temporary start project, **Save Project** opens the Save Project As
 dialogue. The footer shows **[TEMPORARY]** until a permanent project folder has

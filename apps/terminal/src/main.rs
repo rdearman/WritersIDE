@@ -924,9 +924,12 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
     &["help.resume-tutorial", "help.context", "help.search"],
     &[
         "scene.create",
+        "structure.chapter",
         "scene.open",
         "scene.rename",
         "scene.field",
+        "scene.move-earlier",
+        "scene.move-later",
         "outline.move-up",
         "outline.move-down",
         "scene.move",
@@ -1427,6 +1430,8 @@ enum CommandAction {
     WriteSelectedChapter,
     MoveOutlineUp,
     MoveOutlineDown,
+    MoveSceneEarlier,
+    MoveSceneLater,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2290,6 +2295,36 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::MoveOutlineDown,
             task_group: "",
             menu_priority: 17,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "scene.move-earlier",
+            label: "Move Scene Earlier",
+            description: "Move the selected scene one position earlier in the manuscript",
+            category: "Scene",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &[],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::MoveSceneEarlier,
+            task_group: "Scene Cards",
+            menu_priority: 2,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "scene.move-later",
+            label: "Move Scene Later",
+            description: "Move the selected scene one position later in the manuscript",
+            category: "Scene",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &[],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::MoveSceneLater,
+            task_group: "Scene Cards",
+            menu_priority: 3,
             advanced: false,
         },
         legacy_command(
@@ -7052,11 +7087,6 @@ impl AppState {
     fn move_scene_card(&mut self, direction: isize) -> Result<(), Box<dyn std::error::Error>> {
         let scene = selected_scene_for_workspace(self).ok_or("select a scene card first")?;
         let record = self.app.get_scene(scene)?;
-        let Some(chapter) = record.chapter_id else {
-            self.message =
-                "This scene is Unplaced · use Scene → Move Scene to Chapter to place it".into();
-            return Ok(());
-        };
         let included = self.app.scene_is_included(scene)?;
         let candidates = self
             .app
@@ -7069,6 +7099,49 @@ impl AppState {
                     == included
             })
             .collect::<Vec<_>>();
+        let Some(chapter) = record.chapter_id else {
+            let unplaced = candidates
+                .iter()
+                .filter(|candidate| candidate.chapter_id.is_none())
+                .collect::<Vec<_>>();
+            let current = unplaced
+                .iter()
+                .position(|candidate| candidate.scene.id == scene)
+                .ok_or("selected unplaced scene is missing from its collection")?;
+            let destination = if direction < 0 && current > 0 {
+                Some((None, current - 1))
+            } else if direction > 0 && current + 1 < unplaced.len() {
+                Some((None, current + 1))
+            } else if direction > 0 {
+                self.app
+                    .list_structural_nodes()?
+                    .into_iter()
+                    .find(|node| node.kind == "chapter")
+                    .map(|node| (Some(node.id), 0))
+            } else {
+                None
+            };
+            let Some((destination, position)) = destination else {
+                self.message = "Already at the end of Unplaced · no change made".into();
+                return Ok(());
+            };
+            if let Some(chapter) = destination {
+                self.app.move_scene(scene, chapter, position as u32)?;
+                self.message = "Moved scene from Unplaced into the first chapter".into();
+            } else {
+                self.app.reorder_unplaced_scene(scene, position as u32)?;
+                self.message = format!(
+                    "Moved unplaced scene to position {} · selection kept with this scene",
+                    position + 1
+                );
+            }
+            self.refresh()?;
+            self.selected = scene_card_ids(self)
+                .iter()
+                .position(|id| *id == scene)
+                .unwrap_or(0);
+            return Ok(());
+        };
         let same_chapter = candidates
             .iter()
             .filter(|candidate| candidate.chapter_id == Some(chapter))
@@ -7081,12 +7154,12 @@ impl AppState {
             let target = same_chapter[current - 1]
                 .position
                 .ok_or("target scene has no manuscript position")?;
-            Some((chapter, target))
+            Some((Some(chapter), target))
         } else if direction > 0 && current + 1 < same_chapter.len() {
             let target = same_chapter[current + 1]
                 .position
                 .ok_or("target scene has no manuscript position")?;
-            Some((chapter, target))
+            Some((Some(chapter), target))
         } else {
             let chapters = self
                 .app
@@ -7106,21 +7179,23 @@ impl AppState {
             } else {
                 chapters.get(chapter_index + 1).map(|node| node.id)
             };
-            adjacent.map(|destination| {
-                let peers = candidates
-                    .iter()
-                    .filter(|candidate| candidate.chapter_id == Some(destination))
-                    .collect::<Vec<_>>();
-                let position = if direction < 0 {
-                    peers
-                        .last()
-                        .and_then(|peer| peer.position)
-                        .map_or(0, |position| position.saturating_add(1))
-                } else {
-                    peers.first().and_then(|peer| peer.position).unwrap_or(0)
-                };
-                (destination, position)
-            })
+            adjacent
+                .map(|destination| {
+                    let peers = candidates
+                        .iter()
+                        .filter(|candidate| candidate.chapter_id == Some(destination))
+                        .collect::<Vec<_>>();
+                    let position = if direction < 0 {
+                        peers
+                            .last()
+                            .and_then(|peer| peer.position)
+                            .map_or(0, |position| position.saturating_add(1))
+                    } else {
+                        peers.first().and_then(|peer| peer.position).unwrap_or(0)
+                    };
+                    (Some(destination), position)
+                })
+                .or_else(|| (direction < 0 && chapter_index == 0).then_some((None, 0)))
         };
         let Some((destination, position)) = destination else {
             self.message = if direction < 0 {
@@ -7130,7 +7205,17 @@ impl AppState {
             };
             return Ok(());
         };
-        self.app.move_scene(scene, destination, position)?;
+        if let Some(destination) = destination {
+            self.app.move_scene(scene, destination, position)?;
+        } else {
+            let unplaced_count = self
+                .app
+                .list_scenes(false)?
+                .iter()
+                .filter(|candidate| candidate.chapter_id.is_none())
+                .count();
+            self.app.unplace_scene(scene, unplaced_count as u32)?;
+        }
         self.refresh()?;
         self.selected = scene_card_ids(self)
             .iter()
@@ -7142,10 +7227,63 @@ impl AppState {
             self.app
                 .list_structural_nodes()?
                 .into_iter()
-                .find(|node| node.id == destination)
-                .map_or_else(|| "chapter".to_owned(), |node| node.title)
+                .find(|node| Some(node.id) == destination)
+                .map_or_else(|| "Unplaced".to_owned(), |node| node.title)
         );
         Ok(())
+    }
+
+    fn move_selected_card_chapter(
+        &mut self,
+        direction: isize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let scene = selected_scene_for_workspace(self).ok_or("select a scene card first")?;
+        let record = self.app.get_scene(scene)?;
+        let chapter = record
+            .chapter_id
+            .ok_or("Unplaced scenes have no chapter block to move")?;
+        let nodes = self.app.list_structural_nodes()?;
+        let selected = nodes
+            .iter()
+            .find(|node| node.id == chapter)
+            .ok_or("scene chapter is missing from the outline")?;
+        let parent = selected.parent_id;
+        let title = selected.title.clone();
+        let siblings = nodes
+            .iter()
+            .filter(|node| node.kind == "chapter" && node.parent_id == parent)
+            .collect::<Vec<_>>();
+        let index = siblings
+            .iter()
+            .position(|node| node.id == chapter)
+            .ok_or("chapter is missing from its parent")?;
+        let target = if direction < 0 {
+            index.checked_sub(1)
+        } else {
+            (index + 1 < siblings.len()).then_some(index + 1)
+        };
+        let Some(target) = target else {
+            self.message = "Chapter is already at this boundary · no change made".into();
+            return Ok(());
+        };
+        self.app
+            .move_structural_node(chapter, parent, target as u32)?;
+        self.refresh()?;
+        self.selected = scene_card_ids(self)
+            .iter()
+            .position(|id| *id == scene)
+            .unwrap_or(0);
+        self.message = format!(
+            "Moved chapter “{}” as a block · scene order and identity preserved",
+            title
+        );
+        Ok(())
+    }
+
+    fn start_chapter_at_selected_card(&mut self) {
+        self.mode = Some('H');
+        self.prompt.clear();
+        self.message = "New chapter at this position · enter a title or Esc to cancel".into();
     }
     fn open_series_book(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.dirty {
@@ -11303,6 +11441,12 @@ impl AppState {
             {
                 Some("Select a chapter or section with a sibling below")
             }
+            CommandAction::MoveSceneEarlier | CommandAction::MoveSceneLater
+                if self.workspace != Workspace::Cards
+                    || selected_scene_for_workspace(self).is_none() =>
+            {
+                Some("Select a scene card first")
+            }
             CommandAction::ResolveSaveConflict if !self.dirty => {
                 Some("There are no unsaved manuscript changes to resolve")
             }
@@ -12174,6 +12318,8 @@ impl AppState {
             CommandAction::WriteSelectedChapter => self.write_selected_chapter()?,
             CommandAction::MoveOutlineUp => self.move_selected_outline_item(false)?,
             CommandAction::MoveOutlineDown => self.move_selected_outline_item(true)?,
+            CommandAction::MoveSceneEarlier => self.move_scene_card(-1)?,
+            CommandAction::MoveSceneLater => self.move_scene_card(1)?,
             CommandAction::Save => {
                 if self.temporary_project {
                     if let Err(error) = self.start_save_project_as()
@@ -12369,6 +12515,48 @@ impl AppState {
         let cmd = self.prompt.trim().to_owned();
         self.prompt.clear();
         let mode = self.mode.take();
+        if mode == Some('H') {
+            if cmd.is_empty() {
+                self.message = "Chapter not created · enter a title or press Esc to cancel".into();
+                return Ok(());
+            }
+            let scene = selected_scene_for_workspace(self);
+            let record = scene.map(|id| self.app.get_scene(id)).transpose()?;
+            let current_chapter = record.as_ref().and_then(|record| record.chapter_id);
+            let nodes = self.app.list_structural_nodes()?;
+            let current_node =
+                current_chapter.and_then(|id| nodes.iter().find(|node| node.id == id));
+            let parent = current_node.and_then(|node| node.parent_id);
+            let insertion = current_node.map(|node| node.position);
+            let append_position = nodes
+                .iter()
+                .filter(|node| node.parent_id == parent)
+                .map(|node| node.position.saturating_add(1))
+                .max()
+                .unwrap_or(0);
+            let chapter = self.app.create_chapter(parent, &cmd, append_position)?;
+            if let Some(position) = insertion {
+                self.app.move_structural_node(chapter, parent, position)?;
+            }
+            if let Some(scene) = scene {
+                self.app.move_scene(scene, chapter, 0)?;
+                self.refresh()?;
+                self.selected = scene_card_ids(self)
+                    .iter()
+                    .position(|id| *id == scene)
+                    .unwrap_or(0);
+            }
+            self.message = format!(
+                "Created chapter “{}”{}",
+                cmd,
+                if scene.is_some() {
+                    " at the selected scene"
+                } else {
+                    ""
+                }
+            );
+            return Ok(());
+        }
         if mode == Some('h') {
             let result = (|| -> Result<(), Box<dyn std::error::Error>> {
                 if cmd.is_empty() {
@@ -19555,7 +19743,7 @@ fn display_shortcut_label(label: String) -> String {
 fn workspace_action_hint(state: &AppState) -> String {
     match state.workspace {
         Workspace::Cards => format!(
-            "↑/↓ select · ←/→ reorder · {}: Include/Exclude · Insert New Scene · Enter Write · Scene menu: Move to Chapter",
+            "{}: Include/Exclude · ↑↓ select · ←→ move · ⇧←→ chapter · Tab columns",
             effective_shortcut_label(state, "scene.toggle-inclusion", "Space")
         ),
         Workspace::Outline => "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Move Item Up/Down".into(),
@@ -24189,6 +24377,26 @@ fn scene_card_ids(s: &AppState) -> Vec<SceneId> {
         .collect()
 }
 
+fn scene_card_ids_for_inclusion(s: &AppState, included: bool) -> Vec<SceneId> {
+    let excluded = s
+        .app
+        .list_excluded_scene_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    s.scenes
+        .iter()
+        .filter(|(id, _, _, _)| excluded.contains(id) != included)
+        .map(|(id, _, _, _)| *id)
+        .collect()
+}
+
+fn selected_card_collection_is_included(s: &AppState) -> bool {
+    selected_scene_for_workspace(s)
+        .and_then(|scene| s.app.scene_is_included(scene).ok())
+        .unwrap_or(true)
+}
+
 fn workspace_items(s: &AppState) -> Vec<String> {
     if s.workspace == Workspace::Series {
         if let Some(wizard) = s.scrivener_import.as_ref() {
@@ -27503,6 +27711,29 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.dispatch_registered(command.action)?;
             }
         }
+        KeyCode::Tab if s.workspace == Workspace::Cards => {
+            let target_included = !selected_card_collection_is_included(s);
+            if let Some(scene) = scene_card_ids_for_inclusion(s, target_included)
+                .first()
+                .copied()
+            {
+                s.selected = scene_card_ids(s)
+                    .iter()
+                    .position(|candidate| *candidate == scene)
+                    .unwrap_or(0);
+                s.message = if target_included {
+                    "Included scenes · Tab switches to Excluded".into()
+                } else {
+                    "Excluded scenes · Tab switches to Included".into()
+                };
+            } else {
+                s.message = if target_included {
+                    "No Included scenes · Space restores a selected Excluded scene".into()
+                } else {
+                    "No Excluded scenes · Space moves the selected scene here".into()
+                };
+            }
+        }
         KeyCode::Tab => s.switch(next_primary_destination(s.workspace, true)),
         KeyCode::BackTab => s.switch(next_primary_destination(s.workspace, false)),
         KeyCode::Up | KeyCode::Char('k')
@@ -27553,6 +27784,16 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             s.resume_tutorial()?;
         }
         KeyCode::Enter if s.workspace == Workspace::Research && s.proposal_review_active => {}
+        KeyCode::Left if s.workspace == Workspace::Cards && k.modifiers == KeyModifiers::SHIFT => {
+            if let Err(error) = s.move_selected_card_chapter(-1) {
+                s.message = error.to_string();
+            }
+        }
+        KeyCode::Right if s.workspace == Workspace::Cards && k.modifiers == KeyModifiers::SHIFT => {
+            if let Err(error) = s.move_selected_card_chapter(1) {
+                s.message = error.to_string();
+            }
+        }
         KeyCode::Left if s.workspace == Workspace::Cards && k.modifiers.is_empty() => {
             if let Err(error) = s.move_scene_card(-1) {
                 s.message = error.to_string();
@@ -27568,7 +27809,12 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.message = error.to_string();
             }
         }
-        KeyCode::Insert if s.workspace == Workspace::Cards => {
+        KeyCode::Insert
+            if s.workspace == Workspace::Cards && k.modifiers == KeyModifiers::SHIFT =>
+        {
+            s.start_chapter_at_selected_card();
+        }
+        KeyCode::Insert if s.workspace == Workspace::Cards && k.modifiers.is_empty() => {
             if let Err(error) = s.dispatch_registered_command_id("scene.create") {
                 s.message = error.to_string();
             }
@@ -27585,6 +27831,34 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         {
             if let Err(error) = s.move_scene_card(1) {
                 s.message = error.to_string();
+            }
+        }
+        KeyCode::Up if s.workspace == Workspace::Cards && k.modifiers.is_empty() => {
+            let collection =
+                scene_card_ids_for_inclusion(s, selected_card_collection_is_included(s));
+            let current = selected_scene_for_workspace(s)
+                .and_then(|scene| collection.iter().position(|candidate| *candidate == scene))
+                .unwrap_or(0);
+            if let Some(scene) = collection.get(current.saturating_sub(1)) {
+                s.selected = scene_card_ids(s)
+                    .iter()
+                    .position(|candidate| candidate == scene)
+                    .unwrap_or(s.selected);
+            }
+        }
+        KeyCode::Down if s.workspace == Workspace::Cards && k.modifiers.is_empty() => {
+            let collection =
+                scene_card_ids_for_inclusion(s, selected_card_collection_is_included(s));
+            let current = selected_scene_for_workspace(s)
+                .and_then(|scene| collection.iter().position(|candidate| *candidate == scene))
+                .unwrap_or(0);
+            if let Some(scene) =
+                collection.get((current + 1).min(collection.len().saturating_sub(1)))
+            {
+                s.selected = scene_card_ids(s)
+                    .iter()
+                    .position(|candidate| candidate == scene)
+                    .unwrap_or(s.selected);
             }
         }
         KeyCode::Char(' ')
@@ -30488,8 +30762,123 @@ mod tests {
             state.app.load_scene_text(moving).unwrap().0,
             "This prose stays with the scene."
         );
-        assert!(workspace_action_hint(&state).contains("←/→ reorder"));
-        assert!(workspace_action_hint(&state).contains("Scene menu: Move to Chapter"));
+        assert!(workspace_action_hint(&state).contains("←→ move"));
+        assert!(workspace_action_hint(&state).contains("Tab columns"));
+    }
+
+    #[test]
+    fn scene_cards_order_unplaced_scenes_switch_collections_and_move_chapter_blocks() {
+        let root = tempfile::tempdir().unwrap();
+        let project_path = root.path().join("Novel");
+        let mut app = WriterApp::create_project(&project_path, "Novel").unwrap();
+        let first_chapter = app.create_chapter(None, "First", 0).unwrap();
+        let second_chapter = app.create_chapter(None, "Second", 1).unwrap();
+        let unplaced_a = app.create_unplaced_scene("Unplaced A").unwrap();
+        let unplaced_b = app.create_unplaced_scene("Unplaced B").unwrap();
+        let placed = app.create_scene(first_chapter, "Placed", 0).unwrap();
+        let held = app.create_scene(second_chapter, "Held aside", 0).unwrap();
+        app.set_scene_included(held, false).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.switch(Workspace::Cards);
+        state.refresh().unwrap();
+        state.selected = scene_card_ids(&state)
+            .iter()
+            .position(|id| *id == unplaced_a)
+            .unwrap();
+
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        assert_eq!(selected_scene_for_workspace(&state), Some(unplaced_b));
+        handle(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert_eq!(selected_scene_for_workspace(&state), Some(held));
+        handle(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert!(selected_scene_for_workspace(&state).is_some_and(|scene| scene != held));
+
+        state.selected = scene_card_ids(&state)
+            .iter()
+            .position(|id| *id == unplaced_a)
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.app.list_scenes(false).unwrap()[0].scene.id,
+            unplaced_b
+        );
+        assert_eq!(selected_scene_for_workspace(&state), Some(unplaced_a));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.app.get_scene(unplaced_a).unwrap().chapter_id,
+            Some(first_chapter)
+        );
+        assert_eq!(selected_scene_for_workspace(&state), Some(unplaced_a));
+        handle(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.app.get_scene(unplaced_a).unwrap().chapter_id, None);
+
+        state.selected = scene_card_ids(&state)
+            .iter()
+            .position(|id| *id == placed)
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        let chapter_order = state
+            .app
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|node| node.kind == "chapter")
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        assert_eq!(chapter_order, [second_chapter, first_chapter]);
+        assert_eq!(selected_scene_for_workspace(&state), Some(placed));
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Insert, KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        assert_eq!(state.mode, Some('H'));
+        for character in "New boundary".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let new_chapter = state.app.get_scene(placed).unwrap().chapter_id.unwrap();
+        assert_eq!(
+            state
+                .app
+                .list_structural_nodes()
+                .unwrap()
+                .into_iter()
+                .find(|node| node.id == new_chapter)
+                .unwrap()
+                .title,
+            "New boundary"
+        );
+        assert_eq!(selected_scene_for_workspace(&state), Some(placed));
+        drop(state);
+        let reopened = WriterApp::open_project(&project_path).unwrap();
+        assert_eq!(reopened.get_scene(unplaced_a).unwrap().chapter_id, None);
+        assert_eq!(
+            reopened.get_scene(placed).unwrap().chapter_id,
+            Some(new_chapter)
+        );
+        assert_eq!(reopened.list_scenes(false).unwrap()[0].scene.id, unplaced_b);
     }
 
     #[test]

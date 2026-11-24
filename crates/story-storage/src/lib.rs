@@ -57,6 +57,7 @@ const MIGRATION_40: &str = include_str!("../migrations/0040_story_interval_bound
 const MIGRATION_41: &str = include_str!("../migrations/0041_event_relationships.sql");
 const MIGRATION_42: &str = include_str!("../migrations/0042_diagnostic_suppressions.sql");
 const MIGRATION_43: &str = include_str!("../migrations/0043_scene_inclusion.sql");
+const MIGRATION_44: &str = include_str!("../migrations/0044_unplaced_scene_order.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -1446,6 +1447,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_41}\nINSERT INTO schema_migrations(version,applied_at) VALUES(41,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_42}\nINSERT INTO schema_migrations(version,applied_at) VALUES(42,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_43}\nINSERT INTO schema_migrations(version,applied_at) VALUES(43,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_44}\nINSERT INTO schema_migrations(version,applied_at) VALUES(44,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1494,7 +1496,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 43 {
+        if version > 44 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1667,6 +1669,10 @@ impl ProjectStore {
         }
         if current_version == 42 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_43}\nINSERT INTO schema_migrations(version,applied_at) VALUES(43,'{}');\nCOMMIT;", now()))?;
+            current_version = 43;
+        }
+        if current_version == 43 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_44}\nINSERT INTO schema_migrations(version,applied_at) VALUES(44,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -2436,6 +2442,131 @@ impl ProjectStore {
         self.create_scene_record(None, title)
     }
 
+    pub fn reorder_unplaced_scene(&mut self, id: SceneId, position: u32) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let placement: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scene_placement WHERE scene_id=?1)",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        if placement {
+            return Err(StorageError::Invalid("scene is placed in a chapter".into()));
+        }
+        let mut ids = query_unplaced_scene_ids(&tx)?;
+        let current = ids
+            .iter()
+            .position(|scene| scene == &id.to_string())
+            .ok_or_else(|| StorageError::NotFound(id.to_string()))?;
+        let moved = ids.remove(current);
+        if position as usize > ids.len() {
+            return Err(StorageError::Invalid(
+                "unplaced scene position beyond sibling count".into(),
+            ));
+        }
+        ids.insert(position as usize, moved);
+        compact_unplaced_scene_order(&tx, &ids)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    pub fn unplace_scene(&mut self, id: SceneId, position: u32) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let source: Option<String> = tx
+            .query_row(
+                "SELECT chapter_id FROM scene_placement WHERE scene_id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(source) = source else {
+            let mut ids = query_unplaced_scene_ids(&tx)?;
+            let current = ids
+                .iter()
+                .position(|scene| scene == &id.to_string())
+                .ok_or_else(|| StorageError::NotFound(id.to_string()))?;
+            let moved = ids.remove(current);
+            if position as usize > ids.len() {
+                return Err(StorageError::Invalid(
+                    "unplaced scene position beyond sibling count".into(),
+                ));
+            }
+            ids.insert(position as usize, moved);
+            compact_unplaced_scene_order(&tx, &ids)?;
+            tx.commit()?;
+            return Ok(());
+        };
+        let mut source_ids = query_scene_ids(&tx, &source)?;
+        if !source_ids.iter().any(|scene| scene == &id.to_string()) {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        source_ids.retain(|scene| scene != &id.to_string());
+        let mut unplaced_ids = query_unplaced_scene_ids(&tx)?;
+        if position as usize > unplaced_ids.len() {
+            return Err(StorageError::Invalid(
+                "unplaced scene position beyond sibling count".into(),
+            ));
+        }
+        unplaced_ids.insert(position as usize, id.to_string());
+        let max: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position),0) FROM scene_placement",
+            [],
+            |row| row.get(0),
+        )?;
+        let base = max
+            .checked_mul(3)
+            .and_then(|value| value.checked_add(100))
+            .ok_or_else(|| StorageError::Invalid("position space exhausted".into()))?;
+        for (index, scene) in source_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE scene_placement SET position=?2 WHERE scene_id=?1",
+                params![scene, base + index as i64],
+            )?;
+        }
+        tx.execute(
+            "DELETE FROM scene_placement WHERE scene_id=?1",
+            [id.to_string()],
+        )?;
+        for (index, scene) in source_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE scene_placement SET position=?2 WHERE scene_id=?1",
+                params![scene, index as i64],
+            )?;
+        }
+        let unplaced_max: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position),0) FROM unplaced_scene_order",
+            [],
+            |row| row.get(0),
+        )?;
+        let staging = unplaced_max
+            .checked_add(100)
+            .ok_or_else(|| StorageError::Invalid("unplaced scene positions exhausted".into()))?;
+        tx.execute(
+            "INSERT INTO unplaced_scene_order(scene_id,position) VALUES(?1,?2)",
+            params![id.to_string(), staging],
+        )?;
+        let staging = staging
+            .checked_add(100)
+            .ok_or_else(|| StorageError::Invalid("unplaced scene positions exhausted".into()))?;
+        for (index, scene) in unplaced_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE unplaced_scene_order SET position=?2 WHERE scene_id=?1",
+                params![scene, staging + index as i64],
+            )?;
+        }
+        for (index, scene) in unplaced_ids.iter().enumerate() {
+            tx.execute(
+                "UPDATE unplaced_scene_order SET position=?2 WHERE scene_id=?1",
+                params![scene, index as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn create_scene_record(
         &mut self,
         placement: Option<(NodeId, u32)>,
@@ -2503,6 +2634,16 @@ impl ProjectStore {
             tx.execute(
                 "INSERT INTO scene_placement(scene_id,chapter_id,position) VALUES(?1,?2,?3)",
                 params![id.to_string(), chapter.to_string(), i64::from(position)],
+            )?;
+        } else {
+            let position: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(position)+1,0) FROM unplaced_scene_order",
+                [],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO unplaced_scene_order(scene_id,position) VALUES(?1,?2)",
+                params![id.to_string(), position],
             )?;
         }
         tx.execute("INSERT INTO scene_content(scene_id,relative_path,sha256,byte_length) VALUES(?1,?2,?3,0)",params![id.to_string(),rel,hash])?;
@@ -2905,7 +3046,7 @@ impl ProjectStore {
         Ok(())
     }
     pub fn list_scenes(&self, include_archived: bool) -> Result<Vec<SceneRecord>> {
-        let sql = "WITH RECURSIVE node_order(id,path) AS (SELECT id,printf('%010d/',position) FROM structural_node WHERE parent_id IS NULL UNION ALL SELECT n.id,o.path||printf('%010d/',n.position) FROM structural_node n JOIN node_order o ON n.parent_id=o.id) SELECT s.id FROM scene s LEFT JOIN scene_placement p ON p.scene_id=s.id LEFT JOIN node_order n ON n.id=p.chapter_id WHERE (?1=1 OR s.archived=0) ORDER BY CASE WHEN p.scene_id IS NULL THEN 0 ELSE 1 END,n.path,p.position,s.created_at,s.id";
+        let sql = "WITH RECURSIVE node_order(id,path) AS (SELECT id,printf('%010d/',position) FROM structural_node WHERE parent_id IS NULL UNION ALL SELECT n.id,o.path||printf('%010d/',n.position) FROM structural_node n JOIN node_order o ON n.parent_id=o.id) SELECT s.id FROM scene s LEFT JOIN scene_placement p ON p.scene_id=s.id LEFT JOIN node_order n ON n.id=p.chapter_id LEFT JOIN unplaced_scene_order u ON u.scene_id=s.id WHERE (?1=1 OR s.archived=0) ORDER BY CASE WHEN p.scene_id IS NULL THEN 0 ELSE 1 END,CASE WHEN p.scene_id IS NULL THEN u.position ELSE NULL END,n.path,p.position,s.created_at,s.id";
         let ids: Vec<String> = {
             let mut q = self.conn.prepare(sql)?;
             q.query_map([include_archived], |r| r.get(0))?
@@ -3214,6 +3355,10 @@ impl ProjectStore {
                     params![scene_id, index as i64],
                 )?;
             }
+            tx.execute(
+                "DELETE FROM unplaced_scene_order WHERE scene_id=?1",
+                [id.to_string()],
+            )?;
             tx.commit()?;
             return Ok(());
         };
@@ -10016,6 +10161,40 @@ fn query_scene_ids(conn: &Connection, chapter: &str) -> Result<Vec<String>> {
     Ok(q.query_map([chapter], |r| r.get(0))?
         .collect::<std::result::Result<Vec<_>, _>>()?)
 }
+fn query_unplaced_scene_ids(conn: &Connection) -> Result<Vec<String>> {
+    let mut query =
+        conn.prepare("SELECT scene_id FROM unplaced_scene_order ORDER BY position,scene_id")?;
+    Ok(query
+        .query_map([], |row| row.get(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?)
+}
+fn compact_unplaced_scene_order(
+    transaction: &rusqlite::Transaction<'_>,
+    ids: &[String],
+) -> Result<()> {
+    let maximum: i64 = transaction.query_row(
+        "SELECT COALESCE(MAX(position),0) FROM unplaced_scene_order",
+        [],
+        |row| row.get(0),
+    )?;
+    let offset = maximum
+        .checked_mul(3)
+        .and_then(|value| value.checked_add(ids.len() as i64 + 100))
+        .ok_or_else(|| StorageError::Invalid("unplaced scene positions exhausted".into()))?;
+    for (index, id) in ids.iter().enumerate() {
+        transaction.execute(
+            "UPDATE unplaced_scene_order SET position=?2 WHERE scene_id=?1",
+            params![id, offset + index as i64],
+        )?;
+    }
+    for (index, id) in ids.iter().enumerate() {
+        transaction.execute(
+            "UPDATE unplaced_scene_order SET position=?2 WHERE scene_id=?1",
+            params![id, index as i64],
+        )?;
+    }
+    Ok(())
+}
 fn query_assembly_item_ids(
     transaction: &rusqlite::Transaction<'_>,
     assembly: AssemblyId,
@@ -10257,7 +10436,7 @@ mod tests {
         let project = directory.path().join("Book");
         let store = ProjectStore::create(&project, "Book").unwrap();
         store.conn.execute_batch(
-            "DROP TABLE scene_exclusion; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
+            "DROP TABLE scene_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
         ).unwrap();
         drop(store);
 
@@ -10283,7 +10462,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 43);
+        assert_eq!(version, 44);
     }
     #[test]
     fn event_character_and_location_relationships_are_typed_atomic_and_persistent() {
@@ -10342,7 +10521,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 43);
+        assert_eq!(schema_version, 44);
     }
     #[test]
     fn writing_challenges_are_validated_persisted_and_completed_once() {
@@ -12042,7 +12221,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 43))
+            .map(|version| assert_eq!(version, 44))
             .unwrap();
     }
 
@@ -12323,7 +12502,7 @@ mod tests {
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch("DROP TABLE scene_exclusion; DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code; DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
-        conn.execute_batch("DROP TABLE diagnostic_suppression; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TABLE diagnostic_suppression; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -12333,7 +12512,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 43);
+        assert_eq!(version, 44);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -12423,6 +12602,7 @@ mod tests {
              DROP TABLE story_event_interval_boundary;
              DROP TABLE scene_interval_boundary;
              DROP TABLE diagnostic_suppression;
+             DROP TABLE unplaced_scene_order;
              DELETE FROM schema_migrations WHERE version>=9;",
         )
         .unwrap();
@@ -14083,5 +14263,72 @@ mod tests {
             "INSERT INTO diagnostic_suppression(id,rule_id,scope,reason,created_unix_ms,last_checked_unix_ms,status) VALUES('bad','PUB004','finding','bad',1,1,'active')",
             [],
         ).is_err());
+    }
+
+    #[test]
+    fn unplaced_scenes_have_persistent_reorderable_positions_and_can_be_reinserted() {
+        let directory = tempdir().unwrap();
+        let mut store = ProjectStore::create(directory.path().join("Novel"), "Novel").unwrap();
+        let first = store.create_unplaced_scene("First").unwrap();
+        let second = store.create_unplaced_scene("Second").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+
+        store.reorder_unplaced_scene(second, 0).unwrap();
+        assert_eq!(
+            store
+                .list_scenes(false)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.scene.id)
+                .collect::<Vec<_>>(),
+            [second, first]
+        );
+        store.move_scene(second, chapter, 0).unwrap();
+        store.unplace_scene(second, 1).unwrap();
+        assert_eq!(
+            store
+                .list_scenes(false)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.scene.id)
+                .collect::<Vec<_>>(),
+            [first, second]
+        );
+        let positions = query_unplaced_scene_ids(&store.conn).unwrap();
+        assert_eq!(positions, [first.to_string(), second.to_string()]);
+        assert!(store.reorder_unplaced_scene(second, 8).is_err());
+    }
+
+    #[test]
+    fn schema_forty_three_migration_backfills_unplaced_scene_order() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut store = ProjectStore::create(&project, "Novel").unwrap();
+        let first = store.create_unplaced_scene("First").unwrap();
+        let second = store.create_unplaced_scene("Second").unwrap();
+        drop(store);
+
+        let connection = Connection::open(project.join("story.db")).unwrap();
+        connection
+            .execute_batch(
+                "DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version=44;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let migrated = ProjectStore::open(&project).unwrap();
+        assert_eq!(
+            query_unplaced_scene_ids(&migrated.conn).unwrap(),
+            [first.to_string(), second.to_string()]
+        );
+        let version: i64 = migrated
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 44);
     }
 }

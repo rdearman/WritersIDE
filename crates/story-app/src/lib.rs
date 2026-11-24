@@ -1225,6 +1225,12 @@ impl WriterApp {
     pub fn create_unplaced_scene(&mut self, title: &str) -> Result<SceneId> {
         Ok(self.store.create_unplaced_scene(title)?)
     }
+    pub fn reorder_unplaced_scene(&mut self, scene: SceneId, position: u32) -> Result<()> {
+        Ok(self.store.reorder_unplaced_scene(scene, position)?)
+    }
+    pub fn unplace_scene(&mut self, scene: SceneId, position: u32) -> Result<()> {
+        Ok(self.store.unplace_scene(scene, position)?)
+    }
     pub fn create_content_unit(
         &mut self,
         kind: ContentUnitKind,
@@ -7544,10 +7550,10 @@ unexpected_prose = "must not be silently discarded"
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64
-            + 1;
+            + 5_000;
         app.add_diagnostic_suppression(&finding, "rule", "Temporary review", Some(expiry))
             .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(3));
+        std::thread::sleep(std::time::Duration::from_millis(5_010));
         let current = app
             .compile_diagnostics()
             .unwrap()
