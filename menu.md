@@ -6,6 +6,8 @@ Choose **Search All Commands…** from File, Edit, Insert, Navigate, View, Revie
 
 The complete command inventory and before/after placement audit is in [docs/menu-audit-v0.1.md](docs/menu-audit-v0.1.md). Command-use frequency is not measured; the audit’s visibility tiers are qualitative.
 
+On a normal launch without a project argument, the start screen offers **New Project**, **Open Project**, **Recent Projects**, **Import Scrivener Project**, **Guided Tour**, and **Quick Start**. Choosing New Project opens the shared browser with Fiction/Non-fiction selection; it does not open a raw path prompt first. Passing a project path still opens that project directly.
+
 ## File
 
 - New Project

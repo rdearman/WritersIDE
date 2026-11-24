@@ -65,8 +65,27 @@ def main():
     try:
         read_for(1.0)
         if create_fiction:
-            if b"New Project" not in output:
-                raise AssertionError("first-run project browser was not rendered")
+            startup_deadline = time.monotonic() + 5.0
+            while (
+                (b"Open" not in output or b"Scrivener" not in output)
+                and time.monotonic() < startup_deadline
+            ):
+                read_for(0.25)
+            if b"Open" not in output or b"Scrivener" not in output:
+                raise AssertionError(
+                    "first-run project chooser was not rendered; output tail: "
+                    + repr(bytes(output[-2400:]))
+                )
+            os.write(master, b"\r")  # select New Project from the start screen
+            read_for(0.4)
+            browser_deadline = time.monotonic() + 5.0
+            while (
+                (b"Directory" not in output or b"type" not in output)
+                and time.monotonic() < browser_deadline
+            ):
+                read_for(0.25)
+            if b"Directory" not in output or b"type" not in output:
+                raise AssertionError("New Project did not open the type-aware folder browser")
             os.write(master, b"\x1b[12~")  # F2: choose Fiction
             read_for(0.25)
             os.write(master, b"\x1b[15~")  # F5: request creation

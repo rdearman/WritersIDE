@@ -619,7 +619,12 @@ struct HelpPanel {
 
 fn welcome_panel(has_progress: bool) -> HelpPanel {
     let mut lines = vec![
-        "Choose how to begin. The tutorial uses its own disposable sample project.".into(),
+        "Choose a project action or start a tutorial. Tutorials use a disposable sample project."
+            .into(),
+        "New Project · choose Fiction or Non-fiction, then a location".into(),
+        "Open Project · continue an existing Writer's IDE project".into(),
+        "Recent Projects · reopen a project used recently".into(),
+        "Import Scrivener Project · continue an existing manuscript".into(),
         "Guided Tour · overview of navigation, writing, references and publishing".into(),
         "Quick Start · create/open, write and save, then compile".into(),
         "Skip · continue directly to your project; Help remains available".into(),
@@ -10607,6 +10612,15 @@ impl AppState {
         self.help_panel = Some(welcome_panel(preferences.active_tutorial.is_some()));
         Ok(())
     }
+    fn mark_welcome_seen(&self, dismiss_tutorial: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let mut preferences = onboarding::load(&self.tutorial_preferences_path)?;
+        preferences.welcome_seen = true;
+        if dismiss_tutorial {
+            preferences.tutorial_dismissed = true;
+        }
+        onboarding::store(&self.tutorial_preferences_path, &preferences)?;
+        Ok(())
+    }
     fn restart_tutorial(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let preferences = onboarding::load(&user_tutorial_preferences_path())?;
         let progress = preferences.active_tutorial;
@@ -19030,12 +19044,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.refresh()?;
     open_default_manuscript_if_unrestored(&mut state, has_saved_session)?;
     let onboarding_path = user_tutorial_preferences_path();
-    if startup_scratch.is_some() {
-        state.start_file_browser(FileBrowserPurpose::NewProject)?;
-        state.message = "Choose Fiction or Non-fiction, then select a folder and project name · Esc opens the temporary start screen".into();
-    }
     match onboarding::load(&onboarding_path) {
-        _ if startup_scratch.is_some() => {}
+        Ok(preferences) if startup_scratch.is_some() => {
+            state.help_panel = Some(welcome_panel(preferences.active_tutorial.is_some()));
+            state.message = "Start screen · choose New Project, Open Project, Recent Projects, Import, or a tutorial".into();
+        }
         Ok(preferences) if !preferences.welcome_seen || preferences.active_tutorial.is_some() => {
             state.help_panel = Some(welcome_panel(preferences.active_tutorial.is_some()));
         }
@@ -21095,11 +21108,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
         let choices = panel
             .lines
             .iter()
-            .filter(|line| {
-                ["Guided Tour", "Quick Start", "Skip", "Resume Tutorial"]
-                    .iter()
-                    .any(|prefix| line.starts_with(prefix))
-            })
+            .filter(|line| is_welcome_choice(line))
             .count();
         panel
             .lines
@@ -21160,6 +21169,21 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
         ),
         rect,
     );
+}
+
+fn is_welcome_choice(line: &str) -> bool {
+    [
+        "New Project",
+        "Open Project",
+        "Recent Projects",
+        "Import Scrivener Project",
+        "Guided Tour",
+        "Quick Start",
+        "Skip",
+        "Resume Tutorial",
+    ]
+    .iter()
+    .any(|prefix| line.starts_with(prefix))
 }
 
 fn draw_macro_preview_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
@@ -26038,11 +26062,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         if panel_title == Some("Welcome to Writer's IDE") {
             match k.code {
                 KeyCode::Esc => {
-                    let path = user_tutorial_preferences_path();
-                    let mut preferences = onboarding::load(&path)?;
-                    preferences.welcome_seen = true;
-                    preferences.tutorial_dismissed = true;
-                    onboarding::store(&path, &preferences)?;
+                    s.mark_welcome_seen(true)?;
                     s.help_panel = None;
                     s.message = "Welcome skipped · reopen it from the Help menu".into();
                 }
@@ -26053,35 +26073,60 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 }
                 KeyCode::Down => {
                     if let Some(panel) = s.help_panel.as_mut() {
-                        let max = if panel
+                        let max = panel
                             .lines
                             .iter()
-                            .any(|line| line.starts_with("Resume Tutorial"))
-                        {
-                            3
-                        } else {
-                            2
-                        };
+                            .filter(|line| is_welcome_choice(line))
+                            .count()
+                            .saturating_sub(1);
                         panel.scroll = (panel.scroll + 1).min(max);
                     }
                 }
                 KeyCode::Enter => {
-                    let selected = s.help_panel.as_ref().map_or(0, |panel| panel.scroll);
-                    match selected {
-                        0 => s.begin_tutorial(onboarding::TutorialTrack::GuidedTour)?,
-                        1 => s.begin_tutorial(onboarding::TutorialTrack::QuickStart)?,
-                        2 => {
-                            let path = user_tutorial_preferences_path();
-                            let mut preferences = onboarding::load(&path)?;
-                            preferences.welcome_seen = true;
-                            preferences.tutorial_dismissed = true;
-                            onboarding::store(&path, &preferences)?;
+                    let selected = s
+                        .help_panel
+                        .as_ref()
+                        .and_then(|panel| {
+                            panel
+                                .lines
+                                .iter()
+                                .filter(|line| is_welcome_choice(line))
+                                .nth(panel.scroll)
+                        })
+                        .cloned()
+                        .unwrap_or_default();
+                    match selected.split('·').next().unwrap_or_default().trim() {
+                        "New Project" => {
+                            s.mark_welcome_seen(false)?;
+                            s.help_panel = None;
+                            s.dispatch_registered_command_id("file.new-project")?;
+                        }
+                        "Open Project" => {
+                            s.mark_welcome_seen(false)?;
+                            s.help_panel = None;
+                            s.dispatch_registered_command_id("file.open-project")?;
+                        }
+                        "Recent Projects" => {
+                            s.mark_welcome_seen(false)?;
+                            s.help_panel = None;
+                            s.open_recent_project_picker();
+                        }
+                        "Import Scrivener Project" => {
+                            s.mark_welcome_seen(false)?;
+                            s.help_panel = None;
+                            s.dispatch_registered_command_id("file.import-scrivener")?;
+                        }
+                        "Guided Tour" => s.begin_tutorial(onboarding::TutorialTrack::GuidedTour)?,
+                        "Quick Start" => s.begin_tutorial(onboarding::TutorialTrack::QuickStart)?,
+                        "Skip" => {
+                            s.mark_welcome_seen(true)?;
                             s.help_panel = None;
                             s.message =
                                 "Tutorial skipped · Help remains available from the Help menu"
                                     .into();
                         }
-                        _ => s.resume_tutorial()?,
+                        "Resume Tutorial" => s.resume_tutorial()?,
+                        _ => {}
                     }
                 }
                 KeyCode::F(1) => s.close_context_help(),
@@ -39701,6 +39746,53 @@ mod tests {
             )
             .title
             .contains("Compile")
+        );
+    }
+
+    #[test]
+    fn first_run_start_screen_offers_project_actions_before_the_new_project_browser() {
+        let directory = tempfile::tempdir().unwrap();
+        let app =
+            WriterApp::create_project(directory.path().join("Temporary"), "Temporary").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.tutorial_preferences_path = directory.path().join("preferences/tutorial.json");
+        state.help_panel = Some(welcome_panel(false));
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        for choice in [
+            "New Project",
+            "Open Project",
+            "Recent Projects",
+            "Import Scrivener Project",
+            "Guided Tour",
+            "Quick Start",
+        ] {
+            assert!(rendered.contains(choice), "missing {choice}: {rendered}");
+        }
+        assert!(state.file_browser.is_none());
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::NewProject
+        );
+        assert!(
+            onboarding::load(&state.tutorial_preferences_path)
+                .unwrap()
+                .welcome_seen
         );
     }
 
