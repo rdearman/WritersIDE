@@ -7998,7 +7998,6 @@ impl AppState {
         path: PathBuf,
         notice: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let recent_projects_path = self.recent_projects_path.clone();
         if self.dirty {
             return Err("save the current manuscript buffer before changing books".into());
         }
@@ -8011,15 +8010,67 @@ impl AppState {
         let context_command_bindings = load_context_command_bindings_or_default(&path).0;
         let mut app = WriterApp::open_project(&path)?;
         app.recover_interrupted_writing_challenges()?;
+        self.finish_project_switch(
+            path,
+            app,
+            function_bindings,
+            command_bindings,
+            context_command_bindings,
+            [function_warning, command_warning]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · "),
+            notice,
+        )
+    }
+    fn switch_to_open_project(
+        &mut self,
+        path: PathBuf,
+        app: WriterApp,
+        notice: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err("save the current manuscript buffer before changing books".into());
+        }
+        if self.active_challenge.is_some() {
+            return Err("finish or quit the active writing challenge before changing books".into());
+        }
+        self.save_session()?;
+        let (function_bindings, function_warning) = load_bindings_or_default(&path);
+        let (command_bindings, command_warning) = load_command_bindings_or_default(&path);
+        let context_command_bindings = load_context_command_bindings_or_default(&path).0;
+        self.finish_project_switch(
+            path,
+            app,
+            function_bindings,
+            command_bindings,
+            context_command_bindings,
+            [function_warning, command_warning]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(" · "),
+            notice,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn finish_project_switch(
+        &mut self,
+        path: PathBuf,
+        app: WriterApp,
+        function_bindings: Vec<(u8, Workspace)>,
+        command_bindings: CommandBindings,
+        context_command_bindings: Vec<ContextCommandBinding>,
+        binding_warning: String,
+        notice: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let recent_projects_path = self.recent_projects_path.clone();
         let mut next = Self::new(app, function_bindings);
         next.recent_projects_path = recent_projects_path.clone();
         next.command_bindings = command_bindings;
         next.context_command_bindings = context_command_bindings;
-        next.message = [function_warning, command_warning]
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .join(" · ");
+        next.message = binding_warning;
         next.selected_series_root = story_series::SeriesStore::open_for_book(&path)
             .ok()
             .map(|(series, _)| series.root().to_owned());
@@ -10484,7 +10535,8 @@ impl AppState {
         });
         onboarding::store(&preferences_path, &preferences)?;
         let recent_projects_path = self.recent_projects_path.take();
-        let switched = self.switch_to_project(demo_path, "Tutorial sample opened".into());
+        let switched =
+            self.switch_to_open_project(demo_path, demo, "Tutorial sample opened".into());
         self.recent_projects_path = recent_projects_path;
         switched?;
         self.tutorial_preferences_path = preferences_path.clone();
@@ -38964,6 +39016,54 @@ mod tests {
         assert_eq!(
             PathBuf::from(progress.return_project),
             original_path.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn tutorial_cold_entry_and_warm_resume_are_measured_and_restore_context() {
+        use std::time::Instant;
+
+        let dir = tempfile::tempdir().unwrap();
+        let original = WriterApp::create_project(dir.path().join("Original"), "Original").unwrap();
+        let demo_path = dir.path().join("Tutorial");
+        let preferences_path = dir.path().join("prefs/tutorial-state.json");
+        let mut state = AppState::new(original, default_bindings());
+
+        let cold_start = Instant::now();
+        state
+            .begin_tutorial_at(
+                onboarding::TutorialTrack::GuidedTour,
+                demo_path,
+                preferences_path.clone(),
+            )
+            .unwrap();
+        let cold_entry = cold_start.elapsed();
+        state.exit_tutorial().unwrap();
+
+        let warm_start = Instant::now();
+        state.resume_tutorial_at(&preferences_path).unwrap();
+        let warm_resume = warm_start.elapsed();
+
+        eprintln!(
+            "tutorial timing (disposable project): cold entry {cold_entry:?}, warm resume {warm_resume:?}"
+        );
+        assert!(
+            cold_entry < std::time::Duration::from_secs(5),
+            "cold tutorial entry should not block for more than five seconds: {cold_entry:?}"
+        );
+        assert!(
+            warm_resume < std::time::Duration::from_secs(5),
+            "tutorial resume should not block for more than five seconds: {warm_resume:?}"
+        );
+        assert!(
+            state
+                .help_panel
+                .as_ref()
+                .is_some_and(|panel| panel.title.starts_with("Tutorial ·"))
+        );
+        assert_eq!(
+            state.app.get_project().unwrap().title,
+            "Writer's IDE Tutorial Sample"
         );
     }
 

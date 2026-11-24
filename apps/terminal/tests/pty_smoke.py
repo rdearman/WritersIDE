@@ -100,9 +100,9 @@ def main():
             )
             return
 
-        # A fresh isolated profile may show the welcome/help panel above the
-        # project. Esc dismisses that topmost panel and should reveal prose.
-        os.write(master, b"\x1b")
+        # A fresh isolated profile shows the welcome panel. Use its visible
+        # Skip choice so the test follows the discoverable onboarding route.
+        os.write(master, b"\x1b[B\x1b[B\r")
         read_for(0.3)
         if b"Arrival" not in output:
             raise AssertionError(
