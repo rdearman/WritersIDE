@@ -1,9 +1,16 @@
 static PTY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(target_os = "linux")]
+fn lock_pty_test() -> std::sync::MutexGuard<'static, ()> {
+    PTY_TEST_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
-    let _guard = PTY_TEST_LOCK.lock().unwrap();
+    let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
 
@@ -45,7 +52,7 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
 #[cfg(target_os = "linux")]
 #[test]
 fn full_screen_terminal_creates_a_fiction_project_and_saves_a_scene_in_a_pty() {
-    let _guard = PTY_TEST_LOCK.lock().unwrap();
+    let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
     use story_core::BookType;
@@ -101,7 +108,7 @@ fn full_screen_terminal_creates_a_fiction_project_and_saves_a_scene_in_a_pty() {
 #[cfg(target_os = "linux")]
 #[test]
 fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
-    let _guard = PTY_TEST_LOCK.lock().unwrap();
+    let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
 
@@ -139,7 +146,7 @@ fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
 #[cfg(target_os = "linux")]
 #[test]
 fn scene_and_reference_removal_dialogues_are_cancellable_in_a_real_pty() {
-    let _guard = PTY_TEST_LOCK.lock().unwrap();
+    let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
 
@@ -197,7 +204,7 @@ fn scene_and_reference_removal_dialogues_are_cancellable_in_a_real_pty() {
 #[cfg(target_os = "linux")]
 #[test]
 fn populated_chapter_removal_retains_scenes_through_the_real_terminal_workflow() {
-    let _guard = PTY_TEST_LOCK.lock().unwrap();
+    let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
 
@@ -303,7 +310,7 @@ fn populated_chapter_removal_retains_scenes_through_the_real_terminal_workflow()
 #[cfg(target_os = "linux")]
 #[test]
 fn populated_chapter_removal_can_rehome_scenes_to_a_selected_chapter_in_a_real_pty() {
-    let _guard = PTY_TEST_LOCK.lock().unwrap();
+    let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
 
@@ -365,7 +372,7 @@ fn populated_chapter_removal_can_rehome_scenes_to_a_selected_chapter_in_a_real_p
 #[cfg(target_os = "linux")]
 #[test]
 fn populated_chapter_subtree_deletion_is_recoverable_through_a_real_pty() {
-    let _guard = PTY_TEST_LOCK.lock().unwrap();
+    let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
     use story_core::ContentUnitKind;
@@ -449,7 +456,7 @@ fn populated_chapter_subtree_deletion_is_recoverable_through_a_real_pty() {
 #[cfg(target_os = "linux")]
 #[test]
 fn nonfiction_section_subtree_deletion_preserves_owned_prose_for_recovery_in_a_real_pty() {
-    let _guard = PTY_TEST_LOCK.lock().unwrap();
+    let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
     use story_core::{BookType, ContentUnitKind, NodeKind};
