@@ -176,6 +176,13 @@ struct ReadingRemovalDialog {
     restoring: bool,
 }
 
+#[derive(Clone, Debug)]
+struct SceneRemovalDialog {
+    id: SceneId,
+    title: String,
+    restoring: bool,
+}
+
 struct AppState {
     app: WriterApp,
     temporary_project: bool,
@@ -226,6 +233,8 @@ struct AppState {
     reading_selection_start: Option<u64>,
     reading_removed_list: bool,
     pending_reading_removal: Option<ReadingRemovalDialog>,
+    removed_scenes_list: bool,
+    pending_scene_removal: Option<SceneRemovalDialog>,
     function_bindings: Vec<(u8, Workspace)>,
     command_bindings: CommandBindings,
     context_command_bindings: Vec<ContextCommandBinding>,
@@ -949,6 +958,9 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "outline.move-down",
         "scene.move",
         "scene.toggle-inclusion",
+        "scene.remove",
+        "scene.removed-list",
+        "scene.restore",
         "command.palette-open",
     ],
 ];
@@ -1453,6 +1465,9 @@ enum CommandAction {
     MoveOutlineDown,
     MoveSceneEarlier,
     MoveSceneLater,
+    ArchiveSelectedScene,
+    ShowRemovedScenes,
+    RestoreSelectedScene,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2391,6 +2406,51 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::MoveSceneLater,
             task_group: "Scene Cards",
             menu_priority: 3,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "scene.remove",
+            label: "Move Scene to Removed",
+            description: "Reversibly remove the selected scene while preserving its prose and relationships",
+            category: "Scene",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["archive scene", "remove scene"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ArchiveSelectedScene,
+            task_group: "Scene Cards",
+            menu_priority: 4,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "scene.removed-list",
+            label: "Show Removed Scenes",
+            description: "Browse scenes that can be restored to the manuscript",
+            category: "Scene",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["removed scenes", "scene trash"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ShowRemovedScenes,
+            task_group: "Scene Cards",
+            menu_priority: 5,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "scene.restore",
+            label: "Restore Selected Scene",
+            description: "Return the selected removed scene with its original identity, placement and metadata",
+            category: "Scene",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["restore scene", "unarchive scene"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::RestoreSelectedScene,
+            task_group: "Scene Cards",
+            menu_priority: 6,
             advanced: false,
         },
         legacy_command(
@@ -6142,6 +6202,8 @@ impl AppState {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -7147,10 +7209,12 @@ impl AppState {
         Ok(())
     }
     fn refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let removed_scenes = self.workspace == Workspace::Cards && self.removed_scenes_list;
         self.scenes = self
             .app
-            .list_scenes(false)?
+            .list_scenes(removed_scenes)?
             .into_iter()
+            .filter(|record| record.scene.archived == removed_scenes)
             .map(|r| (r.scene.id, r.scene.title, r.scene.status, r.actual_words))
             .collect();
         if !self.scenes.is_empty() {
@@ -7208,6 +7272,10 @@ impl AppState {
         if self.workspace != Workspace::Cards {
             return Err("open Scene Cards to move a scene between Included and Excluded".into());
         }
+        if self.removed_scenes_list {
+            self.message = "Restore the scene before changing whether it is included".into();
+            return Ok(());
+        }
         let scene = selected_scene_for_workspace(self).ok_or("select a scene card first")?;
         let included = self.app.scene_is_included(scene)?;
         self.app.set_scene_included(scene, !included)?;
@@ -7224,6 +7292,10 @@ impl AppState {
         Ok(())
     }
     fn move_scene_card(&mut self, direction: isize) -> Result<(), Box<dyn std::error::Error>> {
+        if self.removed_scenes_list {
+            self.message = "Restore the scene before changing its manuscript position".into();
+            return Ok(());
+        }
         let scene = selected_scene_for_workspace(self).ok_or("select a scene card first")?;
         let record = self.app.get_scene(scene)?;
         let included = self.app.scene_is_included(scene)?;
@@ -7376,6 +7448,10 @@ impl AppState {
         &mut self,
         direction: isize,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.removed_scenes_list {
+            self.message = "Restore the scene before moving its chapter".into();
+            return Ok(());
+        }
         let selected_scene = selected_scene_for_workspace(self);
         let chapter = self
             .selected_card_chapter
@@ -10392,6 +10468,89 @@ impl AppState {
         };
         Ok(())
     }
+    fn toggle_removed_scenes(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace != Workspace::Cards {
+            self.switch(Workspace::Cards);
+        }
+        self.removed_scenes_list = !self.removed_scenes_list;
+        self.selected_card_chapter = None;
+        self.selected = 0;
+        self.refresh()?;
+        self.message = if self.removed_scenes_list {
+            "Removed Scenes · select a scene and choose Restore Selected Scene".into()
+        } else {
+            "Scene Cards · Included and Excluded · select a card to write or organise it".into()
+        };
+        Ok(())
+    }
+    fn begin_scene_removal(&mut self, restoring: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace != Workspace::Cards {
+            self.message = "Open Scene Cards and select a scene first".into();
+            return Ok(());
+        }
+        if restoring != self.removed_scenes_list {
+            self.message = if restoring {
+                "Show Removed Scenes and select a scene to restore".into()
+            } else {
+                "Select an active scene to move to Removed Scenes".into()
+            };
+            return Ok(());
+        }
+        let Some(id) = selected_scene_for_workspace(self) else {
+            self.message = if restoring {
+                "There are no removed scenes to restore".into()
+            } else {
+                "Select a scene card to remove".into()
+            };
+            return Ok(());
+        };
+        if self.dirty && self.editing_scene == Some(id) {
+            self.message =
+                "Save or cancel this scene's unsaved edits before moving it to Removed Scenes"
+                    .into();
+            return Ok(());
+        }
+        let scene = self.app.get_scene(id)?;
+        self.pending_scene_removal = Some(SceneRemovalDialog {
+            id,
+            title: scene.scene.title,
+            restoring,
+        });
+        Ok(())
+    }
+    fn finish_scene_removal(
+        &mut self,
+        dialog: SceneRemovalDialog,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if dialog.restoring {
+            self.app.restore_archived_scene(dialog.id)?;
+            self.removed_scenes_list = false;
+        } else {
+            self.app.archive_scene(dialog.id)?;
+            if self.editing_scene == Some(dialog.id) {
+                self.editing_scene = None;
+                self.editor.clear();
+                self.saved_hash.clear();
+                self.dirty = false;
+                self.cursor = (0, 0);
+            }
+        }
+        self.pending_scene_removal = None;
+        self.selected = self.selected.saturating_sub(usize::from(!dialog.restoring));
+        self.refresh()?;
+        self.message = if dialog.restoring {
+            format!(
+                "Restored scene ‘{}’ to its original manuscript position",
+                dialog.title
+            )
+        } else {
+            format!(
+                "Moved scene ‘{}’ to Removed Scenes · prose, identity and links preserved",
+                dialog.title
+            )
+        };
+        Ok(())
+    }
     fn open_selected(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.workspace == Workspace::Outline {
             match outline_rows(self).get(self.selected).cloned() {
@@ -11727,6 +11886,36 @@ impl AppState {
         if spec.id == "research.removed-references" && self.workspace != Workspace::Reading {
             return Some("Open the Reference Library first");
         }
+        if spec.id == "scene.remove" {
+            return if self.workspace != Workspace::Cards {
+                Some("Open Scene Cards first")
+            } else if self.removed_scenes_list {
+                Some("Select a scene in Included or Excluded first")
+            } else if selected_scene_for_workspace(self).is_none() {
+                Some("Select a scene card first")
+            } else {
+                None
+            };
+        }
+        if spec.id == "scene.restore" {
+            return if self.workspace != Workspace::Cards || !self.removed_scenes_list {
+                Some("Show Removed Scenes first")
+            } else if selected_scene_for_workspace(self).is_none() {
+                Some("Select a removed scene first")
+            } else {
+                None
+            };
+        }
+        if self.workspace == Workspace::Cards
+            && self.removed_scenes_list
+            && menu_category(&spec) == "Scene"
+            && !matches!(
+                spec.id,
+                "scene.removed-list" | "scene.restore" | "scene.open"
+            )
+        {
+            return Some("Restore the scene before changing its manuscript data");
+        }
         match spec.action {
             CommandAction::NewProject if self.dirty => {
                 Some("Save the manuscript buffer before creating a project")
@@ -12664,6 +12853,9 @@ impl AppState {
             CommandAction::MoveOutlineDown => self.move_selected_outline_item(true)?,
             CommandAction::MoveSceneEarlier => self.move_scene_card(-1)?,
             CommandAction::MoveSceneLater => self.move_scene_card(1)?,
+            CommandAction::ArchiveSelectedScene => self.begin_scene_removal(false)?,
+            CommandAction::ShowRemovedScenes => self.toggle_removed_scenes()?,
+            CommandAction::RestoreSelectedScene => self.begin_scene_removal(true)?,
             CommandAction::Save => {
                 if self.temporary_project {
                     if let Err(error) = self.start_save_project_as()
@@ -20173,10 +20365,16 @@ fn display_shortcut_label(label: String) -> String {
 
 fn workspace_action_hint(state: &AppState) -> String {
     match state.workspace {
-        Workspace::Cards => format!(
-            "{}: Include/Exclude · ↑↓ select · ←→ move/place · ⇧↑↓ chapter · ⇧←→ move chapter · ⇧Ins new chapter · Tab columns",
-            effective_shortcut_label(state, "scene.toggle-inclusion", "Space")
-        ),
+        Workspace::Cards => {
+            if state.removed_scenes_list {
+                "Removed Scenes · ↑/↓ select · Scene > Restore Selected Scene · Scene > Show Removed Scenes returns".into()
+            } else {
+                format!(
+                    "{}: Include/Exclude · ↑↓ select · ←→ move/place · ⇧↑↓ chapter · ⇧←→ move chapter · ⇧Ins new chapter · Tab columns · Scene > Move Scene to Removed",
+                    effective_shortcut_label(state, "scene.toggle-inclusion", "Space")
+                )
+            }
+        }
         Workspace::Outline => "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Move Item Up/Down".into(),
         Workspace::Editor => "Esc: Outline".into(),
         _ => "Tab: next primary view · Shift+Tab: previous".into(),
@@ -20205,6 +20403,25 @@ fn scene_card_rows(
     s: &AppState,
     included: bool,
 ) -> Vec<(Option<SceneId>, Option<story_core::NodeId>, String)> {
+    if s.removed_scenes_list {
+        let nodes = s.app.list_structural_nodes().unwrap_or_default();
+        return s
+            .scenes
+            .iter()
+            .filter_map(|(id, _, _, _)| {
+                let record = s.app.get_scene(*id).ok()?;
+                let chapter = record
+                    .chapter_id
+                    .and_then(|chapter| nodes.iter().find(|node| node.id == chapter))
+                    .map(|node| (node.id, node.title.clone()));
+                Some((*id, chapter))
+            })
+            .map(|(id, chapter)| match chapter {
+                Some((chapter, title)) => (Some(id), Some(chapter), title),
+                None => (Some(id), None, "Unplaced".into()),
+            })
+            .collect();
+    }
     let excluded = s
         .app
         .list_excluded_scene_ids()
@@ -20340,6 +20557,18 @@ fn draw_scene_card_collection(
 }
 
 fn draw_scene_cards_workspace(frame: &mut ratatui::Frame<'_>, state: &AppState, area: Rect) {
+    if state.removed_scenes_list {
+        let rows = scene_card_rows(state, true);
+        draw_scene_card_collection(
+            frame,
+            area,
+            "Removed Scenes · Restore from Scene menu",
+            &rows,
+            selected_scene_for_workspace(state),
+            None,
+        );
+        return;
+    }
     let included = scene_card_rows(state, true);
     let excluded = scene_card_rows(state, false);
     let selected = selected_scene_for_workspace(state);
@@ -21896,6 +22125,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     }
     if s.pending_reading_removal.is_some() {
         draw_reading_removal_overlay(f, s);
+    }
+    if s.pending_scene_removal.is_some() {
+        draw_scene_removal_overlay(f, s);
     }
     if s.help_panel.is_some() {
         draw_help_overlay(f, s);
@@ -23697,6 +23929,47 @@ fn draw_reading_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     );
 }
 
+fn draw_scene_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(dialog) = &s.pending_scene_removal else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 76);
+    let height = 7.min(area.height.max(1));
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, rect);
+    let text = Text::from(vec![
+        Line::from(if dialog.restoring {
+            "Restore this scene to the manuscript?"
+        } else {
+            "Move this scene to Removed Scenes?"
+        }),
+        Line::from(truncate_display_cells(
+            &dialog.title,
+            width.saturating_sub(4) as usize,
+        )),
+        Line::from("Its prose, identity, placement and story links will be retained."),
+        Line::from("Enter/Y confirms · Esc/N cancels"),
+    ]);
+    f.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title(if dialog.restoring {
+                    " Restore Scene "
+                } else {
+                    " Remove Scene "
+                })
+                .borders(Borders::ALL),
+        ),
+        rect,
+    );
+}
+
 fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let Some(form) = s.series_form.as_ref() else {
         return;
@@ -25038,6 +25311,9 @@ fn outline_rows(s: &AppState) -> Vec<OutlineRow> {
 }
 
 fn scene_card_ids(s: &AppState) -> Vec<SceneId> {
+    if s.removed_scenes_list {
+        return s.scenes.iter().map(|(id, _, _, _)| *id).collect();
+    }
     let excluded = s
         .app
         .list_excluded_scene_ids()
@@ -25256,6 +25532,15 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                             .find(|node| node.id == id)
                     })
                     .map_or_else(|| "Unplaced".to_owned(), |node| node.title);
+                if s.removed_scenes_list {
+                    return Some(format!(
+                        "Removed · {}\n{} · {} · {} words",
+                        chapter,
+                        row.scene.title,
+                        row.scene.status.as_str(),
+                        row.actual_words
+                    ));
+                }
                 Some(format!(
                     "{} · {}\n{} · {} · {} words",
                     if included { "Included" } else { "Excluded" },
@@ -26978,6 +27263,19 @@ fn handle_command_palette_key(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(dialog) = s.pending_scene_removal.clone() {
+        match k.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                s.finish_scene_removal(dialog)?;
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                s.pending_scene_removal = None;
+                s.message = "Cancelled · scene unchanged".into();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if let Some(dialog) = s.pending_reading_removal.clone() {
         match k.code {
             KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
@@ -34276,6 +34574,8 @@ mod tests {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -37771,6 +38071,8 @@ mod tests {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -37917,6 +38219,8 @@ mod tests {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38059,6 +38363,8 @@ mod tests {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38209,6 +38515,8 @@ mod tests {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38509,6 +38817,8 @@ mod tests {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38659,6 +38969,8 @@ mod tests {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -40240,6 +40552,8 @@ mod tests {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -40525,6 +40839,8 @@ mod tests {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -40637,6 +40953,114 @@ mod tests {
         state.command().unwrap();
         assert_eq!(state.reading_offset, passage_offset);
         assert_eq!(state.workspace, Workspace::Reading);
+    }
+
+    #[test]
+    fn scene_removal_and_restoration_are_named_confirmed_and_preserve_scene_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Last Scene", 0).unwrap();
+        let mut metadata = app.get_scene(scene).unwrap().scene;
+        metadata.status = SceneStatus::Complete;
+        metadata.synopsis = "The mystery is solved.".into();
+        app.update_scene_metadata(&metadata).unwrap();
+        let character = app.create_character("Mara").unwrap();
+        app.link_character(scene, character, story_core::ParticipationRole::Major)
+            .unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "The truth came to light.")
+            .unwrap();
+
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Cards;
+        state.refresh().unwrap();
+        state.selected = 0;
+        let scene_menu = SCENE_MENU_INDEX;
+        let remove = command_by_id("scene.remove").unwrap();
+        state.open_menu_category(scene_menu);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == remove.id)
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.pending_scene_removal.is_some());
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.app.list_scenes(false).unwrap().len(), 1);
+
+        state.open_menu_category(scene_menu);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == remove.id)
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.app.list_scenes(false).unwrap().is_empty());
+        let compiled = state
+            .app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        assert!(!String::from_utf8_lossy(&compiled.bytes).contains("The truth came to light."));
+        assert!(
+            state
+                .message
+                .contains("prose, identity and links preserved")
+        );
+
+        state.open_menu_category(scene_menu);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "scene.removed-list")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.removed_scenes_list);
+        assert_eq!(scene_card_ids(&state), vec![scene]);
+        let restore = command_by_id("scene.restore").unwrap();
+        state.open_menu_category(scene_menu);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == restore.id)
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        let restored = state.app.get_scene(scene).unwrap();
+        assert!(!restored.scene.archived);
+        assert_eq!(restored.scene.status, SceneStatus::Complete);
+        assert_eq!(restored.scene.synopsis, "The mystery is solved.");
+        assert_eq!(restored.chapter_id, Some(chapter));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "The truth came to light."
+        );
+        let compiled = state
+            .app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        assert!(String::from_utf8_lossy(&compiled.bytes).contains("The truth came to light."));
+        assert_eq!(state.app.scene_character_analytics(scene).unwrap().len(), 1);
+        assert!(!state.removed_scenes_list);
     }
 
     #[test]
@@ -41041,6 +41465,8 @@ mod tests {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -41202,6 +41628,8 @@ mod tests {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -41415,6 +41843,8 @@ mod tests {
             reading_selection_start: None,
             reading_removed_list: false,
             pending_reading_removal: None,
+            removed_scenes_list: false,
+            pending_scene_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),

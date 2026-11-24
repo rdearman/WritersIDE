@@ -3726,6 +3726,12 @@ impl WriterApp {
     pub fn archive_scene(&mut self, id: SceneId) -> Result<()> {
         Ok(self.store.archive_scene(id)?)
     }
+    pub fn restore_archived_scene(&mut self, id: SceneId) -> Result<()> {
+        Ok(self.store.restore_archived_scene(id)?)
+    }
+    pub fn scene_character_analytics(&self, id: SceneId) -> Result<Vec<(String, String, String)>> {
+        Ok(self.store.scene_character_analytics(id)?)
+    }
     pub fn create_character(&mut self, name: &str) -> Result<CharacterId> {
         let id = CharacterId::new();
         self.store.add_character(id, name)?;
