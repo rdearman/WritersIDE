@@ -1,7 +1,7 @@
 # Engineering Design v2.20 Addendum — Manuscript Editor Audit for #61
 
 Date: 24 November 2026  
-Status: Audit complete; projection foundation implemented; editor behavior and storage format remain unchanged.
+Status: Audit complete; source-mapped projection is available as an optional terminal editor view; full rendered-editing behavior remains in progress.
 
 ## Existing architecture
 
@@ -25,7 +25,7 @@ Status: Audit complete; projection foundation implemented; editor behavior and s
 
 1. Add a renderer-neutral editor projection in `story-document`: display text/semantic runs plus a per-grapheme source-range map, built from the existing parser and offset ranges. Cover paragraphs, headings, emphasis, strong text, links, lists, code and Unicode. Preserve unsupported syntax as visible source text.
 2. Prove round-trip and mapping contracts with model tests, including cursor positions at hidden delimiter boundaries, nested formatting, malformed Markdown, combining marks, emoji/wide graphemes and line wrapping. Do not change the active editor until this map is complete.
-3. Add an explicit Source/Rendered view toggle and route mouse-free cursor movement, selection, insertion/deletion, undo, clipboard, find/replace and proofing through the projection map. Initially keep unsupported constructs source-visible and provide immediate fallback to Source view.
+3. Add an explicit Source/Rendered view toggle and route mouse-free cursor movement, selection, insertion/deletion, undo, clipboard, find/replace and proofing through the projection map. Initially keep unsupported constructs source-visible and provide immediate fallback to Source view. **Partial:** the view toggle, style rendering, and source/display mapping for the visible cursor row, narrowing, selection and mention highlighting are connected; editing operations still act on canonical source coordinates.
 4. Add semantic formatting commands for supported constructs only, operating on selections or insertion state and represented in Markdown. Test save/reopen, undo and compile output. Do not invent underline/alignment semantics.
 5. Add configurable writing-column presentation and a concise two-row location/count/save telemetry area, using terminal cell widths rather than bytes. Keep all display preferences project/user presentation settings, not manuscript content.
 6. Defer editable chapter/whole-book scopes until boundary, selection, paste, deletion and undo semantics are specified. A future continuous view may be read-only first.
@@ -42,4 +42,10 @@ Status: Audit complete; projection foundation implemented; editor behavior and s
 
 `story-document::SemanticDocument::rendered_projection` now produces a renderer-neutral grapheme stream with semantic styles and source byte ranges. It supports plain text, headings, paragraphs, emphasis, strong text, strikethrough, simple lists, block quotes, links by visible label, and inline code. Hidden delimiters map to adjacent display positions using an explicit `ProjectionBias`; invalid UTF-8 boundaries are rejected. Unicode tests cover composed text, a zero-width-joiner emoji, source/display offsets and hidden delimiters.
 
-When a construct does not yet have a safe display-to-source mapping (including entities/escapes that require decoding, images, tables, task lists, footnote definitions and ordered lists), the projection falls back to an identity-mapped source view. This is deliberate: it retains every byte and prevents editing against guessed offsets. The terminal editor does not consume this projection yet. Selection/edit operations, styled Ratatui output, viewport wrapping, and interactive source/rendered switching remain the next integration work. The foundation tests do not establish full word-processor usability or satisfy #61 acceptance.
+When a construct does not yet have a safe display-to-source mapping (including entities/escapes that require decoding, images, tables, task lists, footnote definitions and ordered lists), the projection falls back to an identity-mapped source view. This is deliberate: it retains every byte and prevents editing against guessed offsets.
+
+## Terminal editor integration (24 November 2026)
+
+The View menu and command palette now expose **Show Rendered Markdown / Show Markdown Source**. The preference is stored with existing project editor preferences. The terminal renderer styles supported headings, emphasis, code, links, block quotes and strikethrough; hides supported Markdown delimiters; maps visible selection and narrowing to display positions; and maps mention highlighting back to canonical source ranges. Unsupported constructs keep the source visible and the pane title identifies the source fallback. A terminal-buffer test checks the displayed output, original scene text, unchanged dirty state and saved preference.
+
+This is a display projection, not yet a full WYSIWYM editor. Keyboard editing and text services continue to modify canonical Markdown. The visual row marker follows source/display mapping, but there is no semantic formatting toolbar or chapter-wide rendered editing yet. The full workspace tests, Clippy and formatting gates passed for this integration; human UAT is still needed for cursor behavior and terminal wrapping. This does not complete #61.

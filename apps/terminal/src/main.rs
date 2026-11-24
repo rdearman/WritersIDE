@@ -891,7 +891,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "scene.open",
         "search.return-position",
     ],
-    &["view.formatting-marks"],
+    &["view.formatting-marks", "view.rendered-markdown"],
     &[
         "edit.resolve-save-conflict",
         "issue.create",
@@ -1311,6 +1311,8 @@ struct EditorPreferences {
     indent_width: usize,
     #[serde(default)]
     show_formatting_marks: bool,
+    #[serde(default)]
+    rendered_markdown: bool,
 }
 
 impl Default for EditorPreferences {
@@ -1320,6 +1322,7 @@ impl Default for EditorPreferences {
             indentation: "tabs".into(),
             indent_width: 4,
             show_formatting_marks: false,
+            rendered_markdown: false,
         }
     }
 }
@@ -1426,6 +1429,7 @@ enum CommandAction {
     LegacyPalette,
     CompileWorkflow,
     ToggleFormattingMarks,
+    ToggleRenderedMarkdown,
     ToggleSceneInclusion,
     WriteSelectedChapter,
     MoveOutlineUp,
@@ -1931,6 +1935,21 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::ToggleFormattingMarks,
             task_group: "Editor View",
             menu_priority: 1,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "view.rendered-markdown",
+            label: "Show Rendered Markdown",
+            description: "Display supported Markdown as formatted prose while preserving the canonical source",
+            category: "View",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["wysiwym", "render markdown", "source view"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ToggleRenderedMarkdown,
+            task_group: "Editor View",
+            menu_priority: 2,
             advanced: false,
         },
         CommandSpec {
@@ -4118,7 +4137,7 @@ fn subsequence_matches(
 
 fn menu_category(spec: &CommandSpec) -> &'static str {
     let id = spec.id;
-    if id == "view.formatting-marks" {
+    if matches!(id, "view.formatting-marks" | "view.rendered-markdown") {
         "View"
     } else if spec.category == "Help" || id.starts_with("help.") {
         "Help"
@@ -12314,6 +12333,16 @@ impl AppState {
                     "Formatting marks hidden · manuscript text is unchanged".into()
                 };
             }
+            CommandAction::ToggleRenderedMarkdown => {
+                self.editor_preferences.rendered_markdown =
+                    !self.editor_preferences.rendered_markdown;
+                save_editor_preferences(self.app.project_root(), &self.editor_preferences)?;
+                self.message = if self.editor_preferences.rendered_markdown {
+                    "Rendered Markdown shown where source mapping is safe · manuscript source is unchanged".into()
+                } else {
+                    "Markdown source shown · manuscript source is unchanged".into()
+                };
+            }
             CommandAction::ToggleSceneInclusion => self.toggle_scene_card_inclusion()?,
             CommandAction::WriteSelectedChapter => self.write_selected_chapter()?,
             CommandAction::MoveOutlineUp => self.move_selected_outline_item(false)?,
@@ -19586,23 +19615,6 @@ fn editor_grapheme_is_mentioned(byte_offset: u64, byte_len: u64, ranges: &[(u64,
         .any(|(start, finish)| *start < end && *finish > byte_offset)
 }
 
-fn push_editor_span_run(spans: &mut Vec<Span<'static>>, run: &mut String, style: u8) {
-    if run.is_empty() {
-        return;
-    }
-    let text = std::mem::take(run);
-    spans.push(match style {
-        1 => Span::styled(text, Style::default().fg(Color::White).bg(Color::Blue)),
-        2 => Span::styled(
-            text,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::UNDERLINED),
-        ),
-        _ => Span::raw(text),
-    });
-}
-
 fn ensure_project_managed_directory(
     project_root: &Path,
     directory: &Path,
@@ -20324,6 +20336,16 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             }
         } else {
             let full_text = s.editor.join("\n");
+            let projection = if s.editor_preferences.rendered_markdown {
+                let projection = story_document::SemanticDocument::parse(full_text.clone())
+                    .rendered_projection();
+                (projection.mode == story_document::ProjectionMode::Rendered).then_some(projection)
+            } else {
+                None
+            };
+            let view_source = projection
+                .as_ref()
+                .map_or(full_text.as_str(), |projection| projection.text.as_str());
             let (view_start, view_end) = s
                 .narrowed_passage
                 .filter(|(start, end)| {
@@ -20332,18 +20354,61 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         && full_text.is_char_boundary(*start)
                         && full_text.is_char_boundary(*end)
                 })
-                .unwrap_or((0, full_text.len()));
-            let view_text = &full_text[view_start..view_end];
+                .map(|(start, end)| {
+                    if let Some(projection) = &projection {
+                        (
+                            projection
+                                .source_to_display(start, story_document::ProjectionBias::Before)
+                                .unwrap_or(0),
+                            projection
+                                .source_to_display(end, story_document::ProjectionBias::After)
+                                .unwrap_or(projection.text.len()),
+                        )
+                    } else {
+                        (start, end)
+                    }
+                })
+                .unwrap_or((0, view_source.len()));
+            let view_text = &view_source[view_start.min(view_source.len())
+                ..view_end
+                    .min(view_source.len())
+                    .max(view_start.min(view_source.len()))];
             let view_lines = view_text.split('\n').collect::<Vec<_>>();
-            let cursor_byte = editor_position_byte(&s.editor, main_cursor.0, main_cursor.1);
+            let source_cursor_byte = editor_position_byte(&s.editor, main_cursor.0, main_cursor.1);
+            let cursor_byte = projection
+                .as_ref()
+                .map_or(source_cursor_byte, |projection| {
+                    projection
+                        .source_to_display(
+                            source_cursor_byte,
+                            story_document::ProjectionBias::After,
+                        )
+                        .unwrap_or(projection.text.len())
+                });
             let view_cursor = editor_position_from_byte(
                 view_text,
                 cursor_byte.saturating_sub(view_start).min(view_text.len()),
             )
             .unwrap_or((0, 0));
             let selection = s.selection_bounds().and_then(|(start, end)| {
-                let a = editor_position_byte(&s.editor, start.0, start.1).max(view_start);
-                let b = editor_position_byte(&s.editor, end.0, end.1).min(view_end);
+                let source_a = editor_position_byte(&s.editor, start.0, start.1);
+                let source_b = editor_position_byte(&s.editor, end.0, end.1);
+                let a = projection
+                    .as_ref()
+                    .map_or(source_a, |projection| {
+                        projection
+                            .source_to_display(source_a, story_document::ProjectionBias::Before)
+                            .unwrap_or(0)
+                    })
+                    .max(view_start);
+                let b = projection
+                    .as_ref()
+                    .map_or(source_b, |projection| {
+                        projection
+                            .source_to_display(source_b, story_document::ProjectionBias::After)
+                            .unwrap_or(projection.text.len())
+                    })
+                    .min(view_end);
                 (a < b).then(|| {
                     (
                         editor_position_from_byte(view_text, a - view_start).unwrap_or((0, 0)),
@@ -20357,6 +20422,13 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     .take(s.scroll)
                     .map(|line| line.len() as u64 + 1)
                     .sum::<u64>();
+            let projected_graphemes = projection.as_ref().map(|projection| {
+                projection
+                    .graphemes
+                    .iter()
+                    .map(|grapheme| (grapheme.display.start, grapheme))
+                    .collect::<BTreeMap<_, _>>()
+            });
             let content = view_lines
                 .iter()
                 .enumerate()
@@ -20369,8 +20441,6 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     };
                     let mut spans = vec![Span::raw(prefix)];
                     let mut byte_offset = line_start_byte;
-                    let mut run_style = None;
-                    let mut run = String::new();
                     for (col, ch) in line.graphemes(true).enumerate() {
                         let shown = if s.editor_preferences.show_formatting_marks && ch == "\t" {
                             "→"
@@ -20381,26 +20451,57 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                             (row > sr || (row == sr && col >= sc))
                                 && (row < er || (row == er && col < ec))
                         });
-                        let decorated = editor_grapheme_is_mentioned(
-                            byte_offset,
-                            ch.len() as u64,
-                            &mention_ranges,
-                        );
-                        let style = if selected {
-                            1
+                        let source_range = projected_graphemes
+                            .as_ref()
+                            .and_then(|items| items.get(&(byte_offset as usize)))
+                            .map(|item| item.source);
+                        let decorated = source_range.is_some_and(|source| {
+                            editor_grapheme_is_mentioned(
+                                source.start as u64,
+                                source.end.saturating_sub(source.start) as u64,
+                                &mention_ranges,
+                            )
+                        });
+                        if selected {
+                            spans.push(Span::styled(
+                                shown.to_owned(),
+                                Style::default().fg(Color::White).bg(Color::Blue),
+                            ));
                         } else if decorated {
-                            2
+                            spans.push(Span::styled(
+                                shown.to_owned(),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::UNDERLINED),
+                            ));
+                        } else if let Some(style) = projected_graphemes
+                            .as_ref()
+                            .and_then(|items| items.get(&(byte_offset as usize)))
+                            .map(|item| item.style)
+                        {
+                            let mut terminal_style = Style::default();
+                            if style.bold || style.heading_level.is_some() {
+                                terminal_style = terminal_style.add_modifier(Modifier::BOLD);
+                            }
+                            if style.italic || style.block_quote {
+                                terminal_style = terminal_style.add_modifier(Modifier::ITALIC);
+                            }
+                            if style.strikethrough {
+                                terminal_style = terminal_style.add_modifier(Modifier::CROSSED_OUT);
+                            }
+                            if style.link {
+                                terminal_style = terminal_style
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::UNDERLINED);
+                            } else if style.code || style.heading_level.is_some() {
+                                terminal_style = terminal_style.fg(Color::Yellow);
+                            }
+                            spans.push(Span::styled(shown.to_owned(), terminal_style));
                         } else {
-                            0
-                        };
-                        if run_style.is_some_and(|current| current != style) {
-                            push_editor_span_run(&mut spans, &mut run, run_style.unwrap_or(0));
+                            spans.push(Span::raw(shown.to_owned()));
                         }
-                        run_style = Some(style);
-                        run.push_str(shown);
                         byte_offset += ch.len() as u64;
                     }
-                    push_editor_span_run(&mut spans, &mut run, run_style.unwrap_or(0));
                     if s.editor_preferences.show_formatting_marks
                         && let Some(marker) =
                             formatting_line_marker(line, view_lines.get(row + 1).copied())
@@ -20413,10 +20514,22 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 .collect::<Vec<_>>();
             let title = s.assembly_draft.map_or_else(
                 || {
-                    if s.narrowed_passage.is_some() {
-                        format!("Editor — {} · narrowed passage", s.selected_scene())
+                    let presentation = if s.editor_preferences.rendered_markdown {
+                        if projection.is_some() {
+                            " · rendered"
+                        } else {
+                            " · source fallback"
+                        }
                     } else {
-                        format!("Editor — {}", s.selected_scene())
+                        ""
+                    };
+                    if s.narrowed_passage.is_some() {
+                        format!(
+                            "Editor — {} · narrowed passage{presentation}",
+                            s.selected_scene()
+                        )
+                    } else {
+                        format!("Editor — {}{presentation}", s.selected_scene())
                     }
                 },
                 |id| {
@@ -22817,6 +22930,13 @@ fn displayed_command_label(state: &AppState, command: CommandSpec) -> String {
     }
     if command.id == "command.palette-open" {
         return "Search All Commands…".into();
+    }
+    if command.id == "view.rendered-markdown" {
+        return if state.editor_preferences.rendered_markdown {
+            "Show Markdown Source".into()
+        } else {
+            "Show Rendered Markdown".into()
+        };
     }
     if command.id != "help.resume-tutorial" {
         return command.label.to_owned();
@@ -42934,5 +43054,65 @@ mod tests {
                 .unwrap()
                 .show_formatting_marks
         );
+    }
+
+    #[test]
+    fn rendered_markdown_view_hides_supported_syntax_without_changing_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 10).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let original_source = "# Heading\nA **bold** and *italic* line.";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), original_source)
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.dirty = false;
+
+        let view_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "View")
+            .unwrap();
+        assert!(MENU_COMMON_COMMANDS[view_menu].contains(&"view.rendered-markdown"));
+        let command = command_by_id("view.rendered-markdown").unwrap();
+        assert_eq!(
+            displayed_command_label(&state, command),
+            "Show Rendered Markdown"
+        );
+
+        state
+            .dispatch_registered(CommandAction::ToggleRenderedMarkdown)
+            .unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Heading"));
+        assert!(screen.contains("bold"));
+        assert!(screen.contains("italic"));
+        assert!(!screen.contains("**"));
+        assert!(!screen.contains("# Heading"));
+        assert!(screen.contains("rendered"));
+        assert_eq!(state.editor.join("\n"), original_source);
+        assert!(!state.dirty);
+        assert_eq!(
+            displayed_command_label(&state, command),
+            "Show Markdown Source"
+        );
+        assert!(
+            load_editor_preferences(state.app.project_root())
+                .unwrap()
+                .rendered_markdown
+        );
+
+        let database_source = state.app.load_scene_text(scene).unwrap().0;
+        assert_eq!(database_source, original_source);
     }
 }
