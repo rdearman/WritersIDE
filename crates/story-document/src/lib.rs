@@ -27,6 +27,425 @@ pub struct SourceRange {
     pub end: usize,
 }
 
+/// Presentation style for a grapheme in a rendered Markdown projection.
+/// This is deliberately renderer-neutral; a terminal can map it to attributes
+/// while a desktop renderer can map it to richer formatting.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectionStyle {
+    pub bold: bool,
+    pub italic: bool,
+    pub code: bool,
+    pub strikethrough: bool,
+    pub link: bool,
+    pub block_quote: bool,
+    pub heading_level: Option<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ProjectionGrapheme {
+    /// UTF-8 byte range in `RenderedProjection::text`.
+    pub display: SourceRange,
+    /// UTF-8 byte range in the canonical Markdown source. Synthetic display
+    /// characters (such as list bullets and paragraph separators) use an
+    /// empty range at the source insertion boundary.
+    pub source: SourceRange,
+    pub style: ProjectionStyle,
+}
+
+/// Display-only projection of Markdown with explicit grapheme-to-source maps.
+/// It never serializes back to manuscript text. Editing code must translate
+/// through these maps rather than applying display offsets to canonical prose.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RenderedProjection {
+    pub text: String,
+    pub graphemes: Vec<ProjectionGrapheme>,
+    pub source_len: usize,
+    pub mode: ProjectionMode,
+    source_boundaries: Vec<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ProjectionMode {
+    Rendered,
+    SourceFallback,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProjectionBias {
+    Before,
+    After,
+}
+
+impl RenderedProjection {
+    /// Converts a display UTF-8 boundary into a canonical source boundary.
+    /// A display boundary inside a multi-byte grapheme is rejected.
+    pub fn display_to_source(&self, offset: usize, bias: ProjectionBias) -> Option<usize> {
+        if offset > self.text.len() || !self.text.is_char_boundary(offset) {
+            return None;
+        }
+        if offset == self.text.len() {
+            return Some(match bias {
+                ProjectionBias::Before => self
+                    .graphemes
+                    .last()
+                    .map(|item| item.source.end)
+                    .unwrap_or(0),
+                ProjectionBias::After => self.source_len,
+            });
+        }
+        let grapheme = self
+            .graphemes
+            .iter()
+            .find(|item| item.display.start <= offset && offset < item.display.end)?;
+        Some(match bias {
+            ProjectionBias::Before => grapheme.source.start,
+            ProjectionBias::After => grapheme.source.end,
+        })
+    }
+
+    /// Converts a canonical source UTF-8 boundary into the nearest display
+    /// boundary. Markdown delimiters collapse to the previous or next visible
+    /// grapheme according to `bias`.
+    pub fn source_to_display(&self, offset: usize, bias: ProjectionBias) -> Option<usize> {
+        if offset > self.source_len || self.source_boundaries.binary_search(&offset).is_err() {
+            return None;
+        }
+        if let Some(item) = self
+            .graphemes
+            .iter()
+            .find(|item| item.source.start < offset && offset < item.source.end)
+        {
+            return Some(match bias {
+                ProjectionBias::Before => item.display.start,
+                ProjectionBias::After => item.display.end,
+            });
+        }
+        if let Some(item) = self
+            .graphemes
+            .iter()
+            .find(|item| item.source.start == offset)
+        {
+            return Some(item.display.start);
+        }
+        if let Some(item) = self.graphemes.iter().find(|item| item.source.end == offset) {
+            return Some(item.display.end);
+        }
+        let previous = self
+            .graphemes
+            .iter()
+            .rev()
+            .find(|item| item.source.end <= offset)
+            .map(|item| item.display.end)
+            .unwrap_or(0);
+        let next = self
+            .graphemes
+            .iter()
+            .find(|item| item.source.start >= offset)
+            .map(|item| item.display.start)
+            .unwrap_or(self.text.len());
+        Some(match bias {
+            ProjectionBias::Before => previous,
+            ProjectionBias::After => next,
+        })
+    }
+}
+
+impl SemanticDocument {
+    /// Builds a renderer-neutral display projection from the current Markdown
+    /// source. Each visible grapheme retains a UTF-8 source range; delimiters
+    /// are hidden and resolve to an adjacent visible position via `ProjectionBias`.
+    pub fn rendered_projection(&self) -> RenderedProjection {
+        #[derive(Clone, Copy)]
+        struct Frame {
+            style: ProjectionStyle,
+            block: bool,
+        }
+
+        let requires_source_fallback = self.nodes.iter().any(|node| {
+            matches!(
+                node.kind,
+                SemanticKind::Image { .. }
+                    | SemanticKind::Table
+                    | SemanticKind::TableHead
+                    | SemanticKind::TableRow
+                    | SemanticKind::TableCell
+                    | SemanticKind::FootnoteDefinition { .. }
+                    | SemanticKind::TaskListMarker { .. }
+                    | SemanticKind::List { ordered: Some(_) }
+            )
+        }) || Parser::new_ext(&self.source, markdown_options())
+            .into_offset_iter()
+            .any(|(event, range)| match event {
+                Event::Text(value) => self.source.get(range) != Some(value.as_ref()),
+                Event::Code(value) => {
+                    let raw = self.source.get(range.clone()).unwrap_or("");
+                    let delimiters = raw.bytes().take_while(|byte| *byte == b'`').count();
+                    delimiters == 0
+                        || raw.bytes().rev().take_while(|byte| *byte == b'`').count() != delimiters
+                        || raw.get(delimiters..raw.len().saturating_sub(delimiters))
+                            != Some(value.as_ref())
+                }
+                _ => false,
+            });
+
+        let mut projection = RenderedProjection {
+            text: String::new(),
+            graphemes: Vec::new(),
+            source_len: self.source.len(),
+            mode: if requires_source_fallback {
+                ProjectionMode::SourceFallback
+            } else {
+                ProjectionMode::Rendered
+            },
+            source_boundaries: self
+                .source
+                .char_indices()
+                .map(|(offset, _)| offset)
+                .chain(std::iter::once(self.source.len()))
+                .collect(),
+        };
+        if requires_source_fallback {
+            projection.text = self.source.clone();
+            for (source_start, grapheme) in self.source.grapheme_indices(true) {
+                let display_start = source_start;
+                let display_end = display_start + grapheme.len();
+                projection.graphemes.push(ProjectionGrapheme {
+                    display: SourceRange {
+                        start: display_start,
+                        end: display_end,
+                    },
+                    source: SourceRange {
+                        start: source_start,
+                        end: source_start + grapheme.len(),
+                    },
+                    style: ProjectionStyle::default(),
+                });
+            }
+            return projection;
+        }
+        let mut frames = Vec::<Frame>::new();
+        let mut style = ProjectionStyle::default();
+
+        let append = |projection: &mut RenderedProjection,
+                      value: &str,
+                      source: SourceRange,
+                      style: ProjectionStyle| {
+            let mut source_cursor = source.start;
+            for grapheme in value.graphemes(true) {
+                let display_start = projection.text.len();
+                projection.text.push_str(grapheme);
+                let display_end = projection.text.len();
+                let source_end = if source.start == source.end {
+                    source.start
+                } else {
+                    (source_cursor + grapheme.len()).min(source.end)
+                };
+                projection.graphemes.push(ProjectionGrapheme {
+                    display: SourceRange {
+                        start: display_start,
+                        end: display_end,
+                    },
+                    source: SourceRange {
+                        start: source_cursor.min(source_end),
+                        end: source_end,
+                    },
+                    style,
+                });
+                source_cursor = source_end;
+            }
+        };
+        let append_break = |projection: &mut RenderedProjection,
+                            count: usize,
+                            source_at: usize,
+                            style: ProjectionStyle| {
+            if projection.text.is_empty() {
+                return;
+            }
+            let existing = projection
+                .text
+                .chars()
+                .rev()
+                .take_while(|ch| *ch == '\n')
+                .count();
+            for _ in existing..count {
+                append(
+                    projection,
+                    "\n",
+                    SourceRange {
+                        start: source_at,
+                        end: source_at,
+                    },
+                    style,
+                );
+            }
+        };
+
+        for (event, range) in Parser::new_ext(&self.source, markdown_options()).into_offset_iter() {
+            match event {
+                Event::Start(tag) => {
+                    let mut next = style;
+                    let block = match &tag {
+                        Tag::Paragraph => true,
+                        Tag::Heading(level, _, _) => {
+                            next.heading_level = Some(*level as u8);
+                            true
+                        }
+                        Tag::BlockQuote => {
+                            next.block_quote = true;
+                            true
+                        }
+                        Tag::CodeBlock(_) => {
+                            next.code = true;
+                            true
+                        }
+                        Tag::List(_)
+                        | Tag::Item
+                        | Tag::Table(_)
+                        | Tag::TableHead
+                        | Tag::TableRow
+                        | Tag::TableCell => true,
+                        Tag::Emphasis => {
+                            next.italic = true;
+                            false
+                        }
+                        Tag::Strong => {
+                            next.bold = true;
+                            false
+                        }
+                        Tag::Strikethrough => {
+                            next.strikethrough = true;
+                            false
+                        }
+                        Tag::Link(..) => {
+                            next.link = true;
+                            false
+                        }
+                        Tag::Image(..) => false,
+                        Tag::FootnoteDefinition(..) => true,
+                    };
+                    if block {
+                        append_break(&mut projection, 2, range.start, style);
+                    }
+                    if matches!(tag, Tag::Item) {
+                        append(
+                            &mut projection,
+                            "• ",
+                            SourceRange {
+                                start: range.start,
+                                end: range.start,
+                            },
+                            style,
+                        );
+                    }
+                    frames.push(Frame { style, block });
+                    style = next;
+                }
+                Event::End(_) => {
+                    if let Some(frame) = frames.pop() {
+                        style = frame.style;
+                        if frame.block {
+                            append_break(&mut projection, 2, range.end, style);
+                        }
+                    }
+                }
+                Event::Text(value) => {
+                    let value = value.as_ref();
+                    let raw = self.source.get(range.clone()).unwrap_or("");
+                    // Entities and backslash escapes do not have a one-to-one
+                    // grapheme map. Keep their source spelling visible until a
+                    // precise decoder map is available instead of misplacing edits.
+                    let shown = if raw == value { value } else { raw };
+                    append(
+                        &mut projection,
+                        shown,
+                        SourceRange {
+                            start: range.start,
+                            end: range.end,
+                        },
+                        style,
+                    );
+                }
+                Event::Code(value) => {
+                    let raw = self.source.get(range.clone()).unwrap_or("");
+                    let mut raw_style = style;
+                    raw_style.code = true;
+                    let delimiter_len = raw.bytes().take_while(|byte| *byte == b'`').count();
+                    let rendered = if delimiter_len > 0
+                        && raw.bytes().rev().take_while(|byte| *byte == b'`').count()
+                            == delimiter_len
+                    {
+                        raw.get(delimiter_len..raw.len().saturating_sub(delimiter_len))
+                            .filter(|inner| *inner == value.as_ref())
+                    } else {
+                        None
+                    };
+                    let (shown, source_range) = rendered.map_or(
+                        (
+                            raw,
+                            SourceRange {
+                                start: range.start,
+                                end: range.end,
+                            },
+                        ),
+                        |inner| {
+                            (
+                                inner,
+                                SourceRange {
+                                    start: range.start + delimiter_len,
+                                    end: range.end - delimiter_len,
+                                },
+                            )
+                        },
+                    );
+                    append(&mut projection, shown, source_range, raw_style);
+                }
+                Event::Html(_) => {
+                    let raw = self.source.get(range.clone()).unwrap_or("");
+                    append(
+                        &mut projection,
+                        raw,
+                        SourceRange {
+                            start: range.start,
+                            end: range.end,
+                        },
+                        style,
+                    );
+                }
+                Event::SoftBreak => append(
+                    &mut projection,
+                    " ",
+                    SourceRange {
+                        start: range.start,
+                        end: range.end,
+                    },
+                    style,
+                ),
+                Event::HardBreak => append_break(&mut projection, 1, range.end, style),
+                Event::FootnoteReference(_) | Event::Rule | Event::TaskListMarker(_) => {
+                    let raw = self.source.get(range.clone()).unwrap_or("");
+                    append(
+                        &mut projection,
+                        raw,
+                        SourceRange {
+                            start: range.start,
+                            end: range.end,
+                        },
+                        style,
+                    );
+                }
+            }
+        }
+        while projection.text.ends_with('\n') {
+            if let Some(grapheme) = projection.graphemes.pop() {
+                projection.text.truncate(grapheme.display.start);
+            } else {
+                break;
+            }
+        }
+        projection
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum SemanticKind {
     Paragraph,
@@ -2322,6 +2741,111 @@ output = "exports/old.md"
         for node in &document.nodes {
             assert!(source.is_char_boundary(node.source.start));
             assert!(source.is_char_boundary(node.source.end));
+        }
+    }
+
+    #[test]
+    fn rendered_projection_hides_supported_delimiters_and_maps_unicode_graphemes() {
+        let source = "# Title\n\nA *small* **bold** [link](https://example.test) — Élodie 👩‍🚀.\n";
+        let document = SemanticDocument::parse(source);
+        let projection = document.rendered_projection();
+
+        assert_eq!(projection.text, "Title\n\nA small bold link — Élodie 👩‍🚀.");
+        assert_eq!(projection.source_len, source.len());
+        assert!(projection.graphemes.iter().all(|item| {
+            projection.text.is_char_boundary(item.display.start)
+                && projection.text.is_char_boundary(item.display.end)
+                && source.is_char_boundary(item.source.start)
+                && source.is_char_boundary(item.source.end)
+        }));
+
+        let bold_offset = projection.text.find("bold").unwrap();
+        let bold = projection
+            .graphemes
+            .iter()
+            .find(|item| item.display.start == bold_offset)
+            .unwrap();
+        assert!(bold.style.bold);
+        assert_eq!(&source[bold.source.start..bold.source.end], "b");
+
+        let italic_offset = projection.text.find("small").unwrap();
+        let italic = projection
+            .graphemes
+            .iter()
+            .find(|item| item.display.start == italic_offset)
+            .unwrap();
+        assert!(italic.style.italic);
+
+        let heading = projection.graphemes.first().unwrap();
+        assert_eq!(heading.style.heading_level, Some(1));
+
+        let emoji = projection.text.find("👩‍🚀").unwrap();
+        let emoji_source = projection
+            .graphemes
+            .iter()
+            .find(|item| item.display.start == emoji)
+            .unwrap();
+        assert_eq!(
+            &source[emoji_source.source.start..emoji_source.source.end],
+            "👩‍🚀"
+        );
+        assert_eq!(
+            projection.display_to_source(emoji, ProjectionBias::Before),
+            Some(emoji_source.source.start)
+        );
+        assert_eq!(
+            projection.source_to_display(emoji_source.source.start, ProjectionBias::After),
+            Some(emoji)
+        );
+        assert!(
+            projection
+                .display_to_source(emoji + 1, ProjectionBias::Before)
+                .is_none()
+        );
+        assert!(
+            projection
+                .source_to_display(emoji_source.source.start + 1, ProjectionBias::Before)
+                .is_none()
+        );
+        assert_eq!(
+            projection.display_to_source(projection.text.len(), ProjectionBias::Before),
+            Some(source.find(".\n").unwrap() + 1)
+        );
+        assert_eq!(
+            projection.display_to_source(projection.text.len(), ProjectionBias::After),
+            Some(source.len())
+        );
+    }
+
+    #[test]
+    fn rendered_projection_falls_back_for_constructs_without_safe_source_mapping() {
+        for source in [
+            "An &amp; entity and \\*escaped stars\\*.\n",
+            "| Name | Value |\n| --- | --- |\n| Ada | 42 |\n",
+            "![alt](figure.png)\n",
+            "1. first\n2. second\n",
+        ] {
+            let projection = SemanticDocument::parse(source).rendered_projection();
+            assert_eq!(projection.mode, ProjectionMode::SourceFallback);
+            assert_eq!(projection.text, source);
+            assert!(projection.graphemes.iter().all(|item| {
+                source[item.source.start..item.source.end]
+                    == projection.text[item.display.start..item.display.end]
+            }));
+        }
+    }
+
+    #[test]
+    fn rendered_projection_maps_inline_code_without_exposing_delimiters() {
+        let source = "Use `let answer = 42;` in the example.\n";
+        let projection = SemanticDocument::parse(source).rendered_projection();
+        assert_eq!(projection.mode, ProjectionMode::Rendered);
+        assert!(projection.text.contains("let answer = 42;"));
+        assert!(!projection.text.contains("`let answer = 42;`"));
+        assert!(projection.graphemes.iter().any(|item| item.style.code));
+        for item in &projection.graphemes {
+            assert!(source.is_char_boundary(item.source.start));
+            assert!(source.is_char_boundary(item.source.end));
         }
     }
 

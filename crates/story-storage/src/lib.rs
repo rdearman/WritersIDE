@@ -14312,6 +14312,18 @@ mod tests {
 
         let connection = Connection::open(project.join("story.db")).unwrap();
         connection
+            .execute(
+                "UPDATE scene SET created_at = ?1 WHERE id = ?2",
+                params!["2020-01-01T00:00:00Z", first.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE scene SET created_at = ?1 WHERE id = ?2",
+                params!["2021-01-01T00:00:00Z", second.to_string()],
+            )
+            .unwrap();
+        connection
             .execute_batch(
                 "DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version=44;",
             )

@@ -1,7 +1,7 @@
 # Engineering Design v2.20 Addendum — Manuscript Editor Audit for #61
 
 Date: 24 November 2026  
-Status: Audit complete; implementation plan recorded; no editor behavior or storage format changed.
+Status: Audit complete; projection foundation implemented; editor behavior and storage format remain unchanged.
 
 ## Existing architecture
 
@@ -38,3 +38,8 @@ Status: Audit complete; implementation plan recorded; no editor behavior or stor
 - Markdown has ambiguous/incomplete constructs while being typed. The source view must remain immediately available, and incomplete syntax must not make editing impossible.
 - This audit does not implement rendered editing, formatting commands, writing-column preferences, or continuous chapter/manuscript editing. No acceptance criterion for #61 is claimed complete.
 
+## Projection foundation (24 November 2026)
+
+`story-document::SemanticDocument::rendered_projection` now produces a renderer-neutral grapheme stream with semantic styles and source byte ranges. It supports plain text, headings, paragraphs, emphasis, strong text, strikethrough, simple lists, block quotes, links by visible label, and inline code. Hidden delimiters map to adjacent display positions using an explicit `ProjectionBias`; invalid UTF-8 boundaries are rejected. Unicode tests cover composed text, a zero-width-joiner emoji, source/display offsets and hidden delimiters.
+
+When a construct does not yet have a safe display-to-source mapping (including entities/escapes that require decoding, images, tables, task lists, footnote definitions and ordered lists), the projection falls back to an identity-mapped source view. This is deliberate: it retains every byte and prevents editing against guessed offsets. The terminal editor does not consume this projection yet. Selection/edit operations, styled Ratatui output, viewport wrapping, and interactive source/rendered switching remain the next integration work. The foundation tests do not establish full word-processor usability or satisfy #61 acceptance.
