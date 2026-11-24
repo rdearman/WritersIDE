@@ -1,4 +1,4 @@
-# Terminal menu audit — 23 November 2026
+# Terminal menu audit — 24 November 2026
 
 This is the complete registered command inventory at the audited source revision. It maps every registered command ID to its current author-facing access point, proposed access point, frequency signal, and disposition. The source of truth is `command_registry()` plus `MENU_COMMON_COMMANDS` in `apps/terminal/src/main.rs`; the regression test `menus_are_flat_curated_lists_and_keep_all_commands_searchable` checks that menu IDs are registered, curated lists are unique, and all other registered actions remain searchable.
 
@@ -14,7 +14,7 @@ No capability or command ID is removed. Primary menus remain concise, single-lev
 |---|---|---|---|---|---|
 | `view.dashboard` | Dashboard | Search All Commands… / command palette → Navigate | Search All Commands… / command palette → Navigate | Searchable-only candidate; not measured | Retain in searchable registry |
 | `view.outline` | Outline | Navigate menu; command palette / Search All Commands | Navigate menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
-| `view.cards` | Scene Cards | Search All Commands… / command palette → Navigate | Search All Commands… / command palette → Navigate | Searchable-only candidate; not measured | Retain in searchable registry |
+| `view.cards` | Scene Cards | Search All Commands… / command palette → Navigate | Navigate menu; command palette / Search All Commands | Routine candidate; not measured | Promote to primary list for fiction planning |
 | `view.editor` | Manuscript | Navigate menu; command palette / Search All Commands | Navigate menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
 | `view.plot-grid` | Plot Grid | Search All Commands… / command palette → Navigate | Search All Commands… / command palette → Navigate | Searchable-only candidate; not measured | Retain in searchable registry |
 | `view.characters` | Characters | Search All Commands… / command palette → Navigate | Search All Commands… / command palette → Navigate | Searchable-only candidate; not measured | Retain in searchable registry |
@@ -80,7 +80,7 @@ No capability or command ID is removed. Primary menus remain concise, single-lev
 | `scene.move` | Move Scene | Edit menu; command palette / Search All Commands | Edit menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
 | `scene.rename` | Rename Scene | Edit menu; command palette / Search All Commands | Edit menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
 | `scene.status` | Set Scene Status | Edit menu; command palette / Search All Commands | Edit menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
-| `scene.field` | Edit Scene Planning Field | Edit menu; command palette / Search All Commands | Edit menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
+| `scene.field` | Edit Scene Planning Field | Edit menu; command palette / Search All Commands | Search All Commands… / command palette → Edit | Searchable-only candidate; not measured | Retain in searchable registry |
 | `search.find-panel` | Find in Manuscript | Edit menu; command palette / Search All Commands | Edit menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
 | `search.find-open` | Find in All Open Files | Search All Commands… / command palette → Navigate | Search All Commands… / command palette → Navigate | Searchable-only candidate; not measured | Retain in searchable registry |
 | `search.find-project` | Find in Project | Search All Commands… / command palette → Navigate | Search All Commands… / command palette → Navigate | Searchable-only candidate; not measured | Retain in searchable registry |

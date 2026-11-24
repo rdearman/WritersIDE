@@ -114,8 +114,13 @@ def main():
         # directly.
         os.write(master, b"\x1b[21~")  # xterm F10
         read_for(0.5)
-        if b"actions and groups" not in output:
-            raise AssertionError("F10 did not render the File menu in the PTY")
+        # Ratatui emits cursor moves between spans, so inspect two distinctive
+        # action labels instead of expecting the rendered line contiguously.
+        if b"Recent" not in output or b"Quit" not in output:
+            raise AssertionError(
+                "F10 did not render the direct File menu in the PTY; output tail: "
+                + repr(bytes(output[-2400:]))
+            )
 
         set_size(master, 60, 201)
         read_for(0.4)
