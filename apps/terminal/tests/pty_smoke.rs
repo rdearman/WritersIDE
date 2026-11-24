@@ -415,6 +415,76 @@ fn populated_chapter_removal_can_rehome_scenes_to_a_selected_chapter_in_a_real_p
 
 #[cfg(target_os = "linux")]
 #[test]
+fn cancelling_populated_chapter_removal_preserves_hierarchy_and_prose_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+    use story_core::ContentUnitKind;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Chapter Cancellation Project");
+    let mut app = WriterApp::create_project(&project, "Chapter Cancellation Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, scene_hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&scene_hash), "The traveler arrives.")
+        .unwrap();
+    let prose = app
+        .create_content_unit(
+            ContentUnitKind::ChapterBody,
+            "Chapter prose",
+            Some(chapter),
+            0,
+            None,
+        )
+        .unwrap();
+    let (_, prose_hash) = app.load_content_unit_text(prose).unwrap();
+    app.save_content_unit_text(prose, Some(&prose_hash), "The road was quiet.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY chapter-removal cancellation: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("chapter-removal-cancel")
+        .output()
+        .expect("run the Linux PTY chapter-removal cancellation workflow");
+    assert!(
+        result.status.success(),
+        "PTY chapter-removal cancellation failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(reopened.get_scene(scene).unwrap().chapter_id, Some(chapter));
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "The traveler arrives."
+    );
+    assert!(!reopened.get_content_unit(prose).unwrap().archived);
+    assert_eq!(
+        reopened.load_content_unit_text(prose).unwrap().0,
+        "The road was quiet."
+    );
+    assert!(
+        reopened
+            .list_structural_nodes()
+            .unwrap()
+            .iter()
+            .any(|node| node.id == chapter && node.title == "Opening")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn populated_chapter_subtree_deletion_is_recoverable_through_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

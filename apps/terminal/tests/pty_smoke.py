@@ -31,9 +31,11 @@ def main():
         ["chapter-removal"],
         ["chapter-removal-target"],
         ["chapter-removal-delete"],
+        ["chapter-removal-cancel"],
     )
     chapter_removal_target = modes == ["chapter-removal-target"]
     chapter_removal_delete = modes == ["chapter-removal-delete"]
+    chapter_removal_cancel = modes == ["chapter-removal-cancel"]
     section_removal_delete = modes == ["section-removal-delete"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
@@ -330,7 +332,19 @@ def main():
                         "subtree deletion did not preview Compile impact and recovery; visible tail: "
                         + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
                     )
-            os.write(master, b"\r")  # confirm the selected explicit removal action
+            if chapter_removal_cancel:
+                os.write(master, b"\x1b")  # cancel; all hierarchy and prose must remain
+                if not wait_for_fragments(
+                    (b"cancel", b"Opening", b"Arrival"),
+                    dialog_start,
+                    timeout=3.0,
+                ):
+                    raise AssertionError(
+                        "cancelling chapter removal did not return to the intact outline; visible tail: "
+                        + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                    )
+            else:
+                os.write(master, b"\r")  # confirm the selected explicit removal action
             read_for(0.4)
             os.write(master, b"\x11")
             quit_deadline = time.monotonic() + 5.0
@@ -345,6 +359,8 @@ def main():
                 print("PTY chapter removal passed: scene rehoming to a selected chapter was available.")
             elif chapter_removal_delete:
                 print("PTY chapter removal passed: recoverable subtree deletion was selected explicitly.")
+            elif chapter_removal_cancel:
+                print("PTY chapter removal passed: cancellation leaves the populated chapter untouched.")
             else:
                 print("PTY chapter removal passed: choices are visible and the default retains scenes as Unplaced.")
             return
