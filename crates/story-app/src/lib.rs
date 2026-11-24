@@ -4697,6 +4697,17 @@ impl WriterApp {
     pub fn list_reading_documents(&self) -> Result<Vec<story_storage::ReadingDocumentRecord>> {
         Ok(self.store.list_reading_documents()?)
     }
+    pub fn list_removed_reading_documents(
+        &self,
+    ) -> Result<Vec<story_storage::ReadingDocumentRecord>> {
+        Ok(self.store.list_archived_reading_documents()?)
+    }
+    pub fn remove_reading_document(&mut self, id: ReadingId) -> Result<()> {
+        Ok(self.store.archive_reading_document(id)?)
+    }
+    pub fn restore_reading_document(&mut self, id: ReadingId) -> Result<()> {
+        Ok(self.store.restore_reading_document(id)?)
+    }
     pub fn reload_reading_document(
         &mut self,
         id: ReadingId,

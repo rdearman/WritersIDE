@@ -169,6 +169,13 @@ enum OutlineRow {
     ContentUnit(story_core::ContentUnitId),
 }
 
+#[derive(Clone, Debug)]
+struct ReadingRemovalDialog {
+    id: story_core::ReadingId,
+    title: String,
+    restoring: bool,
+}
+
 struct AppState {
     app: WriterApp,
     temporary_project: bool,
@@ -217,6 +224,8 @@ struct AppState {
     reading_offset: u64,
     reading_focus: bool,
     reading_selection_start: Option<u64>,
+    reading_removed_list: bool,
+    pending_reading_removal: Option<ReadingRemovalDialog>,
     function_bindings: Vec<(u8, Workspace)>,
     command_bindings: CommandBindings,
     context_command_bindings: Vec<ContextCommandBinding>,
@@ -868,6 +877,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "search.replace-panel",
         "edit.bold-selection",
         "edit.italic-selection",
+        "research.remove-reference",
         "scene.rename",
         "scene.status",
         "scene.move",
@@ -916,6 +926,8 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
     &[
         "command.palette-open",
         "research.create",
+        "research.removed-references",
+        "research.restore-reference",
         "settings.keybinding-manager",
         "edit.preferences",
         "edit.text-expansion",
@@ -2572,6 +2584,30 @@ fn command_registry() -> Vec<CommandSpec> {
             "Tools",
             "read",
             true,
+        ),
+        legacy_command(
+            "research.remove-reference",
+            "Move Reference to Removed",
+            "Hide the selected reference from the library; restore it later from Removed References",
+            "Edit",
+            "reading-remove",
+            false,
+        ),
+        legacy_command(
+            "research.removed-references",
+            "Show Removed References",
+            "Browse references that can be restored to the library",
+            "Tools",
+            "reading-removed",
+            false,
+        ),
+        legacy_command(
+            "research.restore-reference",
+            "Restore Selected Reference",
+            "Return the selected removed reference to the library",
+            "Tools",
+            "reading-restore",
+            false,
         ),
         legacy_command(
             "research.highlight",
@@ -6104,6 +6140,8 @@ impl AppState {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -10247,8 +10285,12 @@ impl AppState {
         Ok(())
     }
     fn open_reading_selected(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let docs = self.app.list_reading_documents()?;
+        let docs = self.listed_reading_documents()?;
         if let Some(doc) = docs.get(self.selected) {
+            if doc.archived != self.reading_removed_list {
+                self.message = "Reference list changed; choose an item again".into();
+                return Ok(());
+            }
             self.reading_document = Some(doc.id);
             self.reading_text = doc.extracted_text.clone();
             self.reading_offset = self.app.reading_checkpoint(doc.id)?.unwrap_or(0);
@@ -10261,6 +10303,93 @@ impl AppState {
                 .count();
             self.message = format!("{} · {}", doc.title, doc.media_type);
         }
+        Ok(())
+    }
+    fn listed_reading_documents(
+        &self,
+    ) -> Result<Vec<story_storage::ReadingDocumentRecord>, Box<dyn std::error::Error>> {
+        Ok(if self.reading_removed_list {
+            self.app.list_removed_reading_documents()?
+        } else {
+            self.app.list_reading_documents()?
+        })
+    }
+    fn toggle_removed_readings(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace != Workspace::Reading {
+            self.switch(Workspace::Reading);
+        }
+        self.reading_removed_list = !self.reading_removed_list;
+        self.selected = 0;
+        self.reading_document = None;
+        self.reading_text.clear();
+        self.reading_offset = 0;
+        self.scroll = 0;
+        self.reading_focus = false;
+        self.message = if self.reading_removed_list {
+            "Removed References · select an item and choose Restore Selected Reference".into()
+        } else {
+            "Reference Library · active references".into()
+        };
+        Ok(())
+    }
+    fn begin_reading_removal(&mut self, restoring: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace != Workspace::Reading {
+            self.message = "Open the Reference Library and select a reference first".into();
+            return Ok(());
+        }
+        if restoring != self.reading_removed_list {
+            self.message = if restoring {
+                "Show Removed References and select an item to restore".into()
+            } else {
+                "Select an active reference to remove".into()
+            };
+            return Ok(());
+        }
+        let Some(document) = self.listed_reading_documents()?.get(self.selected).cloned() else {
+            self.message = if restoring {
+                "There are no removed references to restore".into()
+            } else {
+                "Select a reference to remove".into()
+            };
+            return Ok(());
+        };
+        self.pending_reading_removal = Some(ReadingRemovalDialog {
+            id: document.id,
+            title: document.title,
+            restoring,
+        });
+        Ok(())
+    }
+    fn finish_reading_removal(
+        &mut self,
+        dialog: ReadingRemovalDialog,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if dialog.restoring {
+            self.app.restore_reading_document(dialog.id)?;
+        } else {
+            if self.dirty {
+                self.message =
+                    "Save or cancel the active manuscript edit before removing a reference".into();
+                return Ok(());
+            }
+            self.app.remove_reading_document(dialog.id)?;
+            if self.reading_document == Some(dialog.id) {
+                self.reading_document = None;
+                self.reading_text.clear();
+                self.reading_offset = 0;
+                self.scroll = 0;
+            }
+        }
+        self.pending_reading_removal = None;
+        self.selected = self.selected.saturating_sub(usize::from(!dialog.restoring));
+        self.message = if dialog.restoring {
+            format!("Restored reference '{}'", dialog.title)
+        } else {
+            format!(
+                "Moved '{}' to Removed References · original source unchanged",
+                dialog.title
+            )
+        };
         Ok(())
     }
     fn open_selected(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -11567,6 +11696,37 @@ impl AppState {
         self.menu_commands()
     }
     fn command_disabled_reason(&self, spec: CommandSpec) -> Option<&'static str> {
+        if spec.id == "research.remove-reference" {
+            return if self.workspace != Workspace::Reading {
+                Some("Open the Reference Library first")
+            } else if self.reading_removed_list {
+                Some("Select an active reference from the Reference Library")
+            } else if self
+                .app
+                .list_reading_documents()
+                .is_ok_and(|items| items.is_empty())
+            {
+                Some("Select a reference first")
+            } else {
+                None
+            };
+        }
+        if spec.id == "research.restore-reference" {
+            return if self.workspace != Workspace::Reading || !self.reading_removed_list {
+                Some("Show Removed References first")
+            } else if self
+                .app
+                .list_removed_reading_documents()
+                .is_ok_and(|items| items.is_empty())
+            {
+                Some("Select a removed reference first")
+            } else {
+                None
+            };
+        }
+        if spec.id == "research.removed-references" && self.workspace != Workspace::Reading {
+            return Some("Open the Reference Library first");
+        }
         match spec.action {
             CommandAction::NewProject if self.dirty => {
                 Some("Save the manuscript buffer before creating a project")
@@ -12864,6 +13024,12 @@ impl AppState {
         &mut self,
         cmd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        match cmd {
+            "reading-remove" => return self.begin_reading_removal(false),
+            "reading-removed" => return self.toggle_removed_readings(),
+            "reading-restore" => return self.begin_reading_removal(true),
+            _ => {}
+        }
         if cmd == "subchapter" {
             if !matches!(
                 outline_rows(self).get(self.selected),
@@ -21085,14 +21251,22 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         f.render_stateful_widget(
             List::new(items).highlight_symbol("▸ ").block(
                 Block::default()
-                    .title("Reference Library · h/l changes pane")
+                    .title(if s.reading_removed_list {
+                        "Removed References · Enter restores selection · h/l changes pane"
+                    } else {
+                        "Reference Library · Delete removes selection · Tools shows removed · h/l changes pane"
+                    })
                     .borders(Borders::ALL),
             ),
             body[0],
             &mut list_state,
         );
         let text = if s.reading_text.is_empty() {
-            "Choose a reference and press Enter. :read-import PATH imports a read-only copy."
+            if s.reading_removed_list {
+                "Choose a removed reference and press Enter to inspect it. Restore Selected Reference returns it to the library."
+            } else {
+                "Choose a reference and press Enter. Delete moves it to Removed References; the original source is unchanged."
+            }
                 .to_owned()
         } else {
             s.reading_text.clone()
@@ -21719,6 +21893,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     }
     if s.recent_project_picker.is_some() {
         draw_recent_project_picker_overlay(f, s);
+    }
+    if s.pending_reading_removal.is_some() {
+        draw_reading_removal_overlay(f, s);
     }
     if s.help_panel.is_some() {
         draw_help_overlay(f, s);
@@ -23475,6 +23652,48 @@ fn draw_recent_project_picker_overlay(f: &mut ratatui::Frame<'_>, state: &AppSta
             .highlight_style(Style::default().bg(Color::Blue).fg(Color::White)),
         inner,
         &mut ListState::default().with_selected(selected),
+    );
+}
+
+fn draw_reading_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(dialog) = &s.pending_reading_removal else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 76);
+    let height = 7.min(area.height.max(1));
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, rect);
+    let action = if dialog.restoring {
+        "Restore this reference to the Reference Library?"
+    } else {
+        "Move this reference to Removed References?"
+    };
+    let text = Text::from(vec![
+        Line::from(action),
+        Line::from(truncate_display_cells(
+            &dialog.title,
+            width.saturating_sub(4) as usize,
+        )),
+        Line::from("The source file and its notes remain preserved."),
+        Line::from("Enter/Y confirms · Esc/N cancels"),
+    ]);
+    f.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title(if dialog.restoring {
+                    " Restore Reference "
+                } else {
+                    " Remove Reference "
+                })
+                .borders(Borders::ALL),
+        ),
+        rect,
     );
 }
 
@@ -25256,8 +25475,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             .map(|i| format!("[{}] {}   ({} scenes)", i.status, i.title, i.scene_count))
             .collect(),
         Workspace::Reading => s
-            .app
-            .list_reading_documents()
+            .listed_reading_documents()
             .unwrap_or_default()
             .into_iter()
             .map(|r| format!("{}   {}", r.title, r.media_type))
@@ -26760,6 +26978,19 @@ fn handle_command_palette_key(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(dialog) = s.pending_reading_removal.clone() {
+        match k.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                s.finish_reading_removal(dialog)?;
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                s.pending_reading_removal = None;
+                s.message = "Cancelled · reference unchanged".into();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     let tutorial_has_focus = s
         .help_panel
         .as_ref()
@@ -27500,6 +27731,16 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         return Ok(false);
     }
+    if s.workspace == Workspace::Reading && matches!(k.code, KeyCode::Delete | KeyCode::Backspace) {
+        if s.reading_focus {
+            s.message =
+                "Reference text is read-only · focus the list with h before removing an item"
+                    .into();
+        } else {
+            s.begin_reading_removal(false)?;
+        }
+        return Ok(false);
+    }
     if k.modifiers.contains(KeyModifiers::CONTROL)
         && matches!(k.code, KeyCode::Char('f' | 'F' | 'h' | 'H'))
     {
@@ -27554,10 +27795,13 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             KeyCode::PageDown if s.reading_focus => s.scroll = s.scroll.saturating_add(20),
             KeyCode::Up | KeyCode::Char('k') => s.selected = s.selected.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') => {
-                let n = s.app.list_reading_documents()?.len();
+                let n = s.listed_reading_documents()?.len();
                 if n > 0 {
                     s.selected = (s.selected + 1).min(n - 1);
                 }
+            }
+            KeyCode::Delete | KeyCode::Backspace if !s.reading_focus => {
+                s.begin_reading_removal(false)?;
             }
             KeyCode::Enter if !s.reading_focus => s.open_reading_selected()?,
             KeyCode::Enter if s.reading_focus => {
@@ -34030,6 +34274,8 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -37523,6 +37769,8 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -37667,6 +37915,8 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -37807,6 +38057,8 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -37955,6 +38207,8 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38253,6 +38507,8 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38401,6 +38657,8 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -39980,6 +40238,8 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -40263,6 +40523,8 @@ mod tests {
             reading_offset: 0,
             reading_focus: true,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -40375,6 +40637,102 @@ mod tests {
         state.command().unwrap();
         assert_eq!(state.reading_offset, passage_offset);
         assert_eq!(state.workspace, Workspace::Reading);
+    }
+
+    #[test]
+    fn reference_library_remove_and_restore_work_through_menus_without_touching_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let source = directory.path().join("reference.txt");
+        fs::write(&source, "The observatory opens at midnight.").unwrap();
+        let parsed = story_reading::import_reference(&source).unwrap();
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let reading = app
+            .import_reading_document(&parsed, source.to_str().unwrap())
+            .unwrap();
+        let copied_path = project.join(app.get_reading_document(reading).unwrap().relative_path);
+        let original_bytes = fs::read(&source).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Reading;
+        state.selected = 0;
+        state.reading_document = Some(reading);
+        state.reading_text = parsed.extracted_text;
+
+        let edit_menu = MENU_CATEGORIES
+            .iter()
+            .position(|item| *item == "Edit")
+            .unwrap();
+        state.open_menu_category(edit_menu);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "research.remove-reference")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.pending_reading_removal.is_some());
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.app.list_reading_documents().unwrap().len(), 1);
+        assert!(copied_path.exists());
+
+        state.open_menu_category(edit_menu);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "research.remove-reference")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.app.list_reading_documents().unwrap().is_empty());
+        assert_eq!(state.app.list_removed_reading_documents().unwrap().len(), 1);
+        assert!(copied_path.exists());
+        assert_eq!(fs::read(&source).unwrap(), original_bytes);
+
+        let tools_menu = MENU_CATEGORIES
+            .iter()
+            .position(|item| *item == "Tools")
+            .unwrap();
+        state.open_menu_category(tools_menu);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "research.removed-references")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.reading_removed_list);
+        state.open_menu_category(tools_menu);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "research.restore-reference")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(
+            state
+                .app
+                .list_removed_reading_documents()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(state.app.list_reading_documents().unwrap().len(), 1);
+        assert!(!state.app.get_reading_document(reading).unwrap().archived);
+        assert_eq!(fs::read(&source).unwrap(), original_bytes);
     }
 
     #[test]
@@ -40681,6 +41039,8 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -40840,6 +41200,8 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -41051,6 +41413,8 @@ mod tests {
             reading_offset: 0,
             reading_focus: false,
             reading_selection_start: None,
+            reading_removed_list: false,
+            pending_reading_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),

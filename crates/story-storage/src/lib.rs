@@ -58,6 +58,7 @@ const MIGRATION_41: &str = include_str!("../migrations/0041_event_relationships.
 const MIGRATION_42: &str = include_str!("../migrations/0042_diagnostic_suppressions.sql");
 const MIGRATION_43: &str = include_str!("../migrations/0043_scene_inclusion.sql");
 const MIGRATION_44: &str = include_str!("../migrations/0044_unplaced_scene_order.sql");
+const MIGRATION_45: &str = include_str!("../migrations/0045_reading_document_trash.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -816,6 +817,7 @@ pub struct ReadingDocumentRecord {
     pub source_sha256: String,
     pub extracted_text: String,
     pub language_code: Option<String>,
+    pub archived: bool,
 }
 #[derive(Clone, Debug)]
 pub struct ReadingAnnotationRecord {
@@ -1448,6 +1450,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_42}\nINSERT INTO schema_migrations(version,applied_at) VALUES(42,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_43}\nINSERT INTO schema_migrations(version,applied_at) VALUES(43,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_44}\nINSERT INTO schema_migrations(version,applied_at) VALUES(44,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_45}\nINSERT INTO schema_migrations(version,applied_at) VALUES(45,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1496,7 +1499,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 44 {
+        if version > 45 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1673,6 +1676,10 @@ impl ProjectStore {
         }
         if current_version == 43 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_44}\nINSERT INTO schema_migrations(version,applied_at) VALUES(44,'{}');\nCOMMIT;", now()))?;
+            current_version = 44;
+        }
+        if current_version == 44 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_45}\nINSERT INTO schema_migrations(version,applied_at) VALUES(45,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -7377,7 +7384,7 @@ impl ProjectStore {
         Ok(id)
     }
     pub fn get_reading_document(&self, id: ReadingId) -> Result<ReadingDocumentRecord> {
-        let row:(String,String,String,String,String,String,Option<String>)=self.conn.query_row("SELECT title,media_type,relative_path,source_identifier,source_sha256,extracted_text,language_code FROM reading_document WHERE id=?1",[id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?.ok_or_else(||StorageError::NotFound(id.to_string()))?;
+        let row:(String,String,String,String,String,String,Option<String>,bool)=self.conn.query_row("SELECT title,media_type,relative_path,source_identifier,source_sha256,extracted_text,language_code,archived FROM reading_document WHERE id=?1",[id.to_string()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?,r.get(7)?))).optional()?.ok_or_else(||StorageError::NotFound(id.to_string()))?;
         let source = fs::read(self.safe_path(Path::new(&row.2))?)?;
         if format!("{:x}", Sha256::digest(&source)) != row.4 {
             return Err(StorageError::Conflict(format!(
@@ -7393,6 +7400,7 @@ impl ProjectStore {
             source_sha256: row.4,
             extracted_text: row.5,
             language_code: row.6,
+            archived: row.7,
         })
     }
     pub fn set_reading_document_language(
@@ -7415,11 +7423,20 @@ impl ProjectStore {
         Ok(())
     }
     pub fn list_reading_documents(&self) -> Result<Vec<ReadingDocumentRecord>> {
+        self.list_reading_documents_with_archive_state(false)
+    }
+    pub fn list_archived_reading_documents(&self) -> Result<Vec<ReadingDocumentRecord>> {
+        self.list_reading_documents_with_archive_state(true)
+    }
+    fn list_reading_documents_with_archive_state(
+        &self,
+        archived: bool,
+    ) -> Result<Vec<ReadingDocumentRecord>> {
         let ids: Vec<String> = {
             let mut q = self
                 .conn
-                .prepare("SELECT id FROM reading_document ORDER BY title COLLATE NOCASE,id")?;
-            q.query_map([], |r| r.get(0))?
+                .prepare("SELECT id FROM reading_document WHERE archived=?1 ORDER BY title COLLATE NOCASE,id")?;
+            q.query_map([archived], |r| r.get(0))?
                 .collect::<std::result::Result<_, _>>()?
         };
         ids.into_iter()
@@ -7430,6 +7447,48 @@ impl ProjectStore {
                 self.get_reading_document(id)
             })
             .collect()
+    }
+    pub fn archive_reading_document(&mut self, id: ReadingId) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE reading_document SET archived=1,updated_at=?2 WHERE id=?1 AND archived=0",
+            params![id.to_string(), now()],
+        )?;
+        if changed == 0 {
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM reading_document WHERE id=?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )?;
+            return if exists {
+                Err(StorageError::Invalid(
+                    "reading document is already in Removed References".into(),
+                ))
+            } else {
+                Err(StorageError::NotFound(id.to_string()))
+            };
+        }
+        Ok(())
+    }
+    pub fn restore_reading_document(&mut self, id: ReadingId) -> Result<()> {
+        let changed = self.conn.execute(
+            "UPDATE reading_document SET archived=0,updated_at=?2 WHERE id=?1 AND archived=1",
+            params![id.to_string(), now()],
+        )?;
+        if changed == 0 {
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM reading_document WHERE id=?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )?;
+            return if exists {
+                Err(StorageError::Invalid(
+                    "reading document is not in Removed References".into(),
+                ))
+            } else {
+                Err(StorageError::NotFound(id.to_string()))
+            };
+        }
+        Ok(())
     }
     pub fn reload_reading_document(
         &mut self,
@@ -7506,7 +7565,7 @@ impl ProjectStore {
         if terms.trim().is_empty() {
             return Ok(Vec::new());
         }
-        let mut q=self.conn.prepare("SELECT document_id,title,snippet(reading_fts,2,'[',']','…',12) FROM reading_fts WHERE reading_fts MATCH ?1 ORDER BY bm25(reading_fts),title")?;
+        let mut q=self.conn.prepare("SELECT f.document_id,f.title,snippet(reading_fts,2,'[',']','…',12) FROM reading_fts f JOIN reading_document d ON d.id=f.document_id WHERE reading_fts MATCH ?1 AND d.archived=0 ORDER BY bm25(reading_fts),f.title")?;
         let rows = q.query_map([terms], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -8491,7 +8550,7 @@ impl ProjectStore {
         if terms.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let mut query = self.conn.prepare("SELECT entity_kind,entity_id,title,snippet(project_search_fts,3,'[',']','…',12) FROM project_search_fts WHERE project_search_fts MATCH ?1 ORDER BY bm25(project_search_fts),entity_kind,entity_id LIMIT ?2")?;
+        let mut query = self.conn.prepare("SELECT entity_kind,entity_id,title,snippet(project_search_fts,3,'[',']','…',12) FROM project_search_fts WHERE project_search_fts MATCH ?1 AND (entity_kind<>'reading' OR EXISTS(SELECT 1 FROM reading_document WHERE reading_document.id=project_search_fts.entity_id AND archived=0)) ORDER BY bm25(project_search_fts),entity_kind,entity_id LIMIT ?2")?;
         Ok(query
             .query_map(params![terms, limit], |row| {
                 Ok(ProjectSearchHit {
@@ -10436,8 +10495,8 @@ mod tests {
         let project = directory.path().join("Book");
         let store = ProjectStore::create(&project, "Book").unwrap();
         store.conn.execute_batch(
-            "DROP TABLE scene_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
-        ).unwrap();
+            "DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
+       ).unwrap();
         drop(store);
 
         let mut migrated = ProjectStore::open(&project).unwrap();
@@ -10462,7 +10521,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
     }
     #[test]
     fn event_character_and_location_relationships_are_typed_atomic_and_persistent() {
@@ -10521,7 +10580,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 44);
+        assert_eq!(schema_version, 45);
     }
     #[test]
     fn writing_challenges_are_validated_persisted_and_completed_once() {
@@ -12221,7 +12280,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 44))
+            .map(|version| assert_eq!(version, 45))
             .unwrap();
     }
 
@@ -12489,6 +12548,64 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_reading_document_is_recoverable_and_never_touches_the_source() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let original = directory.path().join("reference.txt");
+        fs::write(&original, "Mara studies the silver observatory key.").unwrap();
+        let parsed = story_reading::import_reference(&original).unwrap();
+        let mut store = ProjectStore::create(&project, "Novel").unwrap();
+        let reading = store
+            .import_reading_document(&parsed, original.to_str().unwrap())
+            .unwrap();
+        let copied_path = project.join(store.get_reading_document(reading).unwrap().relative_path);
+        assert!(copied_path.exists());
+        assert_eq!(store.list_reading_documents().unwrap().len(), 1);
+        assert_eq!(store.search_reading("observatory").unwrap().len(), 1);
+        assert!(
+            store
+                .search_project("observatory", 10)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.entity_kind == "reading" && hit.entity_id == reading.to_string())
+        );
+
+        store.archive_reading_document(reading).unwrap();
+        let removed = store.list_archived_reading_documents().unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].archived);
+        assert!(store.list_reading_documents().unwrap().is_empty());
+        assert!(store.search_reading("observatory").unwrap().is_empty());
+        assert!(
+            !store
+                .search_project("observatory", 10)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.entity_kind == "reading" && hit.entity_id == reading.to_string())
+        );
+        assert!(copied_path.exists());
+        assert_eq!(fs::read(&original).unwrap(), parsed.source_bytes);
+        assert!(store.archive_reading_document(reading).is_err());
+
+        drop(store);
+        let mut reopened = ProjectStore::open(&project).unwrap();
+        assert_eq!(reopened.list_archived_reading_documents().unwrap().len(), 1);
+        reopened.restore_reading_document(reading).unwrap();
+        assert_eq!(reopened.list_reading_documents().unwrap().len(), 1);
+        assert_eq!(reopened.search_reading("observatory").unwrap().len(), 1);
+        assert!(
+            reopened
+                .search_project("observatory", 10)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.entity_kind == "reading" && hit.entity_id == reading.to_string())
+        );
+        assert!(!reopened.get_reading_document(reading).unwrap().archived);
+        assert!(copied_path.exists());
+        assert_eq!(fs::read(&original).unwrap(), parsed.source_bytes);
+    }
+
+    #[test]
     fn version_four_projects_migrate_and_build_project_search_index() {
         let d = tempdir().unwrap();
         let project = d.path().join("N");
@@ -12500,7 +12617,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("DROP TABLE scene_exclusion; DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code; DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
+        conn.execute_batch("DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code; DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
         conn.execute_batch("DROP TABLE diagnostic_suppression; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
@@ -12512,7 +12629,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -12541,7 +12658,7 @@ mod tests {
 
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch(
-            "DROP TABLE scene_exclusion; DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code;
+            "DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code;
              DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
              DROP TRIGGER story_link_source_exists_insert;
              DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update;
@@ -14325,7 +14442,7 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version=44;",
+                "DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>=44;",
             )
             .unwrap();
         drop(connection);
@@ -14341,6 +14458,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 44);
+        assert_eq!(version, 45);
     }
 }
