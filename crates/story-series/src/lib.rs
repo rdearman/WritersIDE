@@ -368,9 +368,26 @@ impl SeriesStore {
         series_id: SeriesId,
         book: &SeriesBook,
     ) -> Result<()> {
-        let path = root
-            .join(&book.relative_path)
-            .join(".writers-ide/series-membership.toml");
+        let relative = Path::new(&book.relative_path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+        {
+            return Err(SeriesError::InvalidBookPath(book.relative_path.clone()));
+        }
+        let canonical_root = root.canonicalize()?;
+        let book_root = root.join(relative).canonicalize()?;
+        if !book_root.starts_with(&canonical_root) {
+            return Err(SeriesError::BookOutsideSeries);
+        }
+        let control = book_root.join(".writers-ide");
+        if fs::symlink_metadata(&control)?.file_type().is_symlink() {
+            return Err(SeriesError::Config(
+                "book metadata directory cannot be a symbolic link".into(),
+            ));
+        }
+        let path = control.join("series-membership.toml");
         if !path.exists() {
             return Ok(());
         }
@@ -921,6 +938,45 @@ mod tests {
         assert_eq!(SeriesStore::open_for_book(&first_path).unwrap().1, first);
         let reopened = story_storage::ProjectStore::open(&first_path).unwrap();
         assert_eq!(reopened.load_text(scene_id).unwrap().0, original_prose);
+    }
+
+    #[test]
+    fn removing_a_book_rejects_a_corrupt_path_without_touching_external_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let series_root = temp.path().join("Series");
+        let mut series = SeriesStore::create(&series_root, "Series").unwrap();
+        let (book_path, project_id) = book_folder(&series_root, "Book");
+        let book = series
+            .add_book(project_id, &book_path, "Book", None)
+            .unwrap();
+        let outside = temp.path().join("Outside/.writers-ide");
+        fs::create_dir_all(&outside).unwrap();
+        let protected = outside.join("series-membership.toml");
+        fs::write(&protected, "protected external file").unwrap();
+
+        series
+            .conn
+            .execute(
+                "UPDATE series_book SET relative_path='../Outside' WHERE id=?1",
+                [book.id.to_string()],
+            )
+            .unwrap();
+        assert!(matches!(
+            series.remove_book(book.id),
+            Err(SeriesError::InvalidBookPath(_))
+        ));
+        assert_eq!(
+            fs::read_to_string(protected).unwrap(),
+            "protected external file"
+        );
+        let active = series.list_books().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, book.id);
+        assert!(
+            book_path
+                .join(".writers-ide/series-membership.toml")
+                .is_file()
+        );
     }
 
     #[test]
