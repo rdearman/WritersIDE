@@ -1,6 +1,9 @@
+static PTY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(target_os = "linux")]
 #[test]
 fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
+    let _guard = PTY_TEST_LOCK.lock().unwrap();
     use std::process::Command;
     use story_app::WriterApp;
 
@@ -42,6 +45,7 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
 #[cfg(target_os = "linux")]
 #[test]
 fn full_screen_terminal_creates_a_fiction_project_and_saves_a_scene_in_a_pty() {
+    let _guard = PTY_TEST_LOCK.lock().unwrap();
     use std::process::Command;
     use story_app::WriterApp;
     use story_core::BookType;
@@ -97,6 +101,7 @@ fn full_screen_terminal_creates_a_fiction_project_and_saves_a_scene_in_a_pty() {
 #[cfg(target_os = "linux")]
 #[test]
 fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
+    let _guard = PTY_TEST_LOCK.lock().unwrap();
     use std::process::Command;
     use story_app::WriterApp;
 
@@ -134,6 +139,7 @@ fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
 #[cfg(target_os = "linux")]
 #[test]
 fn scene_and_reference_removal_dialogues_are_cancellable_in_a_real_pty() {
+    let _guard = PTY_TEST_LOCK.lock().unwrap();
     use std::process::Command;
     use story_app::WriterApp;
 
@@ -191,6 +197,7 @@ fn scene_and_reference_removal_dialogues_are_cancellable_in_a_real_pty() {
 #[cfg(target_os = "linux")]
 #[test]
 fn populated_chapter_removal_retains_scenes_through_the_real_terminal_workflow() {
+    let _guard = PTY_TEST_LOCK.lock().unwrap();
     use std::process::Command;
     use story_app::WriterApp;
 
@@ -296,6 +303,7 @@ fn populated_chapter_removal_retains_scenes_through_the_real_terminal_workflow()
 #[cfg(target_os = "linux")]
 #[test]
 fn populated_chapter_removal_can_rehome_scenes_to_a_selected_chapter_in_a_real_pty() {
+    let _guard = PTY_TEST_LOCK.lock().unwrap();
     use std::process::Command;
     use story_app::WriterApp;
 
@@ -351,5 +359,89 @@ fn populated_chapter_removal_can_rehome_scenes_to_a_selected_chapter_in_a_real_p
     assert_eq!(
         reopened.load_scene_text(scene).unwrap().0,
         "The traveler arrives."
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn populated_chapter_subtree_deletion_is_recoverable_through_a_real_pty() {
+    let _guard = PTY_TEST_LOCK.lock().unwrap();
+    use std::process::Command;
+    use story_app::WriterApp;
+    use story_core::ContentUnitKind;
+    use story_document::CompileFormat;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Chapter Removal Project");
+    let mut app = WriterApp::create_project(&project, "Chapter Removal Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "The traveler arrives.")
+        .unwrap();
+    let prose = app
+        .create_content_unit(
+            ContentUnitKind::ChapterBody,
+            "Opening prose",
+            Some(chapter),
+            0,
+            None,
+        )
+        .unwrap();
+    let (_, prose_hash) = app.load_content_unit_text(prose).unwrap();
+    app.save_content_unit_text(prose, Some(&prose_hash), "A chapter introduction.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY subtree-deletion workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("chapter-removal-delete")
+        .output()
+        .expect("run the Linux PTY chapter-subtree deletion workflow");
+    assert!(
+        result.status.success(),
+        "PTY chapter-subtree deletion workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let mut reopened = WriterApp::open_project(&project).unwrap();
+    assert!(reopened.list_scenes(false).unwrap().is_empty());
+    assert!(
+        reopened
+            .list_archived_structural_nodes()
+            .unwrap()
+            .iter()
+            .any(|node| node.id == chapter)
+    );
+    assert!(reopened.get_content_unit(prose).unwrap().archived);
+    let compiled = String::from_utf8(
+        reopened
+            .compile_artifact(CompileFormat::Markdown, false)
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert!(!compiled.contains("The traveler arrives."));
+    assert!(!compiled.contains("A chapter introduction."));
+
+    reopened.restore_latest_structural_removal(chapter).unwrap();
+    assert_eq!(reopened.get_scene(scene).unwrap().chapter_id, Some(chapter));
+    assert!(!reopened.get_content_unit(prose).unwrap().archived);
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "The traveler arrives."
+    );
+    assert_eq!(
+        reopened.load_content_unit_text(prose).unwrap().0,
+        "A chapter introduction."
     );
 }

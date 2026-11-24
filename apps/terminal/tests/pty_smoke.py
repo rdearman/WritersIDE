@@ -26,8 +26,13 @@ def main():
     create_fiction = modes == ["create-fiction"]
     previous_position = modes == ["previous-position"]
     removal_dialogs = modes == ["removal-dialogs"]
-    chapter_removal = modes in (["chapter-removal"], ["chapter-removal-target"])
+    chapter_removal = modes in (
+        ["chapter-removal"],
+        ["chapter-removal-target"],
+        ["chapter-removal-delete"],
+    )
     chapter_removal_target = modes == ["chapter-removal-target"]
+    chapter_removal_delete = modes == ["chapter-removal-delete"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
     child_pid, master = pty.fork()
@@ -258,7 +263,18 @@ def main():
                         "chapter destination choice did not preview its target and Compile effect; visible tail: "
                         + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
                     )
-            os.write(master, b"\r")  # confirm the selected retain-and-rehome action
+            elif chapter_removal_delete:
+                os.write(master, b"\x1b[B\x1b[B")  # choose recoverable subtree deletion
+                if not wait_for_fragments(
+                    (b"Deletechapter", b"removed scenes", b"omitted", b"restored"),
+                    dialog_start,
+                    timeout=3.0,
+                ):
+                    raise AssertionError(
+                        "subtree deletion did not preview Compile impact and recovery; visible tail: "
+                        + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                    )
+            os.write(master, b"\r")  # confirm the selected explicit removal action
             read_for(0.4)
             os.write(master, b"\x11")
             quit_deadline = time.monotonic() + 5.0
@@ -271,6 +287,8 @@ def main():
                 raise AssertionError("application did not exit cleanly after the chapter removal")
             if chapter_removal_target:
                 print("PTY chapter removal passed: scene rehoming to a selected chapter was available.")
+            elif chapter_removal_delete:
+                print("PTY chapter removal passed: recoverable subtree deletion was selected explicitly.")
             else:
                 print("PTY chapter removal passed: choices are visible and the default retains scenes as Unplaced.")
             return
