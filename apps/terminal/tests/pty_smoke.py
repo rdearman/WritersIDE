@@ -28,6 +28,7 @@ def main():
     removal_dialogs = modes == ["removal-dialogs"]
     chapter_creation = modes == ["chapter-creation"]
     reference_removal = modes == ["reference-removal"]
+    compile_docx = modes == ["compile-docx"]
     chapter_removal = modes in (
         ["chapter-removal"],
         ["chapter-removal-target"],
@@ -196,6 +197,51 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after reference removal")
             print("PTY reference removal passed: explicit confirmation removes only the project-owned reference.")
+            return
+
+        if compile_docx:
+            # Publish > Compile / Export must lead to the guided file browser,
+            # not leak internal command help into the manuscript panes.
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 6 + b"\x1b[B\r")  # Publish > Compile / Export
+            browser_start = len(output)
+            if not wait_for_fragments(
+                (b"Selectedpath:", b".docx", b"F5Compile"),
+                browser_start,
+                timeout=4.0,
+            ):
+                raise AssertionError(
+                    "Publish > Compile / Export did not open the DOCX file browser; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
+                )
+            set_size(master, 60, 177)
+            read_for(0.3)
+            set_size(master, 24, 80)
+            read_for(0.3)
+            compile_start = len(output)
+            os.write(master, b"\x1b[15~")  # F5: compile to the suggested DOCX path
+            if not wait_for_fragments(
+                (b"Compiled", b"Publish", b"Project.docx"),
+                compile_start,
+                timeout=10.0,
+            ):
+                raise AssertionError(
+                    "DOCX compile did not show explicit success feedback; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
+                )
+            if b"Commands: section TITLE" in ANSI_CONTROL.sub(b"", output):
+                raise AssertionError("internal command registry leaked into the publishing workflow")
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after compiling DOCX")
+            print("PTY publishing workflow passed: menu → DOCX file browser → compiled output and success feedback.")
             return
 
         if create_fiction:

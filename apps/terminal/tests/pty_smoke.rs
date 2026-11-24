@@ -107,6 +107,56 @@ fn full_screen_terminal_creates_a_fiction_project_and_saves_a_scene_in_a_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn publish_menu_compiles_a_docx_and_reports_success_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Publish Project");
+    let mut app = WriterApp::create_project(&project, "Publish Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "The manuscript reaches the reader.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY compile workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("compile-docx")
+        .output()
+        .expect("run the Linux PTY DOCX compile workflow");
+    assert!(
+        result.status.success(),
+        "PTY DOCX compile workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let output = project.join("Publish Project.docx");
+    assert!(output.is_file());
+    assert!(std::fs::metadata(&output).unwrap().len() > 0);
+    let mut archive = zip::ZipArchive::new(std::fs::File::open(output).unwrap()).unwrap();
+    let mut document = String::new();
+    std::io::Read::read_to_string(
+        &mut archive.by_name("word/document.xml").unwrap(),
+        &mut document,
+    )
+    .unwrap();
+    assert!(document.contains("The manuscript reaches the reader."));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
     let _guard = lock_pty_test();
     use std::process::Command;
