@@ -1,6 +1,6 @@
 # Terminal menu audit — 24 November 2026
 
-This is the complete registered command inventory at the audited source revision. It maps every registered command ID to its current author-facing access point, proposed access point, frequency signal, and disposition. The source of truth is `command_registry()` plus `MENU_COMMON_COMMANDS` in `apps/terminal/src/main.rs`; the regression test `menus_are_flat_curated_lists_and_keep_all_commands_searchable` checks that menu IDs are registered, curated lists are unique, and all other registered actions remain searchable.
+This is the complete registered command inventory at the flat-menu baseline (`4cfa92b`). It maps every registered command ID to its current author-facing access point, proposed access point, frequency signal, and disposition. The source of truth is `command_registry()` plus `MENU_COMMON_COMMANDS` in `apps/terminal/src/main.rs`; the regression test `menus_are_flat_curated_lists_and_keep_all_commands_searchable` checks that menu IDs are registered, curated lists are unique, and all other registered actions remain searchable. The UAT 18 contextual-menu update is recorded below as a dated supplement.
 
 ## Frequency interpretation
 
@@ -38,6 +38,7 @@ No capability or command ID is removed. Primary menus remain concise, single-lev
 | `menu.publish` | Open Publish Menu | Menu bar | Menu bar | Navigation infrastructure; not measured | Retain as menu heading |
 | `menu.tools` | Open Tools Menu | Menu bar | Menu bar | Navigation infrastructure; not measured | Retain as menu heading |
 | `menu.help` | Open Help Menu | Menu bar | Menu bar | Navigation infrastructure; not measured | Retain as menu heading |
+| `menu.scene` | Open Scene Menu | Added after the flat-menu baseline; available in Scene Cards | Scene Cards context menu; Publish is hidden in this workspace | Navigation infrastructure; not measured | Add contextual menu heading |
 | `command.palette-open` | Command Palette | All primary menus (except Tools/Help) and Tools | All primary menus (except Tools/Help) and Tools | Routine discovery access; not measured | Retain searchable command entry |
 | `menu.main` | Main Menu | Menu bar | Menu bar | Navigation infrastructure; not measured | Retain as menu heading |
 | `file.new-project` | New Project | File menu; command palette / Search All Commands | File menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
@@ -335,7 +336,11 @@ No capability or command ID is removed. Primary menus remain concise, single-lev
 | `series.new-book` | New Book in Series | Search All Commands… / command palette → File | Search All Commands… / command palette → File | Searchable-only candidate; not measured | Retain in searchable registry |
 | `series.references` | Read Series References | Search All Commands… / command palette → File | Search All Commands… / command palette → File | Searchable-only candidate; not measured | Retain in searchable registry |
 
-**Inventory size:** 322 registered commands, including top-level menu headings. **Curated direct command IDs:** 56.
+**Flat-menu baseline:** 322 registered commands, including top-level menu headings. **Baseline curated direct command IDs:** 56. The contextual Scene menu adds one registered menu command and nine curated contextual menu slots (some reuse baseline command IDs).
+
+## Alpha UAT 18 contextual-menu supplement
+
+The latest UAT direction keeps stable global actions and adds workspace-specific menu roots. In Scene Cards, **Scene** replaces **Publish** in the visible menu bar; Publish remains available from manuscript workspaces and command search. The Scene menu provides New Scene, Write Selected Scene, Rename Selected Scene, Edit Scene Synopsis, Move Scene Up/Down, Move Scene to Chapter, Include / Exclude Scene, and Search All Commands. It reuses existing command IDs and routes. The card keybar displays the effective Include / Exclude binding (Space by default). This supplement is implemented in the source revision that adds `menu.scene`; the other requested contextual menus (Chapter, Research, Character and Timeline) remain follow-up work.
 
 ## Audit limits and follow-up
 

@@ -99,6 +99,21 @@ The complete command inventory and before/after placement audit is in [docs/menu
 - Context Help
 - Search Commands
 
+## Scene (Scene Cards only)
+
+- New Scene
+- Write Selected Scene
+- Rename Selected Scene
+- Edit Scene Synopsis
+- Move Scene Up / Move Scene Down
+- Move Scene to Chapter
+- Include / Exclude Scene
+- Search All Commands…
+
+The Scene menu appears only while Scene Cards is active; Publish is available
+from manuscript workspaces and command search. The Scene Cards footer shows the
+effective Include / Exclude shortcut (Space by default).
+
 ## Notes
 
 - Disabled actions explain why they are unavailable. Availability depends on project and selection context.

@@ -822,10 +822,10 @@ struct RecentProjectPicker {
     selected: usize,
 }
 
-const MENU_CATEGORIES: [&str; 9] = [
-    "File", "Edit", "Insert", "Navigate", "View", "Review", "Publish", "Tools", "Help",
+const MENU_CATEGORIES: [&str; 10] = [
+    "File", "Edit", "Insert", "Navigate", "View", "Review", "Publish", "Tools", "Help", "Scene",
 ];
-const MENU_CATEGORY_COMMAND_IDS: [&str; 9] = [
+const MENU_CATEGORY_COMMAND_IDS: [&str; 10] = [
     "menu.file",
     "menu.edit",
     "menu.insert",
@@ -835,8 +835,9 @@ const MENU_CATEGORY_COMMAND_IDS: [&str; 9] = [
     "menu.publish",
     "menu.tools",
     "menu.help",
+    "menu.scene",
 ];
-const MENU_COMMON_COMMANDS: [&[&str]; 9] = [
+const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
     &[
         "file.new-project",
         "file.open-project",
@@ -908,7 +909,39 @@ const MENU_COMMON_COMMANDS: [&[&str]; 9] = [
         "writing.stats",
     ],
     &["help.resume-tutorial", "help.context", "help.search"],
+    &[
+        "scene.create",
+        "scene.open",
+        "scene.rename",
+        "scene.field",
+        "outline.move-up",
+        "outline.move-down",
+        "scene.move",
+        "scene.toggle-inclusion",
+        "command.palette-open",
+    ],
 ];
+
+const SCENE_MENU_INDEX: usize = 9;
+
+fn menu_category_available(state: &AppState, index: usize) -> bool {
+    let fiction_cards = state.workspace == Workspace::Cards
+        && state
+            .app
+            .get_project()
+            .is_ok_and(|project| project.book_type == story_core::BookType::Fiction);
+    if fiction_cards {
+        index != 6 // Publishing is available from the manuscript and command search.
+    } else {
+        index != SCENE_MENU_INDEX
+    }
+}
+
+fn visible_menu_category_indices(state: &AppState) -> Vec<usize> {
+    (0..MENU_CATEGORIES.len())
+        .filter(|index| menu_category_available(state, *index))
+        .collect()
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SessionSnapshot {
@@ -1460,6 +1493,7 @@ fn command_registry() -> Vec<CommandSpec> {
                     "Publish" => "Open Publish Menu",
                     "Tools" => "Open Tools Menu",
                     "Help" => "Open Help Menu",
+                    "Scene" => "Open Scene Menu",
                     "View" => "Open View Menu",
                     _ => "Open Menu",
                 },
@@ -10910,6 +10944,19 @@ impl AppState {
     fn open_menu_category(&mut self, index: usize) {
         self.pending_command_sequence = None;
         let top = index.min(MENU_CATEGORIES.len().saturating_sub(1));
+        if top == SCENE_MENU_INDEX
+            && self
+                .app
+                .get_project()
+                .is_ok_and(|project| project.book_type != story_core::BookType::Fiction)
+        {
+            self.menu = None;
+            self.message = "Scene actions are available in fiction projects".into();
+            return;
+        }
+        if top == SCENE_MENU_INDEX && self.workspace != Workspace::Cards {
+            self.switch(Workspace::Cards);
+        }
         self.menu = Some(MenuState { top, selected: 0 });
         self.message = format!(
             "{} menu · ↑/↓ choose · Enter runs · Left/Right changes menu · Esc closes",
@@ -10923,6 +10970,41 @@ impl AppState {
         let menu_index = menu.top.min(MENU_CATEGORIES.len() - 1);
         let top = MENU_CATEGORIES[menu_index];
         let commands = command_registry();
+        if menu_index == SCENE_MENU_INDEX {
+            return MENU_COMMON_COMMANDS[menu_index]
+                .iter()
+                .filter_map(|id| commands.iter().find(|spec| spec.id == *id).copied())
+                .map(|mut spec| {
+                    match spec.id {
+                        "scene.open" => {
+                            spec.label = "Write Selected Scene";
+                            spec.takes_arguments = false;
+                        }
+                        "scene.rename" => {
+                            spec.label = "Rename Selected Scene";
+                            spec.takes_arguments = false;
+                        }
+                        "scene.field" => {
+                            spec.label = "Edit Scene Synopsis";
+                            spec.takes_arguments = false;
+                        }
+                        "outline.move-up" => {
+                            spec.label = "Move Scene Up";
+                            spec.takes_arguments = false;
+                        }
+                        "outline.move-down" => {
+                            spec.label = "Move Scene Down";
+                            spec.takes_arguments = false;
+                        }
+                        "scene.toggle-inclusion" => {
+                            spec.label = "Include / Exclude Scene";
+                        }
+                        _ => {}
+                    }
+                    spec
+                })
+                .collect();
+        }
         let mut direct = MENU_COMMON_COMMANDS[menu_index]
             .iter()
             .filter_map(|id| {
@@ -10969,10 +11051,24 @@ impl AppState {
             {
                 Some("Select a chapter in Outline first")
             }
-            CommandAction::MoveOutlineUp if self.outline_move_destination(false).is_none() => {
+            CommandAction::OpenMenuCategory(index)
+                if index == SCENE_MENU_INDEX
+                    && self.app.get_project().is_ok_and(|project| {
+                        project.book_type != story_core::BookType::Fiction
+                    }) =>
+            {
+                Some("Scene actions are available in fiction projects")
+            }
+            CommandAction::MoveOutlineUp
+                if self.workspace == Workspace::Outline
+                    && self.outline_move_destination(false).is_none() =>
+            {
                 Some("Select a chapter or section with a sibling above")
             }
-            CommandAction::MoveOutlineDown if self.outline_move_destination(true).is_none() => {
+            CommandAction::MoveOutlineDown
+                if self.workspace == Workspace::Outline
+                    && self.outline_move_destination(true).is_none() =>
+            {
                 Some("Select a chapter or section with a sibling below")
             }
             CommandAction::ResolveSaveConflict if !self.dirty => {
@@ -11358,7 +11454,12 @@ impl AppState {
                 return Ok(());
             }
             KeyCode::Left => {
-                menu.top = (menu.top + MENU_CATEGORIES.len() - 1) % MENU_CATEGORIES.len();
+                let visible = visible_menu_category_indices(self);
+                let current = visible
+                    .iter()
+                    .position(|index| *index == menu.top)
+                    .unwrap_or(0);
+                menu.top = visible[(current + visible.len() - 1) % visible.len()];
                 menu.selected = 0;
                 self.menu = Some(menu);
                 if self
@@ -11370,7 +11471,12 @@ impl AppState {
                 return Ok(());
             }
             KeyCode::Right => {
-                menu.top = (menu.top + 1) % MENU_CATEGORIES.len();
+                let visible = visible_menu_category_indices(self);
+                let current = visible
+                    .iter()
+                    .position(|index| *index == menu.top)
+                    .unwrap_or(0);
+                menu.top = visible[(current + 1) % visible.len()];
                 menu.selected = 0;
                 self.menu = Some(menu);
                 if self
@@ -11495,12 +11601,16 @@ impl AppState {
                     self.menu = None;
                     self.dispatch_registered_command_id(spec.id)?;
                     return Ok(());
-                } else if let Some(index) = MENU_CATEGORIES.iter().position(|category| {
-                    category
-                        .chars()
-                        .next()
-                        .is_some_and(|first| first.eq_ignore_ascii_case(&ch))
-                }) {
+                } else if let Some(index) =
+                    visible_menu_category_indices(self)
+                        .into_iter()
+                        .find(|index| {
+                            MENU_CATEGORIES[*index]
+                                .chars()
+                                .next()
+                                .is_some_and(|first| first.eq_ignore_ascii_case(&ch))
+                        })
+                {
                     menu.top = index;
                     menu.selected = 0;
                     self.menu = Some(menu);
@@ -11542,6 +11652,24 @@ impl AppState {
         }
         if command_id == "scene.move" && arguments.is_none() {
             return self.start_scene_move();
+        }
+        if command_id == "scene.open" && arguments.is_none() {
+            let scene = selected_scene_for_workspace(self).ok_or("select a scene card first")?;
+            return self.open_scene(scene);
+        }
+        if command_id == "scene.rename" && arguments.is_none() {
+            self.start_scene_rename();
+            return Ok(());
+        }
+        if command_id == "scene.field" && arguments.is_none() {
+            self.start_scene_synopsis();
+            return Ok(());
+        }
+        if command_id == "outline.move-up" && self.workspace == Workspace::Cards {
+            return self.move_scene_card(-1);
+        }
+        if command_id == "outline.move-down" && self.workspace == Workspace::Cards {
+            return self.move_scene_card(1);
         }
         if command_id == "edit.snippet-insert" && arguments.is_none() {
             self.open_snippet_chooser();
@@ -11617,6 +11745,27 @@ impl AppState {
                 .join(" · ")
         );
         Ok(())
+    }
+
+    fn start_scene_rename(&mut self) {
+        if selected_scene_for_workspace(self).is_none() {
+            self.message = "Select a scene card before renaming it".into();
+            return;
+        }
+        self.mode = Some('R');
+        self.prompt.clear();
+        self.message = "Rename selected scene · enter a title · Enter saves · Esc cancels".into();
+    }
+
+    fn start_scene_synopsis(&mut self) {
+        if selected_scene_for_workspace(self).is_none() {
+            self.message = "Select a scene card before editing its synopsis".into();
+            return;
+        }
+        self.mode = Some('Y');
+        self.prompt.clear();
+        self.message =
+            "Edit selected scene synopsis · enter text · Enter saves · Esc cancels".into();
     }
 
     fn record_recent_command(&mut self, command_id: &str) {
@@ -11986,6 +12135,41 @@ impl AppState {
             })();
             if let Err(error) = result {
                 self.message = format!("Scene was not moved: {error}");
+            }
+            return Ok(());
+        }
+        if matches!(mode, Some('R' | 'Y')) {
+            let Some(scene_id) = selected_scene_for_workspace(self) else {
+                self.message = "Select a scene card first · no scene was changed".into();
+                return Ok(());
+            };
+            if mode == Some('R') && cmd.trim().is_empty() {
+                self.message =
+                    "Scene title unchanged · enter a title or press Esc to cancel".into();
+                return Ok(());
+            }
+            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                let mut scene = self.app.get_scene(scene_id)?.scene;
+                if mode == Some('R') {
+                    scene.title = cmd.clone();
+                } else {
+                    scene.synopsis = cmd.clone();
+                }
+                self.app.update_scene_metadata(&scene)?;
+                self.refresh()?;
+                self.selected = scene_card_ids(self)
+                    .iter()
+                    .position(|id| *id == scene_id)
+                    .unwrap_or(0);
+                self.message = if mode == Some('R') {
+                    format!("Renamed scene to “{cmd}”")
+                } else {
+                    "Scene synopsis saved".into()
+                };
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.message = format!("Scene was not changed: {error}");
             }
             return Ok(());
         }
@@ -19004,8 +19188,9 @@ fn menu_bar_line(s: &AppState, width: usize) -> Line<'static> {
 
     let active = s.menu.map(|menu| menu.top);
     let mut spans = vec![Span::raw(" ")];
-    for (index, category) in MENU_CATEGORIES.iter().enumerate() {
-        if index > 0 {
+    for (position, index) in visible_menu_category_indices(s).into_iter().enumerate() {
+        let category = MENU_CATEGORIES[index];
+        if position > 0 {
             spans.push(Span::raw("  "));
         }
         let style = if active == Some(index) {
@@ -19018,7 +19203,7 @@ fn menu_bar_line(s: &AppState, width: usize) -> Line<'static> {
         };
         let shortcuts = effective_shortcut_label(s, MENU_CATEGORY_COMMAND_IDS[index], "");
         let label = if shortcuts.is_empty() {
-            (*category).to_owned()
+            category.to_owned()
         } else {
             format!("{category} {shortcuts}")
         };
@@ -19028,14 +19213,14 @@ fn menu_bar_line(s: &AppState, width: usize) -> Line<'static> {
 }
 
 fn menu_category_x(state: &AppState, category_index: usize) -> u16 {
-    let preceding = MENU_CATEGORIES
-        .iter()
-        .take(category_index.min(MENU_CATEGORIES.len()))
-        .enumerate()
-        .map(|(index, category)| {
+    let preceding = visible_menu_category_indices(state)
+        .into_iter()
+        .take_while(|index| *index != category_index)
+        .map(|index| {
+            let category = MENU_CATEGORIES[index];
             let shortcut = effective_shortcut_label(state, MENU_CATEGORY_COMMAND_IDS[index], "");
             let label = if shortcut.is_empty() {
-                (*category).to_owned()
+                category.to_owned()
             } else {
                 format!("{category} {shortcut}")
             };
@@ -19083,16 +19268,15 @@ fn display_shortcut_label(label: String) -> String {
     label.replace("Ctrl+/", "hold Ctrl, press /")
 }
 
-fn workspace_action_hint(workspace: Workspace) -> &'static str {
-    match workspace {
-        Workspace::Cards => {
-            "Insert: New Scene · ↑/↓ select · Ctrl+↑/↓ reorder · Space include/exclude · Enter open · Edit > Move Scene chooses a chapter"
-        }
-        Workspace::Outline => {
-            "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Move Item Up/Down"
-        }
-        Workspace::Editor => "Esc: Outline",
-        _ => "Tab: next primary view · Shift+Tab: previous",
+fn workspace_action_hint(state: &AppState) -> String {
+    match state.workspace {
+        Workspace::Cards => format!(
+            "{}: Include/Exclude · ↑/↓ select · Ctrl+↑/↓ move · Enter write",
+            effective_shortcut_label(state, "scene.toggle-inclusion", "Space")
+        ),
+        Workspace::Outline => "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Move Item Up/Down".into(),
+        Workspace::Editor => "Esc: Outline".into(),
+        _ => "Tab: next primary view · Shift+Tab: previous".into(),
     }
 }
 
@@ -20366,19 +20550,19 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             } else {
                 "navigation"
             };
-            let pane_hint = if s.workspace == Workspace::Editor {
+            let pane_hint: String = if s.workspace == Workspace::Editor {
                 if s.reference_focused
                     && s.active_reference_pane()
                         .is_some_and(|pane| pane.proofreading.is_some())
                 {
-                    "↑/↓ finding · a apply · i ignore · Esc manuscript"
+                    "↑/↓ finding · a apply · i ignore · Esc manuscript".into()
                 } else if !s.reference_panes.is_empty() && !s.reference_panes_hidden {
-                    "Ctrl+Tab panes"
+                    "Ctrl+Tab panes".into()
                 } else {
-                    "Esc outline"
+                    "Esc outline".into()
                 }
             } else {
-                workspace_action_hint(s.workspace)
+                workspace_action_hint(s)
             };
             let status = if let Some(tutorial) = tutorial_footer_status(s) {
                 format!(
@@ -20418,13 +20602,19 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             if let Some(tutorial) = tutorial_footer_status(s) {
                 format!(
                     " {tutorial} · F10 Menu · {} · {}{}",
-                    workspace_action_hint(s.workspace),
+                    workspace_action_hint(s),
                     if s.dirty { "unsaved" } else { "saved" },
                     if s.message.is_empty() {
                         String::new()
                     } else {
                         format!(" · {}", s.message)
                     }
+                )
+            } else if s.workspace == Workspace::Cards {
+                format!(
+                    " {} · {}",
+                    workspace_action_hint(s),
+                    if s.dirty { "[UNSAVED]" } else { "[SAVED]" }
                 )
             } else {
                 format!(
@@ -20504,19 +20694,19 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 ),
                 top[1],
             );
-            let pane_hint = if s.workspace == Workspace::Editor {
+            let pane_hint: String = if s.workspace == Workspace::Editor {
                 if s.reference_focused
                     && s.active_reference_pane()
                         .is_some_and(|pane| pane.proofreading.is_some())
                 {
-                    "↑/↓ finding · a apply · i ignore · Esc manuscript"
+                    "↑/↓ finding · a apply · i ignore · Esc manuscript".into()
                 } else if !s.reference_panes.is_empty() && !s.reference_panes_hidden {
-                    "Ctrl+Tab: Reference · Esc: Outline"
+                    "Ctrl+Tab: Reference · Esc: Outline".into()
                 } else {
-                    "Esc: Outline"
+                    "Esc: Outline".into()
                 }
             } else {
-                workspace_action_hint(s.workspace)
+                workspace_action_hint(s)
             };
             let menu_hint = display_shortcut_label(effective_shortcut_label(s, "menu.main", "F10"));
             let actions = if let Some(tutorial) = tutorial_footer_status(s) {
@@ -22082,7 +22272,10 @@ fn menu_command_row(state: &AppState, command: CommandSpec, width: usize) -> Str
         mnemonic,
         arguments
     );
-    let shortcuts = effective_command_shortcuts(state, command);
+    let mut shortcuts = effective_command_shortcuts(state, command);
+    if command.id == "scene.toggle-inclusion" && shortcuts.is_empty() {
+        shortcuts.push("Space".into());
+    }
     let shortcut = match shortcuts.as_slice() {
         [] => String::new(),
         [single] => format!(" ({single})"),
@@ -26899,7 +27092,14 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.message = error.to_string();
             }
         }
-        KeyCode::Char(' ') if s.workspace == Workspace::Cards && k.modifiers.is_empty() => {
+        KeyCode::Char(' ')
+            if s.workspace == Workspace::Cards
+                && k.modifiers.is_empty()
+                && !s
+                    .command_bindings
+                    .iter()
+                    .any(|(_, command_id)| command_id == "scene.toggle-inclusion") =>
+        {
             if let Err(error) = s.toggle_scene_card_inclusion() {
                 s.message = error.to_string();
             }
@@ -27078,7 +27278,7 @@ mod tests {
         state.workspace = Workspace::Outline;
         assert_eq!(detail_panel_title(&state), "Selected outline item");
         assert_eq!(
-            workspace_action_hint(state.workspace),
+            workspace_action_hint(&state),
             "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Move Item Up/Down"
         );
 
@@ -27091,7 +27291,143 @@ mod tests {
         state.proposal_review_active = true;
         assert_eq!(detail_panel_title(&state), "Proposed story information");
 
-        assert_eq!(workspace_action_hint(Workspace::Editor), "Esc: Outline");
+        state.workspace = Workspace::Editor;
+        assert_eq!(workspace_action_hint(&state), "Esc: Outline");
+    }
+
+    #[test]
+    fn scene_menu_is_contextual_and_exposes_reversible_scene_actions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.workspace = Workspace::Outline;
+
+        let regular_menus = visible_menu_category_indices(&state);
+        assert!(!regular_menus.contains(&SCENE_MENU_INDEX));
+        assert!(
+            regular_menus.contains(&6),
+            "Publish remains in manuscript workspaces"
+        );
+
+        state.open_menu_category(SCENE_MENU_INDEX);
+        assert_eq!(state.workspace, Workspace::Cards);
+        let card_menus = visible_menu_category_indices(&state);
+        assert!(card_menus.contains(&SCENE_MENU_INDEX));
+        assert!(
+            !card_menus.contains(&6),
+            "Publish is contextual to manuscript workspaces"
+        );
+        let bar = menu_bar_line(&state, 80)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(bar.contains("Scene"), "{bar}");
+        assert!(!bar.contains("Publish"), "{bar}");
+
+        state.selected = scene_card_ids(&state)
+            .iter()
+            .position(|id| *id == second)
+            .unwrap();
+        let entries = state.menu_visible_entries();
+        for label in [
+            "New Scene",
+            "Write Selected Scene",
+            "Rename Selected Scene",
+            "Edit Scene Synopsis",
+            "Move Scene Up",
+            "Move Scene Down",
+            "Move Scene",
+            "Include / Exclude Scene",
+        ] {
+            assert!(
+                entries.iter().any(|entry| entry.label == label),
+                "missing {label}"
+            );
+        }
+        let inclusion = entries
+            .iter()
+            .find(|entry| entry.id == "scene.toggle-inclusion")
+            .copied()
+            .unwrap();
+        assert!(menu_command_row(&state, inclusion, 48).contains("Space"));
+        assert!(workspace_action_hint(&state).starts_with("Space: Include/Exclude"));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Space: Include/Exclude"), "{screen}");
+
+        state.menu.as_mut().unwrap().selected = entries
+            .iter()
+            .position(|entry| entry.id == "scene.toggle-inclusion")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!state.app.scene_is_included(second).unwrap());
+        assert!(state.app.scene_is_included(first).unwrap());
+
+        state.open_menu_category(SCENE_MENU_INDEX);
+        let entries = state.menu_visible_entries();
+        state.menu.as_mut().unwrap().selected = entries
+            .iter()
+            .position(|entry| entry.id == "scene.rename")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.mode, Some('R'));
+        state.prompt = "Renamed Second".into();
+        state.command().unwrap();
+        assert_eq!(
+            state.app.get_scene(second).unwrap().scene.title,
+            "Renamed Second"
+        );
+
+        state.open_menu_category(SCENE_MENU_INDEX);
+        let entries = state.menu_visible_entries();
+        state.menu.as_mut().unwrap().selected = entries
+            .iter()
+            .position(|entry| entry.id == "scene.field")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.mode, Some('Y'));
+        state.prompt = "Mara reaches the station".into();
+        state.command().unwrap();
+        assert_eq!(
+            state.app.get_scene(second).unwrap().scene.synopsis,
+            "Mara reaches the station"
+        );
+        state.command_bindings.push((
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            "scene.toggle-inclusion".into(),
+        ));
+        assert!(workspace_action_hint(&state).starts_with("I: Include/Exclude"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!state.app.scene_is_included(second).unwrap());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.app.scene_is_included(second).unwrap());
     }
 
     #[test]
@@ -36836,9 +37172,14 @@ mod tests {
             MENU_CATEGORIES,
             [
                 "File", "Edit", "Insert", "Navigate", "View", "Review", "Publish", "Tools", "Help",
+                "Scene",
             ]
         );
         for category in MENU_CATEGORIES {
+            if category == "Scene" {
+                assert!(command_by_id("menu.scene").is_some());
+                continue;
+            }
             let commands = command_registry()
                 .into_iter()
                 .filter(|command| command.id != "menu.main" && menu_category(command) == category)
@@ -36899,16 +37240,26 @@ mod tests {
 
         for (top, category) in MENU_CATEGORIES.iter().enumerate() {
             for id in MENU_COMMON_COMMANDS[top] {
+                if top == SCENE_MENU_INDEX {
+                    assert!(
+                        command_by_id(id).is_some(),
+                        "Scene action {id} is unregistered"
+                    );
+                    continue;
+                }
                 assert!(
                     command_by_id(id).is_some_and(|command| menu_category(&command) == *category),
                     "{category} curated action {id} is unregistered or miscategorized"
                 );
             }
+            if top == SCENE_MENU_INDEX {
+                state.workspace = Workspace::Cards;
+            }
             state.menu = Some(MenuState { top, selected: 0 });
             let entries = state.menu_visible_entries();
             let ids = entries.iter().map(|command| command.id).collect::<Vec<_>>();
             let mut expected = MENU_COMMON_COMMANDS[top].to_vec();
-            if category != &"Tools" && category != &"Help" {
+            if top != SCENE_MENU_INDEX && category != &"Tools" && category != &"Help" {
                 expected.push("command.palette-open");
             }
             assert_eq!(
@@ -37248,8 +37599,27 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         for category in MENU_CATEGORIES {
+            if category == "Scene" {
+                assert!(
+                    !wide.contains(category),
+                    "Scene is contextual to fiction cards"
+                );
+                continue;
+            }
             assert!(wide.contains(category), "missing menu root {category}");
         }
+        let chapter = state.app.create_chapter(None, "Chapter", 0).unwrap();
+        state.app.create_scene(chapter, "Scene", 0).unwrap();
+        state.refresh().unwrap();
+        state.workspace = Workspace::Cards;
+        let cards = menu_bar_line(&state, 80)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(cards.contains("Scene"), "{cards}");
+        assert!(!cards.contains("Publish"), "{cards}");
+        state.workspace = Workspace::Dashboard;
         let narrow = menu_bar_line(&state, 40)
             .spans
             .iter()
