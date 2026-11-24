@@ -10936,6 +10936,86 @@ impl AppState {
                 "Restored {} ‘{}’ to its original place",
                 dialog.kind, dialog.title
             )
+        } else if dialog.can_rehome_scenes && dialog.choice == 0 {
+            format!(
+                "Removed chapter ‘{}’ · {} scene(s) moved to Unplaced{} · recoverable",
+                dialog.title,
+                dialog.scene_count,
+                if dialog.content_unit_count > 0 {
+                    format!(
+                        " · {} prose document(s) retained in Removed Documents",
+                        dialog.content_unit_count
+                    )
+                } else {
+                    String::new()
+                }
+            )
+        } else if dialog.can_rehome_scenes && dialog.choice == 1 {
+            let destination = dialog
+                .target_chapters
+                .get(dialog.target_index)
+                .and_then(|target| {
+                    self.app
+                        .list_structural_nodes()
+                        .ok()?
+                        .into_iter()
+                        .find(|node| node.id == *target)
+                        .map(|node| node.title)
+                })
+                .unwrap_or_else(|| "selected chapter".into());
+            format!(
+                "Removed chapter ‘{}’ · {} scene(s) moved to ‘{}’{} · recoverable",
+                dialog.title,
+                dialog.scene_count,
+                destination,
+                if dialog.content_unit_count > 0 {
+                    format!(
+                        " · {} prose document(s) retained in Removed Documents",
+                        dialog.content_unit_count
+                    )
+                } else {
+                    String::new()
+                }
+            )
+        } else if dialog.can_promote_children && dialog.choice == 0 {
+            format!(
+                "Removed section ‘{}’ · child sections promoted to parent{} · recoverable",
+                dialog.title,
+                if dialog.content_unit_count > 0 {
+                    format!(
+                        " · {} prose document(s) retained in Removed Documents",
+                        dialog.content_unit_count
+                    )
+                } else {
+                    String::new()
+                }
+            )
+        } else if dialog.can_promote_children && dialog.choice == 1 {
+            let destination = dialog
+                .target_sections
+                .get(dialog.target_section_index)
+                .and_then(|target| {
+                    self.app
+                        .list_structural_nodes()
+                        .ok()?
+                        .into_iter()
+                        .find(|node| node.id == *target)
+                        .map(|node| node.title)
+                })
+                .unwrap_or_else(|| "selected section".into());
+            format!(
+                "Removed section ‘{}’ · child sections moved to ‘{}’{} · recoverable",
+                dialog.title,
+                destination,
+                if dialog.content_unit_count > 0 {
+                    format!(
+                        " · {} prose document(s) retained in Removed Documents",
+                        dialog.content_unit_count
+                    )
+                } else {
+                    String::new()
+                }
+            )
         } else {
             format!(
                 "Moved {} ‘{}’ and its contents to Removed Documents · identity retained",
@@ -42321,6 +42401,12 @@ mod tests {
         state
             .finish_structural_node_removal(dialog.clone())
             .unwrap();
+        assert!(state.message.contains("1 scene(s) moved to Unplaced"));
+        assert!(
+            state
+                .message
+                .contains("1 prose document(s) retained in Removed Documents")
+        );
         assert!(
             state
                 .app
@@ -42525,6 +42611,12 @@ mod tests {
         state
             .finish_structural_node_removal(dialog.clone())
             .unwrap();
+        assert!(state.message.contains("child sections promoted to parent"));
+        assert!(
+            state
+                .message
+                .contains("1 prose document(s) retained in Removed Documents")
+        );
         assert_eq!(
             state
                 .app
