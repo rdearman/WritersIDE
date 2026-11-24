@@ -866,6 +866,8 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
     &[
         "search.find-panel",
         "search.replace-panel",
+        "edit.bold-selection",
+        "edit.italic-selection",
         "scene.rename",
         "scene.status",
         "scene.move",
@@ -1431,6 +1433,8 @@ enum CommandAction {
     CompileWorkflow,
     ToggleFormattingMarks,
     ToggleRenderedMarkdown,
+    ToggleBoldSelection,
+    ToggleItalicSelection,
     ToggleSceneInclusion,
     WriteSelectedChapter,
     MoveOutlineUp,
@@ -2256,6 +2260,36 @@ fn command_registry() -> Vec<CommandSpec> {
             "subchapter",
             true,
         ),
+        CommandSpec {
+            id: "edit.bold-selection",
+            label: "Bold Selection",
+            description: "Apply or remove bold formatting on the selected prose",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["bold", "strong text"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ToggleBoldSelection,
+            task_group: "Editor Formatting",
+            menu_priority: 12,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "edit.italic-selection",
+            label: "Italic Selection",
+            description: "Apply or remove italic formatting on the selected prose",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["italic", "emphasis"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ToggleItalicSelection,
+            task_group: "Editor Formatting",
+            menu_priority: 13,
+            advanced: false,
+        },
         legacy_command(
             "structure.section",
             "New Section",
@@ -12449,6 +12483,8 @@ impl AppState {
                     "Markdown source shown · manuscript source is unchanged".into()
                 };
             }
+            CommandAction::ToggleBoldSelection => self.toggle_inline_format("**", "bold")?,
+            CommandAction::ToggleItalicSelection => self.toggle_inline_format("*", "italic")?,
             CommandAction::ToggleSceneInclusion => self.toggle_scene_card_inclusion()?,
             CommandAction::WriteSelectedChapter => self.write_selected_chapter()?,
             CommandAction::MoveOutlineUp => self.move_selected_outline_item(false)?,
@@ -18837,6 +18873,91 @@ impl AppState {
         }
         self.dirty = true;
         self.update_narrowed_passage(&before);
+        Ok(())
+    }
+    fn toggle_inline_format(
+        &mut self,
+        marker: &str,
+        label: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some((start_position, end_position)) = self.selection_bounds() else {
+            self.message = format!("Select prose to apply {label} formatting");
+            return Ok(());
+        };
+        let source = self.editor.join("\n");
+        let selection_start =
+            editor_position_byte(&self.editor, start_position.0, start_position.1);
+        let selection_end = editor_position_byte(&self.editor, end_position.0, end_position.1);
+        if selection_start >= selection_end || selection_end > source.len() {
+            self.message = format!("Select prose to apply {label} formatting");
+            return Ok(());
+        }
+        let selected = &source[selection_start..selection_end];
+        let leading = selected.len() - selected.trim_start().len();
+        let formatted_end = selected.trim_end().len();
+        let mut start = selection_start + leading;
+        let mut end = selection_start + formatted_end;
+        if start >= end {
+            self.message = format!("Select non-whitespace prose to apply {label} formatting");
+            return Ok(());
+        }
+
+        let mut updated = source.clone();
+        let selected_text = &source[start..end];
+        let delimiter_run_matches = |before: usize, after: usize| {
+            if marker == "*" {
+                before % 2 == 1 && after % 2 == 1
+            } else {
+                before >= marker.len() && after >= marker.len()
+            }
+        };
+        let selected_leading_run = selected_text.chars().take_while(|ch| *ch == '*').count();
+        let selected_trailing_run = selected_text
+            .chars()
+            .rev()
+            .take_while(|ch| *ch == '*')
+            .count();
+        let remove_selected_wrapper =
+            delimiter_run_matches(selected_leading_run, selected_trailing_run)
+                && selected_leading_run >= marker.len()
+                && selected_trailing_run >= marker.len();
+        let adjacent_leading_run = source[..start]
+            .chars()
+            .rev()
+            .take_while(|ch| *ch == '*')
+            .count();
+        let adjacent_trailing_run = source[end..].chars().take_while(|ch| *ch == '*').count();
+        let remove_adjacent_wrapper =
+            delimiter_run_matches(adjacent_leading_run, adjacent_trailing_run)
+                && adjacent_leading_run >= marker.len()
+                && adjacent_trailing_run >= marker.len();
+        if remove_selected_wrapper {
+            updated.replace_range(end - marker.len()..end, "");
+            updated.replace_range(start..start + marker.len(), "");
+            end -= marker.len() * 2;
+        } else if remove_adjacent_wrapper {
+            updated.replace_range(end..end + marker.len(), "");
+            updated.replace_range(start - marker.len()..start, "");
+            start -= marker.len();
+            end -= marker.len();
+        } else {
+            updated.insert_str(end, marker);
+            updated.insert_str(start, marker);
+            start += marker.len();
+            end += marker.len();
+        }
+
+        self.push_undo();
+        self.editor = updated.split('\n').map(str::to_owned).collect();
+        let selection_start = editor_position_from_byte(&updated, start)
+            .ok_or("formatted selection start is not a grapheme boundary")?;
+        let selection_end = editor_position_from_byte(&updated, end)
+            .ok_or("formatted selection end is not a grapheme boundary")?;
+        self.editor_selection = Some(selection_start);
+        self.cursor = selection_end;
+        self.dirty = true;
+        self.update_narrowed_passage(&source);
+        self.message = format!("{label} formatting updated · manuscript stored as Markdown");
         Ok(())
     }
     fn update_narrowed_passage(&mut self, old_text: &str) {
@@ -43508,5 +43629,88 @@ mod tests {
 
         let database_source = state.app.load_scene_text(scene).unwrap().0;
         assert_eq!(database_source, original_source);
+    }
+
+    #[test]
+    fn semantic_format_commands_edit_selected_prose_and_remain_undoable_in_rendered_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 10).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let source = "A **bold** and *italic* line.";
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), source).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.dirty = false;
+        state.editor_preferences.rendered_markdown = true;
+
+        let bold = command_by_id("edit.bold-selection").unwrap();
+        let italic = command_by_id("edit.italic-selection").unwrap();
+        assert_eq!(bold.category, "Edit");
+        assert_eq!(italic.category, "Edit");
+        let edit_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Edit")
+            .unwrap();
+        assert!(MENU_COMMON_COMMANDS[edit_menu].contains(&bold.id));
+        assert!(MENU_COMMON_COMMANDS[edit_menu].contains(&italic.id));
+        assert!(bold.default_shortcuts.is_empty());
+        assert!(italic.default_shortcuts.is_empty());
+
+        let start = source.find("bold").unwrap();
+        let end = start + "bold".len();
+        state.editor_selection = Some(editor_position_from_byte(source, start).unwrap());
+        state.cursor = editor_position_from_byte(source, end).unwrap();
+        state
+            .dispatch_registered(CommandAction::ToggleItalicSelection)
+            .unwrap();
+        assert_eq!(state.editor.join("\n"), "A ***bold*** and *italic* line.");
+        assert_eq!(state.selection_bounds(), Some(((0, 5), (0, 9))));
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("bold"));
+        assert!(!screen.contains("***"));
+
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), source);
+        assert!(state.dirty, "undo remains an unsaved manuscript change");
+        state
+            .dispatch_registered(CommandAction::ToggleItalicSelection)
+            .unwrap();
+        state.save().unwrap();
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "A ***bold*** and *italic* line."
+        );
+
+        state
+            .dispatch_registered(CommandAction::ToggleItalicSelection)
+            .unwrap();
+        assert_eq!(state.editor.join("\n"), source);
+        state.save().unwrap();
+        assert_eq!(state.app.load_scene_text(scene).unwrap().0, source);
+
+        state
+            .dispatch_registered(CommandAction::ToggleBoldSelection)
+            .unwrap();
+        assert_eq!(state.editor.join("\n"), "A bold and *italic* line.");
+        state.save().unwrap();
+
+        let reopened = WriterApp::open_project(&project).unwrap();
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "A bold and *italic* line."
+        );
     }
 }
