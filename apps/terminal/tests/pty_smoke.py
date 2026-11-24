@@ -25,6 +25,7 @@ def main():
     binary, project, isolated_home, *modes = sys.argv[1:]
     create_fiction = modes == ["create-fiction"]
     previous_position = modes == ["previous-position"]
+    removal_dialogs = modes == ["removal-dialogs"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
     child_pid, master = pty.fork()
@@ -191,8 +192,12 @@ def main():
             os.write(master, b"\x1b")
             read_for(0.3)
             os.write(master, b"\x11")
-            read_for(1.0)
-            finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
             if (
                 finished_pid != child_pid
                 or not os.WIFEXITED(status)
@@ -200,6 +205,63 @@ def main():
             ):
                 raise AssertionError("application did not remain usable and quit cleanly")
             print("PTY navigation regression passed: empty Previous Position is nonfatal; menu and quit remain usable.")
+            return
+
+        if removal_dialogs:
+            # Navigate to Scene Cards through the actual menu and open its
+            # recoverable removal dialogue with the list Delete key.
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 2 + b"\r")
+            if not wait_for(b"Scene Cards", timeout=3.0):
+                raise AssertionError("Navigate > Scene Cards did not open the card list")
+            scene_dialog_start = len(output)
+            os.write(master, b"\x1b[3~")  # Delete
+            if not wait_for_fragments(
+                (b"Remove", b"Scene", b"Arrival", b"Enter/Y confirms", b"Esc/N cancels"),
+                scene_dialog_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "Scene Cards Delete did not show the recoverable confirmation; output tail: "
+                    + repr(bytes(output[-2200:]))
+                )
+            os.write(master, b"\x1b")  # cancel; the scene must remain untouched
+            read_for(0.3)
+
+            # Navigate to Reference Library and verify it has its own
+            # read-only-source-aware confirmation.
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 3 + b"\r")
+            if not wait_for_fragments((b"Field", b"Notes", b"ReferenceLibrary"), timeout=3.0):
+                raise AssertionError(
+                    "Navigate > Reference did not open the imported reference list; visible output tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-2600:]))
+                )
+            reference_dialog_start = len(output)
+            os.write(master, b"\x1b[3~")
+            if not wait_for_fragments(
+                (b"Remove", b"Reference", b"Field", b"Notes", b"source", b"preserved", b"Esc/N cancels"),
+                reference_dialog_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "Reference Library Delete did not show the source-preserving confirmation; output tail: "
+                    + repr(bytes(output[-2200:]))
+                )
+            os.write(master, b"\x1b")
+            read_for(0.3)
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after cancelling removal dialogues")
+            print("PTY removal workflow passed: scene/reference Delete dialogs are visible, cancellable and preserve content.")
             return
 
         # Exercise the actual F10 route instead of calling AppState handlers

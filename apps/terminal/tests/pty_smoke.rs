@@ -130,3 +130,60 @@ fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn scene_and_reference_removal_dialogues_are_cancellable_in_a_real_pty() {
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Removal Project");
+    let source = root.path().join("Field Notes.txt");
+    std::fs::write(&source, "A read-only field reference.").unwrap();
+    let mut app = WriterApp::create_project(&project, "Removal Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "The traveler arrives.")
+        .unwrap();
+    let reference = story_reading::import_reference(&source).unwrap();
+    let reference_id = app
+        .import_reading_document(&reference, source.to_str().unwrap())
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY removal workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("removal-dialogs")
+        .output()
+        .expect("run the Linux PTY removal-dialog workflow");
+    assert!(
+        result.status.success(),
+        "PTY removal workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert!(!reopened.get_scene(scene).unwrap().scene.archived);
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "The traveler arrives."
+    );
+    let active_references = reopened.list_reading_documents().unwrap();
+    assert_eq!(active_references.len(), 1);
+    assert_eq!(active_references[0].id, reference_id);
+    assert_eq!(
+        std::fs::read_to_string(source).unwrap(),
+        "A read-only field reference."
+    );
+}
