@@ -203,6 +203,8 @@ struct StructuralNodeRemovalDialog {
     content_unit_words: u64,
     can_rehome_scenes: bool,
     can_promote_children: bool,
+    target_sections: Vec<story_core::NodeId>,
+    target_section_index: usize,
     target_chapters: Vec<story_core::NodeId>,
     target_index: usize,
     choice: usize,
@@ -10796,6 +10798,16 @@ impl AppState {
             && self.app.get_project()?.book_type == story_core::BookType::Nonfiction
             && node.kind == "section"
             && direct_children > 0;
+        let target_sections = active_nodes
+            .iter()
+            .filter(|candidate| {
+                candidate.kind == "section"
+                    && candidate.id != id
+                    && Some(candidate.id) != node.parent_id
+                    && !subtree_ids.contains(&candidate.id)
+            })
+            .map(|candidate| candidate.id)
+            .collect();
         let target_chapters = active_nodes
             .iter()
             .filter(|candidate| {
@@ -10820,6 +10832,8 @@ impl AppState {
             content_unit_words: units.iter().map(|unit| u64::from(unit.actual_words)).sum(),
             can_rehome_scenes,
             can_promote_children,
+            target_sections,
+            target_section_index: 0,
             target_chapters,
             target_index: 0,
             choice: if can_rehome_scenes || can_promote_children {
@@ -10848,6 +10862,17 @@ impl AppState {
                 .remove_chapter_rehome_scenes(dialog.id, Some(target))?;
         } else if dialog.can_promote_children && dialog.choice == 0 {
             self.app.promote_section_children(dialog.id)?;
+        } else if dialog.can_promote_children && dialog.choice == 1 {
+            let Some(target) = dialog
+                .target_sections
+                .get(dialog.target_section_index)
+                .copied()
+            else {
+                self.message = "Create another section before moving these subsections".into();
+                return Ok(());
+            };
+            self.app
+                .promote_section_children_to(dialog.id, Some(target))?;
         } else {
             self.app.archive_structural_subtree(dialog.id)?;
         }
@@ -24538,17 +24563,34 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
         } else if dialog.can_promote_children {
             lines.push(Line::from("Choose how to handle this non-fiction section:"));
             lines.push(Line::from(format!(
-                "{} Promote child sections; retain this heading and its prose in Removed Documents",
+                "{} Promote child sections to the current parent level",
                 if dialog.choice == 0 { ">" } else { " " }
             )));
             lines.push(Line::from(format!(
+                "{} Move child sections to another section… {}",
+                if dialog.choice == 1 { ">" } else { " " },
+                dialog
+                    .target_sections
+                    .get(dialog.target_section_index)
+                    .and_then(|target| s
+                        .app
+                        .list_structural_nodes()
+                        .ok()?
+                        .into_iter()
+                        .find(|node| node.id == *target)
+                        .map(|node| node.title))
+                    .unwrap_or_else(|| "No compatible destination".into())
+            )));
+            lines.push(Line::from(format!(
                 "{} Delete the whole subtree recoverably",
-                if dialog.choice == 1 { ">" } else { " " }
+                if dialog.choice == 2 { ">" } else { " " }
             )));
             lines.push(Line::from(
-                "Promotion preserves child order and IDs. The removed heading and owned prose remain recoverable.",
+                "Child order and IDs are preserved. The removed heading and its prose remain recoverable in Removed Documents.",
             ));
-            lines.push(Line::from("Up/Down choose · Enter confirm · Esc cancel"));
+            lines.push(Line::from(
+                "Up/Down choose · Left/Right destination · Enter confirm · Esc cancel",
+            ));
         } else {
             lines.push(Line::from(
                 "The entire heading subtree, scenes and prose will be retained in Removed Documents.",
@@ -27913,7 +27955,11 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
             KeyCode::Down if dialog.can_rehome_scenes || dialog.can_promote_children => {
                 if let Some(active) = s.pending_structural_node_removal.as_mut() {
-                    let max_choice = if active.can_rehome_scenes { 2 } else { 1 };
+                    let max_choice = if active.can_rehome_scenes || active.can_promote_children {
+                        2
+                    } else {
+                        0
+                    };
                     active.choice = (active.choice + 1).min(max_choice);
                 }
             }
@@ -27931,6 +27977,23 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                             .target_index
                             .checked_sub(1)
                             .unwrap_or(active.target_chapters.len() - 1);
+                    }
+                }
+            }
+            KeyCode::Left | KeyCode::Right
+                if dialog.can_promote_children
+                    && dialog.choice == 1
+                    && !dialog.target_sections.is_empty() =>
+            {
+                if let Some(active) = s.pending_structural_node_removal.as_mut() {
+                    if k.code == KeyCode::Right {
+                        active.target_section_index =
+                            (active.target_section_index + 1) % active.target_sections.len();
+                    } else {
+                        active.target_section_index = active
+                            .target_section_index
+                            .checked_sub(1)
+                            .unwrap_or(active.target_sections.len() - 1);
                     }
                 }
             }
@@ -42109,6 +42172,76 @@ mod tests {
             .unwrap()
             .validate_project()
             .unwrap();
+    }
+
+    #[test]
+    fn nonfiction_section_removal_can_move_subsections_to_selected_destination() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut app =
+            WriterApp::create_project_with_type(&project, "Book", story_core::BookType::Nonfiction)
+                .unwrap();
+        let source_parent = app
+            .create_structural_node(None, story_core::NodeKind::Section, "Source Part", 0)
+            .unwrap();
+        let removed = app
+            .create_structural_node(
+                Some(source_parent),
+                story_core::NodeKind::Section,
+                "Removed Heading",
+                0,
+            )
+            .unwrap();
+        let child = app
+            .create_structural_node(
+                Some(removed),
+                story_core::NodeKind::Section,
+                "Subsection",
+                0,
+            )
+            .unwrap();
+        let destination = app
+            .create_structural_node(None, story_core::NodeKind::Section, "Destination Part", 1)
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Section { id, .. } if *id == removed))
+            .unwrap();
+        state.begin_structural_node_removal(false).unwrap();
+        let dialog = state.pending_structural_node_removal.as_mut().unwrap();
+        assert_eq!(dialog.target_sections, vec![destination]);
+        dialog.choice = 1;
+        let dialog = dialog.clone();
+        state.finish_structural_node_removal(dialog).unwrap();
+        assert_eq!(
+            state
+                .app
+                .list_structural_nodes()
+                .unwrap()
+                .into_iter()
+                .find(|node| node.id == child)
+                .unwrap()
+                .parent_id,
+            Some(destination)
+        );
+        state
+            .app
+            .restore_latest_structural_removal(removed)
+            .unwrap();
+        assert_eq!(
+            state
+                .app
+                .list_structural_nodes()
+                .unwrap()
+                .into_iter()
+                .find(|node| node.id == child)
+                .unwrap()
+                .parent_id,
+            Some(removed)
+        );
     }
 
     #[test]
