@@ -183,6 +183,13 @@ struct SceneRemovalDialog {
     restoring: bool,
 }
 
+#[derive(Clone, Debug)]
+struct ContentUnitRemovalDialog {
+    id: story_core::ContentUnitId,
+    title: String,
+    restoring: bool,
+}
+
 struct AppState {
     app: WriterApp,
     temporary_project: bool,
@@ -235,6 +242,8 @@ struct AppState {
     pending_reading_removal: Option<ReadingRemovalDialog>,
     removed_scenes_list: bool,
     pending_scene_removal: Option<SceneRemovalDialog>,
+    removed_content_units_list: bool,
+    pending_content_unit_removal: Option<ContentUnitRemovalDialog>,
     function_bindings: Vec<(u8, Workspace)>,
     command_bindings: CommandBindings,
     context_command_bindings: Vec<ContextCommandBinding>,
@@ -894,6 +903,9 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "comment.create",
         "outline.move-up",
         "outline.move-down",
+        "document.remove-content-unit",
+        "document.removed-content-units",
+        "document.restore-content-unit",
     ],
     &[
         "structure.section",
@@ -1468,6 +1480,9 @@ enum CommandAction {
     ArchiveSelectedScene,
     ShowRemovedScenes,
     RestoreSelectedScene,
+    ArchiveSelectedContentUnit,
+    ShowRemovedContentUnits,
+    RestoreSelectedContentUnit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2451,6 +2466,51 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::RestoreSelectedScene,
             task_group: "Scene Cards",
             menu_priority: 6,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "document.remove-content-unit",
+            label: "Move Prose Document to Removed",
+            description: "Reversibly remove selected chapter or section prose while retaining its identity and text",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["remove chapter prose", "archive prose document"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ArchiveSelectedContentUnit,
+            task_group: "Outline",
+            menu_priority: 18,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "document.removed-content-units",
+            label: "Show Removed Prose Documents",
+            description: "Browse removed chapter and section prose documents",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["removed prose", "removed content units"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ShowRemovedContentUnits,
+            task_group: "Outline",
+            menu_priority: 19,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "document.restore-content-unit",
+            label: "Restore Selected Prose Document",
+            description: "Restore removed chapter or section prose to its original location",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["restore chapter prose", "restore prose document"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::RestoreSelectedContentUnit,
+            task_group: "Outline",
+            menu_priority: 20,
             advanced: false,
         },
         legacy_command(
@@ -6204,6 +6264,8 @@ impl AppState {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -10551,6 +10613,91 @@ impl AppState {
         };
         Ok(())
     }
+    fn toggle_removed_content_units(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace != Workspace::Outline {
+            self.switch(Workspace::Outline);
+        }
+        self.removed_content_units_list = !self.removed_content_units_list;
+        self.selected = 0;
+        self.message = if self.removed_content_units_list {
+            "Removed Prose Documents · select a document and choose Restore Selected Prose Document"
+                .into()
+        } else {
+            "Outline · chapters and sections · chapter prose remains independent of scenes".into()
+        };
+        Ok(())
+    }
+    fn begin_content_unit_removal(
+        &mut self,
+        restoring: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace != Workspace::Outline {
+            self.message = "Open Outline and select a prose document first".into();
+            return Ok(());
+        }
+        if restoring != self.removed_content_units_list {
+            self.message = if restoring {
+                "Show Removed Prose Documents and select one to restore".into()
+            } else {
+                "Select chapter or section prose in Outline first".into()
+            };
+            return Ok(());
+        }
+        let Some(OutlineRow::ContentUnit(id)) = outline_rows(self).get(self.selected).cloned()
+        else {
+            self.message = "Select a chapter or section prose document first".into();
+            return Ok(());
+        };
+        if self.dirty && self.editing_content_unit == Some(id) {
+            self.message = "Save or cancel this document's unsaved edits before removing it".into();
+            return Ok(());
+        }
+        let unit = self.app.get_content_unit(id)?;
+        self.pending_content_unit_removal = Some(ContentUnitRemovalDialog {
+            id,
+            title: unit.title,
+            restoring,
+        });
+        Ok(())
+    }
+    fn finish_content_unit_removal(
+        &mut self,
+        dialog: ContentUnitRemovalDialog,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if dialog.restoring {
+            self.app.restore_archived_content_unit(dialog.id)?;
+            self.removed_content_units_list = false;
+        } else {
+            self.app.archive_content_unit(dialog.id)?;
+            if self.editing_content_unit == Some(dialog.id) {
+                self.editing_content_unit = None;
+                self.editor.clear();
+                self.saved_hash.clear();
+                self.dirty = false;
+                self.cursor = (0, 0);
+            }
+        }
+        self.pending_content_unit_removal = None;
+        self.selected = self.selected.saturating_sub(usize::from(!dialog.restoring));
+        if dialog.restoring {
+            self.selected = outline_rows(self)
+                .iter()
+                .position(|row| *row == OutlineRow::ContentUnit(dialog.id))
+                .unwrap_or(0);
+        }
+        self.message = if dialog.restoring {
+            format!(
+                "Restored prose document ‘{}’ to its original location",
+                dialog.title
+            )
+        } else {
+            format!(
+                "Moved ‘{}’ to Removed Prose Documents · text and identity preserved",
+                dialog.title
+            )
+        };
+        Ok(())
+    }
     fn open_selected(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.workspace == Workspace::Outline {
             match outline_rows(self).get(self.selected).cloned() {
@@ -11906,6 +12053,42 @@ impl AppState {
                 None
             };
         }
+        if spec.id == "document.remove-content-unit" {
+            return if self.workspace != Workspace::Outline {
+                Some("Open Outline first")
+            } else if self.removed_content_units_list {
+                Some("Return to the active Outline first")
+            } else if !matches!(
+                outline_rows(self).get(self.selected),
+                Some(OutlineRow::ContentUnit(_))
+            ) {
+                Some("Select chapter or section prose first")
+            } else {
+                None
+            };
+        }
+        if spec.id == "document.restore-content-unit" {
+            return if self.workspace != Workspace::Outline || !self.removed_content_units_list {
+                Some("Show Removed Prose Documents first")
+            } else if !matches!(
+                outline_rows(self).get(self.selected),
+                Some(OutlineRow::ContentUnit(_))
+            ) {
+                Some("Select a removed prose document first")
+            } else {
+                None
+            };
+        }
+        if self.workspace == Workspace::Outline
+            && self.removed_content_units_list
+            && spec.id.starts_with("document.")
+            && !matches!(
+                spec.id,
+                "document.removed-content-units" | "document.restore-content-unit"
+            )
+        {
+            return Some("Restore the prose document before changing it");
+        }
         if self.workspace == Workspace::Cards
             && self.removed_scenes_list
             && menu_category(&spec) == "Scene"
@@ -12856,6 +13039,9 @@ impl AppState {
             CommandAction::ArchiveSelectedScene => self.begin_scene_removal(false)?,
             CommandAction::ShowRemovedScenes => self.toggle_removed_scenes()?,
             CommandAction::RestoreSelectedScene => self.begin_scene_removal(true)?,
+            CommandAction::ArchiveSelectedContentUnit => self.begin_content_unit_removal(false)?,
+            CommandAction::ShowRemovedContentUnits => self.toggle_removed_content_units()?,
+            CommandAction::RestoreSelectedContentUnit => self.begin_content_unit_removal(true)?,
             CommandAction::Save => {
                 if self.temporary_project {
                     if let Err(error) = self.start_save_project_as()
@@ -20375,7 +20561,8 @@ fn workspace_action_hint(state: &AppState) -> String {
                 )
             }
         }
-        Workspace::Outline => "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Move Item Up/Down".into(),
+        Workspace::Outline if state.removed_content_units_list => "Removed Prose Documents · ↑/↓ select · Edit > Restore Selected Prose Document · Edit > Show Removed Prose Documents returns".into(),
+        Workspace::Outline => "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Remove/Restore Prose Document · Edit > Move Item Up/Down".into(),
         Workspace::Editor => "Esc: Outline".into(),
         _ => "Tab: next primary view · Shift+Tab: previous".into(),
     }
@@ -22128,6 +22315,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     }
     if s.pending_scene_removal.is_some() {
         draw_scene_removal_overlay(f, s);
+    }
+    if s.pending_content_unit_removal.is_some() {
+        draw_content_unit_removal_overlay(f, s);
     }
     if s.help_panel.is_some() {
         draw_help_overlay(f, s);
@@ -23970,6 +24160,47 @@ fn draw_scene_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     );
 }
 
+fn draw_content_unit_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(dialog) = &s.pending_content_unit_removal else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 76);
+    let height = 7.min(area.height.max(1));
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, rect);
+    let text = Text::from(vec![
+        Line::from(if dialog.restoring {
+            "Restore this prose document to its original chapter or section?"
+        } else {
+            "Move this prose document to Removed Prose Documents?"
+        }),
+        Line::from(truncate_display_cells(
+            &dialog.title,
+            width.saturating_sub(4) as usize,
+        )),
+        Line::from("Its text, identity and original location will be retained."),
+        Line::from("Enter/Y confirms · Esc/N cancels"),
+    ]);
+    f.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title(if dialog.restoring {
+                    " Restore Prose Document "
+                } else {
+                    " Remove Prose Document "
+                })
+                .borders(Borders::ALL),
+        ),
+        rect,
+    );
+}
+
 fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let Some(form) = s.series_form.as_ref() else {
         return;
@@ -25202,6 +25433,17 @@ fn load_proposal_review_rows(app: &WriterApp) -> Result<Vec<String>, Box<dyn std
 }
 
 fn outline_rows(s: &AppState) -> Vec<OutlineRow> {
+    let content_units = s.app.list_content_units(true).unwrap_or_default();
+    let content_units = content_units
+        .into_iter()
+        .filter(|unit| unit.archived == s.removed_content_units_list)
+        .collect::<Vec<_>>();
+    if s.removed_content_units_list {
+        return content_units
+            .into_iter()
+            .map(|unit| OutlineRow::ContentUnit(unit.id))
+            .collect();
+    }
     let nodes = s.app.list_structural_nodes().unwrap_or_default();
     let scenes = s.app.list_scenes(false).unwrap_or_default();
     let visible_ids = s
@@ -25213,7 +25455,6 @@ fn outline_rows(s: &AppState) -> Vec<OutlineRow> {
         .into_iter()
         .filter(|scene| visible_ids.contains(&scene.scene.id))
         .collect::<Vec<_>>();
-    let content_units = s.app.list_content_units(false).unwrap_or_default();
     let mut rows = Vec::new();
     fn append_node(
         node: &story_storage::StructuralNodeSummary,
@@ -25508,7 +25749,8 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                     |_| format!("  <missing content unit {id}>"),
                     |unit| {
                         format!(
-                            "  {} · {} · {} words",
+                            "  {}{} · {} · {} words",
+                            if unit.archived { "Removed · " } else { "" },
                             unit.title,
                             unit.kind.as_str(),
                             unit.actual_words
@@ -27263,6 +27505,19 @@ fn handle_command_palette_key(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(dialog) = s.pending_content_unit_removal.clone() {
+        match k.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                s.finish_content_unit_removal(dialog)?;
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                s.pending_content_unit_removal = None;
+                s.message = "Cancelled · prose document unchanged".into();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if let Some(dialog) = s.pending_scene_removal.clone() {
         match k.code {
             KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
@@ -29103,7 +29358,7 @@ mod tests {
         assert_eq!(detail_panel_title(&state), "Selected outline item");
         assert_eq!(
             workspace_action_hint(&state),
-            "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Move Item Up/Down"
+            "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Remove/Restore Prose Document · Edit > Move Item Up/Down"
         );
 
         state.workspace = Workspace::StoryBible;
@@ -34576,6 +34831,8 @@ mod tests {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38073,6 +38330,8 @@ mod tests {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38221,6 +38480,8 @@ mod tests {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38365,6 +38626,8 @@ mod tests {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38517,6 +38780,8 @@ mod tests {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38819,6 +39084,8 @@ mod tests {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38971,6 +39238,8 @@ mod tests {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -40554,6 +40823,8 @@ mod tests {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -40841,6 +41112,8 @@ mod tests {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -41061,6 +41334,120 @@ mod tests {
         assert!(String::from_utf8_lossy(&compiled.bytes).contains("The truth came to light."));
         assert_eq!(state.app.scene_character_analytics(scene).unwrap().len(), 1);
         assert!(!state.removed_scenes_list);
+    }
+
+    #[test]
+    fn prose_document_removal_and_restoration_preserve_chapter_text_and_compile_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut app = WriterApp::create_project(&project, "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let unit = app
+            .create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "Chapter One",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, hash) = app.load_content_unit_text(unit).unwrap();
+        app.save_content_unit_text(unit, Some(&hash), "The chapter's prose remains intact.")
+            .unwrap();
+
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| *row == OutlineRow::ContentUnit(unit))
+            .unwrap();
+        state.open_menu_category(1);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "document.remove-content-unit")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.pending_content_unit_removal.is_some());
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.app.list_content_units(false).unwrap().len(), 1);
+
+        state.open_menu_category(1);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "document.remove-content-unit")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.app.list_content_units(false).unwrap().is_empty());
+        let compiled = state
+            .app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&compiled.bytes)
+                .contains("The chapter's prose remains intact.")
+        );
+
+        state.open_menu_category(1);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "document.removed-content-units")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.removed_content_units_list);
+        assert_eq!(outline_rows(&state), vec![OutlineRow::ContentUnit(unit)]);
+        state.open_menu_category(1);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "document.restore-content-unit")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert!(!state.removed_content_units_list);
+        let restored = state.app.get_content_unit(unit).unwrap();
+        assert!(!restored.archived);
+        assert_eq!(restored.parent_id, Some(chapter));
+        assert_eq!(
+            state.app.load_content_unit_text(unit).unwrap().0,
+            "The chapter's prose remains intact."
+        );
+        let compiled = state
+            .app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&compiled.bytes)
+                .contains("The chapter's prose remains intact.")
+        );
+        drop(state);
+        let reopened = WriterApp::open_project(&project).unwrap();
+        assert_eq!(reopened.list_content_units(false).unwrap().len(), 1);
+        assert_eq!(
+            reopened.load_content_unit_text(unit).unwrap().0,
+            "The chapter's prose remains intact."
+        );
     }
 
     #[test]
@@ -41467,6 +41854,8 @@ mod tests {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -41630,6 +42019,8 @@ mod tests {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -41845,6 +42236,8 @@ mod tests {
             pending_reading_removal: None,
             removed_scenes_list: false,
             pending_scene_removal: None,
+            removed_content_units_list: false,
+            pending_content_unit_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),

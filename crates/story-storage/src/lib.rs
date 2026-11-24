@@ -2928,6 +2928,60 @@ impl ProjectStore {
             })
             .collect()
     }
+    pub fn archive_content_unit(&mut self, id: ContentUnitId) -> Result<()> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let archived: Option<bool> = transaction
+            .query_row(
+                "SELECT archived FROM content_unit WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match archived {
+            None => return Err(StorageError::NotFound(format!("content unit {id}"))),
+            Some(true) => {
+                return Err(StorageError::Invalid(
+                    "content unit is already in Removed Documents".into(),
+                ));
+            }
+            Some(false) => {}
+        }
+        transaction.execute(
+            "UPDATE content_unit SET archived=1,updated_at=?2 WHERE id=?1",
+            params![id.to_string(), now()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+    pub fn restore_archived_content_unit(&mut self, id: ContentUnitId) -> Result<()> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let archived: Option<bool> = transaction
+            .query_row(
+                "SELECT archived FROM content_unit WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        match archived {
+            None => return Err(StorageError::NotFound(format!("content unit {id}"))),
+            Some(false) => {
+                return Err(StorageError::Invalid(
+                    "content unit is not in Removed Documents".into(),
+                ));
+            }
+            Some(true) => {}
+        }
+        transaction.execute(
+            "UPDATE content_unit SET archived=0,updated_at=?2 WHERE id=?1",
+            params![id.to_string(), now()],
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
     pub fn rename_content_unit(&mut self, id: ContentUnitId, title: &str) -> Result<()> {
         if title.trim().is_empty() {
             return Err(StorageError::Invalid(
@@ -8595,7 +8649,7 @@ impl ProjectStore {
         if terms.trim().is_empty() || limit == 0 {
             return Ok(Vec::new());
         }
-        let mut query = self.conn.prepare("SELECT entity_kind,entity_id,title,snippet(project_search_fts,3,'[',']','…',12) FROM project_search_fts WHERE project_search_fts MATCH ?1 AND (entity_kind<>'reading' OR EXISTS(SELECT 1 FROM reading_document WHERE reading_document.id=project_search_fts.entity_id AND archived=0)) AND (entity_kind<>'scene' OR EXISTS(SELECT 1 FROM scene WHERE scene.id=project_search_fts.entity_id AND archived=0)) ORDER BY bm25(project_search_fts),entity_kind,entity_id LIMIT ?2")?;
+        let mut query = self.conn.prepare("SELECT entity_kind,entity_id,title,snippet(project_search_fts,3,'[',']','…',12) FROM project_search_fts WHERE project_search_fts MATCH ?1 AND (entity_kind<>'reading' OR EXISTS(SELECT 1 FROM reading_document WHERE reading_document.id=project_search_fts.entity_id AND archived=0)) AND (entity_kind<>'scene' OR EXISTS(SELECT 1 FROM scene WHERE scene.id=project_search_fts.entity_id AND archived=0)) AND (entity_kind<>'content_unit' OR EXISTS(SELECT 1 FROM content_unit WHERE content_unit.id=project_search_fts.entity_id AND archived=0)) ORDER BY bm25(project_search_fts),entity_kind,entity_id LIMIT ?2")?;
         Ok(query
             .query_map(params![terms, limit], |row| {
                 Ok(ProjectSearchHit {
@@ -11207,6 +11261,67 @@ mod tests {
             "A chapter with prose and no scenes."
         );
         st.validate().unwrap();
+    }
+
+    #[test]
+    fn content_unit_removal_is_recoverable_and_retains_prose_and_identity() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter 1", 0)
+            .unwrap();
+        let unit = store
+            .create_content_unit(
+                ContentUnitKind::ChapterBody,
+                "Chapter 1 prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, hash) = store.load_content_unit_text(unit).unwrap();
+        store
+            .save_content_unit_text(unit, Some(&hash), "The orbital manuscript remains intact.")
+            .unwrap();
+        assert_eq!(store.list_content_units(false).unwrap().len(), 1);
+        assert!(
+            store
+                .search_project("orbital", 10)
+                .unwrap()
+                .iter()
+                .any(|hit| hit.entity_kind == "content_unit" && hit.entity_id == unit.to_string())
+        );
+        store.archive_content_unit(unit).unwrap();
+        assert!(store.list_content_units(false).unwrap().is_empty());
+        assert!(
+            store
+                .search_project("orbital", 10)
+                .unwrap()
+                .iter()
+                .all(|hit| hit.entity_id != unit.to_string())
+        );
+        assert!(store.archive_content_unit(unit).is_err());
+
+        drop(store);
+        let mut reopened = ProjectStore::open(&project).unwrap();
+        let removed = reopened.list_content_units(true).unwrap();
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].archived);
+        assert_eq!(removed[0].id, unit);
+        assert_eq!(removed[0].parent_id, Some(chapter));
+        assert_eq!(
+            reopened.load_content_unit_text(unit).unwrap().0,
+            "The orbital manuscript remains intact."
+        );
+        reopened.restore_archived_content_unit(unit).unwrap();
+        assert_eq!(reopened.list_content_units(false).unwrap().len(), 1);
+        assert_eq!(
+            reopened.get_content_unit(unit).unwrap().parent_id,
+            Some(chapter)
+        );
+        assert!(reopened.restore_archived_content_unit(unit).is_err());
+        reopened.validate().unwrap();
     }
 
     #[test]

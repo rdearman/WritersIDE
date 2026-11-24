@@ -16,25 +16,26 @@ Status: Partial implementation; human verification remains open.
 - `Edit > Move Reference to Removed` and `Tools > Show Removed References / Restore Selected Reference` expose the reading-document workflow. A named confirmation distinguishes removal from source deletion.
 - `Scene > Move Scene to Removed / Show Removed Scenes / Restore Selected Scene` provides the corresponding scene workflow in Scene Cards. The confirmation names the scene and states which data is retained.
 - Removed scenes are omitted from normal scene lists, project search and compilation. Restored scenes return to their preserved manuscript position.
+- Chapter and section prose documents reuse the pre-existing `content_unit.archived` field. `Edit > Move Prose Document to Removed / Show Removed Prose Documents / Restore Selected Prose Document` keeps the project-owned Markdown file, stable ID, parent, word metadata and text; archived documents disappear from active outline/search/compile results and can be restored in place. No schema migration is needed for this slice.
 - Existing archived scenes whose former status was not recorded before migration are assigned `idea` as their restoration status. The previous status was already lost by the older archive operation; the migration does not invent it.
 
 ## Failure and consistency rules
 
 - Archive and restore status changes are single SQLite transactions. Repeated archive/restore requests are rejected as invalid state transitions.
-- A dirty editor buffer for the scene prevents removal. A clean open buffer is detached after the author confirms removal.
+- A dirty editor buffer for the selected object prevents removal. A clean open scene buffer is detached after the author confirms removal.
 - Removal is recoverable and retains content files. It is not permanent erasure.
 - Database migration and application services remain independent of the terminal UI.
 
 ## Verification
 
-- Storage tests cover reopen, source/prose preservation, prior scene status, placement, relationships, search visibility and compilation visibility.
-- Terminal state tests exercise confirmation, cancellation, Scene menu actions, restoration and stable identity.
+- Storage tests cover reopen, source/prose preservation, prior scene status, placement, relationships, search visibility and compilation visibility for scenes and prose documents.
+- Terminal state tests exercise confirmation, cancellation, Scene/Edit menu actions, restoration, stable identity and compiler exclusion/restoration.
 - The full workspace suite and terminal suite must pass before this milestone is committed.
 - #63 remains open for human UAT and for the unimplemented scopes below.
 
 ## Explicitly outstanding in #63
 
-- Removal/restore workflows for chapters, sections, books and project-owned imported documents beyond the reading-library case.
+- Removal/restore workflows for structural chapters/sections, books, and project-owned imported documents beyond chapter/section prose units and the reading-library case.
 - A series-level removal workflow and explicit unlink-versus-delete choice.
 - A real PTY acceptance test for the reference and scene removal dialogues.
 - Permanent deletion with dependency reporting, if requested; current operations only move objects to recoverable removed collections.

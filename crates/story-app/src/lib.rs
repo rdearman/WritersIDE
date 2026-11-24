@@ -1259,6 +1259,12 @@ impl WriterApp {
     ) -> Result<Vec<story_storage::ContentUnitRecord>> {
         Ok(self.store.list_content_units(include_archived)?)
     }
+    pub fn archive_content_unit(&mut self, id: ContentUnitId) -> Result<()> {
+        Ok(self.store.archive_content_unit(id)?)
+    }
+    pub fn restore_archived_content_unit(&mut self, id: ContentUnitId) -> Result<()> {
+        Ok(self.store.restore_archived_content_unit(id)?)
+    }
     pub fn load_content_unit_text(&self, id: ContentUnitId) -> Result<(String, String)> {
         Ok(self.store.load_content_unit_text(id)?)
     }
