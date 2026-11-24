@@ -292,3 +292,64 @@ fn populated_chapter_removal_retains_scenes_through_the_real_terminal_workflow()
         "Direct chapter prose remains recoverable."
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn populated_chapter_removal_can_rehome_scenes_to_a_selected_chapter_in_a_real_pty() {
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Chapter Rehome Project");
+    let mut app = WriterApp::create_project(&project, "Chapter Rehome Project").unwrap();
+    let source = app.create_chapter(None, "Opening", 0).unwrap();
+    let target = app.create_chapter(None, "Destination", 1).unwrap();
+    let scene = app.create_scene(source, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "The traveler arrives.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY chapter-rehome workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("chapter-removal-target")
+        .output()
+        .expect("run the Linux PTY chapter-rehome workflow");
+    assert!(
+        result.status.success(),
+        "PTY chapter-rehome workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let mut reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(reopened.get_scene(scene).unwrap().chapter_id, Some(target));
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "The traveler arrives."
+    );
+    let compiled = String::from_utf8(
+        reopened
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert!(compiled.contains("Destination"));
+    assert!(compiled.contains("The traveler arrives."));
+
+    reopened.restore_latest_structural_removal(source).unwrap();
+    assert_eq!(reopened.get_scene(scene).unwrap().chapter_id, Some(source));
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "The traveler arrives."
+    );
+}

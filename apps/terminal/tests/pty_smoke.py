@@ -26,7 +26,8 @@ def main():
     create_fiction = modes == ["create-fiction"]
     previous_position = modes == ["previous-position"]
     removal_dialogs = modes == ["removal-dialogs"]
-    chapter_removal = modes == ["chapter-removal"]
+    chapter_removal = modes in (["chapter-removal"], ["chapter-removal-target"])
+    chapter_removal_target = modes == ["chapter-removal-target"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
     child_pid, master = pty.fork()
@@ -226,7 +227,6 @@ def main():
             if not wait_for_fragments(
                 (
                     b"Delete",
-                    b"Chapter",
                     b"Opening",
                     b"Contains",
                     b"scene(s)",
@@ -247,7 +247,18 @@ def main():
                     "populated chapter removal did not show the explicit recoverable choices; visible tail: "
                     + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
                 )
-            os.write(master, b"\r")  # confirm the default: retain scenes as Unplaced
+            if chapter_removal_target:
+                os.write(master, b"\x1b[B")  # move to the selected-chapter option
+                if not wait_for_fragments(
+                    (b"Destination", b"append", b"selected", b"order"),
+                    dialog_start,
+                    timeout=3.0,
+                ):
+                    raise AssertionError(
+                        "chapter destination choice did not preview its target and Compile effect; visible tail: "
+                        + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                    )
+            os.write(master, b"\r")  # confirm the selected retain-and-rehome action
             read_for(0.4)
             os.write(master, b"\x11")
             quit_deadline = time.monotonic() + 5.0
@@ -258,7 +269,10 @@ def main():
                 finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after the chapter removal")
-            print("PTY chapter removal passed: choices are visible and the default retains scenes as Unplaced.")
+            if chapter_removal_target:
+                print("PTY chapter removal passed: scene rehoming to a selected chapter was available.")
+            else:
+                print("PTY chapter removal passed: choices are visible and the default retains scenes as Unplaced.")
             return
 
         if removal_dialogs:
@@ -335,8 +349,12 @@ def main():
         os.write(master, b"\x1b")  # close menu
         read_for(0.3)
         os.write(master, b"\x11")  # Ctrl+Q
-        read_for(1.0)
-        finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+        quit_deadline = time.monotonic() + 5.0
+        finished_pid = 0
+        status = 0
+        while finished_pid == 0 and time.monotonic() < quit_deadline:
+            read_for(0.1)
+            finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
         if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
             raise AssertionError("the application did not exit cleanly through Ctrl+Q")
         print("PTY smoke passed: scene rendered at 80x24; F10 opened File; resize to 201x60; Ctrl+Q exited cleanly.")
