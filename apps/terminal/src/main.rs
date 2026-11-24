@@ -171,6 +171,7 @@ enum OutlineRow {
 
 struct AppState {
     app: WriterApp,
+    temporary_project: bool,
     workspace: Workspace,
     scenes: Vec<(SceneId, String, SceneStatus, u32)>,
     selected: usize,
@@ -217,6 +218,7 @@ struct AppState {
     command_bindings: CommandBindings,
     context_command_bindings: Vec<ContextCommandBinding>,
     quit_requested: bool,
+    quit_after_project_save: bool,
     pending_command_sequence: Option<PendingCommandSequence>,
     keybinding_manager: Option<KeybindingManagerState>,
     revision_diff: Option<story_core::SnapshotId>,
@@ -540,6 +542,7 @@ struct SeriesActionForm {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FileBrowserPurpose {
     NewProject,
+    SaveProjectAs,
     OpenProject,
     OpenTextFile,
     ImportDocument,
@@ -847,6 +850,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "file.open-text",
         "file.import-document",
         "file.save",
+        "file.save-as",
         "file.quit",
     ],
     &[
@@ -1396,6 +1400,7 @@ enum CommandAction {
     ImportScrivenerNew,
     ImportScrivenerCurrent,
     Save,
+    SaveProjectAs,
     RequestQuit,
     Help,
     ShowWelcome,
@@ -1648,8 +1653,8 @@ fn command_registry() -> Vec<CommandSpec> {
         },
         CommandSpec {
             id: "file.save",
-            label: "Save Manuscript Buffer",
-            description: "Save the current scene or resumable multi-scene assembly buffer",
+            label: "Save Project",
+            description: "Save the current manuscript and project changes; prompts for a permanent location on the first save",
             category: "File",
             default_shortcuts: &["Ctrl+S"],
             mnemonic: Some('s'),
@@ -1657,9 +1662,24 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             task_group: "",
-            menu_priority: 100,
-            advanced: true,
+            menu_priority: 6,
+            advanced: false,
             action: CommandAction::Save,
+        },
+        CommandSpec {
+            id: "file.save-as",
+            label: "Save Project As…",
+            description: "Create a validated independent copy of the complete project at a new location",
+            category: "File",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["save as", "project copy"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "",
+            menu_priority: 7,
+            advanced: false,
+            action: CommandAction::SaveProjectAs,
         },
         CommandSpec {
             id: "file.quit",
@@ -5915,6 +5935,7 @@ impl AppState {
         .join(" · ");
         Self {
             app,
+            temporary_project: false,
             workspace: Workspace::Dashboard,
             scenes: Vec::new(),
             selected: 0,
@@ -5979,6 +6000,7 @@ impl AppState {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -7143,6 +7165,10 @@ impl AppState {
         let fallback = std::env::current_dir()?;
         let current_dir = match purpose {
             FileBrowserPurpose::Compile(_) => self.app.project_root().to_owned(),
+            FileBrowserPurpose::SaveProjectAs => std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_dir())
+                .unwrap_or(fallback),
             FileBrowserPurpose::NewProject
             | FileBrowserPurpose::OpenProject
             | FileBrowserPurpose::OpenTextFile
@@ -7156,6 +7182,11 @@ impl AppState {
         };
         let name = match purpose {
             FileBrowserPurpose::NewProject => "My Novel".to_owned(),
+            FileBrowserPurpose::SaveProjectAs => self
+                .app
+                .get_project()
+                .map(|project| safe_filename(&project.title))
+                .unwrap_or_else(|_| "My Book".to_owned()),
             FileBrowserPurpose::OpenProject
             | FileBrowserPurpose::OpenTextFile
             | FileBrowserPurpose::ImportDocument
@@ -7191,6 +7222,8 @@ impl AppState {
         });
         self.message = if purpose == FileBrowserPurpose::NewProject {
             "Choose Fiction or Non-fiction with F2 · select a parent folder and project name · F5 creates".into()
+        } else if purpose == FileBrowserPurpose::SaveProjectAs {
+            "Choose a parent folder and new project folder name · existing projects are never overwritten".into()
         } else if matches!(
             purpose,
             FileBrowserPurpose::ImportScrivenerSource
@@ -7205,6 +7238,56 @@ impl AppState {
         } else {
             "Choose a folder or filename · F5 confirms · F7 creates folder · Esc cancels".into()
         };
+        Ok(())
+    }
+
+    fn start_save_project_as(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.active_challenge.is_some() {
+            return Err(
+                "finish or quit the active writing challenge before saving the project".into(),
+            );
+        }
+        if self.dirty {
+            self.save()?;
+            if self.dirty {
+                return Err(
+                    "the manuscript still has unsaved changes; resolve the save conflict first"
+                        .into(),
+                );
+            }
+        }
+        self.start_file_browser(FileBrowserPurpose::SaveProjectAs)
+    }
+
+    fn save_project_copy(&mut self, destination: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err("save the active manuscript buffer before copying the project".into());
+        }
+        if self.active_challenge.is_some() {
+            return Err(
+                "finish or quit the active writing challenge before copying the project".into(),
+            );
+        }
+        if fs::symlink_metadata(destination).is_ok() {
+            return Err(
+                "the destination already exists; Writer's IDE never overwrites a project".into(),
+            );
+        }
+        let staging = tempfile::tempdir()?;
+        let archive = staging.path().join("project.writers-ide.zip");
+        self.save_session()?;
+        self.app.backup_project_archive(&archive)?;
+        WriterApp::restore_project_archive(&archive, destination)?;
+        let copied = WriterApp::open_project(destination)?;
+        copied.validate_project()?;
+        self.switch_to_open_project(
+            destination.to_path_buf(),
+            copied,
+            format!(
+                "Saved independent project copy at {}",
+                destination.display()
+            ),
+        )?;
         Ok(())
     }
 
@@ -7335,7 +7418,17 @@ impl AppState {
         match key.code {
             KeyCode::Esc => {
                 close = true;
-                self.message = "File selection cancelled".into();
+                if browser.purpose == FileBrowserPurpose::SaveProjectAs
+                    && self.quit_after_project_save
+                {
+                    self.quit_after_project_save = false;
+                    self.mode = Some('q');
+                    self.prompt =
+                        "Save Project and Quit (s) · Quit Without Saving (d) · Cancel (Esc)".into();
+                    self.message = "Project copy cancelled; no permanent copy was created. Your temporary project remains open.".into();
+                } else {
+                    self.message = "File selection cancelled".into();
+                }
             }
             KeyCode::Tab => browser.focus = (browser.focus + 1) % 3,
             KeyCode::BackTab => browser.focus = (browser.focus + 2) % 3,
@@ -7426,7 +7519,12 @@ impl AppState {
                     browser.overwrite_confirmed = false;
                 }
             }
-            KeyCode::F(4) if browser.purpose == FileBrowserPurpose::NewProject => {
+            KeyCode::F(4)
+                if matches!(
+                    browser.purpose,
+                    FileBrowserPurpose::NewProject | FileBrowserPurpose::SaveProjectAs
+                ) =>
+            {
                 browser.focus = 2;
                 browser.overwrite_confirmed = false;
                 self.message = format!(
@@ -7784,6 +7882,40 @@ impl AppState {
                         });
                         close = true;
                     }
+                    FileBrowserPurpose::SaveProjectAs => {
+                        if fs::symlink_metadata(&destination).is_ok() {
+                            self.message = "That folder already exists; choose a new name. Projects are never overwritten".into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        }
+                        if !browser.overwrite_confirmed {
+                            browser.overwrite_confirmed = true;
+                            self.message = format!(
+                                "Create an independent project copy at {}? Press F5 again to confirm",
+                                destination.display()
+                            );
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        }
+                        let quit_after_save = self.quit_after_project_save;
+                        match self.save_project_copy(&destination) {
+                            Ok(()) => {
+                                close = true;
+                                if quit_after_save {
+                                    self.quit_after_project_save = false;
+                                    self.mode = None;
+                                    self.quit_requested = true;
+                                }
+                            }
+                            Err(error) => {
+                                self.message = format!(
+                                    "Project copy failed; the current project remains open: {error}"
+                                );
+                                self.file_browser = Some(browser);
+                                return Ok(());
+                            }
+                        }
+                    }
                     FileBrowserPurpose::Compile(format) => {
                         if destination.exists() && !browser.overwrite_confirmed {
                             browser.overwrite_confirmed = true;
@@ -8101,6 +8233,7 @@ impl AppState {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let recent_projects_path = self.recent_projects_path.clone();
         let mut next = Self::new(app, function_bindings);
+        next.temporary_project = false;
         next.recent_projects_path = recent_projects_path.clone();
         next.command_bindings = command_bindings;
         next.context_command_bindings = context_command_bindings;
@@ -11940,7 +12073,24 @@ impl AppState {
             CommandAction::WriteSelectedChapter => self.write_selected_chapter()?,
             CommandAction::MoveOutlineUp => self.move_selected_outline_item(false)?,
             CommandAction::MoveOutlineDown => self.move_selected_outline_item(true)?,
-            CommandAction::Save => self.save()?,
+            CommandAction::Save => {
+                if self.temporary_project {
+                    if let Err(error) = self.start_save_project_as()
+                        && !self.message.starts_with("Save conflict/error:")
+                    {
+                        self.message = format!("Choose a project location to save: {error}");
+                    }
+                } else {
+                    self.save()?;
+                }
+            }
+            CommandAction::SaveProjectAs => {
+                if let Err(error) = self.start_save_project_as()
+                    && !self.message.starts_with("Save conflict/error:")
+                {
+                    self.message = format!("Project was not saved as: {error}");
+                }
+            }
             CommandAction::RequestQuit => self.request_quit(),
             CommandAction::Help => {
                 if self.help_panel.is_some() {
@@ -12020,11 +12170,20 @@ impl AppState {
             self.mode = Some('c');
             self.prompt = "Save and quit (s) · Discard and quit (d) · Esc continues".into();
             self.message = "Choose whether to keep the isolated challenge draft".into();
-        } else if self.dirty {
+        } else if self.dirty || self.temporary_project {
             self.quit_requested = false;
             self.mode = Some('q');
-            self.prompt = "Save and Quit (s) · Quit Without Saving (d) · Cancel (Esc)".into();
-            self.message = "Choose how to leave the current unsaved text".into();
+            self.prompt = if self.temporary_project {
+                "Save Project and Quit (s) · Quit Without Saving (d) · Cancel (Esc)".into()
+            } else {
+                "Save and Quit (s) · Quit Without Saving (d) · Cancel (Esc)".into()
+            };
+            self.message = if self.temporary_project {
+                "This temporary project has no permanent location. Save Project opens the destination browser."
+                    .into()
+            } else {
+                "Choose how to leave the current unsaved text".into()
+            };
         } else {
             self.quit_requested = true;
         }
@@ -18844,6 +19003,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = WriterApp::open_project(&project_path)?;
     app.recover_interrupted_writing_challenges()?;
     let mut state = AppState::new(app, function_bindings);
+    state.temporary_project = startup_scratch.is_some();
     let recent_projects_path = user_recent_projects_path();
     state.recent_projects_path = Some(recent_projects_path.clone());
     state.command_bindings = command_bindings;
@@ -20567,13 +20727,25 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             let status = if let Some(tutorial) = tutorial_footer_status(s) {
                 format!(
                     " Active:{focus} · {} · Save {} · {tutorial}",
-                    if s.dirty { "UNSAVED" } else { "saved" },
+                    if s.dirty {
+                        "UNSAVED"
+                    } else if s.temporary_project {
+                        "temporary · not saved to a project folder"
+                    } else {
+                        "saved"
+                    },
                     effective_shortcut_label(s, "file.save", "Ctrl+S")
                 )
             } else {
                 format!(
                     " Active:{focus} · {} · Save {} · Menu {} · Help {} · {pane_hint}",
-                    if s.dirty { "UNSAVED" } else { "saved" },
+                    if s.dirty {
+                        "UNSAVED"
+                    } else if s.temporary_project {
+                        "temporary · not saved to a project folder"
+                    } else {
+                        "saved"
+                    },
                     effective_shortcut_label(s, "file.save", "Ctrl+S"),
                     effective_shortcut_label(s, "menu.main", "F10"),
                     effective_shortcut_label(s, "help.context", "Help menu")
@@ -20603,7 +20775,13 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 format!(
                     " {tutorial} · F10 Menu · {} · {}{}",
                     workspace_action_hint(s),
-                    if s.dirty { "unsaved" } else { "saved" },
+                    if s.dirty {
+                        "unsaved"
+                    } else if s.temporary_project {
+                        "temporary · File > Save Project chooses a permanent location"
+                    } else {
+                        "saved"
+                    },
                     if s.message.is_empty() {
                         String::new()
                     } else {
@@ -20614,7 +20792,13 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 format!(
                     " {} · {}",
                     workspace_action_hint(s),
-                    if s.dirty { "[UNSAVED]" } else { "[SAVED]" }
+                    if s.dirty {
+                        "[UNSAVED]"
+                    } else if s.temporary_project {
+                        "[TEMPORARY]"
+                    } else {
+                        "[SAVED]"
+                    }
                 )
             } else {
                 format!(
@@ -20631,7 +20815,13 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     effective_shortcut_label(s, "menu.main", "F10"),
                     effective_shortcut_label(s, "help.context", "Help menu"),
                     effective_shortcut_label(s, "file.save", "unbound"),
-                    if s.dirty { "unsaved" } else { "saved" },
+                    if s.dirty {
+                        "unsaved"
+                    } else if s.temporary_project {
+                        "temporary · Save Project chooses a permanent location"
+                    } else {
+                        "saved"
+                    },
                     challenge,
                     s.message,
                 )
@@ -20671,6 +20861,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 ("[SAVE FAILED]", Color::Red)
             } else if s.dirty {
                 ("[UNSAVED]", Color::Yellow)
+            } else if s.temporary_project {
+                ("[TEMPORARY]", Color::Yellow)
             } else if s.message == "Autosaved" {
                 ("[AUTOSAVED]", Color::Green)
             } else {
@@ -22649,6 +22841,7 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     f.render_widget(Clear, popup);
     let purpose = match browser.purpose {
         FileBrowserPurpose::NewProject => "New Project · choose parent folder and project name",
+        FileBrowserPurpose::SaveProjectAs => "Save Project As · create an independent project copy",
         FileBrowserPurpose::OpenProject => "Open Project · choose a Writer's IDE project folder",
         FileBrowserPurpose::OpenTextFile => "Open Text File · read-only reference",
         FileBrowserPurpose::ImportDocument => "Import Document · choose a source file",
@@ -22796,6 +22989,8 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let (primary_action, navigation) = if browser.overwrite_confirmed {
         let action = if browser.purpose == FileBrowserPurpose::NewProject {
             "F5 Confirm Create · Esc Cancel"
+        } else if browser.purpose == FileBrowserPurpose::SaveProjectAs {
+            "F5 Confirm Save Copy · Esc Cancel"
         } else {
             "F5 Confirm Overwrite · Esc Cancel"
         };
@@ -22829,6 +23024,11 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         (
             "F4 Select Folder · F5 Create Project · F7 New Folder · Esc Cancel",
             "F2 Choose Fiction/Non-fiction · Tab: panes/name · Parent = current folder",
+        )
+    } else if browser.purpose == FileBrowserPurpose::SaveProjectAs {
+        (
+            "F4 Select Folder · F5 Save Project Copy · F7 New Folder · Esc Cancel",
+            "Tab/Shift+Tab: panes and project name · Parent = current folder",
         )
     } else {
         (
@@ -26242,6 +26442,14 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     return Ok(false);
                 }
                 KeyCode::Char('s' | 'S') => {
+                    if s.temporary_project {
+                        s.quit_after_project_save = true;
+                        if let Err(error) = s.start_save_project_as() {
+                            s.quit_after_project_save = false;
+                            s.message = format!("Project was not saved; it remains open. {error}");
+                        }
+                        return Ok(false);
+                    }
                     if let Err(error) = s.save() {
                         s.prompt = "Retry (s) · Review (v) · Recovery Copy (r) · Quit Without Saving (d) · Edit (Esc)".into();
                         s.message = format!(
@@ -32357,6 +32565,7 @@ mod tests {
         let saved_hash = app.load_scene_text(scene).unwrap().1;
         let mut state = AppState {
             app,
+            temporary_project: false,
             workspace: Workspace::Editor,
             scenes: Vec::new(),
             selected: 1,
@@ -32412,6 +32621,7 @@ mod tests {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -35669,6 +35879,7 @@ mod tests {
         let saved_hash = app.load_scene_text(scene).unwrap().1;
         let mut state = AppState {
             app,
+            temporary_project: false,
             workspace: Workspace::Editor,
             scenes: Vec::new(),
             selected: 0,
@@ -35724,6 +35935,7 @@ mod tests {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -35807,6 +36019,7 @@ mod tests {
         let mut state = AppState {
             app: WriterApp::create_project(tempfile::tempdir().unwrap().path().join("N"), "N")
                 .unwrap(),
+            temporary_project: false,
             workspace: Workspace::Editor,
             scenes: Vec::new(),
             selected: 0,
@@ -35862,6 +36075,7 @@ mod tests {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -35941,6 +36155,7 @@ mod tests {
         let saved_hash = app.load_scene_text(scene).unwrap().1;
         let mut state = AppState {
             app,
+            temporary_project: false,
             workspace: Workspace::Editor,
             scenes: Vec::new(),
             selected: 0,
@@ -35996,6 +36211,7 @@ mod tests {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -36083,6 +36299,7 @@ mod tests {
             .collect();
         let mut state = AppState {
             app,
+            temporary_project: false,
             workspace: Workspace::Outline,
             scenes,
             selected: 1,
@@ -36138,6 +36355,7 @@ mod tests {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -36375,6 +36593,7 @@ mod tests {
         let mut state = AppState {
             app: WriterApp::create_project(tempfile::tempdir().unwrap().path().join("N"), "N")
                 .unwrap(),
+            temporary_project: false,
             workspace: Workspace::Dashboard,
             scenes: Vec::new(),
             selected: 0,
@@ -36430,6 +36649,7 @@ mod tests {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -36517,6 +36737,7 @@ mod tests {
             .collect();
         let mut state = AppState {
             app,
+            temporary_project: false,
             workspace: Workspace::Outline,
             scenes,
             selected: 1,
@@ -36572,6 +36793,7 @@ mod tests {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -37209,6 +37431,7 @@ mod tests {
                 "file.open-text",
                 "file.import-document",
                 "file.save",
+                "file.save-as",
                 "file.quit",
             ]
         );
@@ -37333,7 +37556,7 @@ mod tests {
         let save = command_by_id("file.save").unwrap();
         let save_row = menu_command_row(&state, save, 36);
         assert!(save_row.contains("Ctrl+S"), "{save_row}");
-        assert!(save_row.starts_with("Save Manuscript"), "{save_row}");
+        assert!(save_row.starts_with("Save Project"), "{save_row}");
 
         let clipped = truncate_display_cells("e\u{301}😀Novel", 4);
         assert!(UnicodeWidthStr::width(clipped.as_str()) <= 4);
@@ -38088,6 +38311,7 @@ mod tests {
             .collect();
         let mut state = AppState {
             app,
+            temporary_project: false,
             workspace: Workspace::Revisions,
             scenes,
             selected: 1,
@@ -38143,6 +38367,7 @@ mod tests {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -38365,6 +38590,7 @@ mod tests {
         .unwrap();
         let mut state = AppState {
             app,
+            temporary_project: false,
             workspace: Workspace::Reading,
             scenes: Vec::new(),
             selected: 0,
@@ -38420,6 +38646,7 @@ mod tests {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -38777,6 +39004,7 @@ mod tests {
             .collect::<Vec<_>>();
         let mut state = AppState {
             app,
+            temporary_project: false,
             workspace: Workspace::Search,
             scenes: scenes.into_iter().take(1).collect(),
             selected: 0,
@@ -38832,6 +39060,7 @@ mod tests {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -38930,6 +39159,7 @@ mod tests {
         let issue = app.create_issue("Check the map").unwrap();
         let mut state = AppState {
             app,
+            temporary_project: false,
             workspace: Workspace::Search,
             scenes: Vec::new(),
             selected: 0,
@@ -38985,6 +39215,7 @@ mod tests {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -39135,6 +39366,7 @@ mod tests {
         let app = WriterApp::create_project(dir.path().join("Novel"), "Novel").unwrap();
         let mut state = AppState {
             app,
+            temporary_project: false,
             workspace: Workspace::Outline,
             scenes: Vec::new(),
             selected: 0,
@@ -39190,6 +39422,7 @@ mod tests {
             command_bindings: Vec::new(),
             context_command_bindings: Vec::new(),
             quit_requested: false,
+            quit_after_project_save: false,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -40753,6 +40986,159 @@ mod tests {
         assert!(document.contains("The manuscript reaches the reader."));
         assert!(state.message.starts_with("Compiled"), "{}", state.message);
         assert!(state.file_browser.is_none());
+    }
+
+    #[test]
+    fn first_save_promotes_temporary_project_as_a_complete_independent_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let temporary_root = directory.path().join("Temporary");
+        let mut project =
+            WriterApp::create_project(&temporary_root, "Temporary Start Project").unwrap();
+        let chapter = project.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = project.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = project.load_scene_text(scene).unwrap();
+        project
+            .save_scene_text(scene, Some(&hash), "Beginning.")
+            .unwrap();
+        fs::create_dir_all(temporary_root.join(".git/objects/pack")).unwrap();
+        fs::write(
+            temporary_root.join(".git/config"),
+            "[core]\nrepositoryformatversion = 0\n",
+        )
+        .unwrap();
+        fs::create_dir_all(temporary_root.join("attachments")).unwrap();
+        fs::write(
+            temporary_root.join("attachments/research.txt"),
+            "Research notes",
+        )
+        .unwrap();
+
+        let mut state = AppState::new(project, default_bindings());
+        state.temporary_project = true;
+        state.open_scene(scene).unwrap();
+        let mut temporary_screen =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        temporary_screen
+            .draw(|frame| draw(frame, &mut state))
+            .unwrap();
+        let temporary_text = temporary_screen
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(temporary_text.contains("[TEMPORARY]"), "{temporary_text}");
+        state.editor = vec!["Beginning with saved changes.".into()];
+        state.dirty = true;
+        state.dispatch_registered(CommandAction::Save).unwrap();
+        assert!(!state.dirty);
+        assert_eq!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::SaveProjectAs
+        );
+
+        let parent = directory.path().to_owned();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = parent.clone();
+        browser.entries = file_browser_entries(&parent).unwrap();
+        browser.name = "Saved Novel".into();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.file_browser.as_ref().unwrap().overwrite_confirmed);
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+
+        let destination = parent.join("Saved Novel");
+        assert_eq!(state.app.project_root(), destination);
+        assert!(!state.temporary_project);
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Beginning with saved changes."
+        );
+        assert_eq!(
+            fs::read(destination.join("attachments/research.txt")).unwrap(),
+            b"Research notes"
+        );
+        assert_eq!(
+            fs::read(destination.join(".git/config")).unwrap(),
+            fs::read(temporary_root.join(".git/config")).unwrap()
+        );
+        assert!(temporary_root.join("project.toml").is_file());
+        let reopened = WriterApp::open_project(&destination).unwrap();
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "Beginning with saved changes."
+        );
+    }
+
+    #[test]
+    fn save_project_as_cancel_and_existing_destination_preserve_the_current_project() {
+        let directory = tempfile::tempdir().unwrap();
+        let current_path = directory.path().join("Current");
+        let project = WriterApp::create_project(&current_path, "Current").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.temporary_project = true;
+        let existing = directory.path().join("Existing");
+        fs::create_dir(&existing).unwrap();
+        fs::write(existing.join("keep.txt"), "do not overwrite").unwrap();
+
+        state
+            .dispatch_registered_command_id("file.save-as")
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = directory.path().to_owned();
+        browser.entries = file_browser_entries(directory.path()).unwrap();
+        browser.name = "Existing".into();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            fs::read(existing.join("keep.txt")).unwrap(),
+            b"do not overwrite"
+        );
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.file_browser.is_none());
+        assert_eq!(state.app.project_root(), current_path);
+        assert!(state.temporary_project);
+    }
+
+    #[test]
+    fn temporary_project_quit_requires_a_permanent_save_or_explicit_discard() {
+        let directory = tempfile::tempdir().unwrap();
+        let project =
+            WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.temporary_project = true;
+        state.request_quit();
+        assert!(state.prompt.contains("Save Project and Quit"));
+        assert!(!state.quit_requested);
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::SaveProjectAs
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(state.file_browser.is_none());
+        assert_eq!(state.mode, Some('q'));
+        assert!(!state.quit_requested);
+
+        let should_quit = handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(should_quit);
+        assert!(state.temporary_project);
     }
 
     #[test]

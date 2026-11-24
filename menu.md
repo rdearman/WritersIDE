@@ -15,7 +15,8 @@ The complete command inventory and before/after placement audit is in [docs/menu
 - Import Scrivener Book into Series
 - Open Text File…
 - Import Document…
-- Save Manuscript Buffer
+- Save Project
+- Save Project As…
 - Quit
 - Search All Commands…
 
@@ -113,6 +114,11 @@ The complete command inventory and before/after placement audit is in [docs/menu
 The Scene menu appears only while Scene Cards is active; Publish is available
 from manuscript workspaces and command search. The Scene Cards footer shows the
 effective Include / Exclude shortcut (Space by default).
+
+On a temporary start project, **Save Project** opens the Save Project As
+dialogue. The footer shows **[TEMPORARY]** until a permanent project folder has
+been selected and validated. Save Project As creates a separate copy and never
+overwrites an existing folder.
 
 ## Notes
 

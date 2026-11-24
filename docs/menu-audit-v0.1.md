@@ -48,7 +48,8 @@ No capability or command ID is removed. Primary menus remain concise, single-lev
 | `file.import-scrivener` | Import Scrivener as New Project… | File menu; command palette / Search All Commands | File menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
 | `file.import-scrivener-current` | Import Scrivener into Current Project… | Search All Commands… / command palette → File | Search All Commands… / command palette → File | Searchable-only candidate; not measured | Retain in searchable registry |
 | `file.recent-projects` | Recent Projects | File menu; command palette / Search All Commands | File menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
-| `file.save` | Save Manuscript Buffer | File menu; command palette / Search All Commands | File menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
+| `file.save` | Save Project | File menu; command palette / Search All Commands | File menu; command palette / Search All Commands | Routine candidate; not measured | Save the current book; prompts for a permanent location on a temporary start project |
+| `file.save-as` | Save Project As… | Not registered in the prior audit | File menu; command palette / Search All Commands | Routine project action | Create and validate an independent project copy; never overwrite |
 | `file.quit` | Quit | File menu; command palette / Search All Commands | File menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
 | `edit.resolve-save-conflict` | Resolve Save Conflict | Review menu; command palette / Search All Commands | Review menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
 | `help.context` | Context Help | Help menu; command palette / Search All Commands | Help menu; command palette / Search All Commands | Routine candidate; not measured | Retain in primary list |
@@ -336,7 +337,7 @@ No capability or command ID is removed. Primary menus remain concise, single-lev
 | `series.new-book` | New Book in Series | Search All Commands… / command palette → File | Search All Commands… / command palette → File | Searchable-only candidate; not measured | Retain in searchable registry |
 | `series.references` | Read Series References | Search All Commands… / command palette → File | Search All Commands… / command palette → File | Searchable-only candidate; not measured | Retain in searchable registry |
 
-**Flat-menu baseline:** 322 registered commands, including top-level menu headings. **Baseline curated direct command IDs:** 56. The contextual Scene menu adds one registered menu command and nine curated contextual menu slots (some reuse baseline command IDs).
+**Current registry:** 323 registered commands, including top-level menu headings. **Baseline curated direct command IDs:** 56. The contextual Scene menu adds one registered menu command and nine curated contextual menu slots (some reuse baseline command IDs); Save Project As adds one project action.
 
 ## Alpha UAT 18 contextual-menu supplement
 
@@ -345,3 +346,17 @@ The latest UAT direction keeps stable global actions and adds workspace-specific
 ## Audit limits and follow-up
 
 This audit describes implementation placement and keeps all commands available through existing search/dispatch paths. There is no historical usage data, so the application cannot honestly rank actions by actual use. Human UAT is still required to approve the labels and placement. If usage telemetry is ever added, it must be opt-in and local; it is not required for this menu design.
+
+## Alpha UAT 18 — project save actions
+
+The File menu now presents **Save Project** and **Save Project As…**. The first
+Save Project action on a temporary start project opens the shared destination
+browser after journalling any dirty manuscript buffer. A persistent **[TEMPORARY]**
+status remains visible until the user confirms a destination. Save Project As
+creates a separate staged project copy, including project files, metadata,
+recovery/settings directories and local `.git` history; validates the copy
+before switching to it; and refuses existing destinations (including symlinks).
+The source remains active if the operation is cancelled or fails. Automated
+checks cover manuscript persistence, attachments, Git metadata, collision
+protection and cancellation. The broader UAT request for Close Project and a
+normal-launch project-selection welcome screen remains outstanding.

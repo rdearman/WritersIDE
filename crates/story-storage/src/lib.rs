@@ -1967,6 +1967,7 @@ impl ProjectStore {
             target_db.close().map_err(|(_, e)| StorageError::Sql(e))?;
             File::open(stage.join("story.db"))?.sync_all()?;
             for name in [
+                ".git",
                 "manuscript",
                 "research",
                 "attachments",
@@ -2068,7 +2069,7 @@ impl ProjectStore {
     ) -> Result<()> {
         let archive_path = archive_path.as_ref();
         let destination = destination.as_ref();
-        if destination.exists() {
+        if fs::symlink_metadata(destination).is_ok() {
             return Err(StorageError::Invalid(
                 "restore destination already exists".into(),
             ));
@@ -12982,10 +12983,20 @@ mod tests {
         let sc = s.create_scene(ch, 0, "S").unwrap();
         let (_, h) = s.load_text(sc).unwrap();
         s.save_text(sc, Some(&h), "backup text").unwrap();
+        fs::create_dir_all(p.join(".git/objects/pack")).unwrap();
+        fs::write(
+            p.join(".git/config"),
+            "[core]\n\trepositoryformatversion = 0\n",
+        )
+        .unwrap();
         let backup = d.path().join("N-backup");
         s.backup_to(&backup).unwrap();
         let b = ProjectStore::open(&backup).unwrap();
         assert_eq!(b.load_text(sc).unwrap().0, "backup text");
+        assert_eq!(
+            fs::read(backup.join(".git/config")).unwrap(),
+            fs::read(p.join(".git/config")).unwrap()
+        );
         assert!(b.validate().is_ok());
     }
 
@@ -13031,6 +13042,30 @@ mod tests {
             b"research source"
         );
         assert!(ProjectStore::restore_archive_to(&archive, &relocated).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn archive_restore_refuses_to_replace_a_dangling_destination_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("Source");
+        let mut project = ProjectStore::create(&source, "Source").unwrap();
+        let archive = directory.path().join("source.zip");
+        project.backup_archive_to(&archive).unwrap();
+        drop(project);
+
+        let destination = directory.path().join("Dangling");
+        symlink(directory.path().join("missing-target"), &destination).unwrap();
+        assert!(ProjectStore::restore_archive_to(&archive, &destination).is_err());
+        assert!(
+            fs::symlink_metadata(&destination)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!destination.join("project.toml").exists());
     }
 
     #[test]
