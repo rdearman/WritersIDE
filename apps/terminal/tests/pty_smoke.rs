@@ -445,3 +445,104 @@ fn populated_chapter_subtree_deletion_is_recoverable_through_a_real_pty() {
         "A chapter introduction."
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn nonfiction_section_subtree_deletion_preserves_owned_prose_for_recovery_in_a_real_pty() {
+    let _guard = PTY_TEST_LOCK.lock().unwrap();
+    use std::process::Command;
+    use story_app::WriterApp;
+    use story_core::{BookType, ContentUnitKind, NodeKind};
+    use story_document::CompileFormat;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Non-fiction Removal Project");
+    let mut app =
+        WriterApp::create_project_with_type(&project, "Field Guide", BookType::Nonfiction).unwrap();
+    let parent = app
+        .create_structural_node(None, NodeKind::Section, "Part One", 0)
+        .unwrap();
+    let section = app
+        .create_structural_node(Some(parent), NodeKind::Section, "Old Heading", 0)
+        .unwrap();
+    let child = app
+        .create_structural_node(Some(section), NodeKind::Section, "Subsection", 0)
+        .unwrap();
+    let prose = app
+        .create_content_unit(
+            ContentUnitKind::SectionBody,
+            "Old Heading prose",
+            Some(section),
+            0,
+            None,
+        )
+        .unwrap();
+    let (_, hash) = app.load_content_unit_text(prose).unwrap();
+    app.save_content_unit_text(prose, Some(&hash), "Field notes under this heading.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!(
+            "skipping Linux PTY non-fiction section-removal workflow: python3 is unavailable"
+        );
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("section-removal-delete")
+        .output()
+        .expect("run the Linux PTY non-fiction section-removal workflow");
+    assert!(
+        result.status.success(),
+        "PTY non-fiction section-removal workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let mut reopened = WriterApp::open_project(&project).unwrap();
+    assert!(
+        reopened
+            .list_archived_structural_nodes()
+            .unwrap()
+            .iter()
+            .any(|node| node.id == section)
+    );
+    assert!(
+        !reopened
+            .list_structural_nodes()
+            .unwrap()
+            .iter()
+            .any(|node| node.id == child)
+    );
+    assert!(reopened.get_content_unit(prose).unwrap().archived);
+    let compiled = String::from_utf8(
+        reopened
+            .compile_artifact(CompileFormat::Markdown, false)
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert!(!compiled.contains("Field notes under this heading."));
+
+    reopened.restore_latest_structural_removal(section).unwrap();
+    let restored_nodes = reopened.list_structural_nodes().unwrap();
+    assert!(restored_nodes.iter().any(|node| node.id == section));
+    assert_eq!(
+        restored_nodes
+            .iter()
+            .find(|node| node.id == child)
+            .unwrap()
+            .parent_id,
+        Some(section)
+    );
+    assert!(!reopened.get_content_unit(prose).unwrap().archived);
+    assert_eq!(
+        reopened.load_content_unit_text(prose).unwrap().0,
+        "Field notes under this heading."
+    );
+}

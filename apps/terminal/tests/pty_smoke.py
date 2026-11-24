@@ -33,6 +33,7 @@ def main():
     )
     chapter_removal_target = modes == ["chapter-removal-target"]
     chapter_removal_delete = modes == ["chapter-removal-delete"]
+    section_removal_delete = modes == ["section-removal-delete"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
     child_pid, master = pty.fork()
@@ -165,7 +166,7 @@ def main():
         # Skip choice so the test follows the discoverable onboarding route.
         os.write(master, b"\x1b")  # use the welcome screen's visible Skip key
         read_for(0.4)
-        if b"Arrival" not in output:
+        if not section_removal_delete and b"Arrival" not in output:
             raise AssertionError(
                 "the opening scene was not rendered in the PTY; output tail: "
                 + repr(bytes(output[-1600:]))
@@ -291,6 +292,54 @@ def main():
                 print("PTY chapter removal passed: recoverable subtree deletion was selected explicitly.")
             else:
                 print("PTY chapter removal passed: choices are visible and the default retains scenes as Unplaced.")
+            return
+
+        if section_removal_delete:
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" + b"\r")
+            if not wait_for_fragments(
+                (b"Outline", b"PartOne", b"OldHeading", b"Subsection"), timeout=3.0
+            ):
+                raise AssertionError(
+                    "Navigate > Outline did not show the non-fiction section tree; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
+                )
+            os.write(master, b"\x1b[B")  # select the populated child heading
+            read_for(0.2)
+            dialog_start = len(output)
+            os.write(master, b"\x1b[3~")
+            if not wait_for_fragments(
+                (b"OldHeading", b"subordinate", b"Promote", b"another", b"subtree", b"recoverably"),
+                dialog_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "non-fiction section removal did not offer explicit subtree choices; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
+                )
+            os.write(master, b"\x1b[B\x1b[B")  # choose recoverable subtree deletion
+            if not wait_for_fragments(
+                (b"Deletethewholesubtree", b"omitted", b"restored"),
+                dialog_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "non-fiction subtree choice did not preview Compile and recovery; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"\r")
+            read_for(0.4)
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after section subtree deletion")
+            print("PTY non-fiction removal passed: subtree deletion was explicit, recoverable and cancellable.")
             return
 
         if removal_dialogs:
