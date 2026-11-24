@@ -18,6 +18,7 @@ def set_size(fd, rows, columns):
 def main():
     binary, project, isolated_home, *modes = sys.argv[1:]
     create_fiction = modes == ["create-fiction"]
+    previous_position = modes == ["previous-position"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
     child_pid, master = pty.fork()
@@ -121,13 +122,52 @@ def main():
 
         # A fresh isolated profile shows the welcome panel. Use its visible
         # Skip choice so the test follows the discoverable onboarding route.
-        os.write(master, b"\x1b[B\x1b[B\r")
-        read_for(0.3)
+        os.write(master, b"\x1b")  # use the welcome screen's visible Skip key
+        read_for(0.4)
         if b"Arrival" not in output:
             raise AssertionError(
                 "the opening scene was not rendered in the PTY; output tail: "
                 + repr(bytes(output[-1600:]))
             )
+
+        if previous_position:
+            # F10 opens File; three Right presses select Navigate. Its sixth
+            # entry is Return to Previous Position.
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 3)
+            read_for(0.3)
+            os.write(master, b"\x1b[B" * 5 + b"\r")
+            read_for(0.5)
+            if (
+                b"No" not in output
+                or b"previous" not in output
+                or b"manuscript" not in output
+            ):
+                raise AssertionError(
+                    "empty Previous Position did not report a nonfatal status; output tail: "
+                    + repr(bytes(output[-2000:]))
+                )
+
+            # The menu and normal quit path must still be available after the
+            # unavailable navigation action.
+            os.write(master, b"\x1b[21~")
+            read_for(0.3)
+            if b"Quit" not in output:
+                raise AssertionError("application stopped responding after Previous Position")
+            os.write(master, b"\x1b")
+            read_for(0.3)
+            os.write(master, b"\x11")
+            read_for(1.0)
+            finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if (
+                finished_pid != child_pid
+                or not os.WIFEXITED(status)
+                or os.WEXITSTATUS(status) != 0
+            ):
+                raise AssertionError("application did not remain usable and quit cleanly")
+            print("PTY navigation regression passed: empty Previous Position is nonfatal; menu and quit remain usable.")
+            return
 
         # Exercise the actual F10 route instead of calling AppState handlers
         # directly.

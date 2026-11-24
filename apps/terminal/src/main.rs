@@ -9305,22 +9305,22 @@ impl AppState {
         });
     }
     fn return_to_previous_location(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let location = self
-            .location_history
-            .last()
-            .cloned()
-            .ok_or("there is no previous manuscript position")?;
+        let Some(location) = self.location_history.last().cloned() else {
+            self.message = "No previous manuscript position".into();
+            return Ok(());
+        };
         if self.dirty {
-            return Err(
-                "save the current manuscript before returning to the previous position".into(),
-            );
+            self.message =
+                "Save the current manuscript before returning to the previous position".into();
+            return Ok(());
         }
         let (text, _) = self.app.load_scene_text(location.scene_id)?;
         let offset = if location.quote.is_empty() {
             if location.offset > text.len() || !text.is_char_boundary(location.offset) {
-                return Err("previous position no longer exists in the source scene".into());
+                self.message = "Previous position no longer exists in the source scene".into();
+                return Ok(());
             }
-            location.offset
+            Some(location.offset)
         } else {
             text.get(location.offset..location.offset.saturating_add(location.quote.len()))
                 .filter(|candidate| *candidate == location.quote)
@@ -9330,11 +9330,24 @@ impl AppState {
                     let first = occurrences.next()?.0;
                     occurrences.next().is_none().then_some(first)
                 })
-                .ok_or("previous passage is missing or ambiguous; source was left unchanged")?
+                .or_else(|| {
+                    self.message =
+                        "Previous passage is missing or ambiguous; source was left unchanged"
+                            .into();
+                    None
+                })
+        };
+        let Some(offset) = offset else {
+            return Ok(());
+        };
+        let Some(cursor) = editor_position_from_byte(&text, offset) else {
+            self.message =
+                "Previous position is not a valid editor boundary; source was left unchanged"
+                    .into();
+            return Ok(());
         };
         self.open_scene(location.scene_id)?;
-        self.cursor = editor_position_from_byte(&text, offset)
-            .ok_or("previous position is not a valid UTF-8 editor position")?;
+        self.cursor = cursor;
         self.location_history.pop();
         self.message = "Returned to the previous manuscript position".into();
         Ok(())
@@ -19556,6 +19569,24 @@ fn open_default_manuscript_if_unrestored(
     Ok(())
 }
 
+fn handle_interactive_key(state: &mut AppState, key: KeyEvent) -> bool {
+    let result = handle(state, key);
+    handle_interactive_result(state, result)
+}
+
+fn handle_interactive_result(
+    state: &mut AppState,
+    result: Result<bool, Box<dyn std::error::Error>>,
+) -> bool {
+    match result {
+        Ok(should_quit) => should_quit || std::mem::take(&mut state.quit_requested),
+        Err(error) => {
+            state.message = format!("Action could not be completed: {error}");
+            false
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (project_path, startup_scratch) =
         prepare_startup_project(env::args().nth(1).map(Into::into))?;
@@ -19679,7 +19710,7 @@ fn run(
             match event::read()? {
                 Event::Key(k) => {
                     let previous_render_context = render_context_key(s);
-                    let should_quit = handle(s, k)? || std::mem::take(&mut s.quit_requested);
+                    let should_quit = handle_interactive_key(s, k);
                     if let Some(text) = s.pending_terminal_clipboard.take() {
                         if let Some(sequence) = terminal_clipboard_sequence(&text) {
                             execute!(t.backend_mut(), crossterm::style::Print(sequence))?;
@@ -36077,6 +36108,50 @@ mod tests {
         assert_eq!(state.editing_scene, Some(scene));
         assert_eq!(state.cursor, (0, 7));
         assert!(state.location_history.is_empty());
+    }
+
+    #[test]
+    fn previous_position_without_history_is_a_nonfatal_menu_action_and_preserves_unsaved_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+        let scene = app.create_scene(chapter, "At the Gate", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor[0].push_str(" Unsaved changes.");
+        state.dirty = true;
+        let original_editor = state.editor.clone();
+        let original_cursor = state.cursor;
+
+        let navigate = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Navigate")
+            .unwrap();
+        state.open_menu_category(navigate);
+        let previous = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| command.id == "search.return-position")
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = previous;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert_eq!(state.editing_scene, Some(scene));
+        assert_eq!(state.editor, original_editor);
+        assert_eq!(state.cursor, original_cursor);
+        assert!(state.dirty);
+        assert_eq!(state.message, "No previous manuscript position");
+
+        assert!(!handle_interactive_result(
+            &mut state,
+            Err("test recoverable command failure".into())
+        ));
+        assert!(state.message.contains("test recoverable command failure"));
+        assert_eq!(state.editor, original_editor);
+        assert!(state.dirty);
     }
 
     #[test]

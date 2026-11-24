@@ -93,3 +93,40 @@ fn full_screen_terminal_creates_a_fiction_project_and_saves_a_scene_in_a_pty() {
     assert!(manuscript.contains("Chapter One"));
     assert!(manuscript.contains("First passage."));
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Pty Project");
+    let mut app = WriterApp::create_project(&project, "Pty Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (prose, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), &format!("{prose}Opening prose."))
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY navigation regression: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("previous-position")
+        .output()
+        .expect("run the Linux PTY navigation regression");
+    assert!(
+        result.status.success(),
+        "empty Previous Position PTY flow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
