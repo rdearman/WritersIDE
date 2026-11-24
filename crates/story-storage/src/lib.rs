@@ -62,6 +62,7 @@ const MIGRATION_45: &str = include_str!("../migrations/0045_reading_document_tra
 const MIGRATION_46: &str = include_str!("../migrations/0046_scene_archive_status.sql");
 const MIGRATION_47: &str =
     include_str!("../migrations/0047_recoverable_structural_node_removal.sql");
+const MIGRATION_48: &str = include_str!("../migrations/0048_structural_removal_operations.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -486,7 +487,7 @@ pub struct SceneRecord {
     pub actual_words: u32,
     pub content_hash: String,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StructuralNodeSummary {
     pub id: NodeId,
     pub parent_id: Option<NodeId>,
@@ -494,6 +495,16 @@ pub struct StructuralNodeSummary {
     pub title: String,
     pub position: u32,
     pub archived: bool,
+}
+struct StructuralRemovalScene {
+    scene_id: String,
+    original_chapter_id: Option<String>,
+    original_position: Option<u32>,
+    was_archived: bool,
+    previous_status: String,
+    applied_chapter_id: Option<String>,
+    applied_position: Option<i64>,
+    applied_unplaced_position: Option<i64>,
 }
 #[derive(Clone, Debug)]
 pub struct ContentUnitRecord {
@@ -1457,6 +1468,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_45}\nINSERT INTO schema_migrations(version,applied_at) VALUES(45,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_46}\nINSERT INTO schema_migrations(version,applied_at) VALUES(46,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_47}\nINSERT INTO schema_migrations(version,applied_at) VALUES(47,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_48}\nINSERT INTO schema_migrations(version,applied_at) VALUES(48,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1505,7 +1517,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 47 {
+        if version > 48 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1694,6 +1706,10 @@ impl ProjectStore {
         }
         if current_version == 46 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_47}\nINSERT INTO schema_migrations(version,applied_at) VALUES(47,'{}');\nCOMMIT;", now()))?;
+            current_version = 47;
+        }
+        if current_version == 47 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_48}\nINSERT INTO schema_migrations(version,applied_at) VALUES(48,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -3982,7 +3998,7 @@ impl ProjectStore {
         .collect()
     }
     pub fn list_archived_structural_nodes(&self) -> Result<Vec<StructuralNodeSummary>> {
-        let mut stmt = self.conn.prepare("SELECT id,parent_id,kind,title,position FROM structural_node WHERE archived=1 ORDER BY parent_id,position,id")?;
+        let mut stmt = self.conn.prepare("SELECT node.id,node.parent_id,node.kind,node.title,node.position FROM structural_node node WHERE node.archived=1 AND (node.parent_id IS NULL OR NOT EXISTS(SELECT 1 FROM structural_node parent WHERE parent.id=node.parent_id AND parent.archived=1)) ORDER BY node.parent_id,node.position,node.id")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -4071,6 +4087,380 @@ impl ProjectStore {
             };
         }
         Ok(())
+    }
+    /// Move a populated structural subtree to Removed Documents without
+    /// deleting its rows or manuscript files. The removal record makes the
+    /// exact original hierarchy and object states restorable after restart.
+    pub fn archive_structural_subtree(&mut self, id: NodeId) -> Result<Uuid> {
+        let scenes = self.list_scenes(true)?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let root_exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM structural_node WHERE id=?1 AND archived=0)",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        if !root_exists {
+            return Err(StorageError::NotFound(format!(
+                "active structural node {id}"
+            )));
+        }
+        let removal_id = Uuid::new_v4();
+        tx.execute(
+            "INSERT INTO structural_removal(id,root_node_id,mode,created_at) VALUES(?1,?2,'delete_subtree',?3)",
+            params![removal_id.to_string(), id.to_string(), now()],
+        )?;
+        let nodes: Vec<(String, i64, bool)> = {
+            let mut statement = tx.prepare(
+                "WITH RECURSIVE tree(id,depth) AS (
+                    SELECT id,0 FROM structural_node WHERE id=?1
+                    UNION ALL SELECT child.id,tree.depth+1 FROM structural_node child JOIN tree ON child.parent_id=tree.id
+                 ) SELECT node.id,tree.depth,node.archived FROM structural_node node JOIN tree ON tree.id=node.id ORDER BY tree.depth DESC",
+            )?;
+            statement
+                .query_map([id.to_string()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        let node_ids: std::collections::HashSet<String> =
+            nodes.iter().map(|(node, _, _)| node.clone()).collect();
+        for (node, _, was_archived) in &nodes {
+            tx.execute(
+                "INSERT INTO structural_removal_node(removal_id,node_id,was_archived) VALUES(?1,?2,?3)",
+                params![removal_id.to_string(), node, was_archived],
+            )?;
+        }
+        for scene in scenes.iter().filter(|scene| {
+            scene
+                .chapter_id
+                .is_some_and(|chapter| node_ids.contains(&chapter.to_string()))
+        }) {
+            tx.execute(
+                "INSERT INTO structural_removal_scene(removal_id,scene_id,original_chapter_id,original_position,was_archived,previous_status,applied_chapter_id,applied_position) VALUES(?1,?2,?3,?4,?5,?6,?3,?4)",
+                params![removal_id.to_string(), scene.scene.id.to_string(), scene.chapter_id.map(|node| node.to_string()), scene.position, scene.scene.archived, scene.scene.status.as_str()],
+            )?;
+            if !scene.scene.archived {
+                tx.execute(
+                    "UPDATE scene SET status_before_archive=status,status='archived',archived=1,updated_at=?2 WHERE id=?1",
+                    params![scene.scene.id.to_string(), now()],
+                )?;
+            }
+        }
+        let units: Vec<(String, bool)> = {
+            let mut statement = tx.prepare(
+                "WITH RECURSIVE tree(id) AS (
+                    SELECT id FROM structural_node WHERE id=?1
+                    UNION ALL SELECT child.id FROM structural_node child JOIN tree ON child.parent_id=tree.id
+                 ) SELECT unit.id,unit.archived FROM content_unit unit WHERE unit.parent_node_id IN tree",
+            )?;
+            statement
+                .query_map([id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for (unit, was_archived) in units {
+            tx.execute(
+                "INSERT INTO structural_removal_content_unit(removal_id,content_unit_id,was_archived) VALUES(?1,?2,?3)",
+                params![removal_id.to_string(), unit, was_archived],
+            )?;
+            if !was_archived {
+                tx.execute(
+                    "UPDATE content_unit SET archived=1,updated_at=?2 WHERE id=?1",
+                    params![unit, now()],
+                )?;
+            }
+        }
+        // The recursive query is deepest first so database triggers can
+        // require that every child is already archived before its parent.
+        for (node, _, was_archived) in nodes {
+            if !was_archived {
+                tx.execute(
+                    "UPDATE structural_node SET archived=1,updated_at=?2 WHERE id=?1",
+                    params![node, now()],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(removal_id)
+    }
+
+    /// Remove a fiction chapter while retaining every scene. Scenes are
+    /// appended to the unplaced collection by default, or to a selected
+    /// compatible chapter. The removal record captures exact prior order.
+    pub fn remove_chapter_rehome_scenes(
+        &mut self,
+        chapter_id: NodeId,
+        destination: Option<NodeId>,
+    ) -> Result<Uuid> {
+        let chapter_kind: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT kind FROM structural_node WHERE id=?1 AND archived=0",
+                [chapter_id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if chapter_kind.as_deref() != Some("chapter") {
+            return Err(StorageError::Invalid(
+                "only an active chapter can rehome its scenes".into(),
+            ));
+        }
+        let content_units: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM content_unit WHERE parent_node_id=?1 AND archived=0",
+            [chapter_id.to_string()],
+            |row| row.get(0),
+        )?;
+        if content_units != 0 {
+            return Err(StorageError::Invalid(
+                "this chapter contains prose; choose recoverable deletion so its prose is retained"
+                    .into(),
+            ));
+        }
+        if let Some(destination) = destination {
+            let kind: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT kind FROM structural_node WHERE id=?1 AND archived=0",
+                    [destination.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if kind.as_deref() != Some("chapter") || destination == chapter_id {
+                return Err(StorageError::Invalid(
+                    "select a different active chapter for these scenes".into(),
+                ));
+            }
+        }
+        let scenes: Vec<(String, u32, bool, String)> = {
+            let mut statement = self.conn.prepare(
+                "SELECT scene.id,placement.position,scene.archived,scene.status FROM scene JOIN scene_placement placement ON placement.scene_id=scene.id WHERE placement.chapter_id=?1 ORDER BY placement.position,scene.id",
+            )?;
+            statement
+                .query_map([chapter_id.to_string()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removal_id = Uuid::new_v4();
+        let mode = if destination.is_some() {
+            "move_scenes_chapter"
+        } else {
+            "move_scenes_unplaced"
+        };
+        tx.execute(
+            "INSERT INTO structural_removal(id,root_node_id,mode,target_chapter_id,created_at) VALUES(?1,?2,?3,?4,?5)",
+            params![removal_id.to_string(), chapter_id.to_string(), mode, destination.map(|node| node.to_string()), now()],
+        )?;
+        tx.execute(
+            "INSERT INTO structural_removal_node(removal_id,node_id,was_archived) VALUES(?1,?2,0)",
+            params![removal_id.to_string(), chapter_id.to_string()],
+        )?;
+        let mut unplaced_position: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(position),-1)+1 FROM unplaced_scene_order",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut target_position: i64 = if let Some(destination) = destination {
+            tx.query_row(
+                "SELECT COALESCE(MAX(position),-1)+1 FROM scene_placement WHERE chapter_id=?1",
+                [destination.to_string()],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        };
+        for (scene_id, position, was_archived, status) in scenes {
+            let applied_chapter = destination.map(|node| node.to_string());
+            let applied_position = if destination.is_some() {
+                let value = target_position;
+                tx.execute(
+                    "UPDATE scene_placement SET chapter_id=?2,position=?3 WHERE scene_id=?1",
+                    params![scene_id, destination.map(|node| node.to_string()), value],
+                )?;
+                target_position += 1;
+                Some(value)
+            } else {
+                tx.execute("DELETE FROM scene_placement WHERE scene_id=?1", [&scene_id])?;
+                tx.execute(
+                    "INSERT INTO unplaced_scene_order(scene_id,position) VALUES(?1,?2)",
+                    params![scene_id, unplaced_position],
+                )?;
+                unplaced_position += 1;
+                None
+            };
+            let applied_unplaced = if destination.is_none() {
+                Some(unplaced_position - 1)
+            } else {
+                None
+            };
+            tx.execute(
+                "INSERT INTO structural_removal_scene(removal_id,scene_id,original_chapter_id,original_position,was_archived,previous_status,applied_chapter_id,applied_position,applied_unplaced_position) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+                params![removal_id.to_string(),scene_id,chapter_id.to_string(),position,was_archived,status,applied_chapter,applied_position,applied_unplaced],
+            )?;
+        }
+        tx.execute(
+            "UPDATE structural_node SET archived=1,updated_at=?2 WHERE id=?1",
+            params![chapter_id.to_string(), now()],
+        )?;
+        tx.commit()?;
+        Ok(removal_id)
+    }
+
+    pub fn restore_structural_subtree(&mut self, removal_id: Uuid) -> Result<NodeId> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (root, mode, restored): (String, String, Option<String>) = tx
+            .query_row(
+                "SELECT root_node_id,mode,restored_at FROM structural_removal WHERE id=?1",
+                [removal_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(format!("structural removal {removal_id}")))?;
+        if restored.is_some() {
+            return Err(StorageError::Invalid(
+                "this structural removal has already been restored".into(),
+            ));
+        }
+        let root_id = NodeId(
+            Uuid::parse_str(&root).map_err(|error| StorageError::Invalid(error.to_string()))?,
+        );
+        let nodes: Vec<(String, i64, bool)> = {
+            let mut statement = tx.prepare(
+                "WITH RECURSIVE tree(id,depth) AS (
+                    SELECT id,0 FROM structural_node WHERE id=?1
+                    UNION ALL SELECT child.id,tree.depth+1 FROM structural_node child JOIN tree ON child.parent_id=tree.id
+                 ) SELECT member.node_id,tree.depth,member.was_archived FROM structural_removal_node member JOIN tree ON tree.id=member.node_id WHERE member.removal_id=?2 ORDER BY tree.depth ASC",
+            )?;
+            statement
+                .query_map(params![root, removal_id.to_string()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for (node, _, was_archived) in nodes {
+            if !was_archived {
+                tx.execute(
+                    "UPDATE structural_node SET archived=0,updated_at=?2 WHERE id=?1",
+                    params![node, now()],
+                )?;
+            }
+        }
+        let scenes: Vec<StructuralRemovalScene> = {
+            let mut statement = tx.prepare(
+                "SELECT scene_id,original_chapter_id,original_position,was_archived,previous_status,applied_chapter_id,applied_position,applied_unplaced_position FROM structural_removal_scene WHERE removal_id=?1 ORDER BY original_chapter_id,original_position,scene_id",
+            )?;
+            statement
+                .query_map([removal_id.to_string()], |row| {
+                    Ok(StructuralRemovalScene {
+                        scene_id: row.get(0)?,
+                        original_chapter_id: row.get(1)?,
+                        original_position: row.get(2)?,
+                        was_archived: row.get(3)?,
+                        previous_status: row.get(4)?,
+                        applied_chapter_id: row.get(5)?,
+                        applied_position: row.get(6)?,
+                        applied_unplaced_position: row.get(7)?,
+                    })
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for scene in scenes {
+            if mode == "delete_subtree" {
+                if !scene.was_archived {
+                    tx.execute(
+                        "UPDATE scene SET archived=0,status=?2,status_before_archive=NULL,updated_at=?3 WHERE id=?1",
+                        params![scene.scene_id, scene.previous_status, now()],
+                    )?;
+                }
+                continue;
+            }
+            let current: (Option<String>, Option<u32>, Option<i64>, bool) = tx.query_row(
+                "SELECT placement.chapter_id,placement.position,unplaced.position,scene.archived FROM scene LEFT JOIN scene_placement placement ON placement.scene_id=scene.id LEFT JOIN unplaced_scene_order unplaced ON unplaced.scene_id=scene.id WHERE scene.id=?1",
+                [&scene.scene_id],
+                |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            )?;
+            if current.0 != scene.applied_chapter_id
+                || current.1.map(i64::from) != scene.applied_position
+                || current.2 != scene.applied_unplaced_position
+            {
+                return Err(StorageError::Invalid(format!(
+                    "cannot restore removed chapter because scene {} has moved since removal",
+                    scene.scene_id
+                )));
+            }
+            if current.3 != scene.was_archived {
+                return Err(StorageError::Invalid(format!(
+                    "cannot restore removed chapter because scene {} changed its removed state",
+                    scene.scene_id
+                )));
+            }
+            if let Some(chapter) = scene.original_chapter_id {
+                if current.0.is_some() {
+                    tx.execute(
+                        "DELETE FROM scene_placement WHERE scene_id=?1",
+                        [&scene.scene_id],
+                    )?;
+                }
+                if current.2.is_some() {
+                    tx.execute(
+                        "DELETE FROM unplaced_scene_order WHERE scene_id=?1",
+                        [&scene.scene_id],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO scene_placement(scene_id,chapter_id,position) VALUES(?1,?2,?3)",
+                    params![scene.scene_id, chapter, scene.original_position],
+                )?;
+            }
+        }
+        let units: Vec<(String, bool)> = {
+            let mut statement = tx.prepare(
+                "SELECT content_unit_id,was_archived FROM structural_removal_content_unit WHERE removal_id=?1",
+            )?;
+            statement
+                .query_map([removal_id.to_string()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for (unit, was_archived) in units {
+            if !was_archived {
+                tx.execute(
+                    "UPDATE content_unit SET archived=0,updated_at=?2 WHERE id=?1",
+                    params![unit, now()],
+                )?;
+            }
+        }
+        tx.execute(
+            "UPDATE structural_removal SET restored_at=?2 WHERE id=?1",
+            params![removal_id.to_string(), now()],
+        )?;
+        tx.commit()?;
+        Ok(root_id)
+    }
+    pub fn restore_latest_structural_removal(&mut self, root: NodeId) -> Result<()> {
+        let removal: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT id FROM structural_removal WHERE root_node_id=?1 AND restored_at IS NULL ORDER BY created_at DESC,id DESC LIMIT 1",
+                [root.to_string()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(removal) = removal {
+            let removal = Uuid::parse_str(&removal)
+                .map_err(|error| StorageError::Invalid(error.to_string()))?;
+            self.restore_structural_subtree(removal)?;
+            Ok(())
+        } else {
+            self.restore_archived_structural_node(root)
+        }
     }
     fn update_content_unit_recovery(
         &mut self,
@@ -10699,7 +11089,7 @@ mod tests {
         let project = directory.path().join("Book");
         let store = ProjectStore::create(&project, "Book").unwrap();
         store.conn.execute_batch(
-            "DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
+            "DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
        ).unwrap();
         drop(store);
 
@@ -10725,7 +11115,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 47);
+        assert_eq!(version, 48);
     }
     #[test]
     fn event_character_and_location_relationships_are_typed_atomic_and_persistent() {
@@ -10784,7 +11174,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 47);
+        assert_eq!(schema_version, 48);
     }
     #[test]
     fn writing_challenges_are_validated_persisted_and_completed_once() {
@@ -12638,7 +13028,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 47))
+            .map(|version| assert_eq!(version, 48))
             .unwrap();
     }
 
@@ -13049,7 +13439,7 @@ mod tests {
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch("ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code; DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
-        conn.execute_batch("DROP TABLE diagnostic_suppression; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TABLE diagnostic_suppression; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -13059,7 +13449,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 47);
+        assert_eq!(version, 48);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -13096,7 +13486,7 @@ mod tests {
              DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert;
              DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit;
              DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal;
-             DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; DROP TABLE content_unit_search_content; DROP TABLE content_unit;
+             DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; DROP TABLE content_unit_search_content; DROP TABLE content_unit;
              ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type;
              DROP TRIGGER story_link_source_exists_update;
              DROP TRIGGER story_link_no_transclusion_cycle;
@@ -14813,6 +15203,173 @@ mod tests {
     }
 
     #[test]
+    fn populated_structural_subtree_deletion_recovers_all_documents_after_reopen() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let section = store
+            .create_node(None, NodeKind::Section, "Part One", 0)
+            .unwrap();
+        let chapter = store
+            .create_node(Some(section), NodeKind::Chapter, "Chapter One", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Opening").unwrap();
+        let content_unit = store
+            .create_content_unit(
+                ContentUnitKind::ChapterBody,
+                "Chapter prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let scene_before = store.get_scene(scene).unwrap();
+
+        let removal = store.archive_structural_subtree(section).unwrap();
+        assert!(store.list_structural_nodes().unwrap().is_empty());
+        assert!(store.list_scenes(false).unwrap().is_empty());
+        assert!(store.get_content_unit(content_unit).unwrap().archived);
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE scene SET archived=0 WHERE id=?1",
+                    [scene.to_string()]
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE content_unit SET archived=0 WHERE id=?1",
+                    [content_unit.to_string()]
+                )
+                .is_err()
+        );
+        drop(store);
+
+        let mut reopened = ProjectStore::open(&project).unwrap();
+        assert_eq!(
+            reopened.restore_structural_subtree(removal).unwrap(),
+            section
+        );
+        let active_nodes = reopened.list_structural_nodes().unwrap();
+        assert!(active_nodes.iter().any(|node| node.id == section));
+        assert!(active_nodes.iter().any(|node| node.id == chapter));
+        assert_eq!(reopened.list_scenes(false).unwrap()[0].scene.id, scene);
+        assert!(!reopened.get_content_unit(content_unit).unwrap().archived);
+        let scene_after = reopened.get_scene(scene).unwrap();
+        assert_eq!(scene_after.scene.title, scene_before.scene.title);
+        assert_eq!(scene_after.scene.status, scene_before.scene.status);
+        assert_eq!(scene_after.chapter_id, Some(chapter));
+        assert!(reopened.restore_structural_subtree(removal).is_err());
+        reopened.validate().unwrap();
+    }
+
+    #[test]
+    fn chapter_rehome_to_unplaced_is_atomic_and_restores_order_after_reopen() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter One", 0)
+            .unwrap();
+        let first = store.create_scene(chapter, 0, "First").unwrap();
+        let second = store.create_scene(chapter, 1, "Second").unwrap();
+        let removal = store.remove_chapter_rehome_scenes(chapter, None).unwrap();
+        assert!(store.list_structural_nodes().unwrap().is_empty());
+        assert!(
+            store
+                .list_scenes(false)
+                .unwrap()
+                .iter()
+                .all(|scene| { scene.chapter_id.is_none() })
+        );
+        drop(store);
+
+        let mut reopened = ProjectStore::open(&project).unwrap();
+        assert_eq!(
+            reopened.restore_structural_subtree(removal).unwrap(),
+            chapter
+        );
+        let restored: Vec<_> = reopened
+            .list_scenes(false)
+            .unwrap()
+            .into_iter()
+            .filter(|scene| scene.chapter_id == Some(chapter))
+            .collect();
+        assert_eq!(
+            restored
+                .iter()
+                .map(|scene| scene.scene.id)
+                .collect::<Vec<_>>(),
+            vec![first, second]
+        );
+        assert_eq!(restored[0].position, Some(0));
+        assert_eq!(restored[1].position, Some(1));
+    }
+
+    #[test]
+    fn chapter_rehome_to_another_chapter_preserves_scene_ids_and_can_restore() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let source = store
+            .create_node(None, NodeKind::Chapter, "Source", 0)
+            .unwrap();
+        let target = store
+            .create_node(None, NodeKind::Chapter, "Target", 1)
+            .unwrap();
+        let original = store.create_scene(source, 0, "Original").unwrap();
+        let existing = store.create_scene(target, 0, "Existing").unwrap();
+        let removal = store
+            .remove_chapter_rehome_scenes(source, Some(target))
+            .unwrap();
+        let target_order: Vec<_> = store
+            .list_scenes(false)
+            .unwrap()
+            .into_iter()
+            .filter(|scene| scene.chapter_id == Some(target))
+            .map(|scene| scene.scene.id)
+            .collect();
+        assert_eq!(target_order, vec![existing, original]);
+        assert_eq!(store.restore_structural_subtree(removal).unwrap(), source);
+        let restored = store.get_scene(original).unwrap();
+        assert_eq!(restored.chapter_id, Some(source));
+        assert_eq!(restored.position, Some(0));
+    }
+
+    #[test]
+    fn structural_restore_refuses_to_overwrite_a_scene_moved_after_removal() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let source = store
+            .create_node(None, NodeKind::Chapter, "Source", 0)
+            .unwrap();
+        let destination = store
+            .create_node(None, NodeKind::Chapter, "Destination", 1)
+            .unwrap();
+        let scene = store.create_scene(source, 0, "Opening").unwrap();
+        let removal = store.remove_chapter_rehome_scenes(source, None).unwrap();
+        store.move_scene(scene, destination, 0).unwrap();
+
+        assert!(store.restore_structural_subtree(removal).is_err());
+        assert!(
+            !store
+                .list_structural_nodes()
+                .unwrap()
+                .iter()
+                .any(|node| node.id == source)
+        );
+        assert_eq!(
+            store.get_scene(scene).unwrap().chapter_id,
+            Some(destination)
+        );
+    }
+
+    #[test]
     fn unplaced_scenes_have_persistent_reorderable_positions_and_can_be_reinserted() {
         let directory = tempdir().unwrap();
         let mut store = ProjectStore::create(directory.path().join("Novel"), "Novel").unwrap();
@@ -14872,7 +15429,7 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>=44;",
+                "DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>=44;",
             )
             .unwrap();
         drop(connection);
@@ -14888,6 +15445,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 47);
+        assert_eq!(version, 48);
     }
 }

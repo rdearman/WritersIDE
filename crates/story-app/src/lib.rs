@@ -1049,6 +1049,24 @@ impl WriterApp {
     pub fn restore_archived_structural_node(&mut self, id: NodeId) -> Result<()> {
         Ok(self.store.restore_archived_structural_node(id)?)
     }
+    pub fn archive_structural_subtree(&mut self, id: NodeId) -> Result<uuid::Uuid> {
+        Ok(self.store.archive_structural_subtree(id)?)
+    }
+    pub fn remove_chapter_rehome_scenes(
+        &mut self,
+        chapter: NodeId,
+        destination: Option<NodeId>,
+    ) -> Result<uuid::Uuid> {
+        Ok(self
+            .store
+            .remove_chapter_rehome_scenes(chapter, destination)?)
+    }
+    pub fn restore_structural_subtree(&mut self, id: uuid::Uuid) -> Result<NodeId> {
+        Ok(self.store.restore_structural_subtree(id)?)
+    }
+    pub fn restore_latest_structural_removal(&mut self, root: NodeId) -> Result<()> {
+        Ok(self.store.restore_latest_structural_removal(root)?)
+    }
 
     pub fn create_project_with_metadata(path: impl AsRef<Path>, project: &Project) -> Result<Self> {
         Ok(Self {

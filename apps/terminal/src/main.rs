@@ -196,6 +196,15 @@ struct StructuralNodeRemovalDialog {
     title: String,
     kind: String,
     restoring: bool,
+    descendant_nodes: u32,
+    scene_count: u32,
+    scene_words: u64,
+    content_unit_count: u32,
+    content_unit_words: u64,
+    can_rehome_scenes: bool,
+    target_chapters: Vec<story_core::NodeId>,
+    target_index: usize,
+    choice: usize,
 }
 
 struct AppState {
@@ -2531,12 +2540,12 @@ fn command_registry() -> Vec<CommandSpec> {
         },
         CommandSpec {
             id: "document.remove-empty-node",
-            label: "Move Empty Section or Chapter to Removed",
-            description: "Reversibly remove an empty section or chapter; dependent content must be moved first",
+            label: "Remove Selected Section or Chapter…",
+            description: "Choose how to retain, rehome or recoverably remove its contents",
             category: "Edit",
             default_shortcuts: &[],
             mnemonic: None,
-            palette_aliases: &["remove section", "remove chapter", "archive outline heading"],
+            palette_aliases: &["remove section", "remove chapter", "delete heading", "archive outline heading"],
             palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::ArchiveSelectedStructuralNode,
@@ -10696,7 +10705,7 @@ impl AppState {
         self.message = if self.removed_structural_nodes_list {
             "Removed Sections and Chapters · select one and choose Restore Selected Section or Chapter".into()
         } else {
-            "Outline · chapters and sections · remove only when empty".into()
+            "Outline · select a section or chapter to remove, move or restore".into()
         };
         Ok(())
     }
@@ -10735,11 +10744,78 @@ impl AppState {
         .into_iter()
         .find(|node| node.id == id)
         .ok_or("selected section or chapter no longer exists")?;
+        let active_nodes = self.app.list_structural_nodes()?;
+        let mut subtree_ids = vec![id];
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for candidate in &active_nodes {
+                if candidate
+                    .parent_id
+                    .is_some_and(|parent| subtree_ids.contains(&parent))
+                    && !subtree_ids.contains(&candidate.id)
+                {
+                    subtree_ids.push(candidate.id);
+                    changed = true;
+                }
+            }
+        }
+        let subtree_chapters: Vec<_> = active_nodes
+            .iter()
+            .filter(|candidate| subtree_ids.contains(&candidate.id) && candidate.kind == "chapter")
+            .map(|candidate| candidate.id)
+            .collect();
+        let scenes: Vec<_> = self
+            .app
+            .list_scenes(true)?
+            .into_iter()
+            .filter(|scene| {
+                scene
+                    .chapter_id
+                    .is_some_and(|chapter| subtree_chapters.contains(&chapter))
+            })
+            .collect();
+        let units: Vec<_> = self
+            .app
+            .list_content_units(true)?
+            .into_iter()
+            .filter(|unit| {
+                unit.parent_id
+                    .is_some_and(|parent| subtree_ids.contains(&parent))
+            })
+            .collect();
+        let descendant_nodes = subtree_ids.len().saturating_sub(1) as u32;
+        let can_rehome_scenes = !restoring
+            && node.kind == "chapter"
+            && descendant_nodes == 0
+            && units.is_empty()
+            && !scenes.is_empty();
+        let target_chapters = active_nodes
+            .iter()
+            .filter(|candidate| {
+                candidate.kind == "chapter"
+                    && candidate.id != id
+                    && !subtree_ids.contains(&candidate.id)
+            })
+            .map(|candidate| candidate.id)
+            .collect();
         self.pending_structural_node_removal = Some(StructuralNodeRemovalDialog {
             id,
             title: node.title,
             kind: node.kind,
             restoring,
+            descendant_nodes,
+            scene_count: scenes.len() as u32,
+            scene_words: scenes
+                .iter()
+                .map(|scene| u64::from(scene.actual_words))
+                .sum(),
+            content_unit_count: units.len() as u32,
+            content_unit_words: units.iter().map(|unit| u64::from(unit.actual_words)).sum(),
+            can_rehome_scenes,
+            target_chapters,
+            target_index: 0,
+            choice: if can_rehome_scenes { 0 } else { 2 },
         });
         Ok(())
     }
@@ -10748,10 +10824,19 @@ impl AppState {
         dialog: StructuralNodeRemovalDialog,
     ) -> Result<(), Box<dyn std::error::Error>> {
         if dialog.restoring {
-            self.app.restore_archived_structural_node(dialog.id)?;
+            self.app.restore_latest_structural_removal(dialog.id)?;
             self.removed_structural_nodes_list = false;
+        } else if dialog.can_rehome_scenes && dialog.choice == 0 {
+            self.app.remove_chapter_rehome_scenes(dialog.id, None)?;
+        } else if dialog.can_rehome_scenes && dialog.choice == 1 {
+            let Some(target) = dialog.target_chapters.get(dialog.target_index).copied() else {
+                self.message = "Create another chapter before moving these scenes".into();
+                return Ok(());
+            };
+            self.app
+                .remove_chapter_rehome_scenes(dialog.id, Some(target))?;
         } else {
-            self.app.archive_empty_structural_node(dialog.id)?;
+            self.app.archive_structural_subtree(dialog.id)?;
         }
         self.pending_structural_node_removal = None;
         self.selected = if dialog.restoring {
@@ -10766,7 +10851,7 @@ impl AppState {
             )
         } else {
             format!(
-                "Moved empty {} ‘{}’ to Removed Sections and Chapters · identity retained",
+                "Moved {} ‘{}’ and its contents to Removed Documents · identity retained",
                 dialog.kind, dialog.title
             )
         };
@@ -24244,7 +24329,7 @@ fn draw_reading_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     };
     let area = f.area();
     let width = area.width.saturating_sub(4).clamp(1, 76);
-    let height = 7.min(area.height.max(1));
+    let height = if dialog.restoring { 7 } else { 16 }.min(area.height.max(1));
     let rect = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -24376,30 +24461,83 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
         height,
     );
     f.render_widget(Clear, rect);
-    let text = Text::from(vec![
-        Line::from(if dialog.restoring {
-            "Restore this section or chapter to its original place?"
+    let mut lines = vec![Line::from(truncate_display_cells(
+        &format!("{}: {}", dialog.kind, dialog.title),
+        width.saturating_sub(4) as usize,
+    ))];
+    if dialog.restoring {
+        lines.push(Line::from(
+            "Restore its original hierarchy, ordering and identity?",
+        ));
+        lines.push(Line::from(
+            "Any moved scenes must still be where this removal placed them.",
+        ));
+        lines.push(Line::from("Enter restores · Esc cancels"));
+    } else {
+        lines.push(Line::from(format!(
+            "Contains {} scene(s), {} scene words, {} prose document(s), {} prose words.",
+            dialog.scene_count,
+            dialog.scene_words,
+            dialog.content_unit_count,
+            dialog.content_unit_words
+        )));
+        if dialog.descendant_nodes > 0 {
+            lines.push(Line::from(format!(
+                "Also contains {} subordinate heading(s).",
+                dialog.descendant_nodes
+            )));
+        }
+        if dialog.can_rehome_scenes {
+            lines.push(Line::from("Choose how to handle the scenes:"));
+            lines.push(Line::from(format!(
+                "{} Move scenes to Unplaced",
+                if dialog.choice == 0 { ">" } else { " " }
+            )));
+            lines.push(Line::from(format!(
+                "{} Move scenes to another chapter… {}",
+                if dialog.choice == 1 { ">" } else { " " },
+                dialog
+                    .target_chapters
+                    .get(dialog.target_index)
+                    .and_then(|target| s
+                        .app
+                        .list_structural_nodes()
+                        .ok()?
+                        .into_iter()
+                        .find(|node| node.id == *target)
+                        .map(|node| node.title))
+                    .unwrap_or_else(|| "No destination chapter".into())
+            )));
+            lines.push(Line::from(format!(
+                "{} Delete chapter and all its contents recoverably",
+                if dialog.choice == 2 { ">" } else { " " }
+            )));
+            lines.push(Line::from(
+                "Unplaced scenes are omitted from Compile. Delete retains the full subtree in Removed Documents.",
+            ));
+            lines.push(Line::from(
+                "Up/Down choose · Left/Right destination · Enter confirm · Esc cancel",
+            ));
         } else {
-            "Move this empty section or chapter to Removed Sections and Chapters?"
-        }),
-        Line::from(truncate_display_cells(
-            &format!("{}: {}", dialog.kind, dialog.title),
-            width.saturating_sub(4) as usize,
-        )),
-        Line::from(if dialog.restoring {
-            "Its stable identity and original position will be retained."
-        } else {
-            "It must have no child headings, scenes or prose documents."
-        }),
-        Line::from("Enter/Y confirms · Esc/N cancels"),
-    ]);
+            lines.push(Line::from(
+                "The entire heading subtree, scenes and prose will be retained in Removed Documents.",
+            ));
+            lines.push(Line::from(
+                "This changes manuscript inclusion and Compile output.",
+            ));
+            lines.push(Line::from("Enter removes recoverably · Esc cancels"));
+        }
+    }
+    let text = Text::from(lines);
     f.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: true }).block(
             Block::default()
                 .title(if dialog.restoring {
                     " Restore Outline Heading "
+                } else if dialog.can_rehome_scenes {
+                    " Delete Chapter · Keep or Remove Scenes "
                 } else {
-                    " Remove Empty Outline Heading "
+                    " Delete Heading and Contents "
                 })
                 .borders(Borders::ALL),
         ),
@@ -27737,6 +27875,33 @@ fn handle_command_palette_key(
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
     if let Some(dialog) = s.pending_structural_node_removal.clone() {
         match k.code {
+            KeyCode::Up if dialog.can_rehome_scenes => {
+                if let Some(active) = s.pending_structural_node_removal.as_mut() {
+                    active.choice = active.choice.saturating_sub(1);
+                }
+            }
+            KeyCode::Down if dialog.can_rehome_scenes => {
+                if let Some(active) = s.pending_structural_node_removal.as_mut() {
+                    active.choice = (active.choice + 1).min(2);
+                }
+            }
+            KeyCode::Left | KeyCode::Right
+                if dialog.can_rehome_scenes
+                    && dialog.choice == 1
+                    && !dialog.target_chapters.is_empty() =>
+            {
+                if let Some(active) = s.pending_structural_node_removal.as_mut() {
+                    if k.code == KeyCode::Right {
+                        active.target_index =
+                            (active.target_index + 1) % active.target_chapters.len();
+                    } else {
+                        active.target_index = active
+                            .target_index
+                            .checked_sub(1)
+                            .unwrap_or(active.target_chapters.len() - 1);
+                    }
+                }
+            }
             KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
                 s.finish_structural_node_removal(dialog)?
             }
@@ -41673,6 +41838,130 @@ mod tests {
                 .unwrap()[0]
                 .title,
             "Empty Chapter"
+        );
+    }
+
+    #[test]
+    fn populated_chapter_removal_rehomes_scenes_by_default_and_recovers_subtree() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut app = WriterApp::create_project(&project, "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let other = app.create_chapter(None, "Chapter Two", 1).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Retained manuscript text.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+            .unwrap();
+
+        state.begin_structural_node_removal(false).unwrap();
+        let dialog = state.pending_structural_node_removal.as_ref().unwrap();
+        assert!(dialog.can_rehome_scenes);
+        assert_eq!(dialog.choice, 0);
+        assert_eq!(dialog.scene_count, 1);
+        state
+            .finish_structural_node_removal(dialog.clone())
+            .unwrap();
+        assert!(
+            state
+                .app
+                .list_structural_nodes()
+                .unwrap()
+                .iter()
+                .any(|node| node.id == other)
+        );
+        assert!(
+            !state
+                .app
+                .list_structural_nodes()
+                .unwrap()
+                .iter()
+                .any(|node| node.id == chapter)
+        );
+        assert_eq!(state.app.get_scene(scene).unwrap().chapter_id, None);
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Retained manuscript text."
+        );
+        assert!(
+            !String::from_utf8_lossy(
+                &state
+                    .app
+                    .compile_artifact(story_document::CompileFormat::Markdown, false)
+                    .unwrap()
+                    .bytes
+            )
+            .contains("Retained manuscript text.")
+        );
+
+        state
+            .app
+            .restore_latest_structural_removal(chapter)
+            .unwrap();
+        assert_eq!(
+            state.app.get_scene(scene).unwrap().chapter_id,
+            Some(chapter)
+        );
+        let mut state = AppState::new(state.app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+            .unwrap();
+        state.begin_structural_node_removal(false).unwrap();
+        let dialog = state.pending_structural_node_removal.as_mut().unwrap();
+        dialog.choice = 1;
+        assert_eq!(dialog.target_chapters, vec![other]);
+        let dialog = dialog.clone();
+        state.finish_structural_node_removal(dialog).unwrap();
+        assert_eq!(state.app.get_scene(scene).unwrap().chapter_id, Some(other));
+        state
+            .app
+            .restore_latest_structural_removal(chapter)
+            .unwrap();
+        assert_eq!(
+            state.app.get_scene(scene).unwrap().chapter_id,
+            Some(chapter)
+        );
+
+        let mut state = AppState::new(state.app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+            .unwrap();
+        state.begin_structural_node_removal(false).unwrap();
+        state
+            .pending_structural_node_removal
+            .as_mut()
+            .unwrap()
+            .choice = 2;
+        let dialog = state.pending_structural_node_removal.clone().unwrap();
+        state.finish_structural_node_removal(dialog).unwrap();
+        assert!(state.app.list_scenes(false).unwrap().is_empty());
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Retained manuscript text."
+        );
+        state
+            .app
+            .restore_latest_structural_removal(chapter)
+            .unwrap();
+        assert_eq!(
+            state.app.get_scene(scene).unwrap().chapter_id,
+            Some(chapter)
+        );
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Retained manuscript text."
         );
     }
 
