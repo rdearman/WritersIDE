@@ -16,8 +16,10 @@ def set_size(fd, rows, columns):
 
 
 def main():
-    binary, project, isolated_home = sys.argv[1:]
+    binary, project, isolated_home, *modes = sys.argv[1:]
+    create_fiction = modes == ["create-fiction"]
     os.makedirs(isolated_home, exist_ok=True)
+    os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
     child_pid, master = pty.fork()
     if child_pid == 0:
         environment = os.environ.copy()
@@ -27,9 +29,11 @@ def main():
                 "HOME": isolated_home,
                 "XDG_CONFIG_HOME": os.path.join(isolated_home, "config"),
                 "XDG_DATA_HOME": os.path.join(isolated_home, "data"),
+                "TMPDIR": os.path.join(isolated_home, "tmp"),
             }
         )
-        os.execve(binary, [binary, project], environment)
+        arguments = [binary] if project == "-" else [binary, project]
+        os.execve(binary, arguments, environment)
 
     set_size(master, 24, 80)
     output = bytearray()
@@ -60,6 +64,42 @@ def main():
 
     try:
         read_for(1.0)
+        if create_fiction:
+            if b"New Project" not in output:
+                raise AssertionError("first-run project browser was not rendered")
+            os.write(master, b"\x1b[12~")  # F2: choose Fiction
+            read_for(0.25)
+            os.write(master, b"\x1b[15~")  # F5: request creation
+            read_for(0.25)
+            os.write(master, b"\x1b[15~")  # F5: confirm new folder
+            read_for(0.8)
+            os.write(master, b"\x1b[2~")  # Insert: create a scene
+            read_for(0.2)
+            os.write(master, b"Opening\r")
+            read_for(0.5)
+            os.write(master, b"\r")  # Open the selected scene
+            read_for(0.4)
+            os.write(master, b"First passage.")
+            read_for(0.15)
+            os.write(master, b"\x13")  # Ctrl+S
+            read_for(0.35)
+            os.write(master, b"\x11")  # Ctrl+Q
+            read_for(1.0)
+            finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if (
+                finished_pid != child_pid
+                or not os.WIFEXITED(status)
+                or os.WEXITSTATUS(status) != 0
+            ):
+                raise AssertionError(
+                    "fiction project creation/write flow did not exit cleanly; output tail: "
+                    + repr(bytes(output[-2000:]))
+                )
+            print(
+                "PTY fiction workflow passed: choose Fiction, create project, insert scene, write, save and exit."
+            )
+            return
+
         # A fresh isolated profile may show the welcome/help panel above the
         # project. Esc dismisses that topmost panel and should reveal prose.
         os.write(master, b"\x1b")
