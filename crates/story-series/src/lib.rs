@@ -1,4 +1,4 @@
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Row, Statement, params};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -8,7 +8,7 @@ use story_core::{BookId, ProjectId, SeriesId};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-const SERIES_SCHEMA_VERSION: i64 = 2;
+const SERIES_SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum SeriesError {
@@ -117,8 +117,12 @@ impl SeriesStore {
                  );
                  CREATE UNIQUE INDEX series_book_title_unique
                     ON series_book(title COLLATE NOCASE);
+                 CREATE TABLE removed_series_book(
+                    book_id TEXT PRIMARY KEY REFERENCES series_book(id) ON DELETE CASCADE,
+                    removed_at INTEGER NOT NULL
+                 );
                  INSERT INTO schema_migrations(version,applied_at)
-                    VALUES(1,unixepoch()),(2,unixepoch());",
+                    VALUES(1,unixepoch()),(2,unixepoch()),(3,unixepoch());",
         )?;
         conn.execute(
             "INSERT INTO series_metadata(singleton,id,title,schema_version) VALUES(1,?1,?2,?3)",
@@ -233,6 +237,20 @@ impl SeriesStore {
             self.write_membership(&existing)?;
             return Ok(existing);
         }
+        if let Some(existing) = self.removed_book_for_project(project_id)? {
+            if existing.relative_path != relative_path {
+                return Err(SeriesError::Config(format!(
+                    "removed project {project_id} remains at {}; restore it there or move the project first",
+                    existing.relative_path
+                )));
+            }
+            self.write_membership(&existing)?;
+            self.conn.execute(
+                "DELETE FROM removed_series_book WHERE book_id=?1",
+                [existing.id.to_string()],
+            )?;
+            return Ok(existing);
+        }
         if self
             .list_books()?
             .iter()
@@ -242,9 +260,11 @@ impl SeriesStore {
                 "a book with that name already exists in this series".into(),
             ));
         }
-        let position: u32 = self
-            .conn
-            .query_row("SELECT count(*) FROM series_book", [], |row| row.get(0))?;
+        let position: u32 = self.conn.query_row(
+            "SELECT COALESCE(MAX(position),-1)+1 FROM series_book",
+            [],
+            |row| row.get(0),
+        )?;
         let book = SeriesBook {
             id: BookId::new(),
             project_id,
@@ -267,7 +287,7 @@ impl SeriesStore {
 
     pub fn list_books(&self) -> Result<Vec<SeriesBook>> {
         let mut statement = self.conn.prepare(
-            "SELECT id,project_id,title,relative_path,position,source_fingerprint FROM series_book ORDER BY position,id"
+            "SELECT b.id,b.project_id,b.title,b.relative_path,b.position,b.source_fingerprint FROM series_book b WHERE NOT EXISTS(SELECT 1 FROM removed_series_book r WHERE r.book_id=b.id) ORDER BY b.position,b.id"
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -296,7 +316,7 @@ impl SeriesStore {
 
     pub fn book_for_project(&self, project_id: ProjectId) -> Result<Option<SeriesBook>> {
         let mut statement = self.conn.prepare(
-            "SELECT id,project_id,title,relative_path,position,source_fingerprint FROM series_book WHERE project_id=?1"
+            "SELECT b.id,b.project_id,b.title,b.relative_path,b.position,b.source_fingerprint FROM series_book b WHERE b.project_id=?1 AND NOT EXISTS(SELECT 1 FROM removed_series_book r WHERE r.book_id=b.id)"
         )?;
         statement
             .query_row([project_id.to_string()], |row| {
@@ -313,6 +333,119 @@ impl SeriesStore {
             })
             .optional()
             .map_err(SeriesError::from)
+    }
+
+    /// Recoverably remove a book's membership. The book project directory,
+    /// database, manuscript and membership identity are retained.
+    pub fn remove_book(&mut self, book_id: BookId) -> Result<SeriesBook> {
+        let book = self
+            .book_by_id(book_id)?
+            .ok_or_else(|| SeriesError::Config("book is not an active series member".into()))?;
+        if self.is_book_removed(book_id)? {
+            return Err(SeriesError::Config(
+                "book is already in Removed Books".into(),
+            ));
+        }
+        let series_id = self.id();
+        let series_root = self.root.clone();
+        let transaction = self.conn.transaction()?;
+        transaction.execute(
+            "INSERT INTO removed_series_book(book_id,removed_at) VALUES(?1,unixepoch())",
+            [book_id.to_string()],
+        )?;
+        Self::remove_membership_sidecar(&series_root, series_id, &book)?;
+        if let Err(error) = transaction.commit() {
+            // The sidecar is a repairable index. If SQLite did not commit the
+            // removal, restore it so the active membership remains usable.
+            let _ = self.write_membership(&book);
+            return Err(error.into());
+        }
+        Ok(book)
+    }
+
+    fn remove_membership_sidecar(
+        root: &Path,
+        series_id: SeriesId,
+        book: &SeriesBook,
+    ) -> Result<()> {
+        let path = root
+            .join(&book.relative_path)
+            .join(".writers-ide/series-membership.toml");
+        if !path.exists() {
+            return Ok(());
+        }
+        let current: BookMembership = toml::from_str(&fs::read_to_string(&path)?)
+            .map_err(|error| SeriesError::Config(error.to_string()))?;
+        if current.series_id != series_id || current.book_id != book.id {
+            return Err(SeriesError::MembershipConflict);
+        }
+        fs::remove_file(&path)?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| SeriesError::Config("membership sidecar has no parent".into()))?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    }
+
+    pub fn list_removed_books(&self) -> Result<Vec<SeriesBook>> {
+        let mut statement = self.conn.prepare(
+            "SELECT b.id,b.project_id,b.title,b.relative_path,b.position,b.source_fingerprint FROM series_book b JOIN removed_series_book r ON r.book_id=b.id ORDER BY r.removed_at,b.position,b.id",
+        )?;
+        read_series_books(&mut statement)
+    }
+
+    pub fn restore_book(&mut self, book_id: BookId) -> Result<SeriesBook> {
+        let book = self
+            .book_by_id(book_id)?
+            .ok_or_else(|| SeriesError::Config("book is not in Removed Books".into()))?;
+        if !self.is_book_removed(book_id)? {
+            return Err(SeriesError::Config("book is not in Removed Books".into()));
+        }
+        let path = self.root.join(&book.relative_path);
+        let project = story_storage::ProjectStore::open(&path).map_err(|error| {
+            SeriesError::Config(format!("cannot restore missing book: {error}"))
+        })?;
+        let project_id = project
+            .get_project()
+            .map_err(|error| SeriesError::Config(format!("cannot read book project: {error}")))?
+            .id;
+        if project_id != book.project_id {
+            return Err(SeriesError::BookIdentityMismatch);
+        }
+        // Repair a missing sidecar before making membership active. If this
+        // fails, the database still has the removed state.
+        self.write_membership(&book)?;
+        self.conn.execute(
+            "DELETE FROM removed_series_book WHERE book_id=?1",
+            [book_id.to_string()],
+        )?;
+        Ok(book)
+    }
+
+    fn book_by_id(&self, book_id: BookId) -> Result<Option<SeriesBook>> {
+        let row = self.conn.query_row(
+            "SELECT id,project_id,title,relative_path,position,source_fingerprint FROM series_book WHERE id=?1",
+            [book_id.to_string()],
+            row_to_series_book,
+        ).optional()?;
+        Ok(row)
+    }
+
+    fn removed_book_for_project(&self, project_id: ProjectId) -> Result<Option<SeriesBook>> {
+        let row = self.conn.query_row(
+            "SELECT b.id,b.project_id,b.title,b.relative_path,b.position,b.source_fingerprint FROM series_book b JOIN removed_series_book r ON r.book_id=b.id WHERE b.project_id=?1",
+            [project_id.to_string()],
+            row_to_series_book,
+        ).optional()?;
+        Ok(row)
+    }
+
+    fn is_book_removed(&self, book_id: BookId) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM removed_series_book WHERE book_id=?1)",
+            [book_id.to_string()],
+            |row| row.get(0),
+        )?)
     }
 
     pub fn repair_memberships(&self) -> Result<Vec<PathBuf>> {
@@ -417,38 +550,105 @@ impl SeriesStore {
             let current: BookMembership = toml::from_str(&fs::read_to_string(&path)?)
                 .map_err(|error| SeriesError::Config(error.to_string()))?;
             if current != membership {
-                return Err(SeriesError::MembershipConflict);
+                if !self.previous_membership_is_removed(&project_root, &current, book.project_id)? {
+                    return Err(SeriesError::MembershipConflict);
+                }
+                write_toml_atomically(&path, &membership)?;
             }
             return Ok(());
         }
         write_toml_atomically(&path, &membership)
     }
+
+    fn previous_membership_is_removed(
+        &self,
+        project_root: &Path,
+        previous: &BookMembership,
+        project_id: ProjectId,
+    ) -> Result<bool> {
+        let relative = Path::new(&previous.series_root_relative_path);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_) | Component::ParentDir))
+        {
+            return Ok(false);
+        }
+        let old_root = match project_root.join(relative).canonicalize() {
+            Ok(root) => root,
+            Err(_) => return Ok(false),
+        };
+        let old_series = match Self::open(old_root) {
+            Ok(series) if series.id() == previous.series_id => series,
+            _ => return Ok(false),
+        };
+        let previous_book = old_series.book_by_id(previous.book_id)?;
+        Ok(previous_book.is_some_and(|book| {
+            book.project_id == project_id && old_series.is_book_removed(book.id).unwrap_or(false)
+        }))
+    }
 }
 
 fn migrate_series_schema(conn: &mut Connection, current_version: i64) -> Result<()> {
-    if current_version != 1 {
+    if !(1..=SERIES_SCHEMA_VERSION).contains(&current_version) {
         return Err(SeriesError::UnsupportedSchema(current_version));
     }
-    let transaction = conn.transaction()?;
-    let duplicate: Option<String> = transaction
-        .query_row(
-            "SELECT title FROM series_book GROUP BY title COLLATE NOCASE HAVING count(*) > 1 LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if duplicate.is_some() {
-        return Err(SeriesError::Config(
-            "existing series contains duplicate book names; resolve them before opening".into(),
-        ));
+    let mut version = current_version;
+    if version == 1 {
+        let transaction = conn.transaction()?;
+        let duplicate: Option<String> = transaction
+            .query_row(
+                "SELECT title FROM series_book GROUP BY title COLLATE NOCASE HAVING count(*) > 1 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if duplicate.is_some() {
+            return Err(SeriesError::Config(
+                "existing series contains duplicate book names; resolve them before opening".into(),
+            ));
+        }
+        transaction.execute_batch(
+            "CREATE UNIQUE INDEX series_book_title_unique ON series_book(title COLLATE NOCASE);
+             INSERT INTO schema_migrations(version,applied_at) VALUES(2,unixepoch());
+             UPDATE series_metadata SET schema_version=2 WHERE singleton=1;",
+        )?;
+        transaction.commit()?;
+        version = 2;
     }
-    transaction.execute_batch(
-        "CREATE UNIQUE INDEX series_book_title_unique ON series_book(title COLLATE NOCASE);
-         INSERT INTO schema_migrations(version,applied_at) VALUES(2,unixepoch());
-         UPDATE series_metadata SET schema_version=2 WHERE singleton=1;",
-    )?;
-    transaction.commit()?;
+    if version == 2 {
+        let transaction = conn.transaction()?;
+        transaction.execute_batch(
+            "CREATE TABLE removed_series_book(
+                 book_id TEXT PRIMARY KEY REFERENCES series_book(id) ON DELETE CASCADE,
+                 removed_at INTEGER NOT NULL
+             );
+             INSERT INTO schema_migrations(version,applied_at) VALUES(3,unixepoch());
+             UPDATE series_metadata SET schema_version=3 WHERE singleton=1;",
+        )?;
+        transaction.commit()?;
+    }
     Ok(())
+}
+
+fn row_to_series_book(row: &Row<'_>) -> rusqlite::Result<SeriesBook> {
+    let id: String = row.get(0)?;
+    let project: String = row.get(1)?;
+    Ok(SeriesBook {
+        id: parse_id(&id).map_err(to_sql_conversion_error)?,
+        project_id: parse_id(&project).map_err(to_sql_conversion_error)?,
+        title: row.get(2)?,
+        relative_path: row.get(3)?,
+        position: row.get(4)?,
+        source_fingerprint: row.get(5)?,
+    })
+}
+
+fn read_series_books(statement: &mut Statement<'_>) -> Result<Vec<SeriesBook>> {
+    statement
+        .query_map([], row_to_series_book)?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(SeriesError::from)
 }
 
 fn configure(conn: &Connection) -> Result<()> {
@@ -580,7 +780,8 @@ mod tests {
         connection
             .execute_batch(
                 "DROP INDEX series_book_title_unique;
-                 DELETE FROM schema_migrations WHERE version=2;
+                 DROP TABLE removed_series_book;
+                 DELETE FROM schema_migrations WHERE version>=2;
                  UPDATE series_metadata SET schema_version=1;",
             )
             .unwrap();
@@ -595,7 +796,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(schema_version, 2);
+        assert_eq!(schema_version, 3);
         let migrations: i64 = series
             .conn
             .query_row(
@@ -605,6 +806,17 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migrations, 1);
+        assert_eq!(
+            series
+                .conn
+                .query_row(
+                    "SELECT count(*) FROM schema_migrations WHERE version=3",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
     }
 
     #[test]
@@ -617,7 +829,8 @@ mod tests {
         connection
             .execute_batch(
                 "DROP INDEX series_book_title_unique;
-                 DELETE FROM schema_migrations WHERE version=2;
+                 DROP TABLE removed_series_book;
+                 DELETE FROM schema_migrations WHERE version>=2;
                  UPDATE series_metadata SET schema_version=1;",
             )
             .unwrap();
@@ -656,6 +869,58 @@ mod tests {
             )
             .unwrap();
         assert_eq!(migration_applied, 0);
+    }
+
+    #[test]
+    fn removing_and_restoring_a_book_preserves_its_project_and_series_position() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("Chronicles");
+        let mut series = SeriesStore::create(&root, "Chronicles").unwrap();
+        let (first_path, first_project) = book_folder(&root, "Book 1");
+        let first = series
+            .add_book(first_project, &first_path, "Book One", None)
+            .unwrap();
+        let (second_path, second_project) = book_folder(&root, "Book 2");
+        let second = series
+            .add_book(second_project, &second_path, "Book Two", None)
+            .unwrap();
+        let original_prose = "The book remains independent.";
+        let mut project = story_storage::ProjectStore::open(&first_path).unwrap();
+        let scene_id = {
+            let chapter = project
+                .create_node(None, story_core::NodeKind::Chapter, "Chapter", 0)
+                .unwrap();
+            project.create_scene(chapter, 0, "Opening").unwrap()
+        };
+        let (_, hash) = project.load_text(scene_id).unwrap();
+        project
+            .save_text(scene_id, Some(&hash), original_prose)
+            .unwrap();
+        drop(project);
+        let sidecar = first_path.join(".writers-ide/series-membership.toml");
+        assert!(sidecar.is_file());
+
+        let removed = series.remove_book(first.id).unwrap();
+        assert_eq!(removed, first);
+        assert_eq!(series.list_books().unwrap(), vec![second.clone()]);
+        assert_eq!(series.list_removed_books().unwrap(), vec![first.clone()]);
+        assert!(!sidecar.exists());
+        let reopened = story_storage::ProjectStore::open(&first_path).unwrap();
+        assert_eq!(reopened.load_text(scene_id).unwrap().0, original_prose);
+        drop(reopened);
+        assert!(SeriesStore::open_for_book(&first_path).is_err());
+
+        drop(series);
+        let mut series = SeriesStore::open(&root).unwrap();
+        series.restore_book(first.id).unwrap();
+        assert_eq!(series.list_books().unwrap(), vec![first.clone(), second]);
+        assert_eq!(
+            series.list_removed_books().unwrap(),
+            Vec::<SeriesBook>::new()
+        );
+        assert_eq!(SeriesStore::open_for_book(&first_path).unwrap().1, first);
+        let reopened = story_storage::ProjectStore::open(&first_path).unwrap();
+        assert_eq!(reopened.load_text(scene_id).unwrap().0, original_prose);
     }
 
     #[test]
