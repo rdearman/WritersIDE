@@ -375,7 +375,10 @@ fn populated_chapter_subtree_deletion_is_recoverable_through_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
-    use story_core::{ContentUnitKind, ParticipationRole, ScenePlotline, WordAttributionPolicy};
+    use story_core::{
+        ContentUnitKind, EntityRef, LinkKind, ParticipationRole, ScenePlotline, StoryLink,
+        WordAttributionPolicy,
+    };
     use story_document::CompileFormat;
 
     let root = tempfile::tempdir().unwrap();
@@ -385,6 +388,12 @@ fn populated_chapter_subtree_deletion_is_recoverable_through_a_real_pty() {
     let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
     let (_, hash) = app.load_scene_text(scene).unwrap();
     app.save_scene_text(scene, Some(&hash), "The traveler arrives.")
+        .unwrap();
+    let snapshot = app
+        .create_snapshot(scene, "Before chapter removal")
+        .unwrap();
+    let anchor = app
+        .create_passage_anchor(scene, 0, 3, "The", "", " traveler")
         .unwrap();
     let character = app.create_character("Mara").unwrap();
     app.link_character(scene, character, ParticipationRole::Major)
@@ -402,6 +411,16 @@ fn populated_chapter_subtree_deletion_is_recoverable_through_a_real_pty() {
     .unwrap();
     let event = app.add_event("Arrival", "day 1").unwrap();
     app.link_event(scene, event, "depicts").unwrap();
+    let link = StoryLink {
+        id: story_core::LinkId::new(),
+        source: EntityRef::Scene(scene),
+        source_anchor: Some(anchor),
+        target: EntityRef::Character(character),
+        target_anchor: None,
+        kind: LinkKind::Related,
+        label: "Mara's arrival".into(),
+    };
+    app.create_story_link(&link).unwrap();
     let prose = app
         .create_content_unit(
             ContentUnitKind::ChapterBody,
@@ -478,6 +497,12 @@ fn populated_chapter_subtree_deletion_is_recoverable_through_a_real_pty() {
     assert_eq!(
         reopened.scene_event_links(scene).unwrap(),
         vec![(event, "depicts".into())]
+    );
+    assert_eq!(reopened.list_snapshots(scene).unwrap()[0].id, snapshot);
+    assert_eq!(reopened.list_passage_anchors(scene).unwrap()[0].id, anchor);
+    assert_eq!(
+        reopened.outgoing_links(EntityRef::Scene(scene)).unwrap(),
+        vec![link]
     );
 }
 
