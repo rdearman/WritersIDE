@@ -15576,6 +15576,23 @@ mod tests {
             .create_node(Some(section), NodeKind::Chapter, "Chapter One", 0)
             .unwrap();
         let scene = store.create_scene(chapter, 0, "Opening").unwrap();
+        let (_, text_hash) = store.load_text(scene).unwrap();
+        store
+            .save_text(
+                scene,
+                Some(&text_hash),
+                "The lantern reveals a hidden door.",
+            )
+            .unwrap();
+        let comment = store
+            .create_personal_comment(
+                scene,
+                4,
+                11,
+                "lantern",
+                "Keep this clue visible in the next revision.",
+            )
+            .unwrap();
         let content_unit = store
             .create_content_unit(
                 ContentUnitKind::ChapterBody,
@@ -15590,6 +15607,11 @@ mod tests {
         let removal = store.archive_structural_subtree(section).unwrap();
         assert!(store.list_structural_nodes().unwrap().is_empty());
         assert!(store.list_scenes(false).unwrap().is_empty());
+        assert_eq!(
+            store.list_scene_comments(scene).unwrap()[0].id,
+            comment,
+            "recoverably removed scenes retain anchored editorial comments"
+        );
         assert!(store.get_content_unit(content_unit).unwrap().archived);
         assert!(
             store
@@ -15625,6 +15647,14 @@ mod tests {
         assert_eq!(scene_after.scene.title, scene_before.scene.title);
         assert_eq!(scene_after.scene.status, scene_before.scene.status);
         assert_eq!(scene_after.chapter_id, Some(chapter));
+        let comments = reopened.list_scene_comments(scene).unwrap();
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].id, comment);
+        assert_eq!(comments[0].quote.as_deref(), Some("lantern"));
+        assert_eq!(
+            comments[0].body,
+            "Keep this clue visible in the next revision."
+        );
         assert!(reopened.restore_structural_subtree(removal).is_err());
         reopened.validate().unwrap();
     }
