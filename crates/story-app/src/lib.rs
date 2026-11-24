@@ -1043,6 +1043,12 @@ impl WriterApp {
     ) -> Result<NodeId> {
         Ok(self.store.create_node(parent, kind, title, position)?)
     }
+    pub fn archive_empty_structural_node(&mut self, id: NodeId) -> Result<()> {
+        Ok(self.store.archive_empty_structural_node(id)?)
+    }
+    pub fn restore_archived_structural_node(&mut self, id: NodeId) -> Result<()> {
+        Ok(self.store.restore_archived_structural_node(id)?)
+    }
 
     pub fn create_project_with_metadata(path: impl AsRef<Path>, project: &Project) -> Result<Self> {
         Ok(Self {
@@ -1281,6 +1287,14 @@ impl WriterApp {
     }
     pub fn list_structural_nodes(&self) -> Result<Vec<story_storage::StructuralNodeSummary>> {
         Ok(self.store.list_structural_nodes()?)
+    }
+    pub fn list_archived_structural_nodes(
+        &self,
+    ) -> Result<Vec<story_storage::StructuralNodeSummary>> {
+        Ok(self.store.list_archived_structural_nodes()?)
+    }
+    pub fn next_structural_node_position(&self, parent: Option<NodeId>) -> Result<u32> {
+        Ok(self.store.next_structural_node_position(parent)?)
     }
     /// Capture the current document structure as a reusable, declarative
     /// template. Canonical prose, project identity, attachments, research and

@@ -60,6 +60,8 @@ const MIGRATION_43: &str = include_str!("../migrations/0043_scene_inclusion.sql"
 const MIGRATION_44: &str = include_str!("../migrations/0044_unplaced_scene_order.sql");
 const MIGRATION_45: &str = include_str!("../migrations/0045_reading_document_trash.sql");
 const MIGRATION_46: &str = include_str!("../migrations/0046_scene_archive_status.sql");
+const MIGRATION_47: &str =
+    include_str!("../migrations/0047_recoverable_structural_node_removal.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -491,6 +493,7 @@ pub struct StructuralNodeSummary {
     pub kind: String,
     pub title: String,
     pub position: u32,
+    pub archived: bool,
 }
 #[derive(Clone, Debug)]
 pub struct ContentUnitRecord {
@@ -1453,6 +1456,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_44}\nINSERT INTO schema_migrations(version,applied_at) VALUES(44,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_45}\nINSERT INTO schema_migrations(version,applied_at) VALUES(45,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_46}\nINSERT INTO schema_migrations(version,applied_at) VALUES(46,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_47}\nINSERT INTO schema_migrations(version,applied_at) VALUES(47,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1501,7 +1505,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 46 {
+        if version > 47 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1686,6 +1690,10 @@ impl ProjectStore {
         }
         if current_version == 45 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_46}\nINSERT INTO schema_migrations(version,applied_at) VALUES(46,'{}');\nCOMMIT;", now()))?;
+            current_version = 46;
+        }
+        if current_version == 46 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_47}\nINSERT INTO schema_migrations(version,applied_at) VALUES(47,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -2291,14 +2299,19 @@ impl ProjectStore {
         position: u32,
     ) -> Result<NodeId> {
         if let Some(pid) = parent {
-            let pk: String = self
+            let (pk, parent_archived): (String, bool) = self
                 .conn
                 .query_row(
-                    "SELECT kind FROM structural_node WHERE id=?1",
+                    "SELECT kind,archived FROM structural_node WHERE id=?1",
                     [pid.to_string()],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .map_err(|_| StorageError::NotFound(pid.to_string()))?;
+            if parent_archived {
+                return Err(StorageError::Invalid(
+                    "cannot create a section or chapter under a removed section".into(),
+                ));
+            }
             if pk == "chapter" {
                 return Err(StorageError::Invalid(
                     "chapter cannot contain structural nodes".into(),
@@ -2311,7 +2324,7 @@ impl ProjectStore {
         Ok(id)
     }
     pub fn list_structural_nodes(&self) -> Result<Vec<StructuralNodeSummary>> {
-        let mut stmt = self.conn.prepare("SELECT id,parent_id,kind,title,position FROM structural_node ORDER BY parent_id,position,id")?;
+        let mut stmt = self.conn.prepare("SELECT id,parent_id,kind,title,position FROM structural_node WHERE archived=0 ORDER BY parent_id,position,id")?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -2338,6 +2351,7 @@ impl ProjectStore {
                 kind,
                 title,
                 position,
+                archived: false,
             })
         })
         .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
@@ -3966,6 +3980,97 @@ impl ProjectStore {
             })
         })
         .collect()
+    }
+    pub fn list_archived_structural_nodes(&self) -> Result<Vec<StructuralNodeSummary>> {
+        let mut stmt = self.conn.prepare("SELECT id,parent_id,kind,title,position FROM structural_node WHERE archived=1 ORDER BY parent_id,position,id")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, u32>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (id, parent, kind, title, position) = row?;
+            let parse = |value: String| {
+                Uuid::parse_str(&value).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })
+            };
+            Ok(StructuralNodeSummary {
+                id: NodeId(parse(id)?),
+                parent_id: parent.map(parse).transpose()?.map(NodeId),
+                kind,
+                title,
+                position,
+                archived: true,
+            })
+        })
+        .collect()
+    }
+    pub fn next_structural_node_position(&self, parent: Option<NodeId>) -> Result<u32> {
+        let position: i64 = match parent {
+            Some(parent) => self.conn.query_row(
+                "SELECT COALESCE(MAX(position),-1)+1 FROM structural_node WHERE parent_id=?1",
+                [parent.to_string()],
+                |row| row.get(0),
+            )?,
+            None => self.conn.query_row(
+                "SELECT COALESCE(MAX(position),-1)+1 FROM structural_node WHERE parent_id IS NULL",
+                [],
+                |row| row.get(0),
+            )?,
+        };
+        u32::try_from(position)
+            .map_err(|_| StorageError::Invalid("structural position space exhausted".into()))
+    }
+    pub fn archive_empty_structural_node(&mut self, id: NodeId) -> Result<()> {
+        let updated = self.conn.execute(
+            "UPDATE structural_node SET archived=1,updated_at=?2 WHERE id=?1 AND archived=0",
+            params![id.to_string(), now()],
+        )?;
+        if updated == 0 {
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM structural_node WHERE id=?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )?;
+            return if exists {
+                Err(StorageError::Invalid(
+                    "section or chapter is already in Removed Documents".into(),
+                ))
+            } else {
+                Err(StorageError::NotFound(format!("structural node {id}")))
+            };
+        }
+        Ok(())
+    }
+    pub fn restore_archived_structural_node(&mut self, id: NodeId) -> Result<()> {
+        let updated = self.conn.execute(
+            "UPDATE structural_node SET archived=0,updated_at=?2 WHERE id=?1 AND archived=1",
+            params![id.to_string(), now()],
+        )?;
+        if updated == 0 {
+            let exists: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM structural_node WHERE id=?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )?;
+            return if exists {
+                Err(StorageError::Invalid(
+                    "section or chapter is not in Removed Documents".into(),
+                ))
+            } else {
+                Err(StorageError::NotFound(format!("structural node {id}")))
+            };
+        }
+        Ok(())
     }
     fn update_content_unit_recovery(
         &mut self,
@@ -10594,7 +10699,7 @@ mod tests {
         let project = directory.path().join("Book");
         let store = ProjectStore::create(&project, "Book").unwrap();
         store.conn.execute_batch(
-            "ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
+            "DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
        ).unwrap();
         drop(store);
 
@@ -10620,7 +10725,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
     }
     #[test]
     fn event_character_and_location_relationships_are_typed_atomic_and_persistent() {
@@ -10679,7 +10784,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 46);
+        assert_eq!(schema_version, 47);
     }
     #[test]
     fn writing_challenges_are_validated_persisted_and_completed_once() {
@@ -11322,6 +11427,99 @@ mod tests {
         );
         assert!(reopened.restore_archived_content_unit(unit).is_err());
         reopened.validate().unwrap();
+    }
+
+    #[test]
+    fn empty_structural_nodes_can_be_removed_and_restored_but_dependents_are_protected() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let section = store
+            .create_node(None, NodeKind::Section, "Part One", 0)
+            .unwrap();
+        let chapter = store
+            .create_node(Some(section), NodeKind::Chapter, "Chapter One", 0)
+            .unwrap();
+        assert!(store.archive_empty_structural_node(section).is_err());
+        assert!(
+            store
+                .list_structural_nodes()
+                .unwrap()
+                .iter()
+                .any(|node| node.id == section)
+        );
+        store.archive_empty_structural_node(chapter).unwrap();
+        assert!(
+            !store
+                .list_structural_nodes()
+                .unwrap()
+                .iter()
+                .any(|node| node.id == chapter)
+        );
+        assert_eq!(
+            store.list_archived_structural_nodes().unwrap()[0].id,
+            chapter
+        );
+        assert!(
+            store
+                .create_node(Some(chapter), NodeKind::Chapter, "Nested", 0)
+                .is_err()
+        );
+        drop(store);
+
+        let mut reopened = ProjectStore::open(&project).unwrap();
+        reopened.restore_archived_structural_node(chapter).unwrap();
+        let restored = reopened.list_structural_nodes().unwrap();
+        assert!(
+            restored
+                .iter()
+                .any(|node| node.id == chapter && node.title == "Chapter One")
+        );
+        assert!(
+            reopened
+                .list_archived_structural_nodes()
+                .unwrap()
+                .is_empty()
+        );
+        reopened
+            .conn
+            .execute(
+                "UPDATE structural_node SET archived=1 WHERE id=?1",
+                [section.to_string()],
+            )
+            .unwrap_err();
+    }
+
+    #[test]
+    fn direct_sql_cannot_add_or_move_content_under_removed_headings() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let removed = store
+            .create_node(None, NodeKind::Section, "Removed", 0)
+            .unwrap();
+        let active = store
+            .create_node(None, NodeKind::Section, "Active", 1)
+            .unwrap();
+        let body = store
+            .create_content_unit(ContentUnitKind::SectionBody, "Body", Some(active), 0, None)
+            .unwrap();
+        store.archive_empty_structural_node(removed).unwrap();
+
+        let child = Uuid::new_v4().to_string();
+        assert!(store.conn.execute(
+            "INSERT INTO structural_node(id,parent_id,kind,title,position,created_at,updated_at) VALUES(?1,?2,'section','Invalid child',0,'now','now')",
+            params![child, removed.to_string()]
+        ).is_err());
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE content_unit SET parent_node_id=?2 WHERE id=?1",
+                    params![body.to_string(), removed.to_string()]
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -12440,7 +12638,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 46))
+            .map(|version| assert_eq!(version, 47))
             .unwrap();
     }
 
@@ -12851,7 +13049,7 @@ mod tests {
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch("ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code; DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
-        conn.execute_batch("DROP TABLE diagnostic_suppression; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TABLE diagnostic_suppression; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -12861,7 +13059,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -12898,7 +13096,7 @@ mod tests {
              DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert;
              DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit;
              DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal;
-             DROP TABLE content_unit_search_content; DROP TABLE content_unit;
+             DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; DROP TABLE content_unit_search_content; DROP TABLE content_unit;
              ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type;
              DROP TRIGGER story_link_source_exists_update;
              DROP TRIGGER story_link_no_transclusion_cycle;
@@ -14674,7 +14872,7 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>=44;",
+                "DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>=44;",
             )
             .unwrap();
         drop(connection);
@@ -14690,6 +14888,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 46);
+        assert_eq!(version, 47);
     }
 }

@@ -190,6 +190,14 @@ struct ContentUnitRemovalDialog {
     restoring: bool,
 }
 
+#[derive(Clone, Debug)]
+struct StructuralNodeRemovalDialog {
+    id: story_core::NodeId,
+    title: String,
+    kind: String,
+    restoring: bool,
+}
+
 struct AppState {
     app: WriterApp,
     temporary_project: bool,
@@ -243,7 +251,9 @@ struct AppState {
     removed_scenes_list: bool,
     pending_scene_removal: Option<SceneRemovalDialog>,
     removed_content_units_list: bool,
+    removed_structural_nodes_list: bool,
     pending_content_unit_removal: Option<ContentUnitRemovalDialog>,
+    pending_structural_node_removal: Option<StructuralNodeRemovalDialog>,
     function_bindings: Vec<(u8, Workspace)>,
     command_bindings: CommandBindings,
     context_command_bindings: Vec<ContextCommandBinding>,
@@ -906,6 +916,9 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "document.remove-content-unit",
         "document.removed-content-units",
         "document.restore-content-unit",
+        "document.remove-empty-node",
+        "document.removed-nodes",
+        "document.restore-node",
     ],
     &[
         "structure.section",
@@ -1483,6 +1496,9 @@ enum CommandAction {
     ArchiveSelectedContentUnit,
     ShowRemovedContentUnits,
     RestoreSelectedContentUnit,
+    ArchiveSelectedStructuralNode,
+    ShowRemovedStructuralNodes,
+    RestoreSelectedStructuralNode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2511,6 +2527,51 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::RestoreSelectedContentUnit,
             task_group: "Outline",
             menu_priority: 20,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "document.remove-empty-node",
+            label: "Move Empty Section or Chapter to Removed",
+            description: "Reversibly remove an empty section or chapter; dependent content must be moved first",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["remove section", "remove chapter", "archive outline heading"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ArchiveSelectedStructuralNode,
+            task_group: "Outline",
+            menu_priority: 21,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "document.removed-nodes",
+            label: "Show Removed Sections and Chapters",
+            description: "Browse empty sections and chapters that can be restored",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["removed sections", "removed chapters"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ShowRemovedStructuralNodes,
+            task_group: "Outline",
+            menu_priority: 22,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "document.restore-node",
+            label: "Restore Selected Section or Chapter",
+            description: "Return a removed section or chapter to its original place",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["restore removed section", "restore removed chapter"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::RestoreSelectedStructuralNode,
+            task_group: "Outline",
+            menu_priority: 23,
             advanced: false,
         },
         legacy_command(
@@ -6265,7 +6326,9 @@ impl AppState {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -7309,12 +7372,7 @@ impl AppState {
         let anchor = selected_node.and_then(|id| nodes.iter().find(|node| node.id == id));
         let parent = anchor.and_then(|node| node.parent_id);
         let insertion = anchor.map(|node| node.position);
-        let append_position = nodes
-            .iter()
-            .filter(|node| node.parent_id == parent)
-            .map(|node| node.position.saturating_add(1))
-            .max()
-            .unwrap_or(0);
+        let append_position = self.app.next_structural_node_position(parent)?;
         let chapter = self
             .app
             .create_chapter(parent, title.trim(), append_position)?;
@@ -10618,12 +10676,99 @@ impl AppState {
             self.switch(Workspace::Outline);
         }
         self.removed_content_units_list = !self.removed_content_units_list;
+        self.removed_structural_nodes_list = false;
         self.selected = 0;
         self.message = if self.removed_content_units_list {
             "Removed Prose Documents · select a document and choose Restore Selected Prose Document"
                 .into()
         } else {
             "Outline · chapters and sections · chapter prose remains independent of scenes".into()
+        };
+        Ok(())
+    }
+    fn toggle_removed_structural_nodes(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace != Workspace::Outline {
+            self.switch(Workspace::Outline);
+        }
+        self.removed_structural_nodes_list = !self.removed_structural_nodes_list;
+        self.removed_content_units_list = false;
+        self.selected = 0;
+        self.message = if self.removed_structural_nodes_list {
+            "Removed Sections and Chapters · select one and choose Restore Selected Section or Chapter".into()
+        } else {
+            "Outline · chapters and sections · remove only when empty".into()
+        };
+        Ok(())
+    }
+    fn begin_structural_node_removal(
+        &mut self,
+        restoring: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace != Workspace::Outline {
+            self.message = "Open Outline and select a section or chapter first".into();
+            return Ok(());
+        }
+        if restoring != self.removed_structural_nodes_list {
+            self.message = if restoring {
+                "Show Removed Sections and Chapters and select one to restore"
+            } else {
+                "Return to the active Outline first"
+            }
+            .into();
+            return Ok(());
+        }
+        let Some(row @ (OutlineRow::Section { .. } | OutlineRow::Chapter { .. })) =
+            outline_rows(self).get(self.selected).cloned()
+        else {
+            self.message = "Select a section or chapter first".into();
+            return Ok(());
+        };
+        let id = match row {
+            OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let node = if restoring {
+            self.app.list_archived_structural_nodes()?
+        } else {
+            self.app.list_structural_nodes()?
+        }
+        .into_iter()
+        .find(|node| node.id == id)
+        .ok_or("selected section or chapter no longer exists")?;
+        self.pending_structural_node_removal = Some(StructuralNodeRemovalDialog {
+            id,
+            title: node.title,
+            kind: node.kind,
+            restoring,
+        });
+        Ok(())
+    }
+    fn finish_structural_node_removal(
+        &mut self,
+        dialog: StructuralNodeRemovalDialog,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if dialog.restoring {
+            self.app.restore_archived_structural_node(dialog.id)?;
+            self.removed_structural_nodes_list = false;
+        } else {
+            self.app.archive_empty_structural_node(dialog.id)?;
+        }
+        self.pending_structural_node_removal = None;
+        self.selected = if dialog.restoring {
+            outline_rows(self).iter().position(|row| matches!(row, OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } if *id == dialog.id)).unwrap_or(0)
+        } else {
+            self.selected.saturating_sub(1)
+        };
+        self.message = if dialog.restoring {
+            format!(
+                "Restored {} ‘{}’ to its original place",
+                dialog.kind, dialog.title
+            )
+        } else {
+            format!(
+                "Moved empty {} ‘{}’ to Removed Sections and Chapters · identity retained",
+                dialog.kind, dialog.title
+            )
         };
         Ok(())
     }
@@ -12079,6 +12224,32 @@ impl AppState {
                 None
             };
         }
+        if spec.id == "document.remove-empty-node" {
+            return if self.workspace != Workspace::Outline {
+                Some("Open Outline first")
+            } else if self.removed_structural_nodes_list || self.removed_content_units_list {
+                Some("Return to the active Outline first")
+            } else if !matches!(
+                outline_rows(self).get(self.selected),
+                Some(OutlineRow::Section { .. } | OutlineRow::Chapter { .. })
+            ) {
+                Some("Select a section or chapter first")
+            } else {
+                None
+            };
+        }
+        if spec.id == "document.restore-node" {
+            return if self.workspace != Workspace::Outline || !self.removed_structural_nodes_list {
+                Some("Show Removed Sections and Chapters first")
+            } else if !matches!(
+                outline_rows(self).get(self.selected),
+                Some(OutlineRow::Section { .. } | OutlineRow::Chapter { .. })
+            ) {
+                Some("Select a removed section or chapter first")
+            } else {
+                None
+            };
+        }
         if self.workspace == Workspace::Outline
             && self.removed_content_units_list
             && spec.id.starts_with("document.")
@@ -13042,6 +13213,13 @@ impl AppState {
             CommandAction::ArchiveSelectedContentUnit => self.begin_content_unit_removal(false)?,
             CommandAction::ShowRemovedContentUnits => self.toggle_removed_content_units()?,
             CommandAction::RestoreSelectedContentUnit => self.begin_content_unit_removal(true)?,
+            CommandAction::ArchiveSelectedStructuralNode => {
+                self.begin_structural_node_removal(false)?
+            }
+            CommandAction::ShowRemovedStructuralNodes => self.toggle_removed_structural_nodes()?,
+            CommandAction::RestoreSelectedStructuralNode => {
+                self.begin_structural_node_removal(true)?
+            }
             CommandAction::Save => {
                 if self.temporary_project {
                     if let Err(error) = self.start_save_project_as()
@@ -13255,12 +13433,7 @@ impl AppState {
                 else {
                     return Err("Select a section in Outline before adding a chapter".into());
                 };
-                let position = self
-                    .app
-                    .list_structural_nodes()?
-                    .iter()
-                    .filter(|node| node.parent_id == Some(section))
-                    .count() as u32;
+                let position = self.app.next_structural_node_position(Some(section))?;
                 let chapter = self.app.create_chapter(Some(section), &cmd, position)?;
                 self.refresh()?;
                 self.workspace = Workspace::Outline;
@@ -16029,12 +16202,7 @@ impl AppState {
                 .create_story_object(name.trim(), description.trim())?;
             self.message = format!("Created story object {id}");
         } else if let Some(title) = cmd.strip_prefix("section ") {
-            let position = self
-                .app
-                .list_structural_nodes()?
-                .iter()
-                .filter(|node| node.parent_id.is_none())
-                .count() as u32;
+            let position = self.app.next_structural_node_position(None)?;
             let id = self.app.create_section(title.trim(), position)?;
             self.message = format!("Created section {id}");
         } else if let Some(title) = cmd.strip_prefix("chapter ") {
@@ -16042,12 +16210,7 @@ impl AppState {
                 self.create_empty_chapter_at_card(title)?;
                 return Ok(());
             }
-            let position = self
-                .app
-                .list_structural_nodes()?
-                .iter()
-                .filter(|node| node.parent_id.is_none())
-                .count() as u32;
+            let position = self.app.next_structural_node_position(None)?;
             let id = self.app.create_chapter(None, title.trim(), position)?;
             self.message = format!("Created chapter {id}");
         } else if let Some(name) = cmd.strip_prefix("character ") {
@@ -16392,12 +16555,7 @@ impl AppState {
                 .split_once(' ')
                 .ok_or("use subchapter <section-uuid> <title>")?;
             let parent = story_core::NodeId(parent.parse()?);
-            let position = self
-                .app
-                .list_structural_nodes()?
-                .iter()
-                .filter(|node| node.parent_id == Some(parent))
-                .count() as u32;
+            let position = self.app.next_structural_node_position(Some(parent))?;
             let id = self
                 .app
                 .create_chapter(Some(parent), title.trim(), position)?;
@@ -22319,6 +22477,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.pending_content_unit_removal.is_some() {
         draw_content_unit_removal_overlay(f, s);
     }
+    if s.pending_structural_node_removal.is_some() {
+        draw_structural_node_removal_overlay(f, s);
+    }
     if s.help_panel.is_some() {
         draw_help_overlay(f, s);
     }
@@ -24201,6 +24362,51 @@ fn draw_content_unit_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     );
 }
 
+fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(dialog) = &s.pending_structural_node_removal else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 78);
+    let height = 7.min(area.height.max(1));
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, rect);
+    let text = Text::from(vec![
+        Line::from(if dialog.restoring {
+            "Restore this section or chapter to its original place?"
+        } else {
+            "Move this empty section or chapter to Removed Sections and Chapters?"
+        }),
+        Line::from(truncate_display_cells(
+            &format!("{}: {}", dialog.kind, dialog.title),
+            width.saturating_sub(4) as usize,
+        )),
+        Line::from(if dialog.restoring {
+            "Its stable identity and original position will be retained."
+        } else {
+            "It must have no child headings, scenes or prose documents."
+        }),
+        Line::from("Enter/Y confirms · Esc/N cancels"),
+    ]);
+    f.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title(if dialog.restoring {
+                    " Restore Outline Heading "
+                } else {
+                    " Remove Empty Outline Heading "
+                })
+                .borders(Borders::ALL),
+        ),
+        rect,
+    );
+}
+
 fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let Some(form) = s.series_form.as_ref() else {
         return;
@@ -25433,6 +25639,30 @@ fn load_proposal_review_rows(app: &WriterApp) -> Result<Vec<String>, Box<dyn std
 }
 
 fn outline_rows(s: &AppState) -> Vec<OutlineRow> {
+    if s.removed_structural_nodes_list {
+        return s
+            .app
+            .list_archived_structural_nodes()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|node| {
+                if node.kind == "section" {
+                    OutlineRow::Section {
+                        id: node.id,
+                        title: node.title,
+                        collapsed: false,
+                    }
+                } else {
+                    OutlineRow::Chapter {
+                        id: node.id,
+                        title: node.title,
+                        scene_count: 0,
+                        collapsed: false,
+                    }
+                }
+            })
+            .collect();
+    }
     let content_units = s.app.list_content_units(true).unwrap_or_default();
     let content_units = content_units
         .into_iter()
@@ -27505,6 +27735,19 @@ fn handle_command_palette_key(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(dialog) = s.pending_structural_node_removal.clone() {
+        match k.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                s.finish_structural_node_removal(dialog)?
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                s.pending_structural_node_removal = None;
+                s.message = "Cancelled · section or chapter unchanged".into();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if let Some(dialog) = s.pending_content_unit_removal.clone() {
         match k.code {
             KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
@@ -34832,7 +35075,9 @@ mod tests {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38331,7 +38576,9 @@ mod tests {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38481,7 +38728,9 @@ mod tests {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38627,7 +38876,9 @@ mod tests {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -38781,7 +39032,9 @@ mod tests {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -39085,7 +39338,9 @@ mod tests {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -39239,7 +39494,9 @@ mod tests {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -40824,7 +41081,9 @@ mod tests {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -41113,7 +41372,9 @@ mod tests {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -41334,6 +41595,85 @@ mod tests {
         assert!(String::from_utf8_lossy(&compiled.bytes).contains("The truth came to light."));
         assert_eq!(state.app.scene_character_analytics(scene).unwrap().len(), 1);
         assert!(!state.removed_scenes_list);
+    }
+
+    #[test]
+    fn empty_chapter_removal_and_restoration_are_visible_and_recoverable() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut app = WriterApp::create_project(&project, "Book").unwrap();
+        let chapter = app.create_chapter(None, "Empty Chapter", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| {
+                matches!(
+                    row, OutlineRow::Chapter { id, .. } if *id == chapter
+                )
+            })
+            .unwrap();
+
+        state.open_menu_category(1);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "document.remove-empty-node")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.pending_structural_node_removal.is_some());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.app.list_structural_nodes().unwrap().is_empty());
+        assert_eq!(
+            state.app.list_archived_structural_nodes().unwrap()[0].id,
+            chapter
+        );
+
+        state.open_menu_category(1);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "document.removed-nodes")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.removed_structural_nodes_list);
+        assert!(
+            matches!(outline_rows(&state).first(), Some(OutlineRow::Chapter { id, title, .. }) if *id == chapter && title == "Empty Chapter")
+        );
+        state.open_menu_category(1);
+        state.menu.as_mut().unwrap().selected = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "document.restore-node")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!state.removed_structural_nodes_list);
+        assert_eq!(state.app.list_structural_nodes().unwrap()[0].id, chapter);
+        drop(state);
+        assert_eq!(
+            WriterApp::open_project(&project)
+                .unwrap()
+                .list_structural_nodes()
+                .unwrap()[0]
+                .title,
+            "Empty Chapter"
+        );
     }
 
     #[test]
@@ -41855,7 +42195,9 @@ mod tests {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -42020,7 +42362,9 @@ mod tests {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
@@ -42237,7 +42581,9 @@ mod tests {
             removed_scenes_list: false,
             pending_scene_removal: None,
             removed_content_units_list: false,
+            removed_structural_nodes_list: false,
             pending_content_unit_removal: None,
+            pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
             series_references: Vec::new(),
