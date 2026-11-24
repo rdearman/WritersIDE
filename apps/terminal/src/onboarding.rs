@@ -28,8 +28,9 @@ pub struct TutorialProgress {
     /// Stable sample scene restored when a resumed lesson requires the editor.
     #[serde(default)]
     pub demo_scene: Option<String>,
-    /// Verified user actions for the current tutorial route. Older preference
-    /// files deserialize with an empty set so progress remains resumable.
+    /// Verified user actions for the current lesson. The set is cleared when a
+    /// lesson changes; older preference files deserialize empty and remain
+    /// resumable without inheriting verification from the previous lesson.
     #[serde(default)]
     pub verified_actions: BTreeSet<String>,
 }

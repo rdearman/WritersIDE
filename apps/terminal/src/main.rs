@@ -661,23 +661,23 @@ fn tutorial_panel_at(
             ),
             (
                 "Your sample book",
-                "This separate sample book is disposable. Your opened novel is unchanged. Scene Cards shows one ordered list grouped by chapter; Up/Down selects, Ctrl+Up/Down reorders, Space includes or excludes, Enter opens, and Edit > Move Scene changes chapter.",
+                "This separate sample book is disposable. Open Scene Cards; the sample scene is selected there.",
             ),
             (
                 "Write and save",
-                "Open the sample scene. Type normally; save with File > Save or the shortcut shown below. The saved text can be reopened from Outline.",
+                "Write a short sentence in the sample scene and save it. Your own manuscript stays unchanged.",
             ),
             (
                 "References",
-                "Open a reference pane from the Window menu, then use Ctrl+Tab to move focus between panes.",
+                "Open the outline as a reference, then move focus to that pane.",
             ),
             (
                 "Search and review",
-                "Use Search to find manuscript text. Diagnostics and Issues provide review and follow-up lists.",
+                "Search for a word in the sample manuscript, then press Esc to return.",
             ),
             (
                 "Compile",
-                "Open the Publish menu, compile EPUB, then inspect Compile Results and its source navigation.",
+                "Compile the sample manuscript as an EPUB. The project remains disposable.",
             ),
         ],
     };
@@ -685,34 +685,25 @@ fn tutorial_panel_at(
         .get(step)
         .copied()
         .unwrap_or(("Complete", "The tutorial route is complete."));
-    let required = TUTORIAL_NAVIGATION_ACTIONS;
     let preferences = onboarding::load(preferences_path).ok();
-    let verified = preferences
+    let progress = preferences
         .as_ref()
-        .and_then(|prefs| prefs.active_tutorial.as_ref())
-        .map(|progress| &progress.verified_actions);
-    let lesson_complete = step == 0
-        && verified.is_some_and(|actions| {
-            [
-                "menu",
-                "navigate-menu",
-                "outline-select",
-                "outline",
-                "scene",
-                "write",
-                "save",
-                "return",
-                "resume",
-            ]
-            .iter()
-            .all(|action| actions.contains(*action))
-        });
+        .and_then(|prefs| prefs.active_tutorial.as_ref());
+    let required = tutorial_required_actions(track, step);
+    let verified = progress.map(|progress| &progress.verified_actions);
+    let lesson_complete = required
+        .iter()
+        .all(|(action, _)| verified.is_some_and(|actions| actions.contains(*action)));
     let mut lines = Vec::new();
     if step != 0 {
         lines.push(body.into());
     }
     if lesson_complete {
-        lines.push("Navigation lesson complete · Enter continues".into());
+        lines.push(if step == 0 {
+            "Navigation lesson complete · Enter continues".into()
+        } else {
+            format!("{title} lesson complete · Enter continues")
+        });
     } else {
         let completed = verified.map_or(0, |actions| {
             required
@@ -725,17 +716,12 @@ fn tutorial_panel_at(
             .find(|(key, _)| !verified.is_some_and(|actions| actions.contains(*key)));
         let task = next_task.map_or(
             "All practice tasks verified. Resume the lesson to continue.".to_owned(),
-            |(key, _)| match *key {
-                "menu" => "1/9 · Press F10 to open the menu".into(),
-                "navigate-menu" => "2/9 · Press → until Navigate is highlighted".into(),
-                "outline-select" => "3/9 · Press ↓ until Outline is highlighted".into(),
-                "outline" => "4/9 · Press Enter to open Outline".into(),
-                "scene" => "5/9 · Select the sample scene and press Enter".into(),
-                "write" => "6/9 · Type a few words in the sample scene".into(),
-                "save" => "7/9 · Save your writing from File > Save".into(),
-                "return" => "8/9 · Press Esc to return to Outline".into(),
-                "resume" => "9/9 · Choose Help > Resume Tutorial".into(),
-                _ => "Continue the practice in the sample book.".into(),
+            |(action, label)| {
+                if step == 0 {
+                    tutorial_navigation_task_label(action).to_owned()
+                } else {
+                    (*label).to_owned()
+                }
             },
         );
         lines.push(format!("{completed}/{} verified · {task}", required.len()));
@@ -746,6 +732,57 @@ fn tutorial_panel_at(
         title: format!("Tutorial · {title} · {}/{}", step + 1, lessons.len()),
         lines,
         scroll: 0,
+    }
+}
+
+fn tutorial_navigation_task_label(action: &str) -> &'static str {
+    match action {
+        "menu" => "Press F10 to open the menu",
+        "navigate-menu" => "Press → until Navigate is highlighted",
+        "outline-select" => "Press ↓ until Outline is highlighted",
+        "outline" => "Press Enter to open Outline",
+        "scene" => "Select the sample scene and press Enter",
+        "write" => "Type a few words in the sample scene",
+        "save" => "Save your writing from File > Save",
+        "return" => "Press Esc to return to Outline",
+        "resume" => "Choose Help > Resume Tutorial",
+        _ => "Continue the practice in the sample book",
+    }
+}
+
+fn tutorial_required_actions(
+    track: onboarding::TutorialTrack,
+    step: usize,
+) -> &'static [(&'static str, &'static str)] {
+    const CARDS: [(&str, &str); 1] = [("cards", "Open Scene Cards from Navigate")];
+    const WRITE_SAVE: [(&str, &str); 2] = [
+        ("write", "Type a few words in the sample scene"),
+        ("save", "Save the sample scene from File > Save"),
+    ];
+    const REFERENCE: [(&str, &str); 2] = [
+        ("reference-open", "Open View > Open Outline Reference"),
+        (
+            "reference-focus",
+            "Move focus to the reference pane with Ctrl+Tab",
+        ),
+    ];
+    const SEARCH: [(&str, &str); 1] = [("search", "Search for a word in the sample manuscript")];
+    const COMPILE: [(&str, &str); 1] = [(
+        "compile",
+        "Compile an EPUB from Publish > Compile, then choose EPUB with F2",
+    )];
+    match (track, step) {
+        (_, 0) => &TUTORIAL_NAVIGATION_ACTIONS,
+        (onboarding::TutorialTrack::QuickStart, 1) | (onboarding::TutorialTrack::GuidedTour, 2) => {
+            &WRITE_SAVE
+        }
+        (onboarding::TutorialTrack::QuickStart, 2) | (onboarding::TutorialTrack::GuidedTour, 5) => {
+            &COMPILE
+        }
+        (onboarding::TutorialTrack::GuidedTour, 1) => &CARDS,
+        (onboarding::TutorialTrack::GuidedTour, 3) => &REFERENCE,
+        (onboarding::TutorialTrack::GuidedTour, 4) => &SEARCH,
+        _ => &[],
     }
 }
 
@@ -5655,6 +5692,11 @@ impl AppState {
         };
         let demo_path = PathBuf::from(&progress.demo_project).canonicalize().ok();
         let current_path = self.app.project_root().canonicalize().ok();
+        let required = tutorial_required_actions(progress.track, progress.step);
+        let Some((_, action_label)) = required.iter().find(|(candidate, _)| *candidate == action)
+        else {
+            return;
+        };
         let state_verified = match action {
             "menu" => self.menu.is_some(),
             "navigate-menu" => self
@@ -5676,6 +5718,13 @@ impl AppState {
                 .help_panel
                 .as_ref()
                 .is_some_and(|panel| panel.title.starts_with("Tutorial ·")),
+            "cards" => self.workspace == Workspace::Cards,
+            "reference-open" => self.active_reference_pane().is_some(),
+            "reference-focus" => self.reference_focused && self.active_reference_pane().is_some(),
+            "search" => !self.search_locations.is_empty(),
+            "compile" => {
+                self.message.starts_with("Compiled ") || self.message.starts_with("Compiled to ")
+            }
             _ => true,
         } && demo_path.is_some()
             && current_path == demo_path;
@@ -5683,18 +5732,16 @@ impl AppState {
             self.message = "That step is not complete yet · your tutorial progress is safe".into();
             return;
         }
-        if progress.step == 0 {
-            let next = TUTORIAL_NAVIGATION_ACTIONS
-                .iter()
-                .find(|(required, _)| !progress.verified_actions.contains(*required));
-            if let Some((required, label)) = next
-                && action != *required
-            {
-                self.message = format!(
-                    "One step at a time: {label}. Your tutorial is available from Help > Resume Tutorial."
-                );
-                return;
-            }
+        let next = required
+            .iter()
+            .find(|(required, _)| !progress.verified_actions.contains(*required));
+        if let Some((expected, label)) = next
+            && action != *expected
+        {
+            self.message = format!(
+                "One step at a time: {label}. Your tutorial is available from Help > Resume Tutorial."
+            );
+            return;
         }
         let mut progress_saved = false;
         if progress.verified_actions.insert(action.to_owned()) {
@@ -5706,6 +5753,11 @@ impl AppState {
             }
         }
         if progress_saved && let Some(progress) = preferences.active_tutorial.as_ref() {
+            if action == "reference-open" {
+                // Leave the writing pane focused so the next tutorial task is
+                // an explicit move into the reference pane.
+                self.reference_focused = false;
+            }
             if self
                 .help_panel
                 .as_ref()
@@ -5713,7 +5765,7 @@ impl AppState {
             {
                 self.help_panel = Some(tutorial_panel_at(progress.track, progress.step, &path));
             }
-            self.message = format!("Tutorial step verified · {}", action.replace('-', " "));
+            self.message = format!("Tutorial step verified · {action_label}");
         }
     }
 
@@ -7725,6 +7777,9 @@ impl AppState {
                                     destination.display(),
                                     files.len()
                                 );
+                                if format == story_document::CompileFormat::Epub {
+                                    self.record_tutorial_action("compile");
+                                }
                                 close = true;
                             }
                             Err(error) => {
@@ -8530,6 +8585,7 @@ impl AppState {
             self.message = "No matches".into();
             return Ok(());
         }
+        self.record_tutorial_action("search");
         self.search_location_index = self.search_locations.len().saturating_sub(1);
         let (scene, title) = &found[0];
         if self.dirty && self.editing_scene != Some(*scene) {
@@ -9256,6 +9312,7 @@ impl AppState {
             }
         }
         self.reference_focused = true;
+        self.record_tutorial_action("reference-focus");
     }
     fn cycle_reference(&mut self, forward: bool) {
         if self.reference_panes.is_empty() {
@@ -10235,6 +10292,8 @@ impl AppState {
             self.workspace = w;
             if w == Workspace::Outline {
                 self.record_tutorial_action("outline");
+            } else if w == Workspace::Cards {
+                self.record_tutorial_action("cards");
             }
         }
     }
@@ -10465,9 +10524,7 @@ impl AppState {
             self.message = "There is no active tutorial to retry".into();
             return Ok(());
         };
-        if progress.step == 0 {
-            progress.verified_actions.clear();
-        }
+        progress.verified_actions.clear();
         let (track, step) = (progress.track, progress.step);
         onboarding::store(&path, &preferences)?;
         self.help_panel = Some(tutorial_panel_at(track, step, &path));
@@ -10550,6 +10607,28 @@ impl AppState {
                 }
             }
             Some("resume") => self.switch(Workspace::Outline),
+            Some("cards") => {
+                self.switch(Workspace::Dashboard);
+            }
+            Some("reference-open") | Some("search") | Some("compile") => {
+                self.switch(Workspace::Editor);
+            }
+            Some("reference-focus") => {
+                self.switch(Workspace::Editor);
+                if !self
+                    .reference_panes
+                    .iter()
+                    .any(|pane| pane.source_key == "outline:project")
+                {
+                    self.open_reference_buffer(
+                        "outline:project".into(),
+                        None,
+                        "Outline".into(),
+                        outline_reference_text(&self.app)?,
+                    );
+                }
+                self.reference_focused = false;
+            }
             _ => {}
         }
         Ok(true)
@@ -10579,10 +10658,7 @@ impl AppState {
             );
         };
         let demo_path = PathBuf::from(&progress.demo_project);
-        let next_action = TUTORIAL_NAVIGATION_ACTIONS
-            .iter()
-            .find(|(action, _)| !progress.verified_actions.contains(*action))
-            .map(|(action, _)| *action);
+        let next_action = tutorial_next_action_for_progress(&progress);
         let demo_scene = progress.demo_scene.clone();
         let current_path = self.app.project_root().canonicalize().ok();
         let target_path = demo_path.canonicalize()?;
@@ -10593,9 +10669,7 @@ impl AppState {
             self.recent_projects_path = recent_projects_path;
             switched?;
         }
-        if progress.step == 0
-            && !self.restore_tutorial_context(next_action, demo_scene.as_deref())?
-        {
+        if !self.restore_tutorial_context(next_action, demo_scene.as_deref())? {
             return Ok(());
         }
         self.tutorial_preferences_path = preferences_path.clone();
@@ -10617,31 +10691,19 @@ impl AppState {
             self.help_panel = None;
             return Ok(());
         };
-        if direction == 1 && progress.step == 0 {
-            let required = TUTORIAL_NAVIGATION_ACTIONS.map(|(action, _)| action);
+        if direction == 1 {
+            let required = tutorial_required_actions(progress.track, progress.step);
             let missing: Vec<_> = required
                 .iter()
-                .copied()
-                .filter(|action| !progress.verified_actions.contains(*action))
+                .filter(|(action, _)| !progress.verified_actions.contains(*action))
                 .collect();
             if !missing.is_empty() {
                 let labels = missing
                     .iter()
-                    .map(|action| match *action {
-                        "menu" => "open the menu",
-                        "navigate-menu" => "move the menu highlight to Navigate",
-                        "outline-select" => "highlight Outline",
-                        "outline" => "open Outline",
-                        "scene" => "open the sample scene",
-                        "write" => "write in the scene",
-                        "save" => "save your writing",
-                        "return" => "return to Outline with Esc",
-                        "resume" => "resume this tutorial from Help",
-                        _ => "complete the practice",
-                    })
+                    .map(|(_, label)| *label)
                     .collect::<Vec<_>>()
                     .join(", ");
-                self.message = format!("Finish the navigation practice first: {labels}");
+                self.message = format!("Complete the current practice first: {labels}");
                 self.help_panel = Some(tutorial_panel_at(
                     progress.track,
                     progress.step,
@@ -10650,6 +10712,7 @@ impl AppState {
                 return Ok(());
             }
         }
+        let previous_step = progress.step;
         let last = match progress.track {
             onboarding::TutorialTrack::QuickStart => 2,
             onboarding::TutorialTrack::GuidedTour => 5,
@@ -10679,6 +10742,9 @@ impl AppState {
             return Ok(());
         } else {
             progress.step += 1;
+        }
+        if progress.step != previous_step {
+            progress.verified_actions.clear();
         }
         let track = progress.track;
         let step = progress.step;
@@ -11608,6 +11674,9 @@ impl AppState {
             )?;
         } else {
             self.dispatch_registered_with_args(command.action, arguments)?;
+        }
+        if command_id == "view.cards" {
+            self.record_tutorial_action("cards");
         }
         self.record_recent_command(command.id);
         Ok(())
@@ -14155,6 +14224,9 @@ impl AppState {
                         destination.display(),
                         output_files.len()
                     );
+                    if format == story_document::CompileFormat::Epub {
+                        self.record_tutorial_action("compile");
+                    }
                     if self
                         .app
                         .list_compile_results()?
@@ -16074,6 +16146,7 @@ impl AppState {
                 outline_reference_text(&self.app)?,
             );
             self.reference_focused = true;
+            self.record_tutorial_action("reference-open");
         } else if cmd == "reference-timeline" {
             self.open_reference_buffer(
                 "timeline:project".into(),
@@ -19285,14 +19358,16 @@ fn tutorial_next_action(state: &AppState) -> Option<&'static str> {
     let progress = onboarding::load(&state.tutorial_preferences_path)
         .ok()?
         .active_tutorial?;
-    (progress.step == 0)
-        .then(|| {
-            TUTORIAL_NAVIGATION_ACTIONS
-                .iter()
-                .find(|(required, _)| !progress.verified_actions.contains(*required))
-                .map(|(action, _)| *action)
-        })
-        .flatten()
+    tutorial_next_action_for_progress(&progress)
+}
+
+fn tutorial_next_action_for_progress(
+    progress: &onboarding::TutorialProgress,
+) -> Option<&'static str> {
+    tutorial_required_actions(progress.track, progress.step)
+        .iter()
+        .find(|(required, _)| !progress.verified_actions.contains(*required))
+        .map(|(action, _)| *action)
 }
 
 fn tutorial_expected_action_hint(state: &AppState) -> String {
@@ -19312,6 +19387,11 @@ fn tutorial_expected_action_hint(state: &AppState) -> String {
         ),
         Some("return") => "Press Esc to return to Outline".into(),
         Some("resume") => "Choose Help > Resume Tutorial".into(),
+        Some("cards") => "Open Navigate > Scene Cards".into(),
+        Some("reference-open") => "Open View > Open Outline Reference".into(),
+        Some("reference-focus") => "Press Ctrl+Tab to focus the reference pane".into(),
+        Some("search") => "Search for a word in the sample manuscript".into(),
+        Some("compile") => "Open Publish > Compile, choose EPUB with F2 and save it".into(),
         _ => "Continue the current tutorial lesson".into(),
     }
 }
@@ -19322,6 +19402,31 @@ fn tutorial_key_is_expected(state: &AppState, key: KeyEvent) -> bool {
     }
     if state.menu.is_some() {
         return match tutorial_next_action(state) {
+            Some("cards" | "reference-open" | "compile") => {
+                if matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Esc
+                ) {
+                    return true;
+                }
+                if key.code != KeyCode::Enter {
+                    return false;
+                }
+                let entries = state.menu_visible_entries();
+                let selected = entries.get(state.menu.map_or(0, |menu| menu.selected));
+                let command_id = selected.map(|command| command.id).unwrap_or_default();
+                if selected.is_some_and(|command| {
+                    matches!(command.action, CommandAction::OpenMenuGroup(_))
+                }) {
+                    return key.code == KeyCode::Enter;
+                }
+                match tutorial_next_action(state) {
+                    Some("cards") => command_id == "view.cards",
+                    Some("reference-open") => command_id == "view.reference-outline",
+                    Some("compile") => command_id == "compile.format",
+                    _ => false,
+                }
+            }
             Some("navigate-menu") => {
                 matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Esc)
             }
@@ -19371,6 +19476,29 @@ fn tutorial_key_is_expected(state: &AppState, key: KeyEvent) -> bool {
                     }) && key.code == KeyCode::Enter)
             }
             Some("menu") | None => key.code == KeyCode::Esc,
+            Some("search") => {
+                matches!(
+                    key.code,
+                    KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down | KeyCode::Esc
+                ) || (key.code == KeyCode::Enter
+                    && state
+                        .menu_visible_entries()
+                        .get(state.menu.map_or(0, |menu| menu.selected))
+                        .is_some_and(|command| command.id == "search.find-panel"))
+                    || state.find_panel.as_ref().is_some_and(|_| {
+                        matches!(
+                            key.code,
+                            KeyCode::Char(_)
+                                | KeyCode::Backspace
+                                | KeyCode::Delete
+                                | KeyCode::Enter
+                                | KeyCode::Esc
+                                | KeyCode::Left
+                                | KeyCode::Right
+                                | KeyCode::Tab
+                        )
+                    })
+            }
             _ => key.code == KeyCode::Esc,
         };
     }
@@ -19398,6 +19526,49 @@ fn tutorial_key_is_expected(state: &AppState, key: KeyEvent) -> bool {
                         | KeyCode::End
                 ) || (matches!(key.code, KeyCode::Char(_))
                     && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)))
+        }
+        Some("cards") => tutorial_key_matches_command(state, "view.cards", key),
+        Some("reference-open") => {
+            tutorial_key_matches_command(state, "view.reference-outline", key)
+        }
+        Some("reference-focus") => {
+            key.code == KeyCode::Tab && key.modifiers == KeyModifiers::CONTROL
+        }
+        Some("search") => {
+            tutorial_key_matches_command(state, "search.find-panel", key)
+                || tutorial_key_matches_command(state, "command.palette-open", key)
+                || state.find_panel.is_some()
+                    && matches!(
+                        key.code,
+                        KeyCode::Char(_)
+                            | KeyCode::Backspace
+                            | KeyCode::Delete
+                            | KeyCode::Enter
+                            | KeyCode::Esc
+                            | KeyCode::Left
+                            | KeyCode::Right
+                            | KeyCode::Tab
+                    )
+        }
+        Some("compile") => {
+            tutorial_key_matches_command(state, "compile.format", key)
+                || state.file_browser.as_ref().is_some_and(|browser| {
+                    matches!(browser.purpose, FileBrowserPurpose::Compile(_))
+                        && matches!(
+                            key.code,
+                            KeyCode::Char(_)
+                                | KeyCode::Backspace
+                                | KeyCode::Delete
+                                | KeyCode::Enter
+                                | KeyCode::Esc
+                                | KeyCode::Left
+                                | KeyCode::Right
+                                | KeyCode::Up
+                                | KeyCode::Down
+                                | KeyCode::Tab
+                                | KeyCode::F(2 | 5)
+                        )
+                })
         }
         Some("save") => tutorial_key_matches_command(state, "file.save", key),
         Some("return") => state.workspace == Workspace::Editor && key.code == KeyCode::Esc,
@@ -25535,7 +25706,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             "The tutorial uses Enter to continue · F6 remains assigned to your workspace".into();
         return Ok(false);
     }
-    if tutorial_has_focus {
+    if tutorial_has_focus && s.file_browser.is_none() && s.find_panel.is_none() {
         match k.code {
             KeyCode::F(4) => {
                 s.advance_tutorial(-1)?;
@@ -39166,7 +39337,7 @@ mod tests {
             0,
             "F6 must not skip the navigation practice"
         );
-        assert!(state.message.contains("Finish the navigation practice"));
+        assert!(state.message.contains("Complete the current practice"));
 
         state.record_tutorial_action("write");
         assert!(state.message.contains("step is not complete"));
@@ -39329,7 +39500,7 @@ mod tests {
             panel
                 .lines
                 .iter()
-                .any(|line| line.contains("1/9 · Press F10 to open the menu"))
+                .any(|line| line.contains("0/9 verified · Press F10 to open the menu"))
         );
         assert!(panel.lines.iter().any(|line| {
             line.contains("F4 Back")
@@ -39362,7 +39533,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(screen.contains("1/9 · Press F10 to open the menu"));
+        assert!(screen.contains("0/9 verified · Press F10 to open the menu"));
         assert!(screen.contains("Dashboard"), "workspace remains visible");
 
         let mut preferences = onboarding::load(&preferences_path).unwrap();
@@ -39378,15 +39549,9 @@ mod tests {
             0,
             &preferences_path,
         ));
-        assert!(
-            state
-                .help_panel
-                .as_ref()
-                .unwrap()
-                .lines
-                .iter()
-                .any(|line| { line.contains("2/9 · Press → until Navigate is highlighted") })
-        );
+        assert!(state.help_panel.as_ref().unwrap().lines.iter().any(|line| {
+            line.contains("1/9 verified · Press → until Navigate is highlighted")
+        }));
 
         preferences = onboarding::load(&preferences_path).unwrap();
         preferences
@@ -39525,6 +39690,206 @@ mod tests {
     }
 
     #[test]
+    fn guided_tutorial_requires_real_actions_and_resumes_at_the_current_lesson_context() {
+        let directory = tempfile::tempdir().unwrap();
+        let original_path = directory.path().join("Original");
+        let app = WriterApp::create_project(&original_path, "Original").unwrap();
+        let demo_path = directory.path().join("Tutorial");
+        let preferences_path = directory.path().join("prefs/tutorial.json");
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .begin_tutorial_at(
+                onboarding::TutorialTrack::GuidedTour,
+                demo_path.clone(),
+                preferences_path.clone(),
+            )
+            .unwrap();
+
+        let mut preferences = onboarding::load(&preferences_path).unwrap();
+        preferences
+            .active_tutorial
+            .as_mut()
+            .unwrap()
+            .verified_actions = TUTORIAL_NAVIGATION_ACTIONS
+            .iter()
+            .map(|(action, _)| (*action).to_owned())
+            .collect();
+        onboarding::store(&preferences_path, &preferences).unwrap();
+        state.advance_tutorial(1).unwrap();
+        assert_eq!(tutorial_next_action(&state), Some("cards"));
+        state.advance_tutorial(1).unwrap();
+        assert_eq!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .step,
+            1,
+            "the Cards lesson cannot advance from Enter alone"
+        );
+        assert!(state.message.contains("Scene Cards"));
+
+        state.switch(Workspace::Cards);
+        assert!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .verified_actions
+                .contains("cards")
+        );
+        state.advance_tutorial(1).unwrap();
+        assert_eq!(tutorial_next_action(&state), Some("write"));
+        state.advance_tutorial(1).unwrap();
+        assert!(state.message.contains("Type a few words"));
+
+        let scene = state.app.list_scenes(false).unwrap()[0].scene.id;
+        state.open_scene(scene).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.dirty);
+        assert!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .verified_actions
+                .contains("write")
+        );
+        state.save().unwrap();
+        assert!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .verified_actions
+                .contains("save")
+        );
+        state.advance_tutorial(1).unwrap();
+        assert_eq!(tutorial_next_action(&state), Some("reference-open"));
+
+        state
+            .dispatch_registered_command_id("view.reference-outline")
+            .unwrap();
+        assert!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .verified_actions
+                .contains("reference-open")
+        );
+        state.exit_tutorial().unwrap();
+        assert_eq!(state.app.project_root(), original_path);
+        state.resume_tutorial_at(&preferences_path).unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert!(!state.reference_focused);
+        assert_eq!(tutorial_next_action(&state), Some("reference-focus"));
+        state.toggle_reference_focus();
+        assert!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .verified_actions
+                .contains("reference-focus")
+        );
+        state.advance_tutorial(1).unwrap();
+        assert_eq!(tutorial_next_action(&state), Some("search"));
+
+        let edit_index = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Edit")
+            .unwrap();
+        state.open_menu_category(edit_index);
+        let find_index = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| command.id == "search.find-panel")
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = find_index;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.find_panel.is_some());
+        for character in "disposable".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .step,
+            5,
+            "a successful search and Enter advance to the final tutorial task"
+        );
+        assert_eq!(tutorial_next_action(&state), Some("compile"));
+
+        let publish_index = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Publish")
+            .unwrap();
+        state.open_menu_category(publish_index);
+        let compile_index = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| command.id == "compile.format")
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = compile_index;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        for _ in 0..8 {
+            handle(&mut state, KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)).unwrap();
+        }
+        let epub = state
+            .app
+            .project_root()
+            .join("Writer's IDE Tutorial Sample.epub");
+        handle(&mut state, KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)).unwrap();
+        assert!(
+            epub.is_file(),
+            "expected {}, browser={:?}, message={}",
+            epub.display(),
+            state.file_browser,
+            state.message
+        );
+        assert!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .verified_actions
+                .contains("compile")
+        );
+        state.advance_tutorial(1).unwrap();
+        assert!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .is_none()
+        );
+        assert_eq!(state.app.project_root(), original_path);
+    }
+
+    #[test]
     fn tutorial_modal_uses_enter_for_progress_and_never_leaks_f6_to_workspace() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Original"), "Original").unwrap();
@@ -39629,7 +39994,74 @@ mod tests {
                 .active_tutorial
                 .unwrap()
                 .step,
-            2
+            1,
+            "the tutorial cannot advance until Scene Cards has been opened"
+        );
+        assert!(state.message.contains("Scene Cards"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
+        )
+        .unwrap();
+        for _ in 0..3 {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        let group = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| {
+                matches!(
+                    command.action,
+                    CommandAction::OpenMenuGroup("Workspaces & Outline")
+                )
+            })
+            .expect("Navigate menu exposes workspace group");
+        for _ in 0..group {
+            handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let cards = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| command.id == "view.cards")
+            .expect("workspace group exposes Scene Cards");
+        for _ in 0..cards {
+            handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .step,
+            2,
+            "tutorial state: {:?}; workspace: {:?}; menu: {:?}; message: {}",
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .verified_actions,
+            state.workspace,
+            state.menu,
+            state.message
         );
         assert!(
             state
