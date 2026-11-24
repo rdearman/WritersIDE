@@ -330,6 +330,8 @@ struct AppState {
     reference_swapped: bool,
     selected_series_root: Option<PathBuf>,
     series_reference_view: bool,
+    series_removed_books_view: bool,
+    pending_series_book_removal: Option<story_series::SeriesBook>,
     series_references: Vec<SeriesReferenceRow>,
     scrivener_import: Option<ScrivenerImportWizard>,
     series_form: Option<SeriesActionForm>,
@@ -910,6 +912,9 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "series.import-scrivener",
         "file.open-text",
         "file.import-document",
+        "series.remove-selected-book",
+        "series.removed-books",
+        "series.restore-selected-book",
         "file.save",
         "file.save-as",
         "file.quit",
@@ -3995,6 +4000,30 @@ fn command_registry() -> Vec<CommandSpec> {
             "series-references",
             false,
         ),
+        legacy_command(
+            "series.remove-selected-book",
+            "Remove Selected Book from Series…",
+            "Remove only the selected book's series membership; keep its project and manuscript",
+            "Series",
+            "series-remove-selected-book",
+            false,
+        ),
+        legacy_command(
+            "series.removed-books",
+            "Show Removed Books",
+            "List books removed from the series without deleting their projects",
+            "Series",
+            "series-removed-books",
+            false,
+        ),
+        legacy_command(
+            "series.restore-selected-book",
+            "Restore Selected Book to Series",
+            "Restore the selected book's original series membership and position",
+            "Series",
+            "series-restore-selected-book",
+            false,
+        ),
     ]);
     for command in &mut commands {
         command.task_group = task_group_for_command(*command);
@@ -6345,6 +6374,8 @@ impl AppState {
             pending_structural_node_removal: None,
             selected_series_root,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
@@ -13767,9 +13798,62 @@ impl AppState {
         if cmd == "series-open" {
             self.scrivener_import = None;
             self.series_reference_view = false;
+            self.series_removed_books_view = false;
             self.selected = 0;
             self.switch(Workspace::Series);
             self.message = "Series Books · Enter opens a book · F10 Menu → Series for create/import/reference actions".into();
+            return Ok(());
+        }
+        if cmd == "series-remove-selected-book" {
+            if self.workspace != Workspace::Series
+                || self.series_reference_view
+                || self.series_removed_books_view
+            {
+                return Err("Open the active Series Books list and select a book first".into());
+            }
+            let (book, _) = self
+                .series_books()?
+                .get(self.selected)
+                .cloned()
+                .ok_or("Select a book to remove from the series")?;
+            self.selected_series_root = Some(self.series_root()?);
+            self.pending_series_book_removal = Some(book.clone());
+            self.message = format!(
+                "Remove '{}' from this series? Its project and manuscript will be kept.",
+                book.title
+            );
+            return Ok(());
+        }
+        if cmd == "series-removed-books" {
+            let root = self.series_root()?;
+            self.selected_series_root = Some(root);
+            self.series_reference_view = false;
+            self.series_removed_books_view = true;
+            self.scrivener_import = None;
+            self.selected = 0;
+            self.switch(Workspace::Series);
+            self.message = "Removed Books · projects and manuscript files are preserved · Enter restores the selected membership".into();
+            return Ok(());
+        }
+        if cmd == "series-restore-selected-book" {
+            if self.workspace != Workspace::Series || !self.series_removed_books_view {
+                return Err("Show Removed Books first".into());
+            }
+            let root = self.series_root()?;
+            let mut series = story_series::SeriesStore::open(&root)?;
+            let book = series
+                .list_removed_books()?
+                .get(self.selected)
+                .cloned()
+                .ok_or("Select a removed book to restore")?;
+            series.restore_book(book.id)?;
+            self.series_removed_books_view = false;
+            self.selected_series_root = Some(root);
+            self.selected = 0;
+            self.message = format!(
+                "Restored '{}' to the series · original position retained",
+                book.title
+            );
             return Ok(());
         }
         if let Some(path) = cmd
@@ -22621,6 +22705,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.pending_structural_node_removal.is_some() {
         draw_structural_node_removal_overlay(f, s);
     }
+    if s.pending_series_book_removal.is_some() {
+        draw_series_book_removal_overlay(f, s);
+    }
     if s.help_panel.is_some() {
         draw_help_overlay(f, s);
     }
@@ -24656,6 +24743,37 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
     );
 }
 
+fn draw_series_book_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(book) = &s.pending_series_book_removal else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).clamp(1, 72);
+    let height = 7.min(area.height.max(1));
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, rect);
+    let text = Text::from(vec![
+        Line::from(format!("Remove '{}' from this series?", book.title)),
+        Line::from("Only its series membership will be removed."),
+        Line::from("The book folder, manuscript, metadata and snapshots stay in place."),
+        Line::from("The action can be reversed from File > Show Removed Books."),
+        Line::from("Enter/Y confirms · Esc/N cancels"),
+    ]);
+    f.render_widget(
+        Paragraph::new(text).wrap(Wrap { trim: true }).block(
+            Block::default()
+                .title(" Remove Book from Series ")
+                .borders(Borders::ALL),
+        ),
+        rect,
+    );
+}
+
 fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let Some(form) = s.series_form.as_ref() else {
         return;
@@ -26148,6 +26266,26 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                     )
                 })
                 .collect();
+        }
+        if s.series_removed_books_view {
+            return match s.series_root() {
+                Ok(root) => story_series::SeriesStore::open(&root)
+                    .and_then(|series| series.list_removed_books())
+                    .map(|books| {
+                        books
+                            .into_iter()
+                            .map(|book| {
+                                format!(
+                                    "{} · removed from series · project retained · original position {}",
+                                    book.title,
+                                    book.position + 1
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_else(|error| vec![format!("Could not list removed books: {error}")]),
+                Err(error) => vec![format!("Could not open series: {error}")],
+            };
         }
         let current_project = s.app.get_project().ok().map(|project| project.id);
         return match s.series_books() {
@@ -27984,6 +28122,28 @@ fn handle_command_palette_key(
 }
 
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    if let Some(book) = s.pending_series_book_removal.clone() {
+        match k.code {
+            KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                let root = s.series_root()?;
+                let mut series = story_series::SeriesStore::open(&root)?;
+                series.remove_book(book.id)?;
+                s.pending_series_book_removal = None;
+                s.series_removed_books_view = true;
+                s.selected = 0;
+                s.message = format!(
+                    "Removed '{}' from the series · project and manuscript retained · Enter restores",
+                    book.title
+                );
+            }
+            KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                s.pending_series_book_removal = None;
+                s.message = "Cancelled · book remains in the series".into();
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if let Some(dialog) = s.pending_structural_node_removal.clone() {
         match k.code {
             KeyCode::Up if dialog.can_rehome_scenes || dialog.can_promote_children => {
@@ -29811,6 +29971,12 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
         }
         KeyCode::Enter if s.workspace == Workspace::Series && s.scrivener_import.is_some() => {}
+        KeyCode::Enter if s.workspace == Workspace::Series && s.series_removed_books_view => {
+            match s.execute_legacy_palette_command("series-restore-selected-book") {
+                Ok(()) => {}
+                Err(error) => s.message = error.to_string(),
+            }
+        }
         KeyCode::Enter if s.workspace == Workspace::Series && s.series_reference_view => {
             if let Some(reference) = s.series_references.get(s.selected).cloned() {
                 s.open_reference_buffer(
@@ -30971,6 +31137,86 @@ mod tests {
         let rows = workspace_items(&state);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].contains("Book 3"));
+    }
+
+    #[test]
+    fn removing_a_series_book_keeps_project_and_can_be_restored_from_file_menu() {
+        let root = tempfile::tempdir().unwrap();
+        let initial = WriterApp::create_project(root.path().join("Initial"), "Initial").unwrap();
+        let mut state = AppState::new(initial, default_bindings());
+        let series_root = root.path().join("Series");
+        state
+            .execute_legacy_palette_command(&format!(
+                "series-create {} | Example Series",
+                series_root.display()
+            ))
+            .unwrap();
+        state
+            .execute_legacy_palette_command("series-new-book Book-One | Book One")
+            .unwrap();
+        let book_path = series_root.join("Book-One");
+        let project_id = state.app.get_project().unwrap().id;
+        let chapter = state.app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = state.app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = state.app.load_scene_text(scene).unwrap();
+        state
+            .app
+            .save_scene_text(scene, Some(&hash), "The opening remains safe.")
+            .unwrap();
+        let active = story_series::SeriesStore::open(&series_root)
+            .unwrap()
+            .list_books()
+            .unwrap();
+        assert_eq!(active.len(), 1);
+
+        state.selected_series_root = Some(series_root.clone());
+        state.workspace = Workspace::Series;
+        state.selected = 0;
+        let file_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "File")
+            .unwrap();
+        state.menu = Some(MenuState {
+            top: file_menu,
+            selected: 0,
+        });
+        let file_actions = state
+            .menu_visible_entries()
+            .into_iter()
+            .map(|command| command.id)
+            .collect::<Vec<_>>();
+        assert!(file_actions.contains(&"series.remove-selected-book"));
+        assert!(file_actions.contains(&"series.removed-books"));
+        assert!(file_actions.contains(&"series.restore-selected-book"));
+        state.menu = None;
+        state
+            .execute_legacy_palette_command("series-remove-selected-book")
+            .unwrap();
+        assert!(state.pending_series_book_removal.is_some());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let series = story_series::SeriesStore::open(&series_root).unwrap();
+        assert!(series.list_books().unwrap().is_empty());
+        assert_eq!(series.list_removed_books().unwrap().len(), 1);
+        assert!(book_path.is_dir());
+        let reopened = WriterApp::open_project(&book_path).unwrap();
+        assert_eq!(reopened.get_project().unwrap().id, project_id);
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "The opening remains safe."
+        );
+        assert!(workspace_items(&state)[0].contains("project retained"));
+
+        state
+            .execute_legacy_palette_command("series-restore-selected-book")
+            .unwrap();
+        let series = story_series::SeriesStore::open(&series_root).unwrap();
+        assert_eq!(series.list_books().unwrap()[0].project_id, project_id);
+        assert!(series.list_removed_books().unwrap().is_empty());
+        assert_eq!(series.list_books().unwrap()[0].position, 0);
     }
 
     #[test]
@@ -35378,6 +35624,8 @@ mod tests {
             pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
@@ -38879,6 +39127,8 @@ mod tests {
             pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
@@ -39031,6 +39281,8 @@ mod tests {
             pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
@@ -39179,6 +39431,8 @@ mod tests {
             pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
@@ -39335,6 +39589,8 @@ mod tests {
             pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
@@ -39641,6 +39897,8 @@ mod tests {
             pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
@@ -39797,6 +40055,8 @@ mod tests {
             pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
@@ -40447,6 +40707,9 @@ mod tests {
                 "series.import-scrivener",
                 "file.open-text",
                 "file.import-document",
+                "series.remove-selected-book",
+                "series.removed-books",
+                "series.restore-selected-book",
                 "file.save",
                 "file.save-as",
                 "file.quit",
@@ -41384,6 +41647,8 @@ mod tests {
             pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
@@ -41675,6 +41940,8 @@ mod tests {
             pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
@@ -42855,6 +43122,8 @@ mod tests {
             pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
@@ -43022,6 +43291,8 @@ mod tests {
             pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
@@ -43241,6 +43512,8 @@ mod tests {
             pending_structural_node_removal: None,
             selected_series_root: None,
             series_reference_view: false,
+            series_removed_books_view: false,
+            pending_series_book_removal: None,
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
