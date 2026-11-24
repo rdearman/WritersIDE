@@ -7,7 +7,7 @@ Status: Partial implementation; human verification remains open.
 
 - Scene identity, prose, placement and relationships are already stored independently. The `scene.archived` flag excludes archived scenes from the normal scene listing and compile input.
 - Reading documents are project-owned copies. Their source path is provenance only; removal must not delete or modify the source file.
-- Structural section/chapter removal is recoverable and preserves original node identities and positions. Populated fiction chapters can rehome scenes or move the full subtree to Removed Documents. Non-fiction heading promotion/rehoming remains outstanding.
+- Structural section/chapter removal is recoverable and preserves original node identities and positions. Populated fiction chapters can rehome scenes or move the full subtree to Removed Documents. Non-fiction sections can promote child headings one level and retain the removed heading's own prose in Removed Documents.
 
 ## Implemented contracts
 
@@ -17,9 +17,9 @@ Status: Partial implementation; human verification remains open.
 - `Scene > Move Scene to Removed / Show Removed Scenes / Restore Selected Scene` provides the corresponding scene workflow in Scene Cards. The confirmation names the scene and states which data is retained.
 - Removed scenes are omitted from normal scene lists, project search and compilation. Restored scenes return to their preserved manuscript position.
 - Chapter and section prose documents reuse the pre-existing `content_unit.archived` field. `Edit > Move Prose Document to Removed / Show Removed Prose Documents / Restore Selected Prose Document` keeps the project-owned Markdown file, stable ID, parent, word metadata and text; archived documents disappear from active outline/search/compile results and can be restored in place. No schema migration is needed for this slice.
-- Migration 0047 adds `structural_node.archived`. Migration 0048 adds a recoverable structural-removal operation and membership tables. Empty headings and populated subtrees can be retained in Removed Sections and Chapters, then restored without replacing their IDs, hierarchy, relative order, metadata or manuscript files.
+- Migration 0047 adds `structural_node.archived`. Migration 0048 adds a recoverable structural-removal operation and membership tables. Migration 0049 records original/applied parent and position for promoted headings. Empty headings and populated subtrees can be retained in Removed Sections and Chapters, then restored without replacing their IDs, hierarchy, relative order, metadata or manuscript files.
 - The chapter removal dialogue reports scene and prose counts. For a fiction chapter with scenes and no direct prose, the default is to move scenes to Unplaced; the author can instead choose another chapter or delete the chapter and subtree recoverably. Unplaced scenes are excluded from Compile. Rehoming keeps scene IDs, prose, metadata and inclusion state. Restoration verifies that rehomed scenes have not subsequently moved; it refuses to overwrite a changed placement.
-- A chapter containing direct prose exposes recoverable subtree deletion only, so the prose remains available in Removed Documents. A section with descendants can currently be removed only as a recoverable subtree. SQL triggers prevent removing an active node until its active descendants, scenes and prose have been moved or archived, and prevent adding content under removed headings.
+- A chapter containing direct prose exposes recoverable subtree deletion only, so the prose remains available in Removed Documents. In non-fiction, a populated section offers `Promote child sections` or `Delete the whole subtree recoverably`. Promotion preserves each child's ID, nested subtree and relative order, while the removed heading and directly owned prose remain recoverable together. Restoring the removal restores the original hierarchy and prose; if a promoted child was moved after removal, restoration fails atomically instead of overwriting that move. SQL triggers prevent removing an active node until its active descendants, scenes and prose have been moved or archived, and prevent adding content under removed headings.
 - Existing archived scenes whose former status was not recorded before migration are assigned `idea` as their restoration status. The previous status was already lost by the older archive operation; the migration does not invent it.
 
 ## Failure and consistency rules
@@ -31,14 +31,14 @@ Status: Partial implementation; human verification remains open.
 
 ## Verification
 
-- Storage tests cover reopen, source/prose preservation, prior scene status, placement, relationships, search visibility, subtree deletion/restoration, chapter rehoming, ordering and refusal to overwrite a scene moved after removal.
-- Terminal state tests exercise confirmation, default rehoming to Unplaced, recoverable subtree deletion, restoration, stable identity and compiler exclusion/restoration.
+- Storage tests cover reopen, source/prose preservation, prior scene status, placement, relationships, search visibility, subtree deletion/restoration, chapter rehoming, section promotion, ordering and refusal to overwrite a scene moved after removal.
+- Terminal state tests exercise confirmation, default rehoming to Unplaced, recoverable subtree deletion, non-fiction section promotion, restoration, stable identity and compiler exclusion/restoration.
 - The full workspace suite and terminal suite must pass before this milestone is committed.
 - #63 remains open for human UAT and for the unimplemented scopes below.
 
 ## Explicitly outstanding in #63
 
-- Non-fiction section promotion to its parent or rehoming to another compatible section, including explicit preservation/rehome choices for directly owned prose. The current section action is recoverable subtree removal.
+- Rehoming a section's promoted children to a separately selected compatible section; current promotion targets the removed section's parent level. Directly owned prose is retained with its heading in Removed Documents, but is not yet offered as a separate move into another active compatible content unit.
 - A multi-selection or operation-history browser for choosing among several structural removal records; restoration currently selects the latest unrestored operation for the chosen root.
 - Removal/restore workflows for books and project-owned imported documents beyond chapter/section prose units and the reading-library case.
 - A series-level removal workflow and explicit unlink-versus-delete choice.

@@ -202,6 +202,7 @@ struct StructuralNodeRemovalDialog {
     content_unit_count: u32,
     content_unit_words: u64,
     can_rehome_scenes: bool,
+    can_promote_children: bool,
     target_chapters: Vec<story_core::NodeId>,
     target_index: usize,
     choice: usize,
@@ -10790,6 +10791,14 @@ impl AppState {
             && descendant_nodes == 0
             && units.is_empty()
             && !scenes.is_empty();
+        let direct_children = active_nodes
+            .iter()
+            .filter(|candidate| candidate.parent_id == Some(id))
+            .count();
+        let can_promote_children = !restoring
+            && self.app.get_project()?.book_type == story_core::BookType::Nonfiction
+            && node.kind == "section"
+            && direct_children > 0;
         let target_chapters = active_nodes
             .iter()
             .filter(|candidate| {
@@ -10813,9 +10822,14 @@ impl AppState {
             content_unit_count: units.len() as u32,
             content_unit_words: units.iter().map(|unit| u64::from(unit.actual_words)).sum(),
             can_rehome_scenes,
+            can_promote_children,
             target_chapters,
             target_index: 0,
-            choice: if can_rehome_scenes { 0 } else { 2 },
+            choice: if can_rehome_scenes || can_promote_children {
+                0
+            } else {
+                2
+            },
         });
         Ok(())
     }
@@ -10835,6 +10849,8 @@ impl AppState {
             };
             self.app
                 .remove_chapter_rehome_scenes(dialog.id, Some(target))?;
+        } else if dialog.can_promote_children && dialog.choice == 0 {
+            self.app.promote_section_children(dialog.id)?;
         } else {
             self.app.archive_structural_subtree(dialog.id)?;
         }
@@ -24453,7 +24469,7 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
     };
     let area = f.area();
     let width = area.width.saturating_sub(4).clamp(1, 78);
-    let height = 7.min(area.height.max(1));
+    let height = 10.min(area.height.max(1));
     let rect = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -24518,6 +24534,20 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
             lines.push(Line::from(
                 "Up/Down choose · Left/Right destination · Enter confirm · Esc cancel",
             ));
+        } else if dialog.can_promote_children {
+            lines.push(Line::from("Choose how to handle this non-fiction section:"));
+            lines.push(Line::from(format!(
+                "{} Promote child sections; retain this heading and its prose in Removed Documents",
+                if dialog.choice == 0 { ">" } else { " " }
+            )));
+            lines.push(Line::from(format!(
+                "{} Delete the whole subtree recoverably",
+                if dialog.choice == 1 { ">" } else { " " }
+            )));
+            lines.push(Line::from(
+                "Promotion preserves child order and IDs. The removed heading and owned prose remain recoverable.",
+            ));
+            lines.push(Line::from("Up/Down choose · Enter confirm · Esc cancel"));
         } else {
             lines.push(Line::from(
                 "The entire heading subtree, scenes and prose will be retained in Removed Documents.",
@@ -27875,14 +27905,15 @@ fn handle_command_palette_key(
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
     if let Some(dialog) = s.pending_structural_node_removal.clone() {
         match k.code {
-            KeyCode::Up if dialog.can_rehome_scenes => {
+            KeyCode::Up if dialog.can_rehome_scenes || dialog.can_promote_children => {
                 if let Some(active) = s.pending_structural_node_removal.as_mut() {
                     active.choice = active.choice.saturating_sub(1);
                 }
             }
-            KeyCode::Down if dialog.can_rehome_scenes => {
+            KeyCode::Down if dialog.can_rehome_scenes || dialog.can_promote_children => {
                 if let Some(active) = s.pending_structural_node_removal.as_mut() {
-                    active.choice = (active.choice + 1).min(2);
+                    let max_choice = if active.can_rehome_scenes { 2 } else { 1 };
+                    active.choice = (active.choice + 1).min(max_choice);
                 }
             }
             KeyCode::Left | KeyCode::Right
@@ -41963,6 +41994,97 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "Retained manuscript text."
         );
+    }
+
+    #[test]
+    fn nonfiction_section_removal_promotes_children_and_keeps_owned_prose_recoverable() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut app =
+            WriterApp::create_project_with_type(&project, "Book", story_core::BookType::Nonfiction)
+                .unwrap();
+        let parent = app
+            .create_structural_node(None, story_core::NodeKind::Section, "Part One", 0)
+            .unwrap();
+        let section = app
+            .create_structural_node(
+                Some(parent),
+                story_core::NodeKind::Section,
+                "Old Heading",
+                0,
+            )
+            .unwrap();
+        let child = app
+            .create_structural_node(
+                Some(section),
+                story_core::NodeKind::Section,
+                "Subsection",
+                0,
+            )
+            .unwrap();
+        let prose = app
+            .create_content_unit(
+                story_core::ContentUnitKind::SectionBody,
+                "Old Heading prose",
+                Some(section),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, hash) = app.load_content_unit_text(prose).unwrap();
+        app.save_content_unit_text(prose, Some(&hash), "Keep this prose safely.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Section { id, .. } if *id == section))
+            .unwrap();
+        state.begin_structural_node_removal(false).unwrap();
+        let dialog = state.pending_structural_node_removal.as_ref().unwrap();
+        assert!(dialog.can_promote_children);
+        assert_eq!(dialog.choice, 0);
+        state
+            .finish_structural_node_removal(dialog.clone())
+            .unwrap();
+        assert_eq!(
+            state
+                .app
+                .list_structural_nodes()
+                .unwrap()
+                .into_iter()
+                .find(|node| node.id == child)
+                .unwrap()
+                .parent_id,
+            Some(parent)
+        );
+        assert!(state.app.get_content_unit(prose).unwrap().archived);
+        assert_eq!(
+            state.app.load_content_unit_text(prose).unwrap().0,
+            "Keep this prose safely."
+        );
+        state
+            .app
+            .restore_latest_structural_removal(section)
+            .unwrap();
+        assert_eq!(
+            state
+                .app
+                .list_structural_nodes()
+                .unwrap()
+                .into_iter()
+                .find(|node| node.id == child)
+                .unwrap()
+                .parent_id,
+            Some(section)
+        );
+        assert!(!state.app.get_content_unit(prose).unwrap().archived);
+        drop(state);
+        WriterApp::open_project(&project)
+            .unwrap()
+            .validate_project()
+            .unwrap();
     }
 
     #[test]

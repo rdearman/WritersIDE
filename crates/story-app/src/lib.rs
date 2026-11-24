@@ -1061,6 +1061,9 @@ impl WriterApp {
             .store
             .remove_chapter_rehome_scenes(chapter, destination)?)
     }
+    pub fn promote_section_children(&mut self, section: NodeId) -> Result<uuid::Uuid> {
+        Ok(self.store.promote_section_children(section)?)
+    }
     pub fn restore_structural_subtree(&mut self, id: uuid::Uuid) -> Result<NodeId> {
         Ok(self.store.restore_structural_subtree(id)?)
     }

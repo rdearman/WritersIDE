@@ -63,6 +63,7 @@ const MIGRATION_46: &str = include_str!("../migrations/0046_scene_archive_status
 const MIGRATION_47: &str =
     include_str!("../migrations/0047_recoverable_structural_node_removal.sql");
 const MIGRATION_48: &str = include_str!("../migrations/0048_structural_removal_operations.sql");
+const MIGRATION_49: &str = include_str!("../migrations/0049_structural_promotion_recovery.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -100,6 +101,7 @@ type ProjectRow = (
     String,
     Option<String>,
 );
+type PromotedStructuralNode = (String, Option<String>, i64, Option<String>, i64);
 type ContentUnitJournalRow = (
     String,
     String,
@@ -1469,6 +1471,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_46}\nINSERT INTO schema_migrations(version,applied_at) VALUES(46,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_47}\nINSERT INTO schema_migrations(version,applied_at) VALUES(47,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_48}\nINSERT INTO schema_migrations(version,applied_at) VALUES(48,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_49}\nINSERT INTO schema_migrations(version,applied_at) VALUES(49,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1517,7 +1520,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 48 {
+        if version > 49 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1710,6 +1713,10 @@ impl ProjectStore {
         }
         if current_version == 47 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_48}\nINSERT INTO schema_migrations(version,applied_at) VALUES(48,'{}');\nCOMMIT;", now()))?;
+            current_version = 48;
+        }
+        if current_version == 48 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_49}\nINSERT INTO schema_migrations(version,applied_at) VALUES(49,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -4310,6 +4317,101 @@ impl ProjectStore {
         Ok(removal_id)
     }
 
+    /// Promote a section's child headings to its parent level, then archive
+    /// the removed heading and any prose it directly owns. The prose remains
+    /// intact and recoverable with the heading; child identities and their
+    /// subtrees are preserved. Promotion is one SQLite transaction.
+    pub fn promote_section_children(&mut self, section_id: NodeId) -> Result<Uuid> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (parent_id, kind, archived): (Option<String>, String, bool) = tx
+            .query_row(
+                "SELECT parent_id,kind,archived FROM structural_node WHERE id=?1",
+                [section_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(section_id.to_string()))?;
+        if kind != "section" || archived {
+            return Err(StorageError::Invalid(
+                "only an active section can promote its child headings".into(),
+            ));
+        }
+        let children: Vec<(String, i64, bool)> = {
+            let mut statement = tx.prepare(
+                "SELECT id,position,archived FROM structural_node WHERE parent_id=?1 ORDER BY position,id",
+            )?;
+            statement
+                .query_map([section_id.to_string()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        let units: Vec<(String, bool)> = {
+            let mut statement =
+                tx.prepare("SELECT id,archived FROM content_unit WHERE parent_node_id=?1")?;
+            statement
+                .query_map([section_id.to_string()], |row| {
+                    Ok((row.get(0)?, row.get(1)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        let removal_id = Uuid::new_v4();
+        tx.execute(
+            "INSERT INTO structural_removal(id,root_node_id,mode,created_at) VALUES(?1,?2,'delete_subtree',?3)",
+            params![removal_id.to_string(), section_id.to_string(), now()],
+        )?;
+        tx.execute(
+            "INSERT INTO structural_removal_node(removal_id,node_id,was_archived) VALUES(?1,?2,0)",
+            params![removal_id.to_string(), section_id.to_string()],
+        )?;
+        let next_position: i64 = match &parent_id {
+            Some(parent) => tx.query_row(
+                "SELECT COALESCE(MAX(position),-1)+1 FROM structural_node WHERE parent_id=?1",
+                [parent],
+                |row| row.get(0),
+            )?,
+            None => tx.query_row(
+                "SELECT COALESCE(MAX(position),-1)+1 FROM structural_node WHERE parent_id IS NULL",
+                [],
+                |row| row.get(0),
+            )?,
+        };
+        for (offset, (child_id, child_position, was_archived)) in children.into_iter().enumerate() {
+            let applied_position = next_position + offset as i64;
+            tx.execute(
+                "INSERT INTO structural_removal_node(removal_id,node_id,was_archived,original_parent_id,original_position,applied_parent_id,applied_position) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+                params![removal_id.to_string(),child_id,was_archived,section_id.to_string(),child_position,parent_id,applied_position],
+            )?;
+            tx.execute(
+                "UPDATE structural_node SET parent_id=?2,position=?3,updated_at=?4 WHERE id=?1",
+                params![child_id, parent_id, applied_position, now()],
+            )?;
+        }
+        for (unit_id, was_archived) in units {
+            tx.execute(
+                "INSERT INTO structural_removal_content_unit(removal_id,content_unit_id,was_archived) VALUES(?1,?2,?3)",
+                params![removal_id.to_string(), unit_id, was_archived],
+            )?;
+            if !was_archived {
+                tx.execute(
+                    "UPDATE content_unit SET archived=1,updated_at=?2 WHERE id=?1",
+                    params![unit_id, now()],
+                )?;
+            }
+        }
+        // The heading retains its original slot in Removed Documents. The
+        // promoted children are appended at the parent level, avoiding a
+        // transient uniqueness collision with the archived heading.
+        tx.execute(
+            "UPDATE structural_node SET archived=1,updated_at=?2 WHERE id=?1",
+            params![section_id.to_string(), now()],
+        )?;
+        tx.commit()?;
+        Ok(removal_id)
+    }
+
     pub fn restore_structural_subtree(&mut self, removal_id: Uuid) -> Result<NodeId> {
         let tx = self
             .conn
@@ -4350,6 +4452,40 @@ impl ProjectStore {
                     params![node, now()],
                 )?;
             }
+        }
+        let promoted_nodes: Vec<PromotedStructuralNode> = {
+            let mut statement = tx.prepare(
+                "SELECT node_id,original_parent_id,original_position,applied_parent_id,applied_position FROM structural_removal_node WHERE removal_id=?1 AND applied_position IS NOT NULL ORDER BY original_position,node_id",
+            )?;
+            statement
+                .query_map([removal_id.to_string()], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for (node_id, original_parent, original_position, applied_parent, applied_position) in
+            promoted_nodes
+        {
+            let current: (Option<String>, i64) = tx.query_row(
+                "SELECT parent_id,position FROM structural_node WHERE id=?1",
+                [&node_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if current != (applied_parent.clone(), applied_position) {
+                return Err(StorageError::RecoveryConflict(format!(
+                    "cannot restore removed section because promoted heading {node_id} has since moved"
+                )));
+            }
+            tx.execute(
+                "UPDATE structural_node SET parent_id=?2,position=?3,updated_at=?4 WHERE id=?1",
+                params![node_id, original_parent, original_position, now()],
+            )?;
         }
         let scenes: Vec<StructuralRemovalScene> = {
             let mut statement = tx.prepare(
@@ -11115,7 +11251,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 48);
+        assert_eq!(version, 49);
     }
     #[test]
     fn event_character_and_location_relationships_are_typed_atomic_and_persistent() {
@@ -11174,7 +11310,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 48);
+        assert_eq!(schema_version, 49);
     }
     #[test]
     fn writing_challenges_are_validated_persisted_and_completed_once() {
@@ -13028,7 +13164,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 48))
+            .map(|version| assert_eq!(version, 49))
             .unwrap();
     }
 
@@ -13449,7 +13585,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 48);
+        assert_eq!(version, 49);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -15203,6 +15339,125 @@ mod tests {
     }
 
     #[test]
+    fn section_promotion_preserves_children_and_recovers_owned_prose_after_reopen() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let parent = store
+            .create_node(None, NodeKind::Section, "Part One", 0)
+            .unwrap();
+        let removed = store
+            .create_node(Some(parent), NodeKind::Section, "Old Heading", 0)
+            .unwrap();
+        let first = store
+            .create_node(Some(removed), NodeKind::Section, "First subsection", 0)
+            .unwrap();
+        let second = store
+            .create_node(Some(removed), NodeKind::Section, "Second subsection", 1)
+            .unwrap();
+        let prose = store
+            .create_content_unit(
+                ContentUnitKind::SectionBody,
+                "Old Heading prose",
+                Some(removed),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, hash) = store.load_content_unit_text(prose).unwrap();
+        store
+            .save_content_unit_text(prose, Some(&hash), "This prose stays recoverable.")
+            .unwrap();
+
+        let removal = store.promote_section_children(removed).unwrap();
+        let active = store.list_structural_nodes().unwrap();
+        let promoted: Vec<_> = active
+            .iter()
+            .filter(|node| node.parent_id == Some(parent))
+            .map(|node| node.id)
+            .collect();
+        assert_eq!(promoted, vec![first, second]);
+        assert!(!active.iter().any(|node| node.id == removed));
+        assert!(store.get_content_unit(prose).unwrap().archived);
+        drop(store);
+
+        let mut reopened = ProjectStore::open(&project).unwrap();
+        reopened.restore_structural_subtree(removal).unwrap();
+        let active = reopened.list_structural_nodes().unwrap();
+        assert_eq!(
+            active
+                .iter()
+                .find(|node| node.id == removed)
+                .unwrap()
+                .position,
+            0
+        );
+        assert_eq!(
+            active
+                .iter()
+                .find(|node| node.id == first)
+                .unwrap()
+                .parent_id,
+            Some(removed)
+        );
+        assert_eq!(
+            active
+                .iter()
+                .find(|node| node.id == second)
+                .unwrap()
+                .parent_id,
+            Some(removed)
+        );
+        assert_eq!(
+            reopened.get_content_unit(prose).unwrap().parent_id,
+            Some(removed)
+        );
+        assert_eq!(
+            reopened.load_content_unit_text(prose).unwrap().0,
+            "This prose stays recoverable."
+        );
+        reopened.validate().unwrap();
+    }
+
+    #[test]
+    fn section_promotion_restore_refuses_to_overwrite_a_later_child_move() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let parent = store
+            .create_node(None, NodeKind::Section, "Part One", 0)
+            .unwrap();
+        let removed = store
+            .create_node(Some(parent), NodeKind::Section, "Removed", 0)
+            .unwrap();
+        let child = store
+            .create_node(Some(removed), NodeKind::Section, "Promoted", 0)
+            .unwrap();
+        let other_parent = store
+            .create_node(None, NodeKind::Section, "Part Two", 1)
+            .unwrap();
+        let removal = store.promote_section_children(removed).unwrap();
+        store.move_node(child, Some(other_parent), 0).unwrap();
+        assert!(store.restore_structural_subtree(removal).is_err());
+        assert!(
+            store
+                .list_structural_nodes()
+                .unwrap()
+                .iter()
+                .find(|node| node.id == child)
+                .is_some_and(|node| node.parent_id == Some(other_parent))
+        );
+        assert!(
+            !store
+                .list_structural_nodes()
+                .unwrap()
+                .iter()
+                .any(|node| node.id == removed)
+        );
+        assert!(store.validate().is_ok());
+    }
+
+    #[test]
     fn populated_structural_subtree_deletion_recovers_all_documents_after_reopen() {
         let directory = tempdir().unwrap();
         let project = directory.path().join("Book");
@@ -15445,6 +15700,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 48);
+        assert_eq!(version, 49);
     }
 }
