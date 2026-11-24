@@ -199,6 +199,8 @@ struct StructuralNodeRemovalDialog {
     descendant_nodes: u32,
     scene_count: u32,
     scene_words: u64,
+    included_scene_count: u32,
+    excluded_scene_count: u32,
     content_unit_count: u32,
     content_unit_words: u64,
     can_rehome_scenes: bool,
@@ -10778,6 +10780,20 @@ impl AppState {
                     .is_some_and(|chapter| subtree_chapters.contains(&chapter))
             })
             .collect();
+        let mut included_scene_count = 0;
+        let mut excluded_scene_count = 0;
+        for scene in &scenes {
+            // Archived scenes are already outside the active manuscript and
+            // should not be presented as a change to current Compile output.
+            if scene.scene.archived {
+                continue;
+            }
+            if self.app.scene_is_included(scene.scene.id)? {
+                included_scene_count += 1;
+            } else {
+                excluded_scene_count += 1;
+            }
+        }
         let units: Vec<_> = self
             .app
             .list_content_units(true)?
@@ -10828,6 +10844,8 @@ impl AppState {
                 .iter()
                 .map(|scene| u64::from(scene.actual_words))
                 .sum(),
+            included_scene_count,
+            excluded_scene_count,
             content_unit_count: units.len() as u32,
             content_unit_words: units.iter().map(|unit| u64::from(unit.actual_words)).sum(),
             can_rehome_scenes,
@@ -24491,7 +24509,11 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
     };
     let area = f.area();
     let width = area.width.saturating_sub(4).clamp(1, 78);
-    let height = 10.min(area.height.max(1));
+    // The lifecycle dialogue includes both the object counts and the compile
+    // consequences. Keep enough room for wrapped text at the standard 80x24
+    // terminal size so the final action instructions cannot disappear below
+    // the border.
+    let height = 16.min(area.height.max(1));
     let rect = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -24519,6 +24541,12 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
             dialog.content_unit_count,
             dialog.content_unit_words
         )));
+        if dialog.scene_count > 0 {
+            lines.push(Line::from(format!(
+                "Compile impact: {} included, {} excluded scene(s).",
+                dialog.included_scene_count, dialog.excluded_scene_count
+            )));
+        }
         if dialog.descendant_nodes > 0 {
             lines.push(Line::from(format!(
                 "Also contains {} subordinate heading(s).",
@@ -24557,6 +24585,11 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
                     "Unplaced scenes are omitted from Compile. Delete retains the full subtree in Removed Documents."
                 },
             ));
+            lines.push(Line::from(match dialog.choice {
+                0 => "Compile: included scenes become Unplaced and are omitted until placed in a chapter.",
+                1 => "Compile: included scenes append to the selected chapter in their current order.",
+                _ => "Compile: removed scenes and chapter prose are omitted; the removal can be restored.",
+            }));
             lines.push(Line::from(
                 "Up/Down choose · Left/Right destination · Enter confirm · Esc cancel",
             ));
@@ -24588,6 +24621,11 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
             lines.push(Line::from(
                 "Child order and IDs are preserved. The removed heading and its prose remain recoverable in Removed Documents.",
             ));
+            lines.push(Line::from(match dialog.choice {
+                0 => "Compile order may change as child headings move to the current parent level.",
+                1 => "Compile order may change as child headings move to the selected section.",
+                _ => "Compile: this subtree and its prose are omitted until restored.",
+            }));
             lines.push(Line::from(
                 "Up/Down choose · Left/Right destination · Enter confirm · Esc cancel",
             ));
@@ -42081,6 +42119,55 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "Retained manuscript text."
         );
+    }
+
+    #[test]
+    fn chapter_removal_dialog_previews_compile_impact_and_actions_at_80x24() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut app = WriterApp::create_project(&project, "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let included = app.create_scene(chapter, "Included scene", 0).unwrap();
+        let excluded = app.create_scene(chapter, "Excluded scene", 1).unwrap();
+        app.set_scene_included(excluded, false).unwrap();
+
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+            .unwrap();
+        state.begin_structural_node_removal(false).unwrap();
+        let dialog = state.pending_structural_node_removal.as_ref().unwrap();
+        assert_eq!(dialog.scene_count, 2);
+        assert_eq!(dialog.included_scene_count, 1);
+        assert_eq!(dialog.excluded_scene_count, 1);
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|frame| draw_structural_node_removal_overlay(frame, &state))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("2 scene(s)"), "{rendered:?}");
+        assert!(
+            rendered.contains("Compile impact: 1 included, 1 excluded scene(s)."),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("Move scenes to Unplaced"), "{rendered:?}");
+        assert!(
+            rendered.contains("omitted until placed in a"),
+            "{rendered:?}"
+        );
+        assert!(rendered.contains("Enter confirm"), "{rendered:?}");
+        assert!(state.app.get_scene(included).is_ok());
     }
 
     #[test]
