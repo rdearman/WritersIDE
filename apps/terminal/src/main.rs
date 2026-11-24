@@ -807,14 +807,16 @@ const MENU_COMMON_COMMANDS: [&[&str]; 9] = [
         "scene.status",
         "scene.move",
         "scene.toggle-inclusion",
-        "scene.field",
         "comment.create",
+        "outline.move-up",
+        "outline.move-down",
     ],
     &[
         "structure.section",
         "structure.chapter",
         "scene.create",
         "document.new-content-unit",
+        "document.write-selected-chapter",
         "link.create",
         "link.delete",
         "edit.snippet-insert",
@@ -1326,6 +1328,8 @@ enum CommandAction {
     ToggleFormattingMarks,
     ToggleSceneInclusion,
     WriteSelectedChapter,
+    MoveOutlineUp,
+    MoveOutlineDown,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2119,7 +2123,7 @@ fn command_registry() -> Vec<CommandSpec> {
             id: "document.write-selected-chapter",
             label: "Write Selected Chapter",
             description: "Open or create direct chapter prose without requiring scenes",
-            category: "Edit",
+            category: "Insert",
             default_shortcuts: &[],
             mnemonic: None,
             palette_aliases: &[],
@@ -2128,6 +2132,36 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::WriteSelectedChapter,
             task_group: "",
             menu_priority: 15,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "outline.move-up",
+            label: "Move Outline Item Up",
+            description: "Move the selected chapter or section before its sibling",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &[],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::MoveOutlineUp,
+            task_group: "",
+            menu_priority: 16,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "outline.move-down",
+            label: "Move Outline Item Down",
+            description: "Move the selected chapter or section after its sibling",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &[],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::MoveOutlineDown,
+            task_group: "",
+            menu_priority: 17,
             advanced: false,
         },
         legacy_command(
@@ -3948,7 +3982,10 @@ fn menu_category(spec: &CommandSpec) -> &'static str {
         || id.starts_with("link.")
     {
         "Insert"
-    } else if matches!(id, "search.find-panel" | "search.replace-panel") {
+    } else if matches!(
+        id,
+        "search.find-panel" | "search.replace-panel" | "outline.move-up" | "outline.move-down"
+    ) {
         "Edit"
     } else if spec.category == "View"
         || id.starts_with("view.")
@@ -9912,6 +9949,59 @@ impl AppState {
         self.open_content_unit(unit)?;
         Ok(())
     }
+    fn outline_move_destination(
+        &self,
+        move_down: bool,
+    ) -> Option<(story_core::NodeId, Option<story_core::NodeId>, u32)> {
+        if self.workspace != Workspace::Outline {
+            return None;
+        }
+        let node_id = match outline_rows(self).get(self.selected)? {
+            OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } => *id,
+            _ => return None,
+        };
+        let nodes = self.app.list_structural_nodes().ok()?;
+        let node = nodes.iter().find(|node| node.id == node_id)?;
+        let mut siblings = nodes
+            .iter()
+            .filter(|sibling| sibling.parent_id == node.parent_id && sibling.kind == node.kind)
+            .collect::<Vec<_>>();
+        siblings.sort_by_key(|sibling| sibling.position);
+        let index = siblings.iter().position(|sibling| sibling.id == node_id)?;
+        let destination_index = if move_down {
+            index.checked_add(1)?
+        } else {
+            index.checked_sub(1)?
+        };
+        Some((
+            node_id,
+            node.parent_id,
+            siblings.get(destination_index)?.position,
+        ))
+    }
+    fn move_selected_outline_item(
+        &mut self,
+        move_down: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some((node, parent, position)) = self.outline_move_destination(move_down) else {
+            self.message = "No chapter or section sibling in that direction".into();
+            return Ok(());
+        };
+        self.app.move_structural_node(node, parent, position)?;
+        self.refresh()?;
+        self.selected = outline_rows(self)
+            .iter()
+            .position(|row| {
+                matches!(row, OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } if *id == node)
+            })
+            .unwrap_or(0);
+        self.message = if move_down {
+            "Outline item moved down".into()
+        } else {
+            "Outline item moved up".into()
+        };
+        Ok(())
+    }
     fn open_content_unit(
         &mut self,
         id: story_core::ContentUnitId,
@@ -10770,6 +10860,12 @@ impl AppState {
             {
                 Some("Select a chapter in Outline first")
             }
+            CommandAction::MoveOutlineUp if self.outline_move_destination(false).is_none() => {
+                Some("Select a chapter or section with a sibling above")
+            }
+            CommandAction::MoveOutlineDown if self.outline_move_destination(true).is_none() => {
+                Some("Select a chapter or section with a sibling below")
+            }
             CommandAction::ResolveSaveConflict if !self.dirty => {
                 Some("There are no unsaved manuscript changes to resolve")
             }
@@ -11579,6 +11675,8 @@ impl AppState {
             }
             CommandAction::ToggleSceneInclusion => self.toggle_scene_card_inclusion()?,
             CommandAction::WriteSelectedChapter => self.write_selected_chapter()?,
+            CommandAction::MoveOutlineUp => self.move_selected_outline_item(false)?,
+            CommandAction::MoveOutlineDown => self.move_selected_outline_item(true)?,
             CommandAction::Save => self.save()?,
             CommandAction::RequestQuit => self.request_quit(),
             CommandAction::Help => {
@@ -18859,7 +18957,7 @@ fn workspace_action_hint(workspace: Workspace) -> &'static str {
             "Insert: New Scene · ↑/↓ select · Ctrl+↑/↓ reorder · Space include/exclude · Enter open · Edit > Move Scene chooses a chapter"
         }
         Workspace::Outline => {
-            "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section · Edit > Write Selected Chapter"
+            "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Move Item Up/Down"
         }
         Workspace::Editor => "Esc: Outline",
         _ => "Tab: next primary view · Shift+Tab: previous",
@@ -26757,7 +26855,7 @@ mod tests {
         assert_eq!(detail_panel_title(&state), "Selected outline item");
         assert_eq!(
             workspace_action_hint(state.workspace),
-            "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section · Edit > Write Selected Chapter"
+            "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Move Item Up/Down"
         );
 
         state.workspace = Workspace::StoryBible;
@@ -27289,6 +27387,102 @@ mod tests {
             OutlineRow::Chapter { id, .. } if *id == chapter.id
         )));
         assert!(state.app.list_scenes(false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn nonfiction_outline_reorders_chapters_through_visible_edit_menu_actions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project_with_type(
+            root.path().join("Book"),
+            "Book",
+            story_core::BookType::Nonfiction,
+        )
+        .unwrap();
+        let section = app.create_section("Part One", 0).unwrap();
+        let first = app.create_chapter(Some(section), "First", 0).unwrap();
+        let second = app.create_chapter(Some(section), "Second", 1).unwrap();
+        let prose = app
+            .create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "First prose",
+                Some(first),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, hash) = app.load_content_unit_text(prose).unwrap();
+        app.save_content_unit_text(prose, Some(&hash), "Prose follows the chapter.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        let rows = outline_rows(&state);
+        state.selected = rows
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == first))
+            .unwrap();
+
+        let edit_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Edit")
+            .unwrap();
+        state.menu = Some(MenuState {
+            top: edit_menu,
+            selected: 0,
+            all_commands: false,
+        });
+        let visible = state
+            .menu_visible_entries()
+            .into_iter()
+            .map(|command| command.id)
+            .collect::<Vec<_>>();
+        assert!(visible.contains(&"outline.move-up"));
+        assert!(visible.contains(&"outline.move-down"));
+        state.menu = None;
+        state
+            .dispatch_registered_command_id("outline.move-down")
+            .unwrap();
+
+        let mut siblings = state
+            .app
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|node| node.parent_id == Some(section) && node.kind == "chapter")
+            .collect::<Vec<_>>();
+        siblings.sort_by_key(|node| node.position);
+        assert_eq!(
+            siblings.iter().map(|node| node.id).collect::<Vec<_>>(),
+            [second, first]
+        );
+        assert_eq!(
+            state.app.load_content_unit_text(prose).unwrap().0,
+            "Prose follows the chapter."
+        );
+        assert_eq!(state.app.list_scenes(false).unwrap().len(), 0);
+        assert!(
+            state
+                .command_disabled_reason(command_by_id("outline.move-down").unwrap())
+                .is_some()
+        );
+
+        state.save_session().unwrap();
+        drop(state);
+        let reopened = WriterApp::open_project(root.path().join("Book")).unwrap();
+        let mut siblings = reopened
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|node| node.parent_id == Some(section) && node.kind == "chapter")
+            .collect::<Vec<_>>();
+        siblings.sort_by_key(|node| node.position);
+        assert_eq!(
+            siblings.iter().map(|node| node.id).collect::<Vec<_>>(),
+            [second, first]
+        );
+        assert_eq!(
+            reopened.load_content_unit_text(prose).unwrap().0,
+            "Prose follows the chapter."
+        );
     }
 
     #[test]

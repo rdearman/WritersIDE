@@ -357,3 +357,7 @@ New Project requires an explicit Fiction or Non-fiction choice in the terminal p
 ## First launch without a project argument
 
 Running the terminal application without a project path creates a temporary startup project under the system temporary directory and opens the New Project browser. The temporary startup project is removed on exit and is not added to recent-project history. Supplying a project path retains the normal project-opening behavior. This avoids requiring a raw command-line path or leaving a hidden sample project in the user's home directory.
+
+## Non-fiction outline reordering
+
+The terminal Edit menu provides Move Outline Item Up and Move Outline Item Down for a selected section or chapter with a sibling in that direction. Reordering is transactional, preserves stable identifiers and attached direct prose, and remains independent from story chronology. The commands are disabled when no valid adjacent sibling exists. Moving a chapter between sections is not part of these one-step reorder commands.
