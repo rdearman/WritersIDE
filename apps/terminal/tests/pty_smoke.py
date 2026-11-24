@@ -26,6 +26,7 @@ def main():
     create_fiction = modes == ["create-fiction"]
     previous_position = modes == ["previous-position"]
     removal_dialogs = modes == ["removal-dialogs"]
+    chapter_creation = modes == ["chapter-creation"]
     chapter_removal = modes in (
         ["chapter-removal"],
         ["chapter-removal-target"],
@@ -99,6 +100,60 @@ def main():
 
     try:
         read_for(1.0)
+        if chapter_creation:
+            os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
+            read_for(0.3)
+
+            # Navigate > Scene Cards using the visible F10 menu.
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 2 + b"\r")
+            if not wait_for_fragments((b"Included", b"Excluded"), timeout=3.0):
+                raise AssertionError(
+                    "Navigate > Scene Cards did not open before chapter creation; output tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+
+            def create_chapter(title):
+                menu_start = len(output)
+                os.write(master, b"\x1b[21~")  # F10
+                read_for(0.15)
+                os.write(master, b"\x1b[C" * 2)  # Insert menu
+                read_for(0.15)
+                os.write(master, b"\x1b[B\r")  # New Chapter
+                if not wait_for_fragments((b":chapter_",), menu_start, timeout=3.0):
+                    raise AssertionError(
+                        "Insert > New Chapter did not open its title prompt; output tail: "
+                        + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                    )
+                prompt_start = len(output)
+                os.write(master, title.encode("utf-8") + b"\r")
+                if not wait_for_fragments(
+                    (b"\xe2\x94\x80\xe2\x94\x80 " + title.encode("utf-8")),
+                    prompt_start,
+                    timeout=3.0,
+                ):
+                    raise AssertionError(
+                        f"created chapter {title!r} was not confirmed in Scene Cards; output tail: "
+                        + repr(ANSI_CONTROL.sub(b"", output[prompt_start:]))
+                    )
+
+            create_chapter("Alpha")
+            create_chapter("Beta")
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after creating chapters")
+            print(
+                "PTY chapter-creation workflow passed: Insert > New Chapter displays and persists multiple empty chapters."
+            )
+            return
+
         if create_fiction:
             startup_deadline = time.monotonic() + 5.0
             while (
