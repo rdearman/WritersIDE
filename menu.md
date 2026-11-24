@@ -26,6 +26,8 @@ On a normal launch without a project argument, the start screen offers **New Pro
 - Quit
 - Search All Commands…
 
+When the Series Books workspace is active, File also offers **Remove Selected Book from Series…** and **Show Removed Books**. The Removed Books view offers **Restore Selected Book to Series**. These actions are hidden elsewhere so the general File menu stays compact.
+
 ## Edit
 
 - Find in Manuscript

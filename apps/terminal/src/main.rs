@@ -12305,6 +12305,19 @@ impl AppState {
                     .copied()
             })
             .collect::<Vec<_>>();
+        let in_series_books = self.workspace == Workspace::Series
+            && !self.series_reference_view
+            && !self.series_removed_books_view
+            && self.scrivener_import.is_none();
+        let in_removed_series_books = self.workspace == Workspace::Series
+            && self.series_removed_books_view
+            && self.scrivener_import.is_none();
+        direct.retain(|command| match command.id {
+            "series.remove-selected-book" => in_series_books,
+            "series.removed-books" => in_series_books,
+            "series.restore-selected-book" => in_removed_series_books,
+            _ => true,
+        });
         if top != "Tools"
             && top != "Help"
             && let Some(search) = commands
@@ -31187,7 +31200,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(file_actions.contains(&"series.remove-selected-book"));
         assert!(file_actions.contains(&"series.removed-books"));
-        assert!(file_actions.contains(&"series.restore-selected-book"));
+        assert!(!file_actions.contains(&"series.restore-selected-book"));
         state.menu = None;
         state
             .execute_legacy_palette_command("series-remove-selected-book")
@@ -31209,6 +31222,18 @@ mod tests {
             "The opening remains safe."
         );
         assert!(workspace_items(&state)[0].contains("project retained"));
+        state.menu = Some(MenuState {
+            top: file_menu,
+            selected: 0,
+        });
+        let removed_file_actions = state
+            .menu_visible_entries()
+            .into_iter()
+            .map(|command| command.id)
+            .collect::<Vec<_>>();
+        assert!(!removed_file_actions.contains(&"series.remove-selected-book"));
+        assert!(removed_file_actions.contains(&"series.restore-selected-book"));
+        state.menu = None;
 
         state
             .execute_legacy_palette_command("series-restore-selected-book")
@@ -40761,7 +40786,18 @@ mod tests {
             state.menu = Some(MenuState { top, selected: 0 });
             let entries = state.menu_visible_entries();
             let ids = entries.iter().map(|command| command.id).collect::<Vec<_>>();
-            let mut expected = MENU_COMMON_COMMANDS[top].to_vec();
+            let mut expected = MENU_COMMON_COMMANDS[top]
+                .iter()
+                .copied()
+                .filter(|id| {
+                    !matches!(
+                        *id,
+                        "series.remove-selected-book"
+                            | "series.removed-books"
+                            | "series.restore-selected-book"
+                    )
+                })
+                .collect::<Vec<_>>();
             if top != SCENE_MENU_INDEX && category != &"Tools" && category != &"Help" {
                 expected.push("command.palette-open");
             }
