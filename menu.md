@@ -28,7 +28,7 @@ On a normal launch without a project argument, the start screen offers **New Pro
 - Find and Replace
 - Rename Scene
 - Set Scene Status
-- Move Scene
+- Move Scene to Chapter…
 - Move Scene Between Included and Excluded
 - Comment on Selection
 - Move Outline Item Up
@@ -116,6 +116,9 @@ On a normal launch without a project argument, the start screen offers **New Pro
 The Scene menu appears only while Scene Cards is active; Publish is available
 from manuscript workspaces and command search. The Scene Cards footer shows the
 effective Include / Exclude shortcut (Space by default).
+Use Up/Down to select a card and Left/Right to reorder it, including across a
+chapter boundary. The Scene menu provides the chapter chooser; Up/Down chooses
+the destination, Enter moves, and Esc cancels.
 
 On a temporary start project, **Save Project** opens the Save Project As
 dialogue. The footer shows **[TEMPORARY]** until a permanent project folder has
