@@ -4,11 +4,17 @@
 import fcntl
 import os
 import pty
+import re
 import select
 import signal
 import struct
 import sys
 import time
+
+
+ANSI_CONTROL = re.compile(
+    rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
+)
 
 
 def set_size(fd, rows, columns):
@@ -63,6 +69,25 @@ def main():
                 # cursor location. A real emulator replies to this request.
                 os.write(master, b"\x1b[1;1R")
 
+    def wait_for(marker, start=0, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while (
+            marker not in ANSI_CONTROL.sub(b"", output[start:])
+            and time.monotonic() < deadline
+        ):
+            read_for(0.1)
+        return marker in ANSI_CONTROL.sub(b"", output[start:])
+
+    def wait_for_fragments(markers, start=0, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            visible = ANSI_CONTROL.sub(b"", output[start:])
+            if all(marker in visible for marker in markers):
+                return True
+            read_for(0.1)
+        visible = ANSI_CONTROL.sub(b"", output[start:])
+        return all(marker in visible for marker in markers)
+
     try:
         read_for(1.0)
         if create_fiction:
@@ -100,16 +125,12 @@ def main():
             os.write(master, b"\r")  # Open the selected scene
             read_for(0.4)
             os.write(master, b"First passage.")
-            read_for(0.15)
+            edit_start = len(output)
+            if not wait_for(b"[UNSAVED]", edit_start):
+                raise AssertionError("typed passage did not produce visible unsaved feedback")
             save_request_offset = len(output)
             os.write(master, b"\x13")  # Ctrl+S
-            save_deadline = time.monotonic() + 5.0
-            while (
-                b"[SAVED]" not in output[save_request_offset:]
-                and time.monotonic() < save_deadline
-            ):
-                read_for(0.1)
-            if b"[SAVED]" not in output[save_request_offset:]:
+            if not wait_for(b"[SAVED]", save_request_offset):
                 raise AssertionError("Ctrl+S did not produce visible saved feedback")
             os.write(master, b"\x11")  # Ctrl+Q
             quit_deadline = time.monotonic() + 5.0
@@ -145,16 +166,16 @@ def main():
         if previous_position:
             # F10 opens File; three Right presses select Navigate. Its sixth
             # entry is Return to Previous Position.
+            status_start = len(output)
             os.write(master, b"\x1b[21~")
             read_for(0.2)
             os.write(master, b"\x1b[C" * 3)
             read_for(0.3)
             os.write(master, b"\x1b[B" * 5 + b"\r")
-            read_for(0.5)
-            if (
-                b"No" not in output
-                or b"previous" not in output
-                or b"manuscript" not in output
+            if not wait_for_fragments(
+                (b"No", b"previous", b"manuscript", b"position"),
+                status_start,
+                timeout=3.0,
             ):
                 raise AssertionError(
                     "empty Previous Position did not report a nonfatal status; output tail: "
