@@ -10,11 +10,100 @@ import signal
 import struct
 import sys
 import time
+import unicodedata
 
 
 ANSI_CONTROL = re.compile(
     rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
 )
+CSI = re.compile(r"\x1b\[([0-?]*)([ -/]*)?([@-~])")
+
+
+def terminal_snapshot(data, rows, columns):
+    """Apply the cursor/clear controls Ratatui uses and return visible rows."""
+    cells = [[" "] * columns for _ in range(rows)]
+    row = column = 0
+    text = data.decode("utf-8", errors="replace")
+    index = 0
+    while index < len(text):
+        character = text[index]
+        if character == "\x1b":
+            if text.startswith("\x1b]", index):
+                end = text.find("\x07", index + 2)
+                string_end = text.find("\x1b\\", index + 2)
+                ends = [position for position in (end, string_end) if position >= 0]
+                if ends:
+                    terminator = min(ends)
+                    index = terminator + (2 if terminator == string_end else 1)
+                else:
+                    index = len(text)
+                continue
+            match = CSI.match(text, index)
+            if match:
+                parameters, _, final = match.groups()
+                values = [int(value) for value in re.findall(r"\d+", parameters)]
+                first = values[0] if values else 0
+                if final in ("H", "f"):
+                    row = max(0, (values[0] if values and values[0] else 1) - 1)
+                    column = max(0, (values[1] if len(values) > 1 and values[1] else 1) - 1)
+                elif final == "A":
+                    row = max(0, row - (first or 1))
+                elif final == "B":
+                    row = min(rows - 1, row + (first or 1))
+                elif final == "C":
+                    column = min(columns - 1, column + (first or 1))
+                elif final == "D":
+                    column = max(0, column - (first or 1))
+                elif final == "G":
+                    column = max(0, (first or 1) - 1)
+                elif final == "d":
+                    row = max(0, (first or 1) - 1)
+                elif final == "J" and first in (0, 2, 3):
+                    if first == 2 or first == 3:
+                        cells = [[" "] * columns for _ in range(rows)]
+                        row = column = 0
+                    else:
+                        for clear_row in range(row, rows):
+                            start = column if clear_row == row else 0
+                            cells[clear_row][start:] = [" "] * (columns - start)
+                elif final == "K":
+                    start = column if first == 0 else 0
+                    end = columns if first in (0, 2) else column + 1
+                    cells[row][start:end] = [" "] * max(0, end - start)
+                index = match.end()
+                continue
+            index += 1
+            continue
+        if character == "\r":
+            column = 0
+        elif character == "\n":
+            row = min(rows - 1, row + 1)
+        elif character == "\b":
+            column = max(0, column - 1)
+        elif character >= " " and character != "\x7f" and row < rows and column < columns:
+            width = (
+                0
+                if unicodedata.combining(character)
+                else (2 if unicodedata.east_asian_width(character) in "WF" else 1)
+            )
+            if width:
+                cells[row][column] = character
+                if width == 2 and column + 1 < columns:
+                    cells[row][column + 1] = " "
+                column += width
+            elif column:
+                cells[row][column - 1] += character
+        index += 1
+    return ["".join(line).rstrip() for line in cells]
+
+
+def assert_visible_sentence(data, rows, columns, sentence, context):
+    screen = terminal_snapshot(data, rows, columns)
+    if not any(sentence in line for line in screen):
+        raise AssertionError(
+            f"{context}: expected contiguous prose was absent from the rendered screen; "
+            f"screen rows: {screen!r}"
+        )
 
 
 def set_size(fd, rows, columns):
@@ -311,6 +400,14 @@ def main():
         # Skip choice so the test follows the discoverable onboarding route.
         os.write(master, b"\x1b")  # use the welcome screen's visible Skip key
         read_for(0.4)
+        if not modes:
+            assert_visible_sentence(
+                output,
+                24,
+                80,
+                "The opening paragraph remains readable.",
+                "initial 80x24 screen",
+            )
         if not section_removal_delete and b"Arrival" not in output:
             raise AssertionError(
                 "the opening scene was not rendered in the PTY; output tail: "
@@ -574,8 +671,10 @@ def main():
 
         # Exercise the actual F10 route instead of calling AppState handlers
         # directly.
+        menu_start = len(output)
         os.write(master, b"\x1b[21~")  # xterm F10
-        read_for(0.5)
+        if not wait_for(b"Quit", menu_start, timeout=3.0):
+            raise AssertionError("F10 menu did not remain responsive")
         # Ratatui emits cursor moves between spans, so inspect two distinctive
         # action labels instead of expecting the rendered line contiguously.
         if b"Recent" not in output or b"Quit" not in output:
@@ -583,11 +682,38 @@ def main():
                 "F10 did not render the direct File menu in the PTY; output tail: "
                 + repr(bytes(output[-2400:]))
             )
+        if b"Commands: section TITLE" in ANSI_CONTROL.sub(b"", output):
+            raise AssertionError("internal command registry leaked into the terminal UI")
 
-        set_size(master, 60, 201)
-        read_for(0.4)
         os.write(master, b"\x1b")  # close menu
         read_for(0.3)
+        if b"Commands: section TITLE" in ANSI_CONTROL.sub(b"", output):
+            raise AssertionError("internal command registry appeared after closing the menu")
+        assert_visible_sentence(
+            output,
+            24,
+            80,
+            "The opening paragraph remains readable.",
+            "screen after closing menu",
+        )
+        set_size(master, 60, 201)
+        read_for(0.4)
+        assert_visible_sentence(
+            output,
+            60,
+            201,
+            "The opening paragraph remains readable.",
+            "resized 201x60 screen",
+        )
+        set_size(master, 24, 80)
+        read_for(0.4)
+        assert_visible_sentence(
+            output,
+            24,
+            80,
+            "The opening paragraph remains readable.",
+            "resized-back 80x24 screen",
+        )
         os.write(master, b"\x11")  # Ctrl+Q
         quit_deadline = time.monotonic() + 5.0
         finished_pid = 0
