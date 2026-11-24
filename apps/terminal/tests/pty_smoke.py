@@ -345,11 +345,16 @@ def main():
         if removal_dialogs:
             # Navigate to Scene Cards through the actual menu and open its
             # recoverable removal dialogue with the list Delete key.
+            scene_workspace_start = len(output)
             os.write(master, b"\x1b[21~")
             read_for(0.2)
             os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 2 + b"\r")
-            if not wait_for(b"Scene Cards", timeout=3.0):
+            if not wait_for_fragments(
+                (b"Included", b"Arrival"), scene_workspace_start, timeout=3.0
+            ):
                 raise AssertionError("Navigate > Scene Cards did not open the card list")
+            os.write(master, b"\x1b[B")  # move from the chapter boundary onto its scene card
+            read_for(0.2)
             scene_dialog_start = len(output)
             os.write(master, b"\x1b[3~")  # Delete
             if not wait_for_fragments(
@@ -366,10 +371,15 @@ def main():
 
             # Navigate to Reference Library and verify it has its own
             # read-only-source-aware confirmation.
+            reference_workspace_start = len(output)
             os.write(master, b"\x1b[21~")
             read_for(0.2)
             os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 3 + b"\r")
-            if not wait_for_fragments((b"Field", b"Notes", b"ReferenceLibrary"), timeout=3.0):
+            if not wait_for_fragments(
+                (b"Field", b"Notes", b"ReferenceLibrary"),
+                reference_workspace_start,
+                timeout=3.0,
+            ):
                 raise AssertionError(
                     "Navigate > Reference did not open the imported reference list; visible output tail: "
                     + repr(ANSI_CONTROL.sub(b"", output[-2600:]))

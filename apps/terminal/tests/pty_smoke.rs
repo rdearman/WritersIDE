@@ -375,7 +375,7 @@ fn populated_chapter_subtree_deletion_is_recoverable_through_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
-    use story_core::ContentUnitKind;
+    use story_core::{ContentUnitKind, ParticipationRole, ScenePlotline, WordAttributionPolicy};
     use story_document::CompileFormat;
 
     let root = tempfile::tempdir().unwrap();
@@ -386,6 +386,22 @@ fn populated_chapter_subtree_deletion_is_recoverable_through_a_real_pty() {
     let (_, hash) = app.load_scene_text(scene).unwrap();
     app.save_scene_text(scene, Some(&hash), "The traveler arrives.")
         .unwrap();
+    let character = app.create_character("Mara").unwrap();
+    app.link_character(scene, character, ParticipationRole::Major)
+        .unwrap();
+    let plotline = app.create_plotline("The journey").unwrap();
+    app.set_scene_plotlines(
+        scene,
+        &[ScenePlotline {
+            plotline_id: plotline,
+            role: "advances".into(),
+            share_basis_points: None,
+        }],
+        WordAttributionPolicy::Overlap,
+    )
+    .unwrap();
+    let event = app.add_event("Arrival", "day 1").unwrap();
+    app.link_event(scene, event, "depicts").unwrap();
     let prose = app
         .create_content_unit(
             ContentUnitKind::ChapterBody,
@@ -450,6 +466,18 @@ fn populated_chapter_subtree_deletion_is_recoverable_through_a_real_pty() {
     assert_eq!(
         reopened.load_content_unit_text(prose).unwrap().0,
         "A chapter introduction."
+    );
+    assert_eq!(
+        reopened.scene_character_analytics(scene).unwrap(),
+        vec![(character.to_string(), "Mara".into(), "major".into())]
+    );
+    assert_eq!(
+        reopened.scene_plotline_links(scene).unwrap()[0].plotline_id,
+        plotline
+    );
+    assert_eq!(
+        reopened.scene_event_links(scene).unwrap(),
+        vec![(event, "depicts".into())]
     );
 }
 
