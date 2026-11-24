@@ -89,7 +89,10 @@ def terminal_snapshot(data, rows, columns):
             if width:
                 cells[row][column] = character
                 if width == 2 and column + 1 < columns:
-                    cells[row][column + 1] = " "
+                    # A wide glyph occupies both cells; the continuation
+                    # cell contributes no extra character when rows are
+                    # reconstructed for text-contiguity assertions.
+                    cells[row][column + 1] = ""
                 column += width
             elif column:
                 cells[row][column - 1] += character
@@ -104,6 +107,15 @@ def assert_visible_sentence(data, rows, columns, sentence, context):
             f"{context}: expected contiguous prose was absent from the rendered screen; "
             f"screen rows: {screen!r}"
         )
+
+
+def assert_sample_prose_visible(data, rows, columns, context):
+    for sentence in (
+        "The opening paragraph remains readable.",
+        "Maqrara opened the old bok and found a note inside.",
+        "Élodie waved beside 한글 🧭.",
+    ):
+        assert_visible_sentence(data, rows, columns, sentence, context)
 
 
 def set_size(fd, rows, columns):
@@ -401,13 +413,7 @@ def main():
         os.write(master, b"\x1b")  # use the welcome screen's visible Skip key
         read_for(0.4)
         if not modes:
-            assert_visible_sentence(
-                output,
-                24,
-                80,
-                "The opening paragraph remains readable.",
-                "initial 80x24 screen",
-            )
+            assert_sample_prose_visible(output, 24, 80, "initial 80x24 screen")
         if not section_removal_delete and b"Arrival" not in output:
             raise AssertionError(
                 "the opening scene was not rendered in the PTY; output tail: "
@@ -460,14 +466,35 @@ def main():
         if chapter_removal:
             # Remove the selected populated chapter through Navigate > Outline.
             # The default is the explicitly documented retain-and-unplace path.
+            menu_start = len(output)
             os.write(master, b"\x1b[21~")
-            read_for(0.2)
-            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" + b"\r")
-            read_for(0.3)
-            if not wait_for_fragments((b"Outline", b"Opening", b"Arrival"), timeout=3.0):
+            if not wait_for_fragments(
+                (b"NewProject", b"OpenProject", b"RecentProjects"),
+                menu_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "F10 did not open the File menu; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"\x1b[C" * 3)  # Navigate menu
+            if not wait_for_fragments(
+                (b"PreviousPosition", b"Outline", b"SceneCards"),
+                menu_start,
+                timeout=3.0,
+            ):
+                raise AssertionError("Navigate menu did not expose Outline")
+            os.write(master, b"\x1b[B\r")  # select Outline and open it
+            outline_start = len(output)
+            if not wait_for_fragments(
+                (b"Selectedoutlineitem", b"Opening", b"Arrival"),
+                outline_start,
+                timeout=3.0,
+            ):
                 raise AssertionError("Navigate > Outline did not show the populated chapter")
-            # Workspace selection may be preserved on the last child row;
-            # explicitly select the parent chapter before invoking Delete.
+            # The initial selection may be the scene, so move toward the
+            # chapter boundary. Up saturates at the first row if it is already
+            # selected and reaches the chapter from its first scene.
             os.write(master, b"\x1b[A" * 3)
             read_for(0.2)
             dialog_start = len(output)
@@ -689,31 +716,13 @@ def main():
         read_for(0.3)
         if b"Commands: section TITLE" in ANSI_CONTROL.sub(b"", output):
             raise AssertionError("internal command registry appeared after closing the menu")
-        assert_visible_sentence(
-            output,
-            24,
-            80,
-            "The opening paragraph remains readable.",
-            "screen after closing menu",
-        )
+        assert_sample_prose_visible(output, 24, 80, "screen after closing menu")
         set_size(master, 60, 201)
         read_for(0.4)
-        assert_visible_sentence(
-            output,
-            60,
-            201,
-            "The opening paragraph remains readable.",
-            "resized 201x60 screen",
-        )
+        assert_sample_prose_visible(output, 60, 201, "resized 201x60 screen")
         set_size(master, 24, 80)
         read_for(0.4)
-        assert_visible_sentence(
-            output,
-            24,
-            80,
-            "The opening paragraph remains readable.",
-            "resized-back 80x24 screen",
-        )
+        assert_sample_prose_visible(output, 24, 80, "resized-back 80x24 screen")
         os.write(master, b"\x11")  # Ctrl+Q
         quit_deadline = time.monotonic() + 5.0
         finished_pid = 0

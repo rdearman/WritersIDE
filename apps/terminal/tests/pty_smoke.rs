@@ -23,7 +23,9 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
     app.save_scene_text(
         scene,
         Some(&hash),
-        &format!("{prose}The opening paragraph remains readable."),
+        &format!(
+            "{prose}The opening paragraph remains readable.\nMaqrara opened the old bok and found a note inside.\nÉlodie waved beside 한글 🧭."
+        ),
     )
     .unwrap();
     drop(app);
@@ -46,6 +48,11 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
         "PTY smoke failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
+    );
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "The opening paragraph remains readable.\nMaqrara opened the old bok and found a note inside.\nÉlodie waved beside 한글 🧭."
     );
 }
 
