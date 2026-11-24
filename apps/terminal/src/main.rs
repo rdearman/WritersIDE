@@ -42554,10 +42554,43 @@ mod tests {
         let project = directory.path().join("Book");
         let mut app = WriterApp::create_project(&project, "Book").unwrap();
         let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let prose = app
+            .create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "Chapter prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
         let scene = app.create_scene(chapter, "Opening", 0).unwrap();
         let mut state = AppState::new(app, default_bindings());
         state.workspace = Workspace::Outline;
         state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| *row == OutlineRow::ContentUnit(prose))
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.pending_content_unit_removal.is_some());
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.pending_structural_node_removal.is_some());
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+
         state.selected = outline_rows(&state)
             .iter()
             .position(|row| *row == OutlineRow::Scene(scene))
