@@ -415,6 +415,9 @@ pub struct ScrivenerProjectInventory {
     /// They are not silently treated as a WIDE publication profile.
     #[serde(default)]
     pub compile_settings: Option<ScrivenerCompileSettings>,
+    /// Source-defined section type names keyed by stable Scrivener type ID.
+    #[serde(default)]
+    pub section_types: BTreeMap<String, String>,
     pub items: Vec<ScrivenerBinderItem>,
     pub warnings: Vec<String>,
     pub unsupported: Vec<String>,
@@ -426,6 +429,12 @@ pub struct ScrivenerCompileSettings {
     pub content_scope: Option<String>,
     #[serde(default)]
     pub formats: Vec<ScrivenerCompileFormatSettings>,
+    /// Every project-local `.scrformat` definition, keyed by its own source
+    /// format ID. Some Scrivener projects refer to a built-in format ID in
+    /// compile.xml while retaining a separate custom format file; keep both
+    /// rather than assuming the identifiers match.
+    #[serde(default)]
+    pub available_layouts: BTreeMap<String, BTreeMap<String, ScrivenerCompileLayout>>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -441,6 +450,31 @@ pub struct ScrivenerCompileFormatSettings {
     pub default_back_matter_id: Option<String>,
     #[serde(default)]
     pub add_default_back_matter: Option<bool>,
+    #[serde(default)]
+    pub layouts: BTreeMap<String, ScrivenerCompileLayout>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScrivenerCompileLayout {
+    pub source_layout_id: String,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub include_titles: Option<bool>,
+    #[serde(default)]
+    pub include_text: Option<bool>,
+    #[serde(default)]
+    pub title_prefix: Option<String>,
+    #[serde(default)]
+    pub title_suffix: Option<String>,
+    #[serde(default)]
+    pub text_prefix: Option<String>,
+    #[serde(default)]
+    pub text_suffix: Option<String>,
+    #[serde(default)]
+    pub between_separator_kind: Option<String>,
+    #[serde(default)]
+    pub between_separator_text: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1532,6 +1566,7 @@ pub fn inspect_scrivener_project(
         creator,
         project_metadata: BTreeMap::new(),
         compile_settings: None,
+        section_types: scrivener_section_type_names(&root),
         items: Vec::new(),
         warnings: Vec::new(),
         unsupported: Vec::new(),
@@ -1545,7 +1580,8 @@ pub fn inspect_scrivener_project(
                 .map_err(|error| ImportError::Io(error.to_string()))?;
             let compile_root = parse_scrivener_xml(&compile_xml)?;
             inventory.project_metadata = scrivener_project_metadata(&compile_root);
-            inventory.compile_settings = Some(scrivener_compile_settings(&compile_root));
+            inventory.compile_settings =
+                Some(scrivener_compile_settings(&compile_root, &settings_dir)?);
         } else {
             inventory.warnings.push(
                 "Scrivener compile.xml was not present; project metadata and format-level compile settings could not be inspected".into(),
@@ -1751,6 +1787,33 @@ fn parse_scrivener_xml(xml: &str) -> Result<ScrivenerXmlNode, ImportError> {
                     );
                 }
             }
+            Ok(Event::GeneralRef(event)) => {
+                if let Some(node) = stack.last_mut() {
+                    let decoded = event
+                        .decode()
+                        .map_err(|error| ImportError::Archive(error.to_string()))?;
+                    let character = if let Some(character) = event
+                        .resolve_char_ref()
+                        .map_err(|error| ImportError::Archive(error.to_string()))?
+                    {
+                        character.to_string()
+                    } else {
+                        match decoded.as_ref() {
+                            "amp" => "&".to_owned(),
+                            "lt" => "<".to_owned(),
+                            "gt" => ">".to_owned(),
+                            "apos" => "'".to_owned(),
+                            "quot" => "\"".to_owned(),
+                            entity => {
+                                return Err(ImportError::Archive(format!(
+                                    "unsupported XML entity reference &{entity};"
+                                )));
+                            }
+                        }
+                    };
+                    node.text.push_str(&character);
+                }
+            }
             Ok(Event::CData(event)) => {
                 if let Some(node) = stack.last_mut() {
                     node.text.push_str(
@@ -1868,17 +1931,151 @@ fn scrivener_project_metadata(root: &ScrivenerXmlNode) -> BTreeMap<String, Strin
     values
 }
 
-fn scrivener_compile_settings(root: &ScrivenerXmlNode) -> ScrivenerCompileSettings {
+fn scrivener_section_type_names(root: &ScrivenerXmlNode) -> BTreeMap<String, String> {
+    let Some(section_types) = find_scrivener_node(root, "SectionTypes") else {
+        return BTreeMap::new();
+    };
+    let Some(definitions) = section_types
+        .children
+        .iter()
+        .find(|child| child.name.eq_ignore_ascii_case("TypeDefinitions"))
+    else {
+        return BTreeMap::new();
+    };
+    definitions
+        .children
+        .iter()
+        .filter(|node| node.name.eq_ignore_ascii_case("Type"))
+        .filter_map(|node| {
+            let id = node.attributes.get("ID")?;
+            let name = node.text.trim();
+            (!name.is_empty()).then(|| (id.clone(), name.to_owned()))
+        })
+        .collect()
+}
+
+fn parse_scrivener_format_layouts(
+    settings_dir: &Path,
+) -> Result<BTreeMap<String, BTreeMap<String, ScrivenerCompileLayout>>, ImportError> {
+    fn collect_layouts<'a>(node: &'a ScrivenerXmlNode, output: &mut Vec<&'a ScrivenerXmlNode>) {
+        if node.name.eq_ignore_ascii_case("Layout") {
+            output.push(node);
+        }
+        for child in &node.children {
+            collect_layouts(child, output);
+        }
+    }
+
+    let Some(format_dir) = find_case_insensitive_child(settings_dir, "Compile Formats", true)?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let entries = fs::read_dir(&format_dir).map_err(|error| ImportError::Io(error.to_string()))?;
+    let mut formats = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| ImportError::Io(error.to_string()))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| ImportError::Io(error.to_string()))?;
+        if !kind.is_file()
+            || !entry
+                .path()
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("scrformat"))
+        {
+            continue;
+        }
+        let source =
+            fs::read_to_string(entry.path()).map_err(|error| ImportError::Io(error.to_string()))?;
+        let root = parse_scrivener_xml(&source)?;
+        let Some(format_node) = find_scrivener_node(&root, "CompileFormat") else {
+            continue;
+        };
+        let Some(format_id) = format_node.attributes.get("ID").cloned() else {
+            continue;
+        };
+        let mut layouts = BTreeMap::new();
+        let mut layout_nodes = Vec::new();
+        collect_layouts(format_node, &mut layout_nodes);
+        for node in layout_nodes {
+            let Some(id) = node.attributes.get("ID").cloned() else {
+                continue;
+            };
+            let child = |name: &str| {
+                node.children
+                    .iter()
+                    .find(|child| child.name.eq_ignore_ascii_case(name))
+            };
+            let include = child("Include");
+            let titles = child("Titles");
+            let title_prefix = titles
+                .and_then(|node| node.children.iter().find(|child| child.name == "Prefix"))
+                .map(|node| node.text.clone())
+                .filter(|text| !text.is_empty());
+            let title_suffix = titles
+                .and_then(|node| node.children.iter().find(|child| child.name == "Suffix"))
+                .map(|node| node.text.clone())
+                .filter(|text| !text.is_empty());
+            let text = child("Text");
+            let separators = child("Separators");
+            let between = separators.and_then(|node| {
+                node.children
+                    .iter()
+                    .find(|child| child.name.eq_ignore_ascii_case("Between"))
+            });
+            let yes_no = |value: Option<&String>| {
+                value.map(|value| {
+                    matches!(value.to_ascii_lowercase().as_str(), "yes" | "true" | "1")
+                })
+            };
+            layouts.insert(
+                id.clone(),
+                ScrivenerCompileLayout {
+                    source_layout_id: id.clone(),
+                    name: node.attributes.get("Name").cloned(),
+                    include_titles: yes_no(include.and_then(|node| node.attributes.get("Titles"))),
+                    include_text: yes_no(include.and_then(|node| node.attributes.get("Text"))),
+                    title_prefix,
+                    title_suffix,
+                    text_prefix: text
+                        .and_then(|node| node.children.iter().find(|child| child.name == "Prefix"))
+                        .map(|node| node.text.clone())
+                        .filter(|text| !text.is_empty()),
+                    text_suffix: text
+                        .and_then(|node| node.children.iter().find(|child| child.name == "Suffix"))
+                        .map(|node| node.text.clone())
+                        .filter(|text| !text.is_empty()),
+                    between_separator_kind: between
+                        .and_then(|node| node.attributes.get("Type"))
+                        .cloned(),
+                    between_separator_text: between
+                        .map(|node| node.text.clone())
+                        .filter(|text| !text.is_empty()),
+                },
+            );
+        }
+        formats.insert(format_id, layouts);
+    }
+    Ok(formats)
+}
+
+fn scrivener_compile_settings(
+    root: &ScrivenerXmlNode,
+    settings_dir: &Path,
+) -> Result<ScrivenerCompileSettings, ImportError> {
     let project_content = find_scrivener_node(root, "Content");
     let content_scope = project_content
         .and_then(|node| node.attributes.get("Scope"))
         .cloned();
     let Some(format_settings) = find_scrivener_node(root, "FormatSettings") else {
-        return ScrivenerCompileSettings {
+        return Ok(ScrivenerCompileSettings {
             content_scope,
             formats: Vec::new(),
-        };
+            available_layouts: BTreeMap::new(),
+        });
     };
+    let source_layouts = parse_scrivener_format_layouts(settings_dir)?;
     let formats = format_settings
         .children
         .iter()
@@ -1888,6 +2085,10 @@ fn scrivener_compile_settings(root: &ScrivenerXmlNode) -> ScrivenerCompileSettin
                 source_format_id: format.attributes.get("ID").cloned().unwrap_or_default(),
                 ..ScrivenerCompileFormatSettings::default()
             };
+            settings.layouts = source_layouts
+                .get(&settings.source_format_id)
+                .cloned()
+                .unwrap_or_default();
             if let Some(layouts) = format
                 .children
                 .iter()
@@ -1941,10 +2142,11 @@ fn scrivener_compile_settings(root: &ScrivenerXmlNode) -> ScrivenerCompileSettin
             settings
         })
         .collect();
-    ScrivenerCompileSettings {
+    Ok(ScrivenerCompileSettings {
         content_scope,
         formats,
-    }
+        available_layouts: source_layouts,
+    })
 }
 
 fn scrivener_named_value(node: &ScrivenerXmlNode, name: &str) -> Option<String> {
@@ -3444,7 +3646,46 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
         }
     }
     flush(&mut output, &mut text, current);
-    output.trim().to_owned()
+    let output = output.trim();
+    let mut prose = String::with_capacity(output.len());
+    let mut characters = output.chars().peekable();
+    let mut at_paragraph_start = true;
+    while let Some(character) = characters.next() {
+        if at_paragraph_start && matches!(character, ' ' | '\t') {
+            let mut indentation = vec![character];
+            while characters
+                .peek()
+                .is_some_and(|next| matches!(next, ' ' | '\t'))
+            {
+                indentation.push(characters.next().expect("peeked indentation character"));
+            }
+            let has_tab = indentation.contains(&'\t');
+            let code_indentation = indentation.len() >= 4;
+            if has_tab || code_indentation {
+                // Scrivener commonly exports a paragraph indent as a space
+                // followed by an RTF tab. A raw tab or four spaces at the
+                // start of Markdown is a code-block marker. Preserve the
+                // visible indent using non-breaking spaces instead.
+                for whitespace in indentation {
+                    prose.extend(std::iter::repeat_n(
+                        '\u{00a0}',
+                        if whitespace == '\t' { 4 } else { 1 },
+                    ));
+                }
+            } else {
+                prose.extend(indentation);
+            }
+            at_paragraph_start = false;
+            continue;
+        }
+        prose.push(character);
+        if character == '\n' {
+            at_paragraph_start = true;
+        } else if character != '\r' {
+            at_paragraph_start = false;
+        }
+    }
+    prose
 }
 
 impl ImportInventory {
@@ -3880,6 +4121,25 @@ This is an addition to the old file.}"#;
     }
 
     #[test]
+    fn scrivener_paragraph_indent_does_not_become_a_markdown_code_block() {
+        let source = r#"{\rtf1\ansi First paragraph.\par \tab An indented ordinary paragraph with \b emphasis\b0.\par     Four-space indented prose.\par Next line with\tab an interior tab.}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert!(
+            markdown.contains("\n\n\u{00a0}\u{00a0}\u{00a0}\u{00a0}An indented"),
+            "{markdown:?}"
+        );
+        assert!(
+            markdown.contains("\n\n\u{00a0}\u{00a0}\u{00a0}\u{00a0}Four\\-space"),
+            "{markdown:?}"
+        );
+        assert!(markdown.contains("*emphasis*"), "{markdown:?}");
+        assert!(
+            markdown.contains("Next line with\tan interior tab."),
+            "{markdown:?}"
+        );
+    }
+
+    #[test]
     fn scrivener_rtf_extracts_png_payloads_as_stable_markdown_assets() {
         let source = r#"{\rtf1\ansi Before\par {\*\shppict{\pict\pngblip\picw1\pich1 89504e470d0a1a0a}}\par After}"#;
         let (markdown, assets, unsupported, unsupported_links) =
@@ -4089,7 +4349,10 @@ This is an addition to the old file.}"#;
                 <Children><BinderItem UUID="child" Type="Text"><Title>Chapter prose</Title>
                   <MetaData><IncludeInCompile>Yes</IncludeInCompile><SectionType>type-chapter</SectionType></MetaData>
                   <Children/></BinderItem></Children></BinderItem>
-            </Binder></ScrivenerProject>"#,
+            </Binder><SectionTypes><TypeDefinitions>
+              <Type ID="type-folder">Internal heading role</Type>
+              <Type ID="type-chapter">Numbered chapter role</Type>
+            </TypeDefinitions></SectionTypes></ScrivenerProject>"#,
         )
         .unwrap();
         std::fs::write(
@@ -4106,6 +4369,15 @@ This is an addition to the old file.}"#;
             </FormatSettings></CompileSettings>"#,
         )
         .unwrap();
+        std::fs::create_dir_all(settings.join("Compile Formats")).unwrap();
+        std::fs::write(
+            settings.join("Compile Formats/retailer.scrformat"),
+            r#"<CompileFormat ID="retailer"><Layouts><Layout ID="layout-chapter" Name="Chapter title">
+              <Include Titles="No" Text="Yes"/><Titles><Prefix>Chapter &lt;$t&gt;</Prefix></Titles>
+              <Separators><Between Type="Line">* * *</Between></Separators>
+            </Layout></Layouts></CompileFormat>"#,
+        )
+        .unwrap();
 
         let inventory = inspect_scrivener_project(&project).unwrap();
         assert_eq!(inventory.items[0].include_in_compile, Some(false));
@@ -4119,6 +4391,14 @@ This is an addition to the old file.}"#;
             Some("type-chapter")
         );
         assert_eq!(
+            inventory.section_types.get("type-folder").unwrap(),
+            "Internal heading role"
+        );
+        assert_eq!(
+            inventory.section_types.get("type-chapter").unwrap(),
+            "Numbered chapter role"
+        );
+        assert_eq!(
             inventory.project_metadata.get("ProjectTitle").unwrap(),
             "Imported title"
         );
@@ -4126,7 +4406,8 @@ This is an addition to the old file.}"#;
             inventory.project_metadata.get("Authors").unwrap(),
             "Author name"
         );
-        let formats = inventory.compile_settings.unwrap().formats;
+        let compile_settings = inventory.compile_settings.unwrap();
+        let formats = compile_settings.formats;
         assert_eq!(formats.len(), 2);
         assert_eq!(
             formats[0].section_layouts.get("type-folder").unwrap(),
@@ -4146,6 +4427,17 @@ This is an addition to the old file.}"#;
             Some("back-id")
         );
         assert_eq!(formats[1].add_default_back_matter, Some(false));
+        let layout = formats[1].layouts.get("layout-chapter").unwrap();
+        assert_eq!(layout.name.as_deref(), Some("Chapter title"));
+        assert_eq!(layout.include_titles, Some(false));
+        assert_eq!(layout.include_text, Some(true));
+        assert_eq!(layout.title_prefix.as_deref(), Some("Chapter <$t>"));
+        assert_eq!(layout.between_separator_kind.as_deref(), Some("Line"));
+        assert_eq!(layout.between_separator_text.as_deref(), Some("* * *"));
+        assert_eq!(
+            compile_settings.available_layouts["retailer"]["layout-chapter"],
+            *layout
+        );
     }
 
     #[test]
@@ -4167,6 +4459,7 @@ This is an addition to the old file.}"#;
             creator: None,
             project_metadata: BTreeMap::new(),
             compile_settings: None,
+            section_types: BTreeMap::new(),
             items: vec![
                 ScrivenerBinderItem {
                     source_document_id: "same".into(),

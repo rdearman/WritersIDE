@@ -6,6 +6,8 @@ from unittest import mock
 from pathlib import Path
 
 from real_manuscript_regression import (
+    detailed_epub_difference,
+    epub_document_details,
     epub_semantics,
     epubcheck_command,
     epubcheck_result,
@@ -15,6 +17,43 @@ from real_manuscript_regression import (
 
 
 class EpubSemanticTests(unittest.TestCase):
+    def test_xhtml_details_retain_paragraph_formatting_tables_assets_and_links(self):
+        details = epub_document_details(
+            '''<html xmlns="http://www.w3.org/1999/xhtml"><body>
+              <h2>Chapter One</h2><p>A <strong>bold</strong> word with an en dash –.</p>
+              <pre>  intentional code</pre><p>Visible **literal markers**.</p>
+              <figure><img src="../images/stone.png" alt="Stone garden"/><figcaption>Figure 1</figcaption></figure>
+              <table><tr><th>Year</th><th>Place</th></tr><tr><td>2026</td><td>Kyoto</td></tr></table>
+              <p><a href="#chapter">Chapter link</a></p>
+            </body></html>''',
+            "OPS/chapter.xhtml",
+        )
+        self.assertEqual([item["text"] for item in details["paragraphs"]], [
+            "A bold word with an en dash –.", "Visible **literal markers**.", "Chapter link"
+        ])
+        self.assertEqual(details["headings"][0]["level"], 2)
+        self.assertEqual(details["preformatted"][0]["text"], "  intentional code")
+        self.assertEqual(details["visible_markdown_artifacts"][0]["text"], "Visible **literal markers**.")
+        self.assertEqual(len(details["tables"][0]["rows"]), 2)
+        self.assertEqual(details["images"][0]["alt"], "Stone garden")
+        self.assertEqual(details["links"][0]["href"], "#chapter")
+        self.assertIn("U+2013 EN DASH", details["unicode_counts"])
+
+    def test_detailed_comparison_reports_paragraph_location_and_unicode_delta(self):
+        reference = {"documents": [{"path": "ref/chapter.xhtml", "paragraphs": [
+            {"path": "/body/p[1]", "text": "The garden–wall."},
+            {"path": "/body/p[2]", "text": "A second paragraph."},
+        ]}], "css_summary": {}, "metadata": {}, "navigation_entries": []}
+        generated = {"documents": [{"path": "wide/chapter.xhtml", "paragraphs": [
+            {"path": "/body/p[1]", "text": "The gardenwall."},
+            {"path": "/body/p[2]", "text": "A second paragraph."},
+        ]}], "css_summary": {}, "metadata": {}, "navigation_entries": []}
+        difference = detailed_epub_difference(reference, generated)
+        change = difference["paragraphs"]["changed_regions"][0]
+        self.assertEqual(change["reference"][0]["path"], "/body/p[1]")
+        self.assertIn("U+2013", str(difference["characters"]["missing_from_generated"]))
+        self.assertIn("Scrivener source", change["probable_stage"])
+
     def test_ambiguous_binder_items_are_preserved_as_non_publication_research(self):
         inventory = {
             "items": [

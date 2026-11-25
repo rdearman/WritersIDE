@@ -82,6 +82,152 @@ class TextCollector(html.parser.HTMLParser):
             self._heading_parts.append(data)
 
 
+def epub_document_details(source: str, document_path: str) -> dict:
+    """Extract source-located semantic blocks from one EPUB XHTML document."""
+    try:
+        root = ET.fromstring(source)
+    except ET.ParseError as error:
+        return {"path": document_path, "parse_error": str(error)}
+
+    def tag_name(node: ET.Element) -> str:
+        return node.tag.rsplit("}", 1)[-1].lower()
+
+    def text_of(node: ET.Element) -> str:
+        return "".join(node.itertext())
+
+    def walk(node: ET.Element, path: str, parent: str = "") -> list[dict]:
+        name = tag_name(node)
+        blocks: list[dict] = []
+        attrs = {key.rsplit("}", 1)[-1].lower(): value for key, value in node.attrib.items()}
+        if name in {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "pre", "blockquote", "figcaption"}:
+            text = unicodedata.normalize("NFC", text_of(node))
+            if text.strip() or name in {"pre", "figcaption"}:
+                blocks.append({
+                    "kind": "heading" if name.startswith("h") else name,
+                    "level": int(name[1]) if name.startswith("h") and len(name) == 2 else None,
+                    "path": path,
+                    "parent": parent,
+                    "text": text,
+                    "attributes": attrs,
+                })
+        for child_index, child in enumerate(list(node), 1):
+            child_name = tag_name(child)
+            blocks.extend(walk(child, f"{path}/{child_name}[{child_index}]", name))
+        return blocks
+
+    blocks = walk(root, "/")
+    tables = []
+    images = []
+    links = []
+    parents = {
+        id(child): parent
+        for parent in root.iter()
+        for child in list(parent)
+    }
+    for index, node in enumerate(root.iter(), 1):
+        name = tag_name(node)
+        attrs = {key.rsplit("}", 1)[-1].lower(): value for key, value in node.attrib.items()}
+        if name == "table":
+            rows = []
+            for row in node.iter():
+                if tag_name(row) == "tr":
+                    rows.append([
+                        {"kind": tag_name(cell), "text": unicodedata.normalize("NFC", text_of(cell)),
+                         "rowspan": cell.attrib.get("rowspan"), "colspan": cell.attrib.get("colspan")}
+                        for cell in row if tag_name(cell) in {"td", "th"}
+                    ])
+            tables.append({"index": index, "caption": next((text_of(child) for child in node if tag_name(child) == "caption"), None), "rows": rows})
+        elif name == "img":
+            images.append({"index": index, "src": attrs.get("src"), "alt": attrs.get("alt"), "title": attrs.get("title"), "parent": tag_name(parents.get(id(node), root))})
+        elif name == "a":
+            links.append({"index": index, "href": attrs.get("href"), "label": unicodedata.normalize("NFC", text_of(node))})
+
+    all_text = "\n".join(block["text"] for block in blocks)
+    return {
+        "path": document_path,
+        "blocks": blocks,
+        "paragraphs": [block for block in blocks if block["kind"] == "p"],
+        "preformatted": [block for block in blocks if block["kind"] == "pre"],
+        "headings": [block for block in blocks if block["kind"] == "heading"],
+        "visible_markdown_artifacts": [
+            {"path": block["path"], "text": block["text"]}
+            for block in blocks
+            if re.search(r"(?<!\\)(?:\*\*|\*|__|~~|`{1,3})", block["text"])
+        ],
+        "tables": tables,
+        "images": images,
+        "links": links,
+        "unicode_counts": dict(sorted(collections.Counter(
+            f"U+{ord(character):04X} {unicodedata.name(character, 'UNNAMED')}"
+            for character in all_text if not character.isalnum() and not character.isspace()
+        ).items())),
+    }
+
+
+def detailed_epub_difference(reference: dict, generated: dict) -> dict:
+    """Return content-bearing, source-located comparison evidence for local reports."""
+    left = [
+        {"document": document["path"], "paragraph": index,
+         "path": block.get("path"), "text": block["text"]}
+        for document in reference.get("documents", [])
+        for index, block in enumerate(document.get("paragraphs", []), 1)
+    ]
+    right = [
+        {"document": document["path"], "paragraph": index,
+         "path": block.get("path"), "text": block["text"]}
+        for document in generated.get("documents", [])
+        for index, block in enumerate(document.get("paragraphs", []), 1)
+    ]
+    left_values = [unicodedata.normalize("NFC", item["text"]) for item in left]
+    right_values = [unicodedata.normalize("NFC", item["text"]) for item in right]
+    matcher = difflib.SequenceMatcher(a=left_values, b=right_values, autojunk=False)
+    paragraph_changes = []
+    for operation, a0, a1, b0, b1 in matcher.get_opcodes():
+        if operation == "equal":
+            continue
+        paragraph_changes.append({
+            "operation": operation,
+            "reference": left[a0:a1],
+            "generated": right[b0:b1],
+            "probable_stage": "historical source revision, compile selection, or WIDE pipeline; compare current Scrivener source and persisted WIDE body",
+        })
+
+    left_text = "\n".join(left_values)
+    right_text = "\n".join(right_values)
+    left_chars = collections.Counter(left_text)
+    right_chars = collections.Counter(right_text)
+    character_diff = {
+        "missing_from_generated": [
+            {"character": character, "codepoint": f"U+{ord(character):04X}", "count": count}
+            for character, count in sorted((left_chars - right_chars).items())
+        ],
+        "additional_in_generated": [
+            {"character": character, "codepoint": f"U+{ord(character):04X}", "count": count}
+            for character, count in sorted((right_chars - left_chars).items())
+        ],
+    }
+    ref_docs = reference.get("documents", [])
+    gen_docs = generated.get("documents", [])
+    return {
+        "paragraphs": {
+            "reference_count": len(left), "generated_count": len(right),
+            "changed_regions": paragraph_changes,
+        },
+        "characters": character_diff,
+        "document_details": {
+            "reference": [{key: doc.get(key) for key in ("path", "headings", "preformatted", "visible_markdown_artifacts", "tables", "images", "links")} for doc in ref_docs],
+            "generated": [{key: doc.get(key) for key in ("path", "headings", "preformatted", "visible_markdown_artifacts", "tables", "images", "links")} for doc in gen_docs],
+        },
+        "css": {"reference": reference.get("css_summary", {}), "generated": generated.get("css_summary", {})},
+        "metadata": {"reference": reference.get("metadata", {}), "generated": generated.get("metadata", {})},
+        "navigation": {"reference": reference.get("navigation_entries", []), "generated": generated.get("navigation_entries", [])},
+        "limitations": [
+            "Historical EPUBs may reflect an earlier Scrivener revision or Calibre conversion; paragraph differences require source-side evidence before defect classification.",
+            "CSS summary records declared rules and font declarations; it is not a full browser cascade or visual layout engine.",
+        ],
+    }
+
+
 def run(command: list[str], *, env: dict[str, str], capture: bool = True) -> str:
     result = subprocess.run(command, env=env, text=True, capture_output=capture)
     if result.returncode:
@@ -184,6 +330,8 @@ def epub_semantics(path: pathlib.Path) -> dict:
         }
         spine = [node.attrib["idref"] for node in package.findall("opf:spine/opf:itemref", ns)]
         collectors = []
+        documents = []
+        css_sources = []
         nav_collector = None
         for item_id in spine:
             href = manifest[item_id]
@@ -193,6 +341,13 @@ def epub_semantics(path: pathlib.Path) -> dict:
             collector = TextCollector()
             collector.feed(source)
             collectors.append((href, collector))
+            documents.append(epub_document_details(source, href))
+        for node in package.findall("opf:manifest/opf:item", ns):
+            if node.attrib.get("media-type") != "text/css":
+                continue
+            css_path = (package_dir / unquote(node.attrib["href"])).as_posix()
+            if css_path in names:
+                css_sources.append((css_path, archive.read(css_path).decode("utf-8", errors="replace")))
         nav_item = next(
             (node for node in package.findall("opf:manifest/opf:item", ns)
              if "nav" in node.attrib.get("properties", "").split()),
@@ -275,8 +430,19 @@ def epub_semantics(path: pathlib.Path) -> dict:
                 metadata = {
                     node.tag.rsplit("}", 1)[-1]: (node.text or "").strip()
                     for node in child
-                    if node.tag.rsplit("}", 1)[-1] in {"title", "creator", "language", "identifier"}
+                    if node.tag.rsplit("}", 1)[-1] in {
+                        "title", "creator", "language", "identifier", "date", "rights", "publisher", "subject", "description", "type", "format", "source", "relation"
+                    }
                 }
+        css_joined = "\n".join(source for _, source in css_sources)
+        css_summary = {
+            "files": [path for path, _ in css_sources],
+            "font_families": sorted(set(re.findall(r"(?i)font-family\s*:\s*([^;}]+)", css_joined))),
+            "font_sizes": sorted(set(re.findall(r"(?i)font-size\s*:\s*([^;}]+)", css_joined))),
+            "font_weights": sorted(set(re.findall(r"(?i)font-weight\s*:\s*([^;}]+)", css_joined))),
+            "font_styles": sorted(set(re.findall(r"(?i)font-style\s*:\s*([^;}]+)", css_joined))),
+            "declarations": sorted(set(re.findall(r"([\w-]+\s*:\s*[^;}]+)", css_joined))),
+        }
         headings = [heading for _, c in collectors for heading in c.headings if heading]
         counts = collections.Counter()
         for _, collector in collectors:
@@ -345,10 +511,14 @@ def epub_semantics(path: pathlib.Path) -> dict:
             "text_token_count": len(tokens),
             "text_sha256": hashlib.sha256(normal_text.encode()).hexdigest(),
             "headings": headings,
+            "documents": documents,
+            "css_summary": css_summary,
             "paragraph_count": counts["p"],
             "list_items": counts["li"],
             "table_rows": counts["tr"],
             "table_cells": counts["td"] + counts["th"],
+            "preformatted_blocks": counts["pre"],
+            "code_elements": counts["code"],
             "bold_elements": counts["b"] + counts["strong"],
             "italic_elements": counts["i"] + counts["em"],
             "images": sum(len(c.images) for _, c in collectors),
@@ -394,6 +564,38 @@ def project_text_counts(project: pathlib.Path) -> dict:
             "word_count": sum(len(re.findall(r"\w+", text, flags=re.UNICODE)) for _, _, text in units),
             "content_sha256": hashlib.sha256("\0".join(text for _, _, text in units).encode()).hexdigest(),
         }
+    finally:
+        db.close()
+
+
+def canonical_markdown_diagnostics(project: pathlib.Path) -> dict:
+    """Summarise likely source-vs-renderer causes without copying prose to logs."""
+    import sqlite3
+
+    db = sqlite3.connect(project / "story.db")
+    result = {"documents": 0, "explicit_code_fences": 0, "indented_lines": 0,
+              "tab_indented_lines": 0, "markdown_emphasis_delimiters": 0,
+              "unresolved_image_placeholders": 0, "unresolved_variables": 0,
+              "rtf_escape_residue": 0}
+    try:
+        tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for table in ("scene_content", "content_unit"):
+            if table not in tables:
+                continue
+            id_column = "scene_id" if table == "scene_content" else "id"
+            rows = db.execute(f"SELECT {id_column}, relative_path FROM {table}").fetchall()
+            for entity_id, relative_path in rows:
+                path = project / relative_path
+                text = path.read_text(encoding="utf-8") if path.is_file() else ""
+                result["documents"] += 1
+                result["explicit_code_fences"] += len(re.findall(r"(?m)^\s*(```|~~~)", text)) // 2
+                result["indented_lines"] += len(re.findall(r"(?m)^(?: {4,}|\t+)[^\n]+", text))
+                result["tab_indented_lines"] += len(re.findall(r"(?m)^\t+[^\n]+", text))
+                result["markdown_emphasis_delimiters"] += len(re.findall(r"(?<!\\)(?:\*\*|__|~~)", text))
+                result["unresolved_image_placeholders"] += len(re.findall(r"(?i)SPECIAL_IMAGE|(?:IMAGE|FIGURE)_PLACEHOLDER", text))
+                result["unresolved_variables"] += len(re.findall(r"<\$[^>]+>", text))
+                result["rtf_escape_residue"] += len(re.findall(r"(?i)(?:\\'[0-9a-f]{2}|\\u-?\d+\??)", text))
+        return result
     finally:
         db.close()
 
@@ -561,7 +763,8 @@ def compare_publication_structure(reference: dict, generated: dict) -> dict:
     fields = (
         "spine_documents", "paragraph_count", "list_items", "table_rows",
         "table_cells", "bold_elements", "italic_elements", "images", "links",
-        "notes", "navigation_links", "navigation_text_sha256", "metadata",
+        "preformatted_blocks", "code_elements", "notes", "navigation_links",
+        "navigation_text_sha256", "metadata", "css_summary",
     )
     differences = {}
     for field in fields:
@@ -739,6 +942,7 @@ def main() -> int:
             report["import_message"] = import_out.strip().splitlines()[-1] if import_out.strip() else "completed"
             report["project"] = str(project)
             report["persisted"] = project_text_counts(project)
+            report["canonical_markdown_diagnostics"] = canonical_markdown_diagnostics(project)
             report["source_content_fidelity"] = verify_imported_source_content(project)
             import_report = project / "exports/scrivener-import-report.json"
             if import_report.exists():
@@ -768,6 +972,11 @@ def main() -> int:
             report["generated"] = {key: value for key, value in generated_semantics.items() if key != "tokens_private"}
             report["semantic_comparison"] = semantic_diff
             report["publication_structure_differences"] = structure_diff
+            report["detailed_publication_differences"] = detailed_epub_difference(
+                reference_semantics, generated_semantics
+            )
+            if "canonical_markdown_diagnostics" not in report and project.is_dir():
+                report["canonical_markdown_diagnostics"] = canonical_markdown_diagnostics(project)
             if previous and book_id in previous.get("books", {}):
                 old = previous["books"][book_id].get("generated")
                 report["baseline_comparison"] = (

@@ -198,3 +198,52 @@ matter switches. The inspect-only real-fixture run is recorded under
 `reports/20261125T224346Z/`; its output includes private project metadata and
 must remain local and ignored. Fixture checksums passed before and after the
 run.
+
+## 25 November 2026 — paragraph indentation differential analysis
+
+The human Calibre review of `generated/list-marker-compile-correct-status-rerun-20261125/`
+found ordinary book-01 prose rendered as preformatted code. Differential
+analysis now reports per-XHTML-document paragraphs and source locations,
+headings, pre/code blocks, literal Markdown delimiters, lists, tables, images,
+links, Unicode punctuation and CSS typography. It also compares paragraph
+sequences and character-level Unicode changes between reference and generated
+EPUBs. Historical-publication differences are clues for investigation; the
+source RTF and imported/reopened project remain the authorities for source
+fidelity.
+
+Tracing the source showed paragraph indentation serialized into canonical
+Markdown as leading mixed whitespace such as a space followed by a tab. The
+Markdown renderer consequently interpreted ordinary prose as a code block.
+The earlier correction handled a tab at byte zero, but a fresh targeted import
+still produced 110 preformatted blocks. The corrected importer now recognizes
+leading RTF paragraph indentation runs containing tabs or at least four ASCII
+spaces and encodes those as non-breaking spaces. Tabs inside paragraph text
+remain intact. It does not rewrite prose or add a book-specific workaround.
+Synthetic coverage is in
+`scrivener_paragraph_indent_does_not_become_a_markdown_code_block`.
+
+The full fresh production import/save/reopen/compile run is:
+`reports/rtf-indent-full-20261125/`, with generated EPUBs in
+`generated/rtf-indent-full-20261125/`. The original three-fixture checksum
+manifest passed before and after the run. Persisted source bodies matched
+exactly for book 01 39/39, book 02 36/36 and book 03 68/68. Generated
+preformatted block counts were 0/0/0; book 02 retained 44 images. All three
+generated EPUBs passed EPUBCheck 4.2.6 with zero errors or warnings. A
+full-workspace `cargo test --workspace --offline` passed after this correction,
+including 337 terminal unit tests, 3 author workflow tests and 24 real-PTY
+tests. `cargo fmt`, Clippy with warnings denied, and 9 Python harness tests also
+passed for the batch.
+
+This closes the confirmed unintended-code-formatting defect at the import
+serialization layer. It does not resolve broader publication fidelity:
+historical text, paragraph, CSS, layout, navigation, variables, Scrivener
+compile semantics, publication profiles and inclusion discrepancies remain
+subject to source-level investigation and human acceptance. The detailed local
+report contains private text and stays under ignored `reports/`; do not attach
+it to issues or commit it.
+
+The harness writes detailed local JSON and readable discrepancy reports,
+including expected/actual paragraph text and source document/path. A compact
+summary only records structural counts and validator status. Visual layout
+comparison remains follow-up work where equivalent reference sections and
+safe local rendering tools are available.

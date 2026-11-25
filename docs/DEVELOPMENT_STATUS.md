@@ -391,3 +391,41 @@ implementation work.
 Automated coverage is not human usability acceptance. Keep author-facing issues
 open when UAT is required, including #44, #55, #61 and #63. Do not treat this
 status note as an issue closure or as evidence of human UAT.
+
+## Current working checkpoint — RTF paragraph indentation and EPUB differential tooling
+
+The current working batch fixes an importer defect confirmed by Calibre UAT:
+some Scrivener RTF paragraph indentation was emitted as leading Markdown
+whitespace (including mixed space-plus-tab runs), so prose became `<pre>` code
+in the exported EPUB. The production importer now serializes leading RTF
+indentation without Markdown code-block semantics. Added synthetic regression
+coverage; original prose and internal tabs are preserved.
+
+Latest three-book outputs are local and uncommitted:
+
+- `generated/rtf-indent-full-20261125/book-01.epub`
+- `generated/rtf-indent-full-20261125/book-02.epub`
+- `generated/rtf-indent-full-20261125/book-03.epub`
+
+Full per-book discrepancy report: `reports/rtf-indent-full-20261125/` (private,
+content-bearing, do not commit or share publicly). Fixture SHA-256 validation
+passed before and after. Persisted source bodies are exact (39/39, 36/36,
+68/68); generated preformatted-block counts are 0/0/0; book 02 retains all 44
+illustrations; generated EPUBCheck 4.2.6 results are zero errors/warnings.
+The `cargo test --workspace --offline` suite passed after the production fix,
+including all unit, author workflow, PTY and documentation tests. Python
+regression harness tests, formatting and Clippy also passed.
+
+The differential harness now inspects per-document paragraph/character
+differences and reports CSS declarations, typography, headings, pre/code,
+lists, tables, assets, links, navigation and metadata. It reports likely
+pipeline context and keeps all content-bearing details local. Historical EPUBs
+are not exact source baselines. Overall fidelity remains failed human UAT; this
+repair only addresses the verified unintended code-block defect.
+
+Next safe checkpoint: refresh all open v1.0 issues/comments, then inventory the
+private expanded `fixtures/back-catalogue/` using read-only analysis and a local
+manifest. Continue from that into Scrivener compile selection/layout integration
+in the shared Compile IR and named publication profiles. Keep all private
+manifests, generated output and detailed reports out of Git. The root `.gitignore`,
+`README_TMP.md` and `UAT/` are user-owned changes; do not stage or alter them.
