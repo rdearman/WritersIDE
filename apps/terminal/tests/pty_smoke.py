@@ -127,6 +127,7 @@ def main():
     create_fiction = modes == ["create-fiction"]
     tutorial_navigation = modes == ["tutorial-navigation"]
     scene_rename = modes == ["scene-rename"]
+    heading_rename = modes == ["heading-rename"]
     previous_position = modes == ["previous-position"]
     removal_dialogs = modes == ["removal-dialogs"]
     chapter_creation = modes == ["chapter-creation"]
@@ -272,7 +273,7 @@ def main():
             )
 
     def select_visible_menu_item(label):
-        for _ in range(32):
+        for _ in range(64):
             if wait_for_screen_fragments((f"▸ {label}".encode("utf-8"),), timeout=0.12):
                 return
             os.write(master, b"\x1b[B")
@@ -465,6 +466,44 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit after the scene rename")
             print("PTY scene rename passed: Scene menu opened a prefilled editable title and saved it.")
+            return
+        if heading_rename:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")
+            if not wait_for_screen_fragments((b"Original scene body",), timeout=10.0):
+                raise AssertionError("the selected scene did not open in the manuscript editor")
+            os.write(master, b"\x1b")
+            if not wait_for_workspace_title("Outline"):
+                raise AssertionError("Esc did not return to the manuscript Outline")
+            os.write(master, b"\x1b[A")  # select the chapter heading above the scene
+            read_for(0.3)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.2)
+            os.write(master, b"\x1b[C")  # Edit
+            select_visible_menu_item("Rename Selected Section or Chapter")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Old Chapter", b"Ctrl+A clears title", b"Enter saves"), timeout=3.0
+            ):
+                raise AssertionError("heading rename did not show its prefilled title field")
+            os.write(
+                master,
+                b"\x01" + "Part One · The Returning Light\r".encode("utf-8"),
+            )
+            if not wait_for_screen_fragments(
+                ("Renamed heading to “Part One · The Returning Light”".encode("utf-8"),), timeout=3.0
+            ):
+                raise AssertionError("renamed chapter was not saved; visible tail: " + repr(ANSI_CONTROL.sub(b"", output[-1800:])))
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit after the heading rename")
+            print("PTY heading rename passed: Edit menu saved a prefilled section or chapter heading.")
             return
         if outline_view:
             os.write(master, b"\x1b")  # dismiss first-run welcome

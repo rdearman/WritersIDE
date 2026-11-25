@@ -2435,6 +2435,22 @@ impl ProjectStore {
         .collect::<std::result::Result<Vec<_>, rusqlite::Error>>()
         .map_err(StorageError::from)
     }
+    pub fn rename_structural_node(&mut self, id: NodeId, title: &str) -> Result<()> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Err(StorageError::Invalid(
+                "section or chapter title cannot be empty".into(),
+            ));
+        }
+        let changed = self.conn.execute(
+            "UPDATE structural_node SET title=?2,updated_at=?3 WHERE id=?1 AND archived=0",
+            params![id.to_string(), title, now()],
+        )?;
+        if changed == 0 {
+            return Err(StorageError::NotFound(id.to_string()));
+        }
+        Ok(())
+    }
     pub fn move_node(
         &mut self,
         id: NodeId,
@@ -15142,6 +15158,31 @@ mod tests {
             root_order,
             vec![a.to_string(), b.to_string(), dnode.to_string()]
         );
+    }
+    #[test]
+    fn structural_node_rename_validates_and_persists_without_changing_identity_or_order() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut store = ProjectStore::create(&project, "Novel").unwrap();
+        let section = store
+            .create_node(None, NodeKind::Section, "Part One", 0)
+            .unwrap();
+        let chapter = store
+            .create_node(Some(section), NodeKind::Chapter, "Old Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Opening").unwrap();
+
+        assert!(store.rename_structural_node(chapter, "  ").is_err());
+        store
+            .rename_structural_node(chapter, "The Returning Light")
+            .unwrap();
+        let reopened = ProjectStore::open(&project).unwrap();
+        let nodes = reopened.list_structural_nodes().unwrap();
+        let renamed = nodes.iter().find(|node| node.id == chapter).unwrap();
+        assert_eq!(renamed.title, "The Returning Light");
+        assert_eq!(renamed.parent_id, Some(section));
+        assert_eq!(renamed.position, 0);
+        assert_eq!(reopened.get_scene(scene).unwrap().chapter_id, Some(chapter));
     }
     #[test]
     fn direct_sql_cannot_duplicate_roots_or_retype_populated_chapter() {

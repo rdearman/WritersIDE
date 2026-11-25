@@ -1024,6 +1024,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "document.remove-content-unit",
         "document.removed-content-units",
         "document.restore-content-unit",
+        "document.rename-heading",
         "document.remove-empty-node",
         "document.removed-nodes",
         "document.restore-node",
@@ -1678,6 +1679,7 @@ enum CommandAction {
     WindowClose,
     WindowOnly,
     WriteSelectedChapter,
+    RenameSelectedStructuralNode,
     MoveOutlineUp,
     MoveOutlineDown,
     MoveSceneEarlier,
@@ -3109,6 +3111,21 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::RestoreSelectedContentUnit,
+            task_group: "Outline",
+            menu_priority: 20,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "document.rename-heading",
+            label: "Rename Selected Section or Chapter…",
+            description: "Change the selected section or chapter heading",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["rename section", "rename chapter", "rename heading"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::RenameSelectedStructuralNode,
             task_group: "Outline",
             menu_priority: 20,
             advanced: false,
@@ -14672,6 +14689,20 @@ impl AppState {
                 None
             };
         }
+        if spec.id == "document.rename-heading" {
+            return if self.workspace != Workspace::Outline {
+                Some("Open Outline first")
+            } else if self.removed_structural_nodes_list || self.removed_content_units_list {
+                Some("Return to the active Outline first")
+            } else if !matches!(
+                outline_rows(self).get(self.selected),
+                Some(OutlineRow::Section { .. } | OutlineRow::Chapter { .. })
+            ) {
+                Some("Select a section or chapter first")
+            } else {
+                None
+            };
+        }
         if spec.id == "document.restore-node" {
             return if self.workspace != Workspace::Outline || !self.removed_structural_nodes_list {
                 Some("Show Removed Sections and Chapters first")
@@ -15448,6 +15479,28 @@ impl AppState {
             "Rename selected scene · Ctrl+A clears title · Enter saves · Esc cancels".into();
     }
 
+    fn start_structural_node_rename(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let node = match outline_rows(self).get(self.selected) {
+            Some(OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. }) => *id,
+            _ => {
+                self.message = "Select a section or chapter in Outline before renaming it".into();
+                return Ok(());
+            }
+        };
+        let title = self
+            .app
+            .list_structural_nodes()?
+            .into_iter()
+            .find(|candidate| candidate.id == node)
+            .map(|node| node.title)
+            .ok_or("selected heading no longer exists")?;
+        self.mode = Some('J');
+        self.prompt = title;
+        self.message =
+            "Rename selected heading · Ctrl+A clears title · Enter saves · Esc cancels".into();
+        Ok(())
+    }
+
     fn start_scene_synopsis(&mut self) {
         if selected_scene_for_workspace(self).is_none() {
             self.message = "Select a scene in the Outline before editing its synopsis".into();
@@ -15735,6 +15788,7 @@ impl AppState {
             CommandAction::WindowClose => self.close_focused_window()?,
             CommandAction::WindowOnly => self.keep_only_focused_window()?,
             CommandAction::WriteSelectedChapter => self.write_selected_chapter()?,
+            CommandAction::RenameSelectedStructuralNode => self.start_structural_node_rename()?,
             CommandAction::MoveOutlineUp => self.move_selected_outline_item(false)?,
             CommandAction::MoveOutlineDown => self.move_selected_outline_item(true)?,
             CommandAction::MoveSceneEarlier => self.move_scene_card(-1)?,
@@ -16054,6 +16108,36 @@ impl AppState {
                     };
                 }
                 Err(error) => self.message = format!("Could not create scene: {error}"),
+            }
+            return Ok(());
+        }
+        if mode == Some('J') {
+            if cmd.trim().is_empty() {
+                self.message =
+                    "Heading title unchanged · enter a title or press Esc to cancel".into();
+                return Ok(());
+            }
+            let node_id = match outline_rows(self).get(self.selected) {
+                Some(OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. }) => *id,
+                _ => {
+                    self.message = "Select a section or chapter in Outline first".into();
+                    return Ok(());
+                }
+            };
+            let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                self.app.rename_structural_node(node_id, &cmd)?;
+                self.refresh()?;
+                self.selected = outline_rows(self)
+                    .iter()
+                    .position(|row| {
+                        matches!(row, OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } if *id == node_id)
+                    })
+                    .unwrap_or(0);
+                self.message = format!("Renamed heading to “{cmd}”");
+                Ok(())
+            })();
+            if let Err(error) = result {
+                self.message = format!("Heading was not renamed: {error}");
             }
             return Ok(());
         }
@@ -32624,12 +32708,17 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
             return Ok(false);
         }
-        if s.mode == Some('T') {
+        if matches!(s.mode, Some('T' | 'J')) {
             match k.code {
                 KeyCode::Esc => {
+                    let heading = s.mode == Some('J');
                     s.mode = None;
                     s.prompt.clear();
-                    s.message = "Scene title unchanged".into();
+                    s.message = if heading {
+                        "Heading title unchanged".into()
+                    } else {
+                        "Scene title unchanged".into()
+                    };
                 }
                 KeyCode::Enter => s.command()?,
                 KeyCode::Backspace => {
@@ -34260,6 +34349,88 @@ mod tests {
             .unwrap();
         assert_eq!(state.workspace, Workspace::Outline);
         assert_eq!(selected_scene_for_workspace(&state), Some(created.scene.id));
+    }
+
+    #[test]
+    fn outline_edit_menu_renames_section_and_chapter_headings_without_changing_structure() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let section = app.create_section("Part One", 0).unwrap();
+        let chapter = app.create_chapter(Some(section), "Old Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.workspace = Workspace::Outline;
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+            .unwrap();
+
+        let edit = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Edit")
+            .unwrap();
+        state.open_menu_category(edit);
+        let entries = state.menu_visible_entries();
+        state.menu.as_mut().unwrap().selected = entries
+            .iter()
+            .position(|entry| entry.id == "document.rename-heading")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.mode, Some('J'));
+        assert_eq!(state.prompt, "Old Chapter");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        for character in "The Turning Point".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let nodes = state.app.list_structural_nodes().unwrap();
+        assert_eq!(
+            nodes.iter().find(|node| node.id == chapter).unwrap().title,
+            "The Turning Point"
+        );
+        assert_eq!(
+            nodes.iter().find(|node| node.id == section).unwrap().title,
+            "Part One"
+        );
+        assert_eq!(
+            state.app.get_scene(scene).unwrap().chapter_id,
+            Some(chapter)
+        );
+        assert!(
+            matches!(outline_rows(&state).get(state.selected), Some(OutlineRow::Chapter { id, .. }) if *id == chapter)
+        );
+
+        state
+            .dispatch_registered_command_id("document.rename-heading")
+            .unwrap();
+        assert_eq!(state.prompt, "The Turning Point");
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            state
+                .app
+                .list_structural_nodes()
+                .unwrap()
+                .into_iter()
+                .find(|node| node.id == chapter)
+                .unwrap()
+                .title,
+            "The Turning Point"
+        );
     }
 
     #[test]

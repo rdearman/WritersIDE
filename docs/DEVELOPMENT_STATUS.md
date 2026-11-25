@@ -27,6 +27,25 @@ documentation tests. The first-run tutorial PTY journey passed. Keep #41 open
 for author verification; continue with the next highest-priority open v1.0
 repair after this batch is pushed.
 
+A second outliner repair adds Edit > Rename Selected Section or Chapter. The
+field starts with the current heading, Ctrl+A replaces it, Enter persists the
+new name, and Esc cancels. Storage tests confirm stable node identity, parent,
+position, and dependent scene placement; a Linux PTY journey renamed a chapter,
+exited, reopened the project, and verified the heading and unchanged prose.
+`cargo fmt --all -- --check` and workspace Clippy passed. The complete
+`cargo test --workspace --offline` initially hit the sandbox restriction on the
+Ollama crate's localhost-only test socket; rerunning with the previously
+authorised socket permission passed, including 337 terminal unit tests, 3 author
+workflow tests, and 24 Linux PTY tests.
+
+The latest human publication UAT reports material EPUB fidelity failure despite
+EPUBCheck passing. The new priority is to trace RTF decoding corruption from
+Scrivener extraction through generated XHTML and fix private-planning-material
+leaks in the shared Compile IR. Treat the current Scrivener source as authoritative;
+historical EPUBs are comparison evidence, not exact text baselines. Before making
+changes, refresh issues #7, #35, #44, #53, and #73 and verify fixture checksums.
+Keep all manuscript-bearing output and detailed reports local.
+
 The follow-up outliner repair separates scene-title editing from save-conflict
 review, which previously shared the same key-input mode. Scene > Rename now
 opens a focused field prefilled with the current title; Ctrl+A clears it,
