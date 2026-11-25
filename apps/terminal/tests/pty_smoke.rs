@@ -220,6 +220,50 @@ fn insert_date_time_and_file_work_through_the_real_insert_menu() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn special_character_picker_inserts_and_saves_a_unicode_codepoint_through_the_real_menu() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Special Character Project");
+    let mut app = WriterApp::create_project(&project, "Special Character Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "The opening paragraph.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY special-character workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("special-character")
+        .output()
+        .expect("run the Linux PTY special-character workflow");
+    assert!(
+        result.status.success(),
+        "PTY special-character workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "—The opening paragraph."
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn named_window_layouts_save_and_load_through_the_real_view_menu() {
     let _guard = lock_pty_test();
     use std::process::Command;

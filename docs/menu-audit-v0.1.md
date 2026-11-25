@@ -416,6 +416,13 @@ preceding separator for the final paragraph, retaining neighboring content.
 Unit tests invoke all three through the shared command dispatcher and verify
 Undo restores the exact original text.
 
+The Insert menu provides **Special Character…** with a searchable Unicode
+picker for typographic punctuation, symbols, non-breaking characters and
+recently used characters. Typing a code such as `U+2014` inserts that code
+point when selected; invalid scalar values are rejected. Insertion uses the
+existing undoable editor path, and recent characters are saved in the
+project-local editor preferences.
+
 ## Alpha UAT 19 — manuscript insertion actions
 
 The Insert menu now also exposes **Insert Date/Time** and **Insert File…**.

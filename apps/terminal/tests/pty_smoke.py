@@ -131,6 +131,7 @@ def main():
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
     insert_edit_actions = modes == ["insert-edit-actions"]
+    special_character = modes == ["special-character"]
     named_layouts = modes == ["named-layouts"]
     edit_menu = modes == ["edit-menu"]
     chapter_removal = modes in (
@@ -275,6 +276,39 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after insertion")
             print("PTY editing workflow passed: Insert Date/Time and Insert File work through the menus.")
+            return
+
+        if special_character:
+            os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
+            read_for(0.25)
+            picker_start = len(output)
+            os.write(master, b"\x1b[21~" + b"\x1b[C" * 2 + b"\x1b[B" * 7 + b"\r")
+            if not wait_for_fragments(
+                (b"Insert Special Character", b"U+XXXX"), picker_start, timeout=3.0
+            ):
+                raise AssertionError(
+                    "Insert > Special Character did not open the searchable picker; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"U+2014\r")
+            if not wait_for_screen_fragments(("—The opening paragraph.".encode(),), picker_start, timeout=3.0):
+                raise AssertionError(
+                    "The U+2014 code point was not visible in the manuscript; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"\x13")  # Ctrl+S
+            if not wait_for_screen_fragments((b"[SAVED]",), picker_start, timeout=3.0):
+                raise AssertionError("special-character insertion did not report a saved state")
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after special-character insertion")
+            print("PTY special-character workflow passed: Insert menu, Unicode code point, save, and quit.")
             return
 
         if named_layouts:

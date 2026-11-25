@@ -71,6 +71,7 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - Write Selected Chapter
 - Insert Date/Time
 - Insert File…
+- Special Character… (search by name, or type a Unicode code point such as `U+2014`)
 - Create Story Link
 - Remove Story Link
 - Insert Snippet…

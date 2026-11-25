@@ -322,6 +322,7 @@ struct AppState {
     multi_replace_preview: Option<MultiReplacePreview>,
     snippet_preview: Option<SnippetPreview>,
     snippet_chooser: Option<SnippetChooser>,
+    special_character_picker: Option<SpecialCharacterPicker>,
     pending_replace: Option<Vec<ReplaceTarget>>,
     replace_preview_target: usize,
     replace_preview_match: usize,
@@ -1014,6 +1015,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "document.write-selected-chapter",
         "edit.insert-date-time",
         "edit.insert-file",
+        "edit.insert-special-character",
         "link.create",
         "link.delete",
         "edit.snippet-insert",
@@ -1347,6 +1349,19 @@ struct SnippetChooser {
 }
 
 #[derive(Clone, Debug)]
+struct SpecialCharacterPicker {
+    query: String,
+    selected: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct SpecialCharacterChoice {
+    character: char,
+    name: String,
+    recent: bool,
+}
+
+#[derive(Clone, Debug)]
 struct ReplaceTarget {
     scene: SceneId,
     title: String,
@@ -1485,6 +1500,8 @@ struct EditorPreferences {
     show_formatting_marks: bool,
     #[serde(default)]
     rendered_markdown: bool,
+    #[serde(default)]
+    recent_special_characters: Vec<String>,
 }
 
 impl Default for EditorPreferences {
@@ -1495,6 +1512,7 @@ impl Default for EditorPreferences {
             indent_width: 4,
             show_formatting_marks: false,
             rendered_markdown: false,
+            recent_special_characters: Vec::new(),
         }
     }
 }
@@ -1613,6 +1631,7 @@ enum CommandAction {
     TitleCaseText,
     InsertDateTime,
     InsertFile,
+    OpenSpecialCharacterPicker,
     UndoEdit,
     RedoEdit,
     CutSelection,
@@ -2842,6 +2861,21 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 10,
             advanced: false,
             action: CommandAction::InsertDateTime,
+        },
+        CommandSpec {
+            id: "edit.insert-special-character",
+            label: "Special Character…",
+            description: "Search and insert a Unicode character or enter its code point",
+            category: "Insert",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["insert unicode character", "character picker"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Insertion",
+            menu_priority: 12,
+            advanced: false,
+            action: CommandAction::OpenSpecialCharacterPicker,
         },
         CommandSpec {
             id: "edit.insert-file",
@@ -4826,7 +4860,8 @@ fn registered_global_command_for_key(state: &AppState, key: KeyEvent) -> Option<
         || state.macro_preview.is_some()
         || state.multi_replace_preview.is_some()
         || state.snippet_preview.is_some()
-        || state.snippet_chooser.is_some();
+        || state.snippet_chooser.is_some()
+        || state.special_character_picker.is_some();
     if let Some(help) = command_for_effective_shortcut(state, key)
         .filter(|command| command.action == CommandAction::Help)
     {
@@ -5776,6 +5811,25 @@ fn validate_editor_preferences(
         || !(1..=8).contains(&preferences.indent_width)
     {
         return Err("editor preferences require line_ending=lf|crlf, indentation=tabs|spaces, and indent_width=1..8".into());
+    }
+    if preferences.recent_special_characters.len() > 12
+        || preferences
+            .recent_special_characters
+            .iter()
+            .any(|character| {
+                character.chars().count() != 1 || character.chars().any(char::is_control)
+            })
+        || preferences
+            .recent_special_characters
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .len()
+            != preferences.recent_special_characters.len()
+    {
+        return Err(
+            "recent special characters must contain at most 12 distinct printable Unicode scalars"
+                .into(),
+        );
     }
     Ok(())
 }
@@ -7157,6 +7211,7 @@ impl AppState {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -7468,6 +7523,190 @@ impl AppState {
         self.message =
             "Choose a project or personal snippet · Enter continues · Esc cancels".into();
     }
+
+    fn open_special_character_picker(&mut self) {
+        self.special_character_picker = Some(SpecialCharacterPicker {
+            query: String::new(),
+            selected: 0,
+        });
+        self.message = "Search a character name or type U+ followed by its code point · Enter inserts · Esc cancels".into();
+    }
+
+    fn special_character_choices(&self, query: &str) -> Vec<SpecialCharacterChoice> {
+        const CATALOG: &[(char, &str)] = &[
+            ('—', "Em dash"),
+            ('–', "En dash"),
+            ('…', "Ellipsis"),
+            ('“', "Left double quotation mark"),
+            ('”', "Right double quotation mark"),
+            ('‘', "Left single quotation mark"),
+            ('’', "Right single quotation mark and apostrophe"),
+            ('\u{00a0}', "Non-breaking space"),
+            ('\u{2011}', "Non-breaking hyphen"),
+            ('\u{00ad}', "Discretionary hyphen"),
+            ('•', "Bullet"),
+            ('©', "Copyright sign"),
+            ('®', "Registered sign"),
+            ('™', "Trade mark sign"),
+            ('§', "Section sign"),
+            ('¶', "Pilcrow"),
+            ('†', "Dagger"),
+            ('‡', "Double dagger"),
+            ('°', "Degree sign"),
+            ('£', "Pound sign"),
+            ('€', "Euro sign"),
+            ('¥', "Yen sign"),
+            ('✓', "Check mark"),
+        ];
+        let query = query.trim();
+        let normalized_query = query.to_lowercase();
+        let mut choices = Vec::new();
+        for recent in &self.editor_preferences.recent_special_characters {
+            let Some(character) = recent
+                .chars()
+                .next()
+                .filter(|_| recent.chars().count() == 1)
+            else {
+                continue;
+            };
+            let name = CATALOG
+                .iter()
+                .find(|(candidate, _)| *candidate == character)
+                .map_or_else(
+                    || "Recently used character".to_owned(),
+                    |(_, name)| (*name).to_owned(),
+                );
+            if normalized_query.is_empty()
+                || name.to_lowercase().contains(&normalized_query)
+                || character
+                    .to_string()
+                    .to_lowercase()
+                    .contains(&normalized_query)
+                || format!("u+{:04x}", character as u32).contains(&normalized_query)
+            {
+                choices.push(SpecialCharacterChoice {
+                    character,
+                    name,
+                    recent: true,
+                });
+            }
+        }
+        for (character, name) in CATALOG {
+            if choices.iter().any(|choice| choice.character == *character) {
+                continue;
+            }
+            if normalized_query.is_empty()
+                || name.to_lowercase().contains(&normalized_query)
+                || character
+                    .to_string()
+                    .to_lowercase()
+                    .contains(&normalized_query)
+                || format!("u+{:04x}", *character as u32).contains(&normalized_query)
+            {
+                choices.push(SpecialCharacterChoice {
+                    character: *character,
+                    name: (*name).to_owned(),
+                    recent: false,
+                });
+            }
+        }
+        if let Some(codepoint) = normalized_query
+            .strip_prefix("u+")
+            .or_else(|| normalized_query.strip_prefix("0x"))
+            && let Ok(codepoint) = u32::from_str_radix(codepoint, 16)
+            && let Some(character) = char::from_u32(codepoint)
+            && !character.is_control()
+            && !choices.iter().any(|choice| choice.character == character)
+        {
+            choices.insert(
+                0,
+                SpecialCharacterChoice {
+                    character,
+                    name: "Unicode code point".into(),
+                    recent: false,
+                },
+            );
+        }
+        choices
+    }
+
+    fn handle_special_character_picker_key(&mut self, key: KeyEvent) {
+        let Some(mut picker) = self.special_character_picker.take() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.message = "Character insertion cancelled".into(),
+            KeyCode::Up => {
+                let count = self.special_character_choices(&picker.query).len();
+                if count > 0 {
+                    picker.selected = if picker.selected == 0 {
+                        count - 1
+                    } else {
+                        picker.selected - 1
+                    };
+                }
+                self.special_character_picker = Some(picker);
+            }
+            KeyCode::Down => {
+                let count = self.special_character_choices(&picker.query).len();
+                if count > 0 {
+                    picker.selected = (picker.selected + 1) % count;
+                }
+                self.special_character_picker = Some(picker);
+            }
+            KeyCode::Backspace => {
+                picker.query.pop();
+                picker.selected = 0;
+                self.special_character_picker = Some(picker);
+            }
+            KeyCode::Enter => {
+                if let Some(choice) = self
+                    .special_character_choices(&picker.query)
+                    .get(picker.selected)
+                    .cloned()
+                {
+                    let character = choice.character;
+                    let character_text = character.to_string();
+                    let inserted = self.insert_text_undoably(
+                        &character_text,
+                        &format!("Inserted {}", choice.name),
+                    );
+                    if inserted {
+                        self.editor_preferences
+                            .recent_special_characters
+                            .retain(|recent| recent != &character_text);
+                        self.editor_preferences
+                            .recent_special_characters
+                            .insert(0, character_text.clone());
+                        self.editor_preferences
+                            .recent_special_characters
+                            .truncate(12);
+                    }
+                    if inserted
+                        && let Err(error) = save_editor_preferences(
+                            self.app.project_root(),
+                            &self.editor_preferences,
+                        )
+                    {
+                        self.message = format!(
+                            "Character inserted, but recent-character history was not saved: {error}"
+                        );
+                    }
+                } else {
+                    self.special_character_picker = Some(picker);
+                    self.message =
+                        "No matching character · search a name or enter U+codepoint".into();
+                }
+            }
+            KeyCode::Char(character) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                picker.query.push(character);
+                picker.selected = 0;
+                self.special_character_picker = Some(picker);
+            }
+            _ => self.special_character_picker = Some(picker),
+        }
+    }
+
     fn handle_snippet_chooser_key(&mut self, key: KeyEvent) {
         let Some(mut chooser) = self.snippet_chooser.take() else {
             return;
@@ -13915,6 +14154,7 @@ impl AppState {
                 | "edit.select-paragraph"
                 | "edit.insert-date-time"
                 | "edit.insert-file"
+                | "edit.insert-special-character"
                 | "edit.indent"
                 | "edit.unindent"
                 | "edit.reflow-paragraph"
@@ -13945,6 +14185,7 @@ impl AppState {
                 | "edit.select-paragraph"
                 | "edit.insert-date-time"
                 | "edit.insert-file"
+                | "edit.insert-special-character"
                 | "edit.indent"
                 | "edit.unindent"
                 | "edit.reflow-paragraph"
@@ -15095,6 +15336,7 @@ impl AppState {
             CommandAction::TitleCaseText => self.transform_text_case("title"),
             CommandAction::InsertDateTime => self.insert_current_datetime(),
             CommandAction::InsertFile => self.start_file_browser(FileBrowserPurpose::InsertFile)?,
+            CommandAction::OpenSpecialCharacterPicker => self.open_special_character_picker(),
             CommandAction::UndoEdit => {
                 if self.undo_stack.is_empty()
                     && load_replace_undo(self.app.project_root())?.is_some()
@@ -25298,6 +25540,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.snippet_chooser.is_some() {
         draw_snippet_chooser_overlay(f, s);
     }
+    if s.special_character_picker.is_some() {
+        draw_special_character_picker_overlay(f, s);
+    }
     if s.command_palette.is_some() {
         draw_command_palette_overlay(f, s);
     }
@@ -25333,6 +25578,8 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
         "Command Palette".to_owned()
     } else if state.snippet_chooser.is_some() {
         "Insert Snippet".to_owned()
+    } else if state.special_character_picker.is_some() {
+        "Special Character Picker".to_owned()
     } else if state.recent_project_picker.is_some() {
         "Recent Projects".to_owned()
     } else if let Some(menu) = state.menu {
@@ -25375,6 +25622,11 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
     ];
     if state.file_browser.is_some() {
         lines.push("File browser: Tab/Shift+Tab changes panes and filename; Enter opens a folder; Backspace goes to the parent; Home opens your home folder; / opens filesystem root; F2 changes compile format; F5 confirms; F7 creates a folder; Esc cancels.".into());
+    }
+    if state.special_character_picker.is_some() {
+        lines.push(
+            "Special characters: type to filter names, symbols, or enter a code such as U+2014 · Enter inserts · Esc cancels".into(),
+        );
     }
     if state.workspace == Workspace::Editor {
         lines.push(
@@ -25733,6 +25985,67 @@ fn draw_snippet_chooser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     f.render_widget(
         Paragraph::new("↑/↓ choose · Enter continue · Esc cancel"),
         chunks[1],
+    );
+}
+
+fn draw_special_character_picker_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(picker) = &s.special_character_picker else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).min(72);
+    let height = area.height.saturating_sub(4).min(20);
+    if width < 24 || height < 7 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Insert Special Character ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(format!("Search or code point: {}", picker.query)),
+        chunks[0],
+    );
+    let choices = s.special_character_choices(&picker.query);
+    let items = choices
+        .iter()
+        .map(|choice| {
+            ListItem::new(format!(
+                "{}   {}   U+{:04X}{}",
+                choice.character,
+                choice.name,
+                choice.character as u32,
+                if choice.recent { "  Recent" } else { "" }
+            ))
+        })
+        .collect::<Vec<_>>();
+    f.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White)),
+        chunks[1],
+        &mut ListState::default().with_selected((!choices.is_empty()).then_some(picker.selected)),
+    );
+    f.render_widget(
+        Paragraph::new("Type to search · U+XXXX enters a code point · Enter inserts · Esc cancels"),
+        chunks[2],
     );
 }
 
@@ -31386,6 +31699,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     }
     if s.snippet_chooser.is_some() {
         s.handle_snippet_chooser_key(k);
+        return Ok(false);
+    }
+    if s.special_character_picker.is_some() {
+        s.handle_special_character_picker_key(k);
         return Ok(false);
     }
     if s.command_palette.is_some() {
@@ -38647,6 +38964,7 @@ mod tests {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -42419,6 +42737,7 @@ mod tests {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -42581,6 +42900,7 @@ mod tests {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -42739,6 +43059,7 @@ mod tests {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -42905,6 +43226,7 @@ mod tests {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -43221,6 +43543,7 @@ mod tests {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -43387,6 +43710,7 @@ mod tests {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -44403,6 +44727,121 @@ mod tests {
     }
 
     #[test]
+    fn special_character_picker_searches_codepoints_inserts_undoably_and_remembers_recent() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let hash = app.load_scene_text(scene).unwrap().1;
+        app.save_scene_text(scene, Some(&hash), "Hello world")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+
+        state.open_menu_category(2);
+        let selected = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| command.id == "edit.insert-special-character")
+            .expect("Insert menu should expose the character picker");
+        state.menu.as_mut().unwrap().selected = selected;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.special_character_picker.is_some());
+
+        for character in "U+2014".chars() {
+            state.handle_special_character_picker_key(KeyEvent::new(
+                KeyCode::Char(character),
+                KeyModifiers::NONE,
+            ));
+        }
+        assert_eq!(
+            state
+                .special_character_choices(&state.special_character_picker.as_ref().unwrap().query)
+                [0]
+            .character,
+            '—',
+            "U+2014 should resolve as an explicit Unicode code point"
+        );
+        state
+            .handle_special_character_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(state.special_character_picker.is_none());
+        assert_eq!(state.editor.join("\n"), "—Hello world");
+        assert_eq!(
+            state
+                .editor_preferences
+                .recent_special_characters
+                .first()
+                .map(String::as_str),
+            Some("—")
+        );
+        assert_eq!(
+            load_editor_preferences(state.app.project_root())
+                .unwrap()
+                .recent_special_characters
+                .first()
+                .map(String::as_str),
+            Some("—")
+        );
+        let invalid_preferences = EditorPreferences {
+            recent_special_characters: vec!["two".into()],
+            ..EditorPreferences::default()
+        };
+        assert!(validate_editor_preferences(&invalid_preferences).is_err());
+
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), "Hello world");
+        let original_hash = state.app.load_scene_text(scene).unwrap().1;
+        state
+            .app
+            .save_scene_text(scene, Some(&original_hash), "…Hello world")
+            .unwrap();
+        let reopened = WriterApp::open_project(&project).unwrap();
+        assert_eq!(reopened.load_scene_text(scene).unwrap().0, "…Hello world");
+
+        let mut reopened_state = AppState::new(reopened, default_bindings());
+        reopened_state.open_scene(scene).unwrap();
+        reopened_state.open_special_character_picker();
+        assert_eq!(
+            reopened_state.special_character_choices("")[0].character,
+            '—'
+        );
+        reopened_state
+            .special_character_picker
+            .as_mut()
+            .unwrap()
+            .query = "ellipsis".into();
+        assert_eq!(
+            reopened_state.special_character_choices("ellipsis").len(),
+            1
+        );
+        assert_eq!(
+            reopened_state.special_character_choices("ellipsis")[0].character,
+            '…'
+        );
+        reopened_state
+            .special_character_picker
+            .as_mut()
+            .unwrap()
+            .query = "U+D800".into();
+        assert!(
+            reopened_state
+                .special_character_choices("U+D800")
+                .is_empty()
+        );
+        reopened_state
+            .handle_special_character_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(reopened_state.special_character_picker.is_some());
+        assert!(reopened_state.message.contains("No matching character"));
+        reopened_state
+            .handle_special_character_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(reopened_state.special_character_picker.is_none());
+        assert_eq!(reopened_state.editor.join("\n"), "…Hello world");
+    }
+
+    #[test]
     fn series_import_offers_inline_series_creation_while_other_actions_explain_prerequisite() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -45047,6 +45486,7 @@ mod tests {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -45348,6 +45788,7 @@ mod tests {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -46890,6 +47331,7 @@ mod tests {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -47067,6 +47509,7 @@ mod tests {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -47296,6 +47739,7 @@ mod tests {
             multi_replace_preview: None,
             snippet_preview: None,
             snippet_chooser: None,
+            special_character_picker: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
