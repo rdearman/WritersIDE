@@ -26,7 +26,7 @@ import time
 import unicodedata
 import zipfile
 import xml.etree.ElementTree as ET
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 
 BOOKS = {
@@ -44,6 +44,7 @@ class TextCollector(html.parser.HTMLParser):
         self.headings: list[str] = []
         self.links: list[str] = []
         self.images: list[str] = []
+        self.ids: set[str] = set()
         self._heading_depth = 0
         self._heading_parts: list[str] = []
         self._suppressed_depth = 0
@@ -54,6 +55,8 @@ class TextCollector(html.parser.HTMLParser):
         if tag in self._suppressed:
             self._suppressed_depth += 1
         attrs_map = dict(attrs)
+        if attrs_map.get("id"):
+            self.ids.add(attrs_map["id"])
         if tag == "a":
             self.links.append(attrs_map.get("href") or "")
         elif tag == "img":
@@ -307,6 +310,36 @@ def epub_semantics(path: pathlib.Path) -> dict:
                             decoded_asset_hashes.append("unreadable")
                 else:
                     missing_image_references += 1
+        link_hashes = []
+        broken_link_references = 0
+        internal_link_count = 0
+        external_link_count = 0
+        unsupported_link_scheme_count = 0
+        ids_by_path = {href: collector.ids for href, collector in collectors}
+        for source_href, collector in collectors:
+            for link in collector.links:
+                link_hashes.append(hashlib.sha256(link.encode("utf-8")).hexdigest())
+                parsed = urlsplit(link)
+                if parsed.scheme:
+                    if parsed.scheme.lower() in {"http", "https", "mailto"}:
+                        external_link_count += 1
+                    else:
+                        unsupported_link_scheme_count += 1
+                    continue
+                internal_link_count += 1
+                target_path = source_href
+                if parsed.path:
+                    target_path = posixpath.normpath(
+                        posixpath.join(
+                            posixpath.dirname(source_href),
+                            unquote(parsed.path.lstrip("/")),
+                        )
+                    )
+                    if target_path not in names:
+                        broken_link_references += 1
+                        continue
+                if parsed.fragment and parsed.fragment not in ids_by_path.get(target_path, set()):
+                    broken_link_references += 1
         return {
             "spine_documents": len(spine),
             "text_token_count": len(tokens),
@@ -323,6 +356,11 @@ def epub_semantics(path: pathlib.Path) -> dict:
             "decoded_image_sha256": sorted(decoded_asset_hashes),
             "missing_image_references": missing_image_references,
             "links": sum(len(c.links) for _, c in collectors),
+            "internal_links": internal_link_count,
+            "external_links": external_link_count,
+            "unsupported_link_schemes": unsupported_link_scheme_count,
+            "broken_link_references": broken_link_references,
+            "link_target_sha256": sorted(link_hashes),
             "notes": sum(1 for href, c in collectors if "footnote" in href.lower() or "endnote" in href.lower())
             + counts["aside"],
             "navigation_text_sha256": hashlib.sha256(

@@ -8233,7 +8233,7 @@ unexpected_prose = "must not be silently discarded"
         .unwrap();
         fs::write(
             scene_files.join("content.rtf"),
-            r"{\rtf1\ansi Élodie entered. {\pict\pngblip\picw1\pich1 89504e470d0a1a0a}}",
+            r#"{\rtf1\ansi Élodie entered. {\field{\*\fldinst HYPERLINK "https://example.org/source"}{\fldrslt source}} {\pict\pngblip\picw1\pich1 89504e470d0a1a0a}}"#,
         )
         .unwrap();
         fs::write(
@@ -8275,6 +8275,7 @@ unexpected_prose = "must not be silently discarded"
         assert_eq!(scenes.len(), 1);
         let imported_scene_text = app.load_scene_text(scenes[0]).unwrap().0;
         assert!(imported_scene_text.contains("Élodie entered."));
+        assert!(imported_scene_text.contains("[source](https://example.org/source)"));
         let image_hash = format!("{:x}", Sha256::digest(b"\x89PNG\r\n\x1a\n"));
         let image_path = dir
             .path()

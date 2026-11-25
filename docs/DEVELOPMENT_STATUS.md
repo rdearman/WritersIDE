@@ -108,13 +108,30 @@ byte-for-byte for the illustrated non-fiction book; its generated EPUB has 44
 images and zero broken references. A separate non-fiction source contains two
 images absent from its historical reference publication; this is unresolved and
 may reflect a source/revision/compile difference. EPUBCheck remains unavailable.
-Reference/generated paragraph counts are 1298/358, 648/408 and 1813/1430; link
-counts are 45/0, 149/0 and 26/0. These require tracing through source
-extraction, persisted documents, compile input and historical settings. Do not
-claim publication acceptance. The current fixtures have zero reference table
-rows, so they do not validate table preservation. Next: investigate unexpected
-source images and remaining text, paragraph, link and navigation differences;
-then run a standards validator and continue the other open v1.0 requirements.
+
+The next importer correction preserves safe Scrivener RTF hyperlink fields as
+Markdown links, retains visible text while omitting unsafe destinations, and
+reports unsupported targets. Synthetic importer tests cover a safe web link and
+a rejected `javascript:` URI. The three-book production run at
+`reports/hyperlink-before-commit-20261125/` confirmed the source bodies remain
+exact after persistence/reopen (44/44, 41/41, 76/76), all source fingerprints
+remain unchanged, and generated publications contain 63, 170 and 63 links
+respectively, with zero broken internal links. Historical references contain
+45, 149 and 26 links. Those count differences remain unresolved: the generated
+links correspond to non-Trash source RTF fields, but the reference EPUBs are
+historical outputs and source/compile settings may differ. Text, paragraph and
+navigation differences also remain substantial; no publication acceptance is
+claimed. Reference/generated paragraph counts are 1298/358, 648/408 and
+1813/1430. The current fixtures have zero reference table rows, so they do not
+validate table preservation. Next: investigate remaining text, paragraph,
+navigation, image-scope and historical-link differences, then run a standards
+validator and continue the other open v1.0 requirements.
+
+The user supplied `README_TMP.md` as the draft for an author-facing product
+landing page. It remains queued in documentation/release preparation after the
+current high-priority import/publication regression; audit its capability
+claims, licence, links, developer documentation and genuine synthetic-content
+screenshots before replacing the root README.
 
 The user also provided `README_TMP.md` for replacing the product README. This is
 queued in documentation/release preparation after current high-priority import

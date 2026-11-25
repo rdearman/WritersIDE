@@ -1852,7 +1852,7 @@ fn collect_scrivener_item(
             if let Some(file) = find_case_insensitive_child(&item_dir, "content.rtf", false)? {
                 let bytes = fs::read(&file).map_err(|error| ImportError::Io(error.to_string()))?;
                 let rtf = String::from_utf8_lossy(&bytes);
-                let (markdown, assets, unsupported_picture_count) =
+                let (markdown, assets, unsupported_picture_count, unsupported_link_count) =
                     extract_rtf_markdown_with_assets(&rtf);
                 content_markdown = Some(markdown);
                 embedded_assets = assets;
@@ -1860,6 +1860,12 @@ fn collect_scrivener_item(
                     unsupported.push(format!(
                         "{} embedded RTF picture(s) use unsupported or malformed image data",
                         unsupported_picture_count
+                    ));
+                }
+                if unsupported_link_count > 0 {
+                    unsupported.push(format!(
+                        "{} RTF hyperlink field(s) use unsupported or unsafe destinations",
+                        unsupported_link_count
                     ));
                 }
                 unsupported.push(
@@ -2658,7 +2664,118 @@ fn decode_rtf_picture(group: &[u8]) -> Option<(String, String, Vec<u8>)> {
     valid_signature.then(|| (media_type.to_owned(), extension.to_owned(), output))
 }
 
-fn extract_rtf_markdown_with_assets(source: &str) -> (String, Vec<ScrivenerEmbeddedAsset>, usize) {
+fn rtf_child_group_after<'a>(group: &'a [u8], control: &[u8]) -> Option<&'a [u8]> {
+    let control_at = group
+        .windows(control.len())
+        .position(|window| window == control)?;
+    let start = group[..control_at].iter().rposition(|byte| *byte == b'{')?;
+    let end = find_rtf_group_end(group, start)?;
+    Some(&group[start..end])
+}
+
+fn rtf_hyperlink_target(instruction: &[u8]) -> Option<String> {
+    let instruction = String::from_utf8_lossy(instruction);
+    let start = instruction.to_ascii_uppercase().find("HYPERLINK")? + "HYPERLINK".len();
+    let mut rest = instruction[start..].trim();
+    if rest.starts_with('"') {
+        rest = &rest[1..];
+        let end = rest.find('"')?;
+        let target = &rest[..end];
+        let target = markdown_safe_uri(target);
+        let scheme = target.split(':').next()?.to_ascii_lowercase();
+        return matches!(scheme.as_str(), "http" | "https" | "mailto").then_some(target);
+    }
+    if let Some(anchor) = rest
+        .strip_prefix("\\l ")
+        .or_else(|| rest.strip_prefix("\\l"))
+    {
+        let anchor = anchor.trim().trim_matches('"');
+        if !anchor.is_empty() {
+            return Some(format!("#{anchor}"));
+        }
+    }
+    None
+}
+
+fn markdown_safe_uri(value: &str) -> String {
+    value
+        .replace(' ', "%20")
+        .replace('(', "%28")
+        .replace(')', "%29")
+        .replace('<', "%3C")
+        .replace('>', "%3E")
+}
+
+fn extract_rtf_hyperlinks(source: &str) -> (String, usize) {
+    let bytes = source.as_bytes();
+    let mut segments = Vec::<(usize, usize, String)>::new();
+    let mut unsupported = 0usize;
+    let mut search_from = 0usize;
+    while let Some(relative) = source[search_from..].find("\\field") {
+        let field_at = search_from + relative;
+        let after_word = field_at + "\\field".len();
+        if source
+            .as_bytes()
+            .get(after_word)
+            .is_some_and(u8::is_ascii_alphabetic)
+        {
+            search_from = after_word;
+            continue;
+        }
+        let Some(start) = bytes[..field_at].iter().rposition(|byte| *byte == b'{') else {
+            search_from = after_word;
+            continue;
+        };
+        let Some(end) = find_rtf_group_end(bytes, start) else {
+            unsupported = unsupported.saturating_add(1);
+            search_from = after_word;
+            continue;
+        };
+        let field = &bytes[start..end];
+        let instruction = rtf_child_group_after(field, b"\\fldinst");
+        let result = rtf_child_group_after(field, b"\\fldrslt")
+            .map(|group| extract_rtf_markdown_without_assets(&String::from_utf8_lossy(group)))
+            .unwrap_or_default();
+        let target = instruction.and_then(|group| {
+            let text = group
+                .strip_prefix(b"{\\*")
+                .or_else(|| group.strip_prefix(b"{"))
+                .unwrap_or(group);
+            let text = text.strip_prefix(b"\\fldinst").unwrap_or(text);
+            let text = text.strip_suffix(b"}").unwrap_or(text);
+            rtf_hyperlink_target(text)
+        });
+        let replacement = if let Some(target) = target.filter(|_| !result.is_empty()) {
+            format!("[{result}]({target})")
+        } else {
+            unsupported = unsupported.saturating_add(1);
+            result
+        };
+        segments.push((start, end, replacement));
+        search_from = end;
+    }
+    if segments.is_empty() {
+        return (source.to_owned(), unsupported);
+    }
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    for (start, end, replacement) in segments {
+        if start < cursor {
+            continue;
+        }
+        output.push_str(&source[cursor..start]);
+        output.push_str(&replacement);
+        cursor = end;
+    }
+    output.push_str(&source[cursor..]);
+    (output, unsupported)
+}
+
+fn extract_rtf_markdown_with_assets(
+    source: &str,
+) -> (String, Vec<ScrivenerEmbeddedAsset>, usize, usize) {
+    let (source, unsupported_link_count) = extract_rtf_hyperlinks(source);
+    let source = source.as_str();
     let bytes = source.as_bytes();
     let mut segments = Vec::<(usize, usize, String, Option<ScrivenerEmbeddedAsset>)>::new();
     let mut search_from = 0usize;
@@ -2735,7 +2852,12 @@ fn extract_rtf_markdown_with_assets(source: &str) -> (String, Vec<ScrivenerEmbed
         );
         markdown = markdown.replace(&asset.placeholder, &reference);
     }
-    (markdown, assets, unsupported_picture_count)
+    (
+        markdown,
+        assets,
+        unsupported_picture_count,
+        unsupported_link_count,
+    )
 }
 
 fn extract_rtf_markdown(source: &str) -> String {
@@ -3257,8 +3379,10 @@ This is an addition to the old file.}"#;
     #[test]
     fn scrivener_rtf_extracts_png_payloads_as_stable_markdown_assets() {
         let source = r#"{\rtf1\ansi Before\par {\*\shppict{\pict\pngblip\picw1\pich1 89504e470d0a1a0a}}\par After}"#;
-        let (markdown, assets, unsupported) = extract_rtf_markdown_with_assets(source);
+        let (markdown, assets, unsupported, unsupported_links) =
+            extract_rtf_markdown_with_assets(source);
         assert_eq!(unsupported, 0);
+        assert_eq!(unsupported_links, 0);
         assert_eq!(assets.len(), 1);
         let asset = &assets[0];
         assert_eq!(asset.media_type, "image/png");
@@ -3280,10 +3404,30 @@ This is an addition to the old file.}"#;
     #[test]
     fn scrivener_rtf_reports_unsupported_or_malformed_picture_data() {
         let source = r#"{\rtf1\ansi Text {\pict\emfblip 00112233} tail}"#;
-        let (markdown, assets, unsupported) = extract_rtf_markdown_with_assets(source);
+        let (markdown, assets, unsupported, unsupported_links) =
+            extract_rtf_markdown_with_assets(source);
         assert!(assets.is_empty());
         assert_eq!(unsupported, 1);
+        assert_eq!(unsupported_links, 0);
         assert!(!markdown.contains("00112233"));
+    }
+
+    #[test]
+    fn scrivener_rtf_hyperlink_fields_preserve_visible_text_and_safe_destinations() {
+        let source = r#"{\rtf1\ansi Read {\field{\*\fldinst HYPERLINK "https://example.org/a(b)"}{\fldrslt helpful page}} now}"#;
+        let (markdown, assets, unsupported_pictures, unsupported_links) =
+            extract_rtf_markdown_with_assets(source);
+        assert!(assets.is_empty());
+        assert_eq!(unsupported_pictures, 0);
+        assert_eq!(unsupported_links, 0);
+        assert!(markdown.contains("[helpful page](https://example.org/a%28b%29)"));
+
+        let unsafe_target = r#"{\rtf1\ansi {\field{\*\fldinst HYPERLINK "javascript:alert(1)"}{\fldrslt visible}}}"#;
+        let (safe_markdown, _, _, unsupported_links) =
+            extract_rtf_markdown_with_assets(unsafe_target);
+        assert_eq!(unsupported_links, 1);
+        assert!(!safe_markdown.contains("javascript:"));
+        assert!(safe_markdown.contains("visible"));
     }
 
     #[test]
