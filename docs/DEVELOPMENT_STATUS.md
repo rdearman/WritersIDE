@@ -87,37 +87,40 @@ python3 tools/real_manuscript_regression.py --phase compile \
 python3 tools/real_manuscript_regression.py --phase full
 ```
 
-Latest measured run: `reports/clean-commit-9c5c887/`, with generated projects
-and EPUBs under `generated/clean-commit-9c5c887/`. It used the production
-CLI/importer/storage/compiler and reopened projects before compilation. The
-source commit is `9c5c8879067fa81decf88379ff8d2df1b36f995b`; the harness marked
-the tree dirty only because user-owned `.gitignore`, README draft and UAT files
-were present. No application source changed during the run. A local provisional
-WIDE baseline is retained under ignored `baselines/provisional-9c5c887/`; it is
-not accepted and must not replace a better validated baseline.
+Latest complete three-book run: `reports/clean-commit-d3381a4/`, with generated
+projects and EPUBs under `generated/clean-commit-d3381a4/`. It used the
+production importer/storage/compiler and reopened projects before compilation.
+The tested source revision is `d3381a462e9a103f86701c69333838e00e524ab5`; the
+harness marked the tree dirty because user-owned `.gitignore`, `README_TMP.md`
+and `UAT/` files were present, while application sources matched the commit.
+A local provisional result is preserved at
+`baselines/provisional-d3381a4/`; the earlier provisional run remains in
+`baselines/provisional-9c5c887/`. Neither is an accepted publishing baseline.
 
-For the three books, bodies extracted by the importer were preserved in
-persisted Markdown (44/44, 41/41 and 76/76); research bodies were also preserved
-(1/1, 1/1 and 4/4), and Trash bodies were excluded. Fixture fingerprints matched
-before and after. These checks establish extraction-to-storage consistency,
-not complete fidelity to every source asset or historical publication. All
-imports remain `incomplete` because importer warnings and unresolved source
-items remain.
+For all three books, extracted manuscript bodies survived persistence/reopen
+(44/44, 41/41 and 76/76), research bodies survived (1/1, 1/1 and 4/4), Trash
+bodies were excluded, and fixture fingerprints matched before/after. All
+imports remain incomplete due to unresolved warnings/items. These checks
+establish extraction-to-storage consistency, not complete fidelity.
 
-Publication acceptance has not passed. EPUBCheck is unavailable in this
-environment. For the illustrated non-fiction fixture, the reference contains
-44 image resources and the generated EPUB contains none; RTF picture groups are
-not currently preserved through import. Reference/generated paragraph counts
-are 1298/358, 648/407 and 1813/1430; link counts are 45/0, 149/0 and 26/0.
-These measurements require investigation but do not alone prove source-revision
-or compiler causes. Historical publication revisions/settings have not been
-reconciled. Do not promote a baseline or claim import/publishing acceptance.
-Next: repair RTF image extraction and project-local asset persistence at the
-import layer, improve sanitised warnings, then trace text, paragraph, link and
-navigation differences through extraction, persisted documents and compile
-input. Rerun the three-book suite after relevant changes. Keep all manuscript-
-bearing reports and generated publications local; never commit fixture-derived
-files.
+The RTF image import repair now preserves all 44 reference illustration payloads
+byte-for-byte for the illustrated non-fiction book; its generated EPUB has 44
+images and zero broken references. A separate non-fiction source contains two
+images absent from its historical reference publication; this is unresolved and
+may reflect a source/revision/compile difference. EPUBCheck remains unavailable.
+Reference/generated paragraph counts are 1298/358, 648/408 and 1813/1430; link
+counts are 45/0, 149/0 and 26/0. These require tracing through source
+extraction, persisted documents, compile input and historical settings. Do not
+claim publication acceptance. The current fixtures have zero reference table
+rows, so they do not validate table preservation. Next: investigate unexpected
+source images and remaining text, paragraph, link and navigation differences;
+then run a standards validator and continue the other open v1.0 requirements.
+
+The user also provided `README_TMP.md` for replacing the product README. This is
+queued in documentation/release preparation after current high-priority import
+and publication regressions; it must be capability-audited, preserve accurate
+engineering guidance in developer docs, verify the licence and use only genuine
+screenshots made with synthetic content.
 
 ## Verification commands
 
