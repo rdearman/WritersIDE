@@ -50165,6 +50165,7 @@ mod tests {
         state.undo_edit();
         assert_eq!(state.editor.join("\n"), source);
 
+        state.editor_selection = None;
         state.cursor = (0, 0);
         handle(
             &mut state,
@@ -50191,10 +50192,53 @@ mod tests {
         );
         handle(
             &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        assert_eq!(state.selected_text().as_deref(), Some("o"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.clipboard, "o");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "**bld** and *café* 🙂");
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), source);
+
+        state.editor_selection = None;
+        state.cursor = (0, 0);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "**old** and *café* 🙂");
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), source);
+
+        state.cursor = (0, 0);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(
+            &mut state,
             KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE),
         )
         .unwrap();
-        assert_eq!(state.editor.join("\n"), "**bYold** and *café* 🙂");
+        assert_eq!(state.editor.join("\n"), "**boYld** and *café* 🙂");
         assert!(state.dirty);
     }
 

@@ -20,6 +20,9 @@ second editor buffer or rewrite source during display operations.
   existing Undo and journalled save paths.
 - Unicode positions remain grapheme-aware through the projection's UTF-8 byte
   map. Source-fallback documents retain the existing source-editor behavior.
+- Single-cursor Shift+Arrow selection uses projected movement while retaining
+  canonical source offsets. Copy and deletion therefore operate on the exact
+  selected manuscript bytes.
 - A selected range continues to use canonical source offsets. Multi-cursor
   editing currently retains source-mode cursor movement because each cursor
   needs an independently mapped anchor; this is an explicit limitation.
@@ -30,8 +33,9 @@ second editor buffer or rewrite source during display operations.
 
 Regression coverage verifies that typing at the beginning of rendered bold
 text inserts inside the semantic span, visible horizontal navigation skips
-format delimiters, and typing after movement changes the expected source
-boundary in a document containing accented and emoji graphemes. This does not
-complete #61 coordinate mapping: selection extension, wrapping-aware vertical
-movement, multi-cursor semantics, clipboard, find/replace and proofreading in
-rendered coordinates, plus human writing-workflow acceptance, remain open.
+format delimiters, Shift+Arrow selects and copies visible text, and Backspace
+and Delete act on the expected source ranges with Undo available in a document
+containing accented and emoji graphemes. This does not complete #61 coordinate
+mapping: wrapping-aware vertical movement, multi-cursor semantics,
+find/replace and proofreading in rendered coordinates, plus human
+writing-workflow acceptance, remain open.
