@@ -183,6 +183,12 @@ struct SceneRemovalDialog {
     restoring: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct RemovedScenesReturn {
+    scene: Option<SceneId>,
+    chapter: Option<(story_core::NodeId, bool)>,
+}
+
 #[derive(Clone, Debug)]
 struct ContentUnitRemovalDialog {
     id: story_core::ContentUnitId,
@@ -270,6 +276,7 @@ struct AppState {
     reading_removed_list: bool,
     pending_reading_removal: Option<ReadingRemovalDialog>,
     removed_scenes_list: bool,
+    removed_scenes_return: Option<RemovedScenesReturn>,
     pending_scene_removal: Option<SceneRemovalDialog>,
     removed_content_units_list: bool,
     removed_structural_nodes_list: bool,
@@ -7168,6 +7175,7 @@ impl AppState {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,
@@ -12254,17 +12262,37 @@ impl AppState {
         Ok(())
     }
     fn toggle_removed_scenes(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let entering_removed = !self.removed_scenes_list;
+        if entering_removed {
+            self.removed_scenes_return = Some(RemovedScenesReturn {
+                scene: selected_scene_for_workspace(self),
+                chapter: self.selected_card_chapter,
+            });
+        }
         if self.workspace != Workspace::Cards {
             self.switch(Workspace::Cards);
         }
-        self.removed_scenes_list = !self.removed_scenes_list;
+        self.removed_scenes_list = entering_removed;
         self.selected_card_chapter = None;
         self.selected = 0;
         self.refresh()?;
-        self.message = if self.removed_scenes_list {
+        if !entering_removed && let Some(previous) = self.removed_scenes_return.take() {
+            self.selected_card_chapter = previous.chapter.filter(|(id, _)| {
+                self.app
+                    .list_structural_nodes()
+                    .is_ok_and(|nodes| nodes.iter().any(|node| node.id == *id))
+            });
+            if let Some(scene) = previous.scene {
+                self.selected = scene_card_ids(self)
+                    .iter()
+                    .position(|candidate| *candidate == scene)
+                    .unwrap_or(0);
+            }
+        }
+        self.message = if entering_removed {
             "Removed Scenes · select a scene and choose Restore Selected Scene".into()
         } else {
-            "Scene Cards · Included and Excluded · select a card to write or organise it".into()
+            "Returned to Scene Cards · previous selection restored where available".into()
         };
         Ok(())
     }
@@ -12310,6 +12338,7 @@ impl AppState {
         if dialog.restoring {
             self.app.restore_archived_scene(dialog.id)?;
             self.removed_scenes_list = false;
+            self.removed_scenes_return = None;
         } else {
             self.app.archive_scene(dialog.id)?;
             if self.editing_scene == Some(dialog.id) {
@@ -12323,6 +12352,12 @@ impl AppState {
         self.pending_scene_removal = None;
         self.selected = self.selected.saturating_sub(usize::from(!dialog.restoring));
         self.refresh()?;
+        if dialog.restoring {
+            self.selected = scene_card_ids(self)
+                .iter()
+                .position(|scene| *scene == dialog.id)
+                .unwrap_or(self.selected);
+        }
         self.message = if dialog.restoring {
             format!(
                 "Restored scene ‘{}’ to its original manuscript position",
@@ -14113,6 +14148,9 @@ impl AppState {
                 .filter_map(|id| commands.iter().find(|spec| spec.id == *id).copied())
                 .map(|mut spec| {
                     match spec.id {
+                        "scene.removed-list" if self.removed_scenes_list => {
+                            spec.label = "Return to Scene Cards";
+                        }
                         "scene.open" => {
                             spec.label = "Write Selected Scene";
                             spec.takes_arguments = false;
@@ -23828,7 +23866,7 @@ fn workspace_action_hint(state: &AppState) -> String {
     match state.workspace {
         Workspace::Cards => {
             if state.removed_scenes_list {
-                "Removed Scenes · ↑/↓ select · Scene > Restore Selected Scene · Scene > Show Removed Scenes returns".into()
+                "Removed Scenes · ↑/↓ select · Scene > Restore Selected Scene · Esc returns to Scene Cards".into()
             } else {
                 format!(
                     "{}: Include/Exclude · ↑↓ select · ←→ move/place · ⇧↑↓ chapter · ⇧←→ move chapter · ⇧Ins new chapter · Tab columns · Scene > Move Scene to Removed",
@@ -24045,7 +24083,12 @@ fn draw_scene_card_collection(
             })
         });
     let items = if rows.is_empty() {
-        vec![ListItem::new("No scenes yet · Insert > New Scene")]
+        let empty_state = if title.starts_with("Removed Scenes") {
+            "No removed scenes · Esc or Scene > Return to Scene Cards"
+        } else {
+            "No scenes yet · Insert > New Scene"
+        };
+        vec![ListItem::new(empty_state)]
     } else {
         rows.iter()
             .map(|(_, _, card)| ListItem::new(card.clone()))
@@ -33385,6 +33428,9 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 toggle_scene_selection(s, scene);
             }
         }
+        KeyCode::Esc if s.workspace == Workspace::Cards && s.removed_scenes_list => {
+            s.toggle_removed_scenes()?;
+        }
         KeyCode::Esc if s.workspace == Workspace::Revisions && s.revision_diff.is_some() => {
             s.revision_diff = None;
             s.revision_scene = None;
@@ -39133,6 +39179,7 @@ mod tests {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,
@@ -42944,6 +42991,7 @@ mod tests {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,
@@ -43107,6 +43155,7 @@ mod tests {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,
@@ -43266,6 +43315,7 @@ mod tests {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,
@@ -43433,6 +43483,7 @@ mod tests {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,
@@ -43750,6 +43801,7 @@ mod tests {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,
@@ -43917,6 +43969,7 @@ mod tests {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,
@@ -45693,6 +45746,7 @@ mod tests {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,
@@ -45995,6 +46049,7 @@ mod tests {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,
@@ -46231,6 +46286,61 @@ mod tests {
         assert!(String::from_utf8_lossy(&compiled.bytes).contains("The truth came to light."));
         assert_eq!(state.app.scene_character_analytics(scene).unwrap().len(), 1);
         assert!(!state.removed_scenes_list);
+    }
+
+    #[test]
+    fn removed_scenes_view_has_an_empty_state_and_returns_to_prior_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "First", 0).unwrap();
+        let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Cards;
+        state.refresh().unwrap();
+        state.selected = scene_card_ids(&state)
+            .iter()
+            .position(|scene| *scene == second)
+            .unwrap();
+
+        state.toggle_removed_scenes().unwrap();
+        assert!(state.removed_scenes_list);
+        assert_eq!(scene_card_ids(&state), Vec::<SceneId>::new());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("No removed scenes"));
+        assert!(rendered.contains("Return to Scene Cards"));
+        assert!(!rendered.contains("Insert > New Scene"));
+
+        let scene_menu = SCENE_MENU_INDEX;
+        state.open_menu_category(scene_menu);
+        let return_command = state
+            .menu_commands()
+            .iter()
+            .position(|command| {
+                command.id == "scene.removed-list" && command.label == "Return to Scene Cards"
+            })
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = return_command;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(!state.removed_scenes_list);
+        assert_eq!(selected_scene_for_workspace(&state), Some(second));
+
+        state.toggle_removed_scenes().unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(!state.removed_scenes_list);
+        assert_eq!(selected_scene_for_workspace(&state), Some(second));
+        assert_ne!(first, second);
     }
 
     #[test]
@@ -47538,6 +47648,7 @@ mod tests {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,
@@ -47716,6 +47827,7 @@ mod tests {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,
@@ -47946,6 +48058,7 @@ mod tests {
             reading_removed_list: false,
             pending_reading_removal: None,
             removed_scenes_list: false,
+            removed_scenes_return: None,
             pending_scene_removal: None,
             removed_content_units_list: false,
             removed_structural_nodes_list: false,

@@ -58,6 +58,43 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn removed_scenes_empty_state_returns_to_cards_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Removed Scenes PTY");
+    let mut app = WriterApp::create_project(&project, "Removed Scenes PTY").unwrap();
+    let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    app.move_scene(scene, chapter, 0).unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY Removed Scenes workflow: python3 is unavailable");
+        return;
+    }
+    let home = root.path().join("home");
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(&home)
+        .arg("removed-scenes")
+        .output()
+        .expect("run the Removed Scenes Linux PTY workflow");
+    assert!(
+        result.status.success(),
+        "Removed Scenes PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn full_screen_terminal_creates_a_fiction_project_and_saves_a_scene_in_a_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

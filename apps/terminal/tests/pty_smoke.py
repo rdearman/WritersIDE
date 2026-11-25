@@ -134,6 +134,7 @@ def main():
     special_character = modes == ["special-character"]
     named_layouts = modes == ["named-layouts"]
     edit_menu = modes == ["edit-menu"]
+    removed_scenes = modes == ["removed-scenes"]
     chapter_removal = modes in (
         ["chapter-removal"],
         ["chapter-removal-target"],
@@ -276,6 +277,64 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after insertion")
             print("PTY editing workflow passed: Insert Date/Time and Insert File work through the menus.")
+            return
+
+        if removed_scenes:
+            os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
+            read_for(0.25)
+            # Scene actions are contextual to fiction Scene Cards. Reach that
+            # workspace through the author-facing Navigate menu first.
+            os.write(master, b"\x1b[21~")
+            read_for(0.15)
+            os.write(master, b"\x1b[C" * 3)
+            read_for(0.15)
+            os.write(master, b"\x1b[B" * 2 + b"\r")
+            if not wait_for_fragments((b"Included", b"Arrival"), timeout=3.0):
+                raise AssertionError("Navigate > Scene Cards did not open for the Removed Scenes workflow")
+            menu_start = len(output)
+            # F10, then move to the now-visible Scene menu.
+            os.write(master, b"\x1b[21~")
+            read_for(0.15)
+            for _ in range(9):
+                os.write(master, b"\x1b[C")
+                read_for(0.04)
+            if not wait_for_screen_fragments((b"Show Removed Scenes",), menu_start, timeout=3.0):
+                raise AssertionError(
+                    "Scene menu did not expose Show Removed Scenes; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            selected_removed_command = False
+            for _ in range(20):
+                if wait_for_screen_fragments(("▸ Show Removed Scenes".encode(),), menu_start, timeout=0.2):
+                    selected_removed_command = True
+                    break
+                os.write(master, b"\x1b[B")
+                read_for(0.1)
+            if not selected_removed_command:
+                raise AssertionError("could not select Scene > Show Removed Scenes through the menu")
+            os.write(master, b"\r")
+            if not wait_for_fragments((b"Noremovedscenes", b"ReturntoSceneCards"), menu_start, timeout=3.0):
+                raise AssertionError(
+                    "Removed Scenes did not show its specific empty state; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            return_start = len(output)
+            os.write(master, b"\x1b")  # Esc must return to Scene Cards
+            if not wait_for_fragments((b"Included", b"Arrival"), return_start, timeout=3.0):
+                raise AssertionError(
+                    "Esc did not restore Scene Cards and its prior selection; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after returning from Removed Scenes")
+            print("PTY Removed Scenes workflow passed: Scene menu, empty-state guidance, Esc return and selection restoration.")
             return
 
         if special_character:
