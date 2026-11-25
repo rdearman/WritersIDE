@@ -8665,35 +8665,56 @@ impl AppState {
         Ok(())
     }
 
-    fn create_empty_chapter_at_card(
+    fn create_empty_chapter_at_selection(
         &mut self,
         title: &str,
     ) -> Result<story_core::NodeId, Box<dyn std::error::Error>> {
         let nodes = self.app.list_structural_nodes()?;
+        let outline_node = if self.workspace == Workspace::Outline {
+            match outline_rows(self).get(self.selected) {
+                Some(OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. }) => Some(*id),
+                Some(OutlineRow::ContentUnit(id)) => self.app.get_content_unit(*id)?.parent_id,
+                Some(OutlineRow::Scene(id)) => self.app.get_scene(*id)?.chapter_id,
+                None => None,
+            }
+        } else {
+            None
+        };
         let selected_node = self
             .selected_card_chapter
             .map(|(chapter, _)| chapter)
+            .or(outline_node)
             .or_else(|| {
                 selected_scene_for_workspace(self)
                     .and_then(|scene| self.app.get_scene(scene).ok()?.chapter_id)
             });
         let anchor = selected_node.and_then(|id| nodes.iter().find(|node| node.id == id));
-        let parent = anchor.and_then(|node| node.parent_id);
-        let insertion = anchor.map(|node| node.position);
+        let (parent, insertion) = match anchor {
+            Some(node) if node.kind == "section" => (
+                Some(node.id),
+                self.app.next_structural_node_position(Some(node.id))?,
+            ),
+            Some(node) => (node.parent_id, node.position),
+            None => (None, self.app.next_structural_node_position(None)?),
+        };
         let append_position = self.app.next_structural_node_position(parent)?;
         let chapter = self
             .app
             .create_chapter(parent, title.trim(), append_position)?;
-        if let Some(position) = insertion {
-            self.app.move_structural_node(chapter, parent, position)?;
+        if anchor.is_some_and(|node| node.kind != "section") {
+            self.app.move_structural_node(chapter, parent, insertion)?;
         }
         self.refresh()?;
-        self.workspace = Workspace::Cards;
-        self.selected_card_chapter = Some((chapter, true));
-        self.message = format!(
-            "Created empty chapter “{}” at this position · Insert creates a scene in the selected chapter",
-            title.trim()
-        );
+        if self.workspace == Workspace::Cards {
+            self.selected_card_chapter = Some((chapter, true));
+        } else {
+            self.workspace = Workspace::Outline;
+            self.selected = outline_rows(self)
+                .iter()
+                .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+                .unwrap_or(0);
+        }
+        self.message = format!("Created empty chapter “{}”", title.trim());
         Ok(chapter)
     }
     fn toggle_scene_card_inclusion(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -15942,7 +15963,7 @@ impl AppState {
                 self.message = "Chapter not created · enter a title or press Esc to cancel".into();
                 return Ok(());
             }
-            self.create_empty_chapter_at_card(&cmd)?;
+            self.create_empty_chapter_at_selection(&cmd)?;
             return Ok(());
         }
         if mode == Some('h') {
@@ -18818,17 +18839,43 @@ impl AppState {
                 .create_story_object(name.trim(), description.trim())?;
             self.message = format!("Created story object {id}");
         } else if let Some(title) = cmd.strip_prefix("section ") {
-            let position = self.app.next_structural_node_position(None)?;
-            let id = self.app.create_section(title.trim(), position)?;
-            self.message = format!("Created section {id}");
-        } else if let Some(title) = cmd.strip_prefix("chapter ") {
-            if self.workspace == Workspace::Cards {
-                self.create_empty_chapter_at_card(title)?;
+            let title = title.trim();
+            if title.is_empty() {
+                self.message = "Section not created · enter a title or press Esc to cancel".into();
                 return Ok(());
             }
             let position = self.app.next_structural_node_position(None)?;
-            let id = self.app.create_chapter(None, title.trim(), position)?;
-            self.message = format!("Created chapter {id}");
+            let id = self.app.create_section(title, position)?;
+            self.refresh()?;
+            self.workspace = Workspace::Outline;
+            self.selected = outline_rows(self)
+                .iter()
+                .position(
+                    |row| matches!(row, OutlineRow::Section { id: row_id, .. } if *row_id == id),
+                )
+                .unwrap_or(0);
+            self.message = format!("Created section “{title}”");
+        } else if let Some(title) = cmd.strip_prefix("chapter ") {
+            let title = title.trim();
+            if title.is_empty() {
+                self.message = "Chapter not created · enter a title or press Esc to cancel".into();
+                return Ok(());
+            }
+            if is_manuscript_outliner(self.workspace) {
+                self.create_empty_chapter_at_selection(title)?;
+                return Ok(());
+            }
+            let position = self.app.next_structural_node_position(None)?;
+            let id = self.app.create_chapter(None, title, position)?;
+            self.refresh()?;
+            self.workspace = Workspace::Outline;
+            self.selected = outline_rows(self)
+                .iter()
+                .position(
+                    |row| matches!(row, OutlineRow::Chapter { id: row_id, .. } if *row_id == id),
+                )
+                .unwrap_or(0);
+            self.message = format!("Created chapter “{title}”");
         } else if let Some(name) = cmd.strip_prefix("character ") {
             let id = self.app.create_character(name.trim())?;
             self.selected = self
@@ -43009,6 +43056,78 @@ mod tests {
             ["Beta", "Alpha"]
         );
         assert_eq!(reopened.get_scene(scene).unwrap().chapter_id, Some(beta));
+    }
+
+    #[test]
+    fn insert_new_chapter_from_outline_renders_and_selects_empty_sibling() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project_path, "Novel").unwrap();
+        let section = app.create_section("Part One", 0).unwrap();
+        let existing = app
+            .create_chapter(Some(section), "Existing Chapter", 0)
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == existing))
+            .unwrap();
+
+        let command = command_by_id("structure.chapter").unwrap();
+        state.prompt_for_registered_command(command).unwrap();
+        for character in "New Chapter".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert_eq!(state.workspace, Workspace::Outline);
+        let rows = outline_rows(&state);
+        let created = match rows.get(state.selected) {
+            Some(OutlineRow::Chapter {
+                id,
+                title,
+                scene_count,
+                ..
+            }) => {
+                assert_eq!(title, "New Chapter");
+                assert_eq!(*scene_count, 0);
+                *id
+            }
+            other => panic!("new empty chapter was not selected in Outline: {other:?}"),
+        };
+        let created_node = state
+            .app
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .find(|node| node.id == created)
+            .unwrap();
+        assert_eq!(created_node.parent_id, Some(section));
+        let siblings = state
+            .app
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|node| node.parent_id == Some(section))
+            .map(|node| node.title)
+            .collect::<Vec<_>>();
+        assert_eq!(siblings, ["New Chapter", "Existing Chapter"]);
+
+        let reopened = WriterApp::open_project(&project_path).unwrap();
+        let reopened_outline = AppState::new(reopened, default_bindings());
+        assert!(outline_rows(&reopened_outline).iter().any(
+            |row| matches!(row, OutlineRow::Chapter { id, title, scene_count: 0, .. } if *id == created && title == "New Chapter")
+        ));
     }
 
     #[test]

@@ -243,13 +243,32 @@ def main():
         if not wait_for_screen_fragments((b"Included", b"Excluded"), menu_start, timeout=3.0):
             raise AssertionError("Scene Cards presentation did not render its Included and Excluded collections")
 
+    def show_outline_tree_presentation():
+        """Reach the hierarchical Outline from both the welcome and manuscript views."""
+        show_scene_cards_presentation()
+        menu_start = len(output)
+        os.write(master, b"\x1b[21~")  # F10
+        read_for(0.2)
+        os.write(master, b"\x1b[C" * 4)  # View
+        if not wait_for_screen_fragments((b"Show Outline Tree",), menu_start, timeout=2.0):
+            raise AssertionError("View menu did not offer the tree presentation from Scene Cards")
+        os.write(master, b"\r")
+        if not wait_for_screen_fragments((b"Selected outline item", b"No outline row selected"), menu_start, timeout=3.0):
+            raise AssertionError(
+                "Outline tree did not show the empty-project state; visible tail: "
+                + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+            )
+
     def select_visible_menu_item(label):
         for _ in range(32):
             if wait_for_screen_fragments((f"▸ {label}".encode("utf-8"),), timeout=0.12):
                 return
             os.write(master, b"\x1b[B")
             read_for(0.04)
-        raise AssertionError(f"menu did not expose selectable item {label!r}")
+        raise AssertionError(
+            f"menu did not expose selectable item {label!r}; visible tail: "
+            + repr(ANSI_CONTROL.sub(b"", output[-2200:]))
+        )
 
     try:
         read_for(1.0)
@@ -651,8 +670,8 @@ def main():
             os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
             read_for(0.3)
 
-            # View > Show Scene Cards, a presentation of the unified Outline.
-            show_scene_cards_presentation()
+            # Exercise structural creation in the primary hierarchical view.
+            show_outline_tree_presentation()
 
             def create_chapter(title):
                 menu_start = len(output)
@@ -669,12 +688,12 @@ def main():
                 prompt_start = len(output)
                 os.write(master, title.encode("utf-8") + b"\r")
                 if not wait_for_fragments(
-                    (b"\xe2\x94\x80\xe2\x94\x80 " + title.encode("utf-8")),
+                    (title.encode("utf-8"), b"0scene(s)"),
                     prompt_start,
                     timeout=3.0,
                 ):
                     raise AssertionError(
-                        f"created chapter {title!r} was not confirmed in Scene Cards; output tail: "
+                        f"created chapter {title!r} was not rendered with its empty count in Outline; output tail: "
                         + repr(ANSI_CONTROL.sub(b"", output[prompt_start:]))
                     )
 

@@ -120,13 +120,16 @@ with optional card/table presentations sharing canonical selection and order.
 The View menu now exposes Scene Cards as a presentation of Outline; switching
 between tree and cards preserves chapter/scene selection and does not add a
 second navigation-history or Tab destination. The Scene menu, inclusion toggle,
-scene creation, metadata edits and scene movement now work from the tree. The
-Removed Scenes flow returns to the original outliner presentation and
-selection. The underlying `Workspace::Cards` renderer remains a separate
-projection, so this is an integration step, not completion of #55. Next is
-consolidating the hierarchy and metadata inspector around the unified outline
-while preserving Included/Excluded and Unplaced distinctions, stable records,
-recovery and compile behaviour.
+scene creation, metadata edits and scene movement now work from the tree.
+Insert > New Chapter from the tree creates an empty sibling/child at the
+selected structural boundary, refreshes immediately, and selects the new node;
+the fresh-project PTY workflow now verifies this. The Removed Scenes flow
+returns to the original outliner presentation and selection. The underlying
+`Workspace::Cards` renderer remains a separate projection, so this is an
+integration step, not completion of #55. Next is consolidating the hierarchy
+and metadata inspector around the unified outline while preserving
+Included/Excluded and Unplaced distinctions, stable records, recovery and
+compile behaviour.
 
 ## Latest outliner and real-manuscript work
 
@@ -142,8 +145,11 @@ inspector and full structural integration remain outstanding; #55 is open for
 human UAT.
 
 Verified for this batch: formatting, workspace Clippy with warnings denied,
-the complete workspace tests, and real PTY menu, scene creation, removal,
-structural undo and outliner presentation checks passed.
+the complete workspace tests (335 terminal unit tests, 3 author workflows,
+21 PTY tests, and all other workspace unit/integration/doc tests), and real PTY
+menu, empty chapter creation, scene creation, removal, structural undo and
+outliner presentation checks passed. The Ollama loopback unit test required the
+previously authorised local socket permission.
 
 Private real Scrivener regression fixtures were checked read-only on 2026-11-25.
 `(cd fixtures && sha256sum --quiet -c SHA256SUMS)` passed before and after each
