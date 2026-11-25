@@ -49616,6 +49616,8 @@ mod tests {
             "Research notes",
         )
         .unwrap();
+        fs::create_dir_all(temporary_root.join("templates/empty-nested")).unwrap();
+        fs::create_dir_all(temporary_root.join("exports")).unwrap();
 
         let mut state = AppState::new(project, default_bindings());
         state.temporary_project = true;
@@ -49670,6 +49672,8 @@ mod tests {
             fs::read(destination.join(".git/config")).unwrap(),
             fs::read(temporary_root.join(".git/config")).unwrap()
         );
+        assert!(destination.join("templates/empty-nested").is_dir());
+        assert!(destination.join("exports").is_dir());
         assert!(temporary_root.join("project.toml").is_file());
         let reopened = WriterApp::open_project(&destination).unwrap();
         assert_eq!(

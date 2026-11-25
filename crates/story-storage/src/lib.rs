@@ -668,6 +668,8 @@ struct BackupManifest {
     format_version: u32,
     project_id: String,
     files: std::collections::BTreeMap<String, String>,
+    #[serde(default)]
+    directories: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2097,6 +2099,9 @@ impl ProjectStore {
             let mut files = Vec::new();
             collect_regular_files(&payload, &payload, &mut files)?;
             files.sort();
+            let mut directories = Vec::new();
+            collect_project_directories(&payload, &payload, &mut directories)?;
+            directories.sort();
             let mut hashes = std::collections::BTreeMap::new();
             for relative in &files {
                 let bytes = fs::read(payload.join(relative))?;
@@ -2106,15 +2111,25 @@ impl ProjectStore {
                 );
             }
             let project_id = self.get_project()?.id.to_string();
+            let mut directory_names = directories
+                .iter()
+                .map(|path| path.to_string_lossy().replace('\\', "/"))
+                .collect::<Vec<_>>();
+            directory_names.sort();
             let manifest = BackupManifest {
                 format_version: 1,
                 project_id,
                 files: hashes,
+                directories: directory_names,
             };
             let archive_file = File::create(stage.join("archive.zip"))?;
             let mut archive = zip::ZipWriter::new(archive_file);
             let options = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
+            for relative in &directories {
+                let name = relative.to_string_lossy().replace('\\', "/");
+                archive.add_directory(format!("{name}/"), options)?;
+            }
             for relative in &files {
                 let name = relative.to_string_lossy().replace('\\', "/");
                 archive.start_file(name, options)?;
@@ -2155,22 +2170,37 @@ impl ProjectStore {
             let file = File::open(archive_path)?;
             let mut archive = zip::ZipArchive::new(file)?;
             let mut observed = std::collections::BTreeMap::new();
+            let mut observed_directories = std::collections::BTreeSet::new();
             for index in 0..archive.len() {
                 let mut entry = archive.by_index(index)?;
                 let name = entry.name().to_owned();
                 if name == "manifest.json" {
                     continue;
                 }
-                let relative = safe_archive_path(&name)?;
-                if let Some(mode) = entry.unix_mode()
-                    && mode & 0o170000 != 0
-                    && mode & 0o170000 != 0o100000
-                {
-                    return Err(StorageError::Invalid(
-                        "backup archive contains a non-regular file".into(),
-                    ));
+                let relative = safe_archive_path(name.trim_end_matches('/'))?;
+                let is_directory = entry.is_dir();
+                if let Some(mode) = entry.unix_mode() {
+                    let kind = mode & 0o170000;
+                    if kind != 0
+                        && ((is_directory && kind != 0o040000)
+                            || (!is_directory && kind != 0o100000))
+                    {
+                        return Err(StorageError::Invalid(
+                            "backup archive contains a mismatched filesystem entry type".into(),
+                        ));
+                    }
                 }
                 let output = stage.join(&relative);
+                if is_directory {
+                    let normalized = relative.to_string_lossy().replace('\\', "/");
+                    if !observed_directories.insert(normalized) {
+                        return Err(StorageError::Invalid(
+                            "backup archive contains a duplicate directory".into(),
+                        ));
+                    }
+                    fs::create_dir_all(&output)?;
+                    continue;
+                }
                 let output_parent = output
                     .parent()
                     .ok_or_else(|| StorageError::Invalid("invalid archive file path".into()))?;
@@ -2192,7 +2222,10 @@ impl ProjectStore {
                     StorageError::Invalid(format!("invalid backup manifest: {error}"))
                 })?
             };
-            if manifest.format_version != 1 || observed != manifest.files {
+            if manifest.format_version != 1
+                || observed != manifest.files
+                || observed_directories.into_iter().collect::<Vec<_>>() != manifest.directories
+            {
                 return Err(StorageError::Invalid(
                     "backup manifest contents or hashes do not match the archive".into(),
                 ));
@@ -10861,6 +10894,36 @@ fn collect_regular_files(root: &Path, directory: &Path, files: &mut Vec<PathBuf>
     Ok(())
 }
 
+fn collect_project_directories(
+    root: &Path,
+    directory: &Path,
+    directories: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            return Err(StorageError::Invalid(
+                "project backup contains a symbolic link".into(),
+            ));
+        }
+        if metadata.is_dir() {
+            directories.push(
+                path.strip_prefix(root)
+                    .map_err(|_| StorageError::Invalid("backup path escaped project".into()))?
+                    .to_path_buf(),
+            );
+            collect_project_directories(root, &path, directories)?;
+        } else if !metadata.is_file() {
+            return Err(StorageError::Invalid(
+                "project backup contains a non-regular filesystem entry".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn safe_archive_path(value: &str) -> Result<PathBuf> {
     if value.is_empty() || value.contains(['\\', ':']) {
         return Err(StorageError::Invalid("unsafe backup archive path".into()));
@@ -14503,6 +14566,9 @@ mod tests {
             .save_text(scene, Some(&hash), "Portable manuscript text.")
             .unwrap();
         fs::create_dir_all(project_path.join("attachments")).unwrap();
+        fs::create_dir_all(project_path.join("templates/empty-nested")).unwrap();
+        fs::create_dir_all(project_path.join("exports")).unwrap();
+        fs::create_dir_all(project_path.join("research/empty")).unwrap();
         fs::write(
             project_path.join("attachments/source.txt"),
             b"research source",
@@ -14530,6 +14596,17 @@ mod tests {
             fs::read(relocated.join("attachments/source.txt")).unwrap(),
             b"research source"
         );
+        for directory in [
+            "attachments",
+            "templates/empty-nested",
+            "exports",
+            "research/empty",
+        ] {
+            assert!(
+                relocated.join(directory).is_dir(),
+                "empty author-owned directory was not restored: {directory}"
+            );
+        }
         assert!(ProjectStore::restore_archive_to(&archive, &relocated).is_err());
     }
 
