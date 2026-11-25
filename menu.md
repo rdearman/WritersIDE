@@ -38,6 +38,14 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - Find Previous (`Shift+F3`)
 - Find in Manuscript (`Ctrl+F`)
 - Find and Replace (`Ctrl+H`)
+- Indent Paragraph
+- Unindent Paragraph
+- Reflow Paragraph
+- UPPERCASE
+- lowercase
+- Title Case
+- Bold Selection
+- Italic Selection
 - Rename Scene
 - Set Scene Status
 - Move Scene to Chapter…

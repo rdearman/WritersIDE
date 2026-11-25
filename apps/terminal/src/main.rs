@@ -934,6 +934,12 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "search.replace-panel",
         "edit.bold-selection",
         "edit.italic-selection",
+        "edit.indent",
+        "edit.unindent",
+        "edit.reflow-paragraph",
+        "edit.uppercase",
+        "edit.lowercase",
+        "edit.title-case",
         "research.remove-reference",
         "scene.rename",
         "scene.status",
@@ -1515,6 +1521,12 @@ enum CommandAction {
     ToggleRenderedMarkdown,
     ToggleBoldSelection,
     ToggleItalicSelection,
+    IndentSelection,
+    UnindentSelection,
+    ReflowParagraph,
+    UppercaseText,
+    LowercaseText,
+    TitleCaseText,
     InsertDateTime,
     InsertFile,
     UndoEdit,
@@ -2524,6 +2536,96 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 9,
             advanced: false,
             action: CommandAction::FindPreviousMatch,
+        },
+        CommandSpec {
+            id: "edit.indent",
+            label: "Indent Paragraph",
+            description: "Indent the selected paragraphs or the current paragraph",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["indent", "increase indent"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Formatting",
+            menu_priority: 10,
+            advanced: false,
+            action: CommandAction::IndentSelection,
+        },
+        CommandSpec {
+            id: "edit.unindent",
+            label: "Unindent Paragraph",
+            description: "Remove one indentation level from the selected paragraphs or current paragraph",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["unindent", "decrease indent", "outdent"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Formatting",
+            menu_priority: 11,
+            advanced: false,
+            action: CommandAction::UnindentSelection,
+        },
+        CommandSpec {
+            id: "edit.reflow-paragraph",
+            label: "Reflow Paragraph",
+            description: "Wrap the selected paragraphs or current paragraph to a readable width",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["wrap paragraph", "format paragraph"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Formatting",
+            menu_priority: 12,
+            advanced: false,
+            action: CommandAction::ReflowParagraph,
+        },
+        CommandSpec {
+            id: "edit.uppercase",
+            label: "UPPERCASE",
+            description: "Change the selected text or current paragraph to uppercase",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["change case upper"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Formatting",
+            menu_priority: 13,
+            advanced: false,
+            action: CommandAction::UppercaseText,
+        },
+        CommandSpec {
+            id: "edit.lowercase",
+            label: "lowercase",
+            description: "Change the selected text or current paragraph to lowercase",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["change case lower"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Formatting",
+            menu_priority: 14,
+            advanced: false,
+            action: CommandAction::LowercaseText,
+        },
+        CommandSpec {
+            id: "edit.title-case",
+            label: "Title Case",
+            description: "Capitalise the first letter of each word in the selected text or current paragraph",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["change case title"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Formatting",
+            menu_priority: 15,
+            advanced: false,
+            action: CommandAction::TitleCaseText,
         },
         CommandSpec {
             id: "edit.insert-date-time",
@@ -12675,6 +12777,12 @@ impl AppState {
                 | "edit.select-all"
                 | "edit.insert-date-time"
                 | "edit.insert-file"
+                | "edit.indent"
+                | "edit.unindent"
+                | "edit.reflow-paragraph"
+                | "edit.uppercase"
+                | "edit.lowercase"
+                | "edit.title-case"
                 | "search.find-next"
                 | "search.find-previous"
         ) && self.workspace != Workspace::Editor
@@ -12692,6 +12800,12 @@ impl AppState {
                 | "edit.select-all"
                 | "edit.insert-date-time"
                 | "edit.insert-file"
+                | "edit.indent"
+                | "edit.unindent"
+                | "edit.reflow-paragraph"
+                | "edit.uppercase"
+                | "edit.lowercase"
+                | "edit.title-case"
         ) && self.reference_focused
         {
             return Some("Focus the manuscript pane first");
@@ -13776,6 +13890,12 @@ impl AppState {
             }
             CommandAction::ToggleBoldSelection => self.toggle_inline_format("**", "bold")?,
             CommandAction::ToggleItalicSelection => self.toggle_inline_format("*", "italic")?,
+            CommandAction::IndentSelection => self.adjust_paragraph_indentation(true),
+            CommandAction::UnindentSelection => self.adjust_paragraph_indentation(false),
+            CommandAction::ReflowParagraph => self.reflow_selected_paragraphs(),
+            CommandAction::UppercaseText => self.transform_text_case("upper"),
+            CommandAction::LowercaseText => self.transform_text_case("lower"),
+            CommandAction::TitleCaseText => self.transform_text_case("title"),
             CommandAction::InsertDateTime => self.insert_current_datetime(),
             CommandAction::InsertFile => self.start_file_browser(FileBrowserPurpose::InsertFile)?,
             CommandAction::UndoEdit => {
@@ -20321,6 +20441,242 @@ impl AppState {
         self.update_narrowed_passage(&source);
         self.message = format!("{label} formatting updated · manuscript stored as Markdown");
         Ok(())
+    }
+    fn current_paragraph_byte_range(&self, source: &str) -> (usize, usize) {
+        let row = self.cursor.0.min(self.editor.len().saturating_sub(1));
+        let mut starts = vec![0usize];
+        starts.extend(source.match_indices('\n').map(|(index, _)| index + 1));
+        let mut first = row;
+        while first > 0 && !self.editor[first - 1].trim().is_empty() {
+            first -= 1;
+        }
+        let mut last = row;
+        while last + 1 < self.editor.len() && !self.editor[last + 1].trim().is_empty() {
+            last += 1;
+        }
+        let end = starts.get(last + 1).map_or(source.len(), |start| start - 1);
+        (starts[first], end)
+    }
+    fn editor_operation_range(&self, paragraph: bool) -> (usize, usize) {
+        let source = self.editor.join("\n");
+        if let Some((start, end)) = self.selection_bounds() {
+            return (
+                editor_position_byte(&self.editor, start.0, start.1),
+                editor_position_byte(&self.editor, end.0, end.1),
+            );
+        }
+        if paragraph {
+            return self.current_paragraph_byte_range(&source);
+        }
+        let row = self.cursor.0.min(self.editor.len().saturating_sub(1));
+        let start = self
+            .editor
+            .iter()
+            .take(row)
+            .map(|line| line.len() + 1)
+            .sum();
+        (start, start + self.editor[row].len())
+    }
+    fn replace_editor_range(&mut self, start: usize, end: usize, replacement: &str, label: &str) {
+        let source = self.editor.join("\n");
+        if start > end
+            || end > source.len()
+            || !source.is_char_boundary(start)
+            || !source.is_char_boundary(end)
+        {
+            self.message = "The selected text could not be transformed safely".into();
+            return;
+        }
+        if source.get(start..end) == Some(replacement) {
+            self.message = format!("{label}: no changes needed");
+            return;
+        }
+        if self
+            .narrowed_passage
+            .is_some_and(|(low, high)| start < low || end > high)
+        {
+            self.message = "The selected text extends outside the narrowed passage".into();
+            return;
+        }
+        let before = source.clone();
+        let mut updated = source;
+        updated.replace_range(start..end, replacement);
+        self.push_undo();
+        self.editor = updated.split('\n').map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        self.cursor =
+            editor_position_from_byte(&updated, start + replacement.len()).unwrap_or((0, 0));
+        self.editor_selection = None;
+        self.dirty = true;
+        self.update_narrowed_passage(&before);
+        self.message = format!("{label} · Undo available");
+    }
+    fn adjust_paragraph_indentation(&mut self, indent: bool) {
+        let source = self.editor.join("\n");
+        let (start, end) = self.editor_operation_range(false);
+        if self
+            .narrowed_passage
+            .is_some_and(|(low, high)| start < low || end > high)
+        {
+            self.message = "The selected paragraphs extend outside the narrowed passage".into();
+            return;
+        }
+        let mut starts = vec![0usize];
+        starts.extend(source.match_indices('\n').map(|(index, _)| index + 1));
+        let first_row = starts
+            .partition_point(|line_start| *line_start <= start)
+            .saturating_sub(1);
+        let end_row = starts
+            .partition_point(|line_start| *line_start <= end)
+            .saturating_sub(1);
+        let last_row = if end > start && starts.get(end_row) == Some(&end) {
+            end_row.saturating_sub(1)
+        } else {
+            end_row
+        };
+        let width = self.editor_preferences.indent_width.max(1);
+        let indent_text = if self.editor_preferences.indentation == "tabs" {
+            "\t".to_owned()
+        } else {
+            " ".repeat(width)
+        };
+        let mut updated = source.clone();
+        let mut delta_before_cursor = 0isize;
+        let cursor_byte = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+        let anchor_byte = self
+            .editor_selection
+            .map(|anchor| editor_position_byte(&self.editor, anchor.0, anchor.1));
+        let mut delta_before_anchor = 0isize;
+        for row in (first_row..=last_row.min(starts.len().saturating_sub(1))).rev() {
+            let line_start = starts[row];
+            let line_end = source[line_start..]
+                .find('\n')
+                .map_or(source.len(), |offset| line_start + offset);
+            let line = &source[line_start..line_end];
+            let change = if indent {
+                Some((line_start, line_start, indent_text.as_str()))
+            } else if line.starts_with('\t') {
+                Some((line_start, line_start + 1, ""))
+            } else {
+                let spaces = line
+                    .chars()
+                    .take_while(|character| *character == ' ')
+                    .count();
+                let remove = spaces.min(width);
+                (remove > 0).then_some((line_start, line_start + remove, ""))
+            };
+            if let Some((remove_start, remove_end, replacement)) = change {
+                updated.replace_range(remove_start..remove_end, replacement);
+                if cursor_byte >= remove_end {
+                    delta_before_cursor +=
+                        replacement.len() as isize - (remove_end - remove_start) as isize;
+                }
+                if anchor_byte.is_some_and(|byte| byte >= remove_end) {
+                    delta_before_anchor +=
+                        replacement.len() as isize - (remove_end - remove_start) as isize;
+                }
+            }
+        }
+        if updated == source {
+            self.message = "Paragraph already has no indentation to remove".into();
+            return;
+        }
+        let before = source;
+        self.push_undo();
+        self.editor = updated.split('\n').map(str::to_owned).collect();
+        self.cursor = editor_position_from_byte(
+            &updated,
+            cursor_byte.saturating_add_signed(delta_before_cursor),
+        )
+        .unwrap_or((0, 0));
+        if let Some(anchor_byte) = anchor_byte {
+            self.editor_selection = editor_position_from_byte(
+                &updated,
+                anchor_byte.saturating_add_signed(delta_before_anchor),
+            )
+            .or(Some(self.cursor));
+        }
+        self.dirty = true;
+        self.update_narrowed_passage(&before);
+        self.message = if indent {
+            "Paragraph indented · Undo available"
+        } else {
+            "Paragraph unindented · Undo available"
+        }
+        .into();
+    }
+    fn reflow_selected_paragraphs(&mut self) {
+        let source = self.editor.join("\n");
+        let (start, end) = self.editor_operation_range(true);
+        let Some(selected) = source.get(start..end) else {
+            self.message = "The current paragraph could not be reflowed safely".into();
+            return;
+        };
+        let reflowed = selected
+            .split("\n\n")
+            .map(|paragraph| {
+                let mut line = String::new();
+                let mut output = Vec::new();
+                for word in paragraph.split_whitespace() {
+                    let next_width = line.graphemes(true).count()
+                        + usize::from(!line.is_empty())
+                        + word.graphemes(true).count();
+                    if !line.is_empty() && next_width > 78 {
+                        output.push(std::mem::take(&mut line));
+                    }
+                    if !line.is_empty() {
+                        line.push(' ');
+                    }
+                    line.push_str(word);
+                }
+                if !line.is_empty() {
+                    output.push(line);
+                }
+                output.join("\n")
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        self.replace_editor_range(start, end, &reflowed, "Paragraph reflowed");
+    }
+    fn transform_text_case(&mut self, mode: &str) {
+        let source = self.editor.join("\n");
+        let (start, end) = self.editor_operation_range(true);
+        let Some(selected) = source.get(start..end) else {
+            self.message = "The current text could not be changed safely".into();
+            return;
+        };
+        let transformed = match mode {
+            "upper" => selected.to_uppercase(),
+            "lower" => selected.to_lowercase(),
+            "title" => selected
+                .split_inclusive(char::is_whitespace)
+                .map(|segment| {
+                    let Some((offset, first)) =
+                        segment.char_indices().find(|(_, ch)| ch.is_alphabetic())
+                    else {
+                        return segment.to_owned();
+                    };
+                    let mut result = String::with_capacity(segment.len());
+                    result.push_str(&segment[..offset]);
+                    result.extend(first.to_uppercase());
+                    result.extend(
+                        segment[offset + first.len_utf8()..]
+                            .chars()
+                            .flat_map(char::to_lowercase),
+                    );
+                    result
+                })
+                .collect(),
+            _ => return,
+        };
+        let label = match mode {
+            "upper" => "Text changed to uppercase",
+            "lower" => "Text changed to lowercase",
+            _ => "Text changed to title case",
+        };
+        self.replace_editor_range(start, end, &transformed, label);
     }
     fn update_narrowed_passage(&mut self, old_text: &str) {
         let Some((start, end)) = self.narrowed_passage else {
@@ -46674,6 +47030,72 @@ mod tests {
         state.cursor = (0, 0);
         run_edit_menu(&mut state, "edit.paste-clipboard");
         assert_eq!(state.editor.join("\n"), "alpha betaalpha beta");
+    }
+
+    #[test]
+    fn edit_menu_formatting_actions_indent_reflow_change_case_and_undo() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let hash = app.load_scene_text(scene).unwrap().1;
+        app.save_scene_text(
+            scene,
+            Some(&hash),
+            "the FIRST line wraps\nacross lines but keeps its words",
+        )
+        .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+
+        let run_edit_menu = |state: &mut AppState, command_id: &str| {
+            state.open_menu_category(1);
+            let selected = state
+                .menu_visible_entries()
+                .iter()
+                .position(|command| command.id == command_id)
+                .unwrap_or_else(|| panic!("{command_id} is absent from the Edit menu"));
+            state.menu.as_mut().unwrap().selected = selected;
+            state
+                .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+
+        state.cursor = (0, 0);
+        run_edit_menu(&mut state, "edit.indent");
+        assert!(
+            state.editor[0].starts_with("\tthe FIRST"),
+            "{} / {:?}",
+            state.message,
+            state.editor
+        );
+        run_edit_menu(&mut state, "edit.unindent");
+        assert_eq!(state.editor[0], "the FIRST line wraps");
+
+        state.editor_selection = Some((0, 0));
+        state.cursor = (0, 9);
+        run_edit_menu(&mut state, "edit.uppercase");
+        assert_eq!(state.editor[0], "THE FIRST line wraps");
+        run_edit_menu(&mut state, "edit.undo");
+        assert_eq!(state.editor[0], "the FIRST line wraps");
+
+        state.editor_selection = None;
+        state.cursor = (0, 0);
+        run_edit_menu(&mut state, "edit.title-case");
+        assert_eq!(state.editor[0], "The First Line Wraps");
+        run_edit_menu(&mut state, "edit.lowercase");
+        assert_eq!(state.editor[0], "the first line wraps");
+
+        let long_line = format!("{} second line", "word ".repeat(18).trim_end());
+        state.editor = vec![long_line.clone()];
+        state.cursor = (0, 0);
+        state.editor_selection = None;
+        run_edit_menu(&mut state, "edit.reflow-paragraph");
+        assert!(state.editor.len() > 1);
+        assert_eq!(state.editor.join(" ").split_whitespace().count(), 20);
+        run_edit_menu(&mut state, "edit.undo");
+        assert_eq!(state.editor.join("\n"), long_line);
     }
 
     #[test]

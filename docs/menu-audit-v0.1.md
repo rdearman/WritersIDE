@@ -381,8 +381,14 @@ registry displays conventional shortcuts (`Ctrl+Z`, `Ctrl+Y` / `Ctrl+Shift+Z`,
 existing editor operations; reference-pane `Ctrl+C` retains its passage-copy
 meaning, and scoped replacement undo remains available through `Ctrl+Z`.
 Automated menu-path regression coverage verifies selection, clipboard, cut,
-undo, redo and paste. This supplement does not claim that every requested text
-transformation from issue #54 is implemented.
+undo, redo and paste. The Edit menu also exposes paragraph indentation, reflow
+and case conversion as direct actions. These transform the current paragraph
+when there is no selection, or selected text/paragraphs when selected; successful
+changes are undoable. Indentation follows the project's tab or spaces
+preference. Reflow wraps to 78 grapheme clusters while retaining blank
+paragraph breaks. Case actions include uppercase, lowercase and title case.
+Regression coverage invokes these operations through the Edit menu and checks
+their results and undo behaviour.
 
 ## Alpha UAT 19 — manuscript insertion actions
 
@@ -391,5 +397,4 @@ Date/time inserts an explicit UTC timestamp. Insert File reuses the shared
 two-pane browser, accepts UTF-8 text files, preserves source bytes, and inserts
 the chosen text at the manuscript cursor as one undoable edit. Menu integration,
 undo, save/reopen persistence, and source preservation are exercised in both
-unit and Linux PTY tests. Remaining #54 editing requests (including paragraph
-reflow, indentation controls and case transformation) are not claimed complete.
+unit and Linux PTY tests.
