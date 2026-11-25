@@ -22594,6 +22594,53 @@ impl AppState {
         }
     }
 
+    fn delete_rendered_grapheme(&mut self, backward: bool) -> bool {
+        if !self.editor_preferences.rendered_markdown
+            || self.editor_selection.is_some()
+            || !self.extra_cursors.is_empty()
+        {
+            return false;
+        }
+        let source = self.editor.join("\n");
+        let projection = story_document::SemanticDocument::parse(source).rendered_projection();
+        if projection.mode != story_document::ProjectionMode::Rendered {
+            return false;
+        }
+        let Some(source_offset) = self.rendered_source_offset_for_cursor(&projection, self.cursor)
+        else {
+            return false;
+        };
+        let Some(display_offset) =
+            projection.source_to_display(source_offset, story_document::ProjectionBias::After)
+        else {
+            return false;
+        };
+        let target = if backward {
+            projection
+                .graphemes
+                .iter()
+                .rev()
+                .find(|grapheme| grapheme.display.end <= display_offset)
+        } else {
+            projection
+                .graphemes
+                .iter()
+                .find(|grapheme| grapheme.display.start >= display_offset)
+        };
+        if let Some(target) = target {
+            let range = target.source;
+            let label = if backward { "Backspace" } else { "Delete" };
+            self.replace_editor_range(range.start, range.end, "", label);
+        } else {
+            self.message = if backward {
+                "Start of rendered passage · no visible text to remove".into()
+            } else {
+                "End of rendered passage · no visible text to remove".into()
+            };
+        }
+        true
+    }
+
     fn move_editor_cursors_in_view(&mut self, motion: CursorMotion, selecting: bool) {
         if !self.editor_preferences.rendered_markdown || !self.extra_cursors.is_empty() {
             self.move_editor_cursors(motion, selecting);
@@ -32267,6 +32314,11 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 && !k.modifiers.contains(KeyModifiers::ALT)
                 || (k.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(k.code, KeyCode::Char('x' | 'v')))));
+        if matches!(k.code, KeyCode::Backspace | KeyCode::Delete)
+            && s.delete_rendered_grapheme(k.code == KeyCode::Backspace)
+        {
+            return Ok(false);
+        }
         if mutating {
             s.search_locations.clear();
             s.search_result_rows.clear();
@@ -50155,6 +50207,14 @@ mod tests {
         let mut state = AppState::new(app, default_bindings());
         state.open_scene(scene).unwrap();
         state.editor_preferences.rendered_markdown = true;
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), source);
+        assert!(!state.dirty, "backspace at the visible start is a no-op");
 
         handle(
             &mut state,

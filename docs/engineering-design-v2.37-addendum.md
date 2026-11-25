@@ -18,6 +18,11 @@ second editor buffer or rewrite source during display operations.
   from a hidden-syntax boundary to the corresponding visible source boundary.
   The shared editor operation then mutates canonical Markdown and uses the
   existing Undo and journalled save paths.
+- Backspace/Delete on a lone rendered cursor remove the adjacent visible
+  grapheme's mapped source range. At the start/end of rendered text they are
+  no-ops; hidden emphasis or heading delimiters are never treated as visible
+  prose to delete. Selected-text deletion continues to remove the exact source
+  selection.
 - Unicode positions remain grapheme-aware through the projection's UTF-8 byte
   map. Source-fallback documents retain the existing source-editor behavior.
 - Single-cursor Shift+Arrow selection uses projected movement while retaining
