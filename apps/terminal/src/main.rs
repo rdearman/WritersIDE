@@ -12910,16 +12910,9 @@ impl AppState {
     fn open_selected(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.workspace == Workspace::Outline {
             match outline_rows(self).get(self.selected).cloned() {
-                Some(OutlineRow::Section { id, .. }) => return self.toggle_outline_node(id),
-                Some(OutlineRow::Chapter { id, .. }) => return self.toggle_outline_node(id),
-                Some(OutlineRow::Scene(id)) => {
-                    self.selected = self
-                        .scenes
-                        .iter()
-                        .position(|scene| scene.0 == id)
-                        .ok_or("outline scene no longer exists")?;
-                    return self.open_scene(id);
-                }
+                Some(OutlineRow::Section { id, .. }) => return self.open_outline_container(id),
+                Some(OutlineRow::Chapter { id, .. }) => return self.open_outline_container(id),
+                Some(OutlineRow::Scene(id)) => return self.open_scene(id),
                 Some(OutlineRow::ContentUnit(id)) => return self.open_content_unit(id),
                 None => return Ok(()),
             }
@@ -13134,6 +13127,99 @@ impl AppState {
         if let Some(id) = self.active_scene() {
             self.open_scene(id)?;
         }
+        Ok(())
+    }
+    fn open_outline_container(
+        &mut self,
+        node_id: story_core::NodeId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            self.message =
+                "Save the open manuscript text before navigating from the outline".into();
+            return Ok(());
+        }
+
+        let nodes = self.app.list_structural_nodes()?;
+        let descendants = nodes
+            .iter()
+            .filter(|candidate| {
+                let mut parent = candidate.parent_id;
+                while let Some(parent_id) = parent {
+                    if parent_id == node_id {
+                        return true;
+                    }
+                    parent = nodes
+                        .iter()
+                        .find(|item| item.id == parent_id)
+                        .and_then(|item| item.parent_id);
+                }
+                false
+            })
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>();
+
+        // Opening a container should reveal its first manuscript document.
+        // Expand only its descendants so the selected document remains visible
+        // when the author returns to the outliner.
+        self.collapsed_outline_nodes
+            .retain(|collapsed| *collapsed != node_id && !descendants.contains(collapsed));
+        let rows = outline_rows(self);
+        let node_row = rows.iter().position(|row| {
+            matches!(row, OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } if *id == node_id)
+        });
+        let target = node_row.and_then(|position| {
+            rows.iter()
+                .enumerate()
+                .skip(position + 1)
+                .find_map(|(row_index, row)| {
+                    let belongs_to_node = match row {
+                        OutlineRow::ContentUnit(id) => self
+                            .app
+                            .get_content_unit(*id)
+                            .ok()
+                            .and_then(|unit| unit.parent_id)
+                            .is_some_and(|parent| {
+                                parent == node_id || descendants.contains(&parent)
+                            }),
+                        OutlineRow::Scene(id) => self
+                            .app
+                            .get_scene(*id)
+                            .ok()
+                            .and_then(|scene| scene.chapter_id)
+                            .is_some_and(|chapter| {
+                                chapter == node_id || descendants.contains(&chapter)
+                            }),
+                        OutlineRow::Section { .. } | OutlineRow::Chapter { .. } => false,
+                    };
+                    belongs_to_node.then_some((row_index, row.clone()))
+                })
+        });
+
+        if let Some((row_index, row)) = target {
+            self.selected = row_index;
+            return match row {
+                OutlineRow::ContentUnit(id) => self.open_content_unit(id),
+                OutlineRow::Scene(id) => self.open_scene(id),
+                OutlineRow::Section { .. } | OutlineRow::Chapter { .. } => unreachable!(),
+            };
+        }
+
+        let title = nodes
+            .iter()
+            .find(|node| node.id == node_id)
+            .map(|node| node.title.clone())
+            .unwrap_or_else(|| "Selected section".into());
+        self.switch(Workspace::Editor);
+        self.editing_scene = None;
+        self.editing_content_unit = None;
+        self.editor.clear();
+        self.saved_hash.clear();
+        self.cursor = (0, 0);
+        self.scroll = 0;
+        self.message = format!(
+            "{} is empty · use Insert > Write Chapter or create a child document",
+            title
+        );
         Ok(())
     }
     fn open_scene(&mut self, id: SceneId) -> Result<(), Box<dyn std::error::Error>> {
@@ -13519,13 +13605,20 @@ impl AppState {
                     .and_then(|scene| scene_card_ids(self).iter().position(|id| *id == scene))
                     .unwrap_or(0);
             } else if w == Workspace::Outline {
-                self.selected = current_scene
-                    .and_then(|scene| {
-                        outline_rows(self)
-                            .iter()
-                            .position(|row| *row == OutlineRow::Scene(scene))
-                    })
-                    .unwrap_or(0);
+                let rows = outline_rows(self);
+                if let Some(scene) = current_scene {
+                    self.selected = rows
+                        .iter()
+                        .position(|row| *row == OutlineRow::Scene(scene))
+                        .unwrap_or(self.selected.min(rows.len().saturating_sub(1)));
+                } else if let Some(content_unit) = self.editing_content_unit {
+                    self.selected = rows
+                        .iter()
+                        .position(|row| *row == OutlineRow::ContentUnit(content_unit))
+                        .unwrap_or(self.selected.min(rows.len().saturating_sub(1)));
+                } else {
+                    self.selected = self.selected.min(rows.len().saturating_sub(1));
+                }
             } else if previous == Workspace::Cards {
                 self.selected = current_scene
                     .and_then(|scene| self.scenes.iter().position(|row| row.0 == scene))
@@ -23976,7 +24069,7 @@ fn workspace_action_hint(state: &AppState) -> String {
             }
         }
         Workspace::Outline if state.removed_content_units_list => "Removed Prose Documents · ↑/↓ select · Edit > Restore Selected Prose Document · Edit > Show Removed Prose Documents returns".into(),
-        Workspace::Outline => "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Remove/Restore Prose Document · Edit > Move Item Up/Down".into(),
+        Workspace::Outline => "↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude · Insert creates content · Edit > Remove/Move".into(),
         Workspace::Editor => "Esc: Outline".into(),
         _ => "Tab: next primary view · Shift+Tab: previous".into(),
     }
@@ -25480,7 +25573,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     .cloned()
                     .unwrap_or_else(|| "No outline row selected".into());
                 format!(
-                    "{row}\n\nEnter or Space toggles chapter collapse. Enter on a scene opens it."
+                    "{row}\n\nEnter opens this item in the manuscript. Space expands or collapses headings, or changes whether a scene is included."
                 )
             } else if s.workspace == Workspace::Research && s.proposal_review_active {
                 format!(
@@ -33605,18 +33698,43 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.message = format!("Diff for {}", snapshot.label);
             }
         }
+        KeyCode::Char(' ') if s.workspace == Workspace::Outline && k.modifiers.is_empty() => {
+            match outline_rows(s).get(s.selected).cloned() {
+                Some(OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. }) => {
+                    s.toggle_outline_node(id)?;
+                }
+                Some(OutlineRow::Scene(id)) => {
+                    let included = s.app.scene_is_included(id)?;
+                    s.app.set_scene_included(id, !included)?;
+                    s.refresh()?;
+                    s.selected = outline_rows(s)
+                        .iter()
+                        .position(|row| *row == OutlineRow::Scene(id))
+                        .unwrap_or(s.selected);
+                    let title = s.app.get_scene(id)?.scene.title;
+                    s.message = if included {
+                        format!("Moved “{title}” to Excluded · its text and metadata are retained")
+                    } else {
+                        format!(
+                            "Moved “{title}” to Included · it will appear in Compile when placed"
+                        )
+                    };
+                }
+                Some(OutlineRow::ContentUnit(_)) | None => {
+                    s.message = "Select a heading or scene to change its outline state".into();
+                }
+            }
+        }
         KeyCode::Char(' ')
-            if matches!(
-                s.workspace,
-                Workspace::Outline | Workspace::Cards | Workspace::Search
-            ) =>
+            if s.workspace == Workspace::Outline && k.modifiers == KeyModifiers::CONTROL =>
         {
             if let Some(scene) = selected_scene_for_workspace(s) {
                 toggle_scene_selection(s, scene);
-            } else if s.workspace == Workspace::Outline
-                && let Some(OutlineRow::Chapter { id, .. }) = outline_rows(s).get(s.selected)
-            {
-                s.toggle_outline_node(*id)?;
+            }
+        }
+        KeyCode::Char(' ') if s.workspace == Workspace::Search && k.modifiers.is_empty() => {
+            if let Some(scene) = selected_scene_for_workspace(s) {
+                toggle_scene_selection(s, scene);
             }
         }
         KeyCode::Enter if s.workspace == Workspace::Assemblies => {
@@ -33726,7 +33844,7 @@ mod tests {
         assert_eq!(detail_panel_title(&state), "Selected outline item");
         assert_eq!(
             workspace_action_hint(&state),
-            "↑/↓ select · Enter expand/collapse · Insert > New Chapter/Section or Write Chapter · Edit > Remove/Restore Prose Document · Edit > Move Item Up/Down"
+            "↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude · Insert creates content · Edit > Remove/Move"
         );
 
         state.workspace = Workspace::StoryBible;
@@ -34473,6 +34591,148 @@ mod tests {
             "Argument with evidence."
         );
         assert!(reopened_state.app.list_scenes(false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn outline_enter_opens_heading_prose_or_first_descendant_instead_of_collapsing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project_with_type(
+            root.path().join("Book"),
+            "Book",
+            story_core::BookType::Nonfiction,
+        )
+        .unwrap();
+        let section = app.create_section("Part I", 0).unwrap();
+        let chapter = app.create_chapter(Some(section), "Chapter 10", 0).unwrap();
+        let body = app
+            .create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "Chapter 10 prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let section_body = app
+            .create_content_unit(
+                story_core::ContentUnitKind::SectionBody,
+                "Part I prose",
+                Some(section),
+                0,
+                None,
+            )
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Section { id, .. } if *id == section))
+            .unwrap();
+        state.open_selected().unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert_eq!(state.editing_content_unit, Some(section_body));
+
+        state.workspace = Workspace::Outline;
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+            .unwrap();
+        state.open_selected().unwrap();
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert_eq!(state.editing_content_unit, Some(body));
+        state.switch(Workspace::Outline);
+        assert_eq!(
+            outline_rows(&state).get(state.selected),
+            Some(&OutlineRow::ContentUnit(body))
+        );
+    }
+
+    #[test]
+    fn outline_enter_on_empty_heading_shows_its_empty_manuscript_context() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let empty = app.create_chapter(None, "Empty Chapter", 0).unwrap();
+        let previous_chapter = app.create_chapter(None, "Previous", 1).unwrap();
+        let previous_scene = app
+            .create_scene(previous_chapter, "Previously open", 0)
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(previous_scene).unwrap();
+        state.workspace = Workspace::Outline;
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == empty))
+            .unwrap();
+
+        state.open_selected().unwrap();
+
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert_eq!(state.editing_scene, None);
+        assert_eq!(state.editing_content_unit, None);
+        assert!(state.editor.is_empty());
+        assert!(state.message.contains("Empty Chapter is empty"));
+        assert!(state.message.contains("Insert > Write Chapter"));
+        assert_eq!(state.app.load_scene_text(previous_scene).unwrap().0, "");
+    }
+
+    #[test]
+    fn outline_enter_on_section_without_prose_opens_first_nested_scene_and_restores_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let section = app.create_section("Part I", 0).unwrap();
+        let chapter = app.create_chapter(Some(section), "Chapter 1", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.workspace = Workspace::Outline;
+        state.collapsed_outline_nodes.insert(section);
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Section { id, .. } if *id == section))
+            .unwrap();
+
+        state.open_selected().unwrap();
+
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert_eq!(state.editing_scene, Some(scene));
+        assert!(!state.collapsed_outline_nodes.contains(&section));
+        state.switch(Workspace::Outline);
+        assert_eq!(
+            outline_rows(&state).get(state.selected),
+            Some(&OutlineRow::Scene(scene))
+        );
+    }
+
+    #[test]
+    fn outline_space_reversibly_toggles_scene_compile_inclusion() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.workspace = Workspace::Outline;
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| *row == OutlineRow::Scene(scene))
+            .unwrap();
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(!state.app.scene_is_included(scene).unwrap());
+        assert!(state.message.contains("to Excluded"));
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.app.scene_is_included(scene).unwrap());
+        assert!(state.message.contains("to Included"));
     }
 
     #[test]
@@ -40338,7 +40598,7 @@ mod tests {
         );
         handle(
             &mut reopened,
-            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
         )
         .unwrap();
         assert_eq!(workspace_items(&reopened).len(), 4);

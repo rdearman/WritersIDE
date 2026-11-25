@@ -131,6 +131,7 @@ def main():
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
     insert_edit_actions = modes == ["insert-edit-actions"]
+    outline_enter = modes == ["outline-enter"]
     special_character = modes == ["special-character"]
     named_layouts = modes == ["named-layouts"]
     edit_menu = modes == ["edit-menu"]
@@ -228,6 +229,60 @@ def main():
 
     try:
         read_for(1.0)
+        if outline_enter:
+            if not wait_for_screen_fragments(
+                (b"Guided Tour", b"Quick Start"), timeout=10.0
+            ):
+                raise AssertionError("the first-run welcome screen did not become ready")
+            os.write(master, b"\x1b")  # dismiss the visible first-run welcome screen
+            read_for(0.25)
+
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 3)  # Navigate
+            selected_outline = False
+            for _ in range(16):
+                if wait_for_screen_fragments(("▸ Outline".encode(),), menu_start, timeout=0.15):
+                    selected_outline = True
+                    break
+                os.write(master, b"\x1b[B")
+                read_for(0.1)
+            if not selected_outline:
+                raise AssertionError("Navigate did not expose the selected Outline command")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Part I", b"Chapter 1", b"Opening"), menu_start, timeout=5.0
+            ):
+                raise AssertionError("the hierarchical outline did not render its seeded nodes")
+
+            # The tree is Section > Chapter > Scene. Move to the section and
+            # verify Enter opens its first manuscript descendant.
+            os.write(master, b"\x1b[A" * 2)
+            read_for(0.2)
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Opening paragraph remains editable.",), timeout=5.0
+            ):
+                raise AssertionError("Enter on a section did not open its first scene")
+
+            os.write(master, b"\x1b")
+            if not wait_for_screen_fragments(
+                (b"Part I", b"Chapter 1", b"Opening"), timeout=5.0
+            ):
+                raise AssertionError("returning from the editor did not restore the outline")
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after Outline navigation")
+            print("PTY Outline workflow passed: Enter opens a section descendant and restores the selected hierarchy.")
+            return
+
         if insert_edit_actions:
             os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
             read_for(0.25)
@@ -902,7 +957,7 @@ def main():
             if chapter_removal_cancel:
                 os.write(master, b"\x1b")  # cancel; all hierarchy and prose must remain
                 if not wait_for_screen_fragments(
-                    (b"toggleschaptercollapse", b"scene(s)"),
+                    (b"Opening", b"scene(s)"),
                     dialog_start,
                     timeout=3.0,
                 ):

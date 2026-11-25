@@ -434,6 +434,49 @@ fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn outline_enter_opens_a_section_descendant_and_returns_to_the_same_scene() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Outline PTY");
+    let mut app = WriterApp::create_project(&project, "Outline PTY").unwrap();
+    let section = app.create_section("Part I", 0).unwrap();
+    let chapter = app.create_chapter(Some(section), "Chapter 1", 0).unwrap();
+    let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+    let expected = "Opening paragraph remains editable.";
+    let expected_hash = app.load_scene_text(scene).unwrap().1;
+    app.save_scene_text(scene, Some(&expected_hash), expected)
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux unified Outline PTY workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("outline-enter")
+        .output()
+        .expect("run the Linux PTY unified Outline workflow");
+    assert!(
+        result.status.success(),
+        "unified Outline PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(reopened.load_scene_text(scene).unwrap().0, expected);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn scene_and_reference_removal_dialogues_are_cancellable_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

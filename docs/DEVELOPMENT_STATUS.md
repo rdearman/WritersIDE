@@ -53,6 +53,33 @@ records or changing storage unless an audit proves it necessary. Preserve
 Included/Excluded and Unplaced distinctions, and retain existing recovery and
 compile behavior.
 
+## Latest outliner and real-manuscript work
+
+The terminal outline now treats Enter on a section/chapter as “open its first
+manuscript document”: direct prose is preferred by outline order, otherwise the
+first descendant document is opened. Empty headings open an empty manuscript
+context with a useful creation hint. Returning from the editor restores the
+selected scene or prose document. Space now expands/collapses headings and
+toggles a scene between Included and Excluded; Ctrl+Space remains available for
+multi-selection. These changes are incremental; Outline and Scene Cards are
+still separate workspaces, so #55 is not complete and still requires human UAT.
+
+Verified for this batch: terminal unit tests 333/333, author workflows 3/3,
+Linux PTY tests 20/20, terminal Clippy, formatting, Python PTY harness syntax,
+and `git diff --check`. The full workspace suite has not yet been rerun for this
+batch.
+
+Private real Scrivener regression fixtures were checked read-only on 2026-11-25.
+`(cd fixtures && sha256sum --quiet -c SHA256SUMS)` passed and Git tracks no files
+under `fixtures/`, `generated/`, `reports/` or `baselines/`. The projects are
+all Scrivener 3.1.5.1 Windows manifests (manifest revision 2.0): book 01 has 70
+binder items and RTF/PDF assets; book 02 has 64 items and a nested binder; book
+03 has 118 items and both RTF and plain-text assets. `epubcheck` is not installed
+in the current environment; Java, Calibre and Pandoc are present. The production
+import/compile regression harness for these three fixtures is still outstanding.
+Keep all fixture-derived content and reports in the private ignored directories;
+never commit or publish them.
+
 ## Verification commands
 
 ```sh
