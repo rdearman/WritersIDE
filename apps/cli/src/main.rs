@@ -13,6 +13,54 @@ use story_core::{
     SceneQueryFilter, SnapshotId,
 };
 
+struct ScrivenerImportCliOptions {
+    mapping_path: Option<PathBuf>,
+    title: Option<String>,
+    mode: story_import::ScrivenerImportMode,
+    book_type: story_core::BookType,
+}
+
+fn parse_scrivener_import_options(
+    tokens: Vec<String>,
+) -> Result<ScrivenerImportCliOptions, Box<dyn std::error::Error>> {
+    let mut positional = Vec::new();
+    let mut editable = false;
+    let mut book_type = story_core::BookType::Fiction;
+    let mut book_type_seen = false;
+    for token in tokens {
+        if token == "--editable" {
+            if editable {
+                return Err("duplicate --editable option".into());
+            }
+            editable = true;
+        } else if let Some(value) = token.strip_prefix("--book-type=") {
+            if book_type_seen {
+                return Err("duplicate --book-type option".into());
+            }
+            book_type = story_core::BookType::parse(value)
+                .ok_or("book type must be fiction, nonfiction, or custom")?;
+            book_type_seen = true;
+        } else if token.starts_with('-') {
+            return Err(format!("unknown Scrivener import option: {token}").into());
+        } else {
+            positional.push(token);
+        }
+    }
+    if positional.len() > 2 {
+        return Err("Scrivener import accepts only mapping.json and an optional title".into());
+    }
+    Ok(ScrivenerImportCliOptions {
+        mapping_path: positional.first().map(PathBuf::from),
+        title: positional.get(1).cloned(),
+        mode: if editable {
+            story_import::ScrivenerImportMode::Editable
+        } else {
+            story_import::ScrivenerImportMode::Both
+        },
+        book_type,
+    })
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let Some(cmd) = args.next() else {
@@ -2436,15 +2484,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 .next()
                 .ok_or("missing .scriv project directory or .scrivx manifest")?;
             let destination = PathBuf::from(args.next().ok_or("missing new project directory")?);
-            let mapping_path = args.next().map(PathBuf::from);
-            let requested_title = args.next();
-            let mode = match args.next().as_deref() {
-                None => story_import::ScrivenerImportMode::Both,
-                Some("--editable") => story_import::ScrivenerImportMode::Editable,
-                Some(value) => {
-                    return Err(format!("unknown Scrivener import option: {value}").into());
-                }
-            };
+            let options = parse_scrivener_import_options(args.collect())?;
+            let mapping_path = options.mapping_path;
+            let requested_title = options.title;
+            let mode = options.mode;
             if destination.exists() {
                 return Err(
                     "Scrivener import requires a new project directory that does not already exist"
@@ -2481,7 +2524,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let staging_parent = tempfile::tempdir_in(parent)?;
                 let staging_project = staging_parent.path().join("book");
                 let title = requested_title.as_deref().unwrap_or(&inventory.title);
-                let mut app = WriterApp::create_project(&staging_project, title)?;
+                let mut app = WriterApp::create_project_with_type(
+                    &staging_project,
+                    title,
+                    options.book_type,
+                )?;
                 let (run, scenes) = app.import_scrivener_inventory(&inventory, &plan, mode)?;
                 app.validate_project()?;
                 let report = serde_json::json!({
@@ -3516,7 +3563,7 @@ fn usage() {
         "writers-ide inspect-scrivener <.scriv-project-directory|.scrivx-manifest> (experimental inventory only)"
     );
     eprintln!(
-        "writers-ide import-scrivener <source> <new-project-directory> [mapping.json] [title] [--editable]"
+        "writers-ide import-scrivener <source> <new-project-directory> [mapping.json] [title] [--book-type=fiction|nonfiction|custom] [--editable]"
     );
     eprintln!("writers-ide series-create <series-directory> <title>");
     eprintln!("writers-ide series-list <series-directory>");
@@ -4173,12 +4220,50 @@ mod watch_tests {
         apply_replace_preview, compile_edition, compile_edition_using_recipe_engine,
         compile_edition_with_aspell, compile_edition_with_aspell_and_overwrite,
         compile_edition_with_overwrite, edition_watch_fingerprint, parse_scene_query_filter,
-        recover_cli_replace_groups, run_auto_snapshot_check, run_processing_recipe,
-        scenes_for_scope, spellcheck_project, spellcheck_project_with_engine, undo_cli_replace,
-        watch_fingerprint,
+        parse_scrivener_import_options, recover_cli_replace_groups, run_auto_snapshot_check,
+        run_processing_recipe, scenes_for_scope, spellcheck_project,
+        spellcheck_project_with_engine, undo_cli_replace, watch_fingerprint,
     };
     use std::fs;
     use story_app::WriterApp;
+
+    #[test]
+    fn scrivener_import_options_select_book_type_and_preserve_legacy_default() {
+        let options = parse_scrivener_import_options(vec![
+            "mapping.json".into(),
+            "A Unicode title – Île".into(),
+            "--editable".into(),
+            "--book-type=nonfiction".into(),
+        ])
+        .unwrap();
+        assert_eq!(
+            options.mapping_path.as_deref(),
+            Some(std::path::Path::new("mapping.json"))
+        );
+        assert_eq!(options.title.as_deref(), Some("A Unicode title – Île"));
+        assert_eq!(options.mode, story_import::ScrivenerImportMode::Editable);
+        assert_eq!(options.book_type, story_core::BookType::Nonfiction);
+
+        let defaults = parse_scrivener_import_options(Vec::new()).unwrap();
+        assert_eq!(defaults.book_type, story_core::BookType::Fiction);
+        assert_eq!(defaults.mode, story_import::ScrivenerImportMode::Both);
+    }
+
+    #[test]
+    fn scrivener_import_options_reject_unknown_or_duplicate_flags() {
+        assert!(parse_scrivener_import_options(vec!["--book-type=poetry".into()]).is_err());
+        assert!(
+            parse_scrivener_import_options(vec!["--editable".into(), "--editable".into()]).is_err()
+        );
+        assert!(
+            parse_scrivener_import_options(vec![
+                "--book-type=fiction".into(),
+                "--book-type=nonfiction".into()
+            ])
+            .is_err()
+        );
+    }
+
     #[test]
     fn watch_fingerprint_is_acknowledged_only_after_success() {
         let mut watcher = WatchSuccess::default();

@@ -33,12 +33,10 @@ Commit `97b8878` addresses UAT-19 and UAT-20 in #61:
   line; a punctuated sentence on its own line removes only that sentence line.
 - Both deletion paths use the existing undoable source-range replacement.
 
-The full terminal unit suite (329 tests), author workflows (3 tests), and a
-standalone serialized Linux PTY run (19 tests) passed. Formatting and workspace
-Clippy passed. A full workspace run passed unit and crate tests but had
-intermittent PTY startup/menu timing failures; the PTY suite passed when run
-independently. Run the full workspace suite again after the next implementation
-batch, and investigate any repeated PTY failure before claiming the gate.
+The full workspace suite passed for the latest batch: terminal unit tests
+333/333, author workflows 3/3 and serialized Linux PTY tests 20/20, along with
+the workspace crate and doc tests. Workspace Clippy with `-D warnings`,
+formatting and `git diff --check` passed.
 
 ## Current architectural finding
 
@@ -64,21 +62,63 @@ toggles a scene between Included and Excluded; Ctrl+Space remains available for
 multi-selection. These changes are incremental; Outline and Scene Cards are
 still separate workspaces, so #55 is not complete and still requires human UAT.
 
-Verified for this batch: terminal unit tests 333/333, author workflows 3/3,
-Linux PTY tests 20/20, terminal Clippy, formatting, Python PTY harness syntax,
-and `git diff --check`. The full workspace suite has not yet been rerun for this
-batch.
+Verified for this batch: full workspace tests, workspace Clippy, formatting,
+Python harness syntax and `git diff --check` all passed.
 
 Private real Scrivener regression fixtures were checked read-only on 2026-11-25.
-`(cd fixtures && sha256sum --quiet -c SHA256SUMS)` passed and Git tracks no files
-under `fixtures/`, `generated/`, `reports/` or `baselines/`. The projects are
-all Scrivener 3.1.5.1 Windows manifests (manifest revision 2.0): book 01 has 70
-binder items and RTF/PDF assets; book 02 has 64 items and a nested binder; book
-03 has 118 items and both RTF and plain-text assets. `epubcheck` is not installed
-in the current environment; Java, Calibre and Pandoc are present. The production
-import/compile regression harness for these three fixtures is still outstanding.
-Keep all fixture-derived content and reports in the private ignored directories;
-never commit or publish them.
+`(cd fixtures && sha256sum --quiet -c SHA256SUMS)` passed before and after each
+run. Git tracks no files under `fixtures/`, `generated/`, `reports/` or
+`baselines/`; the four root-relative exclusions are present. The three projects
+use Scrivener 3.1.5.1 Windows manifests (manifest revision 2.0): book 01 has 70
+binder items and RTF/PDF assets; book 02 has 64 items, nested structure and 44
+embedded RTF picture groups; book 03 has 118 items and RTF/plain-text assets.
+`epubcheck` is unavailable; Java, Calibre and Pandoc are present.
+
+The private production-pipeline harness is `tools/real_manuscript_regression.py`.
+It defaults to repository-relative fixtures and writes all project copies,
+publications and content-bearing reports under ignored `generated/` and
+`reports/`. Commands:
+
+```sh
+python3 tools/real_manuscript_regression.py --phase inspect
+python3 tools/real_manuscript_regression.py --book book-02 --phase import
+python3 tools/real_manuscript_regression.py --phase compile \
+  --project-root generated/IMPORT_RUN_ID
+python3 tools/real_manuscript_regression.py --phase full
+```
+
+Latest measured run: `reports/verification-after-fixes-20261125/`, with
+generated projects and EPUBs under
+`generated/verification-after-fixes-20261125/`. It used the production
+CLI/importer/storage/compiler and reopened projects before compilation. The
+report identifies the pre-commit source revision and a dirty working tree, so
+it is diagnostic, not a release baseline. The measured results remain
+provisional.
+
+For the three books, bodies extracted by the importer were preserved in
+persisted Markdown (44/44, 41/41 and 76/76); research bodies were also preserved
+(1/1, 1/1 and 4/4), and Trash bodies were excluded. Fixture fingerprints matched
+before and after. These checks establish extraction-to-storage consistency,
+not complete fidelity to every source asset or historical publication. All
+imports remain `incomplete` because importer warnings and unresolved source
+items remain.
+
+Publication acceptance has not passed. EPUBCheck is unavailable in this
+environment. For the illustrated non-fiction fixture, the reference contains
+44 image resources and the generated EPUB contains none; RTF picture groups are
+not currently preserved through import. Reference/generated paragraph counts
+are 1298/358, 648/407 and 1813/1430; link counts are 45/0, 149/0 and 26/0.
+These measurements require investigation but do not alone prove source-revision
+or compiler causes. Historical publication revisions/settings have not been
+reconciled. Do not promote a baseline or claim import/publishing acceptance.
+Next: repair image/asset import at the source layer, improve sanitised
+diagnostics, and trace text, paragraph, link and navigation differences
+through extraction, persisted documents and compile input. Keep all
+manuscript-bearing reports local and never commit fixture-derived files.
+
+After committing the current importer and content-unit persistence fixes, rerun
+the three-book suite against a clean commit. Keep its result provisional and do
+not replace a better validated baseline automatically.
 
 ## Verification commands
 

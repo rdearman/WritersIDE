@@ -4560,7 +4560,8 @@ impl WriterApp {
                             0,
                             None,
                         )?;
-                        self.save_content_unit_text(unit, None, text)?;
+                        let (_, expected) = self.load_content_unit_text(unit)?;
+                        self.save_content_unit_text(unit, Some(&expected), text)?;
                         destinations.push(("content_unit", unit.to_string(), "content_markdown"));
                     }
                 }
@@ -4594,7 +4595,8 @@ impl WriterApp {
                             0,
                             None,
                         )?;
-                        self.save_content_unit_text(unit, None, text)?;
+                        let (_, expected) = self.load_content_unit_text(unit)?;
+                        self.save_content_unit_text(unit, Some(&expected), text)?;
                         destinations.push(("content_unit", unit.to_string(), "content_markdown"));
                     }
                     destinations.push(("structural_node", node.to_string(), "chapter"));
@@ -8144,10 +8146,15 @@ unexpected_prose = "must not be silently discarded"
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("SeriesBook.scriv");
         let scene_files = source.join("Files/Data/scene-1");
+        let section_files = source.join("Files/Data/section-1");
+        let chapter_files = source.join("Files/Data/chapter-1");
         fs::create_dir_all(&scene_files).unwrap();
+        fs::create_dir_all(&section_files).unwrap();
+        fs::create_dir_all(&chapter_files).unwrap();
         fs::write(
             source.join("SeriesBook.scrivx"),
             r#"<ScrivenerProject Version="2.0"><Binder>
+              <BinderItem UUID="section-1" Type="Folder"><Title>Part One</Title><Children/></BinderItem>
               <BinderItem UUID="chapter-1" Type="Folder"><Title>Chapter One</Title><Children>
                 <BinderItem UUID="scene-1" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
               </Children></BinderItem>
@@ -8158,6 +8165,16 @@ unexpected_prose = "must not be silently discarded"
         fs::write(
             scene_files.join("content.rtf"),
             r"{\rtf1\ansi Élodie entered.}",
+        )
+        .unwrap();
+        fs::write(
+            section_files.join("content.rtf"),
+            r"{\rtf1\ansi Part introduction.}",
+        )
+        .unwrap();
+        fs::write(
+            chapter_files.join("content.rtf"),
+            r"{\rtf1\ansi Chapter introduction.}",
         )
         .unwrap();
         fs::write(scene_files.join("synopsis.txt"), "The door opens").unwrap();
@@ -8171,6 +8188,11 @@ unexpected_prose = "must not be silently discarded"
             .find(|decision| decision.source_document_id == "chapter-1")
             .unwrap()
             .destination_kind = story_import::ScrivenerDestinationKind::Chapter;
+        plan.decisions
+            .iter_mut()
+            .find(|decision| decision.source_document_id == "section-1")
+            .unwrap()
+            .destination_kind = story_import::ScrivenerDestinationKind::Section;
         assert!(
             plan.preview(&inventory)
                 .unwrap()
@@ -8183,9 +8205,26 @@ unexpected_prose = "must not be silently discarded"
             .unwrap();
         assert_eq!(scenes.len(), 1);
         assert_eq!(app.load_scene_text(scenes[0]).unwrap().0, "Élodie entered.");
+        let content_units = app.list_content_units(false).unwrap();
+        let section_body = content_units
+            .iter()
+            .find(|unit| unit.title == "Part One")
+            .unwrap();
+        let chapter_body = content_units
+            .iter()
+            .find(|unit| unit.title == "Chapter One")
+            .unwrap();
+        assert_eq!(
+            app.load_content_unit_text(section_body.id).unwrap().0,
+            "Part introduction."
+        );
+        assert_eq!(
+            app.load_content_unit_text(chapter_body.id).unwrap().0,
+            "Chapter introduction."
+        );
         let scene = app.get_scene(scenes[0]).unwrap();
         assert_eq!(scene.scene.synopsis, "The door opens");
-        assert_eq!(app.list_structural_nodes().unwrap().len(), 1);
+        assert_eq!(app.list_structural_nodes().unwrap().len(), 2);
         assert_eq!(app.list_reading_documents().unwrap().len(), 1);
         assert_eq!(
             story_import::inspect_scrivener_project(&source)
@@ -8197,8 +8236,8 @@ unexpected_prose = "must not be silently discarded"
         let snapshots = fs::read_dir(snapshot_root).unwrap().count();
         assert_eq!(snapshots, 1);
         let summary = app.get_import_run_summary(run).unwrap();
-        assert_eq!(summary.source_items, 3);
-        assert_eq!(summary.provenance_records, 3);
+        assert_eq!(summary.source_items, 4);
+        assert_eq!(summary.provenance_records, 6);
         assert_eq!(summary.status, "incomplete");
         assert!(
             summary
