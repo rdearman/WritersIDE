@@ -1235,6 +1235,25 @@ def main():
             raise AssertionError("internal command registry appeared after closing the menu")
         assert_sample_prose_visible(output, 24, 80, "screen after closing menu")
 
+        # Exercise both advertised New Project routes through terminal key
+        # delivery. The menu mnemonic must win over the Navigate category's
+        # N mnemonic, and Ctrl+N must dispatch the same command globally.
+        os.write(master, b"\x1b[21~")  # F10 opens File
+        read_for(0.2)
+        os.write(master, b"n")
+        if not wait_for_screen_fragments((b"Project title", b"Create Project"), timeout=3.0):
+            raise AssertionError("File > n did not open the New Project dialogue")
+        os.write(master, b"\x1b")  # cancel without creating a project
+        read_for(0.3)
+        assert_sample_prose_visible(output, 24, 80, "screen after cancelling New Project")
+
+        os.write(master, b"\x0e")  # Ctrl+N
+        if not wait_for_screen_fragments((b"Project title", b"Create Project"), timeout=3.0):
+            raise AssertionError("Ctrl+N did not open the New Project dialogue")
+        os.write(master, b"\x1b")  # cancel without creating a project
+        read_for(0.3)
+        assert_sample_prose_visible(output, 24, 80, "screen after cancelling Ctrl+N")
+
         # Exercise an actual manuscript → imported reference → manuscript
         # transition. Both panes contain distinct synthetic prose so stale
         # text leakage is observable in the reconstructed terminal screen.

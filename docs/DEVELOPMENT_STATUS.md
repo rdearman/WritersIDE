@@ -159,6 +159,13 @@ unchanged and the manuscript bytes survive reopen. The historical scattered-
 glyph screenshot still has not been reproduced; this is added regression
 coverage, not a proven root-cause fix. #56 remains open for human verification.
 
+The #58 shortcut-precedence fix now also has a real-PTY regression in the same
+smoke workflow. It sends the visible File-menu `n` mnemonic and the terminal
+Ctrl+N byte, confirms each opens New Project, cancels both dialogues, and
+checks that the manuscript screen remains active and unchanged. The focused
+Linux PTY test passed; human verification of terminal/key-delivery variants
+remains outstanding.
+
 Private real Scrivener regression fixtures were checked read-only on 2026-11-25.
 `(cd fixtures && sha256sum --quiet -c SHA256SUMS)` passed before and after each
 run. Git tracks no files under `fixtures/`, `generated/`, `reports/` or
