@@ -920,6 +920,15 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "file.quit",
     ],
     &[
+        "edit.undo",
+        "edit.redo",
+        "edit.cut-selection",
+        "edit.copy-selection",
+        "edit.paste-clipboard",
+        "edit.delete-selection",
+        "edit.select-all",
+        "search.find-next",
+        "search.find-previous",
         "search.find-panel",
         "search.replace-panel",
         "edit.bold-selection",
@@ -1503,6 +1512,15 @@ enum CommandAction {
     ToggleRenderedMarkdown,
     ToggleBoldSelection,
     ToggleItalicSelection,
+    UndoEdit,
+    RedoEdit,
+    CutSelection,
+    CopySelection,
+    PasteClipboard,
+    DeleteSelection,
+    SelectAllText,
+    FindNextMatch,
+    FindPreviousMatch,
     ToggleSceneInclusion,
     WriteSelectedChapter,
     MoveOutlineUp,
@@ -2366,6 +2384,141 @@ fn command_registry() -> Vec<CommandSpec> {
             task_group: "Editor Formatting",
             menu_priority: 13,
             advanced: false,
+        },
+        CommandSpec {
+            id: "edit.undo",
+            label: "Undo",
+            description: "Undo the last manuscript text edit",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["undo"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 1,
+            advanced: false,
+            action: CommandAction::UndoEdit,
+        },
+        CommandSpec {
+            id: "edit.redo",
+            label: "Redo",
+            description: "Redo the last undone manuscript text edit",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["redo"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 2,
+            advanced: false,
+            action: CommandAction::RedoEdit,
+        },
+        CommandSpec {
+            id: "edit.cut-selection",
+            label: "Cut Selection",
+            description: "Move selected manuscript text to the local clipboard",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["cut"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 3,
+            advanced: false,
+            action: CommandAction::CutSelection,
+        },
+        CommandSpec {
+            id: "edit.copy-selection",
+            label: "Copy Selection",
+            description: "Copy selected manuscript text to the local clipboard",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["copy"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 4,
+            advanced: false,
+            action: CommandAction::CopySelection,
+        },
+        CommandSpec {
+            id: "edit.paste-clipboard",
+            label: "Paste",
+            description: "Insert text from the local clipboard at the editor cursor",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["paste"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 5,
+            advanced: false,
+            action: CommandAction::PasteClipboard,
+        },
+        CommandSpec {
+            id: "edit.delete-selection",
+            label: "Delete Selection",
+            description: "Delete selected manuscript text; Undo restores it",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["delete selected text"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 6,
+            advanced: false,
+            action: CommandAction::DeleteSelection,
+        },
+        CommandSpec {
+            id: "edit.select-all",
+            label: "Select All",
+            description: "Select all text in the current manuscript document",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["select all text"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 7,
+            advanced: false,
+            action: CommandAction::SelectAllText,
+        },
+        CommandSpec {
+            id: "search.find-next",
+            label: "Find Next",
+            description: "Move to the next match in the active search",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["next match"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Search",
+            menu_priority: 8,
+            advanced: false,
+            action: CommandAction::FindNextMatch,
+        },
+        CommandSpec {
+            id: "search.find-previous",
+            label: "Find Previous",
+            description: "Move to the previous match in the active search",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["previous match"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Search",
+            menu_priority: 9,
+            advanced: false,
+            action: CommandAction::FindPreviousMatch,
         },
         legacy_command(
             "structure.section",
@@ -4461,7 +4614,12 @@ fn menu_category(spec: &CommandSpec) -> &'static str {
         "Insert"
     } else if matches!(
         id,
-        "search.find-panel" | "search.replace-panel" | "outline.move-up" | "outline.move-down"
+        "search.find-panel"
+            | "search.replace-panel"
+            | "search.find-next"
+            | "search.find-previous"
+            | "outline.move-up"
+            | "outline.move-down"
     ) {
         "Edit"
     } else if spec.category == "View"
@@ -12412,6 +12570,41 @@ impl AppState {
         self.menu_commands()
     }
     fn command_disabled_reason(&self, spec: CommandSpec) -> Option<&'static str> {
+        if matches!(
+            spec.id,
+            "edit.undo"
+                | "edit.redo"
+                | "edit.cut-selection"
+                | "edit.copy-selection"
+                | "edit.paste-clipboard"
+                | "edit.delete-selection"
+                | "edit.select-all"
+                | "search.find-next"
+                | "search.find-previous"
+        ) && self.workspace != Workspace::Editor
+        {
+            return Some("Open a manuscript document first");
+        }
+        match spec.id {
+            "edit.undo" if self.undo_stack.is_empty() => {
+                return Some("There is no manuscript edit to undo");
+            }
+            "edit.redo" if self.redo_stack.is_empty() => {
+                return Some("There is no manuscript edit to redo");
+            }
+            "edit.cut-selection" | "edit.copy-selection" | "edit.delete-selection"
+                if self.selected_text().is_none() =>
+            {
+                return Some("Select manuscript text first");
+            }
+            "edit.paste-clipboard" if self.clipboard.is_empty() => {
+                return Some("The local clipboard is empty");
+            }
+            "search.find-next" | "search.find-previous" if self.search_hits.is_empty() => {
+                return Some("Run a search before navigating matches");
+            }
+            _ => {}
+        }
         if spec.id == "research.remove-reference" {
             return if self.workspace != Workspace::Reading {
                 Some("Open the Reference Library first")
@@ -13466,6 +13659,15 @@ impl AppState {
             }
             CommandAction::ToggleBoldSelection => self.toggle_inline_format("**", "bold")?,
             CommandAction::ToggleItalicSelection => self.toggle_inline_format("*", "italic")?,
+            CommandAction::UndoEdit => self.undo_edit(),
+            CommandAction::RedoEdit => self.redo_edit(),
+            CommandAction::CutSelection => self.cut_selected_text()?,
+            CommandAction::CopySelection => self.copy_selected_text()?,
+            CommandAction::PasteClipboard => self.paste_clipboard(),
+            CommandAction::DeleteSelection => self.delete_selected_text(),
+            CommandAction::SelectAllText => self.select_all_text(),
+            CommandAction::FindNextMatch => self.navigate_search_match(true)?,
+            CommandAction::FindPreviousMatch => self.navigate_search_match(false)?,
             CommandAction::ToggleSceneInclusion => self.toggle_scene_card_inclusion()?,
             CommandAction::WriteSelectedChapter => self.write_selected_chapter()?,
             CommandAction::MoveOutlineUp => self.move_selected_outline_item(false)?,
@@ -20299,6 +20501,76 @@ impl AppState {
         lines.extend(self.editor[start_row + 1..end_row].iter().cloned());
         lines.push(self.editor[end_row].graphemes(true).take(end_col).collect());
         Some(lines.join("\n"))
+    }
+    fn cut_selected_text(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(text) = self.selected_text() else {
+            self.message = "Select manuscript text before cutting".into();
+            return Ok(());
+        };
+        self.remember_kill(text.clone())?;
+        self.clipboard = text;
+        self.push_undo();
+        if self.delete_selection() {
+            self.message = "Selection cut · Undo restores it".into();
+        } else {
+            self.undo_stack.pop();
+            self.message = "Selection is outside the active editing range".into();
+        }
+        Ok(())
+    }
+    fn copy_selected_text(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(text) = self.selected_text() else {
+            self.message = "Select manuscript text before copying".into();
+            return Ok(());
+        };
+        self.remember_kill(text.clone())?;
+        self.clipboard = text;
+        self.message = "Selection copied to the local clipboard".into();
+        Ok(())
+    }
+    fn paste_clipboard(&mut self) {
+        if self.clipboard.is_empty() {
+            self.message = "The local clipboard is empty".into();
+            return;
+        }
+        let text = self.clipboard.clone();
+        self.push_undo();
+        self.paste_text(&text);
+        self.message = "Clipboard text pasted · Undo available".into();
+    }
+    fn delete_selected_text(&mut self) {
+        if self.selected_text().is_none() {
+            self.message = "Select manuscript text before deleting".into();
+            return;
+        }
+        self.push_undo();
+        if self.delete_selection() {
+            self.message = "Selection deleted · Undo restores it".into();
+        } else {
+            self.undo_stack.pop();
+            self.message = "Selection is outside the active editing range".into();
+        }
+    }
+    fn select_all_text(&mut self) {
+        let text = self.editor.join("\n");
+        let (start, end) = self
+            .narrowed_passage
+            .filter(|(start, end)| {
+                start <= end
+                    && *end <= text.len()
+                    && text.is_char_boundary(*start)
+                    && text.is_char_boundary(*end)
+            })
+            .unwrap_or((0, text.len()));
+        self.extra_cursors.clear();
+        self.editor_selection = editor_position_from_byte(&text, start);
+        self.cursor = editor_position_from_byte(&text, end).unwrap_or(self.cursor);
+        self.message = if self.editor_selection.is_some() && start != end {
+            "Selected all text in the current manuscript document".into()
+        } else {
+            self.editor_selection = None;
+            "The current manuscript document is empty".into()
+        };
     }
     fn visible_editor_line_count(&self) -> usize {
         let text = self.editor.join("\n");
@@ -46191,6 +46463,51 @@ mod tests {
         assert!(footer.contains("Help > Resume Tutorial"), "{footer}");
         assert_eq!(state.editor, ["Unsaved sentence stays here."]);
         assert!(state.dirty);
+    }
+
+    #[test]
+    fn edit_menu_exposes_working_selection_clipboard_and_undo_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let hash = app.load_scene_text(scene).unwrap().1;
+        app.save_scene_text(scene, Some(&hash), "alpha beta")
+            .unwrap();
+
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+
+        let run_edit_menu = |state: &mut AppState, command_id: &str| {
+            state.open_menu_category(1);
+            let selected = state
+                .menu_visible_entries()
+                .iter()
+                .position(|command| command.id == command_id)
+                .unwrap_or_else(|| panic!("{command_id} is absent from the Edit menu"));
+            state.menu.as_mut().unwrap().selected = selected;
+            state
+                .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+
+        run_edit_menu(&mut state, "edit.select-all");
+        assert_eq!(state.selected_text().as_deref(), Some("alpha beta"));
+        run_edit_menu(&mut state, "edit.copy-selection");
+        assert_eq!(state.clipboard, "alpha beta");
+        run_edit_menu(&mut state, "edit.cut-selection");
+        assert_eq!(state.editor.join("\n"), "");
+        run_edit_menu(&mut state, "edit.undo");
+        assert_eq!(state.editor.join("\n"), "alpha beta");
+        run_edit_menu(&mut state, "edit.redo");
+        assert_eq!(state.editor.join("\n"), "");
+        run_edit_menu(&mut state, "edit.undo");
+        run_edit_menu(&mut state, "edit.select-all");
+        state.editor_selection = None;
+        state.cursor = (0, 0);
+        run_edit_menu(&mut state, "edit.paste-clipboard");
+        assert_eq!(state.editor.join("\n"), "alpha betaalpha beta");
     }
 
     #[test]
