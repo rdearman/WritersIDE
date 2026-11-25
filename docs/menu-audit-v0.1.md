@@ -383,3 +383,13 @@ meaning, and scoped replacement undo remains available through `Ctrl+Z`.
 Automated menu-path regression coverage verifies selection, clipboard, cut,
 undo, redo and paste. This supplement does not claim that every requested text
 transformation from issue #54 is implemented.
+
+## Alpha UAT 19 — manuscript insertion actions
+
+The Insert menu now also exposes **Insert Date/Time** and **Insert File…**.
+Date/time inserts an explicit UTC timestamp. Insert File reuses the shared
+two-pane browser, accepts UTF-8 text files, preserves source bytes, and inserts
+the chosen text at the manuscript cursor as one undoable edit. Menu integration,
+undo, save/reopen persistence, and source preservation are exercised in both
+unit and Linux PTY tests. Remaining #54 editing requests (including paragraph
+reflow, indentation controls and case transformation) are not claimed complete.

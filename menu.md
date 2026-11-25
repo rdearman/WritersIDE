@@ -54,6 +54,8 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - New Scene
 - Create Direct Prose Unit
 - Write Selected Chapter
+- Insert Date/Time
+- Insert File…
 - Create Story Link
 - Remove Story Link
 - Insert Snippet…

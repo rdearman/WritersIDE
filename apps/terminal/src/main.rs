@@ -602,6 +602,7 @@ enum FileBrowserPurpose {
     SaveProjectAs,
     OpenProject,
     OpenTextFile,
+    InsertFile,
     ImportDocument,
     ImportScrivenerSource,
     ImportScrivenerCurrent,
@@ -954,6 +955,8 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "scene.create",
         "document.new-content-unit",
         "document.write-selected-chapter",
+        "edit.insert-date-time",
+        "edit.insert-file",
         "link.create",
         "link.delete",
         "edit.snippet-insert",
@@ -1512,6 +1515,8 @@ enum CommandAction {
     ToggleRenderedMarkdown,
     ToggleBoldSelection,
     ToggleItalicSelection,
+    InsertDateTime,
+    InsertFile,
     UndoEdit,
     RedoEdit,
     CutSelection,
@@ -2519,6 +2524,36 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 9,
             advanced: false,
             action: CommandAction::FindPreviousMatch,
+        },
+        CommandSpec {
+            id: "edit.insert-date-time",
+            label: "Insert Date/Time",
+            description: "Insert the current UTC date and time at the manuscript cursor",
+            category: "Insert",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &[],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Insertion",
+            menu_priority: 10,
+            advanced: false,
+            action: CommandAction::InsertDateTime,
+        },
+        CommandSpec {
+            id: "edit.insert-file",
+            label: "Insert File…",
+            description: "Insert UTF-8 text from a selected file at the manuscript cursor",
+            category: "Insert",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &[],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Insertion",
+            menu_priority: 11,
+            advanced: false,
+            action: CommandAction::InsertFile,
         },
         legacy_command(
             "structure.section",
@@ -7997,6 +8032,7 @@ impl AppState {
             FileBrowserPurpose::NewProject
             | FileBrowserPurpose::OpenProject
             | FileBrowserPurpose::OpenTextFile
+            | FileBrowserPurpose::InsertFile
             | FileBrowserPurpose::ImportDocument
             | FileBrowserPurpose::ImportScrivenerSource
             | FileBrowserPurpose::ImportScrivenerCurrent
@@ -8014,6 +8050,7 @@ impl AppState {
                 .unwrap_or_else(|_| "My Book".to_owned()),
             FileBrowserPurpose::OpenProject
             | FileBrowserPurpose::OpenTextFile
+            | FileBrowserPurpose::InsertFile
             | FileBrowserPurpose::ImportDocument
             | FileBrowserPurpose::ImportScrivenerSource
             | FileBrowserPurpose::ImportScrivenerCurrent
@@ -8474,6 +8511,7 @@ impl AppState {
                     browser.purpose,
                     FileBrowserPurpose::OpenProject
                         | FileBrowserPurpose::OpenTextFile
+                        | FileBrowserPurpose::InsertFile
                         | FileBrowserPurpose::ImportDocument
                         | FileBrowserPurpose::ImportScrivenerSource
                         | FileBrowserPurpose::ImportScrivenerCurrent
@@ -8529,6 +8567,40 @@ impl AppState {
                             Ok(()) => close = true,
                             Err(error) => {
                                 self.message = format!("Could not open text file: {error}");
+                                self.file_browser = Some(browser);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    FileBrowserPurpose::InsertFile => {
+                        let Some(source) =
+                            browser
+                                .entries
+                                .get(browser.selected)
+                                .and_then(|(item, is_dir)| {
+                                    (!is_dir).then(|| browser.current_dir.join(item))
+                                })
+                        else {
+                            self.message = "Select a text file, then press F5".into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        };
+                        match fs::read_to_string(&source) {
+                            Ok(text) => {
+                                let label = source
+                                    .file_name()
+                                    .and_then(|name| name.to_str())
+                                    .unwrap_or("file");
+                                if self.insert_text_undoably(&text, &format!("Inserted {label}")) {
+                                    close = true;
+                                } else {
+                                    self.file_browser = Some(browser);
+                                    return Ok(());
+                                }
+                            }
+                            Err(error) => {
+                                self.message =
+                                    format!("Could not insert {}: {error}", source.display());
                                 self.file_browser = Some(browser);
                                 return Ok(());
                             }
@@ -12601,6 +12673,8 @@ impl AppState {
                 | "edit.paste-clipboard"
                 | "edit.delete-selection"
                 | "edit.select-all"
+                | "edit.insert-date-time"
+                | "edit.insert-file"
                 | "search.find-next"
                 | "search.find-previous"
         ) && self.workspace != Workspace::Editor
@@ -12616,6 +12690,8 @@ impl AppState {
                 | "edit.paste-clipboard"
                 | "edit.delete-selection"
                 | "edit.select-all"
+                | "edit.insert-date-time"
+                | "edit.insert-file"
         ) && self.reference_focused
         {
             return Some("Focus the manuscript pane first");
@@ -13700,6 +13776,8 @@ impl AppState {
             }
             CommandAction::ToggleBoldSelection => self.toggle_inline_format("**", "bold")?,
             CommandAction::ToggleItalicSelection => self.toggle_inline_format("*", "italic")?,
+            CommandAction::InsertDateTime => self.insert_current_datetime(),
+            CommandAction::InsertFile => self.start_file_browser(FileBrowserPurpose::InsertFile)?,
             CommandAction::UndoEdit => {
                 if self.undo_stack.is_empty()
                     && load_replace_undo(self.app.project_root())?.is_some()
@@ -20587,6 +20665,28 @@ impl AppState {
         self.paste_text(&text);
         self.message = "Clipboard text pasted · Undo available".into();
     }
+    fn insert_text_undoably(&mut self, text: &str, success: &str) -> bool {
+        if text.is_empty() {
+            self.message = "The selected file is empty; manuscript text was unchanged".into();
+            return false;
+        }
+        let before = self.editor.join("\n");
+        self.push_undo();
+        self.paste_text(text);
+        if self.editor.join("\n") == before {
+            self.undo_stack.pop();
+            self.message = "Text could not be inserted at the current editing position".into();
+            false
+        } else {
+            self.message = format!("{success} · Undo available");
+            true
+        }
+    }
+    fn insert_current_datetime(&mut self) {
+        let now = time::OffsetDateTime::now_utc();
+        let stamp = format!("{} {} UTC", now.date(), now.time());
+        self.insert_text_undoably(&stamp, "Inserted current date and time");
+    }
     fn delete_selected_text(&mut self) {
         if self.selected_text().is_none() {
             self.message = "Select manuscript text before deleting".into();
@@ -25334,6 +25434,7 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         FileBrowserPurpose::SaveProjectAs => "Save Project As · create an independent project copy",
         FileBrowserPurpose::OpenProject => "Open Project · choose a Writer's IDE project folder",
         FileBrowserPurpose::OpenTextFile => "Open Text File · read-only reference",
+        FileBrowserPurpose::InsertFile => "Insert File · choose UTF-8 text to insert",
         FileBrowserPurpose::ImportDocument => "Import Document · choose a source file",
         FileBrowserPurpose::ImportScrivenerSource => {
             "Import Scrivener · choose a .scriv folder or .scrivx manifest"
@@ -46573,6 +46674,78 @@ mod tests {
         state.cursor = (0, 0);
         run_edit_menu(&mut state, "edit.paste-clipboard");
         assert_eq!(state.editor.join("\n"), "alpha betaalpha beta");
+    }
+
+    #[test]
+    fn insert_date_time_and_file_are_menu_driven_undoable_and_leave_sources_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let hash = app.load_scene_text(scene).unwrap().1;
+        app.save_scene_text(scene, Some(&hash), "Opening").unwrap();
+
+        let source = directory.path().join("inserted.md");
+        let source_text = "\nImported quotation, kept in its source file.";
+        fs::write(&source, source_text).unwrap();
+        let original_source = fs::read(&source).unwrap();
+
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.cursor = (0, "Opening".graphemes(true).count());
+        state.open_menu_category(2);
+        let date_time = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| command.id == "edit.insert-date-time")
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = date_time;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.editor.join("\n").contains(" UTC"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "Opening");
+
+        state.open_menu_category(2);
+        let insert_file = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| command.id == "edit.insert-file")
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = insert_file;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = directory.path().to_owned();
+        browser.entries = file_browser_entries(directory.path()).unwrap();
+        browser.selected = browser
+            .entries
+            .iter()
+            .position(|(name, is_dir)| name == "inserted.md" && !is_dir)
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.file_browser.is_none());
+        assert_eq!(
+            state.editor.join("\n"),
+            "Opening\nImported quotation, kept in its source file."
+        );
+        assert_eq!(fs::read(&source).unwrap(), original_source);
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "Opening");
     }
 
     #[test]

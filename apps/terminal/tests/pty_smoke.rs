@@ -164,6 +164,62 @@ fn publish_menu_compiles_a_docx_and_reports_success_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn insert_date_time_and_file_work_through_the_real_insert_menu() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let source = home.join("imported.txt");
+    let source_text = "Inserted file text remains read-only.";
+    std::fs::write(&source, source_text).unwrap();
+    let original_source = std::fs::read(&source).unwrap();
+    let project = root.path().join("Writing Project");
+    let mut app = WriterApp::create_project(&project, "Writing Project").unwrap();
+    let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+    let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+    let hash = app.load_scene_text(scene).unwrap().1;
+    app.save_scene_text(scene, Some(&hash), "Opening paragraph.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY insertion workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(&home)
+        .arg("insert-edit-actions")
+        .output()
+        .expect("run the Linux PTY edit insertion workflow");
+    assert!(
+        result.status.success(),
+        "PTY insertion workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    let text = reopened.load_scene_text(scene).unwrap().0;
+    assert!(
+        text.contains("UTC"),
+        "date/time not saved in scene: {text:?}"
+    );
+    assert!(
+        text.contains(source_text),
+        "file text not saved in scene: {text:?}"
+    );
+    assert_eq!(std::fs::read(source).unwrap(), original_source);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
     let _guard = lock_pty_test();
     use std::process::Command;

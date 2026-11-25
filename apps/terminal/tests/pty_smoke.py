@@ -130,6 +130,7 @@ def main():
     chapter_creation = modes == ["chapter-creation"]
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
+    insert_edit_actions = modes == ["insert-edit-actions"]
     chapter_removal = modes in (
         ["chapter-removal"],
         ["chapter-removal-target"],
@@ -205,6 +206,59 @@ def main():
 
     try:
         read_for(1.0)
+        if insert_edit_actions:
+            os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
+            read_for(0.25)
+
+            date_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.15)
+            os.write(master, b"\x1b[C" * 2 + b"\x1b[B" * 5 + b"\r")
+            if not wait_for_fragments(
+                (b"Inserted", b"UTC"), date_start, timeout=3.0
+            ):
+                raise AssertionError(
+                    "Insert > Insert Date/Time did not run through the menu; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+
+            file_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.15)
+            os.write(master, b"\x1b[C" * 2 + b"\x1b[B" * 6 + b"\r")
+            if not wait_for_fragments(
+                (b"Selectedpath:", b"F5Confirm"),
+                file_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "Insert > Insert File did not open the shared browser; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"\t" + b"\x1b[B" * 3 + b"\x1b[15~")
+            if not wait_for_fragments(
+                (b"Inserted", b"imported.txt"),
+                file_start,
+                timeout=4.0,
+            ):
+                raise AssertionError(
+                    "Insert File did not insert the selected UTF-8 file; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"\x13")  # Ctrl+S
+            read_for(0.3)
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after insertion")
+            print("PTY editing workflow passed: Insert Date/Time and Insert File work through the menus.")
+            return
+
         if chapter_creation:
             os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
             read_for(0.3)
