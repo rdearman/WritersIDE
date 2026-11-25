@@ -4454,14 +4454,21 @@ fn command_registry() -> Vec<CommandSpec> {
             "board-add",
             true,
         ),
-        legacy_command(
-            "writing.stats",
-            "Writing Statistics",
-            "Opt in to local aggregate counts without recording manuscript text",
-            "Tools",
-            "writing-stats",
-            true,
-        ),
+        CommandSpec {
+            id: "writing.stats",
+            label: "Writing Statistics",
+            description: "View manuscript, chapter, scene, session, and target progress",
+            category: "Tools",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["writing progress", "word counts", "statistics"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Writing & Progress",
+            menu_priority: 1,
+            advanced: false,
+            action: CommandAction::Workspace(Workspace::Analytics),
+        },
         legacy_command("edit.snippet-save", "Define Session Snippet", "Store a reusable snippet with an optional ${cursor} marker", "Insert", "snippet", true),
         legacy_command("edit.snippet-list", "Manage Snippets…", "Find commands to add, preview, insert, or remove project and personal snippets", "Tools", "snippet-list", false),
         legacy_command("edit.snippet-insert", "Insert Snippet…", "Choose and insert a project or personal snippet", "Insert", "snippet-insert", true),
@@ -47493,6 +47500,39 @@ mod tests {
                 .any(|row| row.contains("Budget suggestion · Scene 4 · 400 words"))
         );
         assert!(scenes.iter().all(|scene| scene.target_words.is_none()));
+    }
+
+    #[test]
+    fn tools_writing_statistics_opens_the_author_facing_dashboard() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        let tools_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "Tools")
+            .unwrap();
+
+        state.open_menu_category(tools_menu);
+        let commands = state.menu_commands();
+        let index = commands
+            .iter()
+            .position(|command| command.id == "writing.stats")
+            .expect("Writing Statistics is directly available in Tools");
+        assert_eq!(commands[index].label, "Writing Statistics");
+        state.menu.as_mut().unwrap().selected = index;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(state.workspace, Workspace::Analytics);
+        assert!(state.mode.is_none());
+        assert!(!state.prompt.contains("writing-stats"));
+        let rows = workspace_items(&state);
+        assert!(
+            rows.iter().any(|row| row.contains("word")),
+            "the statistics dashboard should show manuscript counts: {rows:?}"
+        );
     }
 
     #[test]
