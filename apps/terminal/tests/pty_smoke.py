@@ -631,12 +631,16 @@ def main():
                 read_for(0.25)
             if b"Directory" not in output or b"type" not in output:
                 raise AssertionError("New Project did not open the type-aware folder browser")
-            os.write(master, b"\x1b[12~")  # F2: choose Fiction
-            read_for(0.25)
-            os.write(master, b"\x1b[15~")  # F5: request creation
-            read_for(0.25)
-            os.write(master, b"\x1b[15~")  # F5: confirm new folder
-            read_for(0.8)
+            # Use the visible, focusable book-type and Create Project controls.
+            # Tab: tree -> contents -> title -> folder -> book type.
+            os.write(master, b"\t\t\t\t\r\t\r")
+            if not wait_for_fragments(
+                (b"Included", b"Excluded"), timeout=5.0
+            ):
+                raise AssertionError(
+                    "Enter on Create Project did not open the new fiction project; output tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
+                )
             os.write(master, b"\x1b[2~")  # Insert: create a scene
             read_for(0.2)
             os.write(master, b"Opening\r")

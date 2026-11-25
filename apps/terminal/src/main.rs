@@ -662,7 +662,10 @@ struct FileBrowserState {
     selected: usize,
     tree_selected: usize,
     focus: u8,
+    /// Project title; the new-project folder name follows it until explicitly overridden.
     name: String,
+    folder_name: String,
+    folder_name_overridden: bool,
     new_project_book_type: Option<story_core::BookType>,
     overwrite_confirmed: bool,
     org_import_mode: story_import::OrgImportMode,
@@ -9082,6 +9085,11 @@ impl AppState {
         };
         let entries = file_browser_entries(&current_dir)?;
         let tree_selected = file_browser_ancestors(&current_dir).len().saturating_sub(1);
+        let folder_name = if purpose == FileBrowserPurpose::NewProject {
+            name.clone()
+        } else {
+            String::new()
+        };
         self.menu = None;
         self.command_palette = None;
         self.file_browser = Some(FileBrowserState {
@@ -9092,6 +9100,8 @@ impl AppState {
             tree_selected,
             focus: 0,
             name,
+            folder_name,
+            folder_name_overridden: false,
             new_project_book_type: None,
             overwrite_confirmed: false,
             org_import_mode: story_import::OrgImportMode::SingleDocument,
@@ -9099,7 +9109,7 @@ impl AppState {
             preview_scroll: 0,
         });
         self.message = if purpose == FileBrowserPurpose::NewProject {
-            "Choose Fiction or Non-fiction with F2 · select a parent folder and project name · F5 creates".into()
+            "Choose a parent, project title and folder · Tab to Book type · Enter selects and creates".into()
         } else if purpose == FileBrowserPurpose::SaveProjectAs {
             "Choose a parent folder and new project folder name · existing projects are never overwritten".into()
         } else if matches!(
@@ -9172,6 +9182,20 @@ impl AppState {
     fn handle_file_browser_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn std::error::Error>> {
         let Some(mut browser) = self.file_browser.take() else {
             return Ok(());
+        };
+        // New Project exposes its book type and actions as focusable controls.
+        // Enter on those controls follows the same paths as the optional F-key
+        // shortcuts, so creation never depends on an undocumented chord.
+        let key = if browser.purpose == FileBrowserPurpose::NewProject && key.code == KeyCode::Enter
+        {
+            match browser.focus {
+                4 => KeyEvent::new(KeyCode::F(2), key.modifiers),
+                5 => KeyEvent::new(KeyCode::F(5), key.modifiers),
+                6 => KeyEvent::new(KeyCode::Esc, key.modifiers),
+                _ => key,
+            }
+        } else {
+            key
         };
         if let Some(preview) = browser.text_import_preview.as_ref() {
             match key.code {
@@ -9317,8 +9341,22 @@ impl AppState {
                     self.message = "File selection cancelled".into();
                 }
             }
-            KeyCode::Tab => browser.focus = (browser.focus + 1) % 3,
-            KeyCode::BackTab => browser.focus = (browser.focus + 2) % 3,
+            KeyCode::Tab => {
+                let focus_count = if browser.purpose == FileBrowserPurpose::NewProject {
+                    7
+                } else {
+                    3
+                };
+                browser.focus = (browser.focus + 1) % focus_count;
+            }
+            KeyCode::BackTab => {
+                let focus_count = if browser.purpose == FileBrowserPurpose::NewProject {
+                    7
+                } else {
+                    3
+                };
+                browser.focus = (browser.focus + focus_count - 1) % focus_count;
+            }
             KeyCode::Up => {
                 if browser.focus == 0 {
                     browser.tree_selected = browser.tree_selected.saturating_sub(1);
@@ -9360,7 +9398,7 @@ impl AppState {
                             story_core::BookType::Fiction
                         }
                     };
-                    if browser.name == "My Novel" {
+                    if browser.name == "My Novel" || browser.name == "My Book" {
                         browser.name = match selected_type {
                             story_core::BookType::Nonfiction => "My Book",
                             story_core::BookType::Fiction | story_core::BookType::Custom => {
@@ -9368,6 +9406,9 @@ impl AppState {
                             }
                         }
                         .to_owned();
+                        if !browser.folder_name_overridden {
+                            browser.folder_name = browser.name.clone();
+                        }
                     }
                     browser.new_project_book_type = Some(selected_type);
                     browser.overwrite_confirmed = false;
@@ -9434,6 +9475,16 @@ impl AppState {
                         Err(error) => self.message = format!("Could not open folder: {error}"),
                     }
                 }
+            }
+            KeyCode::Enter
+                if browser.purpose == FileBrowserPurpose::NewProject && browser.focus == 2 =>
+            {
+                browser.focus = 3;
+            }
+            KeyCode::Enter
+                if browser.purpose == FileBrowserPurpose::NewProject && browser.focus == 3 =>
+            {
+                browser.focus = 4;
             }
             KeyCode::Enter
                 if browser.focus == 2
@@ -9752,6 +9803,13 @@ impl AppState {
                         }
                     }
                     FileBrowserPurpose::NewProject => {
+                        let folder_name = browser.folder_name.trim();
+                        if !file_browser_leaf_name_is_safe(folder_name) {
+                            self.message = "Enter a valid project folder name".into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        }
+                        let destination = browser.current_dir.join(folder_name);
                         if self.dirty || self.active_challenge.is_some() {
                             self.message = "Save or finish the active writing session before creating a project".into();
                             self.file_browser = Some(browser);
@@ -9768,15 +9826,6 @@ impl AppState {
                             self.file_browser = Some(browser);
                             return Ok(());
                         };
-                        if !browser.overwrite_confirmed {
-                            browser.overwrite_confirmed = true;
-                            self.message = format!(
-                                "Create project at {}? Press F5 again to confirm, or Esc to cancel",
-                                destination.display()
-                            );
-                            self.file_browser = Some(browser);
-                            return Ok(());
-                        }
                         if let Err(error) = fs::create_dir(&destination) {
                             self.message = format!(
                                 "Could not create project folder {}: {error}",
@@ -9792,10 +9841,9 @@ impl AppState {
                             self.message = format!("Project creation failed: {error}");
                             return Ok(());
                         }
-                        self.switch_to_project(
-                            destination,
-                            format!("Created and opened project: {name}"),
-                        )?;
+                        let created_message =
+                            format!("Created and opened {name} in {}", destination.display());
+                        self.switch_to_project(destination, created_message)?;
                         self.switch(match book_type {
                             story_core::BookType::Fiction => Workspace::Cards,
                             story_core::BookType::Nonfiction | story_core::BookType::Custom => {
@@ -9882,14 +9930,40 @@ impl AppState {
                 }
             }
             KeyCode::Char(c)
-                if browser.focus == 2
+                if (browser.focus == 2
+                    || (browser.purpose == FileBrowserPurpose::NewProject
+                        && browser.focus == 3))
                     && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) =>
             {
-                browser.name.push(c);
+                if browser.purpose == FileBrowserPurpose::NewProject && browser.focus == 3 {
+                    browser.folder_name.push(c);
+                    browser.folder_name_overridden = true;
+                } else {
+                    browser.name.push(c);
+                    if browser.purpose == FileBrowserPurpose::NewProject
+                        && !browser.folder_name_overridden
+                    {
+                        browser.folder_name = safe_filename(&browser.name);
+                    }
+                }
                 browser.overwrite_confirmed = false;
             }
-            KeyCode::Backspace if browser.focus == 2 => {
-                browser.name.pop();
+            KeyCode::Backspace
+                if browser.focus == 2
+                    || (browser.purpose == FileBrowserPurpose::NewProject
+                        && browser.focus == 3) =>
+            {
+                if browser.purpose == FileBrowserPurpose::NewProject && browser.focus == 3 {
+                    browser.folder_name.pop();
+                    browser.folder_name_overridden = true;
+                } else {
+                    browser.name.pop();
+                    if browser.purpose == FileBrowserPurpose::NewProject
+                        && !browser.folder_name_overridden
+                    {
+                        browser.folder_name = safe_filename(&browser.name);
+                    }
+                }
                 browser.overwrite_confirmed = false;
             }
             _ => {}
@@ -23816,7 +23890,12 @@ fn scene_card_rows(
         .unwrap_or_default()
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let nodes = s.app.list_structural_nodes().unwrap_or_default();
+    let mut nodes = s.app.list_structural_nodes().unwrap_or_default();
+    let node_positions = nodes
+        .iter()
+        .map(|node| (node.id, (node.parent_id, node.position)))
+        .collect::<BTreeMap<_, _>>();
+    nodes.sort_by_key(|node| structural_node_order_path(node, &node_positions));
     let scenes = s
         .scenes
         .iter()
@@ -23854,7 +23933,27 @@ fn scene_card_rows(
             ));
         }
     }
-    for chapter in nodes.iter().filter(|node| node.kind == "chapter") {
+    for node in &nodes {
+        if node.kind == "section" {
+            let section_has_scenes = nodes
+                .iter()
+                .filter(|chapter| chapter.kind == "chapter" && chapter.parent_id == Some(node.id))
+                .any(|chapter| {
+                    scenes.iter().any(|(_, scene_chapter, ..)| {
+                        scene_chapter
+                            .as_ref()
+                            .is_some_and(|(id, _)| *id == chapter.id)
+                    })
+                });
+            if included || section_has_scenes {
+                rows.push((None, None, format!("── Section: {} ──", node.title)));
+            }
+            continue;
+        }
+        if node.kind != "chapter" {
+            continue;
+        }
+        let chapter = node;
         let chapter_scenes = scenes
             .iter()
             .filter(|(_, scene_chapter, ..)| {
@@ -23867,7 +23966,16 @@ fn scene_card_rows(
         // every chapter boundary, including empty chapters. Excluded displays
         // only chapter groups that actually contain excluded scenes.
         if included || !chapter_scenes.is_empty() {
-            rows.push((None, Some(chapter.id), format!("── {} ──", chapter.title)));
+            let indentation = if chapter.parent_id.is_some() {
+                "   "
+            } else {
+                ""
+            };
+            rows.push((
+                None,
+                Some(chapter.id),
+                format!("{indentation}── {} ──", chapter.title),
+            ));
         }
         card_number = 0;
         for (id, _, title, status, words, synopsis) in chapter_scenes {
@@ -23880,6 +23988,23 @@ fn scene_card_rows(
         }
     }
     rows
+}
+
+fn structural_node_order_path(
+    node: &story_storage::StructuralNodeSummary,
+    positions: &BTreeMap<story_core::NodeId, (Option<story_core::NodeId>, u32)>,
+) -> Vec<u32> {
+    let mut path = Vec::new();
+    let mut current = Some(node.id);
+    while let Some(id) = current {
+        let Some((parent, position)) = positions.get(&id).copied() else {
+            break;
+        };
+        path.push(position);
+        current = parent;
+    }
+    path.reverse();
+    path
 }
 
 fn scene_card_text(
@@ -28088,6 +28213,8 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(2),
         ])
         .split(inner);
@@ -28145,7 +28272,9 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         &mut ListState::default()
             .with_selected((!browser.entries.is_empty()).then_some(browser.selected)),
     );
-    let selected_path = if matches!(
+    let selected_path = if browser.purpose == FileBrowserPurpose::NewProject {
+        browser.current_dir.join(&browser.folder_name)
+    } else if matches!(
         browser.purpose,
         FileBrowserPurpose::ImportScrivenerSource
             | FileBrowserPurpose::ImportScrivenerCurrent
@@ -28166,9 +28295,14 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             .wrap(Wrap { trim: true }),
         chunks[1],
     );
+    let title_label = if browser.purpose == FileBrowserPurpose::NewProject {
+        "Project title"
+    } else {
+        "Name"
+    };
     f.render_widget(
         Paragraph::new(format!(
-            "Name: {}{}",
+            "{title_label}: {}{}",
             browser.name,
             if browser.focus == 2 { "▏" } else { "" }
         ))
@@ -28176,21 +28310,51 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         chunks[2],
     );
     if browser.purpose == FileBrowserPurpose::NewProject {
+        f.render_widget(
+            Paragraph::new(format!(
+                "Project folder: {}{}",
+                browser.folder_name,
+                if browser.focus == 3 { "▏" } else { "" }
+            ))
+            .style(Style::default().fg(Color::Yellow)),
+            chunks[3],
+        );
         let book_type = match browser.new_project_book_type {
             Some(story_core::BookType::Fiction) => "Fiction",
             Some(story_core::BookType::Nonfiction) => "Non-fiction",
             Some(story_core::BookType::Custom) | None => "Choose Fiction or Non-fiction",
         };
         f.render_widget(
-            Paragraph::new(format!("Book type: {book_type} · F2 Change"))
-                .style(Style::default().fg(Color::Cyan)),
-            chunks[3],
+            Paragraph::new(format!(
+                "Book type: {}{book_type}{} · F2 Change",
+                if browser.focus == 4 { "[ " } else { "" },
+                if browser.focus == 4 { " ]" } else { "" }
+            ))
+            .style(Style::default().fg(Color::Cyan)),
+            chunks[4],
+        );
+        f.render_widget(
+            Paragraph::new(format!(
+                "{}  {}",
+                if browser.focus == 5 {
+                    "[ Create Project ]"
+                } else {
+                    "  Create Project  "
+                },
+                if browser.focus == 6 {
+                    "[ Cancel ]"
+                } else {
+                    "  Cancel  "
+                }
+            ))
+            .style(Style::default().fg(Color::Green)),
+            chunks[5],
         );
     }
     f.render_widget(
-        Paragraph::new(truncate_display_cells(&s.message, chunks[4].width as usize))
+        Paragraph::new(truncate_display_cells(&s.message, chunks[6].width as usize))
             .style(Style::default().fg(Color::Yellow)),
-        chunks[4],
+        chunks[6],
     );
     let (primary_action, navigation) = if browser.overwrite_confirmed {
         let action = if browser.purpose == FileBrowserPurpose::NewProject {
@@ -28228,8 +28392,8 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         )
     } else if browser.purpose == FileBrowserPurpose::NewProject {
         (
-            "F4 Select Folder · F5 Create Project · F7 New Folder · Esc Cancel",
-            "F2 Choose Fiction/Non-fiction · Tab: panes/name · Parent = current folder",
+            "Tab: choose controls · Enter: activate · Esc: cancel · F-keys are optional",
+            "Choose a book type, then Create Project · current folder is the parent",
         )
     } else if browser.purpose == FileBrowserPurpose::SaveProjectAs {
         (
@@ -28246,11 +28410,11 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         Paragraph::new(vec![
             Line::from(truncate_display_cells(
                 primary_action,
-                chunks[5].width as usize,
+                chunks[7].width as usize,
             )),
-            Line::from(truncate_display_cells(navigation, chunks[5].width as usize)),
+            Line::from(truncate_display_cells(navigation, chunks[7].width as usize)),
         ]),
-        chunks[5],
+        chunks[7],
     );
 }
 
@@ -33897,9 +34061,6 @@ mod tests {
             browser.entries = file_browser_entries(root.path()).unwrap();
         }
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
-            .unwrap();
-        state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE))
             .unwrap();
         for _ in 0.."My Novel".chars().count() {
@@ -33916,17 +34077,24 @@ mod tests {
                 .unwrap();
         }
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
-        assert!(state.file_browser.is_some());
-        assert!(!root.path().join("A New Project").exists());
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
 
         assert_eq!(state.app.get_project().unwrap().title, "A New Project");
         assert_eq!(state.app.project_root(), root.path().join("A New Project"));
-        assert!(state.message.contains("Created and opened project"));
+        assert!(state.message.contains("Created and opened A New Project"));
         assert_eq!(
             state.app.get_project().unwrap().book_type,
             story_core::BookType::Fiction
@@ -34025,7 +34193,11 @@ mod tests {
             browser.current_dir = root.path().to_owned();
             browser.entries = file_browser_entries(root.path()).unwrap();
             browser.name = "Existing".into();
+            browser.folder_name = "Existing".into();
         }
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
@@ -42190,6 +42362,44 @@ mod tests {
     }
 
     #[test]
+    fn scene_cards_render_sections_and_nested_empty_chapters_in_outline_order() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let first_section = app.create_section("Part One", 0).unwrap();
+        let second_section = app.create_section("Part Two", 1).unwrap();
+        let chapter = app
+            .create_chapter(Some(first_section), "Opening", 0)
+            .unwrap();
+        app.create_chapter(Some(second_section), "Aftermath", 0)
+            .unwrap();
+        let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.switch(Workspace::Cards);
+
+        let rows = scene_card_rows(&state, true);
+        let labels = rows.iter().map(|row| row.2.as_str()).collect::<Vec<_>>();
+        assert!(labels.contains(&"── Section: Part One ──"));
+        assert!(labels.contains(&"   ── Opening ──"));
+        assert!(labels.contains(&"── Section: Part Two ──"));
+        assert!(labels.contains(&"   ── Aftermath ──"));
+        let part_one = labels
+            .iter()
+            .position(|label| *label == "── Section: Part One ──")
+            .unwrap();
+        let opening = labels
+            .iter()
+            .position(|label| *label == "   ── Opening ──")
+            .unwrap();
+        let arrival = rows.iter().position(|row| row.0 == Some(scene)).unwrap();
+        let part_two = labels
+            .iter()
+            .position(|label| *label == "── Section: Part Two ──")
+            .unwrap();
+        assert!(part_one < opening && opening < arrival && arrival < part_two);
+    }
+
+    #[test]
     fn scene_cards_move_between_chapters_without_losing_content_or_metadata() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -49549,35 +49759,37 @@ mod tests {
         browser.current_dir = root.clone();
         browser.entries = file_browser_entries(&root).unwrap();
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
-            .unwrap();
-        state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE))
             .unwrap();
         assert_eq!(state.file_browser.as_ref().unwrap().focus, 2);
         assert!(state.message.contains(&root.display().to_string()));
         let browser = state.file_browser.as_mut().unwrap();
         browser.name = "New Novel".into();
+        browser.folder_name = "Novel Files".into();
+        browser.folder_name_overridden = true;
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
-        assert!(state.file_browser.is_some());
-        assert!(
-            state
-                .message
-                .contains(&root.join("New Novel").display().to_string())
-        );
-        assert!(!root.join("New Novel").exists());
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
-        assert_eq!(state.app.project_root(), root.join("New Novel"));
-        assert!(root.join("New Novel/project.toml").is_file());
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.app.project_root(), root.join("Novel Files"));
+        assert!(root.join("Novel Files/project.toml").is_file());
         assert!(state.file_browser.is_none());
         assert_eq!(
             state.app.get_project().unwrap().book_type,
             story_core::BookType::Fiction
         );
+        assert_eq!(state.app.get_project().unwrap().title, "New Novel");
         assert_eq!(state.workspace, Workspace::Cards);
         assert!(state.app.list_scenes(false).unwrap().is_empty());
     }
@@ -49598,13 +49810,27 @@ mod tests {
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
             .unwrap();
+        // Focus the visible Cancel action and activate it with Enter.
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
-        assert!(state.message.contains("Create project at"));
-        assert!(!directory.path().join("Cancelled Novel").exists());
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
 
         assert!(!directory.path().join("Cancelled Novel").exists());
@@ -49721,13 +49947,13 @@ mod tests {
         assert!(rendered.contains("Directory tree · focused"));
         assert!(rendered.contains("Folder contents"));
         assert!(rendered.contains("Selected path:"));
+        assert!(rendered.contains("Project title:"));
+        assert!(rendered.contains("Project folder:"));
         assert!(rendered.contains("Book type: Choose Fiction or Non-fiction"));
         assert!(rendered.contains("F2 Change"));
-        assert!(rendered.contains("Choose Fiction/Non-fiction"));
-        assert!(rendered.contains("F4 Select Folder"));
-        assert!(rendered.contains("F5 Create Project"));
-        assert!(rendered.contains("F7 New Folder"));
-        assert!(rendered.contains("Esc Cancel"));
+        assert!(rendered.contains("Create Project"));
+        assert!(rendered.contains("Cancel"));
+        assert!(rendered.contains("Tab: choose controls"));
     }
 
     #[test]
