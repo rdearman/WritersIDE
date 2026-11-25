@@ -17,6 +17,7 @@ authoritative source for approved requirements and human UAT findings.
 
 ## Recent verified commits
 
+- `66be93e` — preserve Scrivener RTF hyperlinks during import.
 - `1d2e165` — structural removal Undo/Redo outside the manuscript editor.
 - `4519221` — Tools > Writing Statistics opens the author-facing dashboard.
 - `97b8878` — safe sentence deletion and visible editor caret after selection.
@@ -132,6 +133,20 @@ landing page. It remains queued in documentation/release preparation after the
 current high-priority import/publication regression; audit its capability
 claims, licence, links, developer documentation and genuine synthetic-content
 screenshots before replacing the root README.
+
+The post-commit three-book regression for `66be93e307489f53f1d5368290c1c040c0b962d8`
+is stored locally in `reports/clean-commit-66be93e/`; a provisional local copy is
+in `baselines/provisional-66be93e/`. The run completed and fixture checksums
+passed. Source-body persistence was exact for manuscript bodies (44/44, 41/41,
+76/76) and research bodies (1/1, 1/1, 4/4), and all three source fingerprints
+were unchanged. Generated EPUBs contain 63, 170 and 63 links, with zero broken
+internal links; references contain 45, 149 and 26. Generated/reference image
+counts are 2/0, 44/44 and 0/0; all generated references resolve. Text sequence
+similarities remain 0.951104, 0.872523 and 0.909124; paragraph counts remain
+1298/358, 648/408 and 1813/1430. Imports are incomplete and EPUBCheck is
+unavailable. These results are provisional, not fidelity acceptance. Relevant
+GitHub comments are pending because issue-comment API requests returned GraphQL
+errors after the commit; retry them at the next GitHub checkpoint.
 
 The user also provided `README_TMP.md` for replacing the product README. This is
 queued in documentation/release preparation after current high-priority import
