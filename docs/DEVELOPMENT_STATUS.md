@@ -325,50 +325,44 @@ screenshots made with synthetic content.
 ## Latest publication work checkpoint — 25 November 2026
 
 Human Calibre UAT rejected the recent EPUBs for fidelity despite successful
-EPUBCheck validation. Two shared import safety corrections are implemented in
-the current working tree: RTF `\\uN` fallback parsing now honours scoped
-`\\ucN` and declared byte code pages; Scrivener content outside recognised
-Draft/Research/Trash containers defaults to private Research and is excluded
-from ordinary compilation. The import preview warns about ambiguous items.
-Production Compile IR privacy coverage and synthetic importer/harness tests
-were added. Do not claim publication acceptance: Scrivener layout/selection,
-chapter numbering, scene separators, placeholders and alternative publication
-front/back matter profiles remain incomplete.
+EPUBCheck validation. Commit `5de1f5e` fixed RTF `\\uN` fallback parsing and
+made content outside recognised Draft/Research/Trash containers private by
+default. Commit `c2adcbb1490b956f313c2ae88bb34501227316b2` then fixed
+per-binder-item metadata scoping and added inventory of project metadata,
+`SectionType`, compile scope, format layout mappings and front/back matter
+switches. These source compile settings are not yet applied to WIDE's shared
+Compile IR or named publication profiles. Do not claim publication acceptance:
+chapter numbering, hidden structural headings, scene separators, variables and
+alternative publication matter remain incomplete.
 
-The latest available local publication set is:
+The latest exact-commit local EPUB set, for provisional Calibre review, is:
 
-- `generated/uat-publication-safe-20261125/book-01.epub`
-- `generated/uat-publication-safe-20261125/book-02.epub`
-- `generated/uat-publication-safe-20261125/book-03.epub`
+- `generated/20261125T230034Z/book-01.epub`
+- `generated/20261125T230034Z/book-02.epub`
+- `generated/20261125T230034Z/book-03.epub`
 
-Its local machine and human reports are in
-`reports/uat-publication-safe-20261125/`. The run was made against
-`09dceb278426571b7cc4f29b64e58f7224a961b0` with the then-current dirty tree;
-the run predates the final synthetic fixture correction. Checksum and source
-fingerprint checks passed. All generated EPUBs passed EPUBCheck 4.2.6 with zero
-errors/warnings; source body persistence was exact (manuscript 39/39, 36/36,
-68/68; research 6/6, 6/6, 12/12). Targeted private-content signature checks
-found no checked unknown-area content in generated publications. The historical
-reference EPUBs separately have 2/2/0 errors and zero warnings. Historical
-token-sequence similarity remains 0.965808/0.931482/0.953626 and this is not
-accepted fidelity; source revisions and old compile settings must be triaged.
-See [the regression log](REAL_MANUSCRIPT_REGRESSION.md#25-november-2026--publication-uat-failure-and-safe-import-checkpoint)
-for the limits and details.
+The exact-commit machine and human reports are in
+`reports/20261125T230034Z/`. Fixture checksum and source fingerprint checks
+passed. Source body persistence was exact (manuscript 39/39, 36/36, 68/68;
+research 6/6, 6/6, 12/12). All generated EPUBs passed EPUBCheck 4.2.6 with
+zero errors/warnings. Historical references separately had 2/2/0 errors and
+zero warnings. Historical token comparison has missing/additional counts
+918/1084, 1081/205, and 2643/2494. These are unresolved edition comparisons,
+not proof of current-source omissions; semantic fidelity and privacy acceptance
+remain open. The import report still marks each import incomplete. See
+[the regression log](REAL_MANUSCRIPT_REGRESSION.md#25-november-2026--scrivener-compile-metadata-inventory-correction)
+for the current limits and exact classification.
 
-Verification on the current source tree passed: `cargo fmt --all -- --check`,
-workspace Clippy with warnings denied, the full offline workspace suite
-(including 337 terminal unit tests, 3 author journeys, and 24 Linux PTY tests),
-and 7 Python regression-harness tests. The tutorial-resume and Previous
-Position PTY flows were made independent of a fixed starting menu root; the
-full PTY suite passed serially. Fixture SHA-256 verification passed after the
-complete private run. The then-current three-book EPUB run is not rerun for
-the subsequent test-only menu changes.
+Verification for `c2adcbb` passed: `cargo fmt --all -- --check`, workspace
+Clippy with warnings denied, the full offline workspace suite (including 337
+terminal unit tests, 3 author journeys and 24 Linux PTY tests), and 7 Python
+regression-harness tests. The full test suite required the previously
+authorised localhost socket permission for one Ollama test. Fixture SHA-256
+verification passed after the exact-commit private run.
 
-Next: commit and push the verified RTF/private-import and test-harness batch,
-refresh the issue register/comments, then investigate Scrivener project compile
-metadata and the shared Compile IR boundary for hidden structural headings,
-chapter placeholders, scene separators and compile variables. Keep the feature
-freeze and continue the open v1.0 backlog afterward. `.gitignore`,
+Next: apply source compile inclusion/layout and metadata to the shared Compile
+IR and named publication profiles, then repeat the full real-manuscript run.
+Keep the feature freeze and continue the open v1.0 backlog afterward. `.gitignore`,
 `README_TMP.md` and `UAT/` remain user-owned/unrelated and must not be staged.
 
 ## Verification commands
