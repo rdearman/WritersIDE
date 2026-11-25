@@ -423,8 +423,23 @@ pub struct ScrivenerBinderItem {
     pub synopsis: Option<String>,
     pub notes_markdown: Option<String>,
     pub content_markdown: Option<String>,
+    #[serde(default)]
+    pub embedded_assets: Vec<ScrivenerEmbeddedAsset>,
     pub fields: BTreeMap<String, String>,
     pub unsupported: Vec<String>,
+}
+
+/// An image extracted from a Scrivener RTF text body. Binary payloads are
+/// available to an in-process import, while inventory JSON exposes only a
+/// stable placeholder, digest and media type so preview reports stay compact.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScrivenerEmbeddedAsset {
+    pub placeholder: String,
+    pub media_type: String,
+    pub extension: String,
+    pub sha256: String,
+    #[serde(skip)]
+    pub bytes: Vec<u8>,
 }
 
 /// Explicit destination choice shown in a Scrivener import preview. `Unmapped`
@@ -1827,6 +1842,7 @@ fn collect_scrivener_item(
     let mut synopsis = None;
     let mut notes_markdown = None;
     let mut content_markdown = None;
+    let mut embedded_assets = Vec::new();
     if read_candidate_content {
         if let Some(data_dir) =
             find_case_insensitive_child(&project_root.join("Files"), "Data", true)?
@@ -1836,7 +1852,16 @@ fn collect_scrivener_item(
             if let Some(file) = find_case_insensitive_child(&item_dir, "content.rtf", false)? {
                 let bytes = fs::read(&file).map_err(|error| ImportError::Io(error.to_string()))?;
                 let rtf = String::from_utf8_lossy(&bytes);
-                content_markdown = Some(extract_rtf_markdown(&rtf));
+                let (markdown, assets, unsupported_picture_count) =
+                    extract_rtf_markdown_with_assets(&rtf);
+                content_markdown = Some(markdown);
+                embedded_assets = assets;
+                if unsupported_picture_count > 0 {
+                    unsupported.push(format!(
+                        "{} embedded RTF picture(s) use unsupported or malformed image data",
+                        unsupported_picture_count
+                    ));
+                }
                 unsupported.push(
                     "Scrivener RTF font, colour, layout and embedded-object fidelity needs review"
                         .into(),
@@ -1872,6 +1897,7 @@ fn collect_scrivener_item(
         synopsis,
         notes_markdown,
         content_markdown,
+        embedded_assets,
         fields,
         unsupported,
     });
@@ -2497,7 +2523,226 @@ fn extract_rtf_text(source: &str) -> String {
 /// Markdown. Unsupported document-level formatting is reported by the caller.
 /// This intentionally preserves bold, italic and strike runs without trying
 /// to reproduce page layout or embedded objects.
+fn find_rtf_group_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut index = start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\\' => {
+                index += 1;
+                if index >= bytes.len() {
+                    break;
+                }
+                if bytes[index].is_ascii_alphabetic() {
+                    let word_start = index;
+                    while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+                        index += 1;
+                    }
+                    let word = &bytes[word_start..index];
+                    if index < bytes.len() && bytes[index] == b'-' {
+                        index += 1;
+                    }
+                    let number_start = index;
+                    while index < bytes.len() && bytes[index].is_ascii_digit() {
+                        index += 1;
+                    }
+                    if word == b"bin" && number_start < index {
+                        let length = std::str::from_utf8(&bytes[number_start..index])
+                            .ok()?
+                            .parse::<usize>()
+                            .ok()?;
+                        if index < bytes.len() && bytes[index] == b' ' {
+                            index += 1;
+                        }
+                        index = index.checked_add(length)?;
+                        continue;
+                    }
+                    if index < bytes.len() && bytes[index] == b' ' {
+                        index += 1;
+                    }
+                } else if bytes[index] == b'\'' {
+                    index = index.saturating_add(3);
+                } else {
+                    index += 1;
+                }
+            }
+            b'{' => {
+                depth += 1;
+                index += 1;
+            }
+            b'}' => {
+                depth = depth.checked_sub(1)?;
+                index += 1;
+                if depth == 0 {
+                    return Some(index);
+                }
+            }
+            _ => index += 1,
+        }
+    }
+    None
+}
+
+fn decode_rtf_picture(group: &[u8]) -> Option<(String, String, Vec<u8>)> {
+    let format_at = group
+        .windows(b"\\pngblip".len())
+        .position(|window| window == b"\\pngblip")
+        .map(|at| (at, "image/png", "png"))
+        .or_else(|| {
+            group
+                .windows(b"\\jpegblip".len())
+                .position(|window| window == b"\\jpegblip")
+                .map(|at| (at, "image/jpeg", "jpg"))
+        })?;
+    let (at, media_type, extension) = format_at;
+    let control_length = if extension == "png" {
+        b"\\pngblip".len()
+    } else {
+        b"\\jpegblip".len()
+    };
+    let mut index = at + control_length;
+    let mut high_nibble = None;
+    let mut output = Vec::new();
+    while index < group.len() {
+        if group[index] == b'\\' {
+            index += 1;
+            if index >= group.len() {
+                break;
+            }
+            if group[index].is_ascii_alphabetic() {
+                let word_start = index;
+                while index < group.len() && group[index].is_ascii_alphabetic() {
+                    index += 1;
+                }
+                let word = &group[word_start..index];
+                if index < group.len() && group[index] == b'-' {
+                    index += 1;
+                }
+                let number_start = index;
+                while index < group.len() && group[index].is_ascii_digit() {
+                    index += 1;
+                }
+                if word == b"bin" && number_start < index {
+                    let length = std::str::from_utf8(&group[number_start..index])
+                        .ok()?
+                        .parse::<usize>()
+                        .ok()?;
+                    if index < group.len() && group[index] == b' ' {
+                        index += 1;
+                    }
+                    index = index.checked_add(length)?;
+                } else if index < group.len() && group[index] == b' ' {
+                    index += 1;
+                }
+            } else if group[index] == b'\'' {
+                index = index.saturating_add(3);
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        if let Some(nibble) = (group[index] as char).to_digit(16) {
+            if let Some(high) = high_nibble.take() {
+                output.push(((high << 4) | nibble) as u8);
+            } else {
+                high_nibble = Some(nibble);
+            }
+        }
+        index += 1;
+    }
+    let valid_signature = if extension == "png" {
+        output.starts_with(b"\x89PNG\r\n\x1a\n")
+    } else {
+        output.starts_with(&[0xff, 0xd8]) && output.ends_with(&[0xff, 0xd9])
+    };
+    valid_signature.then(|| (media_type.to_owned(), extension.to_owned(), output))
+}
+
+fn extract_rtf_markdown_with_assets(source: &str) -> (String, Vec<ScrivenerEmbeddedAsset>, usize) {
+    let bytes = source.as_bytes();
+    let mut segments = Vec::<(usize, usize, String, Option<ScrivenerEmbeddedAsset>)>::new();
+    let mut search_from = 0usize;
+    let mut unsupported_picture_count = 0usize;
+    while let Some(relative) = source[search_from..].find("\\pict") {
+        let pict_at = search_from + relative;
+        let after_word = pict_at + "\\pict".len();
+        if source
+            .as_bytes()
+            .get(after_word)
+            .is_some_and(u8::is_ascii_alphabetic)
+        {
+            search_from = after_word;
+            continue;
+        }
+        let Some(picture_start) = bytes[..pict_at].iter().rposition(|byte| *byte == b'{') else {
+            search_from = after_word;
+            continue;
+        };
+        let Some(picture_end) = find_rtf_group_end(bytes, picture_start) else {
+            unsupported_picture_count = unsupported_picture_count.saturating_add(1);
+            search_from = after_word;
+            continue;
+        };
+        let group = &bytes[picture_start..picture_end];
+        let wrapper = source[..pict_at]
+            .rfind("\\shppict")
+            .filter(|at| !source[*at..pict_at].contains('}'))
+            .and_then(|at| {
+                let start = bytes[..at].iter().rposition(|byte| *byte == b'{')?;
+                let end = find_rtf_group_end(bytes, start)?;
+                (end >= picture_end).then_some((start, end))
+            });
+        let (start, end) = wrapper.unwrap_or((picture_start, picture_end));
+        if let Some((media_type, extension, image_bytes)) = decode_rtf_picture(group) {
+            let sha256 = format!("{:x}", Sha256::digest(&image_bytes));
+            let placeholder = format!("WIDESCRIVENERASSET-{sha256}");
+            let asset = ScrivenerEmbeddedAsset {
+                placeholder: placeholder.clone(),
+                media_type,
+                extension,
+                sha256,
+                bytes: image_bytes,
+            };
+            segments.push((start, end, format!("\\par {placeholder}\\par"), Some(asset)));
+        } else {
+            unsupported_picture_count = unsupported_picture_count.saturating_add(1);
+            segments.push((start, end, String::new(), None));
+        }
+        search_from = end;
+    }
+
+    let mut prepared = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    let mut assets = Vec::new();
+    for (start, end, replacement, asset) in segments {
+        if start < cursor {
+            continue;
+        }
+        prepared.push_str(&source[cursor..start]);
+        prepared.push_str(&replacement);
+        if let Some(asset) = asset {
+            assets.push(asset);
+        }
+        cursor = end;
+    }
+    prepared.push_str(&source[cursor..]);
+
+    let mut markdown = extract_rtf_markdown_without_assets(&prepared);
+    for asset in &assets {
+        let reference = format!(
+            "![Illustration](attachments/scrivener-{}.{})",
+            asset.sha256, asset.extension
+        );
+        markdown = markdown.replace(&asset.placeholder, &reference);
+    }
+    (markdown, assets, unsupported_picture_count)
+}
+
 fn extract_rtf_markdown(source: &str) -> String {
+    extract_rtf_markdown_with_assets(source).0
+}
+
+fn extract_rtf_markdown_without_assets(source: &str) -> String {
     #[derive(Clone, Copy, Default, Eq, PartialEq)]
     struct Style {
         bold: bool,
@@ -3010,6 +3255,38 @@ This is an addition to the old file.}"#;
     }
 
     #[test]
+    fn scrivener_rtf_extracts_png_payloads_as_stable_markdown_assets() {
+        let source = r#"{\rtf1\ansi Before\par {\*\shppict{\pict\pngblip\picw1\pich1 89504e470d0a1a0a}}\par After}"#;
+        let (markdown, assets, unsupported) = extract_rtf_markdown_with_assets(source);
+        assert_eq!(unsupported, 0);
+        assert_eq!(assets.len(), 1);
+        let asset = &assets[0];
+        assert_eq!(asset.media_type, "image/png");
+        assert_eq!(asset.extension, "png");
+        assert_eq!(asset.bytes, b"\x89PNG\r\n\x1a\n");
+        assert_eq!(asset.sha256, format!("{:x}", Sha256::digest(&asset.bytes)));
+        assert!(
+            markdown.contains(&format!(
+                "![Illustration](attachments/scrivener-{}.png)",
+                asset.sha256
+            )),
+            "{markdown:?}"
+        );
+        let inventory_json = serde_json::to_string(asset).unwrap();
+        assert!(inventory_json.contains(&asset.sha256));
+        assert!(!inventory_json.contains("137,80,78,71"));
+    }
+
+    #[test]
+    fn scrivener_rtf_reports_unsupported_or_malformed_picture_data() {
+        let source = r#"{\rtf1\ansi Text {\pict\emfblip 00112233} tail}"#;
+        let (markdown, assets, unsupported) = extract_rtf_markdown_with_assets(source);
+        assert!(assets.is_empty());
+        assert_eq!(unsupported, 1);
+        assert!(!markdown.contains("00112233"));
+    }
+
+    #[test]
     fn synthetic_scrivener_layout_inventory_preserves_hierarchy_and_source() {
         // Synthetic parser fixture only. This exercises the inventory contract
         // and is not evidence of compatibility with real Scrivener projects.
@@ -3114,6 +3391,7 @@ This is an addition to the old file.}"#;
                     synopsis: None,
                     notes_markdown: None,
                     content_markdown: None,
+                    embedded_assets: Vec::new(),
                     fields: BTreeMap::new(),
                     unsupported: Vec::new(),
                 },
@@ -3128,6 +3406,7 @@ This is an addition to the old file.}"#;
                     synopsis: None,
                     notes_markdown: None,
                     content_markdown: None,
+                    embedded_assets: Vec::new(),
                     fields: BTreeMap::new(),
                     unsupported: Vec::new(),
                 },

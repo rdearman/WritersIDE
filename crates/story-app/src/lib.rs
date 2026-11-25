@@ -23,6 +23,8 @@ pub enum AppError {
     Pipeline(#[from] story_pipeline::PipelineError),
     #[error(transparent)]
     Git(#[from] story_git::GitError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
     #[error("user preferences error: {0}")]
     Preferences(String),
 }
@@ -4553,6 +4555,7 @@ impl WriterApp {
                     if let Some(text) = item.content_markdown.as_deref()
                         && !text.is_empty()
                     {
+                        let text = self.materialize_scrivener_assets(item)?;
                         let unit = self.create_content_unit(
                             ContentUnitKind::SectionBody,
                             title,
@@ -4561,7 +4564,7 @@ impl WriterApp {
                             None,
                         )?;
                         let (_, expected) = self.load_content_unit_text(unit)?;
-                        self.save_content_unit_text(unit, Some(&expected), text)?;
+                        self.save_content_unit_text(unit, Some(&expected), &text)?;
                         destinations.push(("content_unit", unit.to_string(), "content_markdown"));
                     }
                 }
@@ -4588,6 +4591,7 @@ impl WriterApp {
                     if let Some(text) = item.content_markdown.as_deref()
                         && !text.is_empty()
                     {
+                        let text = self.materialize_scrivener_assets(item)?;
                         let unit = self.create_content_unit(
                             ContentUnitKind::ChapterBody,
                             title,
@@ -4596,7 +4600,7 @@ impl WriterApp {
                             None,
                         )?;
                         let (_, expected) = self.load_content_unit_text(unit)?;
-                        self.save_content_unit_text(unit, Some(&expected), text)?;
+                        self.save_content_unit_text(unit, Some(&expected), &text)?;
                         destinations.push(("content_unit", unit.to_string(), "content_markdown"));
                     }
                     destinations.push(("structural_node", node.to_string(), "chapter"));
@@ -4620,9 +4624,10 @@ impl WriterApp {
                     let mut metadata = self.get_scene(scene)?.scene;
                     metadata.synopsis = item.synopsis.clone().unwrap_or_default();
                     self.update_scene_metadata(&metadata)?;
-                    if let Some(text) = item.content_markdown.as_deref() {
+                    if item.content_markdown.is_some() {
+                        let text = self.materialize_scrivener_assets(item)?;
                         let (_, expected) = self.load_scene_text(scene)?;
-                        self.save_scene_text(scene, Some(&expected), text)?;
+                        self.save_scene_text(scene, Some(&expected), &text)?;
                     }
                     if let Some(notes) = item.notes_markdown.as_deref()
                         && !notes.is_empty()
@@ -4729,6 +4734,70 @@ impl WriterApp {
         )?;
         Ok((run, imported_scenes))
     }
+
+    fn materialize_scrivener_assets(
+        &self,
+        item: &story_import::ScrivenerBinderItem,
+    ) -> Result<String> {
+        let mut markdown = item.content_markdown.clone().unwrap_or_default();
+        for asset in &item.embedded_assets {
+            let digest = format!("{:x}", Sha256::digest(&asset.bytes));
+            if digest != asset.sha256 {
+                return Err(AppError::Domain(format!(
+                    "Scrivener image digest mismatch for source document {}",
+                    item.source_document_id
+                )));
+            }
+            let extension = match (asset.media_type.as_str(), asset.extension.as_str()) {
+                ("image/png", "png") => "png",
+                ("image/jpeg", "jpg") => "jpg",
+                _ => {
+                    return Err(AppError::Domain(format!(
+                        "unsupported Scrivener image type {}",
+                        asset.media_type
+                    )));
+                }
+            };
+            let relative = format!("attachments/scrivener-{}.{}", digest, extension);
+            reject_project_symlink_components(self.project_root(), &relative)?;
+            let path = self.project_root().join(&relative);
+            fs::create_dir_all(path.parent().expect("attachment path has a parent"))?;
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut file) => {
+                    use std::io::Write;
+                    if let Err(error) = file.write_all(&asset.bytes).and_then(|()| file.sync_all())
+                    {
+                        let _ = fs::remove_file(&path);
+                        return Err(AppError::Io(error));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let existing = fs::read(&path)?;
+                    if format!("{:x}", Sha256::digest(&existing)) != digest {
+                        return Err(AppError::Domain(format!(
+                            "existing project attachment does not match imported image {digest}"
+                        )));
+                    }
+                }
+                Err(error) => return Err(AppError::Io(error)),
+            }
+            let image_markdown = format!("![Illustration]({relative})");
+            if markdown.contains(&asset.placeholder) {
+                markdown = markdown.replace(&asset.placeholder, &image_markdown);
+            } else if !markdown.contains(&image_markdown) {
+                return Err(AppError::Domain(format!(
+                    "Scrivener image placeholder is missing from source document {}",
+                    item.source_document_id
+                )));
+            }
+        }
+        Ok(markdown)
+    }
+
     pub fn get_import_run_summary(
         &self,
         run: ImportRunId,
@@ -8164,7 +8233,7 @@ unexpected_prose = "must not be silently discarded"
         .unwrap();
         fs::write(
             scene_files.join("content.rtf"),
-            r"{\rtf1\ansi Élodie entered.}",
+            r"{\rtf1\ansi Élodie entered. {\pict\pngblip\picw1\pich1 89504e470d0a1a0a}}",
         )
         .unwrap();
         fs::write(
@@ -8204,7 +8273,16 @@ unexpected_prose = "must not be silently discarded"
             .import_scrivener_inventory(&inventory, &plan, story_import::ScrivenerImportMode::Both)
             .unwrap();
         assert_eq!(scenes.len(), 1);
-        assert_eq!(app.load_scene_text(scenes[0]).unwrap().0, "Élodie entered.");
+        let imported_scene_text = app.load_scene_text(scenes[0]).unwrap().0;
+        assert!(imported_scene_text.contains("Élodie entered."));
+        let image_hash = format!("{:x}", Sha256::digest(b"\x89PNG\r\n\x1a\n"));
+        let image_path = dir
+            .path()
+            .join(format!("Imported/attachments/scrivener-{image_hash}.png"));
+        assert_eq!(fs::read(image_path).unwrap(), b"\x89PNG\r\n\x1a\n");
+        assert!(imported_scene_text.contains(&format!(
+            "![Illustration](attachments/scrivener-{image_hash}.png)"
+        )));
         let content_units = app.list_content_units(false).unwrap();
         let section_body = content_units
             .iter()
