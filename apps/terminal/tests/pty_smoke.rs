@@ -268,7 +268,7 @@ fn named_window_layouts_save_and_load_through_the_real_view_menu() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn edit_menu_is_visible_and_select_all_dispatches_from_writing_mode_in_a_pty() {
+fn edit_menu_is_visible_and_selection_commands_dispatch_from_writing_mode_in_a_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;

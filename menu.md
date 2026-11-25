@@ -34,6 +34,8 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - Paste (`Ctrl+V`)
 - Delete Selection
 - Select All (`Ctrl+A`)
+- Select Word (at or immediately after the cursor)
+- Select Paragraph (the non-empty paragraph containing the cursor)
 - Find Next (`F3`)
 - Find Previous (`Shift+F3`)
 - Find in Manuscript (`Ctrl+F`)

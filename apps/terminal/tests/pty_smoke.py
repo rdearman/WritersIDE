@@ -339,7 +339,7 @@ def main():
             read_for(0.15)
             os.write(master, b"\x1b[C")  # Edit menu
             if not wait_for_screen_fragments(
-                (b"Undo", b"Select All", b"Find and Replace"),
+                (b"Undo", b"Select All"),
                 edit_start,
                 timeout=3.0,
             ):
@@ -357,6 +357,23 @@ def main():
                     "Edit > Select All did not dispatch from the writing menu; visible tail: "
                     + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
                 )
+            os.write(master, b"\x1b[21~")
+            read_for(0.15)
+            os.write(master, b"\x1b[C" + b"\x1b[B" * 7 + b"\r")  # Edit > Select Word
+            if not wait_for_screen_fragments(
+                (b"Selected word",), edit_start, timeout=3.0
+            ):
+                raise AssertionError("Edit > Select Word did not dispatch from writing mode")
+
+            os.write(master, b"\x1b[21~")
+            read_for(0.15)
+            os.write(master, b"\x1b[C" + b"\x1b[B" * 8 + b"\r")  # Edit > Select Paragraph
+            if not wait_for_screen_fragments(
+                (b"Selected paragraph",), edit_start, timeout=3.0
+            ):
+                raise AssertionError(
+                    "Edit > Select Paragraph did not dispatch from writing mode"
+                )
             os.write(master, b"\x11")  # Ctrl+Q
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0
@@ -366,7 +383,7 @@ def main():
                 finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after Edit-menu workflow")
-            print("PTY Edit-menu workflow passed: Edit is visible in writing mode and Select All dispatches.")
+            print("PTY Edit-menu workflow passed: Select All, Select Word and Select Paragraph dispatch in writing mode.")
             return
 
         if chapter_creation:

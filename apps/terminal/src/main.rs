@@ -972,6 +972,8 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "edit.paste-clipboard",
         "edit.delete-selection",
         "edit.select-all",
+        "edit.select-word",
+        "edit.select-paragraph",
         "search.find-next",
         "search.find-previous",
         "search.find-panel",
@@ -1613,6 +1615,8 @@ enum CommandAction {
     PasteClipboard,
     DeleteSelection,
     SelectAllText,
+    SelectWord,
+    SelectParagraph,
     FindNextMatch,
     FindPreviousMatch,
     ToggleSceneInclusion,
@@ -2588,6 +2592,36 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 7,
             advanced: false,
             action: CommandAction::SelectAllText,
+        },
+        CommandSpec {
+            id: "edit.select-word",
+            label: "Select Word",
+            description: "Select the word at or immediately after the editor cursor",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["select current word"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 8,
+            advanced: false,
+            action: CommandAction::SelectWord,
+        },
+        CommandSpec {
+            id: "edit.select-paragraph",
+            label: "Select Paragraph",
+            description: "Select the non-empty paragraph containing the editor cursor",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["select current paragraph"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 9,
+            advanced: false,
+            action: CommandAction::SelectParagraph,
         },
         CommandSpec {
             id: "search.find-next",
@@ -13681,6 +13715,8 @@ impl AppState {
                 | "edit.paste-clipboard"
                 | "edit.delete-selection"
                 | "edit.select-all"
+                | "edit.select-word"
+                | "edit.select-paragraph"
                 | "edit.insert-date-time"
                 | "edit.insert-file"
                 | "edit.indent"
@@ -13704,6 +13740,8 @@ impl AppState {
                 | "edit.paste-clipboard"
                 | "edit.delete-selection"
                 | "edit.select-all"
+                | "edit.select-word"
+                | "edit.select-paragraph"
                 | "edit.insert-date-time"
                 | "edit.insert-file"
                 | "edit.indent"
@@ -14871,6 +14909,8 @@ impl AppState {
             CommandAction::PasteClipboard => self.paste_clipboard(),
             CommandAction::DeleteSelection => self.delete_selected_text(),
             CommandAction::SelectAllText => self.select_all_text(),
+            CommandAction::SelectWord => self.select_word_at_cursor(),
+            CommandAction::SelectParagraph => self.select_paragraph_at_cursor(),
             CommandAction::FindNextMatch => self.navigate_search_match(true)?,
             CommandAction::FindPreviousMatch => self.navigate_search_match(false)?,
             CommandAction::ToggleSceneInclusion => self.toggle_scene_card_inclusion()?,
@@ -22135,6 +22175,106 @@ impl AppState {
             self.editor_selection = None;
             "The current manuscript document is empty".into()
         };
+    }
+    fn select_word_at_cursor(&mut self) {
+        let text = self.editor.join("\n");
+        let cursor = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+        let graphemes = text.grapheme_indices(true).collect::<Vec<_>>();
+        let is_word = graphemes
+            .iter()
+            .enumerate()
+            .map(|(index, (_, grapheme))| {
+                grapheme.chars().any(char::is_alphanumeric)
+                    || *grapheme == "_"
+                    || ((*grapheme == "'" || *grapheme == "’")
+                        && index > 0
+                        && index + 1 < graphemes.len()
+                        && graphemes[index - 1].1.chars().any(char::is_alphanumeric)
+                        && graphemes[index + 1].1.chars().any(char::is_alphanumeric))
+            })
+            .collect::<Vec<_>>();
+        let at = graphemes.partition_point(|(start, _)| *start < cursor);
+        let current = (at < graphemes.len() && graphemes[at].0 <= cursor && is_word[at])
+            .then_some(at)
+            .or_else(|| (at..graphemes.len()).find(|index| is_word[*index]))
+            .or_else(|| (0..at).rev().find(|index| is_word[*index]));
+        let Some(current) = current else {
+            self.editor_selection = None;
+            self.message = "There is no word at or near the editor cursor".into();
+            return;
+        };
+        let mut first = current;
+        let mut last = current + 1;
+        while first > 0 && is_word[first - 1] {
+            first -= 1;
+        }
+        while last < is_word.len() && is_word[last] {
+            last += 1;
+        }
+        let start = graphemes[first].0;
+        let end = graphemes.get(last).map_or(text.len(), |(byte, _)| *byte);
+        self.select_editor_byte_range(start, end, "Selected word");
+    }
+    fn select_paragraph_at_cursor(&mut self) {
+        if self.editor.is_empty() {
+            self.editor_selection = None;
+            self.message = "The current manuscript document is empty".into();
+            return;
+        }
+        let row = self.cursor.0.min(self.editor.len() - 1);
+        if self.editor[row].trim().is_empty() {
+            self.editor_selection = None;
+            self.message = "Place the cursor in a non-empty paragraph first".into();
+            return;
+        }
+        let mut first = row;
+        while first > 0 && !self.editor[first - 1].trim().is_empty() {
+            first -= 1;
+        }
+        let mut last = row;
+        while last + 1 < self.editor.len() && !self.editor[last + 1].trim().is_empty() {
+            last += 1;
+        }
+        let start = editor_position_byte(&self.editor, first, 0);
+        let end = editor_position_byte(&self.editor, last, grapheme_count(&self.editor[last]));
+        self.select_editor_byte_range(start, end, "Selected paragraph");
+    }
+    fn select_editor_byte_range(&mut self, start: usize, end: usize, label: &str) {
+        let text = self.editor.join("\n");
+        if start >= end
+            || end > text.len()
+            || !text.is_char_boundary(start)
+            || !text.is_char_boundary(end)
+        {
+            self.editor_selection = None;
+            self.message = "No selectable text at the current position".into();
+            return;
+        }
+        if self
+            .narrowed_passage
+            .is_some_and(|(start_limit, end_limit)| start < start_limit || end > end_limit)
+        {
+            self.editor_selection = None;
+            self.message = "Selection would extend outside the narrowed passage".into();
+            return;
+        }
+        let Some(start_position) = editor_position_from_byte(&text, start) else {
+            self.editor_selection = None;
+            self.message = "Selection start is not a valid editor boundary".into();
+            return;
+        };
+        let Some(end_position) = editor_position_from_byte(&text, end) else {
+            self.editor_selection = None;
+            self.message = "Selection end is not a valid editor boundary".into();
+            return;
+        };
+        self.extra_cursors.clear();
+        self.editor_selection = Some(start_position);
+        self.cursor = end_position;
+        self.message = format!(
+            "{label} · {} words",
+            text[start..end].split_whitespace().count()
+        );
     }
     fn visible_editor_line_count(&self) -> usize {
         let text = self.editor.join("\n");
@@ -49128,6 +49268,62 @@ mod tests {
         state.cursor = (0, 0);
         run_edit_menu(&mut state, "edit.paste-clipboard");
         assert_eq!(state.editor.join("\n"), "alpha betaalpha beta");
+    }
+
+    #[test]
+    fn edit_menu_selects_unicode_words_and_multiline_paragraphs_without_editing_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let source = "Café's story continues\non this line\n\nA second paragraph.";
+        let hash = app.load_scene_text(scene).unwrap().1;
+        app.save_scene_text(scene, Some(&hash), source).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+
+        let run_edit_menu = |state: &mut AppState, command_id: &str| {
+            state.open_menu_category(1);
+            let selected = state
+                .menu_visible_entries()
+                .iter()
+                .position(|command| command.id == command_id)
+                .unwrap_or_else(|| panic!("{command_id} is absent from the Edit menu"));
+            state.menu.as_mut().unwrap().selected = selected;
+            state
+                .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+
+        state.cursor = (0, 2);
+        run_edit_menu(&mut state, "edit.select-word");
+        assert_eq!(state.selected_text().as_deref(), Some("Café's"));
+        assert!(state.message.starts_with("Selected word"));
+
+        state.editor_selection = None;
+        state.cursor = (1, 2);
+        run_edit_menu(&mut state, "edit.select-paragraph");
+        assert_eq!(
+            state.selected_text().as_deref(),
+            Some("Café's story continues\non this line")
+        );
+        assert!(state.message.starts_with("Selected paragraph"));
+        assert_eq!(state.editor.join("\n"), source);
+
+        state.editor_selection = None;
+        state.cursor = (2, 0);
+        run_edit_menu(&mut state, "edit.select-paragraph");
+        assert!(state.selected_text().is_none());
+        assert!(state.message.contains("non-empty paragraph"));
+
+        state.editor_selection = None;
+        state.cursor = (0, 0);
+        state.narrowed_passage = Some((0, "Café's".len()));
+        run_edit_menu(&mut state, "edit.select-paragraph");
+        assert!(state.selected_text().is_none());
+        assert!(state.message.contains("outside the narrowed passage"));
+        assert_eq!(state.editor.join("\n"), source);
     }
 
     #[test]
