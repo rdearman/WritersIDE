@@ -35,6 +35,7 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - Delete Selection
 - Select All (`Ctrl+A`)
 - Select Word (at or immediately after the cursor)
+- Select Sentence (using punctuation, paragraph boundaries and common abbreviations)
 - Select Paragraph (the non-empty paragraph containing the cursor)
 - Find Next (`F3`)
 - Find Previous (`Shift+F3`)

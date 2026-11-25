@@ -973,6 +973,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "edit.delete-selection",
         "edit.select-all",
         "edit.select-word",
+        "edit.select-sentence",
         "edit.select-paragraph",
         "search.find-next",
         "search.find-previous",
@@ -1616,6 +1617,7 @@ enum CommandAction {
     DeleteSelection,
     SelectAllText,
     SelectWord,
+    SelectSentence,
     SelectParagraph,
     FindNextMatch,
     FindPreviousMatch,
@@ -2609,6 +2611,21 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::SelectWord,
         },
         CommandSpec {
+            id: "edit.select-sentence",
+            label: "Select Sentence",
+            description: "Select the sentence containing or following the editor cursor",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["select current sentence"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 9,
+            advanced: false,
+            action: CommandAction::SelectSentence,
+        },
+        CommandSpec {
             id: "edit.select-paragraph",
             label: "Select Paragraph",
             description: "Select the non-empty paragraph containing the editor cursor",
@@ -2619,7 +2636,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             task_group: "Editor Editing",
-            menu_priority: 9,
+            menu_priority: 10,
             advanced: false,
             action: CommandAction::SelectParagraph,
         },
@@ -5071,6 +5088,112 @@ fn editor_position_from_byte(text: &str, byte: usize) -> Option<(usize, usize)> 
         prefix.matches('\n').count(),
         grapheme_count(prefix.rsplit('\n').next().unwrap_or_default()),
     ))
+}
+
+fn editor_sentence_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut paragraphs = Vec::new();
+    let mut offset = 0;
+    let mut paragraph_start = None;
+    let mut paragraph_end = 0;
+    for line in text.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        if content.trim().is_empty() {
+            if let Some(start) = paragraph_start.take() {
+                paragraphs.push(start..paragraph_end);
+            }
+        } else {
+            paragraph_start.get_or_insert(offset);
+            paragraph_end = offset + content.len();
+        }
+        offset += line.len();
+    }
+    if let Some(start) = paragraph_start {
+        paragraphs.push(start..paragraph_end);
+    }
+
+    let mut ranges = Vec::new();
+    for paragraph in paragraphs {
+        let Some(source) = text.get(paragraph.clone()) else {
+            continue;
+        };
+        let mut sentence_start = 0;
+        while sentence_start < source.len() {
+            while source[sentence_start..]
+                .chars()
+                .next()
+                .is_some_and(char::is_whitespace)
+            {
+                sentence_start += source[sentence_start..].chars().next().unwrap().len_utf8();
+            }
+            if sentence_start >= source.len() {
+                break;
+            }
+            let mut scan = sentence_start;
+            let boundary = loop {
+                if scan >= source.len() {
+                    break None;
+                }
+                let character = source[scan..].chars().next().unwrap();
+                let after_character = scan + character.len_utf8();
+                if matches!(character, '.' | '!' | '?' | '…') {
+                    let mut sentence_end = after_character;
+                    while source[sentence_end..].chars().next().is_some_and(|next| {
+                        matches!(next, '\"' | '\'' | '”' | '’' | ')' | ']' | '}')
+                    }) {
+                        sentence_end += source[sentence_end..].chars().next().unwrap().len_utf8();
+                    }
+                    let follows_space_or_end = source[sentence_end..]
+                        .chars()
+                        .next()
+                        .is_none_or(char::is_whitespace);
+                    let abbreviation =
+                        character == '.' && is_nonterminal_period(source, scan, after_character);
+                    if follows_space_or_end && !abbreviation {
+                        let next_start = sentence_end
+                            + source[sentence_end..]
+                                .chars()
+                                .take_while(|next| next.is_whitespace())
+                                .map(char::len_utf8)
+                                .sum::<usize>();
+                        break Some((sentence_end, next_start));
+                    }
+                }
+                scan = after_character;
+            };
+            if let Some((sentence_end, next_start)) = boundary {
+                if sentence_end > sentence_start {
+                    ranges.push(paragraph.start + sentence_start..paragraph.start + sentence_end);
+                }
+                sentence_start = next_start;
+            } else {
+                let sentence_end = source.trim_end().len();
+                if sentence_end > sentence_start {
+                    ranges.push(paragraph.start + sentence_start..paragraph.start + sentence_end);
+                }
+                break;
+            }
+        }
+    }
+    ranges
+}
+
+fn is_nonterminal_period(source: &str, period: usize, after_period: usize) -> bool {
+    let token = source[..period]
+        .rsplit(char::is_whitespace)
+        .next()
+        .unwrap_or_default()
+        .trim_matches(|character: char| !character.is_alphanumeric())
+        .to_ascii_lowercase();
+    let next = source[after_period..].trim_start().chars().next();
+    matches!(
+        token.as_str(),
+        "mr" | "mrs" | "ms" | "dr" | "prof" | "sr" | "jr" | "st" | "vs" | "etc" | "eg" | "ie"
+    ) || (token.chars().count() == 1 && token.chars().all(char::is_alphabetic))
+        || (source[..period]
+            .chars()
+            .next_back()
+            .is_some_and(char::is_numeric)
+            && next.is_some_and(char::is_numeric))
 }
 
 fn parse_processing_stages(names: &str) -> Result<Vec<story_pipeline::Stage>, String> {
@@ -13716,6 +13839,7 @@ impl AppState {
                 | "edit.delete-selection"
                 | "edit.select-all"
                 | "edit.select-word"
+                | "edit.select-sentence"
                 | "edit.select-paragraph"
                 | "edit.insert-date-time"
                 | "edit.insert-file"
@@ -13741,6 +13865,7 @@ impl AppState {
                 | "edit.delete-selection"
                 | "edit.select-all"
                 | "edit.select-word"
+                | "edit.select-sentence"
                 | "edit.select-paragraph"
                 | "edit.insert-date-time"
                 | "edit.insert-file"
@@ -14910,6 +15035,7 @@ impl AppState {
             CommandAction::DeleteSelection => self.delete_selected_text(),
             CommandAction::SelectAllText => self.select_all_text(),
             CommandAction::SelectWord => self.select_word_at_cursor(),
+            CommandAction::SelectSentence => self.select_sentence_at_cursor(),
             CommandAction::SelectParagraph => self.select_paragraph_at_cursor(),
             CommandAction::FindNextMatch => self.navigate_search_match(true)?,
             CommandAction::FindPreviousMatch => self.navigate_search_match(false)?,
@@ -22214,6 +22340,22 @@ impl AppState {
         let start = graphemes[first].0;
         let end = graphemes.get(last).map_or(text.len(), |(byte, _)| *byte);
         self.select_editor_byte_range(start, end, "Selected word");
+    }
+    fn select_sentence_at_cursor(&mut self) {
+        let text = self.editor.join("\n");
+        let cursor = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+        let ranges = editor_sentence_ranges(&text);
+        let selected = ranges
+            .iter()
+            .find(|range| range.start <= cursor && cursor <= range.end)
+            .or_else(|| ranges.iter().find(|range| range.start >= cursor))
+            .or_else(|| ranges.last());
+        let Some(range) = selected else {
+            self.editor_selection = None;
+            self.message = "There is no sentence at or near the editor cursor".into();
+            return;
+        };
+        self.select_editor_byte_range(range.start, range.end, "Selected sentence");
     }
     fn select_paragraph_at_cursor(&mut self) {
         if self.editor.is_empty() {
@@ -49277,7 +49419,8 @@ mod tests {
         let mut app = WriterApp::create_project(&project, "Novel").unwrap();
         let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
         let scene = app.create_scene(chapter, "Scene", 0).unwrap();
-        let source = "Café's story continues\non this line\n\nA second paragraph.";
+        let source =
+            "Café's story continues. On this line!\ncontinues here.\n\nA second paragraph.";
         let hash = app.load_scene_text(scene).unwrap().1;
         app.save_scene_text(scene, Some(&hash), source).unwrap();
         let mut state = AppState::new(app, default_bindings());
@@ -49302,11 +49445,16 @@ mod tests {
         assert!(state.message.starts_with("Selected word"));
 
         state.editor_selection = None;
+        state.cursor = (0, "Café's story continues. ".graphemes(true).count());
+        run_edit_menu(&mut state, "edit.select-sentence");
+        assert_eq!(state.selected_text().as_deref(), Some("On this line!"));
+
+        state.editor_selection = None;
         state.cursor = (1, 2);
         run_edit_menu(&mut state, "edit.select-paragraph");
         assert_eq!(
             state.selected_text().as_deref(),
-            Some("Café's story continues\non this line")
+            Some("Café's story continues. On this line!\ncontinues here.")
         );
         assert!(state.message.starts_with("Selected paragraph"));
         assert_eq!(state.editor.join("\n"), source);
@@ -49324,6 +49472,20 @@ mod tests {
         assert!(state.selected_text().is_none());
         assert!(state.message.contains("outside the narrowed passage"));
         assert_eq!(state.editor.join("\n"), source);
+    }
+
+    #[test]
+    fn sentence_selection_keeps_common_abbreviations_quotes_and_paragraph_boundaries() {
+        let source = "Dr. Moss replied, ‘I agree.’ Next!\n\nFinal sentence.";
+        let ranges = editor_sentence_ranges(source);
+        let sentences = ranges
+            .iter()
+            .map(|range| &source[range.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(
+            sentences,
+            ["Dr. Moss replied, ‘I agree.’", "Next!", "Final sentence."]
+        );
     }
 
     #[test]

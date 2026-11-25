@@ -16,9 +16,14 @@ requirements are finished.
   whitespace, it selects the next word; at the end of the document it falls
   back to the previous word. Alphanumeric graphemes and underscores form words;
   apostrophes between alphanumeric graphemes remain internal.
+- Select Sentence selects a punctuation-delimited sentence. Blank lines are
+  paragraph boundaries; common English abbreviations, single-letter initials,
+  decimal points, and closing quotation marks receive deterministic handling.
+  This lightweight rule is language-agnostic and is not a full linguistic
+  sentence tokenizer.
 - Select Paragraph selects contiguous non-empty source lines bounded by blank
   lines. A blank current line has no paragraph to select.
-- Both commands clear extra cursors, respect narrowed editing ranges, report
+- All three commands clear extra cursors, respect narrowed editing ranges, report
   boundary failures, and leave manuscript bytes untouched.
 - Selection is transient editor state and is not added to project persistence.
 
@@ -26,9 +31,9 @@ requirements are finished.
 
 Automated coverage exercises both actions through the Edit command dispatcher,
 including accented text, apostrophes, multiline paragraphs, blank-line
-boundaries, narrowed passages, real Linux PTY menu dispatch, and save/reopen
-source integrity. Human UAT remains required for discoverability and expected
-word-boundary behavior.
+boundaries, common abbreviations, closing quotes, narrowed passages, real Linux
+PTY menu dispatch, and save/reopen source integrity. Human UAT remains required
+for discoverability and expected word/sentence boundary behavior.
 
 ## Remaining #61 scope
 

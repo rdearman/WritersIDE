@@ -392,13 +392,16 @@ paragraph breaks. Case actions include uppercase, lowercase and title case.
 Regression coverage invokes these operations through the Edit menu and checks
 their results and undo behaviour.
 
-The Edit menu also exposes **Select Word** and **Select Paragraph**. Word
-selection is Unicode grapheme-aware and includes internal apostrophes in
-words; from whitespace it selects the next word, falling back to the previous
-word at document end. Paragraph selection spans adjacent non-empty source lines
-up to a blank line. Both use canonical source selection offsets, respect a
-narrowed passage, and do not modify manuscript text. Unit and PTY regressions
-cover menu dispatch and persisted source integrity. Human UAT is still required.
+The Edit menu also exposes **Select Word**, **Select Sentence** and **Select
+Paragraph**. Word selection is Unicode grapheme-aware and includes internal
+apostrophes; from whitespace it selects the next word, falling back to the
+previous word at document end. Sentence selection uses punctuation boundaries,
+blank paragraphs and a small common-abbreviation rule; it is not a full
+language-specific tokenizer. Paragraph selection spans adjacent non-empty
+source lines up to a blank line. These actions use canonical source selection
+offsets, respect a narrowed passage, and do not modify manuscript text. Unit
+and PTY regressions cover menu dispatch and persisted source integrity. Human
+UAT is still required.
 
 ## Alpha UAT 19 — manuscript insertion actions
 
