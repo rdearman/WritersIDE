@@ -976,7 +976,25 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "scene.open",
         "search.return-position",
     ],
-    &["view.formatting-marks", "view.rendered-markdown"],
+    &[
+        "view.formatting-marks",
+        "view.rendered-markdown",
+        "view.follow-scene-card",
+        "view.pin-reference",
+        "view.toggle-references",
+        "view.reference-outline",
+        "view.reference-timeline",
+        "view.reference-diagnostics",
+        "window.next",
+        "window.previous",
+        "window.move-reference-earlier",
+        "window.move-reference-later",
+        "window.close",
+        "window.return-to-writing",
+        "window.maximize",
+        "window.restore-layout",
+        "window.swap-sides",
+    ],
     &[
         "edit.resolve-save-conflict",
         "issue.create",
@@ -4745,7 +4763,14 @@ fn subsequence_matches(
 
 fn menu_category(spec: &CommandSpec) -> &'static str {
     let id = spec.id;
-    if matches!(id, "view.formatting-marks" | "view.rendered-markdown") {
+    if matches!(id, "view.formatting-marks" | "view.rendered-markdown")
+        || id.starts_with("view.reference-")
+        || matches!(
+            id,
+            "view.follow-scene-card" | "view.pin-reference" | "view.toggle-references"
+        )
+        || id.starts_with("window.")
+    {
         "View"
     } else if spec.category == "Help" || id.starts_with("help.") {
         "Help"
@@ -12803,6 +12828,31 @@ impl AppState {
             "series.restore-selected-book" => in_removed_series_books,
             _ => true,
         });
+        if menu_index == 4 {
+            let editor = self.workspace == Workspace::Editor;
+            let has_references = !self.reference_panes.is_empty();
+            let multiple_references = self.reference_panes.len() > 1;
+            direct.retain(|command| match command.id {
+                "view.formatting-marks" => editor,
+                "view.rendered-markdown" => self.workspace == Workspace::Reading,
+                "view.follow-scene-card" => editor && self.editing_scene.is_some(),
+                "view.pin-reference" => editor && self.reference_focused && has_references,
+                "view.toggle-references" => editor && has_references,
+                "view.reference-outline"
+                | "view.reference-timeline"
+                | "view.reference-diagnostics"
+                | "window.maximize" => editor,
+                "window.next"
+                | "window.previous"
+                | "window.move-reference-earlier"
+                | "window.move-reference-later" => editor && multiple_references,
+                "window.close" => editor && has_references,
+                "window.return-to-writing" => editor && self.reference_focused,
+                "window.restore-layout" => editor && self.editor_focus_mode,
+                "window.swap-sides" => editor && has_references,
+                _ => true,
+            });
+        }
         if top != "Tools"
             && top != "Help"
             && let Some(search) = commands
@@ -41803,8 +41853,11 @@ mod tests {
     #[test]
     fn menus_are_flat_curated_lists_and_keep_all_commands_searchable() {
         let directory = tempfile::tempdir().unwrap();
-        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
         let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
         let registered_ids = command_registry()
             .iter()
             .map(|command| command.id)
@@ -41847,6 +41900,22 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>();
+            if top == 4 {
+                expected.retain(|id| {
+                    matches!(
+                        *id,
+                        "view.formatting-marks"
+                            | "view.follow-scene-card"
+                            | "view.reference-outline"
+                            | "view.reference-timeline"
+                            | "view.reference-diagnostics"
+                            | "window.maximize"
+                    )
+                });
+                if state.editor_focus_mode {
+                    expected.push("window.restore-layout");
+                }
+            }
             if top != SCENE_MENU_INDEX && category != &"Tools" && category != &"Help" {
                 expected.push("command.palette-open");
             }
@@ -47542,6 +47611,90 @@ mod tests {
         assert!(state.help_panel.is_none());
         assert_eq!(state.mode, Some('q'));
         assert_eq!(state.prompt, "Save and Quit · Quit Without Saving · Cancel");
+    }
+
+    #[test]
+    fn view_menu_exposes_only_applicable_reference_window_actions() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+
+        let view_index = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "View")
+            .unwrap();
+        let open_view_menu = |state: &mut AppState| {
+            state.open_menu_category(view_index);
+        };
+        let has_action = |state: &AppState, id: &str| {
+            state.menu_commands().iter().any(|command| command.id == id)
+        };
+        let activate = |state: &mut AppState, id: &str| {
+            open_view_menu(state);
+            state.menu.as_mut().unwrap().selected = state
+                .menu_commands()
+                .iter()
+                .position(|command| command.id == id)
+                .unwrap_or_else(|| panic!("{id} is absent from the View menu"));
+            state
+                .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+
+        open_view_menu(&mut state);
+        assert!(has_action(&state, "view.formatting-marks"));
+        assert!(has_action(&state, "view.reference-outline"));
+        assert!(has_action(&state, "window.maximize"));
+        assert!(!has_action(&state, "window.close"));
+        assert!(!has_action(&state, "window.next"));
+
+        activate(&mut state, "view.reference-outline");
+        assert_eq!(state.reference_panes.len(), 1);
+        assert!(state.reference_focused);
+        open_view_menu(&mut state);
+        assert!(has_action(&state, "view.pin-reference"));
+        assert!(has_action(&state, "view.toggle-references"));
+        assert!(has_action(&state, "window.return-to-writing"));
+        assert!(has_action(&state, "window.close"));
+        assert!(!has_action(&state, "window.next"));
+
+        activate(&mut state, "window.return-to-writing");
+        assert!(!state.reference_focused);
+        activate(&mut state, "view.reference-timeline");
+        assert_eq!(state.reference_panes.len(), 2);
+        open_view_menu(&mut state);
+        assert!(has_action(&state, "window.next"));
+        assert!(has_action(&state, "window.previous"));
+        assert!(has_action(&state, "window.move-reference-earlier"));
+        assert!(has_action(&state, "window.move-reference-later"));
+
+        activate(&mut state, "window.close");
+        assert_eq!(state.reference_panes.len(), 1);
+    }
+
+    #[test]
+    fn view_menu_hides_editor_pane_actions_outside_the_editor() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.switch(Workspace::Cards);
+        let view_index = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "View")
+            .unwrap();
+        state.open_menu_category(view_index);
+        let ids = state
+            .menu_commands()
+            .iter()
+            .map(|command| command.id)
+            .collect::<Vec<_>>();
+        assert!(!ids.contains(&"view.formatting-marks"));
+        assert!(!ids.contains(&"view.reference-outline"));
+        assert!(!ids.contains(&"window.maximize"));
+        assert!(ids.contains(&"command.palette-open"));
     }
 
     #[test]

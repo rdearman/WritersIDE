@@ -398,3 +398,23 @@ two-pane browser, accepts UTF-8 text files, preserves source bytes, and inserts
 the chosen text at the manuscript cursor as one undoable edit. Menu integration,
 undo, save/reopen persistence, and source preservation are exercised in both
 unit and Linux PTY tests.
+
+## 25 November 2026 — contextual View menu
+
+The View menu now exposes the existing reference-pane operations when they are
+applicable in the manuscript editor: open Outline, Timeline, and Compile
+Diagnostics references; follow the active scene card; pin a focused reference;
+hide/show open reference panes; switch or reorder multiple reference windows;
+close a reference; return focus to writing; maximize/restore; and swap editor
+and reference sides. Formatting marks are shown only while editing, and
+rendered Markdown only in the Reference workspace. Actions that require an open
+scene, focused reference, or multiple windows are omitted until that condition
+holds. This reduces irrelevant menu entries while preserving command IDs and
+the searchable command registry.
+
+The application still renders its editor and reference-pane model rather than
+the recursive `PaneLayout` geometry module. Therefore generic recursive splits,
+same-buffer independent windows, and arbitrary view-buffer switching remain
+unimplemented under #13; this menu update does not claim those requirements as
+complete. Unit regressions verify menu visibility by workspace and invoke
+reference open, return-to-writing, and close through the actual View menu.
