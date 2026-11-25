@@ -2388,7 +2388,7 @@ fn command_registry() -> Vec<CommandSpec> {
         CommandSpec {
             id: "edit.undo",
             label: "Undo",
-            description: "Undo the last manuscript text edit",
+            description: "Undo the last manuscript edit or scoped replacement",
             category: "Edit",
             default_shortcuts: &[],
             mnemonic: None,
@@ -4179,6 +4179,19 @@ fn command_registry() -> Vec<CommandSpec> {
         ),
     ]);
     for command in &mut commands {
+        command.default_shortcuts = match command.id {
+            "edit.undo" => &["Ctrl+Z"],
+            "edit.redo" => &["Ctrl+Y", "Ctrl+Shift+Z"],
+            "edit.cut-selection" => &["Ctrl+X"],
+            "edit.copy-selection" => &["Ctrl+C"],
+            "edit.paste-clipboard" => &["Ctrl+V"],
+            "edit.select-all" => &["Ctrl+A"],
+            "search.find-panel" => &["Ctrl+F"],
+            "search.replace-panel" => &["Ctrl+H"],
+            "search.find-next" => &["F3"],
+            "search.find-previous" => &["Shift+F3"],
+            _ => command.default_shortcuts,
+        };
         command.task_group = task_group_for_command(*command);
         command.menu_priority = MENU_CATEGORIES
             .iter()
@@ -4327,16 +4340,25 @@ fn command_by_id(id: &str) -> Option<CommandSpec> {
 
 fn command_for_effective_shortcut(state: &AppState, key: KeyEvent) -> Option<CommandSpec> {
     command_registry().into_iter().find(|command| {
-        !matches!(
-            command.action,
-            CommandAction::Workspace(_) | CommandAction::Save
-        ) && effective_command_shortcuts(state, *command)
-            .iter()
-            .any(|shortcut| {
-                parse_shortcut(shortcut).is_ok_and(|event| {
-                    same_keycode(event.code, key.code) && event.modifiers == key.modifiers
+        // In an editor reference pane, Ctrl+C copies the selected reference
+        // passage. Let the reference-view handler keep that established meaning
+        // instead of routing it to the manuscript selection command.
+        !(state.workspace == Workspace::Editor
+            && state.reference_focused
+            && command.id == "edit.copy-selection"
+            && key.code == KeyCode::Char('c')
+            && key.modifiers == KeyModifiers::CONTROL)
+            && !matches!(
+                command.action,
+                CommandAction::Workspace(_) | CommandAction::Save
+            )
+            && effective_command_shortcuts(state, *command)
+                .iter()
+                .any(|shortcut| {
+                    parse_shortcut(shortcut).is_ok_and(|event| {
+                        same_keycode(event.code, key.code) && event.modifiers == key.modifiers
+                    })
                 })
-            })
     })
 }
 
@@ -12585,8 +12607,27 @@ impl AppState {
         {
             return Some("Open a manuscript document first");
         }
+        if matches!(
+            spec.id,
+            "edit.undo"
+                | "edit.redo"
+                | "edit.cut-selection"
+                | "edit.copy-selection"
+                | "edit.paste-clipboard"
+                | "edit.delete-selection"
+                | "edit.select-all"
+        ) && self.reference_focused
+        {
+            return Some("Focus the manuscript pane first");
+        }
         match spec.id {
-            "edit.undo" if self.undo_stack.is_empty() => {
+            "edit.undo"
+                if self.undo_stack.is_empty()
+                    && load_replace_undo(self.app.project_root())
+                        .ok()
+                        .flatten()
+                        .is_none() =>
+            {
                 return Some("There is no manuscript edit to undo");
             }
             "edit.redo" if self.redo_stack.is_empty() => {
@@ -12600,7 +12641,7 @@ impl AppState {
             "edit.paste-clipboard" if self.clipboard.is_empty() => {
                 return Some("The local clipboard is empty");
             }
-            "search.find-next" | "search.find-previous" if self.search_hits.is_empty() => {
+            "search.find-next" | "search.find-previous" if self.search_locations.is_empty() => {
                 return Some("Run a search before navigating matches");
             }
             _ => {}
@@ -13659,7 +13700,15 @@ impl AppState {
             }
             CommandAction::ToggleBoldSelection => self.toggle_inline_format("**", "bold")?,
             CommandAction::ToggleItalicSelection => self.toggle_inline_format("*", "italic")?,
-            CommandAction::UndoEdit => self.undo_edit(),
+            CommandAction::UndoEdit => {
+                if self.undo_stack.is_empty()
+                    && load_replace_undo(self.app.project_root())?.is_some()
+                {
+                    self.undo_last_scoped_replace()?;
+                } else {
+                    self.undo_edit();
+                }
+            }
             CommandAction::RedoEdit => self.redo_edit(),
             CommandAction::CutSelection => self.cut_selected_text()?,
             CommandAction::CopySelection => self.copy_selected_text()?,
@@ -41263,6 +41312,22 @@ mod tests {
         let save_row = menu_command_row(&state, save, 36);
         assert!(save_row.contains("Ctrl+S"), "{save_row}");
         assert!(save_row.starts_with("Save Project"), "{save_row}");
+
+        state.menu.as_mut().unwrap().top = 1;
+        for (id, shortcut) in [
+            ("edit.undo", "Ctrl+Z"),
+            ("edit.redo", "Ctrl+Y"),
+            ("edit.cut-selection", "Ctrl+X"),
+            ("edit.copy-selection", "Ctrl+C"),
+            ("edit.paste-clipboard", "Ctrl+V"),
+            ("edit.select-all", "Ctrl+A"),
+            ("search.find-next", "F3"),
+            ("search.find-previous", "Shift+F3"),
+        ] {
+            let command = command_by_id(id).unwrap();
+            let row = menu_command_row(&state, command, 48);
+            assert!(row.contains(shortcut), "{id}: {row}");
+        }
 
         let clipped = truncate_display_cells("e\u{301}😀Novel", 4);
         assert!(UnicodeWidthStr::width(clipped.as_str()) <= 4);

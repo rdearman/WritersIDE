@@ -27,8 +27,17 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 
 ## Edit
 
-- Find in Manuscript
-- Find and Replace
+- Undo (`Ctrl+Z`)
+- Redo (`Ctrl+Y` / `Ctrl+Shift+Z`)
+- Cut Selection (`Ctrl+X`)
+- Copy Selection (`Ctrl+C`)
+- Paste (`Ctrl+V`)
+- Delete Selection
+- Select All (`Ctrl+A`)
+- Find Next (`F3`)
+- Find Previous (`Shift+F3`)
+- Find in Manuscript (`Ctrl+F`)
+- Find and Replace (`Ctrl+H`)
 - Rename Scene
 - Set Scene Status
 - Move Scene to Chapter…

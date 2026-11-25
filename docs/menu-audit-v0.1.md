@@ -371,3 +371,15 @@ cancel. The temporary directory is owned by the running application and is
 removed only when discarded/closed or when another project replaces it.
 Automated tests verify that the old project can be reopened, saved text persists
 before closing, and cancellation leaves the current buffer intact.
+
+## Alpha UAT 19 — contextual Edit actions
+
+The Edit menu exposes Undo, Redo, Cut Selection, Copy Selection, Paste, Delete
+Selection, Select All, Find Next and Find Previous as direct menu actions. The
+registry displays conventional shortcuts (`Ctrl+Z`, `Ctrl+Y` / `Ctrl+Shift+Z`,
+`Ctrl+X/C/V/A`, `Ctrl+F/H`, and `F3` / `Shift+F3`). Shortcut dispatch reuses the
+existing editor operations; reference-pane `Ctrl+C` retains its passage-copy
+meaning, and scoped replacement undo remains available through `Ctrl+Z`.
+Automated menu-path regression coverage verifies selection, clipboard, cut,
+undo, redo and paste. This supplement does not claim that every requested text
+transformation from issue #54 is implemented.
