@@ -335,6 +335,9 @@ struct AppState {
     reference_layout: ReferenceLayout,
     reference_panes_hidden: bool,
     reference_swapped: bool,
+    pane_layout: Option<pane_layout::PaneLayout>,
+    restore_pane_layout: Option<pane_layout::PaneLayout>,
+    pane_bounds: pane_layout::PaneRect,
     selected_series_root: Option<PathBuf>,
     series_reference_view: bool,
     series_removed_books_view: bool,
@@ -496,6 +499,7 @@ struct ActiveWritingSession {
 
 #[derive(Clone, Debug)]
 struct ReferencePane {
+    layout_id: Option<u64>,
     source_key: String,
     scene_id: Option<SceneId>,
     title: String,
@@ -991,11 +995,16 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "view.reference-outline",
         "view.reference-timeline",
         "view.reference-diagnostics",
+        "window.split-side-by-side",
+        "window.split-top-bottom",
+        "window.grow",
+        "window.shrink",
         "window.next",
         "window.previous",
         "window.move-reference-earlier",
         "window.move-reference-later",
         "window.close",
+        "window.only",
         "window.return-to-writing",
         "window.maximize",
         "window.restore-layout",
@@ -1139,6 +1148,12 @@ struct SessionSnapshot {
     reference_panes_hidden: bool,
     #[serde(default)]
     reference_swapped: bool,
+    #[serde(default)]
+    pane_layout: Option<pane_layout::PaneLayout>,
+    #[serde(default)]
+    restore_pane_layout: Option<pane_layout::PaneLayout>,
+    #[serde(default)]
+    reference_layout_ids: Vec<Option<u64>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1564,6 +1579,11 @@ enum CommandAction {
     FindNextMatch,
     FindPreviousMatch,
     ToggleSceneInclusion,
+    WindowSplit(pane_layout::Orientation),
+    WindowResize(bool),
+    WindowFocusNext(bool),
+    WindowClose,
+    WindowOnly,
     WriteSelectedChapter,
     MoveOutlineUp,
     MoveOutlineDown,
@@ -3762,21 +3782,47 @@ fn command_registry() -> Vec<CommandSpec> {
             "compile-jump",
             true,
         ),
-        legacy_command(
+        window_command(
+            "window.split-side-by-side",
+            "Split Side by Side",
+            "Split the focused writing window into side-by-side views",
+            CommandAction::WindowSplit(pane_layout::Orientation::Vertical),
+            1,
+        ),
+        window_command(
+            "window.split-top-bottom",
+            "Split Top and Bottom",
+            "Split the focused writing window into stacked views",
+            CommandAction::WindowSplit(pane_layout::Orientation::Horizontal),
+            2,
+        ),
+        window_command(
+            "window.grow",
+            "Grow Focused Window",
+            "Move the nearest divider to give the focused window more room",
+            CommandAction::WindowResize(true),
+            3,
+        ),
+        window_command(
+            "window.shrink",
+            "Shrink Focused Window",
+            "Move the nearest divider to give the focused window less room",
+            CommandAction::WindowResize(false),
+            4,
+        ),
+        window_command(
             "window.next",
             "Next Window",
-            "Focus the next reference buffer",
-            "View",
-            "reference-next",
-            false,
+            "Focus the next visible window",
+            CommandAction::WindowFocusNext(false),
+            5,
         ),
-        legacy_command(
+        window_command(
             "window.previous",
             "Previous Window",
-            "Focus the previous reference buffer",
-            "View",
-            "reference-prev",
-            false,
+            "Focus the previous visible window",
+            CommandAction::WindowFocusNext(true),
+            6,
         ),
         legacy_command(
             "window.move-reference-earlier",
@@ -3794,13 +3840,19 @@ fn command_registry() -> Vec<CommandSpec> {
             "reference-move-later",
             false,
         ),
-        legacy_command(
+        window_command(
             "window.close",
-            "Close Reference Window",
-            "Close the selected reference buffer",
-            "View",
-            "reference-close",
-            false,
+            "Close Window",
+            "Close the focused pane while preserving its document",
+            CommandAction::WindowClose,
+            9,
+        ),
+        window_command(
+            "window.only",
+            "Single View",
+            "Keep the focused view and close the other panes",
+            CommandAction::WindowOnly,
+            10,
         ),
         legacy_command(
             "window.return-to-writing",
@@ -4491,6 +4543,30 @@ fn legacy_command(
         menu_priority: 100,
         advanced: true,
         action: CommandAction::LegacyPalette,
+    }
+}
+
+fn window_command(
+    id: &'static str,
+    label: &'static str,
+    description: &'static str,
+    action: CommandAction,
+    menu_priority: u8,
+) -> CommandSpec {
+    CommandSpec {
+        id,
+        label,
+        description,
+        category: "View",
+        default_shortcuts: &[],
+        mnemonic: None,
+        palette_aliases: &[],
+        palette_prefix: None,
+        takes_arguments: false,
+        action,
+        task_group: "Window",
+        menu_priority,
+        advanced: false,
     }
 }
 
@@ -6792,6 +6868,14 @@ impl AppState {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         }
     }
     fn session_path(&self) -> std::path::PathBuf {
@@ -7224,6 +7308,13 @@ impl AppState {
             reference_layout: self.reference_layout,
             reference_panes_hidden: self.reference_panes_hidden,
             reference_swapped: self.reference_swapped,
+            pane_layout: self.pane_layout.clone(),
+            restore_pane_layout: self.restore_pane_layout.clone(),
+            reference_layout_ids: self
+                .reference_panes
+                .iter()
+                .map(|pane| pane.layout_id)
+                .collect(),
             reference_follow_modes: self
                 .reference_panes
                 .iter()
@@ -7470,6 +7561,15 @@ impl AppState {
                         let row = self.app.get_scene(id).ok()?;
                         Some((Some(id), row.scene.title.clone(), format_scene_card(&row)))
                     }),
+                "content-unit" => source_id
+                    .parse::<uuid::Uuid>()
+                    .ok()
+                    .map(story_core::ContentUnitId)
+                    .and_then(|id| {
+                        let row = self.app.get_content_unit(id).ok()?;
+                        let (content, _) = self.app.load_content_unit_text(id).ok()?;
+                        Some((None, row.title, content))
+                    }),
                 "outline" if source_id == "project" => outline_reference_text(&self.app)
                     .ok()
                     .map(|content| (None, "Outline".into(), content)),
@@ -7601,6 +7701,7 @@ impl AppState {
                     .unwrap_or(fallback_scroll);
                 let scroll = requested.min(content.lines().count().saturating_sub(1));
                 self.reference_panes.push(ReferencePane {
+                    layout_id: snapshot.reference_layout_ids.get(index).copied().flatten(),
                     source_key: value.clone(),
                     scene_id,
                     title,
@@ -7648,6 +7749,31 @@ impl AppState {
                 );
             }
         }
+        if let Some(layout) = snapshot.pane_layout.clone() {
+            let mut available = vec![1];
+            available.extend(
+                self.reference_panes
+                    .iter()
+                    .filter_map(|pane| pane.layout_id),
+            );
+            if layout.is_valid_subset_of_panes(&available) {
+                self.pane_layout = Some(layout);
+                if let Some(layout) = &self.pane_layout {
+                    self.sync_focused_window(layout.focused());
+                }
+            } else {
+                stale_reference = true;
+            }
+        }
+        self.restore_pane_layout = snapshot.restore_pane_layout.clone().filter(|layout| {
+            let mut available = vec![1];
+            available.extend(
+                self.reference_panes
+                    .iter()
+                    .filter_map(|pane| pane.layout_id),
+            );
+            layout.is_valid_with_panes(&available)
+        });
         if let Some(id) = snapshot
             .assembly_draft
             .as_deref()
@@ -10452,6 +10578,195 @@ impl AppState {
     fn active_reference_pane_mut(&mut self) -> Option<&mut ReferencePane> {
         self.reference_panes.get_mut(self.active_reference)
     }
+    fn sync_focused_window(&mut self, pane_id: u64) {
+        if pane_id == 1 {
+            self.reference_focused = false;
+            return;
+        }
+        if let Some(index) = self
+            .reference_panes
+            .iter()
+            .position(|pane| pane.layout_id == Some(pane_id))
+        {
+            self.active_reference = index;
+            self.reference_focused = true;
+        }
+    }
+    fn split_focused_window(
+        &mut self,
+        orientation: pane_layout::Orientation,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace != Workspace::Editor {
+            return Err("open a manuscript before splitting the writing view".into());
+        }
+        if self.editing_scene.is_none()
+            && self.editing_content_unit.is_none()
+            && self.assembly_draft.is_none()
+        {
+            return Err("open a manuscript document before splitting the writing view".into());
+        }
+        let mut layout = self.pane_layout.clone().unwrap_or_default();
+        if self.pane_layout.is_none() && !self.reference_panes.is_empty() {
+            for pane in &mut self.reference_panes {
+                let rect = layout
+                    .rectangles(self.pane_bounds, 18, 6)
+                    .into_iter()
+                    .find(|(id, _)| *id == layout.focused())
+                    .map(|(_, rect)| rect)
+                    .unwrap_or(self.pane_bounds);
+                let id = layout.split(pane_layout::Orientation::Vertical, 5_000, rect, 18, 6)?;
+                pane.layout_id = Some(id);
+            }
+            if self.reference_focused
+                && let Some(id) = self
+                    .reference_panes
+                    .get(self.active_reference)
+                    .and_then(|pane| pane.layout_id)
+            {
+                layout.focus(id)?;
+            }
+        }
+        let focused = layout.focused();
+        let bounds = layout
+            .rectangles(self.pane_bounds, 18, 6)
+            .into_iter()
+            .find(|(id, _)| *id == focused)
+            .map(|(_, rect)| rect)
+            .unwrap_or(self.pane_bounds);
+        let new_id = layout.split(orientation, 5_000, bounds, 18, 6)?;
+        let new_pane = if focused == 1 {
+            let title = self
+                .editing_scene
+                .and_then(|id| self.app.get_scene(id).ok().map(|row| row.scene.title))
+                .or_else(|| {
+                    self.editing_content_unit
+                        .and_then(|id| self.app.get_content_unit(id).ok().map(|row| row.title))
+                })
+                .unwrap_or_else(|| "Manuscript".into());
+            ReferencePane {
+                layout_id: Some(new_id),
+                source_key: self
+                    .editing_scene
+                    .map(|scene| format!("scene:{scene}"))
+                    .or_else(|| {
+                        self.editing_content_unit
+                            .map(|unit| format!("content-unit:{unit}"))
+                    })
+                    .unwrap_or_else(|| format!("split-editor:{new_id}")),
+                scene_id: self.editing_scene,
+                title: format!("{title} · second view"),
+                content: self.editor.join("\n"),
+                scroll: self.scroll,
+                follow_context: false,
+                shared_scene: true,
+                cursor: self.cursor,
+                selection_anchor: None,
+                proofreading: None,
+            }
+        } else {
+            let pane = self
+                .reference_panes
+                .iter()
+                .find(|pane| pane.layout_id == Some(focused))
+                .ok_or("focused reference window is unavailable")?;
+            let mut duplicate = pane.clone();
+            duplicate.layout_id = Some(new_id);
+            duplicate.title = format!("{} · second view", duplicate.title);
+            duplicate
+        };
+        self.reference_panes.push(new_pane);
+        self.active_reference = self.reference_panes.len() - 1;
+        self.pane_layout = Some(layout);
+        self.reference_focused = true;
+        self.editor_focus_mode = false;
+        self.message = match orientation {
+            pane_layout::Orientation::Vertical => "Split side by side · new window focused".into(),
+            pane_layout::Orientation::Horizontal => {
+                "Split top and bottom · new window focused".into()
+            }
+        };
+        self.save_session()?;
+        Ok(())
+    }
+    fn focus_window_next(&mut self, reverse: bool) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(layout) = self.pane_layout.as_mut() {
+            layout.focus_next(reverse);
+            let focused = layout.focused();
+            self.focus_manual_pane(focused);
+            self.message = "Focused previous window".into();
+            if !reverse {
+                self.message = "Focused next window".into();
+            }
+            self.save_session()?;
+        } else if self.reference_panes.is_empty() {
+            self.message = "No other window is open".into();
+        } else {
+            self.cycle_reference(!reverse);
+            self.message = if reverse {
+                "Focused previous reference window".into()
+            } else {
+                "Focused next reference window".into()
+            };
+        }
+        Ok(())
+    }
+    fn resize_focused_window(&mut self, grow: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(layout) = self.pane_layout.as_mut() else {
+            return Err("split the writing view before resizing a window".into());
+        };
+        layout.resize_focused_parent(grow)?;
+        self.message = if grow {
+            "Focused window enlarged · divider moved one step".into()
+        } else {
+            "Focused window reduced · divider moved one step".into()
+        };
+        self.save_session()?;
+        Ok(())
+    }
+    fn close_focused_window(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(layout) = self.pane_layout.as_mut() else {
+            if self.reference_panes.is_empty() {
+                return Err("there is only one window open".into());
+            }
+            if self.reference_focused {
+                self.reference_panes.remove(self.active_reference);
+                self.active_reference = self
+                    .active_reference
+                    .min(self.reference_panes.len().saturating_sub(1));
+                self.reference_focused = false;
+            } else {
+                self.reference_panes.pop();
+            }
+            self.message = "Reference window closed · document remains in the project".into();
+            return Ok(());
+        };
+        if layout.pane_count() == 1 {
+            return Err("there is only one window open".into());
+        }
+        let closing = layout.focused();
+        layout.close(closing)?;
+        self.reference_panes
+            .retain(|pane| pane.layout_id != Some(closing));
+        let focused = layout.focused();
+        self.sync_focused_window(focused);
+        self.message = "Window closed · its document remains open and unchanged".into();
+        self.save_session()?;
+        Ok(())
+    }
+    fn keep_only_focused_window(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(layout) = self.pane_layout.as_mut() else {
+            self.message = "The current view is already the only window".into();
+            return Ok(());
+        };
+        let focused = layout.focused();
+        layout.only_focused();
+        self.reference_panes
+            .retain(|pane| pane.layout_id == Some(focused));
+        self.sync_focused_window(focused);
+        self.message = "Single view · other documents remain open".into();
+        self.save_session()?;
+        Ok(())
+    }
     fn select_proofreading_finding(&mut self, forward: bool) -> bool {
         let Some(pane) = self.active_reference_pane_mut() else {
             return false;
@@ -10575,6 +10890,16 @@ impl AppState {
         self.reference_focused = false;
     }
     fn toggle_reference_focus(&mut self) {
+        if let Some(layout) = self.pane_layout.as_ref() {
+            let panes = layout.panes();
+            if panes.len() > 1 {
+                let current = layout.focused();
+                let index = panes.iter().position(|id| *id == current).unwrap_or(0);
+                self.focus_manual_pane(panes[(index + 1) % panes.len()]);
+                self.record_tutorial_action("reference-focus");
+                return;
+            }
+        }
         if self.reference_focused {
             self.focus_main_editor();
             return;
@@ -10587,6 +10912,24 @@ impl AppState {
         }
         self.reference_focused = true;
         self.record_tutorial_action("reference-focus");
+    }
+    fn focus_manual_pane(&mut self, pane_id: u64) {
+        if self.reference_focused && self.active_reference_shares_open_scene() {
+            let index = self.active_reference;
+            if index < self.reference_panes.len() {
+                std::mem::swap(&mut self.cursor, &mut self.reference_panes[index].cursor);
+            }
+        }
+        if let Some(layout) = self.pane_layout.as_mut() {
+            let _ = layout.focus(pane_id);
+        }
+        self.sync_focused_window(pane_id);
+        if self.reference_focused && self.active_reference_shares_open_scene() {
+            let index = self.active_reference;
+            if index < self.reference_panes.len() {
+                std::mem::swap(&mut self.cursor, &mut self.reference_panes[index].cursor);
+            }
+        }
     }
     fn cycle_reference(&mut self, forward: bool) {
         if self.reference_panes.is_empty() {
@@ -10677,11 +11020,50 @@ impl AppState {
         let shared_scene = scene_id.is_some()
             && scene_id == self.editing_scene
             && !source_key.starts_with("scene-card:");
-        if let Some(index) = self
+        let existing_index = self
             .reference_panes
             .iter()
-            .position(|pane| pane.source_key == source_key)
+            .position(|pane| pane.source_key == source_key);
+        if existing_index.is_none()
+            && let Some(layout) = self.pane_layout.as_ref()
+            && layout.focused() != 1
         {
+            let focused = layout.focused();
+            if let Some(index) = self
+                .reference_panes
+                .iter()
+                .position(|pane| pane.layout_id == Some(focused))
+            {
+                self.reference_panes[index] = ReferencePane {
+                    layout_id: Some(focused),
+                    source_key,
+                    scene_id,
+                    title,
+                    content,
+                    scroll: 0,
+                    follow_context: false,
+                    shared_scene,
+                    cursor: if shared_scene { self.cursor } else { (0, 0) },
+                    selection_anchor: None,
+                    proofreading: None,
+                };
+                self.active_reference = index;
+                self.sync_focused_window(focused);
+                let _ = self.save_session();
+                return;
+            }
+        }
+        let mut layout_id = existing_index.and_then(|index| self.reference_panes[index].layout_id);
+        if self.pane_layout.is_some() && layout_id.is_none() {
+            layout_id = self.add_reference_window_to_layout();
+            if layout_id.is_none() {
+                self.message =
+                    "The terminal is too small to open another view; resize it and try again"
+                        .into();
+                return;
+            }
+        }
+        if let Some(index) = existing_index {
             let scroll = self.reference_panes[index].scroll;
             let cursor = if shared_scene {
                 self.cursor
@@ -10689,6 +11071,7 @@ impl AppState {
                 self.reference_panes[index].cursor
             };
             self.reference_panes[index] = ReferencePane {
+                layout_id,
                 source_key,
                 scene_id,
                 title,
@@ -10703,6 +11086,7 @@ impl AppState {
             self.active_reference = index;
         } else {
             self.reference_panes.push(ReferencePane {
+                layout_id,
                 source_key,
                 scene_id,
                 title,
@@ -10716,6 +11100,26 @@ impl AppState {
             });
             self.active_reference = self.reference_panes.len() - 1;
         }
+        if let Some(layout_id) = layout_id {
+            if let Some(layout) = self.pane_layout.as_mut() {
+                let _ = layout.focus(layout_id);
+            }
+            self.sync_focused_window(layout_id);
+            let _ = self.save_session();
+        }
+    }
+    fn add_reference_window_to_layout(&mut self) -> Option<u64> {
+        let bounds = self.pane_bounds;
+        let layout = self.pane_layout.as_mut()?;
+        let focused = layout.focused();
+        let rect = layout
+            .rectangles(bounds, 18, 6)
+            .into_iter()
+            .find(|(id, _)| *id == focused)
+            .map(|(_, rect)| rect)?;
+        layout
+            .split(pane_layout::Orientation::Vertical, 5_000, rect, 18, 6)
+            .ok()
     }
     fn open_external_text_file(&mut self, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         let canonical_path = path.canonicalize()?;
@@ -12938,6 +13342,11 @@ impl AppState {
             let editor = self.workspace == Workspace::Editor;
             let has_references = !self.reference_panes.is_empty();
             let multiple_references = self.reference_panes.len() > 1;
+            let multiple_windows = self
+                .pane_layout
+                .as_ref()
+                .is_some_and(|layout| layout.pane_count() > 1)
+                || multiple_references;
             direct.retain(|command| match command.id {
                 "view.formatting-marks" => editor,
                 "view.rendered-markdown" => self.workspace == Workspace::Reading,
@@ -12948,11 +13357,21 @@ impl AppState {
                 | "view.reference-timeline"
                 | "view.reference-diagnostics"
                 | "window.maximize" => editor,
+                "window.split-side-by-side" | "window.split-top-bottom" => editor,
+                "window.grow" | "window.shrink" => editor && multiple_windows,
                 "window.next"
                 | "window.previous"
                 | "window.move-reference-earlier"
-                | "window.move-reference-later" => editor && multiple_references,
-                "window.close" => editor && has_references,
+                | "window.move-reference-later" => {
+                    editor
+                        && (if command.id.starts_with("window.move-reference") {
+                            multiple_references
+                        } else {
+                            multiple_windows
+                        })
+                }
+                "window.close" => editor && (has_references || multiple_windows),
+                "window.only" => editor && multiple_windows,
                 "window.return-to-writing" => editor && self.reference_focused,
                 "window.restore-layout" => editor && self.editor_focus_mode,
                 "window.swap-sides" => editor && has_references,
@@ -14123,6 +14542,11 @@ impl AppState {
             CommandAction::FindNextMatch => self.navigate_search_match(true)?,
             CommandAction::FindPreviousMatch => self.navigate_search_match(false)?,
             CommandAction::ToggleSceneInclusion => self.toggle_scene_card_inclusion()?,
+            CommandAction::WindowSplit(orientation) => self.split_focused_window(orientation)?,
+            CommandAction::WindowResize(grow) => self.resize_focused_window(grow)?,
+            CommandAction::WindowFocusNext(reverse) => self.focus_window_next(reverse)?,
+            CommandAction::WindowClose => self.close_focused_window()?,
+            CommandAction::WindowOnly => self.keep_only_focused_window()?,
             CommandAction::WriteSelectedChapter => self.write_selected_chapter()?,
             CommandAction::MoveOutlineUp => self.move_selected_outline_item(false)?,
             CommandAction::MoveOutlineDown => self.move_selected_outline_item(true)?,
@@ -18648,7 +19072,34 @@ impl AppState {
             self.message = format!("Reference layout: {}", value.trim());
             self.save_session()?;
         } else if cmd == "reference-return" {
-            self.focus_main_editor();
+            if self
+                .pane_layout
+                .as_ref()
+                .is_some_and(|layout| layout.panes().contains(&1))
+            {
+                self.focus_manual_pane(1);
+                self.save_session()?;
+            } else if let Some(layout) = self.pane_layout.as_mut() {
+                let focused = layout.focused();
+                let rect = layout
+                    .rectangles(self.pane_bounds, 18, 6)
+                    .into_iter()
+                    .find(|(id, _)| *id == focused)
+                    .map(|(_, rect)| rect)
+                    .unwrap_or(self.pane_bounds);
+                layout.split_with_existing_id(
+                    pane_layout::Orientation::Vertical,
+                    5_000,
+                    rect,
+                    18,
+                    6,
+                    1,
+                )?;
+                self.sync_focused_window(1);
+                self.save_session()?;
+            } else {
+                self.focus_main_editor();
+            }
             self.message = "Manuscript editor focused".into();
         } else if cmd == "reference-next" {
             self.cycle_reference(true);
@@ -18683,20 +19134,32 @@ impl AppState {
             .into();
             self.save_session()?;
         } else if cmd == "window-maximize" {
-            self.editor_focus_mode = true;
-            if self.reference_focused && self.reference_panes_hidden {
-                self.reference_panes_hidden = false;
-            }
-            self.message = if self.reference_focused {
-                "Reference pane maximized · Ctrl-G or window-restore restores layout"
+            if let Some(layout) = self.pane_layout.as_mut() {
+                if self.restore_pane_layout.is_none() {
+                    self.restore_pane_layout = Some(layout.clone());
+                    layout.only_focused();
+                }
+                self.editor_focus_mode = true;
             } else {
-                "Manuscript pane maximized · Ctrl-G or window-restore restores layout"
+                self.editor_focus_mode = true;
+                if self.reference_focused && self.reference_panes_hidden {
+                    self.reference_panes_hidden = false;
+                }
             }
-            .into();
+            self.message =
+                "Focused window maximized · Restore Window Layout restores the exact split tree"
+                    .into();
             self.save_session()?;
         } else if cmd == "window-restore" {
-            self.editor_focus_mode = false;
-            self.message = "Window layout restored".into();
+            if let Some(layout) = self.restore_pane_layout.take() {
+                let focused = layout.focused();
+                self.pane_layout = Some(layout);
+                self.focus_manual_pane(focused);
+                self.message = "Window layout restored".into();
+            } else {
+                self.editor_focus_mode = false;
+                self.message = "Window layout restored".into();
+            }
             self.save_session()?;
         } else if cmd == "reference-close" {
             if self.reference_focused {
@@ -22513,6 +22976,83 @@ fn tutorial_key_is_expected(state: &AppState, key: KeyEvent) -> bool {
     }
 }
 
+fn draw_manual_pane_layout(
+    f: &mut ratatui::Frame<'_>,
+    state: &AppState,
+    area: Rect,
+    layout: pane_layout::PaneLayout,
+    editor: Paragraph<'static>,
+) {
+    let bounds = pane_layout::PaneRect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: area.height,
+    };
+    for (pane_id, rect) in layout.rectangles(bounds, 18, 6) {
+        let area = Rect::new(rect.x, rect.y, rect.width, rect.height);
+        if pane_id == 1 {
+            f.render_widget(editor.clone(), area);
+            continue;
+        }
+        let Some(pane) = state
+            .reference_panes
+            .iter()
+            .find(|pane| pane.layout_id == Some(pane_id))
+        else {
+            f.render_widget(
+                Paragraph::new("This view is no longer available")
+                    .block(Block::default().title("Window").borders(Borders::ALL)),
+                area,
+            );
+            continue;
+        };
+        let shared_scene = pane.shared_scene && pane.scene_id == state.editing_scene;
+        let lines = if shared_scene {
+            state.editor.clone()
+        } else {
+            pane.content.lines().map(str::to_owned).collect()
+        };
+        let content = lines
+            .iter()
+            .enumerate()
+            .skip(pane.scroll)
+            .map(|(row, line)| {
+                let prefix = if shared_scene && pane_id == layout.focused() && row == pane.cursor.0
+                {
+                    "> "
+                } else {
+                    "  "
+                };
+                Line::from(format!("{prefix}{line}"))
+            })
+            .collect::<Vec<_>>();
+        let focused = pane_id == layout.focused();
+        let title = if focused {
+            format!("{} · focused", pane.title)
+        } else {
+            pane.title.clone()
+        };
+        let block = Block::default()
+            .title(truncate_display_cells(
+                &title,
+                area.width.saturating_sub(4) as usize,
+            ))
+            .borders(Borders::ALL)
+            .border_style(if focused {
+                Style::default().fg(Color::Cyan)
+            } else {
+                Style::default()
+            });
+        f.render_widget(
+            Paragraph::new(content)
+                .wrap(Wrap { trim: false })
+                .block(block),
+            area,
+        );
+    }
+}
+
 fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     let area = f.area();
     s.planning_board_area = None;
@@ -22552,10 +23092,16 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             ])
             .split(rows[1])
     };
+    s.pane_bounds = pane_layout::PaneRect {
+        x: rows[1].x,
+        y: rows[1].y,
+        width: rows[1].width,
+        height: rows[1].height,
+    };
     if s.workspace == Workspace::Cards {
         draw_scene_cards_workspace(f, s, rows[1]);
     } else if s.workspace == Workspace::Editor {
-        if !s.editor_focus_mode {
+        if !s.editor_focus_mode && s.pane_layout.is_none() {
             let (items, title, selected) = if let Some(targets) = &s.pending_replace {
                 (
                     targets
@@ -22941,9 +23487,21 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 } else {
                     editor_title
                 })
-                .borders(Borders::ALL),
+                .borders(Borders::ALL)
+                .border_style(
+                    if s.pane_layout
+                        .as_ref()
+                        .is_some_and(|layout| layout.focused() == 1)
+                    {
+                        Style::default().fg(Color::Cyan)
+                    } else {
+                        Style::default()
+                    },
+                ),
         );
-        if has_reference_panes && compact_single_pane && s.reference_focused {
+        if let Some(layout) = s.pane_layout.clone() {
+            draw_manual_pane_layout(f, s, rows[1], layout, editor);
+        } else if has_reference_panes && compact_single_pane && s.reference_focused {
             let index = s.active_reference.min(s.reference_panes.len() - 1);
             let reference = &s.reference_panes[index];
             let is_shared_scene = reference.shared_scene
@@ -37021,6 +37579,14 @@ mod tests {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         };
         handle(
             &mut state,
@@ -38654,6 +39220,142 @@ mod tests {
             Direction::Horizontal
         );
         assert_eq!(ReferenceLayout::Auto.direction(80), Direction::Vertical);
+    }
+
+    #[test]
+    fn recursive_window_splits_close_and_restore_without_losing_documents() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Draft", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "The manuscript remains intact.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.pane_bounds = pane_layout::PaneRect {
+            x: 0,
+            y: 1,
+            width: 160,
+            height: 50,
+        };
+
+        let view_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "View")
+            .unwrap();
+        state.open_menu_category(view_menu);
+        let split_command = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "window.split-side-by-side")
+            .expect("View menu exposes side-by-side split");
+        state.menu.as_mut().unwrap().selected = split_command;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.pane_layout.as_ref().unwrap().panes(), vec![1, 2]);
+        state.dispatch_registered_command_id("window.grow").unwrap();
+        let pane_layout::PaneNode::Split { ratio, .. } = state.pane_layout.as_ref().unwrap().root()
+        else {
+            panic!("window split should remain active after resize");
+        };
+        assert_eq!(*ratio, 4_500);
+        state
+            .split_focused_window(pane_layout::Orientation::Horizontal)
+            .unwrap();
+        assert_eq!(state.pane_layout.as_ref().unwrap().panes(), vec![1, 2, 3]);
+        state
+            .split_focused_window(pane_layout::Orientation::Vertical)
+            .unwrap();
+        assert_eq!(
+            state.pane_layout.as_ref().unwrap().panes(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(
+            state
+                .reference_panes
+                .iter()
+                .all(|pane| pane.layout_id.is_some())
+        );
+        state.open_reference_buffer(
+            "timeline:project".into(),
+            None,
+            "Story Timeline".into(),
+            "A different view in the focused window".into(),
+        );
+        assert_eq!(state.reference_panes.len(), 3);
+        assert_eq!(
+            state
+                .reference_panes
+                .iter()
+                .find(|pane| pane.layout_id == Some(4))
+                .unwrap()
+                .source_key,
+            "timeline:project"
+        );
+
+        let mut reopened = AppState::new(
+            WriterApp::open_project(&project).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        assert_eq!(reopened.pane_layout, state.pane_layout);
+        assert_eq!(reopened.reference_panes.len(), 3);
+        for (width, height) in [(80, 24), (177, 60), (201, 60)] {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut reopened)).unwrap();
+        }
+        reopened
+            .execute_legacy_palette_command("reference-return")
+            .unwrap();
+        assert_eq!(reopened.pane_layout.as_ref().unwrap().focused(), 1);
+        reopened.pane_layout.as_mut().unwrap().focus(4).unwrap();
+        reopened.sync_focused_window(4);
+        reopened.close_focused_window().unwrap();
+        assert_eq!(
+            reopened.pane_layout.as_ref().unwrap().panes(),
+            vec![1, 2, 3]
+        );
+        reopened.keep_only_focused_window().unwrap();
+        assert_eq!(reopened.pane_layout.as_ref().unwrap().panes().len(), 1);
+        assert_eq!(
+            reopened.app.load_scene_text(scene).unwrap().0,
+            "The manuscript remains intact."
+        );
+    }
+
+    #[test]
+    fn closing_the_editor_pane_keeps_writing_reachable() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Draft", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.pane_bounds = pane_layout::PaneRect {
+            x: 0,
+            y: 1,
+            width: 120,
+            height: 40,
+        };
+        state
+            .split_focused_window(pane_layout::Orientation::Vertical)
+            .unwrap();
+        state.pane_layout.as_mut().unwrap().focus(1).unwrap();
+        state.sync_focused_window(1);
+        state.close_focused_window().unwrap();
+        assert!(!state.pane_layout.as_ref().unwrap().panes().contains(&1));
+        assert_eq!(state.reference_panes.len(), 1);
+
+        state
+            .execute_legacy_palette_command("reference-return")
+            .unwrap();
+        assert!(state.pane_layout.as_ref().unwrap().panes().contains(&1));
+        assert_eq!(state.pane_layout.as_ref().unwrap().focused(), 1);
+        assert_eq!(state.editing_scene, Some(scene));
     }
 
     #[test]
@@ -40524,6 +41226,14 @@ mod tests {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         };
         assert_eq!(state.selected_text().as_deref(), Some("pha\nbe"));
         handle(
@@ -40678,6 +41388,14 @@ mod tests {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         };
         handle(
             &mut state,
@@ -40828,6 +41546,14 @@ mod tests {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         };
         handle(
             &mut state,
@@ -40986,6 +41712,14 @@ mod tests {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -41294,6 +42028,14 @@ mod tests {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         };
         assert!(
             !handle(
@@ -41452,6 +42194,14 @@ mod tests {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -42113,9 +42863,23 @@ mod tests {
                             | "view.reference-outline"
                             | "view.reference-timeline"
                             | "view.reference-diagnostics"
+                            | "window.split-side-by-side"
+                            | "window.split-top-bottom"
                             | "window.maximize"
                     )
                 });
+                if state
+                    .pane_layout
+                    .as_ref()
+                    .is_some_and(|layout| layout.pane_count() > 1)
+                    || state.reference_panes.len() > 1
+                {
+                    let maximize = expected
+                        .iter()
+                        .position(|id| *id == "window.maximize")
+                        .unwrap_or(expected.len());
+                    expected.splice(maximize..maximize, ["window.grow", "window.shrink"]);
+                }
                 if state.editor_focus_mode {
                     expected.push("window.restore-layout");
                 }
@@ -43090,6 +43854,14 @@ mod tests {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         };
         handle(
             &mut state,
@@ -43383,6 +44155,14 @@ mod tests {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         };
         state.mode = Some(':');
         state.prompt = "reading-links".into();
@@ -44917,6 +45697,14 @@ mod tests {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         };
         state.mode = Some(':');
         state.prompt = format!("query {}", query.id);
@@ -45086,6 +45874,14 @@ mod tests {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         };
         let hit = |kind: &str, id: String, title: &str| story_storage::ProjectSearchHit {
             entity_kind: kind.into(),
@@ -45307,6 +46103,14 @@ mod tests {
             reference_layout: ReferenceLayout::Auto,
             reference_panes_hidden: false,
             reference_swapped: false,
+            pane_layout: None,
+            restore_pane_layout: None,
+            pane_bounds: pane_layout::PaneRect {
+                x: 0,
+                y: 1,
+                width: 80,
+                height: 18,
+            },
         };
         let execute = |state: &mut AppState, command: String| {
             state.mode = Some(':');

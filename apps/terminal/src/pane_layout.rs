@@ -3,7 +3,9 @@
 //! The tree stores layout only; documents and editor buffers remain owned by
 //! the application state. This lets a pane be split without copying prose.
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Orientation {
     Vertical,
     Horizontal,
@@ -17,7 +19,7 @@ pub struct PaneRect {
     pub height: u16,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum PaneNode {
     Leaf(u64),
     Split {
@@ -29,7 +31,7 @@ pub enum PaneNode {
     },
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct PaneLayout {
     root: PaneNode,
     focused: u64,
@@ -41,8 +43,24 @@ pub enum LayoutError {
     UnknownPane,
     InsufficientSpace,
     CannotCloseOnlyPane,
+    NoParentSplit,
     PaneIdExhausted,
 }
+
+impl std::fmt::Display for LayoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::UnknownPane => "the selected window no longer exists",
+            Self::InsufficientSpace => "the terminal area is too small for another split",
+            Self::CannotCloseOnlyPane => "there is only one window open",
+            Self::NoParentSplit => "the focused window has no divider to resize",
+            Self::PaneIdExhausted => "no more window identifiers are available",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for LayoutError {}
 
 impl Default for PaneLayout {
     fn default() -> Self {
@@ -123,6 +141,29 @@ impl PaneLayout {
         Ok(new_id)
     }
 
+    /// Adds a pane with an existing stable ID beside the focused leaf. This is
+    /// used to restore a document view that was closed while its document
+    /// remained open in the application state.
+    pub fn split_with_existing_id(
+        &mut self,
+        orientation: Orientation,
+        ratio: u16,
+        bounds: PaneRect,
+        min_width: u16,
+        min_height: u16,
+        id: u64,
+    ) -> Result<(), LayoutError> {
+        if contains(&self.root, id) {
+            return Err(LayoutError::UnknownPane);
+        }
+        let new_id = self.split(orientation, ratio, bounds, min_width, min_height)?;
+        if !replace_leaf(&mut self.root, new_id, PaneNode::Leaf(id)) {
+            return Err(LayoutError::UnknownPane);
+        }
+        self.focused = id;
+        Ok(())
+    }
+
     /// Remove one leaf and promote its sibling subtree into the same region.
     pub fn close(&mut self, id: u64) -> Result<(), LayoutError> {
         if self.pane_count() == 1 && self.focused == id {
@@ -152,6 +193,18 @@ impl PaneLayout {
         }
     }
 
+    /// Adjusts the nearest divider so the focused pane grows or shrinks by a
+    /// small deterministic step. The ratio is stored in basis points.
+    pub fn resize_focused_parent(&mut self, grow: bool) -> Result<(), LayoutError> {
+        if resize_focused_parent(&mut self.root, self.focused, grow) {
+            Ok(())
+        } else if contains(&self.root, self.focused) {
+            Err(LayoutError::NoParentSplit)
+        } else {
+            Err(LayoutError::UnknownPane)
+        }
+    }
+
     pub fn rectangles(
         &self,
         bounds: PaneRect,
@@ -161,6 +214,25 @@ impl PaneLayout {
         let mut output = Vec::new();
         layout_node(&self.root, bounds, min_width, min_height, &mut output);
         output
+    }
+
+    pub fn is_valid_with_panes(&self, available: &[u64]) -> bool {
+        let mut actual = self.panes();
+        actual.sort_unstable();
+        let mut expected = available.to_vec();
+        expected.sort_unstable();
+        actual == expected
+            && actual.contains(&self.focused)
+            && self.next_id > actual.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Validates a temporarily maximized layout that contains a subset of the
+    /// application's open panes. Every referenced pane must still exist.
+    pub fn is_valid_subset_of_panes(&self, available: &[u64]) -> bool {
+        let actual = self.panes();
+        actual.iter().all(|id| available.contains(id))
+            && actual.contains(&self.focused)
+            && self.next_id > actual.iter().copied().max().unwrap_or(0)
     }
 }
 
@@ -307,6 +379,39 @@ fn resize_parent(node: &mut PaneNode, id: u64, ratio: u16) -> bool {
     }
 }
 
+fn resize_focused_parent(node: &mut PaneNode, id: u64, grow: bool) -> bool {
+    let PaneNode::Split {
+        ratio,
+        first,
+        second,
+        ..
+    } = node
+    else {
+        return false;
+    };
+    if matches!(first.as_ref(), PaneNode::Leaf(child) if *child == id) {
+        *ratio = if grow {
+            ratio.saturating_add(500).min(9_000)
+        } else {
+            ratio.saturating_sub(500).max(1_000)
+        };
+        return true;
+    }
+    if matches!(second.as_ref(), PaneNode::Leaf(child) if *child == id) {
+        *ratio = if grow {
+            ratio.saturating_sub(500).max(1_000)
+        } else {
+            ratio.saturating_add(500).min(9_000)
+        };
+        return true;
+    }
+    if contains(first, id) {
+        resize_focused_parent(first, id, grow)
+    } else {
+        resize_focused_parent(second, id, grow)
+    }
+}
+
 fn remove_leaf(node: PaneNode, id: u64) -> Option<PaneNode> {
     match node {
         PaneNode::Leaf(candidate) if candidate == id => None,
@@ -448,6 +553,54 @@ mod tests {
             layout.close(layout.focused()),
             Err(LayoutError::CannotCloseOnlyPane)
         );
+    }
+
+    #[test]
+    fn restores_a_closed_stable_pane_id_without_reusing_ids() {
+        let mut layout = PaneLayout::default();
+        let reference = layout
+            .split(Orientation::Vertical, 5_000, WIDE, 20, 8)
+            .unwrap();
+        layout.close(1).unwrap();
+        assert_eq!(layout.panes(), vec![reference]);
+        layout
+            .split_with_existing_id(Orientation::Horizontal, 5_000, WIDE, 20, 8, 1)
+            .unwrap();
+        assert_eq!(layout.panes(), vec![reference, 1]);
+        assert_eq!(layout.focused(), 1);
+        let before = layout.clone();
+        assert_eq!(
+            layout.split_with_existing_id(Orientation::Vertical, 5_000, WIDE, 20, 8, 1),
+            Err(LayoutError::UnknownPane)
+        );
+        assert_eq!(layout, before);
+    }
+
+    #[test]
+    fn focused_pane_resize_changes_the_nearest_divider_in_expected_direction() {
+        let mut layout = PaneLayout::default();
+        let first = layout.focused();
+        let second = layout
+            .split(Orientation::Vertical, 5_000, WIDE, 20, 8)
+            .unwrap();
+        layout.resize_focused_parent(true).unwrap();
+        let PaneNode::Split { ratio, .. } = layout.root() else {
+            panic!("split root expected");
+        };
+        assert_eq!(*ratio, 4_500, "focused second pane should grow to the left");
+        layout.focus(first).unwrap();
+        layout.resize_focused_parent(true).unwrap();
+        let PaneNode::Split { ratio, .. } = layout.root() else {
+            panic!("split root expected");
+        };
+        assert_eq!(*ratio, 5_000, "focused first pane should grow to the right");
+        layout.only_focused();
+        assert_eq!(
+            layout.resize_focused_parent(true),
+            Err(LayoutError::NoParentSplit)
+        );
+        assert_eq!(layout.focused(), first);
+        assert!(second > first);
     }
 
     #[test]

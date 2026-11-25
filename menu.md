@@ -85,12 +85,18 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - Open Outline Reference (Manuscript editor)
 - Open Timeline Reference (Manuscript editor)
 - Open Compile Diagnostics Reference (Manuscript editor)
+- Split Side by Side (Manuscript editor)
+- Split Top and Bottom (Manuscript editor)
+- Grow Focused Window / Shrink Focused Window (when a divider is available)
+- Next Window / Previous Window (when multiple windows are open)
+- Close Window (when multiple windows are open)
+- Single View (when multiple windows are open)
 - Hide/Show Reference Panes (when reference panes are open)
 - Follow Scene Card (when writing a scene)
 - Pin Reference Pane (when a reference pane has focus)
 - Next/Previous Window (when multiple reference panes are open)
 - Move Reference Earlier/Later (when multiple reference panes are open)
-- Close Reference Window (when a reference pane is open)
+- Close Window (when a reference pane is open)
 - Return to Writing (when a reference pane has focus)
 - Maximize Current Window / Restore Window Layout
 - Swap Editor and Reference Sides (when a reference pane is open)
@@ -98,12 +104,11 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - Search All Commands…
 
 View actions are contextual: editor/reference-pane commands appear only in the
-manuscript editor and only when their required pane or scene exists. Formatting
-marks are available while editing; rendered Markdown is available in the
-Reference workspace. The current application uses a manuscript editor with
-reference panes. Recursive Emacs-style windows and arbitrary view buffers are
-not yet integrated into the application; their presence in the internal pane
-geometry model does not imply that those user workflows are available.
+manuscript editor and only when their required pane or scene exists. Split
+windows may be nested; focus, close, Single View, maximize and restore operate
+on the focused pane. Each pane retains a stable document source, and the pane
+tree and focus restore with the project session. Formatting marks are available
+while editing; rendered Markdown is available in the Reference workspace.
 
 ## Review
 
