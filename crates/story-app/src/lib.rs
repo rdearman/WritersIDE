@@ -8233,7 +8233,7 @@ unexpected_prose = "must not be silently discarded"
         .unwrap();
         fs::write(
             scene_files.join("content.rtf"),
-            r#"{\rtf1\ansi Élodie entered. {\field{\*\fldinst HYPERLINK "https://example.org/source"}{\fldrslt source}} {\pict\pngblip\picw1\pich1 89504e470d0a1a0a}}"#,
+            r#"{\rtf1\ansi Élodie entered.\par # Not a heading\par - Not a list item\par > Not a quotation\par `Not code`\par 1. Not a numbered list\par {\field{\*\fldinst HYPERLINK "https://example.org/source"}{\fldrslt source}} {\pict\pngblip\picw1\pich1 89504e470d0a1a0a}}"#,
         )
         .unwrap();
         fs::write(
@@ -8275,6 +8275,11 @@ unexpected_prose = "must not be silently discarded"
         assert_eq!(scenes.len(), 1);
         let imported_scene_text = app.load_scene_text(scenes[0]).unwrap().0;
         assert!(imported_scene_text.contains("Élodie entered."));
+        assert!(imported_scene_text.contains(r"\# Not a heading"));
+        assert!(imported_scene_text.contains(r"\- Not a list item"));
+        assert!(imported_scene_text.contains(r"\> Not a quotation"));
+        assert!(imported_scene_text.contains(r"\`Not code\`"));
+        assert!(imported_scene_text.contains(r"1\. Not a numbered list"));
         assert!(imported_scene_text.contains("[source](https://example.org/source)"));
         let image_hash = format!("{:x}", Sha256::digest(b"\x89PNG\r\n\x1a\n"));
         let image_path = dir
@@ -8305,6 +8310,20 @@ unexpected_prose = "must not be silently discarded"
         assert_eq!(scene.scene.synopsis, "The door opens");
         assert_eq!(app.list_structural_nodes().unwrap().len(), 2);
         assert_eq!(app.list_reading_documents().unwrap().len(), 1);
+        if std::process::Command::new("pandoc")
+            .arg("--version")
+            .output()
+            .is_ok()
+        {
+            let artifact = app
+                .compile_artifact(story_document::CompileFormat::Html, false)
+                .unwrap();
+            let html = String::from_utf8(artifact.bytes).unwrap();
+            assert!(html.contains("# Not a heading"));
+            assert!(html.contains("- Not a list item"));
+            assert!(!html.contains("<h1># Not a heading"));
+            assert!(!html.contains("<li>- Not a list item"));
+        }
         assert_eq!(
             story_import::inspect_scrivener_project(&source)
                 .unwrap()

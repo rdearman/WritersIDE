@@ -4971,7 +4971,6 @@ dependencies = [
  "regex",
  "serde",
  "story-core",
- "story-storage",
  "toml",
  "unicode-segmentation",
 ]
@@ -5045,7 +5044,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "story-core",
  "tempfile",
  "thiserror 2.0.21",
  "zip 0.6.6",

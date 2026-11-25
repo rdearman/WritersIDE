@@ -32,26 +32,51 @@ development checks, not runtime dependencies. The EPUBCheck wrapper at
 `/usr/bin/epubcheck` fails under the restricted shell, but the installed JAR at
 `/usr/share/java/epubcheck.jar` runs successfully through Java.
 
-The post-RTF-boundary-fix full private run is
-`reports/corrected-source-epubcheck-20261125/` (generated projects and EPUBs:
-`generated/corrected-source-epubcheck-20261125/`). It ran the production import,
-save/reopen and compile pipeline with a dirty worktree based on commit
-`3901e7364ed6107f35ac1d69080ac7d7dbd0b981`; fixture checksums passed after the
-run. Source manuscript bodies survived exactly: book 01 44/44, book 02 41/41,
-book 03 76/76; research bodies survived 1/1, 1/1 and 4/4. All three generated
-EPUB 3.2 files passed EPUBCheck with zero errors and warnings. Historical EPUBs
-returned 2, 2 and 0 errors respectively; those are reference defects, not WIDE
-output defects. Imports remain incomplete: book 02’s output has 36 list items
-against 45 in the reference, among other unresolved source/publication
-differences. This is not fidelity acceptance and must not promote a baseline.
-The report’s overall acceptance remains provisional pending discrepancy triage
-and human review.
+The latest completed real-manuscript run is
+`reports/list-marker-all-books-20261125/` (projects and publications under the
+matching `generated/` directory). It used the production importer, persistence,
+reopen and compiler based on `a21dc27a3b51599076ccbace486ea5946529520b` with
+uncommitted importer/harness changes. Fixture checksums passed after testing.
+Manuscript bodies survived persistence exactly: 44/44, 41/41 and 76/76;
+research bodies survived 1/1, 1/1 and 4/4. All three Scrivener source
+fingerprints were unchanged and SQLite integrity checks returned `ok`. The RTF
+list-marker fix restored the affected book's measured list items from 36 to 45.
+All generated EPUBs had zero EPUBCheck errors and warnings; historical
+references had 2/2/0 errors. A compile-only rerun of all three persisted
+projects is at `reports/list-marker-compile-correct-status-rerun-20261125/`.
+The full-run JSON acceptance wording was stale, so use the compile-only report
+for validator status. Neither report establishes fidelity acceptance: source
+compile inclusion mappings and material text/structure differences remain
+unresolved, and human publication review is outstanding. See
+[the regression guide](REAL_MANUSCRIPT_REGRESSION.md) for exact details.
 
-Next regression task: trace the nine missing list items to their specific RTF
-structures and verify recoverable Scrivener compile inclusion settings. Then
-rerun targeted import/compile checks and the complete three-book suite after
-the production fix. Run dependency, licence and coverage checks with the newly
-available Rust tools at suitable checkpoints.
+Targeted Rust importer tests (23), the importer integration test (1), the
+synthetic Python regression tests (6), `cargo fmt --all -- --check`, workspace
+Clippy with warnings denied, and the full workspace suite passed after the RTF
+list repair and unused dependency cleanup. The full suite included 333 terminal
+unit tests, 3 end-to-end author workflows, 20 PTY tests, and all workspace
+unit/integration/doc tests. The Ollama loopback test passed when run with the
+previously authorised local socket permission. The PTY suite also confirmed
+that Previous Position with empty history leaves the app running; #62 remains
+open for human UAT, not because implementation is unverified by automation.
+
+`cargo audit` completed after fetching a local RustSec database (1,568
+advisories) and reported 26 vulnerabilities plus 10 allowed warnings in the
+lockfile. Relevant dependency paths include `rusqlite`/`libsqlite3-sys`,
+`url`, `zip` and `zstd`; the concrete advisory list should be reviewed before a
+release. No automatic dependency upgrades were made. `cargo deny check` could
+not download all locked platform-specific crate metadata in the restricted
+environment. `cargo-machete` initially found two unused direct dependencies;
+both were removed, and a repeat check passed. `cargo llvm-cov` could not run
+because `llvm-tools-preview` is not installed and rustup could not write or
+download it here. Do not claim dependency-policy or coverage checks passed.
+
+Next: finish source compile-section mapping and accurate inclusion semantics,
+compare the semantic imports/publications against the current source rather
+than assuming historical EPUB equality, then continue the highest-priority
+open v1.0 issue. The feature freeze remains active. Documentation-folder
+consolidation remains queued behind the reliability, editing, import and
+publication priorities.
 
 ## Priorities
 

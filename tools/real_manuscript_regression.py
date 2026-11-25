@@ -524,6 +524,39 @@ def compare_tokens(reference: dict, generated: dict) -> dict:
     }
 
 
+def epubcheck_result(command: list[str] | None, path: pathlib.Path, *, env: dict[str, str]) -> dict:
+    if command is None:
+        return {"status": "unavailable", "errors": None, "warnings": None}
+    checked = subprocess.run(
+        [*command, str(path)], env=env, text=True, capture_output=True
+    )
+    output = f"{checked.stdout}\n{checked.stderr}"
+    summary = re.search(
+        r"Messages:\s*(\d+) fatals?\s*/\s*(\d+) errors?\s*/\s*(\d+) warnings?\s*/\s*(\d+) infos?",
+        output,
+    )
+    codes = collections.Counter(re.findall(r"(?:ERROR|FATAL)\(([A-Z]+-\d+)\)", output))
+    no_errors = summary is not None and int(summary.group(1)) == 0 and int(summary.group(2)) == 0
+    return {
+        "status": "passed" if checked.returncode == 0 and no_errors else "failed",
+        "exit_code": checked.returncode,
+        "fatal_count": int(summary.group(1)) if summary else None,
+        "errors": int(summary.group(2)) if summary else None,
+        "warnings": int(summary.group(3)) if summary else None,
+        "info_count": int(summary.group(4)) if summary else None,
+        "diagnostic_codes": dict(sorted(codes.items())),
+        "diagnostics_local": output.strip(),
+    }
+
+
+def epubcheck_command() -> list[str] | None:
+    path = shutil.which("epubcheck")
+    if path is None:
+        return None
+    resolved = pathlib.Path(path).resolve()
+    return ["java", "-jar", str(resolved)] if zipfile.is_zipfile(resolved) else [path]
+
+
 def compare_publication_structure(reference: dict, generated: dict) -> dict:
     fields = (
         "spine_documents", "paragraph_count", "list_items", "table_rows",
@@ -578,6 +611,20 @@ def compare_publication_structure(reference: dict, generated: dict) -> dict:
     return differences
 
 
+def regression_acceptance(books: dict[str, dict], epubcheck_version: str | None) -> str:
+    compiled = [report["compile"]["epubcheck"] for report in books.values() if "compile" in report]
+    if not compiled:
+        return "not validated; no publication artifacts were compiled"
+    if not epubcheck_version or any(check.get("status") == "unavailable" for check in compiled):
+        return "provisional; EPUBCheck unavailable for one or more generated publications"
+    if any(check.get("status") != "passed" or check.get("errors", 0) for check in compiled):
+        return "provisional; generated EPUB validation failed or returned an incomplete result"
+    if any(check.get("warnings", 0) for check in compiled):
+        return "provisional; generated EPUBCheck warnings require investigation"
+    scope = "all three generated EPUBs pass EPUBCheck" if len(compiled) == len(BOOKS) else "targeted generated EPUB passes EPUBCheck"
+    return f"provisional; {scope}; discrepancy triage and human review remain"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture-root", type=pathlib.Path, default=pathlib.Path("fixtures"))
@@ -628,15 +675,20 @@ def main() -> int:
         "phase": args.phase,
         "books": {},
     }
-    epubcheck = shutil.which("epubcheck")
+    epubcheck = epubcheck_command()
     try:
         import PIL
         run_results["pillow_version"] = PIL.__version__
     except ImportError:
         pass
     if epubcheck:
-        version = subprocess.run([epubcheck, "--version"], env=env, text=True, capture_output=True)
-        run_results["epubcheck_version"] = (version.stdout or version.stderr).strip()
+        version = subprocess.run([*epubcheck, "--version"], env=env, text=True, capture_output=True)
+        version_output = (version.stdout or "") + (version.stderr or "")
+        if re.search(r"EPUBCheck v\d", version_output):
+            run_results["epubcheck_version"] = re.search(r"EPUBCheck v[^\s]+", version_output).group(0)
+        else:
+            run_results["epubcheck_version"] = "detected but unusable: " + (version.stderr.strip() or "version command failed")
+            epubcheck = None
     baseline_summary = args.baseline_summary
     if baseline_summary is None:
         candidate = root / "baselines/current/summary.json"
@@ -701,15 +753,18 @@ def main() -> int:
             run([str(cli), "compile", str(project), "epub", str(output)], env=env)
             generated_semantics = epub_semantics(output)
             reference_semantics = epub_semantics(reference)
+            generated_epubcheck = epubcheck_result(epubcheck, output, env=env)
+            reference_epubcheck = epubcheck_result(epubcheck, reference, env=env)
             semantic_diff = compare_tokens(reference_semantics, generated_semantics)
             structure_diff = compare_publication_structure(reference_semantics, generated_semantics)
             report["compile"] = {
                 "path": str(output),
                 "bytes": output.stat().st_size,
                 "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
-                "epubcheck": "unavailable" if shutil.which("epubcheck") is None else "not yet run",
+                "epubcheck": generated_epubcheck,
             }
             report["reference"] = {key: value for key, value in reference_semantics.items() if key != "tokens_private"}
+            report["reference"]["epubcheck"] = reference_epubcheck
             report["generated"] = {key: value for key, value in generated_semantics.items() if key != "tokens_private"}
             report["semantic_comparison"] = semantic_diff
             report["publication_structure_differences"] = structure_diff
@@ -729,12 +784,25 @@ def main() -> int:
         report["timings_seconds"] = timings
         run_results["books"][book_id] = report
 
-    run_results["acceptance"] = "provisional; requires EPUBCheck, discrepancy triage, and human review"
+    run_results["acceptance"] = regression_acceptance(
+        run_results["books"], run_results["epubcheck_version"]
+    )
     json_path = run_reports / "summary.json"
     json_path.write_text(json.dumps(run_results, ensure_ascii=False, indent=2), encoding="utf-8")
     lines = [f"# Private real-manuscript regression — {run_id}", "", f"Commit: `{run_results['commit']}`", "", "Fixture SHA-256: passed", ""]
     for book_id, report in run_results["books"].items():
-        lines.extend([f"## {book_id}", "", f"- Import: {report.get('import_status', 'not run')}", f"- Source unchanged: {report.get('source_unchanged', 'not checked')}", f"- EPUBCheck: {report.get('compile', {}).get('epubcheck', 'not run')}"])
+        lines.extend([f"## {book_id}", "", f"- Import: {report.get('import_status', 'not run')}", f"- Source unchanged: {report.get('source_unchanged', 'not checked')}"])
+        if "compile" in report:
+            generated_check = report["compile"]["epubcheck"]
+            reference_check = report["reference"].get("epubcheck", {})
+            lines.append(
+                f"- Generated EPUBCheck: {generated_check.get('status')}; "
+                f"{generated_check.get('errors')} errors, {generated_check.get('warnings')} warnings"
+            )
+            lines.append(
+                f"- Reference EPUBCheck: {reference_check.get('status')}; "
+                f"{reference_check.get('errors')} errors, {reference_check.get('warnings')} warnings"
+            )
         fidelity = report.get("source_content_fidelity")
         if fidelity:
             lines.append(

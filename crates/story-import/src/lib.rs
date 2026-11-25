@@ -2706,9 +2706,10 @@ fn markdown_safe_uri(value: &str) -> String {
         .replace('>', "%3E")
 }
 
-fn extract_rtf_hyperlinks(source: &str) -> (String, usize) {
+fn extract_rtf_hyperlinks(source: &str) -> (String, usize, Vec<(String, String)>) {
     let bytes = source.as_bytes();
     let mut segments = Vec::<(usize, usize, String)>::new();
+    let mut links = Vec::new();
     let mut unsupported = 0usize;
     let mut search_from = 0usize;
     while let Some(relative) = source[search_from..].find("\\field") {
@@ -2746,7 +2747,9 @@ fn extract_rtf_hyperlinks(source: &str) -> (String, usize) {
             rtf_hyperlink_target(text)
         });
         let replacement = if let Some(target) = target.filter(|_| !result.is_empty()) {
-            format!("[{result}]({target})")
+            let placeholder = format!("WIDEHYPERLINK{}END", links.len());
+            links.push((placeholder.clone(), format!("[{result}]({target})")));
+            placeholder
         } else {
             unsupported = unsupported.saturating_add(1);
             result
@@ -2755,7 +2758,7 @@ fn extract_rtf_hyperlinks(source: &str) -> (String, usize) {
         search_from = end;
     }
     if segments.is_empty() {
-        return (source.to_owned(), unsupported);
+        return (source.to_owned(), unsupported, links);
     }
     let mut output = String::with_capacity(source.len());
     let mut cursor = 0usize;
@@ -2768,13 +2771,106 @@ fn extract_rtf_hyperlinks(source: &str) -> (String, usize) {
         cursor = end;
     }
     output.push_str(&source[cursor..]);
-    (output, unsupported)
+    (output, unsupported, links)
+}
+
+fn extract_rtf_list_text(source: &str) -> (String, Vec<(String, String)>) {
+    let bytes = source.as_bytes();
+    let mut segments = Vec::<(usize, usize, String)>::new();
+    let mut markers = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(relative) = source[search_from..].find("\\listtext") {
+        let control_at = search_from + relative;
+        let after_word = control_at + "\\listtext".len();
+        if source
+            .as_bytes()
+            .get(after_word)
+            .is_some_and(u8::is_ascii_alphabetic)
+        {
+            search_from = after_word;
+            continue;
+        }
+        let Some(start) = bytes[..control_at].iter().rposition(|byte| *byte == b'{') else {
+            search_from = after_word;
+            continue;
+        };
+        let Some(end) = find_rtf_group_end(bytes, start) else {
+            search_from = after_word;
+            continue;
+        };
+        let group = &source[start..end];
+        let marker = if group.contains("\\u9679") || group.contains("\\u9675") {
+            Some("- ".to_owned())
+        } else {
+            let plain_marker = group.bytes().collect::<Vec<_>>();
+            let mut numeric = String::new();
+            let mut after_control = false;
+            for byte in plain_marker {
+                if byte == b'\\' {
+                    after_control = true;
+                    continue;
+                }
+                if after_control {
+                    if !byte.is_ascii_alphanumeric() && byte != b'-' {
+                        after_control = false;
+                    }
+                    continue;
+                }
+                if byte.is_ascii_digit() || (byte == b'.' && !numeric.is_empty()) {
+                    numeric.push(char::from(byte));
+                } else if !numeric.is_empty() {
+                    break;
+                }
+            }
+            numeric.ends_with('.').then(|| format!("{numeric} "))
+        };
+        let Some(marker) = marker else {
+            search_from = end;
+            continue;
+        };
+        let placeholder = format!("WIDERTFLISTITEM{}END", markers.len());
+        let mut replacement_end = end;
+        if source.as_bytes().get(end..end + 4) == Some(b"\\tab") {
+            replacement_end += 4;
+            if source.as_bytes().get(replacement_end) == Some(&b' ') {
+                replacement_end += 1;
+            }
+        }
+        // Removing a group immediately after an RTF control word can join the
+        // following placeholder to that word (for example `\\plainWIDERTF…`),
+        // making the RTF reader consume the placeholder as part of the control.
+        // Keep a delimiter in the prepared RTF; the parser consumes this space.
+        let replacement = if start > 0 && source.as_bytes()[start - 1].is_ascii_alphanumeric() {
+            format!(" {placeholder}")
+        } else {
+            placeholder.clone()
+        };
+        segments.push((start, replacement_end, replacement));
+        markers.push((placeholder, marker));
+        search_from = replacement_end;
+    }
+    if segments.is_empty() {
+        return (source.to_owned(), markers);
+    }
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    for (start, end, placeholder) in segments {
+        if start < cursor {
+            continue;
+        }
+        output.push_str(&source[cursor..start]);
+        output.push_str(&placeholder);
+        cursor = end;
+    }
+    output.push_str(&source[cursor..]);
+    (output, markers)
 }
 
 fn extract_rtf_markdown_with_assets(
     source: &str,
 ) -> (String, Vec<ScrivenerEmbeddedAsset>, usize, usize) {
-    let (source, unsupported_link_count) = extract_rtf_hyperlinks(source);
+    let (source, unsupported_link_count, links) = extract_rtf_hyperlinks(source);
+    let (source, list_markers) = extract_rtf_list_text(&source);
     let source = source.as_str();
     let bytes = source.as_bytes();
     let mut segments = Vec::<(usize, usize, String, Option<ScrivenerEmbeddedAsset>)>::new();
@@ -2783,10 +2879,13 @@ fn extract_rtf_markdown_with_assets(
     while let Some(relative) = source[search_from..].find("\\pict") {
         let pict_at = search_from + relative;
         let after_word = pict_at + "\\pict".len();
-        if source
-            .as_bytes()
-            .get(after_word)
-            .is_some_and(u8::is_ascii_alphabetic)
+        let is_control_word_boundary =
+            pict_at == 0 || !source.as_bytes()[pict_at - 1].is_ascii_alphabetic();
+        if !is_control_word_boundary
+            || source
+                .as_bytes()
+                .get(after_word)
+                .is_some_and(u8::is_ascii_alphabetic)
         {
             search_from = after_word;
             continue;
@@ -2812,7 +2911,7 @@ fn extract_rtf_markdown_with_assets(
         let (start, end) = wrapper.unwrap_or((picture_start, picture_end));
         if let Some((media_type, extension, image_bytes)) = decode_rtf_picture(group) {
             let sha256 = format!("{:x}", Sha256::digest(&image_bytes));
-            let placeholder = format!("WIDESCRIVENERASSET-{sha256}");
+            let placeholder = format!("WIDESCRIVENERASSET{sha256}END");
             let asset = ScrivenerEmbeddedAsset {
                 placeholder: placeholder.clone(),
                 media_type,
@@ -2845,6 +2944,12 @@ fn extract_rtf_markdown_with_assets(
     prepared.push_str(&source[cursor..]);
 
     let mut markdown = extract_rtf_markdown_without_assets(&prepared);
+    for (placeholder, link) in links {
+        markdown = markdown.replace(&placeholder, &link);
+    }
+    for (placeholder, marker) in list_markers {
+        markdown = markdown.replace(&placeholder, &marker);
+    }
     for asset in &assets {
         let reference = format!(
             "![Illustration](attachments/scrivener-{}.{})",
@@ -2947,6 +3052,15 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
                     | "header" | "footer" | "xmlnstbl" | "listtable" | "listoverridetable" => {
                         style.skip = true
                     }
+                    "plain" => {
+                        // RTF \\plain resets character formatting at a run boundary.
+                        // Keeping inherited emphasis here can wrap a list marker
+                        // placeholder in Markdown emphasis and make the list
+                        // marker cease to be a list marker.
+                        style.bold = false;
+                        style.italic = false;
+                        style.strike = false;
+                    }
                     "b" => style.bold = number != "0",
                     "i" => style.italic = number != "0",
                     "strike" | "strikethrough" => style.strike = number != "0",
@@ -2974,10 +3088,38 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
         if text.is_empty() {
             return;
         }
-        let escaped = text
-            .replace('\\', "\\\\")
-            .replace('*', "\\*")
-            .replace('_', "\\_");
+        let characters = text.chars().collect::<Vec<_>>();
+        let mut escaped = String::with_capacity(text.len());
+        for (index, character) in characters.iter().copied().enumerate() {
+            let ordered_list_marker = character == '.'
+                && index + 1 < characters.len()
+                && characters[index + 1].is_whitespace()
+                && characters[..index].iter().all(char::is_ascii_digit)
+                && index > 0;
+            if matches!(
+                character,
+                '\\' | '`'
+                    | '*'
+                    | '_'
+                    | '{'
+                    | '}'
+                    | '['
+                    | ']'
+                    | '<'
+                    | '>'
+                    | '~'
+                    | '|'
+                    | '#'
+                    | '+'
+                    | '-'
+                    | '!'
+                    | '^'
+            ) || ordered_list_marker
+            {
+                escaped.push('\\');
+            }
+            escaped.push(character);
+        }
         let value = match (style.bold, style.italic, style.strike) {
             (true, true, true) => format!("~~***{escaped}***~~"),
             (true, true, false) => format!("***{escaped}***"),
@@ -3413,6 +3555,16 @@ This is an addition to the old file.}"#;
     }
 
     #[test]
+    fn scrivener_shppict_control_is_not_mistaken_for_pict_and_does_not_discard_following_text() {
+        let source = r#"{\rtf1\ansi Before\par {\*\shppict unsupported shape}\par {\listtext\f0\u9679?}\tab Preserved item\par After.}"#;
+        let (markdown, assets, unsupported, _) = extract_rtf_markdown_with_assets(source);
+        assert!(assets.is_empty());
+        assert_eq!(unsupported, 0);
+        assert!(markdown.contains("- Preserved item"), "{markdown:?}");
+        assert!(markdown.contains("After."), "{markdown:?}");
+    }
+
+    #[test]
     fn scrivener_rtf_hyperlink_fields_preserve_visible_text_and_safe_destinations() {
         let source = r#"{\rtf1\ansi Read {\field{\*\fldinst HYPERLINK "https://example.org/a(b)"}{\fldrslt helpful page}} now}"#;
         let (markdown, assets, unsupported_pictures, unsupported_links) =
@@ -3428,6 +3580,62 @@ This is an addition to the old file.}"#;
         assert_eq!(unsupported_links, 1);
         assert!(!safe_markdown.contains("javascript:"));
         assert!(safe_markdown.contains("visible"));
+    }
+
+    #[test]
+    fn scrivener_rtf_prose_escapes_markdown_syntax_without_losing_literal_punctuation() {
+        let source = r#"{\rtf1\ansi # Not a heading\par - Not a list item\par > Not a quotation\par `Not code`\par 1. Not a numbered list\par A | literal | bar\par Keep [brackets] and (parentheses).}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert!(markdown.contains(r"\# Not a heading"));
+        assert!(markdown.contains(r"\- Not a list item"));
+        assert!(markdown.contains(r"\> Not a quotation"));
+        assert!(markdown.contains(r"\`Not code\`"));
+        assert!(markdown.contains(r"1\. Not a numbered list"));
+        assert!(markdown.contains(r"A \| literal \| bar"));
+        assert!(markdown.contains(r"Keep \[brackets\] and (parentheses)."));
+    }
+
+    #[test]
+    fn scrivener_rtf_bullet_list_markers_become_markdown_list_items() {
+        let source = r#"{\rtf1\ansi Before.\par {\listtext\f0\u9679?}\tab First item\par {\listtext\f0\u9679?}\tab Second item\par After.}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert!(
+            markdown.contains("- First item"),
+            "unexpected RTF list output: {markdown:?}"
+        );
+        assert!(
+            markdown.contains("- Second item"),
+            "unexpected RTF list output: {markdown:?}"
+        );
+        assert!(!markdown.contains("•?"));
+    }
+
+    #[test]
+    fn scrivener_rtf_list_marker_with_scrivener_formatting_groups_becomes_list_item() {
+        let source = r#"{\rtf1\ansi\i1 Styled opening.\par\plain{\listtext\f0\fs24\b0\i0\loch\af0\hich\af0\dbch\af0\uc1\u9679?}{\f0\fs24\b0\i0\cf1 First item}\par After.}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert!(
+            markdown.lines().any(|line| line == "- First item"),
+            "unexpected RTF list output: {markdown:?}"
+        );
+        assert!(
+            markdown.contains("After."),
+            "unexpected RTF output: {markdown:?}"
+        );
+    }
+
+    #[test]
+    fn scrivener_rtf_numbered_list_markers_retain_numbering() {
+        let source = r#"{\rtf1\ansi {\listtext\f0 1.}\tab First item\par {\listtext\f0 2.}\tab Second item\par}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert!(
+            markdown.contains("1. First item"),
+            "unexpected RTF list output: {markdown:?}"
+        );
+        assert!(
+            markdown.contains("2. Second item"),
+            "unexpected RTF list output: {markdown:?}"
+        );
     }
 
     #[test]

@@ -73,6 +73,18 @@ Availability is not the same as a successful audit. Run a tool at an appropriate
 checkpoint and record its result. Do not automatically upgrade dependencies or
 make any of these tools a mandatory runtime requirement.
 
+Latest local audit checkpoint (25 November 2026): `cargo audit` loaded 1,568
+RustSec advisories and reported 26 advisories plus 10 allowed warnings across
+the lockfile, including transitive SQLite, URL, ZIP and zstd dependencies. No
+dependency was automatically upgraded. The affected dependency paths and
+exposure need deliberate compatibility and security review before release.
+`cargo deny check` could not finish because locked platform-specific crate data
+was unavailable from the network-restricted Cargo registry. `cargo-machete`
+found two unused direct dependencies, which were removed; a repeat check passed.
+`cargo llvm-cov` could not run because the `llvm-tools-preview` Rust component
+was unavailable and could not be installed in this environment. These blocked
+checks are not passes.
+
 Examples:
 
 ```sh
