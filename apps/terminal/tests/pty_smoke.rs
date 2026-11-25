@@ -887,3 +887,89 @@ fn nonfiction_section_subtree_deletion_preserves_owned_prose_for_recovery_in_a_r
         "Field notes under this heading."
     );
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn nonfiction_section_owned_prose_rehomes_through_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+    use story_core::{BookType, ContentUnitKind, NodeKind};
+    use story_document::CompileFormat;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Non-fiction Rehome Project");
+    let mut app =
+        WriterApp::create_project_with_type(&project, "Field Guide", BookType::Nonfiction).unwrap();
+    let parent = app
+        .create_structural_node(None, NodeKind::Section, "Part One", 0)
+        .unwrap();
+    let section = app
+        .create_structural_node(Some(parent), NodeKind::Section, "Old Heading", 0)
+        .unwrap();
+    let child = app
+        .create_structural_node(Some(section), NodeKind::Section, "Subsection", 0)
+        .unwrap();
+    let prose = app
+        .create_content_unit(
+            ContentUnitKind::SectionBody,
+            "Old Heading prose",
+            Some(section),
+            0,
+            None,
+        )
+        .unwrap();
+    let (_, hash) = app.load_content_unit_text(prose).unwrap();
+    app.save_content_unit_text(prose, Some(&hash), "Field notes stay in the manuscript.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY non-fiction prose rehome workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("section-removal-rehome")
+        .output()
+        .expect("run the Linux PTY non-fiction prose rehome workflow");
+    assert!(
+        result.status.success(),
+        "PTY non-fiction prose rehome failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let mut reopened = WriterApp::open_project(&project).unwrap();
+    assert!(
+        reopened
+            .list_structural_nodes()
+            .unwrap()
+            .iter()
+            .any(|node| node.id == child && node.parent_id == Some(parent))
+    );
+    let active_prose = reopened.get_content_unit(prose).unwrap();
+    assert!(!active_prose.archived);
+    assert_eq!(active_prose.parent_id, Some(parent));
+    assert_eq!(active_prose.position, 0);
+    let compiled = String::from_utf8(
+        reopened
+            .compile_artifact(CompileFormat::Markdown, false)
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    assert!(compiled.contains("Field notes stay in the manuscript."));
+    reopened.restore_latest_structural_removal(section).unwrap();
+    let restored = reopened.get_content_unit(prose).unwrap();
+    assert_eq!(restored.parent_id, Some(section));
+    assert_eq!(restored.position, 0);
+    assert_eq!(
+        reopened.load_content_unit_text(prose).unwrap().0,
+        "Field notes stay in the manuscript."
+    );
+}

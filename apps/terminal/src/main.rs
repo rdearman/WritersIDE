@@ -205,11 +205,17 @@ struct StructuralNodeRemovalDialog {
     content_unit_words: u64,
     can_rehome_scenes: bool,
     can_promote_children: bool,
+    can_rehome_section_prose: bool,
     target_sections: Vec<story_core::NodeId>,
     target_section_index: usize,
+    target_prose_sections: Vec<story_core::NodeId>,
+    target_prose_section_index: usize,
     target_chapters: Vec<story_core::NodeId>,
     target_index: usize,
     keep_chapter_prose: bool,
+    keep_section_prose: bool,
+    owned_content_unit_count: u32,
+    owned_content_unit_words: u64,
     choice: usize,
 }
 
@@ -11214,6 +11220,10 @@ impl AppState {
                     .is_some_and(|parent| subtree_ids.contains(&parent))
             })
             .collect();
+        let owned_units: Vec<_> = units
+            .iter()
+            .filter(|unit| unit.parent_id == Some(id))
+            .collect();
         let descendant_nodes = subtree_ids.len().saturating_sub(1) as u32;
         let can_rehome_scenes = !restoring
             && node.kind == "chapter"
@@ -11237,6 +11247,15 @@ impl AppState {
             })
             .map(|candidate| candidate.id)
             .collect();
+        let target_prose_sections: Vec<story_core::NodeId> = active_nodes
+            .iter()
+            .filter(|candidate| {
+                candidate.kind == "section"
+                    && candidate.id != id
+                    && !subtree_ids.contains(&candidate.id)
+            })
+            .map(|candidate| candidate.id)
+            .collect();
         let target_chapters: Vec<story_core::NodeId> = active_nodes
             .iter()
             .filter(|candidate| {
@@ -11247,6 +11266,15 @@ impl AppState {
             .map(|candidate| candidate.id)
             .collect();
         let keep_chapter_prose = !units.is_empty() && !target_chapters.is_empty();
+        let can_rehome_section_prose = !restoring
+            && node.kind == "section"
+            && owned_units.iter().any(|unit| !unit.archived)
+            && !target_prose_sections.is_empty();
+        let keep_section_prose = can_rehome_section_prose;
+        let target_prose_section_index = node
+            .parent_id
+            .and_then(|parent| target_prose_sections.iter().position(|id| *id == parent))
+            .unwrap_or(0);
         self.pending_structural_node_removal = Some(StructuralNodeRemovalDialog {
             id,
             title: node.title,
@@ -11264,12 +11292,23 @@ impl AppState {
             content_unit_words: units.iter().map(|unit| u64::from(unit.actual_words)).sum(),
             can_rehome_scenes,
             can_promote_children,
+            can_rehome_section_prose,
             target_sections,
             target_section_index: 0,
+            target_prose_sections,
+            target_prose_section_index,
             target_chapters,
             target_index: 0,
             keep_chapter_prose,
-            choice: if can_rehome_scenes || can_promote_children {
+            keep_section_prose,
+            owned_content_unit_count: owned_units.iter().filter(|unit| !unit.archived).count()
+                as u32,
+            owned_content_unit_words: owned_units
+                .iter()
+                .filter(|unit| !unit.archived)
+                .map(|unit| u64::from(unit.actual_words))
+                .sum(),
+            choice: if can_rehome_scenes || can_promote_children || can_rehome_section_prose {
                 0
             } else {
                 2
@@ -11311,19 +11350,54 @@ impl AppState {
                 scene_destination,
                 prose_destination,
             )?;
-        } else if dialog.can_promote_children && dialog.choice == 0 {
-            self.app.promote_section_children(dialog.id)?;
-        } else if dialog.can_promote_children && dialog.choice == 1 {
-            let Some(target) = dialog
-                .target_sections
-                .get(dialog.target_section_index)
+        } else if dialog.can_promote_children && dialog.choice < 2 {
+            let child_destination = if dialog.choice == 0 {
+                self.app
+                    .list_structural_nodes()?
+                    .into_iter()
+                    .find(|node| node.id == dialog.id)
+                    .and_then(|node| node.parent_id)
+            } else {
+                let Some(target) = dialog
+                    .target_sections
+                    .get(dialog.target_section_index)
+                    .copied()
+                else {
+                    self.message = "Create another section before moving these subsections".into();
+                    return Ok(());
+                };
+                Some(target)
+            };
+            let prose_destination = if dialog.keep_section_prose {
+                dialog
+                    .target_prose_sections
+                    .get(dialog.target_prose_section_index)
+                    .copied()
+            } else {
+                None
+            };
+            self.app.promote_section_children_and_rehome_prose(
+                dialog.id,
+                child_destination,
+                prose_destination,
+            )?;
+        } else if dialog.can_rehome_section_prose
+            && !dialog.can_promote_children
+            && dialog.choice == 0
+        {
+            let Some(destination) = dialog
+                .target_prose_sections
+                .get(dialog.target_prose_section_index)
                 .copied()
             else {
-                self.message = "Create another section before moving these subsections".into();
+                self.message = "Create another section before moving this prose".into();
                 return Ok(());
             };
-            self.app
-                .promote_section_children_to(dialog.id, Some(target))?;
+            self.app.promote_section_children_and_rehome_prose(
+                dialog.id,
+                None,
+                Some(destination),
+            )?;
         } else {
             self.app.archive_structural_subtree(dialog.id)?;
         }
@@ -11356,6 +11430,31 @@ impl AppState {
             format!(
                 " · {} prose document(s) retained in Removed Documents",
                 dialog.content_unit_count
+            )
+        };
+        let section_prose_summary = if dialog.owned_content_unit_count == 0 {
+            String::new()
+        } else if dialog.keep_section_prose && dialog.choice < 2 {
+            let destination = dialog
+                .target_prose_sections
+                .get(dialog.target_prose_section_index)
+                .and_then(|target| {
+                    self.app
+                        .list_structural_nodes()
+                        .ok()?
+                        .into_iter()
+                        .find(|node| node.id == *target)
+                        .map(|node| node.title)
+                })
+                .unwrap_or_else(|| "selected section".into());
+            format!(
+                " · {} heading prose document(s) kept in ‘{}’",
+                dialog.owned_content_unit_count, destination
+            )
+        } else {
+            format!(
+                " · {} heading prose document(s) retained in Removed Documents",
+                dialog.owned_content_unit_count
             )
         };
         self.message = if dialog.restoring {
@@ -11410,15 +11509,7 @@ impl AppState {
         } else if dialog.can_promote_children && dialog.choice == 0 {
             format!(
                 "Removed section ‘{}’ · child sections promoted to parent{} · recoverable",
-                dialog.title,
-                if dialog.content_unit_count > 0 {
-                    format!(
-                        " · {} prose document(s) retained in Removed Documents",
-                        dialog.content_unit_count
-                    )
-                } else {
-                    String::new()
-                }
+                dialog.title, section_prose_summary
             )
         } else if dialog.can_promote_children && dialog.choice == 1 {
             let destination = dialog
@@ -11435,17 +11526,32 @@ impl AppState {
                 .unwrap_or_else(|| "selected section".into());
             format!(
                 "Removed section ‘{}’ · child sections moved to ‘{}’{} · recoverable",
-                dialog.title,
-                destination,
-                if dialog.content_unit_count > 0 {
-                    format!(
-                        " · {} prose document(s) retained in Removed Documents",
-                        dialog.content_unit_count
-                    )
-                } else {
-                    String::new()
-                }
+                dialog.title, destination, section_prose_summary
             )
+        } else if dialog.can_rehome_section_prose && !dialog.can_promote_children {
+            if dialog.choice == 0 {
+                let destination = dialog
+                    .target_prose_sections
+                    .get(dialog.target_prose_section_index)
+                    .and_then(|target| {
+                        self.app
+                            .list_structural_nodes()
+                            .ok()?
+                            .into_iter()
+                            .find(|node| node.id == *target)
+                            .map(|node| node.title)
+                    })
+                    .unwrap_or_else(|| "selected section".into());
+                format!(
+                    "Removed section ‘{}’ · {} prose document(s) kept in ‘{}’ · recoverable",
+                    dialog.title, dialog.owned_content_unit_count, destination
+                )
+            } else {
+                format!(
+                    "Removed section ‘{}’ · {} prose document(s) retained in Removed Documents · recoverable",
+                    dialog.title, dialog.owned_content_unit_count
+                )
+            }
         } else {
             format!(
                 "Moved {} ‘{}’ and its contents to Removed Documents · identity retained",
@@ -25616,6 +25722,12 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
                 dialog.descendant_nodes
             )));
         }
+        if dialog.kind == "section" && dialog.owned_content_unit_count > 0 {
+            lines.push(Line::from(format!(
+                "Direct heading prose: {} document(s), {} words.",
+                dialog.owned_content_unit_count, dialog.owned_content_unit_words
+            )));
+        }
         if dialog.can_rehome_scenes {
             lines.push(Line::from(if dialog.scene_count == 0 {
                 "Choose how to handle the chapter prose:"
@@ -25751,13 +25863,66 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
                 if dialog.choice == 2 { ">" } else { " " }
             )));
             lines.push(Line::from(
-                "Child order and IDs are preserved. The removed heading and its prose remain recoverable in Removed Documents.",
+                "Child order and IDs are preserved. The removed heading is recoverable.",
             ));
+            if dialog.owned_content_unit_count > 0 {
+                let prose_destination = dialog
+                    .target_prose_sections
+                    .get(dialog.target_prose_section_index)
+                    .and_then(|target| {
+                        s.app
+                            .list_structural_nodes()
+                            .ok()?
+                            .into_iter()
+                            .find(|node| node.id == *target)
+                            .map(|node| node.title)
+                    })
+                    .unwrap_or_else(|| "no compatible section".into());
+                lines.push(Line::from(if dialog.choice == 2 {
+                    "Owned prose stays with the recoverable heading. Restore returns it.".into()
+                } else if dialog.keep_section_prose {
+                    format!(
+                        "Prose: keep in ‘{}’ and in Compile · Shift+Left/Right changes destination · P archives it",
+                        prose_destination
+                    )
+                } else {
+                    "Prose: move to Removed Documents (recoverable) · P keeps it active".into()
+                }));
+            }
             lines.push(Line::from(match dialog.choice {
                 0 => "Compile order may change as child headings move to the current parent level.",
                 1 => "Compile order may change as child headings move to the selected section.",
                 _ => "Compile: this subtree and its prose are omitted until restored.",
             }));
+            lines.push(Line::from(
+                "Up/Down choose · Left/Right destination · Enter confirm · Esc cancel",
+            ));
+        } else if dialog.can_rehome_section_prose {
+            let destination = dialog
+                .target_prose_sections
+                .get(dialog.target_prose_section_index)
+                .and_then(|target| {
+                    s.app
+                        .list_structural_nodes()
+                        .ok()?
+                        .into_iter()
+                        .find(|node| node.id == *target)
+                        .map(|node| node.title)
+                })
+                .unwrap_or_else(|| "No compatible section".into());
+            lines.push(Line::from("Choose how to handle this section's prose:"));
+            lines.push(Line::from(format!(
+                "{} Keep prose in ‘{}’ · remains in Compile",
+                if dialog.choice == 0 { ">" } else { " " },
+                destination
+            )));
+            lines.push(Line::from(format!(
+                "{} Move prose to Removed Documents",
+                if dialog.choice == 1 { ">" } else { " " }
+            )));
+            lines.push(Line::from(
+                "Prose document IDs, text and ordering are preserved. The heading is recoverable.",
+            ));
             lines.push(Line::from(
                 "Up/Down choose · Left/Right destination · Enter confirm · Esc cancel",
             ));
@@ -29192,19 +29357,58 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     }
     if let Some(dialog) = s.pending_structural_node_removal.clone() {
         match k.code {
-            KeyCode::Up if dialog.can_rehome_scenes || dialog.can_promote_children => {
+            KeyCode::Up
+                if dialog.can_rehome_scenes
+                    || dialog.can_promote_children
+                    || dialog.can_rehome_section_prose =>
+            {
                 if let Some(active) = s.pending_structural_node_removal.as_mut() {
                     active.choice = active.choice.saturating_sub(1);
                 }
             }
-            KeyCode::Down if dialog.can_rehome_scenes || dialog.can_promote_children => {
+            KeyCode::Down
+                if dialog.can_rehome_scenes
+                    || dialog.can_promote_children
+                    || dialog.can_rehome_section_prose =>
+            {
                 if let Some(active) = s.pending_structural_node_removal.as_mut() {
                     let max_choice = if active.can_rehome_scenes || active.can_promote_children {
                         2
+                    } else if active.can_rehome_section_prose {
+                        1
                     } else {
                         0
                     };
                     active.choice = (active.choice + 1).min(max_choice);
+                }
+            }
+            KeyCode::Left | KeyCode::Right
+                if dialog.can_rehome_section_prose
+                    && dialog.keep_section_prose
+                    && (!dialog.can_promote_children
+                        || k.modifiers.contains(KeyModifiers::SHIFT))
+                    && !dialog.target_prose_sections.is_empty() =>
+            {
+                if let Some(active) = s.pending_structural_node_removal.as_mut() {
+                    if k.code == KeyCode::Right {
+                        active.target_prose_section_index = (active.target_prose_section_index + 1)
+                            % active.target_prose_sections.len();
+                    } else {
+                        active.target_prose_section_index = active
+                            .target_prose_section_index
+                            .checked_sub(1)
+                            .unwrap_or(active.target_prose_sections.len() - 1);
+                    }
+                }
+            }
+            KeyCode::Char('p' | 'P')
+                if dialog.can_promote_children
+                    && dialog.choice < 2
+                    && dialog.owned_content_unit_count > 0
+                    && !dialog.target_prose_sections.is_empty() =>
+            {
+                if let Some(active) = s.pending_structural_node_removal.as_mut() {
+                    active.keep_section_prose = !active.keep_section_prose;
                 }
             }
             KeyCode::Left | KeyCode::Right
@@ -43855,17 +44059,18 @@ mod tests {
             .position(|row| matches!(row, OutlineRow::Section { id, .. } if *id == section))
             .unwrap();
         state.begin_structural_node_removal(false).unwrap();
-        let dialog = state.pending_structural_node_removal.as_ref().unwrap();
+        let dialog = state.pending_structural_node_removal.as_mut().unwrap();
         assert!(dialog.can_promote_children);
         assert_eq!(dialog.choice, 0);
-        state
-            .finish_structural_node_removal(dialog.clone())
-            .unwrap();
+        assert!(dialog.keep_section_prose);
+        dialog.keep_section_prose = false;
+        let dialog = dialog.clone();
+        state.finish_structural_node_removal(dialog).unwrap();
         assert!(state.message.contains("child sections promoted to parent"));
         assert!(
             state
                 .message
-                .contains("1 prose document(s) retained in Removed Documents")
+                .contains("1 heading prose document(s) retained in Removed Documents")
         );
         assert_eq!(
             state
@@ -43974,6 +44179,149 @@ mod tests {
                 .parent_id,
             Some(removed)
         );
+    }
+
+    #[test]
+    fn nonfiction_section_removal_keeps_owned_prose_active_by_default_and_restores_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut app =
+            WriterApp::create_project_with_type(&project, "Book", story_core::BookType::Nonfiction)
+                .unwrap();
+        let parent = app
+            .create_structural_node(None, story_core::NodeKind::Section, "Part One", 0)
+            .unwrap();
+        let removed = app
+            .create_structural_node(
+                Some(parent),
+                story_core::NodeKind::Section,
+                "Old Heading",
+                0,
+            )
+            .unwrap();
+        let child = app
+            .create_structural_node(
+                Some(removed),
+                story_core::NodeKind::Section,
+                "Subsection",
+                0,
+            )
+            .unwrap();
+        let existing = app
+            .create_content_unit(
+                story_core::ContentUnitKind::SectionBody,
+                "Part introduction",
+                Some(parent),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, existing_hash) = app.load_content_unit_text(existing).unwrap();
+        app.save_content_unit_text(existing, Some(&existing_hash), "Part prose first.")
+            .unwrap();
+        let prose = app
+            .create_content_unit(
+                story_core::ContentUnitKind::SectionBody,
+                "Old Heading prose",
+                Some(removed),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, prose_hash) = app.load_content_unit_text(prose).unwrap();
+        app.save_content_unit_text(
+            prose,
+            Some(&prose_hash),
+            "This heading prose remains in the active manuscript.",
+        )
+        .unwrap();
+
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Section { id, .. } if *id == removed))
+            .unwrap();
+        state.begin_structural_node_removal(false).unwrap();
+        let dialog = state.pending_structural_node_removal.as_ref().unwrap();
+        assert!(dialog.can_promote_children);
+        assert!(dialog.can_rehome_section_prose);
+        assert!(dialog.keep_section_prose);
+        assert_eq!(dialog.target_prose_sections, vec![parent]);
+        assert_eq!(dialog.target_prose_section_index, 0);
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            screen.contains("Prose: keep in ‘Part One’ and in Compile"),
+            "{screen}"
+        );
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.message.contains("heading prose document(s) kept"));
+        assert!(
+            !state
+                .app
+                .list_structural_nodes()
+                .unwrap()
+                .iter()
+                .any(|node| node.id == removed)
+        );
+        assert_eq!(
+            state
+                .app
+                .list_structural_nodes()
+                .unwrap()
+                .into_iter()
+                .find(|node| node.id == child)
+                .unwrap()
+                .parent_id,
+            Some(parent)
+        );
+        let active_prose = state
+            .app
+            .list_content_units(false)
+            .unwrap()
+            .into_iter()
+            .filter(|unit| unit.parent_id == Some(parent))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            active_prose.iter().map(|unit| unit.id).collect::<Vec<_>>(),
+            vec![existing, prose]
+        );
+        let compiled = state
+            .app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        let compiled = String::from_utf8(compiled.bytes).unwrap();
+        assert!(compiled.contains("Part prose first."));
+        assert!(compiled.contains("This heading prose remains in the active manuscript."));
+
+        state
+            .app
+            .restore_latest_structural_removal(removed)
+            .unwrap();
+        let restored = state.app.get_content_unit(prose).unwrap();
+        assert_eq!(restored.parent_id, Some(removed));
+        assert_eq!(restored.position, 0);
+        assert_eq!(
+            state.app.load_content_unit_text(prose).unwrap().0,
+            "This heading prose remains in the active manuscript."
+        );
+        state.app.validate_project().unwrap();
     }
 
     #[test]

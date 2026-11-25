@@ -1085,6 +1085,18 @@ impl WriterApp {
             .store
             .promote_section_children_to(section, destination)?)
     }
+    pub fn promote_section_children_and_rehome_prose(
+        &mut self,
+        section: NodeId,
+        destination: Option<NodeId>,
+        prose_destination: Option<NodeId>,
+    ) -> Result<uuid::Uuid> {
+        Ok(self.store.promote_section_children_to_and_rehome_prose(
+            section,
+            destination,
+            prose_destination,
+        )?)
+    }
     pub fn restore_structural_subtree(&mut self, id: uuid::Uuid) -> Result<NodeId> {
         Ok(self.store.restore_structural_subtree(id)?)
     }

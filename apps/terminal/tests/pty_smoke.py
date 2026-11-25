@@ -141,6 +141,7 @@ def main():
     chapter_removal_delete = modes == ["chapter-removal-delete"]
     chapter_removal_cancel = modes == ["chapter-removal-cancel"]
     section_removal_delete = modes == ["section-removal-delete"]
+    section_removal_rehome = modes == ["section-removal-rehome"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
     child_pid, master = pty.fork()
@@ -483,7 +484,7 @@ def main():
         read_for(0.4)
         if not modes:
             assert_sample_prose_visible(output, 24, 80, "initial 80x24 screen")
-        if not section_removal_delete and b"Arrival" not in output:
+        if not section_removal_delete and not section_removal_rehome and b"Arrival" not in output:
             raise AssertionError(
                 "the opening scene was not rendered in the PTY; output tail: "
                 + repr(bytes(output[-1600:]))
@@ -646,7 +647,7 @@ def main():
                 print("PTY chapter removal passed: choices are visible and the default retains scenes as Unplaced.")
             return
 
-        if section_removal_delete:
+        if section_removal_delete or section_removal_rehome:
             os.write(master, b"\x1b[21~")
             read_for(0.2)
             os.write(master, b"\x1b[C" * 3 + b"\x1b[B" + b"\r")
@@ -662,14 +663,43 @@ def main():
             dialog_start = len(output)
             os.write(master, b"\x1b[3~")
             if not wait_for_screen_fragments(
-                (b"subordinate", b"Promote", b"another", b"subtree", b"recoverably"),
+                (b"Directheadingprose", b"Promote", b"Compile"),
                 dialog_start,
                 timeout=3.0,
             ):
                 raise AssertionError(
-                    "non-fiction section removal did not offer explicit subtree choices; visible tail: "
+                    "non-fiction section removal did not preview direct heading prose; visible tail: "
                     + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
                 )
+            if section_removal_rehome:
+                if not wait_for_screen_fragments(
+                    (b"Prose:keepin", b"PartOne", b"andinCompile"), dialog_start, timeout=3.0
+                ):
+                    raise AssertionError(
+                        "active prose destination was not the visible default; visible tail: "
+                        + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
+                    )
+                os.write(master, b"\r")
+                if not wait_for_screen_fragments(
+                    (b"Outline", b"PartOne", b"Subsection"),
+                    dialog_start,
+                    timeout=3.0,
+                ):
+                    raise AssertionError(
+                        "confirming the default did not return to the updated outline; visible tail: "
+                        + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
+                    )
+                os.write(master, b"\x11")
+                quit_deadline = time.monotonic() + 5.0
+                finished_pid = 0
+                status = 0
+                while finished_pid == 0 and time.monotonic() < quit_deadline:
+                    read_for(0.1)
+                    finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                    raise AssertionError("application did not exit cleanly after prose rehoming")
+                print("PTY non-fiction removal passed: direct heading prose stays active and compiled by default.")
+                return
             os.write(master, b"\x1b[B\x1b[B")  # choose recoverable subtree deletion
             if not wait_for_screen_fragments(
                 (b"Deletethewholesubtree", b"omitted", b"restored"),

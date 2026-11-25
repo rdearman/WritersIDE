@@ -66,6 +66,7 @@ const MIGRATION_48: &str = include_str!("../migrations/0048_structural_removal_o
 const MIGRATION_49: &str = include_str!("../migrations/0049_structural_promotion_recovery.sql");
 const MIGRATION_50: &str =
     include_str!("../migrations/0050_structural_removal_content_placement.sql");
+const MIGRATION_51: &str = include_str!("../migrations/0051_multiple_section_bodies.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -1483,6 +1484,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_48}\nINSERT INTO schema_migrations(version,applied_at) VALUES(48,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_49}\nINSERT INTO schema_migrations(version,applied_at) VALUES(49,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_50}\nINSERT INTO schema_migrations(version,applied_at) VALUES(50,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_51}\nINSERT INTO schema_migrations(version,applied_at) VALUES(51,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1531,7 +1533,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 50 {
+        if version > 51 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1732,6 +1734,10 @@ impl ProjectStore {
         }
         if current_version == 49 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_50}\nINSERT INTO schema_migrations(version,applied_at) VALUES(50,'{}');\nCOMMIT;", now()))?;
+            current_version = 50;
+        }
+        if current_version == 50 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_51}\nINSERT INTO schema_migrations(version,applied_at) VALUES(51,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -4423,6 +4429,20 @@ impl ProjectStore {
         section_id: NodeId,
         destination: Option<NodeId>,
     ) -> Result<Uuid> {
+        self.promote_section_children_to_and_rehome_prose(section_id, destination, None)
+    }
+
+    /// Promote child headings into a selected active section or the root
+    /// outline, optionally moving prose owned directly by the removed heading
+    /// into another active section. All placement records and changes commit
+    /// together so restoration can recover the original hierarchy and prose
+    /// positions or reject the entire restore if either has since moved.
+    pub fn promote_section_children_to_and_rehome_prose(
+        &mut self,
+        section_id: NodeId,
+        destination: Option<NodeId>,
+        prose_destination: Option<NodeId>,
+    ) -> Result<Uuid> {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -4463,6 +4483,30 @@ impl ProjectStore {
                 ));
             }
         }
+        if let Some(prose_destination) = prose_destination {
+            let target_kind: Option<String> = tx
+                .query_row(
+                    "SELECT kind FROM structural_node WHERE id=?1 AND archived=0",
+                    [prose_destination.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if target_kind.as_deref() != Some("section") || prose_destination == section_id {
+                return Err(StorageError::Invalid(
+                    "prose destination must be another active section".into(),
+                ));
+            }
+            let is_descendant: bool = tx.query_row(
+                "WITH RECURSIVE descendants(id) AS (SELECT id FROM structural_node WHERE parent_id=?1 UNION ALL SELECT child.id FROM structural_node child JOIN descendants parent ON child.parent_id=parent.id) SELECT EXISTS(SELECT 1 FROM descendants WHERE id=?2)",
+                params![section_id.to_string(), prose_destination.to_string()],
+                |row| row.get(0),
+            )?;
+            if is_descendant {
+                return Err(StorageError::Invalid(
+                    "prose destination cannot be inside the removed section".into(),
+                ));
+            }
+        }
         let target_parent = destination.map(|node| node.to_string());
         let children: Vec<(String, i64, bool)> = {
             let mut statement = tx.prepare(
@@ -4474,12 +4518,12 @@ impl ProjectStore {
                 })?
                 .collect::<std::result::Result<_, _>>()?
         };
-        let units: Vec<(String, bool)> = {
+        let units: Vec<(String, bool, u32)> = {
             let mut statement =
-                tx.prepare("SELECT id,archived FROM content_unit WHERE parent_node_id=?1")?;
+                tx.prepare("SELECT id,archived,position FROM content_unit WHERE parent_node_id=?1 ORDER BY position,id")?;
             statement
                 .query_map([section_id.to_string()], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })?
                 .collect::<std::result::Result<_, _>>()?
         };
@@ -4515,16 +4559,38 @@ impl ProjectStore {
                 params![child_id, target_parent, applied_position, now()],
             )?;
         }
-        for (unit_id, was_archived) in units {
-            tx.execute(
-                "INSERT INTO structural_removal_content_unit(removal_id,content_unit_id,was_archived) VALUES(?1,?2,?3)",
-                params![removal_id.to_string(), unit_id, was_archived],
-            )?;
-            if !was_archived {
+        let mut prose_position: i64 = if let Some(target) = prose_destination {
+            tx.query_row(
+                "SELECT COALESCE(MAX(position),-1)+1 FROM content_unit WHERE parent_node_id=?1",
+                [target.to_string()],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        };
+        for (unit_id, was_archived, original_position) in units {
+            if !was_archived && let Some(target) = prose_destination {
+                let applied_position = prose_position;
                 tx.execute(
-                    "UPDATE content_unit SET archived=1,updated_at=?2 WHERE id=?1",
-                    params![unit_id, now()],
+                    "INSERT INTO structural_removal_content_unit(removal_id,content_unit_id,was_archived,original_parent_node_id,original_position,applied_parent_node_id,applied_position) VALUES(?1,?2,0,?3,?4,?5,?6)",
+                    params![removal_id.to_string(), unit_id, section_id.to_string(), original_position, target.to_string(), applied_position],
                 )?;
+                tx.execute(
+                    "UPDATE content_unit SET parent_node_id=?2,position=?3,updated_at=?4 WHERE id=?1",
+                    params![unit_id, target.to_string(), applied_position, now()],
+                )?;
+                prose_position += 1;
+            } else {
+                tx.execute(
+                    "INSERT INTO structural_removal_content_unit(removal_id,content_unit_id,was_archived) VALUES(?1,?2,?3)",
+                    params![removal_id.to_string(), unit_id, was_archived],
+                )?;
+                if !was_archived {
+                    tx.execute(
+                        "UPDATE content_unit SET archived=1,updated_at=?2 WHERE id=?1",
+                        params![unit_id, now()],
+                    )?;
+                }
             }
         }
         // The heading retains its original slot in Removed Documents. The
@@ -11395,7 +11461,7 @@ mod tests {
         let project = directory.path().join("Book");
         let store = ProjectStore::create(&project, "Book").unwrap();
         store.conn.execute_batch(
-            "DROP INDEX content_unit_one_section_body_per_node; CREATE UNIQUE INDEX content_unit_one_body_per_node ON content_unit(parent_node_id,kind) WHERE kind IN('section_body','chapter_body'); DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
+            "DROP INDEX IF EXISTS content_unit_one_section_body_per_node; CREATE UNIQUE INDEX content_unit_one_body_per_node ON content_unit(parent_node_id,kind) WHERE kind IN('section_body','chapter_body'); DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
        ).unwrap();
         drop(store);
 
@@ -11421,7 +11487,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, 51);
     }
     #[test]
     fn event_character_and_location_relationships_are_typed_atomic_and_persistent() {
@@ -11480,7 +11546,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 50);
+        assert_eq!(schema_version, 51);
     }
     #[test]
     fn writing_challenges_are_validated_persisted_and_completed_once() {
@@ -13334,7 +13400,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 50))
+            .map(|version| assert_eq!(version, 51))
             .unwrap();
     }
 
@@ -13755,7 +13821,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, 51);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -15587,6 +15653,185 @@ mod tests {
             "This prose stays recoverable."
         );
         reopened.validate().unwrap();
+
+        let later_target = reopened
+            .create_node(None, NodeKind::Section, "Later destination", 1)
+            .unwrap();
+        let conflicted_removal = reopened
+            .promote_section_children_to_and_rehome_prose(removed, Some(parent), Some(parent))
+            .unwrap();
+        reopened
+            .conn
+            .execute(
+                "UPDATE content_unit SET parent_node_id=?2,position=0 WHERE id=?1",
+                params![prose.to_string(), later_target.to_string()],
+            )
+            .unwrap();
+        assert!(
+            reopened
+                .restore_structural_subtree(conflicted_removal)
+                .is_err()
+        );
+        assert_eq!(
+            reopened.get_content_unit(prose).unwrap().parent_id,
+            Some(later_target)
+        );
+        assert!(reopened.validate().is_ok());
+    }
+
+    #[test]
+    fn section_promotion_rehomes_owned_prose_and_restores_identity_and_order() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let parent = store
+            .create_node(None, NodeKind::Section, "Part One", 0)
+            .unwrap();
+        let removed = store
+            .create_node(Some(parent), NodeKind::Section, "Old Heading", 0)
+            .unwrap();
+        let child = store
+            .create_node(Some(removed), NodeKind::Section, "Subsection", 0)
+            .unwrap();
+        let existing = store
+            .create_content_unit(
+                ContentUnitKind::SectionBody,
+                "Existing prose",
+                Some(parent),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, existing_hash) = store.load_content_unit_text(existing).unwrap();
+        store
+            .save_content_unit_text(existing, Some(&existing_hash), "First in order.")
+            .unwrap();
+        let prose = store
+            .create_content_unit(
+                ContentUnitKind::SectionBody,
+                "Old Heading prose",
+                Some(removed),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, prose_hash) = store.load_content_unit_text(prose).unwrap();
+        store
+            .save_content_unit_text(prose, Some(&prose_hash), "Kept in the active manuscript.")
+            .unwrap();
+        let original_hash = store.get_content_unit(prose).unwrap().content_hash;
+
+        let removal = store
+            .promote_section_children_to_and_rehome_prose(removed, Some(parent), Some(parent))
+            .unwrap();
+        let active_units = store.list_content_units(false).unwrap();
+        let target_units = active_units
+            .iter()
+            .filter(|unit| unit.parent_id == Some(parent))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            target_units.iter().map(|unit| unit.id).collect::<Vec<_>>(),
+            vec![existing, prose]
+        );
+        assert_eq!(target_units[1].position, 1);
+        assert_eq!(
+            store.get_content_unit(prose).unwrap().content_hash,
+            original_hash
+        );
+        assert_eq!(
+            store.load_content_unit_text(prose).unwrap().0,
+            "Kept in the active manuscript."
+        );
+        assert_eq!(
+            store
+                .list_structural_nodes()
+                .unwrap()
+                .into_iter()
+                .find(|node| node.id == child)
+                .unwrap()
+                .parent_id,
+            Some(parent)
+        );
+        drop(store);
+
+        let mut reopened = ProjectStore::open(&project).unwrap();
+        reopened.restore_structural_subtree(removal).unwrap();
+        let original_units = reopened.list_content_units(false).unwrap();
+        let restored = original_units.iter().find(|unit| unit.id == prose).unwrap();
+        assert_eq!(restored.parent_id, Some(removed));
+        assert_eq!(restored.position, 0);
+        assert_eq!(restored.content_hash, original_hash);
+        assert_eq!(
+            reopened.load_content_unit_text(prose).unwrap().0,
+            "Kept in the active manuscript."
+        );
+        assert_eq!(
+            reopened
+                .list_structural_nodes()
+                .unwrap()
+                .into_iter()
+                .find(|node| node.id == child)
+                .unwrap()
+                .parent_id,
+            Some(removed)
+        );
+        reopened.validate().unwrap();
+    }
+
+    #[test]
+    fn schema_fifty_one_removes_single_section_body_limit_without_data_loss() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut store = ProjectStore::create(&project, "Novel").unwrap();
+        let parent = store
+            .create_node(None, NodeKind::Section, "Part", 0)
+            .unwrap();
+        let first = store
+            .create_content_unit(ContentUnitKind::SectionBody, "First", Some(parent), 0, None)
+            .unwrap();
+        let (_, first_hash) = store.load_content_unit_text(first).unwrap();
+        store
+            .save_content_unit_text(first, Some(&first_hash), "First body")
+            .unwrap();
+        drop(store);
+
+        let connection = Connection::open(project.join("story.db")).unwrap();
+        connection
+            .execute_batch(
+                "CREATE UNIQUE INDEX content_unit_one_section_body_per_node ON content_unit(parent_node_id) WHERE kind='section_body'; DELETE FROM schema_migrations WHERE version=51;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let mut migrated = ProjectStore::open(&project).unwrap();
+        let second = migrated
+            .create_content_unit(
+                ContentUnitKind::SectionBody,
+                "Second",
+                Some(parent),
+                1,
+                None,
+            )
+            .unwrap();
+        let (_, second_hash) = migrated.load_content_unit_text(second).unwrap();
+        migrated
+            .save_content_unit_text(second, Some(&second_hash), "Second body")
+            .unwrap();
+        assert_eq!(
+            migrated.load_content_unit_text(first).unwrap().0,
+            "First body"
+        );
+        assert_eq!(
+            migrated.load_content_unit_text(second).unwrap().0,
+            "Second body"
+        );
+        let version: i64 = migrated
+            .conn
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 51);
     }
 
     #[test]
@@ -15923,7 +16168,7 @@ mod tests {
     }
 
     #[test]
-    fn chapter_prose_rehome_does_not_allow_duplicate_section_body_documents() {
+    fn section_can_receive_multiple_prose_documents_after_rehome_migration() {
         let directory = tempdir().unwrap();
         let mut store = ProjectStore::create(directory.path().join("Book"), "Book").unwrap();
         let section = store
@@ -15938,17 +16183,16 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert!(
-            store
-                .create_content_unit(
-                    ContentUnitKind::SectionBody,
-                    "Second part introduction",
-                    Some(section),
-                    1,
-                    None,
-                )
-                .is_err()
-        );
+        let second = store
+            .create_content_unit(
+                ContentUnitKind::SectionBody,
+                "Second part introduction",
+                Some(section),
+                1,
+                None,
+            )
+            .unwrap();
+        assert_eq!(store.get_content_unit(second).unwrap().position, 1);
     }
 
     #[test]
@@ -16040,7 +16284,7 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP INDEX content_unit_one_section_body_per_node; CREATE UNIQUE INDEX content_unit_one_body_per_node ON content_unit(parent_node_id,kind) WHERE kind IN('section_body','chapter_body'); DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>=44;",
+                "DROP INDEX IF EXISTS content_unit_one_section_body_per_node; CREATE UNIQUE INDEX content_unit_one_body_per_node ON content_unit(parent_node_id,kind) WHERE kind IN('section_body','chapter_body'); DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>=44;",
             )
             .unwrap();
         drop(connection);
@@ -16056,6 +16300,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 50);
+        assert_eq!(version, 51);
     }
 }
