@@ -58,6 +58,49 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn view_menu_switches_between_unified_outline_presentations_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Outline View PTY");
+    let mut app = WriterApp::create_project(&project, "Outline View PTY").unwrap();
+    let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "The harbour was quiet at dawn.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY unified-outline workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("outline-view")
+        .output()
+        .expect("run the unified-outline Linux PTY workflow");
+    assert!(
+        result.status.success(),
+        "unified-outline PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "The harbour was quiet at dawn."
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn removed_scenes_empty_state_returns_to_cards_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

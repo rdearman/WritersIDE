@@ -105,7 +105,7 @@ impl Workspace {
         match self {
             Self::Dashboard => "Dashboard",
             Self::Outline => "Outline",
-            Self::Cards => "Scene Cards",
+            Self::Cards => "Outline · Scene Cards",
             Self::Editor => "Manuscript Editor",
             Self::PlotGrid => "Plot Grid",
             Self::Characters => "Characters",
@@ -126,7 +126,16 @@ impl Workspace {
 const PRIMARY_DESTINATIONS: [Workspace; 3] =
     [Workspace::Editor, Workspace::Outline, Workspace::Reading];
 
+fn is_manuscript_outliner(workspace: Workspace) -> bool {
+    matches!(workspace, Workspace::Outline | Workspace::Cards)
+}
+
 fn next_primary_destination(current: Workspace, forward: bool) -> Workspace {
+    let current = if current == Workspace::Cards {
+        Workspace::Outline
+    } else {
+        current
+    };
     let Some(index) = PRIMARY_DESTINATIONS
         .iter()
         .position(|destination| *destination == current)
@@ -183,8 +192,9 @@ struct SceneRemovalDialog {
     restoring: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct RemovedScenesReturn {
+    workspace: Workspace,
     scene: Option<SceneId>,
     chapter: Option<(story_core::NodeId, bool)>,
 }
@@ -779,7 +789,7 @@ fn tutorial_panel_at(
             ),
             (
                 "Your sample book",
-                "This separate sample book is disposable. Open Scene Cards; the sample scene is selected there.",
+                "This separate sample book is disposable. Switch the Outline to Scene Cards; it is the same manuscript structure in a visual presentation.",
             ),
             (
                 "Write and save",
@@ -872,7 +882,7 @@ fn tutorial_required_actions(
     track: onboarding::TutorialTrack,
     step: usize,
 ) -> &'static [(&'static str, &'static str)] {
-    const CARDS: [(&str, &str); 1] = [("cards", "Open Scene Cards from Navigate")];
+    const CARDS: [(&str, &str); 1] = [("cards", "Show Scene Cards from View")];
     const WRITE_SAVE: [(&str, &str); 2] = [
         ("write", "Type a few words in the sample scene"),
         ("save", "Save the sample scene from File > Save"),
@@ -1034,12 +1044,12 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
     &[
         "view.editor",
         "view.outline",
-        "view.cards",
         "view.reading",
         "scene.open",
         "search.return-position",
     ],
     &[
+        "view.cards",
         "window.switch-view",
         "view.formatting-marks",
         "view.rendered-markdown",
@@ -1120,13 +1130,14 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
 const SCENE_MENU_INDEX: usize = 9;
 
 fn menu_category_available(state: &AppState, index: usize) -> bool {
-    let fiction_cards = state.workspace == Workspace::Cards
+    let fiction_outliner = is_manuscript_outliner(state.workspace)
         && state
             .app
             .get_project()
             .is_ok_and(|project| project.book_type == story_core::BookType::Fiction);
-    if fiction_cards {
-        index != 6 // Publishing is available from the manuscript and command search.
+    if fiction_outliner {
+        !(state.workspace == Workspace::Cards && index == 6)
+        // The compact card presentation leaves Publish to the command search.
     } else {
         index != SCENE_MENU_INDEX
     }
@@ -1726,11 +1737,13 @@ fn command_registry() -> Vec<CommandSpec> {
             label: match workspace {
                 Workspace::Editor => "Manuscript",
                 Workspace::Reading => "Reference",
+                Workspace::Cards => "Outline — Scene Cards",
                 _ => workspace.title(),
             },
             description: match workspace {
                 Workspace::Editor => "Write and revise manuscript text",
                 Workspace::Outline => "View and organise chapters and scenes",
+                Workspace::Cards => "Show the same manuscript outline as ordered scene cards",
                 Workspace::Reading => "Browse imported reference materials",
                 _ => "Open an advanced workspace",
             },
@@ -2161,7 +2174,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_aliases: &["exclude scene", "include scene", "include/exclude scene"],
             palette_prefix: None,
             takes_arguments: false,
-            task_group: "Scene Cards",
+            task_group: "Outline",
             menu_priority: 8,
             advanced: false,
             action: CommandAction::ToggleSceneInclusion,
@@ -2991,7 +3004,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::MoveSceneEarlier,
-            task_group: "Scene Cards",
+            task_group: "Outline",
             menu_priority: 2,
             advanced: false,
         },
@@ -3006,7 +3019,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::MoveSceneLater,
-            task_group: "Scene Cards",
+            task_group: "Outline",
             menu_priority: 3,
             advanced: false,
         },
@@ -3021,7 +3034,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::ArchiveSelectedScene,
-            task_group: "Scene Cards",
+            task_group: "Outline",
             menu_priority: 4,
             advanced: false,
         },
@@ -3036,7 +3049,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::ShowRemovedScenes,
-            task_group: "Scene Cards",
+            task_group: "Outline",
             menu_priority: 5,
             advanced: false,
         },
@@ -3051,7 +3064,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             action: CommandAction::RestoreSelectedScene,
-            task_group: "Scene Cards",
+            task_group: "Outline",
             menu_priority: 6,
             advanced: false,
         },
@@ -5110,7 +5123,8 @@ fn subsequence_matches(
 
 fn menu_category(spec: &CommandSpec) -> &'static str {
     let id = spec.id;
-    if matches!(id, "view.formatting-marks" | "view.rendered-markdown")
+    if id == "view.cards"
+        || matches!(id, "view.formatting-marks" | "view.rendered-markdown")
         || id.starts_with("view.reference-")
         || matches!(
             id,
@@ -8683,18 +8697,17 @@ impl AppState {
         Ok(chapter)
     }
     fn toggle_scene_card_inclusion(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        if self.workspace != Workspace::Cards {
-            return Err("open Scene Cards to move a scene between Included and Excluded".into());
+        if !is_manuscript_outliner(self.workspace) {
+            return Err("open the manuscript Outline to change scene inclusion".into());
         }
         if self.removed_scenes_list {
             self.message = "Restore the scene before changing whether it is included".into();
             return Ok(());
         }
-        let scene = selected_scene_for_workspace(self).ok_or("select a scene card first")?;
+        let scene = selected_scene_for_workspace(self).ok_or("select a scene first")?;
         let included = self.app.scene_is_included(scene)?;
         self.app.set_scene_included(scene, !included)?;
-        let order = scene_card_ids(self);
-        self.selected = order.iter().position(|id| *id == scene).unwrap_or(0);
+        self.select_scene_in_current_outliner(scene);
         let title = self.app.get_scene(scene)?.scene.title;
         self.message = if included {
             format!("Moved “{title}” to Excluded · its text and metadata are retained")
@@ -8705,12 +8718,25 @@ impl AppState {
         };
         Ok(())
     }
+    fn select_scene_in_current_outliner(&mut self, scene: SceneId) {
+        self.selected = if self.workspace == Workspace::Outline {
+            outline_rows(self)
+                .iter()
+                .position(|row| *row == OutlineRow::Scene(scene))
+                .unwrap_or(self.selected)
+        } else {
+            scene_card_ids(self)
+                .iter()
+                .position(|candidate| *candidate == scene)
+                .unwrap_or(0)
+        };
+    }
     fn move_scene_card(&mut self, direction: isize) -> Result<(), Box<dyn std::error::Error>> {
         if self.removed_scenes_list {
             self.message = "Restore the scene before changing its manuscript position".into();
             return Ok(());
         }
-        let scene = selected_scene_for_workspace(self).ok_or("select a scene card first")?;
+        let scene = selected_scene_for_workspace(self).ok_or("select a scene first")?;
         let record = self.app.get_scene(scene)?;
         let included = self.app.scene_is_included(scene)?;
         let candidates = self
@@ -8761,10 +8787,7 @@ impl AppState {
                 );
             }
             self.refresh()?;
-            self.selected = scene_card_ids(self)
-                .iter()
-                .position(|id| *id == scene)
-                .unwrap_or(0);
+            self.select_scene_in_current_outliner(scene);
             return Ok(());
         };
         let same_chapter = candidates
@@ -8842,10 +8865,7 @@ impl AppState {
             self.app.unplace_scene(scene, unplaced_count as u32)?;
         }
         self.refresh()?;
-        self.selected = scene_card_ids(self)
-            .iter()
-            .position(|id| *id == scene)
-            .unwrap_or(0);
+        self.select_scene_in_current_outliner(scene);
         self.message = format!(
             "Moved scene to position {} in {} · selection kept with this scene",
             position + 1,
@@ -8867,9 +8887,18 @@ impl AppState {
             return Ok(());
         }
         let selected_scene = selected_scene_for_workspace(self);
+        let selected_outline_chapter = if self.workspace == Workspace::Outline {
+            match outline_rows(self).get(self.selected) {
+                Some(OutlineRow::Chapter { id, .. }) => Some(*id),
+                _ => None,
+            }
+        } else {
+            None
+        };
         let chapter = self
             .selected_card_chapter
             .map(|(chapter, _)| chapter)
+            .or(selected_outline_chapter)
             .or_else(|| selected_scene.and_then(|scene| self.app.get_scene(scene).ok()?.chapter_id))
             .ok_or("select a chapter header or a placed scene to move its chapter block")?;
         let nodes = self.app.list_structural_nodes()?;
@@ -8900,12 +8929,14 @@ impl AppState {
             .move_structural_node(chapter, parent, target as u32)?;
         self.refresh()?;
         if let Some(scene) = selected_scene {
-            self.selected = scene_card_ids(self)
-                .iter()
-                .position(|id| *id == scene)
-                .unwrap_or(0);
-        } else {
+            self.select_scene_in_current_outliner(scene);
+        } else if self.workspace == Workspace::Cards {
             self.selected_card_chapter = Some((chapter, true));
+        } else {
+            self.selected = outline_rows(self)
+                .iter()
+                .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+                .unwrap_or(self.selected);
         }
         self.message = format!(
             "Moved chapter “{}” as a block · scene order and identity preserved",
@@ -11814,7 +11845,7 @@ impl AppState {
         let scene = self
             .editing_scene
             .or(self.active_scene())
-            .ok_or("select or open a scene before following its scene card")?;
+            .ok_or("select or open a scene in the Outline first")?;
         let row = self.app.get_scene(scene)?;
         self.open_reference_buffer(
             format!("scene-card:{scene}"),
@@ -12271,9 +12302,18 @@ impl AppState {
     fn toggle_removed_scenes(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let entering_removed = !self.removed_scenes_list;
         if entering_removed {
+            let selected_outline_chapter = if self.workspace == Workspace::Outline {
+                match outline_rows(self).get(self.selected) {
+                    Some(OutlineRow::Chapter { id, .. }) => Some((*id, true)),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             self.removed_scenes_return = Some(RemovedScenesReturn {
+                workspace: self.workspace,
                 scene: selected_scene_for_workspace(self),
-                chapter: self.selected_card_chapter,
+                chapter: self.selected_card_chapter.or(selected_outline_chapter),
             });
         }
         if self.workspace != Workspace::Cards {
@@ -12284,28 +12324,42 @@ impl AppState {
         self.selected = 0;
         self.refresh()?;
         if !entering_removed && let Some(previous) = self.removed_scenes_return.take() {
-            self.selected_card_chapter = previous.chapter.filter(|(id, _)| {
+            self.workspace = previous.workspace;
+            let previous_chapter = previous.chapter.filter(|(id, _)| {
                 self.app
                     .list_structural_nodes()
                     .is_ok_and(|nodes| nodes.iter().any(|node| node.id == *id))
             });
-            if let Some(scene) = previous.scene {
-                self.selected = scene_card_ids(self)
+            if self.workspace == Workspace::Cards {
+                self.selected_card_chapter = previous_chapter;
+            } else if let Some((chapter, _)) = previous_chapter {
+                self.selected = outline_rows(self)
                     .iter()
-                    .position(|candidate| *candidate == scene)
-                    .unwrap_or(0);
+                    .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+                    .unwrap_or(self.selected);
+            }
+            if let Some(scene) = previous.scene {
+                self.selected_card_chapter = None;
+                if self.workspace == Workspace::Outline {
+                    self.select_scene_in_current_outliner(scene);
+                } else {
+                    self.selected = scene_card_ids(self)
+                        .iter()
+                        .position(|candidate| *candidate == scene)
+                        .unwrap_or(0);
+                }
             }
         }
         self.message = if entering_removed {
             "Removed Scenes · select a scene and choose Restore Selected Scene".into()
         } else {
-            "Returned to Scene Cards · previous selection restored where available".into()
+            "Returned to Outline · previous selection restored where available".into()
         };
         Ok(())
     }
     fn begin_scene_removal(&mut self, restoring: bool) -> Result<(), Box<dyn std::error::Error>> {
         if !matches!(self.workspace, Workspace::Cards | Workspace::Outline) {
-            self.message = "Open the Outline or Scene Cards and select a scene first".into();
+            self.message = "Open the manuscript Outline and select a scene first".into();
             return Ok(());
         }
         if restoring != self.removed_scenes_list {
@@ -12320,7 +12374,7 @@ impl AppState {
             self.message = if restoring {
                 "There are no removed scenes to restore".into()
             } else {
-                "Select a scene card to remove".into()
+                "Select a scene to remove".into()
             };
             return Ok(());
         };
@@ -13594,16 +13648,41 @@ impl AppState {
     fn switch(&mut self, w: Workspace) {
         if self.workspace != w {
             let previous = self.workspace;
-            let current_scene = self.editing_scene.or_else(|| self.active_scene());
-            if self.history_index + 1 < self.history.len() {
-                self.history.truncate(self.history_index + 1);
+            let outline_selection = (previous == Workspace::Outline)
+                .then(|| outline_rows(self).get(self.selected).cloned())
+                .flatten();
+            let card_chapter = self.selected_card_chapter;
+            let selected_container = matches!(
+                &outline_selection,
+                Some(
+                    OutlineRow::Section { .. }
+                        | OutlineRow::Chapter { .. }
+                        | OutlineRow::ContentUnit(_)
+                )
+            ) || card_chapter.is_some();
+            let current_scene = selected_scene_for_workspace(self).or_else(|| {
+                (!selected_container)
+                    .then(|| self.editing_scene.or_else(|| self.active_scene()))
+                    .flatten()
+            });
+            if !(is_manuscript_outliner(previous) && is_manuscript_outliner(w)) {
+                if self.history_index + 1 < self.history.len() {
+                    self.history.truncate(self.history_index + 1);
+                }
+                self.history.push(self.workspace);
+                self.history_index = self.history.len() - 1;
             }
-            self.history.push(self.workspace);
-            self.history_index = self.history.len() - 1;
             if w == Workspace::Cards {
-                self.selected = current_scene
-                    .and_then(|scene| scene_card_ids(self).iter().position(|id| *id == scene))
-                    .unwrap_or(0);
+                if let Some(scene) = current_scene {
+                    self.selected = scene_card_ids(self)
+                        .iter()
+                        .position(|id| *id == scene)
+                        .unwrap_or(0);
+                    self.selected_card_chapter = None;
+                } else if let Some(OutlineRow::Chapter { id, .. }) = outline_selection {
+                    self.selected_card_chapter = Some((id, true));
+                    self.selected = 0;
+                }
             } else if w == Workspace::Outline {
                 let rows = outline_rows(self);
                 if let Some(scene) = current_scene {
@@ -13615,6 +13694,13 @@ impl AppState {
                     self.selected = rows
                         .iter()
                         .position(|row| *row == OutlineRow::ContentUnit(content_unit))
+                        .unwrap_or(self.selected.min(rows.len().saturating_sub(1)));
+                } else if let Some((chapter, _)) = card_chapter {
+                    self.selected = rows
+                        .iter()
+                        .position(
+                            |row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter),
+                        )
                         .unwrap_or(self.selected.min(rows.len().saturating_sub(1)));
                 } else {
                     self.selected = self.selected.min(rows.len().saturating_sub(1));
@@ -14226,9 +14312,6 @@ impl AppState {
             self.message = "Scene actions are available in fiction projects".into();
             return;
         }
-        if top == SCENE_MENU_INDEX && self.workspace != Workspace::Cards {
-            self.switch(Workspace::Cards);
-        }
         self.menu = Some(MenuState { top, selected: 0 });
         self.message = format!(
             "{} menu · ↑/↓ choose · Enter runs · Left/Right changes menu · Esc closes",
@@ -14249,7 +14332,7 @@ impl AppState {
                 .map(|mut spec| {
                     match spec.id {
                         "scene.removed-list" if self.removed_scenes_list => {
-                            spec.label = "Return to Scene Cards";
+                            spec.label = "Return to Outline";
                         }
                         "scene.open" => {
                             spec.label = "Write Selected Scene";
@@ -14350,6 +14433,15 @@ impl AppState {
                 "window.swap-sides" => editor && has_references,
                 _ => true,
             });
+        }
+        for command in &mut direct {
+            if command.id == "view.cards" {
+                command.label = if self.workspace == Workspace::Cards {
+                    "Show Outline Tree"
+                } else {
+                    "Show Scene Cards"
+                };
+            }
         }
         if top != "Tools"
             && top != "Help"
@@ -14500,12 +14592,12 @@ impl AppState {
             return Some("Open the Reference Library first");
         }
         if spec.id == "scene.remove" {
-            return if self.workspace != Workspace::Cards {
-                Some("Open Scene Cards first")
+            return if !is_manuscript_outliner(self.workspace) {
+                Some("Open the manuscript Outline first")
             } else if self.removed_scenes_list {
                 Some("Select a scene in Included or Excluded first")
             } else if selected_scene_for_workspace(self).is_none() {
-                Some("Select a scene card first")
+                Some("Select a scene in the manuscript Outline first")
             } else {
                 None
             };
@@ -14635,10 +14727,10 @@ impl AppState {
                 Some("Select a chapter or section with a sibling below")
             }
             CommandAction::MoveSceneEarlier | CommandAction::MoveSceneLater
-                if self.workspace != Workspace::Cards
+                if !is_manuscript_outliner(self.workspace)
                     || selected_scene_for_workspace(self).is_none() =>
             {
-                Some("Select a scene card first")
+                Some("Select a scene first")
             }
             CommandAction::ResolveSaveConflict if !self.dirty => {
                 Some("There are no unsaved manuscript changes to resolve")
@@ -15223,7 +15315,7 @@ impl AppState {
             return self.start_scene_move();
         }
         if command_id == "scene.open" && arguments.is_none() {
-            let scene = selected_scene_for_workspace(self).ok_or("select a scene card first")?;
+            let scene = selected_scene_for_workspace(self).ok_or("select a scene first")?;
             return self.open_scene(scene);
         }
         if command_id == "scene.rename" && arguments.is_none() {
@@ -15290,7 +15382,7 @@ impl AppState {
 
     fn start_scene_move(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let Some(scene) = selected_scene_for_workspace(self) else {
-            self.message = "Select a scene card before choosing Move Scene".into();
+            self.message = "Select a scene in the Outline before choosing Move Scene".into();
             return Ok(());
         };
         let chapters = self
@@ -15322,7 +15414,7 @@ impl AppState {
 
     fn start_scene_rename(&mut self) {
         if selected_scene_for_workspace(self).is_none() {
-            self.message = "Select a scene card before renaming it".into();
+            self.message = "Select a scene in the Outline before renaming it".into();
             return;
         }
         self.mode = Some('R');
@@ -15332,7 +15424,7 @@ impl AppState {
 
     fn start_scene_synopsis(&mut self) {
         if selected_scene_for_workspace(self).is_none() {
-            self.message = "Select a scene card before editing its synopsis".into();
+            self.message = "Select a scene in the Outline before editing its synopsis".into();
             return;
         }
         self.mode = Some('Y');
@@ -15497,7 +15589,15 @@ impl AppState {
         arguments: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match action {
-            CommandAction::Workspace(workspace) => self.switch_view_in_focused_window(workspace)?,
+            CommandAction::Workspace(workspace) => {
+                let workspace =
+                    if workspace == Workspace::Cards && self.workspace == Workspace::Cards {
+                        Workspace::Outline
+                    } else {
+                        workspace
+                    };
+                self.switch_view_in_focused_window(workspace)?;
+            }
             CommandAction::OpenMainMenu => self.toggle_menu(),
             CommandAction::OpenCommandPalette => self.open_command_palette(false),
             CommandAction::OpenViewChooser => self.open_command_palette(true),
@@ -15876,7 +15976,20 @@ impl AppState {
                 self.message = "Scene not created · enter a title or press Esc to cancel".into();
                 return Ok(());
             }
-            let selected_chapter = self.selected_card_chapter.map(|(chapter, _)| chapter);
+            let selected_chapter = self
+                .selected_card_chapter
+                .map(|(chapter, _)| chapter)
+                .or_else(
+                    || match (self.workspace, outline_rows(self).get(self.selected)) {
+                        (Workspace::Outline, Some(OutlineRow::Chapter { id, .. })) => Some(*id),
+                        _ => None,
+                    },
+                )
+                .or_else(|| {
+                    selected_scene_for_workspace(self)
+                        .and_then(|scene| self.app.get_scene(scene).ok()?.chapter_id)
+                });
+            let return_workspace = self.workspace;
             let created = if let Some(chapter) = selected_chapter {
                 let position = self
                     .app
@@ -15895,11 +16008,12 @@ impl AppState {
                 Ok(scene) => {
                     self.selected_card_chapter = None;
                     self.refresh()?;
-                    self.workspace = Workspace::Cards;
-                    self.selected = scene_card_ids(self)
-                        .iter()
-                        .position(|id| *id == scene)
-                        .unwrap_or(0);
+                    self.workspace = if return_workspace == Workspace::Outline {
+                        Workspace::Outline
+                    } else {
+                        Workspace::Cards
+                    };
+                    self.select_scene_in_current_outliner(scene);
                     self.message = if let Some(chapter) = selected_chapter {
                         let chapter_title = self
                             .app
@@ -15919,7 +16033,7 @@ impl AppState {
         }
         if matches!(mode, Some('R' | 'Y')) {
             let Some(scene_id) = selected_scene_for_workspace(self) else {
-                self.message = "Select a scene card first · no scene was changed".into();
+                self.message = "Select a scene in the Outline first · no scene was changed".into();
                 return Ok(());
             };
             if mode == Some('R') && cmd.trim().is_empty() {
@@ -15936,10 +16050,7 @@ impl AppState {
                 }
                 self.app.update_scene_metadata(&scene)?;
                 self.refresh()?;
-                self.selected = scene_card_ids(self)
-                    .iter()
-                    .position(|id| *id == scene_id)
-                    .unwrap_or(0);
+                self.select_scene_in_current_outliner(scene_id);
                 self.message = if mode == Some('R') {
                     format!("Renamed scene to “{cmd}”")
                 } else {
@@ -24060,7 +24171,7 @@ fn workspace_action_hint(state: &AppState) -> String {
     match state.workspace {
         Workspace::Cards => {
             if state.removed_scenes_list {
-                "Removed Scenes · ↑/↓ select · Scene > Restore Selected Scene · Esc returns to Scene Cards".into()
+                "Removed Scenes · ↑/↓ select · Scene > Restore Selected Scene · Esc returns to Outline".into()
             } else {
                 format!(
                     "{}: Include/Exclude · ↑↓ select · ←→ move/place · ⇧↑↓ chapter · ⇧←→ move chapter · ⇧Ins new chapter · Tab columns · Scene > Move Scene to Removed",
@@ -24069,7 +24180,14 @@ fn workspace_action_hint(state: &AppState) -> String {
             }
         }
         Workspace::Outline if state.removed_content_units_list => "Removed Prose Documents · ↑/↓ select · Edit > Restore Selected Prose Document · Edit > Show Removed Prose Documents returns".into(),
-        Workspace::Outline => "↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude · Insert creates content · Edit > Remove/Move".into(),
+        Workspace::Outline => {
+            let inclusion = effective_shortcut_label(state, "scene.toggle-inclusion", "Space");
+            if inclusion == "Space" {
+                "↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude · Insert creates content · Edit > Remove/Move".into()
+            } else {
+                format!("↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude · {inclusion}: Include/Exclude · Insert creates content · Edit > Remove/Move")
+            }
+        }
         Workspace::Editor => "Esc: Outline".into(),
         _ => "Tab: next primary view · Shift+Tab: previous".into(),
     }
@@ -24278,7 +24396,7 @@ fn draw_scene_card_collection(
         });
     let items = if rows.is_empty() {
         let empty_state = if title.starts_with("Removed Scenes") {
-            "No removed scenes · Esc or Scene > Return to Scene Cards"
+            "No removed scenes · Esc or Scene > Return to Outline"
         } else {
             "No scenes yet · Insert > New Scene"
         };
@@ -24432,7 +24550,7 @@ fn tutorial_expected_action_hint(state: &AppState) -> String {
         ),
         Some("return") => "Press Esc to return to Outline".into(),
         Some("resume") => "Choose Help > Resume Tutorial".into(),
-        Some("cards") => "Open Navigate > Scene Cards".into(),
+        Some("cards") => "Choose View > Show Scene Cards".into(),
         Some("reference-open") => "Open View > Open Outline Reference".into(),
         Some("reference-focus") => "Press Ctrl+Tab to focus the reference pane".into(),
         Some("search") => "Search for a word in the sample manuscript".into(),
@@ -33704,6 +33822,12 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     s.toggle_outline_node(id)?;
                 }
                 Some(OutlineRow::Scene(id)) => {
+                    if effective_shortcut_label(s, "scene.toggle-inclusion", "Space") != "Space" {
+                        let shortcut =
+                            effective_shortcut_label(s, "scene.toggle-inclusion", "Space");
+                        s.message = format!("Use {shortcut} to change scene inclusion");
+                        return Ok(false);
+                    }
                     let included = s.app.scene_is_included(id)?;
                     s.app.set_scene_included(id, !included)?;
                     s.refresh()?;
@@ -33872,19 +33996,22 @@ mod tests {
         state.workspace = Workspace::Outline;
 
         let regular_menus = visible_menu_category_indices(&state);
-        assert!(!regular_menus.contains(&SCENE_MENU_INDEX));
+        assert!(
+            regular_menus.contains(&SCENE_MENU_INDEX),
+            "Scene actions are available in the unified outline"
+        );
         assert!(
             regular_menus.contains(&6),
             "Publish remains in manuscript workspaces"
         );
 
         state.open_menu_category(SCENE_MENU_INDEX);
-        assert_eq!(state.workspace, Workspace::Cards);
-        let card_menus = visible_menu_category_indices(&state);
-        assert!(card_menus.contains(&SCENE_MENU_INDEX));
+        assert_eq!(state.workspace, Workspace::Outline);
+        let outline_menus = visible_menu_category_indices(&state);
+        assert!(outline_menus.contains(&SCENE_MENU_INDEX));
         assert!(
-            !card_menus.contains(&6),
-            "Publish is contextual to manuscript workspaces"
+            outline_menus.contains(&6),
+            "Publish remains available from the hierarchical outline"
         );
         let bar = menu_bar_line(&state, 80)
             .spans
@@ -33892,11 +34019,10 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(bar.contains("Scene"), "{bar}");
-        assert!(!bar.contains("Publish"), "{bar}");
 
-        state.selected = scene_card_ids(&state)
+        state.selected = outline_rows(&state)
             .iter()
-            .position(|id| *id == second)
+            .position(|row| *row == OutlineRow::Scene(second))
             .unwrap();
         let entries = state.menu_visible_entries();
         for label in [
@@ -33920,7 +34046,13 @@ mod tests {
             .copied()
             .unwrap();
         assert!(menu_command_row(&state, inclusion, 48).contains("Space"));
-        assert!(workspace_action_hint(&state).contains("Space: Include/Exclude"));
+        assert!(
+            workspace_action_hint(&state)
+                .to_lowercase()
+                .contains("space expand/collapse or include/exclude"),
+            "{}",
+            workspace_action_hint(&state)
+        );
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|frame| draw(frame, &mut state)).unwrap();
@@ -33994,6 +34126,38 @@ mod tests {
         )
         .unwrap();
         assert!(state.app.scene_is_included(second).unwrap());
+
+        state.open_menu_category(SCENE_MENU_INDEX);
+        let entries = state.menu_visible_entries();
+        state.menu.as_mut().unwrap().selected = entries
+            .iter()
+            .position(|entry| entry.id == "scene.create")
+            .unwrap();
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.mode, Some('N'));
+        state.prompt = "A new arrival".into();
+        state.command().unwrap();
+        assert_eq!(state.workspace, Workspace::Outline);
+        let created = state
+            .app
+            .list_scenes(false)
+            .unwrap()
+            .into_iter()
+            .find(|scene| scene.scene.title == "A new arrival")
+            .unwrap();
+        assert_eq!(created.chapter_id, Some(chapter));
+        assert_eq!(selected_scene_for_workspace(&state), Some(created.scene.id));
+        state
+            .dispatch_registered_command_id("scene.removed-list")
+            .unwrap();
+        assert!(state.removed_scenes_list);
+        state
+            .dispatch_registered_command_id("scene.removed-list")
+            .unwrap();
+        assert_eq!(state.workspace, Workspace::Outline);
+        assert_eq!(selected_scene_for_workspace(&state), Some(created.scene.id));
     }
 
     #[test]
@@ -36805,6 +36969,63 @@ mod tests {
         );
         assert!(workspace_action_hint(&state).contains("←→ move"));
         assert!(workspace_action_hint(&state).contains("Tab columns"));
+    }
+
+    #[test]
+    fn outline_and_card_presentation_share_selection_order_and_scene_actions() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let first = app.create_chapter(None, "First chapter", 0).unwrap();
+        let second = app.create_chapter(None, "Second chapter", 1).unwrap();
+        let opening = app.create_scene(first, "The arrival", 0).unwrap();
+        let turning = app.create_scene(second, "A difficult choice", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.workspace = Workspace::Outline;
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == second))
+            .unwrap();
+        assert!(
+            matches!(outline_rows(&state).get(state.selected), Some(OutlineRow::Chapter { id, .. }) if *id == second)
+        );
+
+        state.switch(Workspace::Cards);
+        assert_eq!(state.selected_card_chapter, Some((second, true)));
+        assert_eq!(selected_scene_for_workspace(&state), None);
+        state.switch(Workspace::Outline);
+        assert!(matches!(
+            outline_rows(&state).get(state.selected),
+            Some(OutlineRow::Chapter { id, .. }) if *id == second
+        ));
+
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| *row == OutlineRow::Scene(turning))
+            .unwrap();
+        state.dispatch_registered_command_id("view.cards").unwrap();
+        assert_eq!(state.workspace, Workspace::Cards);
+        assert_eq!(selected_scene_for_workspace(&state), Some(turning));
+        state.dispatch_registered_command_id("view.cards").unwrap();
+        assert_eq!(state.workspace, Workspace::Outline);
+        assert_eq!(selected_scene_for_workspace(&state), Some(turning));
+
+        state.open_menu_category(SCENE_MENU_INDEX);
+        assert_eq!(state.workspace, Workspace::Outline);
+        assert!(state.menu_visible_entries().iter().any(|command| {
+            command.id == "scene.toggle-inclusion"
+                && state.command_disabled_reason(*command).is_none()
+        }));
+        state
+            .dispatch_registered_command_id("scene.toggle-inclusion")
+            .unwrap();
+        assert_eq!(state.workspace, Workspace::Outline);
+        assert_eq!(selected_scene_for_workspace(&state), Some(turning));
+        assert!(!state.app.scene_is_included(turning).unwrap());
+        assert_eq!(
+            state.app.get_scene(opening).unwrap().chapter_id,
+            Some(first)
+        );
     }
 
     #[test]
@@ -45205,7 +45426,8 @@ mod tests {
                 expected.retain(|id| {
                     matches!(
                         *id,
-                        "view.formatting-marks"
+                        "view.cards"
+                            | "view.formatting-marks"
                             | "view.follow-scene-card"
                             | "view.reference-outline"
                             | "view.reference-timeline"
@@ -45993,7 +46215,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_destinations_are_easy_to_cycle_and_advanced_views_remain_in_navigate_menu() {
+    fn primary_destinations_are_easy_to_cycle_and_card_view_is_an_outline_presentation() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
         let mut state = AppState::new(app, default_bindings());
@@ -46028,15 +46250,37 @@ mod tests {
             .into_iter()
             .map(|command| command.label)
             .collect::<Vec<_>>();
-        assert!(common.starts_with(&["Manuscript", "Outline", "Scene Cards"]));
+        assert!(common.starts_with(&["Manuscript", "Outline", "Reference"]));
 
         let every_view = state
             .menu_commands()
             .into_iter()
             .map(|command| command.id)
             .collect::<Vec<_>>();
-        assert!(every_view.contains(&"view.cards"));
+        assert!(!every_view.contains(&"view.cards"));
         assert!(!every_view.contains(&"view.analytics"));
+        let view_menu = MENU_CATEGORIES
+            .iter()
+            .position(|name| *name == "View")
+            .unwrap();
+        state.menu = Some(MenuState {
+            top: view_menu,
+            selected: 0,
+        });
+        let card_view = state
+            .menu_commands()
+            .into_iter()
+            .find(|command| command.id == "view.cards")
+            .expect("View menu offers the card presentation");
+        assert_eq!(card_view.label, "Show Scene Cards");
+        state.workspace = Workspace::Cards;
+        assert_eq!(Workspace::Cards.title(), "Outline · Scene Cards");
+        let tree_view = state
+            .menu_commands()
+            .into_iter()
+            .find(|command| command.id == "view.cards")
+            .expect("card view can return to the outline tree");
+        assert_eq!(tree_view.label, "Show Outline Tree");
         assert!(
             command_palette_candidates("Analytics")
                 .iter()
@@ -46811,7 +47055,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("No removed scenes"));
-        assert!(rendered.contains("Return to Scene Cards"));
+        assert!(rendered.contains("Return to Outline"));
         assert!(!rendered.contains("Insert > New Scene"));
 
         let scene_menu = SCENE_MENU_INDEX;
@@ -46820,7 +47064,7 @@ mod tests {
             .menu_commands()
             .iter()
             .position(|command| {
-                command.id == "scene.removed-list" && command.label == "Return to Scene Cards"
+                command.id == "scene.removed-list" && command.label == "Return to Outline"
             })
             .unwrap();
         state.menu.as_mut().unwrap().selected = return_command;
@@ -49106,7 +49350,10 @@ mod tests {
             KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
         )
         .unwrap();
-        for _ in 0..8 {
+        for _ in 0..=MENU_CATEGORIES.len() {
+            if MENU_CATEGORIES[state.menu.unwrap().top] == "Help" {
+                break;
+            }
             handle(
                 &mut state,
                 KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
@@ -49677,7 +49924,7 @@ mod tests {
                 .unwrap()
                 .step,
             1,
-            "the tutorial cannot advance until Scene Cards has been opened"
+            "the tutorial cannot advance until the card presentation has been opened"
         );
         assert!(state.message.contains("Scene Cards"));
         handle(
@@ -49685,7 +49932,7 @@ mod tests {
             KeyEvent::new(KeyCode::F(10), KeyModifiers::NONE),
         )
         .unwrap();
-        for _ in 0..3 {
+        for _ in 0..4 {
             handle(
                 &mut state,
                 KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
@@ -49696,7 +49943,7 @@ mod tests {
             .menu_visible_entries()
             .iter()
             .position(|command| command.id == "view.cards")
-            .expect("Navigate menu exposes Scene Cards directly");
+            .expect("View menu exposes the outline card presentation");
         for _ in 0..cards {
             handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
         }

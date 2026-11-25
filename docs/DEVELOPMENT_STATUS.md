@@ -53,12 +53,13 @@ unresolved, and human publication review is outstanding. See
 Targeted Rust importer tests (23), the importer integration test (1), the
 synthetic Python regression tests (6), `cargo fmt --all -- --check`, workspace
 Clippy with warnings denied, and the full workspace suite passed after the RTF
-list repair and unused dependency cleanup. The full suite included 333 terminal
-unit tests, 3 end-to-end author workflows, 20 PTY tests, and all workspace
-unit/integration/doc tests. The Ollama loopback test passed when run with the
-previously authorised local socket permission. The PTY suite also confirmed
-that Previous Position with empty history leaves the app running; #62 remains
-open for human UAT, not because implementation is unverified by automation.
+list repair and unused dependency cleanup. The latest full workspace run
+included 334 terminal unit tests, 3 end-to-end author workflows, 21 PTY tests,
+and all workspace unit/integration/doc tests. The Ollama loopback test passed
+with the previously authorised local socket permission. The PTY suite also
+confirmed that Previous Position with empty history leaves the app running;
+#62 remains open for human UAT, not because implementation is unverified by
+automation.
 
 `cargo audit` completed after fetching a local RustSec database (1,568
 advisories) and reported 26 vulnerabilities plus 10 allowed warnings in the
@@ -114,16 +115,18 @@ formatting and `git diff --check` passed.
 
 ## Current architectural finding
 
-The terminal still exposes `Workspace::Outline` and `Workspace::Cards` as
-separate workspaces. GitHub #55 was amended on 25 November to supersede the
-separate-outliner requirement: one hierarchical tree must serve fiction and
-non-fiction, with optional card/column presentations sharing the same canonical
-selection and ordering. Existing data/services already represent sections,
-chapters, scenes and direct prose content units. The next implementation task
-is to unify the author-facing workspace/projection without duplicating those
-records or changing storage unless an audit proves it necessary. Preserve
-Included/Excluded and Unplaced distinctions, and retain existing recovery and
-compile behavior.
+GitHub #55 was amended on 25 November to require one author-facing outliner,
+with optional card/table presentations sharing canonical selection and order.
+The View menu now exposes Scene Cards as a presentation of Outline; switching
+between tree and cards preserves chapter/scene selection and does not add a
+second navigation-history or Tab destination. The Scene menu, inclusion toggle,
+scene creation, metadata edits and scene movement now work from the tree. The
+Removed Scenes flow returns to the original outliner presentation and
+selection. The underlying `Workspace::Cards` renderer remains a separate
+projection, so this is an integration step, not completion of #55. Next is
+consolidating the hierarchy and metadata inspector around the unified outline
+while preserving Included/Excluded and Unplaced distinctions, stable records,
+recovery and compile behaviour.
 
 ## Latest outliner and real-manuscript work
 
@@ -131,13 +134,16 @@ The terminal outline now treats Enter on a section/chapter as “open its first
 manuscript document”: direct prose is preferred by outline order, otherwise the
 first descendant document is opened. Empty headings open an empty manuscript
 context with a useful creation hint. Returning from the editor restores the
-selected scene or prose document. Space now expands/collapses headings and
-toggles a scene between Included and Excluded; Ctrl+Space remains available for
-multi-selection. These changes are incremental; Outline and Scene Cards are
-still separate workspaces, so #55 is not complete and still requires human UAT.
+selected scene or prose document. Space expands/collapses headings and toggles
+a scene between Included and Excluded; Ctrl+Space remains available for
+multi-selection. The card renderer is reached from View as another Outline
+presentation, with shared selection, actions and return context. The metadata
+inspector and full structural integration remain outstanding; #55 is open for
+human UAT.
 
-Verified for this batch: full workspace tests, workspace Clippy, formatting,
-Python harness syntax and `git diff --check` all passed.
+Verified for this batch: formatting, workspace Clippy with warnings denied,
+the complete workspace tests, and real PTY menu, scene creation, removal,
+structural undo and outliner presentation checks passed.
 
 Private real Scrivener regression fixtures were checked read-only on 2026-11-25.
 `(cd fixtures && sha256sum --quiet -c SHA256SUMS)` passed before and after each
@@ -183,7 +189,9 @@ The RTF image import repair now preserves all 44 reference illustration payloads
 byte-for-byte for the illustrated non-fiction book; its generated EPUB has 44
 images and zero broken references. A separate non-fiction source contains two
 images absent from its historical reference publication; this is unresolved and
-may reflect a source/revision/compile difference. EPUBCheck remains unavailable.
+may reflect a source/revision/compile difference. EPUBCheck was unavailable for
+this historical run; later runs validated generated EPUBs with the installed
+EPUBCheck JAR, as recorded above.
 
 The next importer correction preserves safe Scrivener RTF hyperlink fields as
 Markdown links, retains visible text while omitting unsafe destinations, and
@@ -218,10 +226,10 @@ were unchanged. Generated EPUBs contain 63, 170 and 63 links, with zero broken
 internal links; references contain 45, 149 and 26. Generated/reference image
 counts are 2/0, 44/44 and 0/0; all generated references resolve. Text sequence
 similarities remain 0.951104, 0.872523 and 0.909124; paragraph counts remain
-1298/358, 648/408 and 1813/1430. Imports are incomplete and EPUBCheck is
-unavailable. These results are provisional, not fidelity acceptance. Relevant
-GitHub comments are pending because issue-comment API requests returned GraphQL
-errors after the commit; retry them at the next GitHub checkpoint.
+1298/358, 648/408 and 1813/1430. Imports are incomplete. EPUBCheck was not run
+for this historical baseline; later validation results are recorded above.
+These results are provisional, not fidelity acceptance. The earlier note about
+pending GitHub comments is superseded by subsequent REST updates.
 
 The user also provided `README_TMP.md` for replacing the product README. This is
 queued in documentation/release preparation after current high-priority import

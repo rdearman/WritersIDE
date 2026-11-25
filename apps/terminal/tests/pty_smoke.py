@@ -136,6 +136,7 @@ def main():
     named_layouts = modes == ["named-layouts"]
     edit_menu = modes == ["edit-menu"]
     removed_scenes = modes == ["removed-scenes"]
+    outline_view = modes == ["outline-view"]
     chapter_removal = modes in (
         ["chapter-removal"],
         ["chapter-removal-target"],
@@ -227,8 +228,64 @@ def main():
         visible = "".join("".join(rows).split())
         return all(marker.decode("utf-8").replace(" ", "") in visible for marker in markers)
 
+    def show_scene_cards_presentation():
+        """Select the card presentation from the unified Outline's View menu."""
+        menu_start = len(output)
+        os.write(master, b"\x1b[21~")  # F10
+        read_for(0.2)
+        os.write(master, b"\x1b[C" * 4)  # View
+        if wait_for_screen_fragments((b"Show Scene Cards",), menu_start, timeout=2.0):
+            os.write(master, b"\r")
+        elif wait_for_screen_fragments((b"Show Outline Tree",), menu_start, timeout=2.0):
+            os.write(master, b"\x1b")  # Already in the card presentation.
+        else:
+            raise AssertionError("View menu did not identify the active Outline presentation")
+        if not wait_for_screen_fragments((b"Included", b"Excluded"), menu_start, timeout=3.0):
+            raise AssertionError("Scene Cards presentation did not render its Included and Excluded collections")
+
+    def select_visible_menu_item(label):
+        for _ in range(32):
+            if wait_for_screen_fragments((f"▸ {label}".encode("utf-8"),), timeout=0.12):
+                return
+            os.write(master, b"\x1b[B")
+            read_for(0.04)
+        raise AssertionError(f"menu did not expose selectable item {label!r}")
+
     try:
         read_for(1.0)
+        if outline_view:
+            os.write(master, b"\x1b")  # dismiss first-run welcome
+            read_for(0.25)
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 4)  # select View
+            if not wait_for_screen_fragments((b"Show Scene Cards",), menu_start, timeout=3.0) and not wait_for_screen_fragments((b"Show Outline Tree",), menu_start, timeout=3.0):
+                raise AssertionError("View menu did not expose the active outline presentation command")
+            first_view_label = "Show Scene Cards" if "Show Scene Cards" in "".join(terminal_snapshot(output, 24, 80)) else "Show Outline Tree"
+            os.write(master, b"\r")
+            read_for(0.25)
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 4)
+            expected_view_label = "Show Outline Tree" if first_view_label == "Show Scene Cards" else "Show Scene Cards"
+            if not wait_for_screen_fragments((expected_view_label.encode("utf-8"),), menu_start, timeout=3.0):
+                raise AssertionError("View menu label did not change after switching outline presentation")
+            os.write(master, b"\x1b")  # close the View menu before exiting
+            read_for(0.2)
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after switching outline presentations; visible tail: " + repr(ANSI_CONTROL.sub(b"", output[-1200:])))
+            print("PTY unified-outline workflow passed: View menu switches between tree and scene-card presentations.")
+            return
+
         if outline_enter:
             if not wait_for_screen_fragments(
                 (b"Guided Tour", b"Quick Start"), timeout=10.0
@@ -339,15 +396,7 @@ def main():
         if removed_scenes:
             os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
             read_for(0.25)
-            # Scene actions are contextual to fiction Scene Cards. Reach that
-            # workspace through the author-facing Navigate menu first.
-            os.write(master, b"\x1b[21~")
-            read_for(0.15)
-            os.write(master, b"\x1b[C" * 3)
-            read_for(0.15)
-            os.write(master, b"\x1b[B" * 2 + b"\r")
-            if not wait_for_fragments((b"Included", b"Arrival"), timeout=3.0):
-                raise AssertionError("Navigate > Scene Cards did not open for the Removed Scenes workflow")
+            show_scene_cards_presentation()
             menu_start = len(output)
             # F10, then move to the now-visible Scene menu.
             os.write(master, b"\x1b[21~")
@@ -357,7 +406,7 @@ def main():
                 timeout=3.0,
             ):
                 raise AssertionError("F10 did not reopen the File menu from Scene Cards")
-            # Publishing is context-hidden in Scene Cards, so the visible
+            # Publishing is context-hidden in the compact card presentation, so the visible
             # sequence from File to Scene contains eight category steps.
             for _ in range(12):
                 if wait_for_screen_fragments((b"Show Removed Scenes",), menu_start, timeout=0.1):
@@ -379,13 +428,13 @@ def main():
             if not selected_removed_command:
                 raise AssertionError("could not select Scene > Show Removed Scenes through the menu")
             os.write(master, b"\r")
-            if not wait_for_fragments((b"Noremovedscenes", b"ReturntoSceneCards"), menu_start, timeout=3.0):
+            if not wait_for_fragments((b"Noremovedscenes", b"ReturntoOutline"), menu_start, timeout=3.0):
                 raise AssertionError(
                     "Removed Scenes did not show its specific empty state; visible tail: "
                     + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
                 )
             return_start = len(output)
-            os.write(master, b"\x1b")  # Esc must return to Scene Cards
+            os.write(master, b"\x1b")  # Esc returns to the unified Outline
             if not wait_for_fragments((b"Included", b"Arrival"), return_start, timeout=3.0):
                 raise AssertionError(
                     "Esc did not restore Scene Cards and its prior selection; visible tail: "
@@ -443,7 +492,9 @@ def main():
             save_start = len(output)
             os.write(master, b"\x1b[21~")  # F10
             read_for(0.2)
-            os.write(master, b"\x1b[C" * 4 + b"\x1b[B" * 9 + b"\r")
+            os.write(master, b"\x1b[C" * 4)  # View
+            select_visible_menu_item("Save Layout")
+            os.write(master, b"\r")
             if not wait_for_screen_fragments(
                 (b"SaveLayout", b"Entersaves", b"Esccancels"),
                 save_start,
@@ -462,7 +513,9 @@ def main():
             load_start = len(output)
             os.write(master, b"\x1b[21~")
             read_for(0.2)
-            os.write(master, b"\x1b[C" * 4 + b"\x1b[B" * 10 + b"\r")
+            os.write(master, b"\x1b[C" * 4)  # View
+            select_visible_menu_item("Load Layout")
+            os.write(master, b"\r")
             if not wait_for_screen_fragments(
                 (b"LoadLayout", b"UATLayout", b"Enterloads"),
                 load_start,
@@ -598,15 +651,8 @@ def main():
             os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
             read_for(0.3)
 
-            # Navigate > Scene Cards using the visible F10 menu.
-            os.write(master, b"\x1b[21~")
-            read_for(0.2)
-            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 2 + b"\r")
-            if not wait_for_fragments((b"Included", b"Excluded"), timeout=3.0):
-                raise AssertionError(
-                    "Navigate > Scene Cards did not open before chapter creation; output tail: "
-                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
-                )
+            # View > Show Scene Cards, a presentation of the unified Outline.
+            show_scene_cards_presentation()
 
             def create_chapter(title):
                 menu_start = len(output)
@@ -653,7 +699,7 @@ def main():
             # removal dialogue. The source file itself must remain untouched.
             os.write(master, b"\x1b[21~")
             read_for(0.2)
-            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 3 + b"\r")
+            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 2 + b"\r")
             if not wait_for_fragments(
                 (b"Field", b"Notes", b"ReferenceLibrary"), timeout=3.0
             ):
@@ -889,7 +935,7 @@ def main():
                 )
             os.write(master, b"\x1b[C" * 3)  # Navigate menu
             if not wait_for_fragments(
-                (b"PreviousPosition", b"Outline", b"SceneCards"),
+                (b"PreviousPosition", b"Outline"),
                 menu_start,
                 timeout=3.0,
             ):
@@ -1080,12 +1126,10 @@ def main():
             return
 
         if removal_dialogs:
-            # Navigate to Scene Cards through the actual menu and open its
-            # recoverable removal dialogue with the list Delete key.
+            # Open the card presentation through View and use its recoverable
+            # removal dialogue with the list Delete key.
             scene_workspace_start = len(output)
-            os.write(master, b"\x1b[21~")
-            read_for(0.2)
-            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 2 + b"\r")
+            show_scene_cards_presentation()
             if not wait_for_screen_fragments(
                 (b"Included", b"Arrival"), scene_workspace_start, timeout=3.0
             ):
@@ -1115,7 +1159,7 @@ def main():
             reference_workspace_start = len(output)
             os.write(master, b"\x1b[21~")
             read_for(0.2)
-            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 3 + b"\r")
+            os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 2 + b"\r")
             if not wait_for_fragments(
                 (b"Field", b"Notes", b"ReferenceLibrary"),
                 reference_workspace_start,
