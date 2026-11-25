@@ -5,6 +5,54 @@ Updated: 2026-11-25
 This is the handover note for ongoing implementation. GitHub issues remain the
 authoritative source for approved requirements and human UAT findings.
 
+## Current checkpoint — 25 November 2026
+
+The root README is now an author-facing alpha introduction. Supporting
+documents are [Getting Started](GETTING_STARTED.md), the [developer guide](DEVELOPMENT.md)
+and the [CLI reference](CLI.md). The README screenshots were captured from the
+running terminal application in a PTY using only the synthetic “The Lantern
+House” demonstration project. `README_TMP.md` remains the supplied, untracked
+draft and must not be staged. The author has also requested a later docs-folder
+consolidation; schedule it after higher-priority reliability, editing, import
+and publishing work, and audit references before removing any documents.
+
+Independent verification tools checked on this host:
+
+- EPUBCheck 4.2.6; Aspell 0.60.8.1; Hunspell 1.7.2.
+- Hunspell dictionaries: British and American English, French, Italian,
+  German, Spanish, Portuguese and Russian. Aspell dictionaries include
+  English, French and Italian.
+- qpdf 11.9.0; Poppler utilities 24.02.0; SQLite CLI 3.45.1; libxml2/xmllint
+  2.9.14; unzip 6.00.
+- cargo-audit 0.23.0; cargo-deny 0.22.1; cargo-machete 0.10.1;
+  cargo-llvm-cov 0.9.2.
+
+Availability does not mean every audit has passed. These are optional
+development checks, not runtime dependencies. The EPUBCheck wrapper at
+`/usr/bin/epubcheck` fails under the restricted shell, but the installed JAR at
+`/usr/share/java/epubcheck.jar` runs successfully through Java.
+
+The post-RTF-boundary-fix full private run is
+`reports/corrected-source-epubcheck-20261125/` (generated projects and EPUBs:
+`generated/corrected-source-epubcheck-20261125/`). It ran the production import,
+save/reopen and compile pipeline with a dirty worktree based on commit
+`3901e7364ed6107f35ac1d69080ac7d7dbd0b981`; fixture checksums passed after the
+run. Source manuscript bodies survived exactly: book 01 44/44, book 02 41/41,
+book 03 76/76; research bodies survived 1/1, 1/1 and 4/4. All three generated
+EPUB 3.2 files passed EPUBCheck with zero errors and warnings. Historical EPUBs
+returned 2, 2 and 0 errors respectively; those are reference defects, not WIDE
+output defects. Imports remain incomplete: book 02’s output has 36 list items
+against 45 in the reference, among other unresolved source/publication
+differences. This is not fidelity acceptance and must not promote a baseline.
+The report’s overall acceptance remains provisional pending discrepancy triage
+and human review.
+
+Next regression task: trace the nine missing list items to their specific RTF
+structures and verify recoverable Scrivener compile inclusion settings. Then
+rerun targeted import/compile checks and the complete three-book suite after
+the production fix. Run dependency, licence and coverage checks with the newly
+available Rust tools at suitable checkpoints.
+
 ## Priorities
 
 1. Protect manuscript data and fix regressions that block ordinary writing.
@@ -73,7 +121,9 @@ run. Git tracks no files under `fixtures/`, `generated/`, `reports/` or
 use Scrivener 3.1.5.1 Windows manifests (manifest revision 2.0): book 01 has 70
 binder items and RTF/PDF assets; book 02 has 64 items, nested structure and 44
 embedded RTF picture groups; book 03 has 118 items and RTF/plain-text assets.
-`epubcheck` is unavailable; Java, Calibre and Pandoc are present.
+EPUBCheck is installed as `/usr/share/java/epubcheck.jar` (v4.2.6) and is invoked
+with Java because the `/usr/bin/epubcheck` wrapper cannot find its interpreter
+inside the restricted shell. Calibre and Pandoc are also present.
 
 The private production-pipeline harness is `tools/real_manuscript_regression.py`.
 It defaults to repository-relative fixtures and writes all project copies,
