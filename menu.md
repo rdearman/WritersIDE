@@ -33,6 +33,9 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - Copy Selection (`Ctrl+C`)
 - Paste (`Ctrl+V`)
 - Delete Selection
+- Delete Word (at the cursor; Undo restores it)
+- Delete Sentence (at the cursor; Undo restores it)
+- Delete Paragraph (at the cursor; Undo restores it)
 - Select All (`Ctrl+A`)
 - Duplicate Selection or Paragraph (duplicate selected text, or the paragraph containing the cursor)
 - Select Word (at or immediately after the cursor)

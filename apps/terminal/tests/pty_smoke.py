@@ -347,7 +347,7 @@ def main():
                     "Edit actions were not visible from the writing screen; visible tail: "
                     + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
                 )
-            os.write(master, b"\x1b[B" * 6 + b"\r")  # Edit > Select All
+            os.write(master, b"\x1b[B" * 9 + b"\r")  # Edit > Select All
             if not wait_for_screen_fragments(
                 (b"Selected all text in the current manuscript document",),
                 edit_start,
@@ -359,7 +359,7 @@ def main():
                 )
             os.write(master, b"\x1b[21~")
             read_for(0.15)
-            os.write(master, b"\x1b[C" + b"\x1b[B" * 7 + b"\r")  # Edit > Duplicate Selection or Paragraph
+            os.write(master, b"\x1b[C" + b"\x1b[B" * 10 + b"\r")  # Edit > Duplicate Selection or Paragraph
             if not wait_for_screen_fragments((b"Duplicated selection",), edit_start, timeout=3.0):
                 raise AssertionError("Edit > Duplicate Selection did not dispatch from writing mode")
             os.write(master, b"\x1b[21~")
@@ -369,7 +369,7 @@ def main():
                 raise AssertionError("Edit > Undo did not reverse selection duplication")
             os.write(master, b"\x1b[21~")
             read_for(0.15)
-            os.write(master, b"\x1b[C" + b"\x1b[B" * 8 + b"\r")  # Edit > Select Word
+            os.write(master, b"\x1b[C" + b"\x1b[B" * 11 + b"\r")  # Edit > Select Word
             if not wait_for_screen_fragments(
                 (b"Selected word",), edit_start, timeout=3.0
             ):
@@ -377,7 +377,7 @@ def main():
 
             os.write(master, b"\x1b[21~")
             read_for(0.15)
-            os.write(master, b"\x1b[C" + b"\x1b[B" * 9 + b"\r")  # Edit > Select Sentence
+            os.write(master, b"\x1b[C" + b"\x1b[B" * 12 + b"\r")  # Edit > Select Sentence
             if not wait_for_screen_fragments(
                 (b"Selected sentence",), edit_start, timeout=3.0
             ):
@@ -385,7 +385,7 @@ def main():
 
             os.write(master, b"\x1b[21~")
             read_for(0.15)
-            os.write(master, b"\x1b[C" + b"\x1b[B" * 10 + b"\r")  # Edit > Select Paragraph
+            os.write(master, b"\x1b[C" + b"\x1b[B" * 13 + b"\r")  # Edit > Select Paragraph
             if not wait_for_screen_fragments(
                 (b"Selected paragraph",), edit_start, timeout=3.0
             ):

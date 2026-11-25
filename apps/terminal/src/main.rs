@@ -971,6 +971,9 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "edit.copy-selection",
         "edit.paste-clipboard",
         "edit.delete-selection",
+        "edit.delete-word",
+        "edit.delete-sentence",
+        "edit.delete-paragraph",
         "edit.select-all",
         "edit.duplicate-selection",
         "edit.select-word",
@@ -1616,6 +1619,9 @@ enum CommandAction {
     CopySelection,
     PasteClipboard,
     DeleteSelection,
+    DeleteWord,
+    DeleteSentence,
+    DeleteParagraph,
     SelectAllText,
     DuplicateSelection,
     SelectWord,
@@ -2583,6 +2589,51 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::DeleteSelection,
         },
         CommandSpec {
+            id: "edit.delete-word",
+            label: "Delete Word",
+            description: "Delete the word at the cursor; Undo restores it",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["delete word at cursor"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 7,
+            advanced: false,
+            action: CommandAction::DeleteWord,
+        },
+        CommandSpec {
+            id: "edit.delete-sentence",
+            label: "Delete Sentence",
+            description: "Delete the sentence at the cursor; Undo restores it",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["delete sentence at cursor"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 8,
+            advanced: false,
+            action: CommandAction::DeleteSentence,
+        },
+        CommandSpec {
+            id: "edit.delete-paragraph",
+            label: "Delete Paragraph",
+            description: "Delete the paragraph at the cursor; Undo restores it",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["delete paragraph at cursor"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 9,
+            advanced: false,
+            action: CommandAction::DeleteParagraph,
+        },
+        CommandSpec {
             id: "edit.select-all",
             label: "Select All",
             description: "Select all text in the current manuscript document",
@@ -2593,7 +2644,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             task_group: "Editor Editing",
-            menu_priority: 7,
+            menu_priority: 10,
             advanced: false,
             action: CommandAction::SelectAllText,
         },
@@ -2608,7 +2659,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             task_group: "Editor Editing",
-            menu_priority: 8,
+            menu_priority: 11,
             advanced: false,
             action: CommandAction::DuplicateSelection,
         },
@@ -2623,7 +2674,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             task_group: "Editor Editing",
-            menu_priority: 9,
+            menu_priority: 12,
             advanced: false,
             action: CommandAction::SelectWord,
         },
@@ -2638,7 +2689,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             task_group: "Editor Editing",
-            menu_priority: 10,
+            menu_priority: 13,
             advanced: false,
             action: CommandAction::SelectSentence,
         },
@@ -2653,7 +2704,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             task_group: "Editor Editing",
-            menu_priority: 11,
+            menu_priority: 14,
             advanced: false,
             action: CommandAction::SelectParagraph,
         },
@@ -13854,6 +13905,9 @@ impl AppState {
                 | "edit.copy-selection"
                 | "edit.paste-clipboard"
                 | "edit.delete-selection"
+                | "edit.delete-word"
+                | "edit.delete-sentence"
+                | "edit.delete-paragraph"
                 | "edit.select-all"
                 | "edit.duplicate-selection"
                 | "edit.select-word"
@@ -13881,6 +13935,9 @@ impl AppState {
                 | "edit.copy-selection"
                 | "edit.paste-clipboard"
                 | "edit.delete-selection"
+                | "edit.delete-word"
+                | "edit.delete-sentence"
+                | "edit.delete-paragraph"
                 | "edit.select-all"
                 | "edit.duplicate-selection"
                 | "edit.select-word"
@@ -15052,6 +15109,9 @@ impl AppState {
             CommandAction::CopySelection => self.copy_selected_text()?,
             CommandAction::PasteClipboard => self.paste_clipboard(),
             CommandAction::DeleteSelection => self.delete_selected_text(),
+            CommandAction::DeleteWord => self.delete_word_at_cursor(),
+            CommandAction::DeleteSentence => self.delete_sentence_at_cursor(),
+            CommandAction::DeleteParagraph => self.delete_paragraph_at_cursor(),
             CommandAction::SelectAllText => self.select_all_text(),
             CommandAction::DuplicateSelection => self.duplicate_selection_or_paragraph(),
             CommandAction::SelectWord => self.select_word_at_cursor(),
@@ -22301,6 +22361,46 @@ impl AppState {
             self.message = "Selection is outside the active editing range".into();
         }
     }
+    fn delete_current_selection_with_spacing(&mut self, paragraph: bool) {
+        let Some((selection_start, selection_end)) = self.selection_bounds() else {
+            return;
+        };
+        let source = self.editor.join("\n");
+        let mut start = editor_position_byte(&self.editor, selection_start.0, selection_start.1);
+        let mut end = editor_position_byte(&self.editor, selection_end.0, selection_end.1);
+        if paragraph {
+            if source
+                .get(end..)
+                .is_some_and(|tail| tail.starts_with("\n\n"))
+            {
+                end += 2;
+            } else if source.get(end..).is_some_and(|tail| tail.starts_with('\n')) {
+                end += 1;
+            } else if source
+                .get(..start)
+                .is_some_and(|head| head.ends_with("\n\n"))
+            {
+                start -= 2;
+            } else if source.get(..start).is_some_and(|head| head.ends_with('\n')) {
+                start -= 1;
+            }
+        } else if let Some(next) = source.get(end..).and_then(|tail| tail.chars().next())
+            && next.is_whitespace()
+            && next != '\n'
+        {
+            end += next.len_utf8();
+        } else if let Some(previous) = source
+            .get(..start)
+            .and_then(|head| head.chars().next_back())
+            && previous.is_whitespace()
+            && previous != '\n'
+        {
+            start -= previous.len_utf8();
+        }
+        self.editor_selection = editor_position_from_byte(&source, start);
+        self.cursor = editor_position_from_byte(&source, end).unwrap_or(self.cursor);
+        self.delete_selected_text();
+    }
     fn select_all_text(&mut self) {
         let text = self.editor.join("\n");
         let (start, end) = self
@@ -22321,6 +22421,24 @@ impl AppState {
             self.editor_selection = None;
             "The current manuscript document is empty".into()
         };
+    }
+    fn delete_word_at_cursor(&mut self) {
+        self.select_word_at_cursor();
+        if self.selected_text().is_some() {
+            self.delete_current_selection_with_spacing(false);
+        }
+    }
+    fn delete_sentence_at_cursor(&mut self) {
+        self.select_sentence_at_cursor();
+        if self.selected_text().is_some() {
+            self.delete_current_selection_with_spacing(false);
+        }
+    }
+    fn delete_paragraph_at_cursor(&mut self) {
+        self.select_paragraph_at_cursor();
+        if self.selected_text().is_some() {
+            self.delete_current_selection_with_spacing(true);
+        }
     }
     fn duplicate_selection_or_paragraph(&mut self) {
         let source = self.editor.join("\n");
@@ -49665,6 +49783,76 @@ mod tests {
         run_edit_menu(&mut state, "edit.select-paragraph");
         assert!(state.selected_text().is_none());
         assert!(state.message.contains("outside the narrowed passage"));
+        assert_eq!(state.editor.join("\n"), source);
+    }
+
+    #[test]
+    fn edit_menu_deletes_word_sentence_and_paragraph_with_undo() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let source = "The quick fox. Another sentence.\n\nSecond paragraph.\n\nLast.";
+        let hash = app.load_scene_text(scene).unwrap().1;
+        app.save_scene_text(scene, Some(&hash), source).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+
+        let run_edit_menu = |state: &mut AppState, command_id: &str| {
+            state.open_menu_category(1);
+            let selected = state
+                .menu_visible_entries()
+                .iter()
+                .position(|command| command.id == command_id)
+                .unwrap_or_else(|| panic!("{command_id} is absent from the Edit menu"));
+            state.menu.as_mut().unwrap().selected = selected;
+            state
+                .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+
+        state.cursor = (0, 4);
+        run_edit_menu(&mut state, "edit.delete-word");
+        assert_eq!(
+            state.editor.join("\n"),
+            "The fox. Another sentence.\n\nSecond paragraph.\n\nLast."
+        );
+        assert!(state.message.starts_with("Selection deleted"));
+        run_edit_menu(&mut state, "edit.undo");
+        assert_eq!(state.editor.join("\n"), source);
+
+        state.cursor = (0, 18);
+        run_edit_menu(&mut state, "edit.delete-sentence");
+        assert_eq!(
+            state.editor.join("\n"),
+            "The quick fox.\n\nSecond paragraph.\n\nLast."
+        );
+        run_edit_menu(&mut state, "edit.undo");
+        assert_eq!(state.editor.join("\n"), source);
+
+        state.cursor = (2, 2);
+        run_edit_menu(&mut state, "edit.delete-paragraph");
+        assert_eq!(
+            state.editor.join("\n"),
+            "The quick fox. Another sentence.\n\nLast."
+        );
+        run_edit_menu(&mut state, "edit.undo");
+        assert_eq!(state.editor.join("\n"), source);
+
+        state.cursor = (0, 2);
+        run_edit_menu(&mut state, "edit.delete-paragraph");
+        assert_eq!(state.editor.join("\n"), "Second paragraph.\n\nLast.");
+        run_edit_menu(&mut state, "edit.undo");
+        assert_eq!(state.editor.join("\n"), source);
+
+        state.cursor = (4, 2);
+        run_edit_menu(&mut state, "edit.delete-paragraph");
+        assert_eq!(
+            state.editor.join("\n"),
+            "The quick fox. Another sentence.\n\nSecond paragraph."
+        );
+        run_edit_menu(&mut state, "edit.undo");
         assert_eq!(state.editor.join("\n"), source);
     }
 

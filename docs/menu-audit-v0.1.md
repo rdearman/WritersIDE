@@ -406,6 +406,16 @@ offsets, respect a narrowed passage, and do not modify manuscript text. Unit
 and PTY regressions cover menu dispatch and persisted source integrity. Human
 UAT is still required.
 
+The Edit menu also provides **Delete Word**, **Delete Sentence** and **Delete
+Paragraph**. These reuse the corresponding Unicode-aware selection operations,
+remove adjacent horizontal whitespace when needed to avoid doubled spaces, and
+preserve paragraph boundaries when deleting within a document. Each operation
+is one undoable edit and respects the current narrowed passage. Paragraph
+deletion removes its following paragraph separator where available, or the
+preceding separator for the final paragraph, retaining neighboring content.
+Unit tests invoke all three through the shared command dispatcher and verify
+Undo restores the exact original text.
+
 ## Alpha UAT 19 — manuscript insertion actions
 
 The Insert menu now also exposes **Insert Date/Time** and **Insert File…**.
