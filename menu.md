@@ -81,6 +81,7 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 
 ## View
 
+- Switch View… (manuscript editor)
 - Show/Hide Formatting Marks
 - Open Outline Reference (Manuscript editor)
 - Open Timeline Reference (Manuscript editor)

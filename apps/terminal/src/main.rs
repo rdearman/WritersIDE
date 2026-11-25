@@ -879,6 +879,7 @@ struct CommandPaletteState {
     selected: usize,
     recent_commands: Vec<String>,
     exclude_command_id: Option<&'static str>,
+    view_only: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -987,6 +988,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "search.return-position",
     ],
     &[
+        "window.switch-view",
         "view.formatting-marks",
         "view.rendered-markdown",
         "view.follow-scene-card",
@@ -1535,6 +1537,7 @@ enum CommandAction {
     Workspace(Workspace),
     OpenMainMenu,
     OpenCommandPalette,
+    OpenViewChooser,
     OpenMenuCategory(usize),
     OpenRecentProjects,
     NewProject,
@@ -3783,6 +3786,13 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         window_command(
+            "window.switch-view",
+            "Switch View…",
+            "Search open and available manuscript and reference views",
+            CommandAction::OpenViewChooser,
+            0,
+        ),
+        window_command(
             "window.split-side-by-side",
             "Split Side by Side",
             "Split the focused writing window into side-by-side views",
@@ -4828,6 +4838,23 @@ fn command_palette_candidates_with_history(
         });
     }
     candidates
+}
+
+fn scoped_palette_candidates(palette: &CommandPaletteState) -> Vec<CommandSpec> {
+    command_palette_candidates_with_history(&palette.query, &palette.recent_commands)
+        .into_iter()
+        .filter(|command| {
+            palette.exclude_command_id != Some(command.id)
+                && (!palette.view_only
+                    || matches!(
+                        command.action,
+                        CommandAction::Workspace(
+                            Workspace::Outline | Workspace::Cards | Workspace::Timeline
+                        )
+                    )
+                    || command.id.starts_with("view.reference-"))
+        })
+        .collect()
 }
 
 fn subsequence_matches(
@@ -7573,6 +7600,18 @@ impl AppState {
                 "outline" if source_id == "project" => outline_reference_text(&self.app)
                     .ok()
                     .map(|content| (None, "Outline".into(), content)),
+                "scene-cards" if source_id == "project" => {
+                    self.app.list_scenes(false).ok().map(|scenes| {
+                        let mut content = String::from("Scene Cards\n\n");
+                        for row in scenes {
+                            content.push_str(&format!(
+                                "{} · {} words\n{}\n\n",
+                                row.scene.title, row.actual_words, row.scene.synopsis
+                            ));
+                        }
+                        (None, "Scene Cards".into(), content)
+                    })
+                }
                 "timeline" if source_id == "project" => Some((
                     None,
                     "Story Timeline".into(),
@@ -13349,6 +13388,7 @@ impl AppState {
                 || multiple_references;
             direct.retain(|command| match command.id {
                 "view.formatting-marks" => editor,
+                "window.switch-view" => editor,
                 "view.rendered-markdown" => self.workspace == Workspace::Reading,
                 "view.follow-scene-card" => editor && self.editing_scene.is_some(),
                 "view.pin-reference" => editor && self.reference_focused && has_references,
@@ -14421,35 +14461,80 @@ impl AppState {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.dispatch_registered_with_args(action, None)
     }
+    fn open_command_palette(&mut self, view_only: bool) {
+        self.menu = None;
+        let recent_commands = match load_command_history(self.app.project_root()) {
+            Ok(commands) => commands,
+            Err(error) => {
+                self.message = format!("Recent commands unavailable: {error}");
+                Vec::new()
+            }
+        };
+        self.command_palette = Some(CommandPaletteState {
+            query: String::new(),
+            selected: 0,
+            recent_commands,
+            exclude_command_id: None,
+            view_only,
+        });
+        if self.message.is_empty() || !self.message.starts_with("Recent commands unavailable") {
+            self.message = if view_only {
+                "Switch View · search open and available views · Enter selects · Esc returns".into()
+            } else {
+                "Search commands · recent commands appear first".into()
+            };
+        }
+    }
+    fn switch_view_in_focused_window(
+        &mut self,
+        workspace: Workspace,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let focused_reference = self
+            .pane_layout
+            .as_ref()
+            .is_some_and(|layout| layout.focused() != 1);
+        if !focused_reference {
+            self.switch(workspace);
+            return Ok(());
+        }
+        let (source, title, content) = match workspace {
+            Workspace::Outline => (
+                "outline:project".into(),
+                "Outline".into(),
+                outline_reference_text(&self.app)?,
+            ),
+            Workspace::Cards => {
+                let scenes = self.app.list_scenes(false)?;
+                let mut content = String::from("Scene Cards\n\n");
+                for row in scenes {
+                    content.push_str(&format!(
+                        "{} · {} words\n{}\n\n",
+                        row.scene.title, row.actual_words, row.scene.synopsis
+                    ));
+                }
+                ("scene-cards:project".into(), "Scene Cards".into(), content)
+            }
+            Workspace::Timeline => (
+                "timeline:project".into(),
+                "Story Timeline".into(),
+                timeline_reference_text(&self.app),
+            ),
+            _ => return Err("that view cannot be opened in a manuscript window yet".into()),
+        };
+        self.open_reference_buffer(source, None, title, content);
+        self.message = format!("{} shown in the focused window", workspace.title());
+        Ok(())
+    }
     fn dispatch_registered_with_args(
         &mut self,
         action: CommandAction,
         arguments: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         match action {
-            CommandAction::Workspace(workspace) => self.switch(workspace),
+            CommandAction::Workspace(workspace) => self.switch_view_in_focused_window(workspace)?,
             CommandAction::OpenMainMenu => self.toggle_menu(),
-            CommandAction::OpenCommandPalette => {
-                self.menu = None;
-                let recent_commands = match load_command_history(self.app.project_root()) {
-                    Ok(commands) => commands,
-                    Err(error) => {
-                        self.message = format!("Recent commands unavailable: {error}");
-                        Vec::new()
-                    }
-                };
-                self.command_palette = Some(CommandPaletteState {
-                    query: String::new(),
-                    selected: 0,
-                    recent_commands,
-                    exclude_command_id: None,
-                });
-                if self.message.is_empty()
-                    || !self.message.starts_with("Recent commands unavailable")
-                {
-                    self.message = "Search commands · recent commands appear first".into();
-                }
-            }
+            CommandAction::OpenCommandPalette => self.open_command_palette(false),
+            CommandAction::OpenViewChooser => self.open_command_palette(true),
             CommandAction::OpenRecentProjects => self.open_recent_project_picker(),
             CommandAction::OpenMenuCategory(index) => self.open_menu_category(index),
             CommandAction::NewProject => {
@@ -25959,13 +26044,15 @@ fn draw_command_palette_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     };
     f.render_widget(Clear, popup);
     let block = Block::default()
-        .title(
-            if palette.query.trim().is_empty() && !palette.recent_commands.is_empty() {
-                " Command Palette · recent actions first · Esc closes "
-            } else {
-                " Command Palette · search actions · Esc closes "
-            },
-        )
+        .title(if palette.view_only && palette.query.trim().is_empty() {
+            " Switch View · recent views first · Esc returns "
+        } else if palette.view_only {
+            " Switch View · search available views · Esc returns "
+        } else if palette.query.trim().is_empty() && !palette.recent_commands.is_empty() {
+            " Command Palette · recent actions first · Esc closes "
+        } else {
+            " Command Palette · search actions · Esc closes "
+        })
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(popup);
@@ -25979,18 +26066,23 @@ fn draw_command_palette_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         ])
         .split(inner);
     f.render_widget(
-        Paragraph::new(format!(" > {}", palette.query)).style(
+        Paragraph::new(format!(
+            "{} > {}",
+            if palette.view_only {
+                "Switch View"
+            } else {
+                "Search"
+            },
+            palette.query
+        ))
+        .style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
         rows[0],
     );
-    let candidates =
-        command_palette_candidates_with_history(&palette.query, &palette.recent_commands)
-            .into_iter()
-            .filter(|candidate| palette.exclude_command_id != Some(candidate.id))
-            .collect::<Vec<_>>();
+    let candidates = scoped_palette_candidates(palette);
     let items = if candidates.is_empty() {
         vec![ListItem::new("No registered command matches this search")]
     } else {
@@ -29816,10 +29908,8 @@ fn handle_command_palette_key(
     let query = palette.query.clone();
     let recent_commands = palette.recent_commands.clone();
     let exclude_command_id = palette.exclude_command_id;
-    let candidates = command_palette_candidates_with_history(&query, &recent_commands)
-        .into_iter()
-        .filter(|candidate| exclude_command_id != Some(candidate.id))
-        .collect::<Vec<_>>();
+    let view_only = palette.view_only;
+    let candidates = scoped_palette_candidates(palette);
     let selected = palette.selected.min(candidates.len().saturating_sub(1));
     match key.code {
         KeyCode::Esc => {
@@ -29851,6 +29941,20 @@ fn handle_command_palette_key(
         KeyCode::Enter => {
             let query = query.trim();
             if let Some((command, arguments)) = command_palette_invocation(query) {
+                if view_only
+                    && !scoped_palette_candidates(&CommandPaletteState {
+                        query: query.to_owned(),
+                        selected: 0,
+                        recent_commands: recent_commands.clone(),
+                        exclude_command_id,
+                        view_only: true,
+                    })
+                    .iter()
+                    .any(|candidate| candidate.id == command.id)
+                {
+                    s.message = "Choose a view from the list or press Esc to return".into();
+                    return Ok(());
+                }
                 if command.takes_arguments && arguments.is_none() {
                     begin_command_arguments(s, command)?;
                 } else {
@@ -32541,6 +32645,7 @@ mod tests {
             selected: 0,
             recent_commands: Vec::new(),
             exclude_command_id: None,
+            view_only: false,
         });
 
         handle_command_palette_key(
@@ -34540,6 +34645,7 @@ mod tests {
             selected: 0,
             recent_commands: Vec::new(),
             exclude_command_id: None,
+            view_only: false,
         });
         handle(
             &mut state,
@@ -39359,6 +39465,68 @@ mod tests {
     }
 
     #[test]
+    fn switch_view_search_reuses_the_focused_window_and_restores_its_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Draft", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.pane_bounds = pane_layout::PaneRect {
+            x: 0,
+            y: 1,
+            width: 120,
+            height: 40,
+        };
+        state
+            .split_focused_window(pane_layout::Orientation::Vertical)
+            .unwrap();
+
+        let view_menu = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "View")
+            .unwrap();
+        state.open_menu_category(view_menu);
+        let switch_view = state
+            .menu_commands()
+            .iter()
+            .position(|command| command.id == "window.switch-view")
+            .expect("View menu exposes Switch View");
+        state.menu.as_mut().unwrap().selected = switch_view;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        let palette = state.command_palette.as_mut().unwrap();
+        assert!(palette.view_only);
+        palette.query = "reference-timeline".into();
+        let candidates = scoped_palette_candidates(palette);
+        let timeline_index = candidates
+            .iter()
+            .position(|command| command.id == "view.reference-timeline")
+            .expect("the timeline reference is searchable");
+        state.command_palette.as_mut().unwrap().selected = timeline_index;
+        handle_command_palette_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.pane_layout.as_ref().unwrap().panes(), vec![1, 2]);
+        assert_eq!(state.reference_panes.len(), 1);
+        assert_eq!(state.reference_panes[0].layout_id, Some(2));
+        assert_eq!(state.reference_panes[0].source_key, "timeline:project");
+
+        let mut reopened = AppState::new(
+            WriterApp::open_project(&project).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        assert_eq!(reopened.pane_layout, state.pane_layout);
+        assert_eq!(reopened.reference_panes.len(), 1);
+        assert_eq!(reopened.reference_panes[0].source_key, "timeline:project");
+    }
+
+    #[test]
     fn outline_timeline_search_and_diagnostics_can_open_and_restore_as_buffers() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("Novel");
@@ -42863,6 +43031,7 @@ mod tests {
                             | "view.reference-outline"
                             | "view.reference-timeline"
                             | "view.reference-diagnostics"
+                            | "window.switch-view"
                             | "window.split-side-by-side"
                             | "window.split-top-bottom"
                             | "window.maximize"
