@@ -22563,6 +22563,89 @@ impl AppState {
         self.extra_cursors.dedup();
     }
 
+    fn rendered_source_offset_for_cursor(
+        &self,
+        projection: &story_document::RenderedProjection,
+        cursor: (usize, usize),
+    ) -> Option<usize> {
+        let source_offset = editor_position_byte(&self.editor, cursor.0, cursor.1);
+        let display_offset =
+            projection.source_to_display(source_offset, story_document::ProjectionBias::After)?;
+        projection.display_to_source(display_offset, story_document::ProjectionBias::Before)
+    }
+
+    fn normalize_rendered_cursor(&mut self) {
+        if !self.editor_preferences.rendered_markdown
+            || self.editor_selection.is_some()
+            || !self.extra_cursors.is_empty()
+        {
+            return;
+        }
+        let source = self.editor.join("\n");
+        let projection = story_document::SemanticDocument::parse(source).rendered_projection();
+        if projection.mode != story_document::ProjectionMode::Rendered {
+            return;
+        }
+        if let Some(source_offset) =
+            self.rendered_source_offset_for_cursor(&projection, self.cursor)
+            && let Some(cursor) = editor_position_from_byte(&self.editor.join("\n"), source_offset)
+        {
+            self.cursor = cursor;
+        }
+    }
+
+    fn move_editor_cursors_in_view(&mut self, motion: CursorMotion, selecting: bool) {
+        if !self.editor_preferences.rendered_markdown || !self.extra_cursors.is_empty() {
+            self.move_editor_cursors(motion, selecting);
+            return;
+        }
+        let source = self.editor.join("\n");
+        let projection = story_document::SemanticDocument::parse(source).rendered_projection();
+        if projection.mode != story_document::ProjectionMode::Rendered {
+            self.move_editor_cursors(motion, selecting);
+            return;
+        }
+        let Some(source_offset) = self.rendered_source_offset_for_cursor(&projection, self.cursor)
+        else {
+            self.move_editor_cursors(motion, selecting);
+            return;
+        };
+        let Some(display_cursor) = editor_position_from_byte(
+            &projection.text,
+            projection
+                .source_to_display(source_offset, story_document::ProjectionBias::After)
+                .unwrap_or(0),
+        ) else {
+            self.move_editor_cursors(motion, selecting);
+            return;
+        };
+        let lines = projection
+            .text
+            .split('\n')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let (row, column) = display_cursor;
+        let target = match motion {
+            CursorMotion::Left if column > 0 => (row, column - 1),
+            CursorMotion::Left if row > 0 => (row - 1, grapheme_count(&lines[row - 1])),
+            CursorMotion::Right if column < grapheme_count(&lines[row]) => (row, column + 1),
+            CursorMotion::Right if row + 1 < lines.len() => (row + 1, 0),
+            CursorMotion::Up => (row.saturating_sub(1), column),
+            CursorMotion::Down => ((row + 1).min(lines.len().saturating_sub(1)), column),
+            CursorMotion::Home => (row, 0),
+            CursorMotion::End => (row, grapheme_count(&lines[row])),
+            _ => (row, column),
+        };
+        let target_display = editor_position_byte(&lines, target.0, target.1);
+        let target_source = projection
+            .display_to_source(target_display, story_document::ProjectionBias::Before)
+            .unwrap_or(source_offset);
+        if let Some(target) = editor_position_from_byte(&self.editor.join("\n"), target_source) {
+            self.last_yank = None;
+            self.move_cursor(target.0, target.1, selecting);
+        }
+    }
+
     fn delete_at_all_cursors(&mut self, backward: bool) -> bool {
         if self.extra_cursors.is_empty()
             || self.editor_selection.is_some()
@@ -32188,6 +32271,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             s.search_locations.clear();
             s.search_result_rows.clear();
             s.push_undo();
+            s.normalize_rendered_cursor();
         }
         if k.modifiers.contains(KeyModifiers::CONTROL) {
             match k.code {
@@ -32210,6 +32294,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 }
                 KeyCode::Char('v') => {
                     let text = s.clipboard.clone();
+                    s.normalize_rendered_cursor();
                     s.paste_text(&text);
                     return Ok(false);
                 }
@@ -32228,7 +32313,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 } else {
                     story_core::EditMacroOp::MoveLineStart
                 });
-                s.move_editor_cursors(CursorMotion::Home, selecting)
+                s.move_editor_cursors_in_view(CursorMotion::Home, selecting)
             }
             KeyCode::End => {
                 s.record_macro_op(if selecting {
@@ -32236,7 +32321,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 } else {
                     story_core::EditMacroOp::MoveLineEnd
                 });
-                s.move_editor_cursors(CursorMotion::End, selecting)
+                s.move_editor_cursors_in_view(CursorMotion::End, selecting)
             }
             KeyCode::Char('w') if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 let row = s.cursor.0;
@@ -32263,7 +32348,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 } else {
                     story_core::EditMacroOp::MoveLeft
                 });
-                s.move_editor_cursors(CursorMotion::Left, selecting)
+                s.move_editor_cursors_in_view(CursorMotion::Left, selecting)
             }
             KeyCode::Right => {
                 s.record_macro_op(if selecting {
@@ -32271,7 +32356,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 } else {
                     story_core::EditMacroOp::MoveRight
                 });
-                s.move_editor_cursors(CursorMotion::Right, selecting)
+                s.move_editor_cursors_in_view(CursorMotion::Right, selecting)
             }
             KeyCode::Up => {
                 s.record_macro_op(if selecting {
@@ -32279,7 +32364,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 } else {
                     story_core::EditMacroOp::MoveUp
                 });
-                s.move_editor_cursors(CursorMotion::Up, selecting)
+                s.move_editor_cursors_in_view(CursorMotion::Up, selecting)
             }
             KeyCode::Down => {
                 s.record_macro_op(if selecting {
@@ -32287,7 +32372,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 } else {
                     story_core::EditMacroOp::MoveDown
                 });
-                s.move_editor_cursors(CursorMotion::Down, selecting)
+                s.move_editor_cursors_in_view(CursorMotion::Down, selecting)
             }
             KeyCode::Char(c)
                 if !k.modifiers.contains(KeyModifiers::CONTROL)
@@ -50055,6 +50140,62 @@ mod tests {
 
         let database_source = state.app.load_scene_text(scene).unwrap().0;
         assert_eq!(database_source, original_source);
+    }
+
+    #[test]
+    fn rendered_editor_navigation_and_typing_map_to_canonical_markdown_boundaries() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let source = "**bold** and *café* 🙂";
+        let hash = app.load_scene_text(scene).unwrap().1;
+        app.save_scene_text(scene, Some(&hash), source).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor_preferences.rendered_markdown = true;
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "**Xbold** and *café* 🙂");
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), source);
+
+        state.cursor = (0, 0);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            editor_position_byte(&state.editor, state.cursor.0, state.cursor.1),
+            3
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            editor_position_byte(&state.editor, state.cursor.0, state.cursor.1),
+            4
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            editor_position_byte(&state.editor, state.cursor.0, state.cursor.1),
+            3
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "**bYold** and *café* 🙂");
+        assert!(state.dirty);
     }
 
     #[test]
