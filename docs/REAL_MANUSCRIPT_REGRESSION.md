@@ -177,3 +177,24 @@ does not establish correct Scrivener compile selection, chapter layouts,
 variables, front/back matter, or publication structure. The next publication
 work must recover those settings from project/format metadata and validate the
 shared Compile IR before adding exporter-specific behavior.
+
+## 25 November 2026 — Scrivener compile metadata inventory correction
+
+The production inventory now reads binder `IncludeInCompile` and `SectionType`
+from each binder item's own metadata scope. It also inventories project
+metadata, project content scope, format-level section layout mappings, and
+front/back matter selection flags from `Settings/compile.xml`. This avoids the
+recursive-field ambiguity where a container could inherit a nested document's
+`IncludeInCompile` value. It does **not** yet apply these settings to WIDE's
+shared Compile IR or a selected WIDE publication profile. Do not claim chapter
+numbering, hidden organisational headings, scene separators or retailer-specific
+matter are recovered until they have source-linked integration tests and pass
+the fresh three-book publication regression.
+
+The synthetic test
+`scrivener_compile_settings_and_binder_flags_are_scoped_to_their_owner` covers
+independent parent/child flags, project metadata, layout mappings and front/back
+matter switches. The inspect-only real-fixture run is recorded under
+`reports/20261125T224346Z/`; its output includes private project metadata and
+must remain local and ignored. Fixture checksums passed before and after the
+run.

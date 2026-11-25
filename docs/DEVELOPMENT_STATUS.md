@@ -46,6 +46,20 @@ historical EPUBs are comparison evidence, not exact text baselines. Before makin
 changes, refresh issues #7, #35, #44, #53, and #73 and verify fixture checksums.
 Keep all manuscript-bearing output and detailed reports local.
 
+The 25 November follow-up audit found that binder `IncludeInCompile` was being
+read from recursively flattened metadata. A folder could therefore inherit a
+child's flag. Import inventory now reads each item's own metadata and records
+its `SectionType` separately. It also inventories project publication metadata,
+content scope, format-level section layout mappings and default front/back
+matter switches from `Settings/compile.xml`. Synthetic regression coverage
+verifies parent and child flags remain independent. The private inspect-only
+run `reports/20261125T224346Z/` read all 70/64/118 binder items, recovered the
+available project metadata and two compile format records per project, and left
+fixture checksums unchanged. This is an inventory correction only: these
+source compile rules are not yet applied to the shared Compile IR, WIDE
+publication profiles, or semantic document presentation. Publication privacy
+and fidelity therefore remain failed acceptance gates.
+
 The follow-up outliner repair separates scene-title editing from save-conflict
 review, which previously shared the same key-input mode. Scene > Rename now
 opens a focused field prefilled with the current title; Ctrl+A clears it,

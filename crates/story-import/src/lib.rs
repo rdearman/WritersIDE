@@ -406,9 +406,41 @@ pub struct ScrivenerProjectInventory {
     pub format_version: Option<String>,
     #[serde(default)]
     pub creator: Option<String>,
+    /// Project metadata recorded in `Settings/compile.xml`, when present.
+    /// Values are kept as source metadata; callers decide whether an empty
+    /// destination field may be populated from them.
+    #[serde(default)]
+    pub project_metadata: BTreeMap<String, String>,
+    /// Scrivener compile settings are retained for review and later mapping.
+    /// They are not silently treated as a WIDE publication profile.
+    #[serde(default)]
+    pub compile_settings: Option<ScrivenerCompileSettings>,
     pub items: Vec<ScrivenerBinderItem>,
     pub warnings: Vec<String>,
     pub unsupported: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScrivenerCompileSettings {
+    #[serde(default)]
+    pub content_scope: Option<String>,
+    #[serde(default)]
+    pub formats: Vec<ScrivenerCompileFormatSettings>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScrivenerCompileFormatSettings {
+    pub source_format_id: String,
+    #[serde(default)]
+    pub section_layouts: BTreeMap<String, String>,
+    #[serde(default)]
+    pub default_front_matter_id: Option<String>,
+    #[serde(default)]
+    pub add_default_front_matter: Option<bool>,
+    #[serde(default)]
+    pub default_back_matter_id: Option<String>,
+    #[serde(default)]
+    pub add_default_back_matter: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -420,6 +452,10 @@ pub struct ScrivenerBinderItem {
     pub type_code: Option<String>,
     pub area: String,
     pub include_in_compile: Option<bool>,
+    /// Binder item's own SectionType value. It is deliberately separate from
+    /// recursively collected custom metadata and from its display title.
+    #[serde(default)]
+    pub section_type_id: Option<String>,
     pub synopsis: Option<String>,
     pub notes_markdown: Option<String>,
     pub content_markdown: Option<String>,
@@ -1494,10 +1530,28 @@ pub fn inspect_scrivener_project(
             .to_owned(),
         format_version: version.clone(),
         creator,
+        project_metadata: BTreeMap::new(),
+        compile_settings: None,
         items: Vec::new(),
         warnings: Vec::new(),
         unsupported: Vec::new(),
     };
+
+    if let Some(settings_dir) = find_case_insensitive_child(&project_root, "Settings", true)? {
+        if let Some(compile_path) =
+            find_case_insensitive_child(&settings_dir, "compile.xml", false)?
+        {
+            let compile_xml = fs::read_to_string(&compile_path)
+                .map_err(|error| ImportError::Io(error.to_string()))?;
+            let compile_root = parse_scrivener_xml(&compile_xml)?;
+            inventory.project_metadata = scrivener_project_metadata(&compile_root);
+            inventory.compile_settings = Some(scrivener_compile_settings(&compile_root));
+        } else {
+            inventory.warnings.push(
+                "Scrivener compile.xml was not present; project metadata and format-level compile settings could not be inspected".into(),
+            );
+        }
+    }
 
     if version.as_deref() != Some("2.0") {
         inventory.unsupported.push(format!(
@@ -1778,6 +1832,121 @@ fn scrivener_field_values(node: &ScrivenerXmlNode, values: &mut BTreeMap<String,
     }
 }
 
+fn scrivener_metadata_node(node: &ScrivenerXmlNode) -> Option<&ScrivenerXmlNode> {
+    node.children
+        .iter()
+        .find(|child| child.name.eq_ignore_ascii_case("MetaData"))
+}
+
+fn scrivener_own_metadata_values(node: &ScrivenerXmlNode) -> BTreeMap<String, String> {
+    let mut values = BTreeMap::new();
+    if let Some(metadata) = scrivener_metadata_node(node) {
+        scrivener_field_values(metadata, &mut values);
+    } else {
+        for child in &node.children {
+            if child.children.is_empty() && !child.text.trim().is_empty() {
+                values.insert(child.name.clone(), child.text.trim().to_owned());
+            }
+        }
+    }
+    values
+}
+
+fn scrivener_project_metadata(root: &ScrivenerXmlNode) -> BTreeMap<String, String> {
+    let Some(project_settings) = find_scrivener_node(root, "ProjectSettings") else {
+        return BTreeMap::new();
+    };
+    let Some(metadata) = project_settings
+        .children
+        .iter()
+        .find(|child| child.name.eq_ignore_ascii_case("MetaData"))
+    else {
+        return BTreeMap::new();
+    };
+    let mut values = BTreeMap::new();
+    scrivener_field_values(metadata, &mut values);
+    values
+}
+
+fn scrivener_compile_settings(root: &ScrivenerXmlNode) -> ScrivenerCompileSettings {
+    let project_content = find_scrivener_node(root, "Content");
+    let content_scope = project_content
+        .and_then(|node| node.attributes.get("Scope"))
+        .cloned();
+    let Some(format_settings) = find_scrivener_node(root, "FormatSettings") else {
+        return ScrivenerCompileSettings {
+            content_scope,
+            formats: Vec::new(),
+        };
+    };
+    let formats = format_settings
+        .children
+        .iter()
+        .filter(|node| node.name.eq_ignore_ascii_case("Format"))
+        .map(|format| {
+            let mut settings = ScrivenerCompileFormatSettings {
+                source_format_id: format.attributes.get("ID").cloned().unwrap_or_default(),
+                ..ScrivenerCompileFormatSettings::default()
+            };
+            if let Some(layouts) = format
+                .children
+                .iter()
+                .find(|child| child.name.eq_ignore_ascii_case("SectionLayouts"))
+            {
+                for layout in layouts
+                    .children
+                    .iter()
+                    .filter(|child| child.name.eq_ignore_ascii_case("Type"))
+                {
+                    if let Some(section_type_id) = layout.attributes.get("ID") {
+                        let layout_name = layout.text.trim();
+                        if !layout_name.is_empty() {
+                            settings
+                                .section_layouts
+                                .insert(section_type_id.clone(), layout_name.to_owned());
+                        }
+                    }
+                }
+            }
+            if let Some(matter) = format
+                .children
+                .iter()
+                .find(|child| child.name.eq_ignore_ascii_case("FrontAndBackMatter"))
+            {
+                for (name, id, add) in [
+                    (
+                        "DefaultFrontMatter",
+                        &mut settings.default_front_matter_id,
+                        &mut settings.add_default_front_matter,
+                    ),
+                    (
+                        "DefaultBackMatter",
+                        &mut settings.default_back_matter_id,
+                        &mut settings.add_default_back_matter,
+                    ),
+                ] {
+                    if let Some(node) = matter
+                        .children
+                        .iter()
+                        .find(|child| child.name.eq_ignore_ascii_case(name))
+                    {
+                        let value = node.text.trim();
+                        *id = (!value.is_empty()).then(|| value.to_owned());
+                        *add = node.attributes.get("Add").map(|value| {
+                            matches!(value.to_ascii_lowercase().as_str(), "yes" | "true" | "1")
+                        });
+                    }
+                }
+            }
+            settings
+        })
+        .collect();
+    ScrivenerCompileSettings {
+        content_scope,
+        formats,
+    }
+}
+
 fn scrivener_named_value(node: &ScrivenerXmlNode, name: &str) -> Option<String> {
     node.children
         .iter()
@@ -1838,7 +2007,8 @@ fn collect_scrivener_item(
     let area = classify_scrivener_area(&title, type_code.as_deref(), &parent_area);
     let mut fields = BTreeMap::new();
     scrivener_field_values(node, &mut fields);
-    let include_in_compile = fields
+    let own_metadata = scrivener_own_metadata_values(node);
+    let include_in_compile = own_metadata
         .iter()
         .find(|(key, _)| {
             key.eq_ignore_ascii_case("IncludeInCompile")
@@ -1850,6 +2020,11 @@ fn collect_scrivener_item(
                 "yes" | "true" | "1" | "include"
             )
         });
+    let section_type_id = own_metadata
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case("SectionType"))
+        .map(|(_, value)| value.clone())
+        .filter(|value| !value.is_empty());
     let mut unsupported = Vec::new();
     let mut synopsis = None;
     let mut notes_markdown = None;
@@ -1912,6 +2087,7 @@ fn collect_scrivener_item(
         type_code,
         area: area.clone(),
         include_in_compile,
+        section_type_id,
         synopsis,
         notes_markdown,
         content_markdown,
@@ -3900,6 +4076,79 @@ This is an addition to the old file.}"#;
     }
 
     #[test]
+    fn scrivener_compile_settings_and_binder_flags_are_scoped_to_their_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Compile Metadata.scriv");
+        let settings = project.join("Settings");
+        std::fs::create_dir_all(&settings).unwrap();
+        std::fs::write(
+            project.join("Compile Metadata.scrivx"),
+            r#"<ScrivenerProject Version="2.0"><Binder>
+              <BinderItem UUID="folder" Type="Folder"><Title>Organisational heading</Title>
+                <MetaData><IncludeInCompile>No</IncludeInCompile><SectionType>type-folder</SectionType></MetaData>
+                <Children><BinderItem UUID="child" Type="Text"><Title>Chapter prose</Title>
+                  <MetaData><IncludeInCompile>Yes</IncludeInCompile><SectionType>type-chapter</SectionType></MetaData>
+                  <Children/></BinderItem></Children></BinderItem>
+            </Binder></ScrivenerProject>"#,
+        )
+        .unwrap();
+        std::fs::write(
+            settings.join("compile.xml"),
+            r#"<CompileSettings><ProjectSettings><Content Scope="Included"/>
+              <MetaData><ProjectTitle>Imported title</ProjectTitle><Authors>Author name</Authors></MetaData>
+            </ProjectSettings><FormatSettings>
+              <Format ID="DEFAULT"><SectionLayouts><Type ID="type-folder">Hidden Section</Type>
+                <Type ID="type-chapter">Chapter Heading</Type></SectionLayouts></Format>
+              <Format ID="retailer"><FrontAndBackMatter>
+                <DefaultFrontMatter Add="Yes">front-id</DefaultFrontMatter>
+                <DefaultBackMatter Add="No">back-id</DefaultBackMatter>
+              </FrontAndBackMatter></Format>
+            </FormatSettings></CompileSettings>"#,
+        )
+        .unwrap();
+
+        let inventory = inspect_scrivener_project(&project).unwrap();
+        assert_eq!(inventory.items[0].include_in_compile, Some(false));
+        assert_eq!(
+            inventory.items[0].section_type_id.as_deref(),
+            Some("type-folder")
+        );
+        assert_eq!(inventory.items[1].include_in_compile, Some(true));
+        assert_eq!(
+            inventory.items[1].section_type_id.as_deref(),
+            Some("type-chapter")
+        );
+        assert_eq!(
+            inventory.project_metadata.get("ProjectTitle").unwrap(),
+            "Imported title"
+        );
+        assert_eq!(
+            inventory.project_metadata.get("Authors").unwrap(),
+            "Author name"
+        );
+        let formats = inventory.compile_settings.unwrap().formats;
+        assert_eq!(formats.len(), 2);
+        assert_eq!(
+            formats[0].section_layouts.get("type-folder").unwrap(),
+            "Hidden Section"
+        );
+        assert_eq!(
+            formats[0].section_layouts.get("type-chapter").unwrap(),
+            "Chapter Heading"
+        );
+        assert_eq!(
+            formats[1].default_front_matter_id.as_deref(),
+            Some("front-id")
+        );
+        assert_eq!(formats[1].add_default_front_matter, Some(true));
+        assert_eq!(
+            formats[1].default_back_matter_id.as_deref(),
+            Some("back-id")
+        );
+        assert_eq!(formats[1].add_default_back_matter, Some(false));
+    }
+
+    #[test]
     fn scrivener_inventory_rejects_malformed_and_duplicate_binder_items() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("Broken.scriv");
@@ -3916,6 +4165,8 @@ This is an addition to the old file.}"#;
             title: String::new(),
             format_version: None,
             creator: None,
+            project_metadata: BTreeMap::new(),
+            compile_settings: None,
             items: vec![
                 ScrivenerBinderItem {
                     source_document_id: "same".into(),
@@ -3925,6 +4176,7 @@ This is an addition to the old file.}"#;
                     type_code: None,
                     area: "unknown".into(),
                     include_in_compile: None,
+                    section_type_id: None,
                     synopsis: None,
                     notes_markdown: None,
                     content_markdown: None,
@@ -3940,6 +4192,7 @@ This is an addition to the old file.}"#;
                     type_code: None,
                     area: "unknown".into(),
                     include_in_compile: None,
+                    section_type_id: None,
                     synopsis: None,
                     notes_markdown: None,
                     content_markdown: None,
