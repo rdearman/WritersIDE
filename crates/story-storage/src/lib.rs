@@ -64,6 +64,8 @@ const MIGRATION_47: &str =
     include_str!("../migrations/0047_recoverable_structural_node_removal.sql");
 const MIGRATION_48: &str = include_str!("../migrations/0048_structural_removal_operations.sql");
 const MIGRATION_49: &str = include_str!("../migrations/0049_structural_promotion_recovery.sql");
+const MIGRATION_50: &str =
+    include_str!("../migrations/0050_structural_removal_content_placement.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -507,6 +509,14 @@ struct StructuralRemovalScene {
     applied_chapter_id: Option<String>,
     applied_position: Option<i64>,
     applied_unplaced_position: Option<i64>,
+}
+struct StructuralRemovalContentUnit {
+    id: String,
+    was_archived: bool,
+    original_parent_id: Option<String>,
+    original_position: Option<u32>,
+    applied_parent_id: Option<String>,
+    applied_position: Option<i64>,
 }
 #[derive(Clone, Debug)]
 pub struct ContentUnitRecord {
@@ -1472,6 +1482,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_47}\nINSERT INTO schema_migrations(version,applied_at) VALUES(47,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_48}\nINSERT INTO schema_migrations(version,applied_at) VALUES(48,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_49}\nINSERT INTO schema_migrations(version,applied_at) VALUES(49,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_50}\nINSERT INTO schema_migrations(version,applied_at) VALUES(50,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1520,7 +1531,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 49 {
+        if version > 50 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1717,6 +1728,10 @@ impl ProjectStore {
         }
         if current_version == 48 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_49}\nINSERT INTO schema_migrations(version,applied_at) VALUES(49,'{}');\nCOMMIT;", now()))?;
+            current_version = 49;
+        }
+        if current_version == 49 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_50}\nINSERT INTO schema_migrations(version,applied_at) VALUES(50,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -4200,6 +4215,18 @@ impl ProjectStore {
         chapter_id: NodeId,
         destination: Option<NodeId>,
     ) -> Result<Uuid> {
+        self.remove_chapter_rehome_scenes_and_prose(chapter_id, destination, None)
+    }
+
+    /// Remove a chapter while independently retaining scenes and direct prose
+    /// in compatible destinations. A missing prose destination archives the
+    /// prose in Removed Documents for explicit recoverable deletion.
+    pub fn remove_chapter_rehome_scenes_and_prose(
+        &mut self,
+        chapter_id: NodeId,
+        destination: Option<NodeId>,
+        prose_destination: Option<NodeId>,
+    ) -> Result<Uuid> {
         let chapter_kind: Option<String> = self
             .conn
             .query_row(
@@ -4228,6 +4255,21 @@ impl ProjectStore {
                 ));
             }
         }
+        if let Some(destination) = prose_destination {
+            let kind: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT kind FROM structural_node WHERE id=?1 AND archived=0",
+                    [destination.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if kind.as_deref() != Some("chapter") || destination == chapter_id {
+                return Err(StorageError::Invalid(
+                    "select a different active chapter for the chapter prose".into(),
+                ));
+            }
+        }
         let scenes: Vec<(String, u32, bool, String)> = {
             let mut statement = self.conn.prepare(
                 "SELECT scene.id,placement.position,scene.archived,scene.status FROM scene JOIN scene_placement placement ON placement.scene_id=scene.id WHERE placement.chapter_id=?1 ORDER BY placement.position,scene.id",
@@ -4241,12 +4283,12 @@ impl ProjectStore {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let content_units: Vec<(String, bool)> = {
+        let content_units: Vec<(String, bool, u32)> = {
             let mut statement =
-                tx.prepare("SELECT id,archived FROM content_unit WHERE parent_node_id=?1")?;
+                tx.prepare("SELECT id,archived,position FROM content_unit WHERE parent_node_id=?1 ORDER BY position,id")?;
             statement
                 .query_map([chapter_id.to_string()], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
                 })?
                 .collect::<std::result::Result<_, _>>()?
         };
@@ -4307,16 +4349,38 @@ impl ProjectStore {
                 params![removal_id.to_string(),scene_id,chapter_id.to_string(),position,was_archived,status,applied_chapter,applied_position,applied_unplaced],
             )?;
         }
-        for (unit_id, was_archived) in content_units {
-            tx.execute(
-                "INSERT INTO structural_removal_content_unit(removal_id,content_unit_id,was_archived) VALUES(?1,?2,?3)",
-                params![removal_id.to_string(), unit_id, was_archived],
-            )?;
-            if !was_archived {
+        let mut prose_position: i64 = if let Some(destination) = prose_destination {
+            tx.query_row(
+                "SELECT COALESCE(MAX(position),-1)+1 FROM content_unit WHERE parent_node_id=?1",
+                [destination.to_string()],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        };
+        for (unit_id, was_archived, original_position) in content_units {
+            if !was_archived && let Some(target) = prose_destination {
+                let applied_position = prose_position;
                 tx.execute(
-                    "UPDATE content_unit SET archived=1,updated_at=?2 WHERE id=?1",
-                    params![unit_id, now()],
+                    "INSERT INTO structural_removal_content_unit(removal_id,content_unit_id,was_archived,original_parent_node_id,original_position,applied_parent_node_id,applied_position) VALUES(?1,?2,0,?3,?4,?5,?6)",
+                    params![removal_id.to_string(), unit_id, chapter_id.to_string(), original_position, target.to_string(), applied_position],
                 )?;
+                tx.execute(
+                    "UPDATE content_unit SET parent_node_id=?2,position=?3,updated_at=?4 WHERE id=?1",
+                    params![unit_id, target.to_string(), applied_position, now()],
+                )?;
+                prose_position += 1;
+            } else {
+                tx.execute(
+                    "INSERT INTO structural_removal_content_unit(removal_id,content_unit_id,was_archived) VALUES(?1,?2,?3)",
+                    params![removal_id.to_string(), unit_id, was_archived],
+                )?;
+                if !was_archived {
+                    tx.execute(
+                        "UPDATE content_unit SET archived=1,updated_at=?2 WHERE id=?1",
+                        params![unit_id, now()],
+                    )?;
+                }
             }
         }
         tx.execute(
@@ -4617,21 +4681,65 @@ impl ProjectStore {
                 )?;
             }
         }
-        let units: Vec<(String, bool)> = {
+        let units: Vec<StructuralRemovalContentUnit> = {
             let mut statement = tx.prepare(
-                "SELECT content_unit_id,was_archived FROM structural_removal_content_unit WHERE removal_id=?1",
+                "SELECT content_unit_id,was_archived,original_parent_node_id,original_position,applied_parent_node_id,applied_position FROM structural_removal_content_unit WHERE removal_id=?1",
             )?;
             statement
                 .query_map([removal_id.to_string()], |row| {
-                    Ok((row.get(0)?, row.get(1)?))
+                    Ok(StructuralRemovalContentUnit {
+                        id: row.get(0)?,
+                        was_archived: row.get(1)?,
+                        original_parent_id: row.get(2)?,
+                        original_position: row.get(3)?,
+                        applied_parent_id: row.get(4)?,
+                        applied_position: row.get(5)?,
+                    })
                 })?
                 .collect::<std::result::Result<_, _>>()?
         };
-        for (unit, was_archived) in units {
-            if !was_archived {
+        for unit in units {
+            if let (
+                Some(original_parent),
+                Some(original_position),
+                Some(applied_parent),
+                Some(applied_position),
+            ) = (
+                unit.original_parent_id,
+                unit.original_position,
+                unit.applied_parent_id,
+                unit.applied_position,
+            ) {
+                let current: (String, u32, bool) = tx.query_row(
+                    "SELECT parent_node_id,position,archived FROM content_unit WHERE id=?1",
+                    [&unit.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                if current != (applied_parent, applied_position as u32, unit.was_archived) {
+                    return Err(StorageError::RecoveryConflict(format!(
+                        "cannot restore removed chapter because prose document {} has moved since removal",
+                        unit.id
+                    )));
+                }
+                let occupied: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM content_unit WHERE parent_node_id=?1 AND position=?2 AND id!=?3)",
+                    params![original_parent, original_position, unit.id],
+                    |row| row.get(0),
+                )?;
+                if occupied {
+                    return Err(StorageError::RecoveryConflict(format!(
+                        "cannot restore removed chapter because original prose position for {} is occupied",
+                        unit.id
+                    )));
+                }
+                tx.execute(
+                    "UPDATE content_unit SET parent_node_id=?2,position=?3,updated_at=?4 WHERE id=?1",
+                    params![unit.id, original_parent, original_position, now()],
+                )?;
+            } else if !unit.was_archived {
                 tx.execute(
                     "UPDATE content_unit SET archived=0,updated_at=?2 WHERE id=?1",
-                    params![unit, now()],
+                    params![unit.id, now()],
                 )?;
             }
         }
@@ -11287,7 +11395,7 @@ mod tests {
         let project = directory.path().join("Book");
         let store = ProjectStore::create(&project, "Book").unwrap();
         store.conn.execute_batch(
-            "DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
+            "DROP INDEX content_unit_one_section_body_per_node; CREATE UNIQUE INDEX content_unit_one_body_per_node ON content_unit(parent_node_id,kind) WHERE kind IN('section_body','chapter_body'); DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
        ).unwrap();
         drop(store);
 
@@ -11313,7 +11421,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 49);
+        assert_eq!(version, 50);
     }
     #[test]
     fn event_character_and_location_relationships_are_typed_atomic_and_persistent() {
@@ -11372,7 +11480,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 49);
+        assert_eq!(schema_version, 50);
     }
     #[test]
     fn writing_challenges_are_validated_persisted_and_completed_once() {
@@ -13226,7 +13334,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 49))
+            .map(|version| assert_eq!(version, 50))
             .unwrap();
     }
 
@@ -13647,7 +13755,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 49);
+        assert_eq!(version, 50);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -15752,6 +15860,98 @@ mod tests {
     }
 
     #[test]
+    fn chapter_prose_can_move_to_another_chapter_and_restore_with_identity_and_order() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let source = store
+            .create_node(None, NodeKind::Chapter, "Source", 0)
+            .unwrap();
+        let target = store
+            .create_node(None, NodeKind::Chapter, "Target", 1)
+            .unwrap();
+        let target_prose = store
+            .create_content_unit(
+                ContentUnitKind::ChapterBody,
+                "Target prose",
+                Some(target),
+                0,
+                None,
+            )
+            .unwrap();
+        let source_prose = store
+            .create_content_unit(
+                ContentUnitKind::ChapterBody,
+                "Source prose",
+                Some(source),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, source_hash) = store.load_content_unit_text(source_prose).unwrap();
+        store
+            .save_content_unit_text(source_prose, Some(&source_hash), "Retained source text.")
+            .unwrap();
+
+        let removal = store
+            .remove_chapter_rehome_scenes_and_prose(source, None, Some(target))
+            .unwrap();
+        let moved = store.get_content_unit(source_prose).unwrap();
+        assert!(!moved.archived);
+        assert_eq!(moved.parent_id, Some(target));
+        assert_eq!(moved.position, 1);
+        assert_eq!(moved.title, "Source prose");
+        assert_eq!(
+            store.load_content_unit_text(source_prose).unwrap().0,
+            "Retained source text."
+        );
+        assert_eq!(store.get_content_unit(target_prose).unwrap().position, 0);
+        drop(store);
+
+        let mut reopened = ProjectStore::open(&project).unwrap();
+        reopened.restore_structural_subtree(removal).unwrap();
+        let restored = reopened.get_content_unit(source_prose).unwrap();
+        assert_eq!(restored.parent_id, Some(source));
+        assert_eq!(restored.position, 0);
+        assert!(!restored.archived);
+        assert_eq!(restored.title, "Source prose");
+        assert_eq!(reopened.get_content_unit(target_prose).unwrap().position, 0);
+        assert_eq!(
+            reopened.load_content_unit_text(source_prose).unwrap().0,
+            "Retained source text."
+        );
+    }
+
+    #[test]
+    fn chapter_prose_rehome_does_not_allow_duplicate_section_body_documents() {
+        let directory = tempdir().unwrap();
+        let mut store = ProjectStore::create(directory.path().join("Book"), "Book").unwrap();
+        let section = store
+            .create_node(None, NodeKind::Section, "Part", 0)
+            .unwrap();
+        store
+            .create_content_unit(
+                ContentUnitKind::SectionBody,
+                "Part introduction",
+                Some(section),
+                0,
+                None,
+            )
+            .unwrap();
+        assert!(
+            store
+                .create_content_unit(
+                    ContentUnitKind::SectionBody,
+                    "Second part introduction",
+                    Some(section),
+                    1,
+                    None,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
     fn structural_restore_refuses_to_overwrite_a_scene_moved_after_removal() {
         let directory = tempdir().unwrap();
         let project = directory.path().join("Book");
@@ -15840,7 +16040,7 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>=44;",
+                "DROP INDEX content_unit_one_section_body_per_node; CREATE UNIQUE INDEX content_unit_one_body_per_node ON content_unit(parent_node_id,kind) WHERE kind IN('section_body','chapter_body'); DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>=44;",
             )
             .unwrap();
         drop(connection);
@@ -15856,6 +16056,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 49);
+        assert_eq!(version, 50);
     }
 }

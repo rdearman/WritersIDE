@@ -1061,6 +1061,18 @@ impl WriterApp {
             .store
             .remove_chapter_rehome_scenes(chapter, destination)?)
     }
+    pub fn remove_chapter_rehome_scenes_and_prose(
+        &mut self,
+        chapter: NodeId,
+        scene_destination: Option<NodeId>,
+        prose_destination: Option<NodeId>,
+    ) -> Result<uuid::Uuid> {
+        Ok(self.store.remove_chapter_rehome_scenes_and_prose(
+            chapter,
+            scene_destination,
+            prose_destination,
+        )?)
+    }
     pub fn promote_section_children(&mut self, section: NodeId) -> Result<uuid::Uuid> {
         Ok(self.store.promote_section_children(section)?)
     }

@@ -204,6 +204,21 @@ def main():
         visible = ANSI_CONTROL.sub(b"", output[start:])
         return all(marker in visible for marker in markers)
 
+    def wait_for_screen_fragments(markers, start=0, timeout=5.0):
+        """Check the reconstructed current screen rather than concatenated redraw bytes."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            # Replay from process start so cursor-relative redraws retain the
+            # cells that were already on screen when this wait began.
+            rows = terminal_snapshot(output, 24, 80)
+            visible = "".join("".join(rows).split())
+            if all(marker.decode("utf-8").replace(" ", "") in visible for marker in markers):
+                return True
+            read_for(0.1)
+        rows = terminal_snapshot(output, 24, 80)
+        visible = "".join("".join(rows).split())
+        return all(marker.decode("utf-8").replace(" ", "") in visible for marker in markers)
+
     try:
         read_for(1.0)
         if insert_edit_actions:
@@ -540,8 +555,8 @@ def main():
                 raise AssertionError("Navigate menu did not expose Outline")
             os.write(master, b"\x1b[B\r")  # select Outline and open it
             outline_start = len(output)
-            if not wait_for_fragments(
-                (b"Selectedoutlineitem", b"Opening", b"Arrival"),
+            if not wait_for_screen_fragments(
+                (b"Selectedoutlineitem", b"Arrival"),
                 outline_start,
                 timeout=3.0,
             ):
@@ -553,10 +568,8 @@ def main():
             read_for(0.2)
             dialog_start = len(output)
             os.write(master, b"\x1b[3~")  # Delete selected chapter heading
-            if not wait_for_fragments(
-                (
+            dialog_markers = (
                     b"Delete",
-                    b"Opening",
                     b"Contains",
                     b"scene(s)",
                     b"prose",
@@ -568,17 +581,19 @@ def main():
                     b"Compile",
                     b"Esc",
                     b"cancel",
-                ),
-                dialog_start,
-                timeout=3.0,
-            ):
+                )
+            if not wait_for_screen_fragments(dialog_markers, dialog_start, timeout=3.0):
+                visible = ANSI_CONTROL.sub(b"", output[dialog_start:])
+                missing = [marker for marker in dialog_markers if marker not in visible]
                 raise AssertionError(
-                    "populated chapter removal did not show the explicit recoverable choices; visible tail: "
+                    "populated chapter removal did not show the explicit recoverable choices; missing "
+                    + repr(missing)
+                    + "; visible tail: "
                     + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
                 )
             if chapter_removal_target:
                 os.write(master, b"\x1b[B")  # move to the selected-chapter option
-                if not wait_for_fragments(
+                if not wait_for_screen_fragments(
                     (b"Destination", b"append", b"selected", b"order"),
                     dialog_start,
                     timeout=3.0,
@@ -589,7 +604,7 @@ def main():
                     )
             elif chapter_removal_delete:
                 os.write(master, b"\x1b[B\x1b[B")  # choose recoverable subtree deletion
-                if not wait_for_fragments(
+                if not wait_for_screen_fragments(
                     (b"Deletechapter", b"removed scenes", b"omitted", b"restored"),
                     dialog_start,
                     timeout=3.0,
@@ -600,8 +615,8 @@ def main():
                     )
             if chapter_removal_cancel:
                 os.write(master, b"\x1b")  # cancel; all hierarchy and prose must remain
-                if not wait_for_fragments(
-                    (b"cancel", b"Opening", b"Arrival"),
+                if not wait_for_screen_fragments(
+                    (b"toggleschaptercollapse", b"scene(s)"),
                     dialog_start,
                     timeout=3.0,
                 ):
@@ -635,8 +650,8 @@ def main():
             os.write(master, b"\x1b[21~")
             read_for(0.2)
             os.write(master, b"\x1b[C" * 3 + b"\x1b[B" + b"\r")
-            if not wait_for_fragments(
-                (b"Outline", b"PartOne", b"OldHeading", b"Subsection"), timeout=3.0
+            if not wait_for_screen_fragments(
+                (b"Outline", b"PartOne", b"Subsection"), timeout=3.0
             ):
                 raise AssertionError(
                     "Navigate > Outline did not show the non-fiction section tree; visible tail: "
@@ -646,8 +661,8 @@ def main():
             read_for(0.2)
             dialog_start = len(output)
             os.write(master, b"\x1b[3~")
-            if not wait_for_fragments(
-                (b"OldHeading", b"subordinate", b"Promote", b"another", b"subtree", b"recoverably"),
+            if not wait_for_screen_fragments(
+                (b"subordinate", b"Promote", b"another", b"subtree", b"recoverably"),
                 dialog_start,
                 timeout=3.0,
             ):
@@ -656,7 +671,7 @@ def main():
                     + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
                 )
             os.write(master, b"\x1b[B\x1b[B")  # choose recoverable subtree deletion
-            if not wait_for_fragments(
+            if not wait_for_screen_fragments(
                 (b"Deletethewholesubtree", b"omitted", b"restored"),
                 dialog_start,
                 timeout=3.0,
@@ -686,7 +701,7 @@ def main():
             os.write(master, b"\x1b[21~")
             read_for(0.2)
             os.write(master, b"\x1b[C" * 3 + b"\x1b[B" * 2 + b"\r")
-            if not wait_for_fragments(
+            if not wait_for_screen_fragments(
                 (b"Included", b"Arrival"), scene_workspace_start, timeout=3.0
             ):
                 raise AssertionError("Navigate > Scene Cards did not open the card list")

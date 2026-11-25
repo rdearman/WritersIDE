@@ -209,6 +209,7 @@ struct StructuralNodeRemovalDialog {
     target_section_index: usize,
     target_chapters: Vec<story_core::NodeId>,
     target_index: usize,
+    keep_chapter_prose: bool,
     choice: usize,
 }
 
@@ -11189,8 +11190,10 @@ impl AppState {
             })
             .collect();
         let descendant_nodes = subtree_ids.len().saturating_sub(1) as u32;
-        let can_rehome_scenes =
-            !restoring && node.kind == "chapter" && descendant_nodes == 0 && !scenes.is_empty();
+        let can_rehome_scenes = !restoring
+            && node.kind == "chapter"
+            && descendant_nodes == 0
+            && (!scenes.is_empty() || !units.is_empty());
         let direct_children = active_nodes
             .iter()
             .filter(|candidate| candidate.parent_id == Some(id))
@@ -11209,7 +11212,7 @@ impl AppState {
             })
             .map(|candidate| candidate.id)
             .collect();
-        let target_chapters = active_nodes
+        let target_chapters: Vec<story_core::NodeId> = active_nodes
             .iter()
             .filter(|candidate| {
                 candidate.kind == "chapter"
@@ -11218,6 +11221,7 @@ impl AppState {
             })
             .map(|candidate| candidate.id)
             .collect();
+        let keep_chapter_prose = !units.is_empty() && !target_chapters.is_empty();
         self.pending_structural_node_removal = Some(StructuralNodeRemovalDialog {
             id,
             title: node.title,
@@ -11239,6 +11243,7 @@ impl AppState {
             target_section_index: 0,
             target_chapters,
             target_index: 0,
+            keep_chapter_prose,
             choice: if can_rehome_scenes || can_promote_children {
                 0
             } else {
@@ -11254,15 +11259,33 @@ impl AppState {
         if dialog.restoring {
             self.app.restore_latest_structural_removal(dialog.id)?;
             self.removed_structural_nodes_list = false;
-        } else if dialog.can_rehome_scenes && dialog.choice == 0 {
-            self.app.remove_chapter_rehome_scenes(dialog.id, None)?;
-        } else if dialog.can_rehome_scenes && dialog.choice == 1 {
-            let Some(target) = dialog.target_chapters.get(dialog.target_index).copied() else {
-                self.message = "Create another chapter before moving these scenes".into();
-                return Ok(());
+        } else if dialog.can_rehome_scenes && dialog.choice < 2 {
+            let scene_destination = if dialog.scene_count > 0 && dialog.choice == 1 {
+                let Some(target) = dialog.target_chapters.get(dialog.target_index).copied() else {
+                    self.message = "Create another chapter before moving these scenes".into();
+                    return Ok(());
+                };
+                Some(target)
+            } else {
+                None
             };
-            self.app
-                .remove_chapter_rehome_scenes(dialog.id, Some(target))?;
+            let retain_prose_in_active_chapter = dialog.content_unit_count > 0
+                && dialog.keep_chapter_prose
+                && !(dialog.scene_count == 0 && dialog.choice == 1);
+            let prose_destination = if retain_prose_in_active_chapter {
+                let Some(target) = dialog.target_chapters.get(dialog.target_index).copied() else {
+                    self.message = "Choose a destination chapter for the prose or move it to Removed Documents".into();
+                    return Ok(());
+                };
+                Some(target)
+            } else {
+                None
+            };
+            self.app.remove_chapter_rehome_scenes_and_prose(
+                dialog.id,
+                scene_destination,
+                prose_destination,
+            )?;
         } else if dialog.can_promote_children && dialog.choice == 0 {
             self.app.promote_section_children(dialog.id)?;
         } else if dialog.can_promote_children && dialog.choice == 1 {
@@ -11285,24 +11308,62 @@ impl AppState {
         } else {
             self.selected.saturating_sub(1)
         };
+        let chapter_prose_summary = if dialog.content_unit_count == 0 {
+            String::new()
+        } else if dialog.keep_chapter_prose {
+            let destination = dialog
+                .target_chapters
+                .get(dialog.target_index)
+                .and_then(|target| {
+                    self.app
+                        .list_structural_nodes()
+                        .ok()?
+                        .into_iter()
+                        .find(|node| node.id == *target)
+                        .map(|node| node.title)
+                })
+                .unwrap_or_else(|| "selected chapter".into());
+            format!(
+                " · {} prose document(s) kept in ‘{}’",
+                dialog.content_unit_count, destination
+            )
+        } else {
+            format!(
+                " · {} prose document(s) retained in Removed Documents",
+                dialog.content_unit_count
+            )
+        };
         self.message = if dialog.restoring {
             format!(
                 "Restored {} ‘{}’ to its original place",
                 dialog.kind, dialog.title
             )
+        } else if dialog.can_rehome_scenes && dialog.scene_count == 0 && dialog.choice == 0 {
+            let destination = dialog
+                .target_chapters
+                .get(dialog.target_index)
+                .and_then(|target| {
+                    self.app
+                        .list_structural_nodes()
+                        .ok()?
+                        .into_iter()
+                        .find(|node| node.id == *target)
+                        .map(|node| node.title)
+                })
+                .unwrap_or_else(|| "selected chapter".into());
+            format!(
+                "Removed chapter ‘{}’ · {} prose document(s) kept in ‘{}’ · recoverable",
+                dialog.title, dialog.content_unit_count, destination
+            )
+        } else if dialog.can_rehome_scenes && dialog.scene_count == 0 && dialog.choice == 1 {
+            format!(
+                "Removed chapter ‘{}’ · {} prose document(s) retained in Removed Documents · recoverable",
+                dialog.title, dialog.content_unit_count
+            )
         } else if dialog.can_rehome_scenes && dialog.choice == 0 {
             format!(
                 "Removed chapter ‘{}’ · {} scene(s) moved to Unplaced{} · recoverable",
-                dialog.title,
-                dialog.scene_count,
-                if dialog.content_unit_count > 0 {
-                    format!(
-                        " · {} prose document(s) retained in Removed Documents",
-                        dialog.content_unit_count
-                    )
-                } else {
-                    String::new()
-                }
+                dialog.title, dialog.scene_count, chapter_prose_summary
             )
         } else if dialog.can_rehome_scenes && dialog.choice == 1 {
             let destination = dialog
@@ -11319,17 +11380,7 @@ impl AppState {
                 .unwrap_or_else(|| "selected chapter".into());
             format!(
                 "Removed chapter ‘{}’ · {} scene(s) moved to ‘{}’{} · recoverable",
-                dialog.title,
-                dialog.scene_count,
-                destination,
-                if dialog.content_unit_count > 0 {
-                    format!(
-                        " · {} prose document(s) retained in Removed Documents",
-                        dialog.content_unit_count
-                    )
-                } else {
-                    String::new()
-                }
+                dialog.title, dialog.scene_count, destination, chapter_prose_summary
             )
         } else if dialog.can_promote_children && dialog.choice == 0 {
             format!(
@@ -25470,7 +25521,12 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
     // consequences. Keep enough room for wrapped text at the standard 80x24
     // terminal size so the final action instructions cannot disappear below
     // the border.
-    let height = 16.min(area.height.max(1));
+    let height = if dialog.content_unit_count > 0 {
+        19
+    } else {
+        16
+    }
+    .min(area.height.max(1));
     let rect = Rect::new(
         area.x + (area.width - width) / 2,
         area.y + (area.height - height) / 2,
@@ -25511,45 +25567,114 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
             )));
         }
         if dialog.can_rehome_scenes {
-            lines.push(Line::from("Choose how to handle the scenes:"));
-            lines.push(Line::from(format!(
-                "{} Move scenes to Unplaced",
-                if dialog.choice == 0 { ">" } else { " " }
-            )));
-            lines.push(Line::from(format!(
-                "{} Move scenes to another chapter… {}",
-                if dialog.choice == 1 { ">" } else { " " },
-                dialog
-                    .target_chapters
-                    .get(dialog.target_index)
-                    .and_then(|target| s
-                        .app
-                        .list_structural_nodes()
-                        .ok()?
-                        .into_iter()
-                        .find(|node| node.id == *target)
-                        .map(|node| node.title))
-                    .unwrap_or_else(|| "No destination chapter".into())
-            )));
+            lines.push(Line::from(if dialog.scene_count == 0 {
+                "Choose how to handle the chapter prose:"
+            } else {
+                "Choose how to handle the chapter:"
+            }));
+            if dialog.scene_count == 0 {
+                lines.push(Line::from(format!(
+                    "{} Keep prose in another chapter… {}",
+                    if dialog.choice == 0 { ">" } else { " " },
+                    dialog
+                        .target_chapters
+                        .get(dialog.target_index)
+                        .and_then(|target| s
+                            .app
+                            .list_structural_nodes()
+                            .ok()?
+                            .into_iter()
+                            .find(|node| node.id == *target)
+                            .map(|node| node.title))
+                        .unwrap_or_else(|| "No destination chapter".into())
+                )));
+                lines.push(Line::from(format!(
+                    "{} Move prose to Removed Documents",
+                    if dialog.choice == 1 { ">" } else { " " }
+                )));
+            } else {
+                lines.push(Line::from(format!(
+                    "{} Move scenes to Unplaced",
+                    if dialog.choice == 0 { ">" } else { " " }
+                )));
+                lines.push(Line::from(format!(
+                    "{} Move scenes to another chapter… {}",
+                    if dialog.choice == 1 { ">" } else { " " },
+                    dialog
+                        .target_chapters
+                        .get(dialog.target_index)
+                        .and_then(|target| s
+                            .app
+                            .list_structural_nodes()
+                            .ok()?
+                            .into_iter()
+                            .find(|node| node.id == *target)
+                            .map(|node| node.title))
+                        .unwrap_or_else(|| "No destination chapter".into())
+                )));
+            }
             lines.push(Line::from(format!(
                 "{} Delete chapter and all its contents recoverably",
                 if dialog.choice == 2 { ">" } else { " " }
             )));
             lines.push(Line::from(
-                if dialog.content_unit_count > 0 {
-                    "Chapter prose is retained in Removed Documents; removed prose and Unplaced scenes are omitted from Compile."
+                if dialog.content_unit_count > 0 && dialog.choice == 2 {
+                    "The chapter prose stays recoverable with the removed chapter."
+                } else if dialog.scene_count == 0 && dialog.choice == 1 {
+                    "Chapter prose moves to Removed Documents and is omitted from Compile."
+                } else if dialog.content_unit_count > 0 && dialog.keep_chapter_prose {
+                    "Chapter prose moves to the selected chapter and stays in Compile."
+                } else if dialog.content_unit_count > 0 {
+                    "Chapter prose moves to Removed Documents and is omitted from Compile."
                 } else {
                     "Unplaced scenes are omitted from Compile. Delete retains the full subtree in Removed Documents."
                 },
             ));
-            lines.push(Line::from(match dialog.choice {
+            lines.push(Line::from(if dialog.scene_count == 0 {
+                match dialog.choice {
+                    0 => "Compile: chapter prose moves to the selected chapter and remains included.",
+                    1 => "Compile: prose moves to Removed Documents and is omitted; it can be restored.",
+                    _ => "Compile: removed chapter prose is omitted; the removal can be restored.",
+                }
+            } else {
+                match dialog.choice {
                 0 => "Compile: included scenes become Unplaced and are omitted until placed in a chapter.",
                 1 => "Compile: included scenes append to the selected chapter in their current order.",
                 _ => "Compile: removed scenes and chapter prose are omitted; the removal can be restored.",
+                }
             }));
-            lines.push(Line::from(
-                "Up/Down choose · Left/Right destination · Enter confirm · Esc cancel",
-            ));
+            if dialog.content_unit_count > 0 {
+                let prose_destination = dialog
+                    .target_chapters
+                    .get(dialog.target_index)
+                    .and_then(|target| {
+                        s.app
+                            .list_structural_nodes()
+                            .ok()?
+                            .into_iter()
+                            .find(|node| node.id == *target)
+                            .map(|node| node.title)
+                    })
+                    .unwrap_or_else(|| "no active destination".into());
+                lines.push(Line::from(if dialog.choice == 2 {
+                    "Prose: retained with the recoverable chapter; Restore returns it".into()
+                } else if dialog.scene_count == 0 && dialog.choice == 1 {
+                    "Prose: moved to Removed Documents; Restore returns it".into()
+                } else if dialog.keep_chapter_prose {
+                    format!(
+                        "Prose: keep in ‘{}’ · P moves it to Removed Documents",
+                        prose_destination
+                    )
+                } else {
+                    "Prose: move to Removed Documents (recoverable) · P keeps it active".into()
+                }));
+                if dialog.scene_count > 0 || dialog.choice == 0 {
+                    lines.push(Line::from(
+                        "Left/Right changes the selected chapter for scenes and prose.",
+                    ));
+                }
+            }
+            lines.push(Line::from("Up/Down choose · Enter confirm · Esc cancel"));
         } else if dialog.can_promote_children {
             lines.push(Line::from("Choose how to handle this non-fiction section:"));
             lines.push(Line::from(format!(
@@ -25603,7 +25728,7 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
                 .title(if dialog.restoring {
                     " Restore Outline Heading "
                 } else if dialog.can_rehome_scenes {
-                    " Delete Chapter · Keep or Remove Scenes "
+                    " Delete Chapter · Keep or Move Content "
                 } else {
                     " Delete Heading and Contents "
                 })
@@ -29035,6 +29160,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             KeyCode::Left | KeyCode::Right
                 if dialog.can_rehome_scenes
                     && dialog.choice == 1
+                    && dialog.scene_count > 0
                     && !dialog.target_chapters.is_empty() =>
             {
                 if let Some(active) = s.pending_structural_node_removal.as_mut() {
@@ -29047,6 +29173,33 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                             .checked_sub(1)
                             .unwrap_or(active.target_chapters.len() - 1);
                     }
+                }
+            }
+            KeyCode::Left | KeyCode::Right
+                if dialog.content_unit_count > 0
+                    && dialog.keep_chapter_prose
+                    && !dialog.target_chapters.is_empty() =>
+            {
+                if let Some(active) = s.pending_structural_node_removal.as_mut() {
+                    if k.code == KeyCode::Right {
+                        active.target_index =
+                            (active.target_index + 1) % active.target_chapters.len();
+                    } else {
+                        active.target_index = active
+                            .target_index
+                            .checked_sub(1)
+                            .unwrap_or(active.target_chapters.len() - 1);
+                    }
+                }
+            }
+            KeyCode::Char('p' | 'P')
+                if dialog.content_unit_count > 0
+                    && dialog.scene_count > 0
+                    && dialog.choice < 2
+                    && !dialog.target_chapters.is_empty() =>
+            {
+                if let Some(active) = s.pending_structural_node_removal.as_mut() {
+                    active.keep_chapter_prose = !active.keep_chapter_prose;
                 }
             }
             KeyCode::Left | KeyCode::Right
@@ -43228,6 +43381,7 @@ mod tests {
         let dialog = state.pending_structural_node_removal.as_ref().unwrap();
         assert!(dialog.can_rehome_scenes);
         assert_eq!(dialog.choice, 0);
+        assert!(dialog.keep_chapter_prose);
         assert_eq!(dialog.scene_count, 1);
         assert_eq!(dialog.content_unit_count, 1);
         state
@@ -43237,7 +43391,7 @@ mod tests {
         assert!(
             state
                 .message
-                .contains("1 prose document(s) retained in Removed Documents")
+                .contains("1 prose document(s) kept in ‘Chapter Two’")
         );
         assert!(
             state
@@ -43256,7 +43410,9 @@ mod tests {
                 .any(|node| node.id == chapter)
         );
         assert_eq!(state.app.get_scene(scene).unwrap().chapter_id, None);
-        assert!(state.app.get_content_unit(chapter_prose).unwrap().archived);
+        let active_prose = state.app.get_content_unit(chapter_prose).unwrap();
+        assert!(!active_prose.archived);
+        assert_eq!(active_prose.parent_id, Some(other));
         assert_eq!(
             state.app.load_content_unit_text(chapter_prose).unwrap().0,
             "Direct chapter prose remains recoverable."
@@ -43265,16 +43421,16 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "Retained manuscript text."
         );
-        assert!(
-            !String::from_utf8_lossy(
-                &state
-                    .app
-                    .compile_artifact(story_document::CompileFormat::Markdown, false)
-                    .unwrap()
-                    .bytes
-            )
-            .contains("Retained manuscript text.")
-        );
+        let compiled = String::from_utf8_lossy(
+            &state
+                .app
+                .compile_artifact(story_document::CompileFormat::Markdown, false)
+                .unwrap()
+                .bytes,
+        )
+        .into_owned();
+        assert!(!compiled.contains("Retained manuscript text."));
+        assert!(compiled.contains("Direct chapter prose remains recoverable."));
 
         state
             .app
@@ -43284,7 +43440,13 @@ mod tests {
             state.app.get_scene(scene).unwrap().chapter_id,
             Some(chapter)
         );
-        assert!(!state.app.get_content_unit(chapter_prose).unwrap().archived);
+        let restored_prose = state.app.get_content_unit(chapter_prose).unwrap();
+        assert!(!restored_prose.archived);
+        assert_eq!(restored_prose.parent_id, Some(chapter));
+        assert_eq!(
+            state.app.load_content_unit_text(chapter_prose).unwrap().0,
+            "Direct chapter prose remains recoverable."
+        );
         let mut state = AppState::new(state.app, default_bindings());
         state.workspace = Workspace::Outline;
         state.refresh().unwrap();
@@ -43340,6 +43502,109 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "Retained manuscript text."
         );
+    }
+
+    #[test]
+    fn chapter_removal_can_explicitly_archive_owned_prose_instead_of_rehoming_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut app = WriterApp::create_project(&project, "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let destination = app.create_chapter(None, "Chapter Two", 1).unwrap();
+        let prose = app
+            .create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "Chapter prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+            .unwrap();
+        state.begin_structural_node_removal(false).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Prose: keep in"));
+        assert!(screen.contains("P moves it to Removed Documents"));
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        let dialog = state.pending_structural_node_removal.clone().unwrap();
+        assert_eq!(dialog.choice, 1);
+        state.finish_structural_node_removal(dialog).unwrap();
+        let removed = state.app.get_content_unit(prose).unwrap();
+        assert!(removed.archived);
+        assert_eq!(removed.parent_id, Some(chapter));
+        assert!(state.message.contains("retained in Removed Documents"));
+        state
+            .app
+            .restore_latest_structural_removal(chapter)
+            .unwrap();
+        let restored = state.app.get_content_unit(prose).unwrap();
+        assert!(!restored.archived);
+        assert_eq!(restored.parent_id, Some(chapter));
+        assert_ne!(chapter, destination);
+    }
+
+    #[test]
+    fn prose_only_chapter_removal_offers_prose_specific_choices() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut app = WriterApp::create_project(&project, "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let destination = app.create_chapter(None, "Chapter Two", 1).unwrap();
+        let prose = app
+            .create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "Chapter prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
+            .unwrap();
+        state.begin_structural_node_removal(false).unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("Choose how to handle the chapter prose"));
+        assert!(screen.contains("Keep prose in another chapter"));
+        assert!(screen.contains("Move prose to Removed Documents"));
+        assert!(!screen.contains("Move scenes to Unplaced"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let moved = state.app.get_content_unit(prose).unwrap();
+        assert!(!moved.archived);
+        assert_eq!(moved.parent_id, Some(destination));
+        assert!(state.message.contains("prose document(s) kept"));
     }
 
     #[test]
