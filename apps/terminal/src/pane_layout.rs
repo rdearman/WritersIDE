@@ -230,9 +230,68 @@ impl PaneLayout {
     /// application's open panes. Every referenced pane must still exist.
     pub fn is_valid_subset_of_panes(&self, available: &[u64]) -> bool {
         let actual = self.panes();
-        actual.iter().all(|id| available.contains(id))
+        let unique = actual
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        unique.len() == actual.len()
+            && valid_node(&self.root)
+            && actual.iter().all(|id| available.contains(id))
             && actual.contains(&self.focused)
             && self.next_id > actual.iter().copied().max().unwrap_or(0)
+    }
+
+    /// Reassigns pane identities while retaining the recursive split tree.
+    /// Every existing leaf must have exactly one mapping, and destination IDs
+    /// must be unique. This lets saved layouts reconnect to currently open
+    /// views by their stable source keys rather than stale runtime pane IDs.
+    pub fn remap_panes(&mut self, mapping: &[(u64, u64)]) -> Result<(), LayoutError> {
+        let existing = self.panes();
+        let mut destinations = std::collections::BTreeSet::new();
+        if mapping.len() != existing.len()
+            || existing
+                .iter()
+                .any(|id| !mapping.iter().any(|(from, _)| from == id))
+            || mapping.iter().any(|(from, _)| !existing.contains(from))
+            || mapping.iter().any(|(_, to)| !destinations.insert(*to))
+        {
+            return Err(LayoutError::UnknownPane);
+        }
+        let remap = |id: &mut u64| {
+            if let Some((_, destination)) = mapping.iter().find(|(source, _)| source == id) {
+                *id = *destination;
+            }
+        };
+        fn visit(node: &mut PaneNode, remap: &impl Fn(&mut u64)) {
+            match node {
+                PaneNode::Leaf(id) => remap(id),
+                PaneNode::Split { first, second, .. } => {
+                    visit(first, remap);
+                    visit(second, remap);
+                }
+            }
+        }
+        visit(&mut self.root, &remap);
+        remap(&mut self.focused);
+        self.next_id = destinations
+            .iter()
+            .copied()
+            .max()
+            .and_then(|largest| largest.checked_add(1))
+            .ok_or(LayoutError::PaneIdExhausted)?;
+        Ok(())
+    }
+}
+
+fn valid_node(node: &PaneNode) -> bool {
+    match node {
+        PaneNode::Leaf(_) => true,
+        PaneNode::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } => (1..=9_999).contains(ratio) && valid_node(first) && valid_node(second),
     }
 }
 
@@ -622,5 +681,36 @@ mod tests {
             layout.resize_parent_split(999, 6_000),
             Err(LayoutError::UnknownPane)
         );
+    }
+
+    #[test]
+    fn remapping_panes_preserves_tree_and_focus_and_rejects_duplicate_ids() {
+        let mut layout = PaneLayout::default();
+        let a = layout.focused();
+        let b = layout
+            .split(Orientation::Vertical, 5_000, WIDE, 20, 8)
+            .unwrap();
+        let c = layout
+            .split(Orientation::Horizontal, 5_000, WIDE, 20, 8)
+            .unwrap();
+        let tree_before = layout.root().clone();
+        assert_eq!(layout.focused(), c);
+
+        layout.remap_panes(&[(a, 11), (b, 22), (c, 33)]).unwrap();
+        assert_eq!(layout.panes(), vec![11, 22, 33]);
+        assert_eq!(layout.focused(), 33);
+        assert_ne!(layout.root(), &tree_before);
+        assert_eq!(
+            layout.split(Orientation::Vertical, 5_000, WIDE, 20, 8),
+            Ok(34)
+        );
+
+        let mut unchanged = PaneLayout::default();
+        let before = unchanged.clone();
+        assert_eq!(
+            unchanged.remap_panes(&[(1, 4), (1, 4)]),
+            Err(LayoutError::UnknownPane)
+        );
+        assert_eq!(unchanged, before);
     }
 }

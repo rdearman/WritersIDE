@@ -512,6 +512,38 @@ struct ReferencePane {
     proofreading: Option<ProofreadingReview>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NamedWindowLayoutsFile {
+    version: u16,
+    layouts: Vec<NamedWindowLayout>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NamedWindowLayout {
+    name: String,
+    layout: pane_layout::PaneLayout,
+    panes: Vec<NamedWindowPane>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct NamedWindowPane {
+    pane_id: u64,
+    source_key: String,
+    source_occurrence: usize,
+}
+
+impl Default for NamedWindowLayoutsFile {
+    fn default() -> Self {
+        Self {
+            version: 1,
+            layouts: Vec::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct ProofreadingReview {
     findings: Vec<ProofreadingAction>,
@@ -1010,6 +1042,8 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "window.return-to-writing",
         "window.maximize",
         "window.restore-layout",
+        "window.save-layout",
+        "window.load-layout",
         "window.swap-sides",
     ],
     &[
@@ -3886,6 +3920,22 @@ fn command_registry() -> Vec<CommandSpec> {
             "Restore the prior split layout",
             "View",
             "window-restore",
+            false,
+        ),
+        legacy_command(
+            "window.save-layout",
+            "Save Layout…",
+            "Save the current recursive window arrangement under a name",
+            "View",
+            "window-layout-save",
+            false,
+        ),
+        legacy_command(
+            "window.load-layout",
+            "Load Layout…",
+            "Restore a named window arrangement for currently open views",
+            "View",
+            "window-layout-load",
             false,
         ),
         legacy_command(
@@ -6908,6 +6958,192 @@ impl AppState {
     fn session_path(&self) -> std::path::PathBuf {
         self.app.project_root().join(".writers-ide/session.json")
     }
+    fn save_named_window_layout(
+        &self,
+        requested_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let name = validate_window_layout_name(requested_name)?;
+        let layout = self
+            .restore_pane_layout
+            .as_ref()
+            .or(self.pane_layout.as_ref())
+            .cloned()
+            .unwrap_or_default();
+        let mut panes = Vec::new();
+        for pane_id in layout.panes() {
+            let (source_key, source_occurrence) = if pane_id == 1 {
+                ("manuscript-editor".to_owned(), 0)
+            } else {
+                let pane_index = self
+                    .reference_panes
+                    .iter()
+                    .position(|pane| pane.layout_id == Some(pane_id))
+                    .ok_or_else(|| format!("Window {pane_id} has no open view to save"))?;
+                let pane = &self.reference_panes[pane_index];
+                let occurrence = self.reference_panes[..pane_index]
+                    .iter()
+                    .filter(|candidate| candidate.source_key == pane.source_key)
+                    .count();
+                (pane.source_key.clone(), occurrence)
+            };
+            panes.push(NamedWindowPane {
+                pane_id,
+                source_key,
+                source_occurrence,
+            });
+        }
+        let root = self.app.project_root().canonicalize()?;
+        let metadata = root.join(".writers-ide");
+        ensure_project_managed_directory(&root, &metadata)?;
+        let path = metadata.join("window-layouts.json");
+        let mut layouts = read_named_window_layouts(&path)?;
+        if let Some(existing) = layouts
+            .layouts
+            .iter_mut()
+            .find(|layout| layout.name.eq_ignore_ascii_case(&name))
+        {
+            *existing = NamedWindowLayout {
+                name: name.clone(),
+                layout,
+                panes,
+            };
+        } else {
+            layouts.layouts.push(NamedWindowLayout {
+                name: name.clone(),
+                layout,
+                panes,
+            });
+        }
+        layouts
+            .layouts
+            .sort_by_key(|layout| layout.name.to_lowercase());
+        write_json_atomically(&path, &serde_json::to_value(layouts)?)?;
+        Ok(())
+    }
+
+    fn named_window_layout_names(&self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let root = self.app.project_root().canonicalize()?;
+        let metadata = root.join(".writers-ide");
+        if fs::symlink_metadata(&metadata)
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        {
+            return Ok(Vec::new());
+        }
+        ensure_project_managed_directory(&root, &metadata)?;
+        let layouts = read_named_window_layouts(&metadata.join("window-layouts.json"))?;
+        Ok(layouts
+            .layouts
+            .into_iter()
+            .map(|layout| layout.name)
+            .collect())
+    }
+
+    fn load_named_window_layout(
+        &mut self,
+        requested_name: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let name = validate_window_layout_name(requested_name)?;
+        let root = self.app.project_root().canonicalize()?;
+        let metadata = root.join(".writers-ide");
+        ensure_project_managed_directory(&root, &metadata)?;
+        let mut saved = read_named_window_layouts(&metadata.join("window-layouts.json"))?
+            .layouts
+            .into_iter()
+            .find(|layout| layout.name.eq_ignore_ascii_case(&name))
+            .ok_or_else(|| format!("No saved window layout named “{name}”"))?;
+
+        let mut mapping = Vec::with_capacity(saved.panes.len());
+        let mut assignments = Vec::new();
+        let mut reserved = self
+            .reference_panes
+            .iter()
+            .filter_map(|pane| pane.layout_id)
+            .chain(std::iter::once(1))
+            .collect::<BTreeSet<_>>();
+        let mut next_id = reserved
+            .iter()
+            .next_back()
+            .copied()
+            .unwrap_or(1)
+            .checked_add(1)
+            .ok_or("window identifiers are exhausted")?;
+        for source in &saved.panes {
+            if source.source_key == "manuscript-editor" {
+                if self.editing_scene.is_none()
+                    && self.editing_content_unit.is_none()
+                    && self.assembly_draft.is_none()
+                {
+                    return Err("Open a manuscript before loading this window layout".into());
+                }
+                mapping.push((source.pane_id, 1));
+                continue;
+            }
+            let pane_index = self
+                .reference_panes
+                .iter()
+                .enumerate()
+                .filter(|(_, pane)| pane.source_key == source.source_key)
+                .nth(source.source_occurrence)
+                .map(|(index, _)| index)
+                .ok_or_else(|| {
+                    format!(
+                        "Open the “{}” view before loading this layout",
+                        source.source_key
+                    )
+                })?;
+            let current_id = if let Some(id) = self.reference_panes[pane_index].layout_id {
+                id
+            } else {
+                while reserved.contains(&next_id) {
+                    next_id = next_id
+                        .checked_add(1)
+                        .ok_or("window identifiers are exhausted")?;
+                }
+                let id = next_id;
+                reserved.insert(id);
+                next_id = next_id
+                    .checked_add(1)
+                    .ok_or("window identifiers are exhausted")?;
+                id
+            };
+            mapping.push((source.pane_id, current_id));
+            assignments.push((pane_index, current_id));
+        }
+        saved.layout.remap_panes(&mapping)?;
+        if !saved.layout.is_valid_subset_of_panes(
+            &self
+                .reference_panes
+                .iter()
+                .filter_map(|pane| pane.layout_id)
+                .chain(assignments.iter().map(|(_, id)| *id))
+                .chain(std::iter::once(1))
+                .collect::<Vec<_>>(),
+        ) {
+            return Err("The saved window layout contains invalid or unavailable panes".into());
+        }
+        for (index, id) in assignments {
+            self.reference_panes[index].layout_id = Some(id);
+        }
+        self.pane_layout = Some(saved.layout);
+        self.restore_pane_layout = None;
+        self.editor_focus_mode = false;
+        self.reference_panes_hidden = false;
+        let focused = self
+            .pane_layout
+            .as_ref()
+            .ok_or("saved window layout could not be applied")?
+            .focused();
+        if focused == 1 {
+            self.focus_main_editor();
+        } else {
+            self.reference_focused = true;
+            self.sync_focused_window(focused);
+        }
+        self.save_session()?;
+        self.message = format!("Loaded window layout “{}”", saved.name);
+        Ok(())
+    }
+
     fn persist_editor_tools(&self) -> Result<(), Box<dyn std::error::Error>> {
         let directory = self.app.project_root().join(".writers-ide");
         fs::create_dir_all(&directory)?;
@@ -13413,7 +13649,11 @@ impl AppState {
                 "window.close" => editor && (has_references || multiple_windows),
                 "window.only" => editor && multiple_windows,
                 "window.return-to-writing" => editor && self.reference_focused,
-                "window.restore-layout" => editor && self.editor_focus_mode,
+                // The visible maximize action becomes the matching restore
+                // action while maximized. Keep the stable restore command in
+                // Search All Commands for keybindings and automation.
+                "window.restore-layout" => false,
+                "window.save-layout" | "window.load-layout" => editor,
                 "window.swap-sides" => editor && has_references,
                 _ => true,
             });
@@ -13516,6 +13756,13 @@ impl AppState {
             } else {
                 None
             };
+        }
+        if spec.id == "window.load-layout"
+            && self
+                .named_window_layout_names()
+                .is_ok_and(|layouts| layouts.is_empty())
+        {
+            return Some("Save a window layout first");
         }
         if spec.id == "research.restore-reference" {
             return if self.workspace != Workspace::Reading || !self.reading_removed_list {
@@ -14845,6 +15092,22 @@ impl AppState {
         let cmd = self.prompt.trim().to_owned();
         self.prompt.clear();
         let mode = self.mode.take();
+        if matches!(mode, Some('L' | 'l')) {
+            let result = if cmd.is_empty() {
+                Err("Enter a layout name, or press Esc to cancel".into())
+            } else if mode == Some('L') {
+                self.save_named_window_layout(&cmd)
+                    .map(|()| format!("Saved window layout “{}”", cmd.trim()))
+            } else {
+                self.load_named_window_layout(&cmd)
+                    .map(|()| format!("Loaded window layout “{}”", cmd.trim()))
+            };
+            self.message = match result {
+                Ok(message) => message,
+                Err(error) => format!("Window layout was not changed: {error}"),
+            };
+            return Ok(());
+        }
         if mode == Some('H') {
             if cmd.is_empty() {
                 self.message = "Chapter not created · enter a title or press Esc to cancel".into();
@@ -15005,6 +15268,36 @@ impl AppState {
         &mut self,
         cmd: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        if cmd == "window-layout-save" {
+            if self.workspace != Workspace::Editor {
+                self.message = "Open a manuscript view before saving a window layout".into();
+                return Ok(());
+            }
+            self.mode = Some('L');
+            self.prompt.clear();
+            self.message = "Save Layout · enter a name · Enter saves · Esc cancels".into();
+            return Ok(());
+        }
+        if cmd == "window-layout-load" {
+            let names = match self.named_window_layout_names() {
+                Ok(names) => names,
+                Err(error) => {
+                    self.message = format!("Saved window layouts could not be read: {error}");
+                    return Ok(());
+                }
+            };
+            if names.is_empty() {
+                self.message = "No saved window layouts · use View > Save Layout first".into();
+                return Ok(());
+            }
+            self.mode = Some('l');
+            self.prompt.clear();
+            self.message = format!(
+                "Load Layout · enter a name ({}) · Enter loads · Esc cancels",
+                names.join(", ")
+            );
+            return Ok(());
+        }
         match cmd {
             "reading-remove" => return self.begin_reading_removal(false),
             "reading-removed" => return self.toggle_removed_readings(),
@@ -19219,21 +19512,32 @@ impl AppState {
             .into();
             self.save_session()?;
         } else if cmd == "window-maximize" {
-            if let Some(layout) = self.pane_layout.as_mut() {
+            if self.restore_pane_layout.is_some() || self.editor_focus_mode {
+                if let Some(layout) = self.restore_pane_layout.take() {
+                    let focused = layout.focused();
+                    self.pane_layout = Some(layout);
+                    self.focus_manual_pane(focused);
+                }
+                self.editor_focus_mode = false;
+                self.message = "Window layout restored".into();
+            } else if let Some(layout) = self.pane_layout.as_mut() {
                 if self.restore_pane_layout.is_none() {
                     self.restore_pane_layout = Some(layout.clone());
                     layout.only_focused();
                 }
                 self.editor_focus_mode = true;
+                self.message =
+                    "Focused window maximized · Restore Windows returns to the exact split tree"
+                        .into();
             } else {
                 self.editor_focus_mode = true;
                 if self.reference_focused && self.reference_panes_hidden {
                     self.reference_panes_hidden = false;
                 }
+                self.message =
+                    "Focused window maximized · Restore Windows returns to the previous view"
+                        .into();
             }
-            self.message =
-                "Focused window maximized · Restore Window Layout restores the exact split tree"
-                    .into();
             self.save_session()?;
         } else if cmd == "window-restore" {
             if let Some(layout) = self.restore_pane_layout.take() {
@@ -25983,6 +26287,11 @@ fn displayed_command_label(state: &AppState, command: CommandSpec) -> String {
             "Show Rendered Markdown".into()
         };
     }
+    if command.id == "window.maximize"
+        && (state.editor_focus_mode || state.restore_pane_layout.is_some())
+    {
+        return "Restore Windows".into();
+    }
     if command.id != "help.resume-tutorial" {
         return command.label.to_owned();
     }
@@ -28599,6 +28908,78 @@ fn write_json_atomically(
     temporary.persist(path)?;
     fs::File::open(parent)?.sync_all()?;
     Ok(())
+}
+
+fn validate_window_layout_name(value: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let name = value.trim();
+    if name.is_empty()
+        || name.chars().count() > 64
+        || name.chars().any(char::is_control)
+        || name.contains('/')
+        || name.contains('\\')
+    {
+        return Err(
+            "layout names must be 1–64 characters and cannot contain path separators".into(),
+        );
+    }
+    Ok(name.to_owned())
+}
+
+fn read_named_window_layouts(
+    path: &Path,
+) -> Result<NamedWindowLayoutsFile, Box<dyn std::error::Error>> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(NamedWindowLayoutsFile::default());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err("saved window layouts must be a regular project file".into());
+    }
+    if metadata.len() > 1_048_576 {
+        return Err("saved window layout file exceeds the 1 MiB safety limit".into());
+    }
+    let mut layouts: NamedWindowLayoutsFile = serde_json::from_slice(&fs::read(path)?)?;
+    if layouts.version != 1 {
+        return Err(format!(
+            "unsupported named window layout version {}",
+            layouts.version
+        )
+        .into());
+    }
+    let mut names = BTreeSet::new();
+    for saved in &layouts.layouts {
+        let normalized = validate_window_layout_name(&saved.name)?.to_lowercase();
+        if !names.insert(normalized) {
+            return Err("saved window layouts contain duplicate names".into());
+        }
+        let mut stored_ids = saved
+            .panes
+            .iter()
+            .map(|pane| pane.pane_id)
+            .collect::<Vec<_>>();
+        let mut layout_ids = saved.layout.panes();
+        stored_ids.sort_unstable();
+        layout_ids.sort_unstable();
+        if stored_ids != layout_ids
+            || saved
+                .panes
+                .iter()
+                .any(|pane| pane.source_key.trim().is_empty())
+        {
+            return Err(format!(
+                "saved window layout “{}” has inconsistent pane identities",
+                saved.name
+            )
+            .into());
+        }
+    }
+    layouts
+        .layouts
+        .sort_by_key(|layout| layout.name.to_lowercase());
+    Ok(layouts)
 }
 
 fn command_history_path(project_root: &Path) -> PathBuf {
@@ -39434,6 +39815,69 @@ mod tests {
     }
 
     #[test]
+    fn maximize_menu_action_toggles_and_restores_the_exact_recursive_layout() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Draft", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.pane_bounds = pane_layout::PaneRect {
+            x: 0,
+            y: 1,
+            width: 180,
+            height: 50,
+        };
+        state
+            .split_focused_window(pane_layout::Orientation::Vertical)
+            .unwrap();
+        state
+            .split_focused_window(pane_layout::Orientation::Horizontal)
+            .unwrap();
+        state.pane_layout.as_mut().unwrap().focus(2).unwrap();
+        state.sync_focused_window(2);
+        state.editor = vec!["Unsaved pane text".into()];
+        state.dirty = true;
+        let before = state.pane_layout.clone().unwrap();
+        let view = MENU_CATEGORIES
+            .iter()
+            .position(|category| *category == "View")
+            .unwrap();
+        state.open_menu_category(view);
+        let maximize = state
+            .menu_commands()
+            .into_iter()
+            .find(|command| command.id == "window.maximize")
+            .unwrap();
+        assert_eq!(
+            displayed_command_label(&state, maximize),
+            "Maximize Current Window"
+        );
+        assert!(
+            !state
+                .menu_commands()
+                .iter()
+                .any(|command| command.id == "window.restore-layout"),
+            "the menu should expose one toggle, not competing maximize/restore rows"
+        );
+        state.menu = None;
+        state
+            .execute_legacy_palette_command("window-maximize")
+            .unwrap();
+        assert_eq!(state.pane_layout.as_ref().unwrap().panes(), [2]);
+        assert_eq!(
+            displayed_command_label(&state, command_by_id("window.maximize").unwrap()),
+            "Restore Windows"
+        );
+        state
+            .execute_legacy_palette_command("window-maximize")
+            .unwrap();
+        assert_eq!(state.pane_layout.as_ref().unwrap(), &before);
+        assert_eq!(state.editor, ["Unsaved pane text"]);
+        assert!(state.dirty);
+    }
+
+    #[test]
     fn closing_the_editor_pane_keeps_writing_reachable() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -43035,6 +43479,8 @@ mod tests {
                             | "window.split-side-by-side"
                             | "window.split-top-bottom"
                             | "window.maximize"
+                            | "window.save-layout"
+                            | "window.load-layout"
                     )
                 });
                 if state
@@ -43048,9 +43494,6 @@ mod tests {
                         .position(|id| *id == "window.maximize")
                         .unwrap_or(expected.len());
                     expected.splice(maximize..maximize, ["window.grow", "window.shrink"]);
-                }
-                if state.editor_focus_mode {
-                    expected.push("window.restore-layout");
                 }
             }
             if top != SCENE_MENU_INDEX && category != &"Tools" && category != &"Help" {
@@ -49214,5 +49657,119 @@ mod tests {
             reopened.load_scene_text(scene).unwrap().0,
             "A bold and *italic* line."
         );
+    }
+
+    #[test]
+    fn named_window_layouts_persist_split_tree_and_reconnect_views_by_source_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+
+        let mut layout = pane_layout::PaneLayout::default();
+        let reference_id = layout
+            .split(
+                pane_layout::Orientation::Vertical,
+                6_500,
+                state.pane_bounds,
+                18,
+                6,
+            )
+            .unwrap();
+        state.reference_panes.push(ReferencePane {
+            layout_id: Some(reference_id),
+            source_key: "outline:project".into(),
+            scene_id: None,
+            title: "Field Notes".into(),
+            content: "A persistent reference view.".into(),
+            scroll: 3,
+            follow_context: false,
+            shared_scene: false,
+            cursor: (2, 4),
+            selection_anchor: None,
+            proofreading: None,
+        });
+        layout.focus(reference_id).unwrap();
+        state.reference_focused = true;
+        state.active_reference = 0;
+        state.pane_layout = Some(layout.clone());
+
+        state
+            .save_named_window_layout("  Writing + Research  ")
+            .unwrap();
+        assert_eq!(
+            state.named_window_layout_names().unwrap(),
+            ["Writing + Research"]
+        );
+
+        // Runtime pane IDs can change as views are reopened. Restore by source
+        // identity while retaining the saved split tree and its focused view.
+        let mut current = pane_layout::PaneLayout::default();
+        current.focus(1).unwrap();
+        state.pane_layout = Some(current);
+        state.reference_panes[0].layout_id = Some(9);
+        state.reference_focused = false;
+        state
+            .load_named_window_layout("writing + research")
+            .unwrap();
+        let restored = state.pane_layout.as_ref().unwrap();
+        assert_eq!(restored.panes(), [1, 9]);
+        assert_eq!(restored.focused(), 9);
+        assert_eq!(state.reference_panes[0].layout_id, Some(9));
+        assert!(state.reference_focused);
+        assert_eq!(state.reference_panes[0].source_key, "outline:project");
+        assert_eq!(state.reference_panes[0].scroll, 3);
+
+        let reopened_app = WriterApp::open_project(&project).unwrap();
+        let mut reopened = AppState::new(reopened_app, default_bindings());
+        reopened.restore_session().unwrap();
+        assert_eq!(reopened.pane_layout.as_ref().unwrap().panes(), [1, 9]);
+        assert_eq!(reopened.pane_layout.as_ref().unwrap().focused(), 9);
+        assert_eq!(reopened.reference_panes[0].source_key, "outline:project");
+    }
+
+    #[test]
+    fn named_window_layout_load_missing_view_or_invalid_name_leaves_layout_unchanged() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        let mut saved = pane_layout::PaneLayout::default();
+        let reference_id = saved
+            .split(
+                pane_layout::Orientation::Vertical,
+                5_000,
+                state.pane_bounds,
+                18,
+                6,
+            )
+            .unwrap();
+        state.reference_panes.push(ReferencePane {
+            layout_id: Some(reference_id),
+            source_key: "research:missing-later".into(),
+            scene_id: None,
+            title: "Reference".into(),
+            content: "Reference text.".into(),
+            scroll: 0,
+            follow_context: false,
+            shared_scene: false,
+            cursor: (0, 0),
+            selection_anchor: None,
+            proofreading: None,
+        });
+        state.pane_layout = Some(saved);
+        state.save_named_window_layout("Research").unwrap();
+
+        assert!(validate_window_layout_name("../outside").is_err());
+        let before = state.pane_layout.clone();
+        state.reference_panes.clear();
+        assert!(state.load_named_window_layout("Research").is_err());
+        assert_eq!(state.pane_layout, before);
     }
 }

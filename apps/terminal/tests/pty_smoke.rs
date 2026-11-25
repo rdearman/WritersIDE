@@ -220,6 +220,101 @@ fn insert_date_time_and_file_work_through_the_real_insert_menu() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn named_window_layouts_save_and_load_through_the_real_view_menu() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Layout Project");
+    let mut app = WriterApp::create_project(&project, "Layout Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "The saved view remains intact.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY named-layout workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("named-layouts")
+        .output()
+        .expect("run the Linux PTY named-layout workflow");
+    assert!(
+        result.status.success(),
+        "PTY named-layout workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let layout_path = project.join(".writers-ide/window-layouts.json");
+    let layouts: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(layout_path).unwrap()).unwrap();
+    assert_eq!(layouts["layouts"][0]["name"], "UAT Layout");
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "The saved view remains intact."
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn edit_menu_is_visible_and_select_all_dispatches_from_writing_mode_in_a_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Edit Menu Project");
+    let mut app = WriterApp::create_project(&project, "Edit Menu Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(
+        scene,
+        Some(&hash),
+        "An author can find the editing actions.",
+    )
+    .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY Edit-menu workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("edit-menu")
+        .output()
+        .expect("run the Linux PTY Edit-menu workflow");
+    assert!(
+        result.status.success(),
+        "PTY Edit-menu workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "An author can find the editing actions."
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
     let _guard = lock_pty_test();
     use std::process::Command;

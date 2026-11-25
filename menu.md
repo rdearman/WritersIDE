@@ -99,7 +99,8 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - Move Reference Earlier/Later (when multiple reference panes are open)
 - Close Window (when a reference pane is open)
 - Return to Writing (when a reference pane has focus)
-- Maximize Current Window / Restore Window Layout
+- Maximize Current Window / Restore Windows (one reversible toggle)
+- Save Layout… / Load Layout… (Manuscript editor; names are stored in the current project)
 - Swap Editor and Reference Sides (when a reference pane is open)
 - Show Rendered Markdown (Reference workspace)
 - Search All Commands…
@@ -110,6 +111,12 @@ windows may be nested; focus, close, Single View, maximize and restore operate
 on the focused pane. Each pane retains a stable document source, and the pane
 tree and focus restore with the project session. Formatting marks are available
 while editing; rendered Markdown is available in the Reference workspace.
+Named layouts preserve the recursive split tree and stable source keys in
+`.writers-ide/window-layouts.json`. Load Layout remaps pane IDs to the matching
+views currently open in the project; it reports a missing view without changing
+the active layout.
+F11 is currently assigned to Find Query History, so maximize/restore remains
+available from View and its command can be remapped in Keybinding Manager.
 
 ## Review
 

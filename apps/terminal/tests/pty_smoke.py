@@ -131,6 +131,8 @@ def main():
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
     insert_edit_actions = modes == ["insert-edit-actions"]
+    named_layouts = modes == ["named-layouts"]
+    edit_menu = modes == ["edit-menu"]
     chapter_removal = modes in (
         ["chapter-removal"],
         ["chapter-removal-target"],
@@ -273,6 +275,98 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after insertion")
             print("PTY editing workflow passed: Insert Date/Time and Insert File work through the menus.")
+            return
+
+        if named_layouts:
+            os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
+            read_for(0.25)
+
+            save_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 4 + b"\x1b[B" * 9 + b"\r")
+            if not wait_for_screen_fragments(
+                (b"SaveLayout", b"Entersaves", b"Esccancels"),
+                save_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "View > Save Layout did not open its named-layout prompt; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"UAT Layout\r")
+            if not wait_for_screen_fragments(
+                (b"Savedwindowlayout", b"UATLayout"), save_start, timeout=3.0
+            ):
+                raise AssertionError("named window layout was not saved through View menu")
+
+            load_start = len(output)
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 4 + b"\x1b[B" * 10 + b"\r")
+            if not wait_for_screen_fragments(
+                (b"LoadLayout", b"UATLayout", b"Enterloads"),
+                load_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "View > Load Layout did not show the available layout; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"UAT Layout\r")
+            if not wait_for_screen_fragments(
+                (b"Loadedwindowlayout", b"UATLayout"), load_start, timeout=3.0
+            ):
+                raise AssertionError("named window layout was not restored through View menu")
+
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after layout workflow")
+            print("PTY window-layout workflow passed: View menu saves and reloads a named project layout.")
+            return
+
+        if edit_menu:
+            os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
+            read_for(0.25)
+            edit_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.15)
+            os.write(master, b"\x1b[C")  # Edit menu
+            if not wait_for_screen_fragments(
+                (b"Undo", b"Select All", b"Find and Replace"),
+                edit_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "Edit actions were not visible from the writing screen; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"\x1b[B" * 6 + b"\r")  # Edit > Select All
+            if not wait_for_screen_fragments(
+                (b"Selected all text in the current manuscript document",),
+                edit_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "Edit > Select All did not dispatch from the writing menu; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after Edit-menu workflow")
+            print("PTY Edit-menu workflow passed: Edit is visible in writing mode and Select All dispatches.")
             return
 
         if chapter_creation:
