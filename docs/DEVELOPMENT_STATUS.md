@@ -87,13 +87,14 @@ python3 tools/real_manuscript_regression.py --phase compile \
 python3 tools/real_manuscript_regression.py --phase full
 ```
 
-Latest measured run: `reports/verification-after-fixes-20261125/`, with
-generated projects and EPUBs under
-`generated/verification-after-fixes-20261125/`. It used the production
+Latest measured run: `reports/clean-commit-9c5c887/`, with generated projects
+and EPUBs under `generated/clean-commit-9c5c887/`. It used the production
 CLI/importer/storage/compiler and reopened projects before compilation. The
-report identifies the pre-commit source revision and a dirty working tree, so
-it is diagnostic, not a release baseline. The measured results remain
-provisional.
+source commit is `9c5c8879067fa81decf88379ff8d2df1b36f995b`; the harness marked
+the tree dirty only because user-owned `.gitignore`, README draft and UAT files
+were present. No application source changed during the run. A local provisional
+WIDE baseline is retained under ignored `baselines/provisional-9c5c887/`; it is
+not accepted and must not replace a better validated baseline.
 
 For the three books, bodies extracted by the importer were preserved in
 persisted Markdown (44/44, 41/41 and 76/76); research bodies were also preserved
@@ -111,14 +112,12 @@ are 1298/358, 648/407 and 1813/1430; link counts are 45/0, 149/0 and 26/0.
 These measurements require investigation but do not alone prove source-revision
 or compiler causes. Historical publication revisions/settings have not been
 reconciled. Do not promote a baseline or claim import/publishing acceptance.
-Next: repair image/asset import at the source layer, improve sanitised
-diagnostics, and trace text, paragraph, link and navigation differences
-through extraction, persisted documents and compile input. Keep all
-manuscript-bearing reports local and never commit fixture-derived files.
-
-After committing the current importer and content-unit persistence fixes, rerun
-the three-book suite against a clean commit. Keep its result provisional and do
-not replace a better validated baseline automatically.
+Next: repair RTF image extraction and project-local asset persistence at the
+import layer, improve sanitised warnings, then trace text, paragraph, link and
+navigation differences through extraction, persisted documents and compile
+input. Rerun the three-book suite after relevant changes. Keep all manuscript-
+bearing reports and generated publications local; never commit fixture-derived
+files.
 
 ## Verification commands
 
