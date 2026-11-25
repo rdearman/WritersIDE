@@ -67,6 +67,51 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn first_run_tutorial_navigation_and_resume_work_through_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Author's Book");
+    WriterApp::create_project(&project, "Author's Book").unwrap();
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY tutorial workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("tutorial-navigation")
+        .output()
+        .expect("run the first-run tutorial Linux PTY workflow");
+    assert!(
+        result.status.success(),
+        "tutorial PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let demo_path = root.path().join("data/writers-ide/tutorial/sample-project");
+    let demo = WriterApp::open_project(&demo_path).unwrap();
+    let scenes = demo.list_scenes(false).unwrap();
+    assert_eq!(
+        scenes.len(),
+        1,
+        "tutorial should use its isolated sample scene"
+    );
+    let saved = demo.load_scene_text(scenes[0].scene.id).unwrap().0;
+    assert!(saved.contains("First tutorial sentence."), "{saved}");
+    let original = WriterApp::open_project(project).unwrap();
+    assert!(original.list_scenes(false).unwrap().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn view_menu_switches_between_unified_outline_presentations_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

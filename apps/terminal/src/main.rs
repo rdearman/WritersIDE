@@ -873,7 +873,7 @@ fn tutorial_navigation_task_label(action: &str) -> &'static str {
         "write" => "Type a few words in the sample scene",
         "save" => "Save your writing from File > Save",
         "return" => "Press Esc to return to Outline",
-        "resume" => "Choose Help > Resume Tutorial",
+        "resume" => "Press Esc to pause, then choose Help > Resume Tutorial",
         _ => "Continue the practice in the sample book",
     }
 }
@@ -24596,7 +24596,7 @@ fn tutorial_expected_action_hint(state: &AppState) -> String {
             effective_shortcut_label(state, "file.save", "Ctrl+S")
         ),
         Some("return") => "Press Esc to return to Outline".into(),
-        Some("resume") => "Choose Help > Resume Tutorial".into(),
+        Some("resume") => "Press Esc to pause, then choose Help > Resume Tutorial".into(),
         Some("cards") => "Choose View > Show Scene Cards".into(),
         Some("reference-open") => "Open View > Open Outline Reference".into(),
         Some("reference-focus") => "Press Ctrl+Tab to focus the reference pane".into(),
@@ -24604,6 +24604,23 @@ fn tutorial_expected_action_hint(state: &AppState) -> String {
         Some("compile") => "Open Publish > Compile, choose EPUB with F2 and save it".into(),
         _ => "Continue the current tutorial lesson".into(),
     }
+}
+
+fn tutorial_editor_input_key(state: &AppState, key: KeyEvent) -> bool {
+    state.workspace == Workspace::Editor
+        && (matches!(
+            key.code,
+            KeyCode::Enter
+                | KeyCode::Backspace
+                | KeyCode::Delete
+                | KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+        ) || (matches!(key.code, KeyCode::Char(_))
+            && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)))
 }
 
 fn tutorial_key_is_expected(state: &AppState, key: KeyEvent) -> bool {
@@ -24656,7 +24673,8 @@ fn tutorial_key_is_expected(state: &AppState, key: KeyEvent) -> bool {
             ),
             Some("write") => matches!(key.code, KeyCode::Esc),
             Some("save") => {
-                matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Esc)
+                tutorial_editor_input_key(state, key)
+                    || matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Esc)
                     || (state.menu.is_some_and(|menu| {
                         let selected_is_save = state
                             .menu_visible_entries()
@@ -24672,6 +24690,10 @@ fn tutorial_key_is_expected(state: &AppState, key: KeyEvent) -> bool {
             Some("return") => key.code == KeyCode::Esc,
             Some("resume") => {
                 matches!(key.code, KeyCode::Left | KeyCode::Right | KeyCode::Esc)
+                    || (state
+                        .menu
+                        .is_some_and(|menu| MENU_CATEGORIES[menu.top] == "Help")
+                        && matches!(key.code, KeyCode::Up | KeyCode::Down))
                     || (state.menu.is_some_and(|menu| {
                         MENU_CATEGORIES[menu.top] == "Help"
                             && state
@@ -24716,21 +24738,10 @@ fn tutorial_key_is_expected(state: &AppState, key: KeyEvent) -> bool {
             state.workspace == Workspace::Outline
                 && matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::Enter)
         }
-        Some("write") => {
-            state.workspace == Workspace::Editor
-                && (matches!(
-                    key.code,
-                    KeyCode::Enter
-                        | KeyCode::Backspace
-                        | KeyCode::Delete
-                        | KeyCode::Left
-                        | KeyCode::Right
-                        | KeyCode::Up
-                        | KeyCode::Down
-                        | KeyCode::Home
-                        | KeyCode::End
-                ) || (matches!(key.code, KeyCode::Char(_))
-                    && (key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT)))
+        Some("write") => tutorial_editor_input_key(state, key),
+        Some("save") => {
+            tutorial_editor_input_key(state, key)
+                || tutorial_key_matches_command(state, "file.save", key)
         }
         Some("cards") => tutorial_key_matches_command(state, "view.cards", key),
         Some("reference-open") => {
@@ -24775,7 +24786,6 @@ fn tutorial_key_is_expected(state: &AppState, key: KeyEvent) -> bool {
                         )
                 })
         }
-        Some("save") => tutorial_key_matches_command(state, "file.save", key),
         Some("return") => state.workspace == Workspace::Editor && key.code == KeyCode::Esc,
         _ => true,
     }
@@ -49456,12 +49466,23 @@ mod tests {
             KeyEvent::new(KeyCode::Char('X'), KeyModifiers::SHIFT),
         )
         .unwrap();
+        for character in " additional words".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
         )
         .unwrap();
         assert!(!state.dirty);
+        assert!(
+            state.editor.join("\n").contains("X additional words"),
+            "tutorial input filtering must let an author finish writing after the first verified character"
+        );
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert_eq!(state.workspace, Workspace::Outline);
         handle(
@@ -49673,6 +49694,92 @@ mod tests {
         assert_eq!(MENU_CATEGORIES[menu.top], "Navigate");
         assert_eq!(tutorial_next_action(&state), Some("outline-select"));
         assert!(state.help_panel.is_some());
+    }
+
+    #[test]
+    fn active_tutorial_allows_arrow_navigation_to_help_resume_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Original"), "Original").unwrap();
+        let preferences_path = directory.path().join("prefs/tutorial.json");
+        let mut state = AppState::new(app, default_bindings());
+        state
+            .begin_tutorial_at(
+                onboarding::TutorialTrack::GuidedTour,
+                directory.path().join("Tutorial"),
+                preferences_path.clone(),
+            )
+            .unwrap();
+
+        let mut preferences = onboarding::load(&preferences_path).unwrap();
+        preferences
+            .active_tutorial
+            .as_mut()
+            .unwrap()
+            .verified_actions = [
+            "menu",
+            "navigate-menu",
+            "outline-select",
+            "outline",
+            "scene",
+            "write",
+            "save",
+            "return",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        onboarding::store(&preferences_path, &preferences).unwrap();
+        state.help_panel = Some(tutorial_panel_at(
+            onboarding::TutorialTrack::GuidedTour,
+            0,
+            &preferences_path,
+        ));
+        state.open_menu_category(
+            MENU_CATEGORIES
+                .iter()
+                .position(|category| *category == "Help")
+                .unwrap(),
+        );
+        assert_eq!(tutorial_next_action(&state), Some("resume"));
+
+        let resume_index = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| command.id == "help.resume-tutorial")
+            .unwrap();
+        for _ in 0..resume_index {
+            handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        }
+        assert_eq!(
+            state
+                .menu_visible_entries()
+                .get(state.menu.unwrap().selected)
+                .unwrap()
+                .id,
+            "help.resume-tutorial"
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(
+            onboarding::load(&preferences_path)
+                .unwrap()
+                .active_tutorial
+                .unwrap()
+                .verified_actions
+                .contains("resume")
+        );
+        assert!(
+            state
+                .help_panel
+                .as_ref()
+                .unwrap()
+                .lines
+                .iter()
+                .any(|line| { line == "Navigation lesson complete · Enter continues" })
+        );
     }
 
     #[test]

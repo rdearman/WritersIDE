@@ -125,6 +125,7 @@ def set_size(fd, rows, columns):
 def main():
     binary, project, isolated_home, *modes = sys.argv[1:]
     create_fiction = modes == ["create-fiction"]
+    tutorial_navigation = modes == ["tutorial-navigation"]
     previous_position = modes == ["previous-position"]
     removal_dialogs = modes == ["removal-dialogs"]
     chapter_creation = modes == ["chapter-creation"]
@@ -228,6 +229,16 @@ def main():
         visible = "".join("".join(rows).split())
         return all(marker.decode("utf-8").replace(" ", "") in visible for marker in markers)
 
+    def wait_for_workspace_title(title, timeout=5.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            rows = terminal_snapshot(output, 24, 80)
+            if len(rows) > 1 and rows[1].startswith(f"┌{title}"):
+                return True
+            read_for(0.1)
+        rows = terminal_snapshot(output, 24, 80)
+        return len(rows) > 1 and rows[1].startswith(f"┌{title}")
+
     def show_scene_cards_presentation():
         """Select the card presentation from the unified Outline's View menu."""
         menu_start = len(output)
@@ -268,10 +279,144 @@ def main():
         raise AssertionError(
             f"menu did not expose selectable item {label!r}; visible tail: "
             + repr(ANSI_CONTROL.sub(b"", output[-2200:]))
+            + "\ncurrent screen: "
+            + repr(terminal_snapshot(output, 24, 80))
         )
 
     try:
         read_for(1.0)
+        if tutorial_navigation:
+            if not wait_for_screen_fragments(
+                (b"Welcome to Writer's IDE", b"Guided Tour", b"Quick Start"), timeout=10.0
+            ):
+                raise AssertionError("first-run welcome did not present the tutorial choices")
+            # New Project, Open Project, Recent Projects, Import, Guided Tour.
+            os.write(master, b"\x1b[B" * 4 + b"\r")
+            if not wait_for_screen_fragments(
+                (b"Tutorial", b"1/6", b"Press F10 to open the menu"), timeout=10.0
+            ):
+                raise AssertionError("Guided Tour did not open its first actionable lesson")
+
+            # F6 is assigned to Characters globally; the focused tutorial must
+            # retain the key and keep the same step and task visible.
+            os.write(master, b"\x1b[17~")
+            read_for(0.2)
+            if not wait_for_screen_fragments(
+                (b"Tutorial", b"1/6", b"0/9 verified", b"Press F10 to open the menu"),
+                timeout=3.0,
+            ):
+                raise AssertionError("F6 took focus away from the active tutorial lesson")
+
+            # Complete the visible route: F10 → Navigate → Outline → scene.
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 3)
+            selected_outline = False
+            for _ in range(16):
+                if wait_for_screen_fragments(("▸ Outline".encode(),), menu_start, timeout=0.12):
+                    selected_outline = True
+                    break
+                os.write(master, b"\x1b[B")
+                read_for(0.05)
+            if not selected_outline:
+                raise AssertionError("Navigate did not visibly select Outline during the tutorial")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"A Sample Chapter", b"The First Page"), timeout=5.0
+            ):
+                raise AssertionError("tutorial did not navigate to its sample outline")
+            os.write(master, b"\x1b[B\r")
+            if not wait_for_screen_fragments((b"Mara opened the old book",), timeout=5.0):
+                raise AssertionError("tutorial sample scene did not open from the outline")
+            if not wait_for_workspace_title("Editor"):
+                raise AssertionError("tutorial scene selection did not open the manuscript editor")
+            os.write(master, b"\nFirst tutorial sentence.")
+            if not wait_for_screen_fragments(
+                (b"6/9 verified", b"Save your writing"), timeout=3.0
+            ):
+                raise AssertionError(
+                    "tutorial did not verify the actual sample-scene edit; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            if not wait_for_screen_fragments((b"First tutorial sentence.",), timeout=3.0):
+                raise AssertionError(
+                    "tutorial stopped accepting text after the first character; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x13")  # Ctrl+S
+            if not wait_for_screen_fragments(
+                (b"7/9 verified", b"Press Esc to return to Outline"), timeout=3.0
+            ):
+                raise AssertionError("tutorial did not verify the saved sample-scene edit")
+            os.write(master, b"\x1b")  # return to Outline, as the lesson requests
+            if not wait_for_workspace_title("Outline"):
+                raise AssertionError("Esc did not return to the tutorial outline")
+            read_for(0.2)
+
+            # Resume from the visible Help menu and advance only after the
+            # required writing, save, return, and resume states are verified.
+            os.write(master, b"\x1b")  # pause the tutorial before opening Help
+            read_for(0.3)
+            rows = terminal_snapshot(output, 24, 80)
+            if any("Tutorial · Find your way around" in row for row in rows):
+                raise AssertionError(
+                    "Escape did not hide the tutorial panel; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            if not any("Resume: Help > Resume Tutorial" in row for row in rows):
+                raise AssertionError("paused tutorial footer did not show its Help resume route")
+            os.write(master, b"\x1b[21~")
+            if not wait_for_screen_fragments((b"New Project", b"Quit"), timeout=3.0):
+                raise AssertionError(
+                    "F10 did not open the File menu while the tutorial was active; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x1b[C" * 8)
+            if not wait_for_screen_fragments((b"Context Help", b"Resume Tutorial"), timeout=3.0):
+                raise AssertionError("Help menu did not expose Resume Tutorial")
+            select_visible_menu_item("Resume Tutorial")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Navigation lesson complete", b"Enter continues"), timeout=5.0
+            ):
+                raise AssertionError("Help > Resume Tutorial did not restore the completed lesson")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Tutorial", b"2/6", b"Show Scene Cards from View"), timeout=5.0
+            ):
+                raise AssertionError("Enter did not advance the tutorial to lesson 2/6")
+
+            # Pause and resume through the same visible command; the exact
+            # lesson number and pending action must be restored.
+            os.write(master, b"\x1b")
+            read_for(0.2)
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 8)
+            select_visible_menu_item("Resume Tutorial")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Tutorial", b"2/6", b"Show Scene Cards from View"), timeout=5.0
+            ):
+                raise AssertionError("tutorial resume did not restore lesson 2 and its pending task")
+            os.write(master, b"\x1b[17;2~")  # Shift+F6 must not switch workspace either
+            if not wait_for_screen_fragments((b"Tutorial", b"2/6"), timeout=3.0):
+                raise AssertionError("Shift+F6 took focus away from the resumed tutorial")
+
+            os.write(master, b"\x1b")  # pause before the ordinary application quit command
+            read_for(0.2)
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit after the tutorial pause")
+            print("PTY tutorial passed: first-run navigation, editing, saving, Help resume and lesson restoration work.")
+            return
         if outline_view:
             os.write(master, b"\x1b")  # dismiss first-run welcome
             read_for(0.25)

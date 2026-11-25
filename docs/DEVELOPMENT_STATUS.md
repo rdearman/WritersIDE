@@ -7,6 +7,26 @@ authoritative source for approved requirements and human UAT findings.
 
 ## Current checkpoint — 25 November 2026
 
+The first-run Guided Tour navigation defect has a verified implementation
+regression. While the tutorial is on its Save step, editor input remains
+available after the first verified character; Help-menu arrow navigation can
+reach **Resume Tutorial**; and the visible instruction and paused footer now
+give the exact `Help > Resume Tutorial` route. A Linux PTY workflow exercised
+first launch, lesson navigation, typing and saving in the disposable sample
+project, pausing, resuming through Help, advancing to lesson 2, pausing and
+resuming there, then exiting. It verified the saved sentence after reopening
+the isolated sample project and verified the author's original project stayed
+scene-free. This automated evidence does not replace human UAT for #41/#59.
+
+Verification for this checkpoint: `cargo fmt --all -- --check`,
+`cargo clippy --offline --workspace --all-targets -- -D warnings`, and
+`cargo test --offline --workspace -- --test-threads=1` all passed. The full
+workspace run included 336 terminal unit tests, 3 author-workflow integration
+tests, 22 Linux PTY tests, and all other workspace unit, integration and
+documentation tests. The first-run tutorial PTY journey passed. Keep #41 open
+for author verification; continue with the next highest-priority open v1.0
+repair after this batch is pushed.
+
 The root README is now an author-facing alpha introduction. Supporting
 documents are [Getting Started](GETTING_STARTED.md), the [developer guide](DEVELOPMENT.md)
 and the [CLI reference](CLI.md). The README screenshots were captured from the
