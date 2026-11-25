@@ -151,6 +151,14 @@ menu, empty chapter creation, scene creation, removal, structural undo and
 outliner presentation checks passed. The Ollama loopback unit test required the
 previously authorised local socket permission.
 
+The #56 rendering regression now exercises an actual PTY transition from
+manuscript prose to an imported synthetic reference and back, checking that
+neither view leaks text into the other and that both remain contiguous through
+80×24 and 201×60 resizes. It also verifies the reference source remains
+unchanged and the manuscript bytes survive reopen. The historical scattered-
+glyph screenshot still has not been reproduced; this is added regression
+coverage, not a proven root-cause fix. #56 remains open for human verification.
+
 Private real Scrivener regression fixtures were checked read-only on 2026-11-25.
 `(cd fixtures && sha256sum --quiet -c SHA256SUMS)` passed before and after each
 run. Git tracks no files under `fixtures/`, `generated/`, `reports/` or

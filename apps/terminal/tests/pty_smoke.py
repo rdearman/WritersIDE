@@ -1234,6 +1234,42 @@ def main():
         if b"Commands: section TITLE" in ANSI_CONTROL.sub(b"", output):
             raise AssertionError("internal command registry appeared after closing the menu")
         assert_sample_prose_visible(output, 24, 80, "screen after closing menu")
+
+        # Exercise an actual manuscript → imported reference → manuscript
+        # transition. Both panes contain distinct synthetic prose so stale
+        # text leakage is observable in the reconstructed terminal screen.
+        os.write(master, b"\x1b[21~")  # F10
+        read_for(0.2)
+        os.write(master, b"\x1b[C" * 3)  # Navigate
+        select_visible_menu_item("Reference")
+        os.write(master, b"\r")
+        if not wait_for_screen_fragments((b"Reference Library",), timeout=3.0):
+            raise AssertionError("Navigate > Reference did not open the Reference Library")
+        os.write(master, b"\r")  # open the selected imported reference
+        if not wait_for_screen_fragments((b"Reference only stays clear.",), timeout=3.0):
+            raise AssertionError("the imported reference prose was not rendered contiguously")
+        assert_visible_sentence(output, 24, 80, "Reference only stays clear.", "Reference Library")
+        if any("Maqrara opened the old bok" in row for row in terminal_snapshot(output, 24, 80)):
+            raise AssertionError("manuscript prose leaked into the Reference Library")
+
+        set_size(master, 60, 201)
+        read_for(0.4)
+        assert_visible_sentence(output, 60, 201, "Reference only stays clear.", "Reference at 201x60")
+        set_size(master, 24, 80)
+        read_for(0.4)
+        assert_visible_sentence(output, 24, 80, "Reference only stays clear.", "Reference at 80x24")
+
+        os.write(master, b"\x1b[21~")  # F10
+        read_for(0.2)
+        os.write(master, b"\x1b[C" * 3)  # Navigate
+        read_for(0.2)
+        select_visible_menu_item("Manuscript")
+        os.write(master, b"\r")
+        read_for(0.4)
+        assert_sample_prose_visible(output, 24, 80, "screen after returning from Reference Library")
+        if any("Reference only stays clear." in row for row in terminal_snapshot(output, 24, 80)):
+            raise AssertionError("reference prose leaked into the manuscript editor")
+
         set_size(master, 60, 201)
         read_for(0.4)
         assert_sample_prose_visible(output, 60, 201, "resized 201x60 screen")

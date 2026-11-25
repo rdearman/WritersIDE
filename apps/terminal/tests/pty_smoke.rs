@@ -28,6 +28,11 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
         ),
     )
     .unwrap();
+    let reference_path = root.path().join("reference notes.txt");
+    std::fs::write(&reference_path, "Reference only stays clear.").unwrap();
+    let reference = story_reading::import_reference(&reference_path).unwrap();
+    app.import_reading_document(&reference, reference_path.to_str().unwrap())
+        .unwrap();
     drop(app);
 
     let python = Command::new("python3").arg("--version").output();
@@ -53,6 +58,10 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
     assert_eq!(
         reopened.load_scene_text(scene).unwrap().0,
         "The opening paragraph remains readable.\nMaqrara opened the old bok and found a note inside.\nÉlodie waved beside 한글 🧭."
+    );
+    assert_eq!(
+        std::fs::read_to_string(reference_path).unwrap(),
+        "Reference only stays clear."
     );
 }
 
