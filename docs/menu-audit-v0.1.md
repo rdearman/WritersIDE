@@ -423,6 +423,13 @@ point when selected; invalid scalar values are rejected. Insertion uses the
 existing undoable editor path, and recent characters are saved in the
 project-local editor preferences.
 
+**Join Adjacent Paragraphs** joins the paragraph under the cursor to the next
+non-empty paragraph, or to the previous paragraph when there is no next one.
+It replaces the blank-line separator with one space and leaves line breaks
+inside either paragraph unchanged. The change is undoable and saved through the
+existing manuscript journal. Empty paragraphs and documents with no adjacent
+paragraph remain unchanged.
+
 ## Alpha UAT 19 — manuscript insertion actions
 
 The Insert menu now also exposes **Insert Date/Time** and **Insert File…**.

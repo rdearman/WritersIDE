@@ -975,6 +975,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "edit.delete-word",
         "edit.delete-sentence",
         "edit.delete-paragraph",
+        "edit.join-paragraphs",
         "edit.select-all",
         "edit.duplicate-selection",
         "edit.select-word",
@@ -1641,6 +1642,7 @@ enum CommandAction {
     DeleteWord,
     DeleteSentence,
     DeleteParagraph,
+    JoinParagraphs,
     SelectAllText,
     DuplicateSelection,
     SelectWord,
@@ -2651,6 +2653,21 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 9,
             advanced: false,
             action: CommandAction::DeleteParagraph,
+        },
+        CommandSpec {
+            id: "edit.join-paragraphs",
+            label: "Join Adjacent Paragraphs",
+            description: "Join the current paragraph to the next, or to the previous at document end",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["join paragraphs", "merge paragraphs"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 18,
+            advanced: false,
+            action: CommandAction::JoinParagraphs,
         },
         CommandSpec {
             id: "edit.select-all",
@@ -15354,6 +15371,7 @@ impl AppState {
             CommandAction::DeleteWord => self.delete_word_at_cursor(),
             CommandAction::DeleteSentence => self.delete_sentence_at_cursor(),
             CommandAction::DeleteParagraph => self.delete_paragraph_at_cursor(),
+            CommandAction::JoinParagraphs => self.join_adjacent_paragraphs(),
             CommandAction::SelectAllText => self.select_all_text(),
             CommandAction::DuplicateSelection => self.duplicate_selection_or_paragraph(),
             CommandAction::SelectWord => self.select_word_at_cursor(),
@@ -22682,6 +22700,48 @@ impl AppState {
             self.delete_current_selection_with_spacing(true);
         }
     }
+    fn join_adjacent_paragraphs(&mut self) {
+        let source = self.editor.join("\n");
+        let (paragraph_start, paragraph_end) = self.current_paragraph_byte_range(&source);
+        if paragraph_start == paragraph_end
+            || source[paragraph_start..paragraph_end].trim().is_empty()
+        {
+            self.message = "Place the cursor in a non-empty paragraph before joining".into();
+            return;
+        }
+
+        let mut next_paragraph_start = paragraph_end;
+        while source.as_bytes().get(next_paragraph_start) == Some(&b'\n') {
+            next_paragraph_start += 1;
+        }
+        if next_paragraph_start < source.len() {
+            self.replace_editor_range(
+                paragraph_end,
+                next_paragraph_start,
+                " ",
+                "Paragraphs joined",
+            );
+            return;
+        }
+
+        let mut previous_separator_start = paragraph_start;
+        while previous_separator_start > 0
+            && source.as_bytes().get(previous_separator_start - 1) == Some(&b'\n')
+        {
+            previous_separator_start -= 1;
+        }
+        if previous_separator_start < paragraph_start {
+            self.replace_editor_range(
+                previous_separator_start,
+                paragraph_start,
+                " ",
+                "Paragraphs joined",
+            );
+        } else {
+            self.message = "There is no adjacent paragraph to join".into();
+        }
+    }
+
     fn duplicate_selection_or_paragraph(&mut self) {
         let source = self.editor.join("\n");
         let is_selection = self.selection_bounds().is_some();
@@ -50298,6 +50358,65 @@ mod tests {
         );
         run_edit_menu(&mut state, "edit.undo");
         assert_eq!(state.editor.join("\n"), source);
+    }
+
+    #[test]
+    fn edit_menu_joins_adjacent_paragraphs_undoably_and_persists() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let source = "First paragraph.\n\nSecond paragraph with é.\n\nLast.";
+        let hash = app.load_scene_text(scene).unwrap().1;
+        app.save_scene_text(scene, Some(&hash), source).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+
+        let run_edit_menu = |state: &mut AppState, command_id: &str| {
+            state.open_menu_category(1);
+            let selected = state
+                .menu_visible_entries()
+                .iter()
+                .position(|command| command.id == command_id)
+                .unwrap_or_else(|| panic!("{command_id} is absent from the Edit menu"));
+            state.menu.as_mut().unwrap().selected = selected;
+            state
+                .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+
+        state.cursor = (0, 2);
+        run_edit_menu(&mut state, "edit.join-paragraphs");
+        let joined_next = "First paragraph. Second paragraph with é.\n\nLast.";
+        assert_eq!(state.editor.join("\n"), joined_next);
+        assert!(state.message.starts_with("Paragraphs joined"));
+        state.dispatch_registered(CommandAction::Save).unwrap();
+        assert_eq!(
+            WriterApp::open_project(&project)
+                .unwrap()
+                .load_scene_text(scene)
+                .unwrap()
+                .0,
+            joined_next
+        );
+        run_edit_menu(&mut state, "edit.undo");
+        assert_eq!(state.editor.join("\n"), source);
+
+        state.cursor = (4, 2);
+        run_edit_menu(&mut state, "edit.join-paragraphs");
+        assert_eq!(
+            state.editor.join("\n"),
+            "First paragraph.\n\nSecond paragraph with é. Last."
+        );
+        run_edit_menu(&mut state, "edit.undo");
+        assert_eq!(state.editor.join("\n"), source);
+
+        state.editor = vec!["Only paragraph.".into()];
+        state.cursor = (0, 2);
+        run_edit_menu(&mut state, "edit.join-paragraphs");
+        assert_eq!(state.editor.join("\n"), "Only paragraph.");
+        assert!(state.message.contains("no adjacent paragraph"));
     }
 
     #[test]

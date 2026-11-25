@@ -326,7 +326,7 @@ fn edit_menu_is_visible_and_selection_commands_dispatch_from_writing_mode_in_a_p
     app.save_scene_text(
         scene,
         Some(&hash),
-        "An author can find the editing actions.",
+        "An author can find the editing actions.\n\nA second paragraph waits.",
     )
     .unwrap();
     drop(app);
@@ -353,7 +353,7 @@ fn edit_menu_is_visible_and_selection_commands_dispatch_from_writing_mode_in_a_p
     let reopened = WriterApp::open_project(&project).unwrap();
     assert_eq!(
         reopened.load_scene_text(scene).unwrap().0,
-        "An author can find the editing actions."
+        "An author can find the editing actions. A second paragraph waits."
     );
 }
 

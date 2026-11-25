@@ -36,6 +36,7 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - Delete Word (at the cursor; Undo restores it)
 - Delete Sentence (at the cursor; Undo restores it)
 - Delete Paragraph (at the cursor; Undo restores it)
+- Join Adjacent Paragraphs (joins with the next paragraph, or previous at document end)
 - Select All (`Ctrl+A`)
 - Duplicate Selection or Paragraph (duplicate selected text, or the paragraph containing the cursor)
 - Select Word (at or immediately after the cursor)
