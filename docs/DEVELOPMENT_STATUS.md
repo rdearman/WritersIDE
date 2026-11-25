@@ -27,6 +27,17 @@ documentation tests. The first-run tutorial PTY journey passed. Keep #41 open
 for author verification; continue with the next highest-priority open v1.0
 repair after this batch is pushed.
 
+The follow-up outliner repair separates scene-title editing from save-conflict
+review, which previously shared the same key-input mode. Scene > Rename now
+opens a focused field prefilled with the current title; Ctrl+A clears it,
+Enter saves, and Esc cancels. A Linux PTY test navigates from the editor back
+to Outline, opens the Scene menu, renames the selected scene, exits, and
+reopens the project to verify the title persisted while manuscript prose stayed
+unchanged. Formatting, workspace Clippy, the full workspace tests, and all 23
+Linux PTY tests passed for this batch. This fixes rename input only; the
+author-approved single unified outliner and metadata inspector remain
+outstanding in #55/#68 and still require human UAT.
+
 The root README is now an author-facing alpha introduction. Supporting
 documents are [Getting Started](GETTING_STARTED.md), the [developer guide](DEVELOPMENT.md)
 and the [CLI reference](CLI.md). The README screenshots were captured from the

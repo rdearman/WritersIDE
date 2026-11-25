@@ -126,6 +126,7 @@ def main():
     binary, project, isolated_home, *modes = sys.argv[1:]
     create_fiction = modes == ["create-fiction"]
     tutorial_navigation = modes == ["tutorial-navigation"]
+    scene_rename = modes == ["scene-rename"]
     previous_position = modes == ["previous-position"]
     removal_dialogs = modes == ["removal-dialogs"]
     chapter_creation = modes == ["chapter-creation"]
@@ -416,6 +417,54 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit after the tutorial pause")
             print("PTY tutorial passed: first-run navigation, editing, saving, Help resume and lesson restoration work.")
+            return
+        if scene_rename:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")  # skip first-run welcome for this existing project
+            if not wait_for_screen_fragments((b"Original scene body",), timeout=10.0):
+                raise AssertionError("the selected scene did not open in the manuscript editor")
+            if not wait_for_workspace_title("Editor"):
+                raise AssertionError("the scene did not open in the manuscript editor")
+            os.write(master, b"\x1b")  # Scene actions are available in the manuscript Outline
+            if not wait_for_workspace_title("Outline"):
+                raise AssertionError("Esc did not return to the selected scene in the Outline")
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.2)
+            menu_start = len(output)
+            for _ in range(12):
+                if wait_for_screen_fragments(
+                    (b"Rename Selected Scene",), menu_start, timeout=0.1
+                ):
+                    break
+                os.write(master, b"\x1b[C")  # advance through the visible menu roots
+                read_for(0.05)
+            if not wait_for_screen_fragments((b"Rename Selected Scene",), timeout=3.0):
+                raise AssertionError(
+                    "Scene menu did not expose Rename Selected Scene; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            select_visible_menu_item("Rename Selected Scene")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Original Scene", b"Ctrl+A clears title", b"Enter saves"), timeout=3.0
+            ):
+                raise AssertionError(
+                    "rename dialogue did not show and focus the current scene title; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x01The Returning Light\r")  # Ctrl+A, replace title, save
+            if not wait_for_screen_fragments((b"The Returning Light",), timeout=3.0):
+                raise AssertionError("renamed scene title was not visible in the outline")
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit after the scene rename")
+            print("PTY scene rename passed: Scene menu opened a prefilled editable title and saved it.")
             return
         if outline_view:
             os.write(master, b"\x1b")  # dismiss first-run welcome

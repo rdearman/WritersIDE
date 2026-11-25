@@ -15434,13 +15434,18 @@ impl AppState {
     }
 
     fn start_scene_rename(&mut self) {
-        if selected_scene_for_workspace(self).is_none() {
+        let Some(scene) = selected_scene_for_workspace(self) else {
             self.message = "Select a scene in the Outline before renaming it".into();
             return;
-        }
-        self.mode = Some('R');
-        self.prompt.clear();
-        self.message = "Rename selected scene · enter a title · Enter saves · Esc cancels".into();
+        };
+        let Ok(record) = self.app.get_scene(scene) else {
+            self.message = "Selected scene could not be loaded · its title was not changed".into();
+            return;
+        };
+        self.mode = Some('T');
+        self.prompt = record.scene.title;
+        self.message =
+            "Rename selected scene · Ctrl+A clears title · Enter saves · Esc cancels".into();
     }
 
     fn start_scene_synopsis(&mut self) {
@@ -16052,19 +16057,19 @@ impl AppState {
             }
             return Ok(());
         }
-        if matches!(mode, Some('R' | 'Y')) {
+        if matches!(mode, Some('T' | 'Y')) {
             let Some(scene_id) = selected_scene_for_workspace(self) else {
                 self.message = "Select a scene in the Outline first · no scene was changed".into();
                 return Ok(());
             };
-            if mode == Some('R') && cmd.trim().is_empty() {
+            if mode == Some('T') && cmd.trim().is_empty() {
                 self.message =
                     "Scene title unchanged · enter a title or press Esc to cancel".into();
                 return Ok(());
             }
             let result = (|| -> Result<(), Box<dyn std::error::Error>> {
                 let mut scene = self.app.get_scene(scene_id)?.scene;
-                if mode == Some('R') {
+                if mode == Some('T') {
                     scene.title = cmd.clone();
                 } else {
                     scene.synopsis = cmd.clone();
@@ -16072,7 +16077,7 @@ impl AppState {
                 self.app.update_scene_metadata(&scene)?;
                 self.refresh()?;
                 self.select_scene_in_current_outliner(scene_id);
-                self.message = if mode == Some('R') {
+                self.message = if mode == Some('T') {
                     format!("Renamed scene to “{cmd}”")
                 } else {
                     "Scene synopsis saved".into()
@@ -32619,6 +32624,30 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
             return Ok(false);
         }
+        if s.mode == Some('T') {
+            match k.code {
+                KeyCode::Esc => {
+                    s.mode = None;
+                    s.prompt.clear();
+                    s.message = "Scene title unchanged".into();
+                }
+                KeyCode::Enter => s.command()?,
+                KeyCode::Backspace => {
+                    s.prompt.pop();
+                }
+                KeyCode::Delete => s.prompt.clear(),
+                KeyCode::Char('a') if k.modifiers == KeyModifiers::CONTROL => {
+                    s.prompt.clear();
+                }
+                KeyCode::Char(character)
+                    if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT =>
+                {
+                    s.prompt.push(character);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
         if s.mode == Some('R') {
             match k.code {
                 KeyCode::Esc => {
@@ -34142,9 +34171,25 @@ mod tests {
         state
             .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
-        assert_eq!(state.mode, Some('R'));
-        state.prompt = "Renamed Second".into();
-        state.command().unwrap();
+        assert_eq!(state.mode, Some('T'));
+        assert_eq!(state.prompt, "Second");
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        for character in "Renamed Second".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
         assert_eq!(
             state.app.get_scene(second).unwrap().scene.title,
             "Renamed Second"

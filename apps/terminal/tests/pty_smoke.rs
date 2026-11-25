@@ -112,6 +112,54 @@ fn first_run_tutorial_navigation_and_resume_work_through_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn scene_rename_from_the_context_menu_is_editable_and_persistent_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Rename Book");
+    let mut app = WriterApp::create_project(&project, "Rename Book").unwrap();
+    let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+    let scene = app.create_scene(chapter, "Original Scene", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "Original scene body.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY scene rename workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("scene-rename")
+        .output()
+        .expect("run the scene rename Linux PTY workflow");
+    assert!(
+        result.status.success(),
+        "scene rename PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(project).unwrap();
+    assert_eq!(
+        reopened.get_scene(scene).unwrap().scene.title,
+        "The Returning Light"
+    );
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "Original scene body."
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn view_menu_switches_between_unified_outline_presentations_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;
