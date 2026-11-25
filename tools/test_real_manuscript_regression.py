@@ -9,11 +9,35 @@ from real_manuscript_regression import (
     epub_semantics,
     epubcheck_command,
     epubcheck_result,
+    make_plan,
     regression_acceptance,
 )
 
 
 class EpubSemanticTests(unittest.TestCase):
+    def test_ambiguous_binder_items_are_preserved_as_non_publication_research(self):
+        inventory = {
+            "items": [
+                {
+                    "source_document_id": "planning-folder",
+                    "type_code": "Folder",
+                    "area": "unknown",
+                    "parent_source_id": None,
+                },
+                {
+                    "source_document_id": "character-notes",
+                    "type_code": "Text",
+                    "area": "unknown",
+                    "parent_source_id": "planning-folder",
+                },
+            ]
+        }
+        plan = make_plan(inventory, "fiction")
+        self.assertEqual(
+            [decision["destination_kind"] for decision in plan["decisions"]],
+            ["Research", "Research"],
+        )
+
     def test_acceptance_does_not_claim_epubcheck_is_missing_after_success(self):
         books = {
             "book-01": {"compile": {"epubcheck": {"status": "passed", "errors": 0, "warnings": 0}}},

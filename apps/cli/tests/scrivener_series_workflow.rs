@@ -11,8 +11,10 @@ fn synthetic_source(
     std::fs::write(
         source.join(format!("{name}.scrivx")),
         r#"<ScrivenerProject Version="2.0"><Binder>
-          <BinderItem UUID="chapter-1" Type="Folder"><Title>Chapter One</Title><Children>
-            <BinderItem UUID="scene-1" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
+          <BinderItem UUID="draft-root" Type="DraftFolder"><Title>Draft</Title><Children>
+            <BinderItem UUID="chapter-1" Type="Folder"><Title>Chapter One</Title><Children>
+              <BinderItem UUID="scene-1" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
+            </Children></BinderItem>
           </Children></BinderItem>
         </Binder></ScrivenerProject>"#,
     )
@@ -43,6 +45,15 @@ fn import_into_series(
         .unwrap();
     assert!(inspect.status.success());
     let mut preview: serde_json::Value = serde_json::from_slice(&inspect.stdout).unwrap();
+    {
+        let draft_root = preview["proposed_plan"]["decisions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|decision| decision["source_document_id"] == "draft-root")
+            .unwrap();
+        draft_root["destination_kind"] = serde_json::json!("Section");
+    }
     let folder = preview["proposed_plan"]["decisions"]
         .as_array_mut()
         .unwrap()

@@ -308,6 +308,55 @@ and publication regressions; it must be capability-audited, preserve accurate
 engineering guidance in developer docs, verify the licence and use only genuine
 screenshots made with synthetic content.
 
+## Latest publication work checkpoint — 25 November 2026
+
+Human Calibre UAT rejected the recent EPUBs for fidelity despite successful
+EPUBCheck validation. Two shared import safety corrections are implemented in
+the current working tree: RTF `\\uN` fallback parsing now honours scoped
+`\\ucN` and declared byte code pages; Scrivener content outside recognised
+Draft/Research/Trash containers defaults to private Research and is excluded
+from ordinary compilation. The import preview warns about ambiguous items.
+Production Compile IR privacy coverage and synthetic importer/harness tests
+were added. Do not claim publication acceptance: Scrivener layout/selection,
+chapter numbering, scene separators, placeholders and alternative publication
+front/back matter profiles remain incomplete.
+
+The latest available local publication set is:
+
+- `generated/uat-publication-safe-20261125/book-01.epub`
+- `generated/uat-publication-safe-20261125/book-02.epub`
+- `generated/uat-publication-safe-20261125/book-03.epub`
+
+Its local machine and human reports are in
+`reports/uat-publication-safe-20261125/`. The run was made against
+`09dceb278426571b7cc4f29b64e58f7224a961b0` with the then-current dirty tree;
+the run predates the final synthetic fixture correction. Checksum and source
+fingerprint checks passed. All generated EPUBs passed EPUBCheck 4.2.6 with zero
+errors/warnings; source body persistence was exact (manuscript 39/39, 36/36,
+68/68; research 6/6, 6/6, 12/12). Targeted private-content signature checks
+found no checked unknown-area content in generated publications. The historical
+reference EPUBs separately have 2/2/0 errors and zero warnings. Historical
+token-sequence similarity remains 0.965808/0.931482/0.953626 and this is not
+accepted fidelity; source revisions and old compile settings must be triaged.
+See [the regression log](REAL_MANUSCRIPT_REGRESSION.md#25-november-2026--publication-uat-failure-and-safe-import-checkpoint)
+for the limits and details.
+
+Verification on the current source tree passed: `cargo fmt --all -- --check`,
+workspace Clippy with warnings denied, the full offline workspace suite
+(including 337 terminal unit tests, 3 author journeys, and 24 Linux PTY tests),
+and 7 Python regression-harness tests. The tutorial-resume and Previous
+Position PTY flows were made independent of a fixed starting menu root; the
+full PTY suite passed serially. Fixture SHA-256 verification passed after the
+complete private run. The then-current three-book EPUB run is not rerun for
+the subsequent test-only menu changes.
+
+Next: commit and push the verified RTF/private-import and test-harness batch,
+refresh the issue register/comments, then investigate Scrivener project compile
+metadata and the shared Compile IR boundary for hidden structural headings,
+chapter placeholders, scene separators and compile variables. Keep the feature
+freeze and continue the open v1.0 backlog afterward. `.gitignore`,
+`README_TMP.md` and `UAT/` remain user-owned/unrelated and must not be staged.
+
 ## Verification commands
 
 ```sh

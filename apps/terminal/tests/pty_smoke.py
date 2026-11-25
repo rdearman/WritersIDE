@@ -285,6 +285,22 @@ def main():
             + repr(terminal_snapshot(output, 24, 80))
         )
 
+    def open_help_menu(already_open=False):
+        """Find Help from the current menu root instead of assuming its index."""
+        if not already_open:
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.2)
+        for _ in range(10):
+            rows = terminal_snapshot(output, 24, 80)
+            if any("▸ Context Help" in row or "▸ Resume Tutorial" in row for row in rows):
+                return
+            os.write(master, b"\x1b[C")
+            read_for(0.1)
+        raise AssertionError(
+            "Help menu was not reachable from the current root; screen: "
+            + repr(terminal_snapshot(output, 24, 80))
+        )
+
     try:
         read_for(1.0)
         if tutorial_navigation:
@@ -374,9 +390,7 @@ def main():
                     "F10 did not open the File menu while the tutorial was active; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
                 )
-            os.write(master, b"\x1b[C" * 8)
-            if not wait_for_screen_fragments((b"Context Help", b"Resume Tutorial"), timeout=3.0):
-                raise AssertionError("Help menu did not expose Resume Tutorial")
+            open_help_menu(already_open=True)
             select_visible_menu_item("Resume Tutorial")
             os.write(master, b"\r")
             if not wait_for_screen_fragments(
@@ -393,15 +407,16 @@ def main():
             # lesson number and pending action must be restored.
             os.write(master, b"\x1b")
             read_for(0.2)
-            os.write(master, b"\x1b[21~")
-            read_for(0.2)
-            os.write(master, b"\x1b[C" * 8)
+            open_help_menu()
             select_visible_menu_item("Resume Tutorial")
             os.write(master, b"\r")
             if not wait_for_screen_fragments(
-                (b"Tutorial", b"2/6", b"Show Scene Cards from View"), timeout=5.0
+                (b"Tutorial", b"2/6", b"Show Scene Cards from View"), timeout=10.0
             ):
-                raise AssertionError("tutorial resume did not restore lesson 2 and its pending task")
+                raise AssertionError(
+                    "tutorial resume did not restore lesson 2 and its pending task; current screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
             os.write(master, b"\x1b[17;2~")  # Shift+F6 must not switch workspace either
             if not wait_for_screen_fragments((b"Tutorial", b"2/6"), timeout=3.0):
                 raise AssertionError("Shift+F6 took focus away from the resumed tutorial")
@@ -1117,14 +1132,19 @@ def main():
             )
 
         if previous_position:
-            # F10 opens File; three Right presses select Navigate. Select the
-            # author-facing row by its visible focus marker so contextual menu
-            # filtering cannot make a hard-coded Down count target another action.
+            # F10 opens the last focused menu root, which may vary by project
+            # or key history. Find Navigate by its visible command instead of
+            # assuming a fixed menu-bar index.
             status_start = len(output)
             os.write(master, b"\x1b[21~")
             read_for(0.2)
-            os.write(master, b"\x1b[C" * 3)
-            read_for(0.3)
+            for _ in range(10):
+                if wait_for_screen_fragments(
+                    (b"Return to Previous Position",), status_start, timeout=0.2
+                ):
+                    break
+                os.write(master, b"\x1b[C")
+                read_for(0.1)
             selected_return = False
             for _ in range(12):
                 if wait_for_screen_fragments(

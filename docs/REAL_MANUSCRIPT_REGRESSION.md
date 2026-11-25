@@ -126,3 +126,54 @@ is still required.
   are optional local tests, never a public-CI dependency.
 - A missing fixture or unavailable validator is explicitly unverified, not a
   pass. Provisional baselines must not replace a better result automatically.
+
+## 25 November 2026 — publication UAT failure and safe-import checkpoint
+
+The author's Calibre review of an earlier set of generated publications failed
+human fidelity acceptance. EPUBCheck passing is not publication acceptance.
+The current Scrivener projects are authoritative for import; the historical
+EPUBs may predate source edits and are comparison evidence only. Do not edit
+imported text to force a match to those editions.
+
+Production RTF extraction now consumes the complete `\uN` fallback according
+to scoped `\ucN`, decodes consecutive hex byte escapes using the declared
+`\ansicpg`/`\cpg` encoding, and retains ordinary numeric prose. Synthetic
+tests cover curly quotes, French accents, copyright, literal 92/93/94 digits,
+zero and multiple fallbacks, UTF-8 byte escapes, and Korean text. Full
+font-table-specific code-page handling and UTF-16 surrogate-pair coverage
+remain limitations to investigate.
+
+Scrivener `DraftFolder`, `ResearchFolder`, and `TrashFolder` roles are now
+classified from their structural type. Content outside a recognised area is
+retained as private Research by default and flagged for author review. It is
+not made publishable merely because Scrivener marks it included or because it
+is in the binder. The import regression harness uses the same conservative
+classification. Unknown items may be explicitly remapped during review; their
+prose remains preserved in the project.
+
+Run `uat-publication-safe-20261125` used commit
+`09dceb278426571b7cc4f29b64e58f7224a961b0` plus the uncommitted changes under
+test. Fixture checksums passed, all three source fingerprints were unchanged,
+and the imported manuscript and research bodies matched the source exactly:
+book 01 39/39 and 6/6; book 02 36/36 and 6/6; book 03 68/68 and 12/12.
+Five, four, and eight long-string checks of unknown/private content respectively
+found no such content in the generated EPUBs. These are targeted leak checks,
+not proof of total publication equivalence. All three generated EPUB 3.2 files
+passed EPUBCheck 4.2.6 with zero errors and warnings. Historical reference EPUB
+validation remains separate: error counts 2/2/0 and zero warnings.
+
+Local EPUBs for human inspection (private outputs; do not commit):
+
+- `generated/uat-publication-safe-20261125/book-01.epub`
+- `generated/uat-publication-safe-20261125/book-02.epub`
+- `generated/uat-publication-safe-20261125/book-03.epub`
+
+The machine report and per-book mapping inventories are in
+`reports/uat-publication-safe-20261125/`. The run predates the final synthetic
+test-fixture correction in the working tree. Token sequence similarity to the
+historical references was 0.965808, 0.931482, and 0.953626; substantial
+differences remain and are not accepted as fidelity. Source/reopen exactness
+does not establish correct Scrivener compile selection, chapter layouts,
+variables, front/back matter, or publication structure. The next publication
+work must recover those settings from project/format metadata and validate the
+shared Compile IR before adding exporter-specific behavior.

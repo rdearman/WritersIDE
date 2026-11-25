@@ -9,6 +9,7 @@ thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+encoding_rs.workspace = true
 zip.workspace = true
 epub = "1.2.4"
 quick-xml.workspace = true

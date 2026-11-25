@@ -492,7 +492,7 @@ impl ScrivenerImportPlan {
             .iter()
             .map(|item| {
                 let destination_kind = match item.area.as_str() {
-                    "research" => ScrivenerDestinationKind::Research,
+                    "research" | "unknown" => ScrivenerDestinationKind::Research,
                     "trash" => ScrivenerDestinationKind::Skip,
                     _ if item.include_in_compile == Some(false) => ScrivenerDestinationKind::Skip,
                     // Binder folder roles vary by project; make the author
@@ -1532,6 +1532,12 @@ pub fn inspect_scrivener_project(
         )?;
     }
 
+    if inventory.items.iter().any(|item| item.area == "unknown") {
+        inventory.warnings.push(
+            "Binder items outside recognised manuscript, research, or trash containers were preserved as private research and excluded from publication by default; review their roles before compiling".into(),
+        );
+    }
+
     inventory.validate()?;
     if inventory.items.is_empty() {
         inventory
@@ -1781,6 +1787,12 @@ fn scrivener_named_value(node: &ScrivenerXmlNode, name: &str) -> Option<String> 
 }
 
 fn classify_scrivener_area(title: &str, type_code: Option<&str>, inherited: &str) -> String {
+    match type_code.map(str::to_ascii_lowercase).as_deref() {
+        Some("draftfolder") => return "manuscript".into(),
+        Some("researchfolder") => return "research".into(),
+        Some("trashfolder") => return "trash".into(),
+        _ => {}
+    }
     let label = format!(
         "{} {}",
         title.to_ascii_lowercase(),
@@ -2970,12 +2982,85 @@ fn extract_rtf_markdown(source: &str) -> String {
 }
 
 fn extract_rtf_markdown_without_assets(source: &str) -> String {
-    #[derive(Clone, Copy, Default, Eq, PartialEq)]
+    #[derive(Clone, Copy, Eq, PartialEq)]
     struct Style {
         bold: bool,
         italic: bool,
         strike: bool,
         skip: bool,
+        unicode_fallback: usize,
+        code_page: u32,
+    }
+
+    impl Default for Style {
+        fn default() -> Self {
+            Self {
+                bold: false,
+                italic: false,
+                strike: false,
+                skip: false,
+                unicode_fallback: 1,
+                code_page: 1252,
+            }
+        }
+    }
+
+    fn rtf_encoding(code_page: u32) -> &'static encoding_rs::Encoding {
+        match code_page {
+            65001 => encoding_rs::UTF_8,
+            932 => encoding_rs::SHIFT_JIS,
+            936 => encoding_rs::GBK,
+            949 => encoding_rs::EUC_KR,
+            950 => encoding_rs::BIG5,
+            _ => {
+                let label = format!("windows-{code_page}");
+                encoding_rs::Encoding::for_label(label.as_bytes())
+                    .unwrap_or(encoding_rs::WINDOWS_1252)
+            }
+        }
+    }
+
+    fn skip_rtf_fallback(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, count: usize) {
+        let mut skipped = 0;
+        while skipped < count {
+            match chars.next() {
+                None => break,
+                Some('{' | '}') => continue,
+                Some('\\') => match chars.next() {
+                    None => break,
+                    Some('\'') => {
+                        let _ = chars.next();
+                        let _ = chars.next();
+                        skipped += 1;
+                    }
+                    Some(symbol) if !symbol.is_ascii_alphabetic() => skipped += 1,
+                    Some(first) => {
+                        // A fallback can itself use an escaped RTF control. Consume
+                        // that complete control token as one fallback character.
+                        let _ = first;
+                        while chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+                            chars.next();
+                        }
+                        if chars
+                            .peek()
+                            .is_some_and(|c| *c == '-' || c.is_ascii_digit())
+                        {
+                            if chars.peek() == Some(&'-') {
+                                chars.next();
+                            }
+                            while chars.peek().is_some_and(|c| c.is_ascii_digit()) {
+                                chars.next();
+                            }
+                        }
+                        if chars.peek() == Some(&' ') {
+                            chars.next();
+                        }
+                        skipped += 1;
+                    }
+                },
+                Some(_) => skipped += 1,
+            }
+        }
     }
 
     let mut chars = source.chars().peekable();
@@ -3013,12 +3098,34 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
                     continue;
                 }
                 if next == '\'' {
-                    let a = chars.next().and_then(|c| c.to_digit(16));
-                    let b = chars.next().and_then(|c| c.to_digit(16));
-                    if !style.skip
-                        && let (Some(a), Some(b)) = (a, b)
-                    {
-                        runs.push((char::from_u32(a * 16 + b).unwrap_or('�'), style));
+                    let Some(byte) = chars
+                        .next()
+                        .and_then(|c| c.to_digit(16))
+                        .zip(chars.next().and_then(|c| c.to_digit(16)))
+                        .map(|(high, low)| ((high << 4) | low) as u8)
+                    else {
+                        continue;
+                    };
+                    let mut bytes = vec![byte];
+                    loop {
+                        let mut probe = chars.clone();
+                        if probe.next() != Some('\\') || probe.next() != Some('\'') {
+                            break;
+                        }
+                        let Some(next_byte) = probe
+                            .next()
+                            .and_then(|c| c.to_digit(16))
+                            .zip(probe.next().and_then(|c| c.to_digit(16)))
+                            .map(|(high, low)| ((high << 4) | low) as u8)
+                        else {
+                            break;
+                        };
+                        bytes.push(next_byte);
+                        chars = probe;
+                    }
+                    if !style.skip {
+                        let (decoded, _, _) = rtf_encoding(style.code_page).decode(&bytes);
+                        runs.extend(decoded.chars().map(|decoded| (decoded, style)));
                     }
                     continue;
                 }
@@ -3064,13 +3171,22 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
                     "b" => style.bold = number != "0",
                     "i" => style.italic = number != "0",
                     "strike" | "strikethrough" => style.strike = number != "0",
+                    "ansicpg" | "cpg" => {
+                        if let Ok(code_page) = number.parse::<u32>() {
+                            style.code_page = code_page;
+                        }
+                    }
+                    "uc" => {
+                        if let Ok(count) = number.parse::<usize>() {
+                            style.unicode_fallback = count.min(32);
+                        }
+                    }
                     "par" | "line" if !style.skip => runs.push(('\n', Style::default())),
                     "tab" if !style.skip => runs.push(('\t', Style::default())),
                     "u" if !style.skip => {
                         if let Ok(code) = number.parse::<i32>() {
                             runs.push((char::from_u32(code as u16 as u32).unwrap_or('�'), style));
-                            // RTF Unicode escapes may be followed by one ANSI fallback char.
-                            let _ = chars.next();
+                            skip_rtf_fallback(&mut chars, style.unicode_fallback);
                         }
                     }
                     _ => {}
@@ -3243,6 +3359,53 @@ mod tests {
             decisions: BTreeMap::new(),
         };
         assert_eq!(inv.apply_mapping_plan(&plan).unwrap(), 1);
+    }
+
+    #[test]
+    fn ambiguous_scrivener_binder_content_defaults_to_private_research() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("Private Material.scriv");
+        let private_id = "private-text";
+        let private_dir = source.join("Files/Data").join(private_id);
+        fs::create_dir_all(&private_dir).unwrap();
+        fs::write(
+            source.join("Private Material.scrivx"),
+            r#"<ScrivenerProject Version="2.0"><Binder>
+              <BinderItem UUID="draft-root" Type="DraftFolder"><Title>Internal title</Title><Children/></BinderItem>
+              <BinderItem UUID="private-folder" Type="Folder"><Title>Planning material</Title><Children>
+                <BinderItem UUID="private-text" Type="Text"><Title>Private notes</Title><Children/></BinderItem>
+              </Children></BinderItem>
+            </Binder></ScrivenerProject>"#,
+        )
+        .unwrap();
+        fs::write(
+            private_dir.join("content.rtf"),
+            r#"{\rtf1\ansi PRIVATEPLANNINGSENTINEL}"#,
+        )
+        .unwrap();
+
+        let inventory = inspect_scrivener_project(&source).unwrap();
+        let private = inventory
+            .items
+            .iter()
+            .find(|item| item.source_document_id == private_id)
+            .unwrap();
+        assert_eq!(private.area, "unknown");
+        assert!(
+            inventory
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("private research"))
+        );
+
+        let plan = ScrivenerImportPlan::proposed(&inventory);
+        assert!(
+            plan.decisions
+                .iter()
+                .filter(|decision| { decision.source_document_id.starts_with("private-") })
+                .all(|decision| decision.destination_kind == ScrivenerDestinationKind::Research)
+        );
+        assert_eq!(plan.preview(&inventory).unwrap().research_items, 2);
     }
 
     #[test]
@@ -3508,6 +3671,28 @@ mod tests {
     }
 
     #[test]
+    fn scrivener_rtf_unicode_fallbacks_follow_uc_and_do_not_leak_hex_digits() {
+        let source = r#"{\rtf1\ansi\ansicpg1252\uc1 It\u8217\'92s \u8220\'93quoted\u8221\'94, \u233\'e9, \u169\'a9. Digits 92 93 94 remain.}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert_eq!(markdown, "It’s “quoted”, é, ©. Digits 92 93 94 remain.");
+    }
+
+    #[test]
+    fn scrivener_rtf_honours_zero_and_multiple_unicode_fallback_counts() {
+        let source = r#"{\rtf1\ansi\uc0\u233X {\uc2\u233\'3f\'3f} \uc1\u8217’}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert_eq!(markdown, "éX é ’");
+    }
+
+    #[test]
+    fn scrivener_rtf_decodes_declared_codepages_and_mixed_unicode_runs() {
+        let source =
+            r#"{\rtf1\ansi\ansicpg65001 UTF-8 \'c3\'a9; {\cpg1252 \'e9} \u54620?\u44544?}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert_eq!(markdown, r"UTF\-8 é; é 한글");
+    }
+
+    #[test]
     fn scrivener_rtf_physical_line_boundary_does_not_join_adjacent_words() {
         let source = r#"{\rtf1\ansi
 Test\
@@ -3650,7 +3835,7 @@ This is an addition to the old file.}"#;
         std::fs::create_dir_all(&document_dir).unwrap();
         let manifest = r#"<?xml version="1.0" encoding="UTF-8"?>
             <ScrivenerProject Version="2.0"><Binder>
-              <BinderItem UUID="chapter-uuid" Type="Folder"><Title>Chapter One</Title><Children>
+              <BinderItem UUID="chapter-uuid" Type="DraftFolder"><Title>Chapter One</Title><Children>
                 <BinderItem UUID="scene-uuid" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
               </Children></BinderItem>
               <BinderItem UUID="research-uuid" Type="Folder"><Title>Research</Title><Children/></BinderItem>

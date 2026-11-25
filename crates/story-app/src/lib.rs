@@ -8227,7 +8227,7 @@ unexpected_prose = "must not be silently discarded"
             source.join("SeriesBook.scrivx"),
             r#"<ScrivenerProject Version="2.0"><Binder>
               <BinderItem UUID="section-1" Type="Folder"><Title>Part One</Title><Children/></BinderItem>
-              <BinderItem UUID="chapter-1" Type="Folder"><Title>Chapter One</Title><Children>
+              <BinderItem UUID="chapter-1" Type="DraftFolder"><Title>Chapter One</Title><Children>
                 <BinderItem UUID="scene-1" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
               </Children></BinderItem>
               <BinderItem UUID="research-1" Type="Folder"><Title>Research</Title><Children/></BinderItem>
@@ -8345,6 +8345,88 @@ unexpected_prose = "must not be silently discarded"
                 .source_identifier
                 .starts_with("research/imported_sources/")
         );
+    }
+
+    #[test]
+    fn scrivener_ambiguous_planning_material_is_preserved_but_never_enters_compile_ir() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Safe Import.scriv");
+        for id in ["scene-1", "private-notes"] {
+            fs::create_dir_all(source.join("Files/Data").join(id)).unwrap();
+        }
+        fs::write(
+            source.join("Safe Import.scrivx"),
+            r#"<ScrivenerProject Version="2.0"><Binder>
+              <BinderItem UUID="draft-root" Type="DraftFolder"><Title>Working Draft</Title><Children>
+                <BinderItem UUID="chapter-1" Type="Folder"><Title>Opening</Title><Children>
+                  <BinderItem UUID="scene-1" Type="Text"><Title>First Scene</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
+                </Children></BinderItem>
+              </Children></BinderItem>
+              <BinderItem UUID="planning-folder" Type="Folder"><Title>Character Profiles</Title><Children>
+                <BinderItem UUID="private-notes" Type="Text"><Title>Private Character Notes</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
+              </Children></BinderItem>
+            </Binder></ScrivenerProject>"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("Files/Data/scene-1/content.rtf"),
+            r#"{\rtf1\ansi PUBLICMANUSCRIPTSENTINEL}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("Files/Data/private-notes/content.rtf"),
+            r#"{\rtf1\ansi PRIVATEPLANNINGSENTINEL}"#,
+        )
+        .unwrap();
+
+        let inventory = story_import::inspect_scrivener_project(&source).unwrap();
+        let mut plan = story_import::ScrivenerImportPlan::proposed(&inventory);
+        for (id, kind) in [
+            (
+                "draft-root",
+                story_import::ScrivenerDestinationKind::Section,
+            ),
+            ("chapter-1", story_import::ScrivenerDestinationKind::Chapter),
+        ] {
+            plan.decisions
+                .iter_mut()
+                .find(|decision| decision.source_document_id == id)
+                .unwrap()
+                .destination_kind = kind;
+        }
+        assert_eq!(
+            plan.decisions
+                .iter()
+                .find(|decision| decision.source_document_id == "private-notes")
+                .unwrap()
+                .destination_kind,
+            story_import::ScrivenerDestinationKind::Research
+        );
+
+        let mut app = WriterApp::create_project(dir.path().join("Imported"), "Imported").unwrap();
+        let (_, scenes) = app
+            .import_scrivener_inventory(&inventory, &plan, story_import::ScrivenerImportMode::Both)
+            .unwrap();
+        assert_eq!(scenes.len(), 1);
+        assert!(
+            app.load_scene_text(scenes[0])
+                .unwrap()
+                .0
+                .contains("PUBLICMANUSCRIPTSENTINEL")
+        );
+        assert!(
+            app.list_reading_documents()
+                .unwrap()
+                .iter()
+                .any(|document| { document.extracted_text.contains("PRIVATEPLANNINGSENTINEL") })
+        );
+
+        let assembly = app.create_assembly("Publication").unwrap();
+        app.add_assembly_scene(assembly, scenes[0], 0).unwrap();
+        let ir = app.compile_assembly_ir(assembly).unwrap();
+        let compiled = ir.render_markdown().0;
+        assert!(compiled.contains("PUBLICMANUSCRIPTSENTINEL"));
+        assert!(!compiled.contains("PRIVATEPLANNINGSENTINEL"));
     }
 
     #[test]

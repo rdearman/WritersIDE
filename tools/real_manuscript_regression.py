@@ -132,7 +132,7 @@ def make_plan(inventory: dict, book_type: str) -> dict:
 
         if area == "trash":
             kind = "Skip"
-        elif area == "research":
+        elif area in {"research", "unknown"}:
             kind = "Research"
         elif book_type == "nonfiction":
             if code in {"folder", "draftfolder"} or nested:
@@ -439,7 +439,7 @@ def verify_imported_source_content(project: pathlib.Path) -> dict:
                 (source["id"],),
             ).fetchall()
             source_hash = hashlib.sha256(original.encode("utf-8")).hexdigest()
-            if area == "research":
+            if area in {"research", "unknown"}:
                 research_checked += 1
                 exact_research = False
                 for destination in destinations:

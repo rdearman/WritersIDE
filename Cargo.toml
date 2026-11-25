@@ -24,6 +24,7 @@ time = { version = "0.3.47", features = ["parsing"] }
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
 unicode-normalization = "0.1.26"
+encoding_rs = "0.8.44"
 regex = "1.12"
 harper-core = { version = "3.2.0", default-features = false }
 pulldown-cmark = "0.9.6"
