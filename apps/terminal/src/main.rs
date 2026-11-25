@@ -972,6 +972,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "edit.paste-clipboard",
         "edit.delete-selection",
         "edit.select-all",
+        "edit.duplicate-selection",
         "edit.select-word",
         "edit.select-sentence",
         "edit.select-paragraph",
@@ -1616,6 +1617,7 @@ enum CommandAction {
     PasteClipboard,
     DeleteSelection,
     SelectAllText,
+    DuplicateSelection,
     SelectWord,
     SelectSentence,
     SelectParagraph,
@@ -2596,6 +2598,21 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::SelectAllText,
         },
         CommandSpec {
+            id: "edit.duplicate-selection",
+            label: "Duplicate Selection or Paragraph",
+            description: "Duplicate selected text or the paragraph containing the cursor",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["duplicate selection", "duplicate paragraph"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Editing",
+            menu_priority: 8,
+            advanced: false,
+            action: CommandAction::DuplicateSelection,
+        },
+        CommandSpec {
             id: "edit.select-word",
             label: "Select Word",
             description: "Select the word at or immediately after the editor cursor",
@@ -2606,7 +2623,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             task_group: "Editor Editing",
-            menu_priority: 8,
+            menu_priority: 9,
             advanced: false,
             action: CommandAction::SelectWord,
         },
@@ -2621,7 +2638,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             task_group: "Editor Editing",
-            menu_priority: 9,
+            menu_priority: 10,
             advanced: false,
             action: CommandAction::SelectSentence,
         },
@@ -2636,7 +2653,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             task_group: "Editor Editing",
-            menu_priority: 10,
+            menu_priority: 11,
             advanced: false,
             action: CommandAction::SelectParagraph,
         },
@@ -13838,6 +13855,7 @@ impl AppState {
                 | "edit.paste-clipboard"
                 | "edit.delete-selection"
                 | "edit.select-all"
+                | "edit.duplicate-selection"
                 | "edit.select-word"
                 | "edit.select-sentence"
                 | "edit.select-paragraph"
@@ -13864,6 +13882,7 @@ impl AppState {
                 | "edit.paste-clipboard"
                 | "edit.delete-selection"
                 | "edit.select-all"
+                | "edit.duplicate-selection"
                 | "edit.select-word"
                 | "edit.select-sentence"
                 | "edit.select-paragraph"
@@ -15034,6 +15053,7 @@ impl AppState {
             CommandAction::PasteClipboard => self.paste_clipboard(),
             CommandAction::DeleteSelection => self.delete_selected_text(),
             CommandAction::SelectAllText => self.select_all_text(),
+            CommandAction::DuplicateSelection => self.duplicate_selection_or_paragraph(),
             CommandAction::SelectWord => self.select_word_at_cursor(),
             CommandAction::SelectSentence => self.select_sentence_at_cursor(),
             CommandAction::SelectParagraph => self.select_paragraph_at_cursor(),
@@ -22301,6 +22321,43 @@ impl AppState {
             self.editor_selection = None;
             "The current manuscript document is empty".into()
         };
+    }
+    fn duplicate_selection_or_paragraph(&mut self) {
+        let source = self.editor.join("\n");
+        let is_selection = self.selection_bounds().is_some();
+        let (start, end) = if let Some((start, end)) = self.selection_bounds() {
+            (
+                editor_position_byte(&self.editor, start.0, start.1),
+                editor_position_byte(&self.editor, end.0, end.1),
+            )
+        } else {
+            self.current_paragraph_byte_range(&source)
+        };
+        if start >= end {
+            self.message = if is_selection {
+                "Select manuscript text before duplicating".into()
+            } else {
+                "Place the cursor in a non-empty paragraph before duplicating".into()
+            };
+            return;
+        }
+        if self
+            .narrowed_passage
+            .is_some_and(|(low, high)| start < low || end > high)
+        {
+            self.message = "The text to duplicate extends outside the narrowed passage".into();
+            return;
+        }
+        let Some(selected) = source.get(start..end) else {
+            self.message = "The selected text could not be duplicated safely".into();
+            return;
+        };
+        let (insertion, label) = if is_selection {
+            (selected.to_owned(), "Duplicated selection")
+        } else {
+            (format!("\n{selected}"), "Duplicated paragraph")
+        };
+        self.replace_editor_range(end, end, &insertion, label);
     }
     fn select_word_at_cursor(&mut self) {
         let text = self.editor.join("\n");
@@ -49472,6 +49529,72 @@ mod tests {
         assert!(state.selected_text().is_none());
         assert!(state.message.contains("outside the narrowed passage"));
         assert_eq!(state.editor.join("\n"), source);
+    }
+
+    #[test]
+    fn edit_menu_duplicates_selection_or_paragraph_with_undo_and_persistence() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let hash = app.load_scene_text(scene).unwrap().1;
+        app.save_scene_text(scene, Some(&hash), "alpha beta\n\ngamma")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+
+        let run_duplicate = |state: &mut AppState| {
+            state.open_menu_category(1);
+            let selected = state
+                .menu_visible_entries()
+                .iter()
+                .position(|command| command.id == "edit.duplicate-selection")
+                .unwrap();
+            state.menu.as_mut().unwrap().selected = selected;
+            state
+                .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+        };
+
+        state.editor_selection = Some((0, 6));
+        state.cursor = (0, 10);
+        run_duplicate(&mut state);
+        assert_eq!(state.editor.join("\n"), "alpha betabeta\n\ngamma");
+        assert!(state.message.starts_with("Duplicated selection"));
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), "alpha beta\n\ngamma");
+
+        state.editor_selection = None;
+        state.cursor = (0, 2);
+        run_duplicate(&mut state);
+        assert_eq!(state.editor.join("\n"), "alpha beta\nalpha beta\n\ngamma");
+        assert!(state.message.starts_with("Duplicated paragraph"));
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), "alpha beta\n\ngamma");
+
+        state.cursor = (2, 2);
+        run_duplicate(&mut state);
+        assert_eq!(state.editor.join("\n"), "alpha beta\n\ngamma\ngamma");
+        let saved_hash = state.app.load_scene_text(scene).unwrap().1;
+        state
+            .app
+            .save_scene_text(scene, Some(&saved_hash), &state.editor.join("\n"))
+            .unwrap();
+        let reopened = WriterApp::open_project(&project).unwrap();
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "alpha beta\n\ngamma\ngamma"
+        );
+
+        state.editor = vec![String::new()];
+        state.cursor = (0, 0);
+        state.editor_selection = None;
+        state.dirty = false;
+        run_duplicate(&mut state);
+        assert_eq!(state.editor.join("\n"), "");
+        assert!(!state.dirty);
+        assert!(state.message.contains("non-empty paragraph"));
     }
 
     #[test]

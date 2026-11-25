@@ -34,6 +34,7 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - Paste (`Ctrl+V`)
 - Delete Selection
 - Select All (`Ctrl+A`)
+- Duplicate Selection or Paragraph (duplicate selected text, or the paragraph containing the cursor)
 - Select Word (at or immediately after the cursor)
 - Select Sentence (using punctuation, paragraph boundaries and common abbreviations)
 - Select Paragraph (the non-empty paragraph containing the cursor)

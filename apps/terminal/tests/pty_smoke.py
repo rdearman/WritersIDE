@@ -359,7 +359,17 @@ def main():
                 )
             os.write(master, b"\x1b[21~")
             read_for(0.15)
-            os.write(master, b"\x1b[C" + b"\x1b[B" * 7 + b"\r")  # Edit > Select Word
+            os.write(master, b"\x1b[C" + b"\x1b[B" * 7 + b"\r")  # Edit > Duplicate Selection or Paragraph
+            if not wait_for_screen_fragments((b"Duplicated selection",), edit_start, timeout=3.0):
+                raise AssertionError("Edit > Duplicate Selection did not dispatch from writing mode")
+            os.write(master, b"\x1b[21~")
+            read_for(0.15)
+            os.write(master, b"\x1b[C\r")  # Edit > Undo
+            if not wait_for_screen_fragments((b"Edit undone",), edit_start, timeout=3.0):
+                raise AssertionError("Edit > Undo did not reverse selection duplication")
+            os.write(master, b"\x1b[21~")
+            read_for(0.15)
+            os.write(master, b"\x1b[C" + b"\x1b[B" * 8 + b"\r")  # Edit > Select Word
             if not wait_for_screen_fragments(
                 (b"Selected word",), edit_start, timeout=3.0
             ):
@@ -367,7 +377,7 @@ def main():
 
             os.write(master, b"\x1b[21~")
             read_for(0.15)
-            os.write(master, b"\x1b[C" + b"\x1b[B" * 8 + b"\r")  # Edit > Select Sentence
+            os.write(master, b"\x1b[C" + b"\x1b[B" * 9 + b"\r")  # Edit > Select Sentence
             if not wait_for_screen_fragments(
                 (b"Selected sentence",), edit_start, timeout=3.0
             ):
@@ -375,13 +385,16 @@ def main():
 
             os.write(master, b"\x1b[21~")
             read_for(0.15)
-            os.write(master, b"\x1b[C" + b"\x1b[B" * 9 + b"\r")  # Edit > Select Paragraph
+            os.write(master, b"\x1b[C" + b"\x1b[B" * 10 + b"\r")  # Edit > Select Paragraph
             if not wait_for_screen_fragments(
                 (b"Selected paragraph",), edit_start, timeout=3.0
             ):
                 raise AssertionError(
                     "Edit > Select Paragraph did not dispatch from writing mode"
                 )
+            os.write(master, b"\x13")  # Ctrl+S
+            if not wait_for_screen_fragments((b"[SAVED]",), edit_start, timeout=3.0):
+                raise AssertionError("the edited scene did not report a successful save")
             os.write(master, b"\x11")  # Ctrl+Q
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0
@@ -391,7 +404,7 @@ def main():
                 finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after Edit-menu workflow")
-            print("PTY Edit-menu workflow passed: Select All, Select Word, Select Sentence and Select Paragraph dispatch in writing mode.")
+            print("PTY Edit-menu workflow passed: selection duplication and Undo, Select All, Select Word, Select Sentence and Select Paragraph dispatch in writing mode.")
             return
 
         if chapter_creation:

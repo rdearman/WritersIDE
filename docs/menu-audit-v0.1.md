@@ -392,8 +392,11 @@ paragraph breaks. Case actions include uppercase, lowercase and title case.
 Regression coverage invokes these operations through the Edit menu and checks
 their results and undo behaviour.
 
-The Edit menu also exposes **Select Word**, **Select Sentence** and **Select
-Paragraph**. Word selection is Unicode grapheme-aware and includes internal
+The Edit menu also exposes **Duplicate Selection or Paragraph**, **Select
+Word**, **Select Sentence** and **Select Paragraph**. Duplication inserts an
+exact copy of the selection after it, or duplicates the non-empty current
+paragraph with a paragraph break; it is undoable and respects narrowed passages.
+Word selection is Unicode grapheme-aware and includes internal
 apostrophes; from whitespace it selects the next word, falling back to the
 previous word at document end. Sentence selection uses punctuation boundaries,
 blank paragraphs and a small common-abbreviation rule; it is not a full

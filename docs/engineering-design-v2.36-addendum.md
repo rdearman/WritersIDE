@@ -2,8 +2,7 @@
 
 ## Scope
 
-The Edit menu now provides explicit **Select Word** and **Select Paragraph**
-commands, extending the current source-based manuscript editor without changing
+The Edit menu provides explicit selection and duplication commands, extending the current source-based manuscript editor without changing
 its storage format or introducing a second selection model. This is a focused
 increment for GitHub issue #61; it does not claim the complete word-processor
 requirements are finished.
@@ -26,6 +25,12 @@ requirements are finished.
 - All three commands clear extra cursors, respect narrowed editing ranges, report
   boundary failures, and leave manuscript bytes untouched.
 - Selection is transient editor state and is not added to project persistence.
+- Duplicate Selection inserts an exact copy immediately after the selected
+  source range. With no selection, Duplicate Paragraph inserts a copy of the
+  non-empty paragraph containing the cursor, separated by a paragraph break.
+  The operation is atomic in the editor, creates one Undo step, respects the
+  narrowed passage boundary, and refuses empty source ranges without changing
+  manuscript content.
 
 ## Verification
 
@@ -38,6 +43,6 @@ for discoverability and expected word/sentence boundary behavior.
 ## Remaining #61 scope
 
 These selection actions do not implement rendered/source editing-coordinate
-translation, paragraph/selection duplication, explicit deduplication,
+translation, explicit deduplication,
 transposition, block selection, full formatting vocabulary, configurable
 writing-canvas telemetry, or safe continuous chapter/manuscript editing.
