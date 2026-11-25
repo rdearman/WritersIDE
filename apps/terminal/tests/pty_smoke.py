@@ -140,9 +140,11 @@ def main():
         ["chapter-removal-target"],
         ["chapter-removal-delete"],
         ["chapter-removal-cancel"],
+        ["chapter-removal-undo-redo"],
     )
+    chapter_removal_undo_redo = modes == ["chapter-removal-undo-redo"]
     chapter_removal_target = modes == ["chapter-removal-target"]
-    chapter_removal_delete = modes == ["chapter-removal-delete"]
+    chapter_removal_delete = modes in (["chapter-removal-delete"], ["chapter-removal-undo-redo"])
     chapter_removal_cancel = modes == ["chapter-removal-cancel"]
     section_removal_delete = modes == ["section-removal-delete"]
     section_removal_rehome = modes == ["section-removal-rehome"]
@@ -294,8 +296,17 @@ def main():
             menu_start = len(output)
             # F10, then move to the now-visible Scene menu.
             os.write(master, b"\x1b[21~")
-            read_for(0.15)
-            for _ in range(9):
+            if not wait_for_screen_fragments(
+                (b"New Project", b"Open Project", b"Recent Projects"),
+                menu_start,
+                timeout=3.0,
+            ):
+                raise AssertionError("F10 did not reopen the File menu from Scene Cards")
+            # Publishing is context-hidden in Scene Cards, so the visible
+            # sequence from File to Scene contains eight category steps.
+            for _ in range(12):
+                if wait_for_screen_fragments((b"Show Removed Scenes",), menu_start, timeout=0.1):
+                    break
                 os.write(master, b"\x1b[C")
                 read_for(0.04)
             if not wait_for_screen_fragments((b"Show Removed Scenes",), menu_start, timeout=3.0):
@@ -741,21 +752,38 @@ def main():
         read_for(0.4)
         if not modes:
             assert_sample_prose_visible(output, 24, 80, "initial 80x24 screen")
-        if not section_removal_delete and not section_removal_rehome and b"Arrival" not in output:
+        if (
+            not section_removal_delete
+            and not section_removal_rehome
+            and not chapter_removal
+            and b"Arrival" not in output
+        ):
             raise AssertionError(
                 "the opening scene was not rendered in the PTY; output tail: "
                 + repr(bytes(output[-1600:]))
             )
 
         if previous_position:
-            # F10 opens File; three Right presses select Navigate. Its sixth
-            # entry is Return to Previous Position.
+            # F10 opens File; three Right presses select Navigate. Select the
+            # author-facing row by its visible focus marker so contextual menu
+            # filtering cannot make a hard-coded Down count target another action.
             status_start = len(output)
             os.write(master, b"\x1b[21~")
             read_for(0.2)
             os.write(master, b"\x1b[C" * 3)
             read_for(0.3)
-            os.write(master, b"\x1b[B" * 5 + b"\r")
+            selected_return = False
+            for _ in range(12):
+                if wait_for_screen_fragments(
+                    ("▸ Return to Previous Position".encode(),), status_start, timeout=0.1
+                ):
+                    selected_return = True
+                    break
+                os.write(master, b"\x1b[B")
+                read_for(0.1)
+            if not selected_return:
+                raise AssertionError("Navigate menu could not focus Return to Previous Position")
+            os.write(master, b"\r")
             if not wait_for_fragments(
                 (b"No", b"previous", b"manuscript", b"position"),
                 status_start,
@@ -885,6 +913,21 @@ def main():
             else:
                 os.write(master, b"\r")  # confirm the selected explicit removal action
             read_for(0.4)
+            if chapter_removal_undo_redo:
+                undo_start = len(output)
+                os.write(master, b"\x1b[21~\x1b[C\r")  # F10 > Edit > Undo
+                if not wait_for_screen_fragments((b"Removedstructurerestored",), undo_start, timeout=3.0):
+                    raise AssertionError(
+                        "Edit > Undo did not restore the chapter outside the editor; visible tail: "
+                        + repr(ANSI_CONTROL.sub(b"", output[-1600:]))
+                    )
+                redo_start = len(output)
+                os.write(master, b"\x1b[21~\x1b[C\x1b[B\r")  # F10 > Edit > Redo
+                if not wait_for_screen_fragments((b"Removedstructureredone",), redo_start, timeout=3.0):
+                    raise AssertionError(
+                        "Edit > Redo did not return the chapter to Removed Documents; visible tail: "
+                        + repr(ANSI_CONTROL.sub(b"", output[-1600:]))
+                    )
             os.write(master, b"\x11")
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0

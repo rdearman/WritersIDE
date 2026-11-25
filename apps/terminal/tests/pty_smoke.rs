@@ -696,6 +696,47 @@ fn empty_chapters_created_from_the_scene_outliner_persist_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn structural_undo_and_redo_work_from_outline_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Structural Undo Project");
+    let mut app = WriterApp::create_project(&project, "Structural Undo Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY structural undo/redo workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("chapter-removal-undo-redo")
+        .output()
+        .expect("run the structural undo/redo Linux PTY workflow");
+    assert!(
+        result.status.success(),
+        "structural undo/redo PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    let removed = reopened.get_scene(scene).unwrap();
+    assert!(removed.scene.archived);
+    assert_eq!(removed.chapter_id, Some(chapter));
+    assert!(reopened.list_structural_nodes().unwrap().is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn populated_chapter_removal_can_rehome_scenes_to_a_selected_chapter_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

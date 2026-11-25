@@ -1103,6 +1103,15 @@ impl WriterApp {
     pub fn restore_latest_structural_removal(&mut self, root: NodeId) -> Result<()> {
         Ok(self.store.restore_latest_structural_removal(root)?)
     }
+    pub fn latest_structural_removal(
+        &self,
+        restored: bool,
+    ) -> Result<Option<(uuid::Uuid, NodeId)>> {
+        Ok(self.store.latest_structural_removal(restored)?)
+    }
+    pub fn redo_structural_removal(&mut self, id: uuid::Uuid) -> Result<NodeId> {
+        Ok(self.store.redo_structural_removal(id)?)
+    }
 
     pub fn create_project_with_metadata(path: impl AsRef<Path>, project: &Project) -> Result<Self> {
         Ok(Self {

@@ -519,6 +519,7 @@ struct StructuralRemovalContentUnit {
     applied_parent_id: Option<String>,
     applied_position: Option<i64>,
 }
+type StructuralRemovalNodeMove = (String, Option<String>, Option<u32>, Option<String>, i64);
 #[derive(Clone, Debug)]
 pub struct ContentUnitRecord {
     pub id: ContentUnitId,
@@ -4853,7 +4854,7 @@ impl ProjectStore {
         let removal: Option<String> = self
             .conn
             .query_row(
-                "SELECT id FROM structural_removal WHERE root_node_id=?1 AND restored_at IS NULL ORDER BY created_at DESC,id DESC LIMIT 1",
+                "SELECT id FROM structural_removal WHERE root_node_id=?1 AND restored_at IS NULL ORDER BY rowid DESC LIMIT 1",
                 [root.to_string()],
                 |row| row.get(0),
             )
@@ -4866,6 +4867,319 @@ impl ProjectStore {
         } else {
             self.restore_archived_structural_node(root)
         }
+    }
+
+    /// Return the newest recoverable structural removal. `restored` selects
+    /// whether the newest structural operation is restored (redo) or pending
+    /// restoration (undo). A newer structural operation invalidates redo.
+    pub fn latest_structural_removal(&self, restored: bool) -> Result<Option<(Uuid, NodeId)>> {
+        let record: Option<(String, String, Option<String>)> = self
+            .conn
+            .query_row(
+                "SELECT id,root_node_id,restored_at FROM structural_removal ORDER BY rowid DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        record
+            .filter(|(_, _, restored_at)| restored_at.is_some() == restored)
+            .map(|(removal, root, _)| {
+                let removal = Uuid::parse_str(&removal)
+                    .map_err(|error| StorageError::Invalid(error.to_string()))?;
+                let root = Uuid::parse_str(&root)
+                    .map_err(|error| StorageError::Invalid(error.to_string()))?;
+                Ok((removal, NodeId(root)))
+            })
+            .transpose()
+    }
+
+    /// Reapply a previously restored structural removal. The saved applied
+    /// placements are checked before mutation, so a new object occupying a
+    /// required position produces a conflict rather than being overwritten.
+    pub fn redo_structural_removal(&mut self, removal_id: Uuid) -> Result<NodeId> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (root, mode, restored): (String, String, Option<String>) = tx
+            .query_row(
+                "SELECT root_node_id,mode,restored_at FROM structural_removal WHERE id=?1",
+                [removal_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?
+            .ok_or_else(|| StorageError::NotFound(format!("structural removal {removal_id}")))?;
+        if restored.is_none() {
+            return Err(StorageError::Invalid(
+                "this structural removal has not been restored".into(),
+            ));
+        }
+        let newest_removal: String = tx.query_row(
+            "SELECT id FROM structural_removal ORDER BY rowid DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if newest_removal != removal_id.to_string() {
+            return Err(StorageError::Invalid(
+                "a newer structural operation has invalidated this redo".into(),
+            ));
+        }
+        let root_id = NodeId(
+            Uuid::parse_str(&root).map_err(|error| StorageError::Invalid(error.to_string()))?,
+        );
+
+        let scenes: Vec<StructuralRemovalScene> = {
+            let mut statement = tx.prepare(
+                "SELECT scene_id,original_chapter_id,original_position,was_archived,previous_status,applied_chapter_id,applied_position,applied_unplaced_position FROM structural_removal_scene WHERE removal_id=?1 ORDER BY original_chapter_id,original_position,scene_id",
+            )?;
+            statement
+                .query_map([removal_id.to_string()], |row| {
+                    Ok(StructuralRemovalScene {
+                        scene_id: row.get(0)?,
+                        original_chapter_id: row.get(1)?,
+                        original_position: row.get(2)?,
+                        was_archived: row.get(3)?,
+                        previous_status: row.get(4)?,
+                        applied_chapter_id: row.get(5)?,
+                        applied_position: row.get(6)?,
+                        applied_unplaced_position: row.get(7)?,
+                    })
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for scene in &scenes {
+            let current: (Option<String>, Option<u32>, Option<i64>, bool) = tx.query_row(
+                "SELECT placement.chapter_id,placement.position,unplaced.position,scene.archived FROM scene LEFT JOIN scene_placement placement ON placement.scene_id=scene.id LEFT JOIN unplaced_scene_order unplaced ON unplaced.scene_id=scene.id WHERE scene.id=?1",
+                [&scene.scene_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?;
+            let expected = (
+                scene.original_chapter_id.clone(),
+                scene.original_position,
+                None,
+                scene.was_archived,
+            );
+            if current != expected {
+                return Err(StorageError::RecoveryConflict(format!(
+                    "cannot redo structural removal because scene {} changed after restoration",
+                    scene.scene_id
+                )));
+            }
+            if mode != "delete_subtree" {
+                if let (Some(chapter), Some(position)) =
+                    (&scene.applied_chapter_id, scene.applied_position)
+                {
+                    let occupied: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM scene_placement WHERE chapter_id=?1 AND position=?2 AND scene_id!=?3)",
+                        params![chapter, position, scene.scene_id],
+                        |row| row.get(0),
+                    )?;
+                    if occupied {
+                        return Err(StorageError::RecoveryConflict(format!(
+                            "cannot redo structural removal because the destination position for scene {} is occupied",
+                            scene.scene_id
+                        )));
+                    }
+                }
+                if let Some(position) = scene.applied_unplaced_position {
+                    let occupied: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM unplaced_scene_order WHERE position=?1 AND scene_id!=?2)",
+                        params![position, scene.scene_id],
+                        |row| row.get(0),
+                    )?;
+                    if occupied {
+                        return Err(StorageError::RecoveryConflict(format!(
+                            "cannot redo structural removal because the unplaced position for scene {} is occupied",
+                            scene.scene_id
+                        )));
+                    }
+                }
+            }
+        }
+
+        // Reapply moved scenes as a batch to avoid transient position clashes.
+        if mode != "delete_subtree" {
+            for scene in &scenes {
+                tx.execute(
+                    "DELETE FROM scene_placement WHERE scene_id=?1",
+                    [&scene.scene_id],
+                )?;
+                tx.execute(
+                    "DELETE FROM unplaced_scene_order WHERE scene_id=?1",
+                    [&scene.scene_id],
+                )?;
+            }
+            for scene in &scenes {
+                if let (Some(chapter), Some(position)) =
+                    (&scene.applied_chapter_id, scene.applied_position)
+                {
+                    tx.execute(
+                        "INSERT INTO scene_placement(scene_id,chapter_id,position) VALUES(?1,?2,?3)",
+                        params![scene.scene_id, chapter, position],
+                    )?;
+                } else if let Some(position) = scene.applied_unplaced_position {
+                    tx.execute(
+                        "INSERT INTO unplaced_scene_order(scene_id,position) VALUES(?1,?2)",
+                        params![scene.scene_id, position],
+                    )?;
+                }
+            }
+        } else {
+            for scene in &scenes {
+                if !scene.was_archived {
+                    tx.execute(
+                        "UPDATE scene SET status_before_archive=status,status='archived',archived=1,updated_at=?2 WHERE id=?1",
+                        params![scene.scene_id, now()],
+                    )?;
+                }
+            }
+        }
+
+        let units: Vec<StructuralRemovalContentUnit> = {
+            let mut statement = tx.prepare(
+                "SELECT content_unit_id,was_archived,original_parent_node_id,original_position,applied_parent_node_id,applied_position FROM structural_removal_content_unit WHERE removal_id=?1",
+            )?;
+            statement
+                .query_map([removal_id.to_string()], |row| {
+                    Ok(StructuralRemovalContentUnit {
+                        id: row.get(0)?,
+                        was_archived: row.get(1)?,
+                        original_parent_id: row.get(2)?,
+                        original_position: row.get(3)?,
+                        applied_parent_id: row.get(4)?,
+                        applied_position: row.get(5)?,
+                    })
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for unit in &units {
+            if let (Some(parent), Some(position), Some(applied_parent), Some(applied_position)) = (
+                &unit.original_parent_id,
+                unit.original_position,
+                &unit.applied_parent_id,
+                unit.applied_position,
+            ) {
+                let current: (String, u32, bool) = tx.query_row(
+                    "SELECT parent_node_id,position,archived FROM content_unit WHERE id=?1",
+                    [&unit.id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+                if current != (parent.clone(), position, unit.was_archived) {
+                    return Err(StorageError::RecoveryConflict(format!(
+                        "cannot redo structural removal because prose document {} changed after restoration",
+                        unit.id
+                    )));
+                }
+                let occupied: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM content_unit WHERE parent_node_id=?1 AND position=?2 AND id!=?3)",
+                    params![applied_parent, applied_position, unit.id],
+                    |row| row.get(0),
+                )?;
+                if occupied {
+                    return Err(StorageError::RecoveryConflict(format!(
+                        "cannot redo structural removal because the destination position for prose document {} is occupied",
+                        unit.id
+                    )));
+                }
+            }
+        }
+        for unit in &units {
+            if let (Some(parent), Some(position), Some(applied_parent), Some(applied_position)) = (
+                &unit.original_parent_id,
+                unit.original_position,
+                &unit.applied_parent_id,
+                unit.applied_position,
+            ) {
+                tx.execute(
+                    "UPDATE content_unit SET parent_node_id=?2,position=?3,updated_at=?4 WHERE id=?1",
+                    params![unit.id, applied_parent, applied_position, now()],
+                )?;
+                let _ = (parent, position);
+            } else if !unit.was_archived {
+                tx.execute(
+                    "UPDATE content_unit SET archived=1,updated_at=?2 WHERE id=?1",
+                    params![unit.id, now()],
+                )?;
+            }
+        }
+
+        // Reapply promoted children, then archive nodes deepest-first.
+        let node_moves: Vec<StructuralRemovalNodeMove> = {
+            let mut statement = tx.prepare(
+                "SELECT node_id,original_parent_id,original_position,applied_parent_id,applied_position FROM structural_removal_node WHERE removal_id=?1 AND applied_position IS NOT NULL ORDER BY original_position,node_id",
+            )?;
+            statement
+                .query_map([removal_id.to_string()], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for (node, original_parent, original_position, applied_parent, applied_position) in
+            &node_moves
+        {
+            let current: (Option<String>, u32) = tx.query_row(
+                "SELECT parent_id,position FROM structural_node WHERE id=?1",
+                [node],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            if current
+                != (
+                    original_parent.clone(),
+                    original_position.ok_or_else(|| {
+                        StorageError::Invalid(format!(
+                            "missing original position for structural node {node}"
+                        ))
+                    })?,
+                )
+            {
+                return Err(StorageError::RecoveryConflict(format!(
+                    "cannot redo structural removal because section or chapter {node} changed after restoration"
+                )));
+            }
+            let occupied: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM structural_node WHERE parent_id IS ?1 AND position=?2 AND id!=?3 AND archived=0)",
+                params![applied_parent, applied_position, node],
+                |row| row.get(0),
+            )?;
+            if occupied {
+                return Err(StorageError::RecoveryConflict(format!(
+                    "cannot redo structural removal because the destination position for section or chapter {node} is occupied"
+                )));
+            }
+            tx.execute(
+                "UPDATE structural_node SET parent_id=?2,position=?3,updated_at=?4 WHERE id=?1",
+                params![node, applied_parent, applied_position, now()],
+            )?;
+        }
+        let nodes: Vec<(String, i64, bool)> = {
+            let mut statement = tx.prepare(
+                "WITH RECURSIVE tree(id,depth) AS (SELECT id,0 FROM structural_node WHERE id=?1 UNION ALL SELECT child.id,tree.depth+1 FROM structural_node child JOIN tree ON child.parent_id=tree.id) SELECT member.node_id,tree.depth,member.was_archived FROM structural_removal_node member JOIN tree ON tree.id=member.node_id WHERE member.removal_id=?2 ORDER BY tree.depth DESC",
+            )?;
+            statement
+                .query_map(params![root, removal_id.to_string()], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?
+                .collect::<std::result::Result<_, _>>()?
+        };
+        for (node, _, was_archived) in nodes {
+            if !was_archived {
+                tx.execute(
+                    "UPDATE structural_node SET archived=1,updated_at=?2 WHERE id=?1",
+                    params![node, now()],
+                )?;
+            }
+        }
+        tx.execute(
+            "UPDATE structural_removal SET restored_at=NULL WHERE id=?1",
+            [removal_id.to_string()],
+        )?;
+        tx.commit()?;
+        Ok(root_id)
     }
     fn update_content_unit_recovery(
         &mut self,
@@ -16086,6 +16400,18 @@ mod tests {
             "Keep this clue visible in the next revision."
         );
         assert!(reopened.restore_structural_subtree(removal).is_err());
+        assert_eq!(
+            reopened.latest_structural_removal(true).unwrap(),
+            Some((removal, section))
+        );
+        assert_eq!(reopened.redo_structural_removal(removal).unwrap(), section);
+        assert!(reopened.list_structural_nodes().unwrap().is_empty());
+        assert!(reopened.list_scenes(false).unwrap().is_empty());
+        assert!(reopened.get_content_unit(content_unit).unwrap().archived);
+        assert_eq!(
+            reopened.latest_structural_removal(false).unwrap(),
+            Some((removal, section))
+        );
         reopened.validate().unwrap();
     }
 
@@ -16149,6 +16475,16 @@ mod tests {
             reopened.load_content_unit_text(prose).unwrap().0,
             "Direct chapter prose is retained."
         );
+        assert_eq!(reopened.redo_structural_removal(removal).unwrap(), chapter);
+        assert!(reopened.list_structural_nodes().unwrap().is_empty());
+        assert!(reopened.get_content_unit(prose).unwrap().archived);
+        assert!(
+            reopened
+                .list_scenes(false)
+                .unwrap()
+                .iter()
+                .all(|scene| scene.chapter_id.is_none())
+        );
     }
 
     #[test]
@@ -16179,6 +16515,65 @@ mod tests {
         let restored = store.get_scene(original).unwrap();
         assert_eq!(restored.chapter_id, Some(source));
         assert_eq!(restored.position, Some(0));
+        assert_eq!(store.redo_structural_removal(removal).unwrap(), source);
+        let redone = store.get_scene(original).unwrap();
+        assert_eq!(redone.chapter_id, Some(target));
+        assert_eq!(redone.position, Some(1));
+        assert_eq!(store.get_scene(existing).unwrap().position, Some(0));
+    }
+
+    #[test]
+    fn structural_redo_conflicts_without_overwriting_new_scene_at_saved_position() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let source = store
+            .create_node(None, NodeKind::Chapter, "Source", 0)
+            .unwrap();
+        let target = store
+            .create_node(None, NodeKind::Chapter, "Target", 1)
+            .unwrap();
+        let moved = store.create_scene(source, 0, "Moved").unwrap();
+        let removal = store
+            .remove_chapter_rehome_scenes(source, Some(target))
+            .unwrap();
+        store.restore_structural_subtree(removal).unwrap();
+        let later = store.create_scene(target, 0, "Later scene").unwrap();
+
+        assert!(store.redo_structural_removal(removal).is_err());
+        assert_eq!(store.get_scene(moved).unwrap().chapter_id, Some(source));
+        assert_eq!(store.get_scene(moved).unwrap().position, Some(0));
+        assert_eq!(store.get_scene(later).unwrap().chapter_id, Some(target));
+        assert_eq!(store.get_scene(later).unwrap().position, Some(0));
+        assert_eq!(store.list_structural_nodes().unwrap().len(), 2);
+        store.validate().unwrap();
+    }
+
+    #[test]
+    fn newer_structural_removal_invalidates_an_older_redo() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let first = store
+            .create_node(None, NodeKind::Chapter, "First", 0)
+            .unwrap();
+        let first_removal = store.archive_structural_subtree(first).unwrap();
+        store.restore_structural_subtree(first_removal).unwrap();
+
+        let second = store
+            .create_node(None, NodeKind::Chapter, "Second", 1)
+            .unwrap();
+        let second_removal = store.archive_structural_subtree(second).unwrap();
+        assert_eq!(
+            store.latest_structural_removal(false).unwrap(),
+            Some((second_removal, second))
+        );
+        assert_eq!(store.latest_structural_removal(true).unwrap(), None);
+        assert!(store.redo_structural_removal(first_removal).is_err());
+        let remaining = store.list_structural_nodes().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, first);
+        store.validate().unwrap();
     }
 
     #[test]

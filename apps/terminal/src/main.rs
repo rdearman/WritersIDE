@@ -14267,9 +14267,7 @@ impl AppState {
     fn command_disabled_reason(&self, spec: CommandSpec) -> Option<&'static str> {
         if matches!(
             spec.id,
-            "edit.undo"
-                | "edit.redo"
-                | "edit.cut-selection"
+            "edit.cut-selection"
                 | "edit.copy-selection"
                 | "edit.paste-clipboard"
                 | "edit.delete-selection"
@@ -14298,9 +14296,7 @@ impl AppState {
         }
         if matches!(
             spec.id,
-            "edit.undo"
-                | "edit.redo"
-                | "edit.cut-selection"
+            "edit.cut-selection"
                 | "edit.copy-selection"
                 | "edit.paste-clipboard"
                 | "edit.delete-selection"
@@ -14331,12 +14327,26 @@ impl AppState {
                     && load_replace_undo(self.app.project_root())
                         .ok()
                         .flatten()
+                        .is_none()
+                    && self
+                        .app
+                        .latest_structural_removal(false)
+                        .ok()
+                        .flatten()
                         .is_none() =>
             {
-                return Some("There is no manuscript edit to undo");
+                return Some("There is no edit or structural change to undo");
             }
-            "edit.redo" if self.redo_stack.is_empty() => {
-                return Some("There is no manuscript edit to redo");
+            "edit.redo"
+                if self.redo_stack.is_empty()
+                    && self
+                        .app
+                        .latest_structural_removal(true)
+                        .ok()
+                        .flatten()
+                        .is_none() =>
+            {
+                return Some("There is no edit or structural change to redo");
             }
             "edit.cut-selection" | "edit.copy-selection" | "edit.delete-selection"
                 if self.selected_text().is_none() =>
@@ -15467,7 +15477,8 @@ impl AppState {
             CommandAction::InsertFile => self.start_file_browser(FileBrowserPurpose::InsertFile)?,
             CommandAction::OpenSpecialCharacterPicker => self.open_special_character_picker(),
             CommandAction::UndoEdit => {
-                if self.undo_stack.is_empty()
+                if self.workspace == Workspace::Editor
+                    && self.undo_stack.is_empty()
                     && load_replace_undo(self.app.project_root())?.is_some()
                 {
                     self.undo_last_scoped_replace()?;
@@ -23327,8 +23338,18 @@ impl AppState {
             self.narrowed_passage = previous.narrowed_passage;
             self.dirty = true;
             self.message = "Edit undone".into();
+        } else if let Ok(Some((removal_id, root_id))) = self.app.latest_structural_removal(false) {
+            match self.app.restore_structural_subtree(removal_id) {
+                Ok(restored) if restored == root_id => {
+                    self.removed_structural_nodes_list = false;
+                    self.workspace = Workspace::Outline;
+                    self.message = "Removed structure restored (Undo)".into();
+                }
+                Ok(_) => self.message = "Structural undo restored an unexpected item".into(),
+                Err(error) => self.message = format!("Structural undo needs attention: {error}"),
+            }
         } else {
-            self.message = "No editor changes to undo".into();
+            self.message = "No editor or structural changes to undo".into();
         }
     }
     fn redo_edit(&mut self) {
@@ -23345,8 +23366,17 @@ impl AppState {
             self.narrowed_passage = next.narrowed_passage;
             self.dirty = true;
             self.message = "Edit redone".into();
+        } else if let Ok(Some((removal_id, _root_id))) = self.app.latest_structural_removal(true) {
+            match self.app.redo_structural_removal(removal_id) {
+                Ok(_) => {
+                    self.removed_structural_nodes_list = true;
+                    self.workspace = Workspace::Outline;
+                    self.message = "Removed structure redone (Redo)".into();
+                }
+                Err(error) => self.message = format!("Structural redo needs attention: {error}"),
+            }
         } else {
-            self.message = "No editor changes to redo".into();
+            self.message = "No editor or structural changes to redo".into();
         }
     }
     fn create_reading_selection(
@@ -25607,7 +25637,11 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             } else if s.workspace == Workspace::Cards {
                 format!(
                     " {} · {}",
-                    workspace_action_hint(s),
+                    if s.message.is_empty() {
+                        workspace_action_hint(s)
+                    } else {
+                        s.message.clone()
+                    },
                     if s.dirty {
                         "[UNSAVED]"
                     } else if s.temporary_project {
@@ -25617,30 +25651,36 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     }
                 )
             } else {
-                format!(
-                    " Active:{} · Menu {} · Help {} · Save {} · q quit · {}{} · {}",
-                    if s.menu.is_some() {
-                        "menu"
-                    } else if s.reference_focused {
-                        "reference"
-                    } else if s.workspace == Workspace::Editor {
-                        "manuscript"
-                    } else {
-                        "navigation"
-                    },
-                    effective_shortcut_label(s, "menu.main", "F10"),
-                    effective_shortcut_label(s, "help.context", "Help menu"),
-                    effective_shortcut_label(s, "file.save", "unbound"),
-                    if s.dirty {
-                        "unsaved"
-                    } else if s.temporary_project {
-                        "temporary · Save Project chooses a permanent location"
-                    } else {
-                        "saved"
-                    },
-                    challenge,
-                    s.message,
-                )
+                let focus = if s.menu.is_some() {
+                    "menu"
+                } else if s.reference_focused {
+                    "reference"
+                } else if s.workspace == Workspace::Editor {
+                    "manuscript"
+                } else {
+                    "navigation"
+                };
+                let save_state = if s.dirty {
+                    "unsaved"
+                } else if s.temporary_project {
+                    "temporary"
+                } else {
+                    "saved"
+                };
+                if s.message.is_empty() {
+                    format!(
+                        " Active:{focus} · Menu {} · Help {} · Save {} · q quit · {save_state}{challenge}",
+                        effective_shortcut_label(s, "menu.main", "F10"),
+                        effective_shortcut_label(s, "help.context", "Help menu"),
+                        effective_shortcut_label(s, "file.save", "unbound"),
+                    )
+                } else {
+                    format!(
+                        " {} · Active:{focus} · Save {} · {save_state}",
+                        s.message,
+                        effective_shortcut_label(s, "file.save", "unbound"),
+                    )
+                }
             }
         };
         if s.mode.is_none() && s.workspace != Workspace::Editor {
@@ -33692,7 +33732,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(screen.contains("Space: Include/Exclude"), "{screen}");
+        assert!(screen.contains("Include / Exclude Scene"), "{screen}");
+        assert!(screen.contains("(Space)"), "{screen}");
 
         state.menu.as_mut().unwrap().selected = entries
             .iter()
@@ -50524,6 +50565,69 @@ mod tests {
         assert!(footer.contains("Help > Resume Tutorial"), "{footer}");
         assert_eq!(state.editor, ["Unsaved sentence stays here."]);
         assert!(state.dirty);
+    }
+
+    #[test]
+    fn structural_undo_and_redo_are_available_without_opening_a_manuscript() {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let section = app.create_section("Part One", 0).unwrap();
+        let chapter = app.create_chapter(Some(section), "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let removal = app.archive_structural_subtree(section).unwrap();
+
+        let mut state = AppState::new(app, default_bindings());
+        assert_ne!(state.workspace, Workspace::Editor);
+        let undo = command_by_id("edit.undo").unwrap();
+        assert_eq!(state.command_disabled_reason(undo), None);
+        state.open_menu_category(1);
+        let undo_index = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| command.id == "edit.undo")
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = undo_index;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            state
+                .app
+                .list_structural_nodes()
+                .unwrap()
+                .iter()
+                .any(|node| node.id == section)
+        );
+        assert!(
+            state
+                .app
+                .list_scenes(false)
+                .unwrap()
+                .iter()
+                .any(|item| item.scene.id == scene)
+        );
+        assert!(state.message.contains("Removed structure restored"));
+
+        let redo = command_by_id("edit.redo").unwrap();
+        assert_eq!(state.command_disabled_reason(redo), None);
+        state.open_menu_category(1);
+        let redo_index = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| command.id == "edit.redo")
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = redo_index;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.app.list_structural_nodes().unwrap().is_empty());
+        assert!(state.app.list_scenes(false).unwrap().is_empty());
+        assert_eq!(
+            state.app.latest_structural_removal(false).unwrap(),
+            Some((removal, section))
+        );
+        assert!(state.message.contains("Removed structure redone"));
     }
 
     #[test]
