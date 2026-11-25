@@ -22819,9 +22819,73 @@ impl AppState {
         }
     }
     fn delete_sentence_at_cursor(&mut self) {
-        self.select_sentence_at_cursor();
-        if self.selected_text().is_some() {
-            self.delete_current_selection_with_spacing(false);
+        let source = self.editor.join("\n");
+        let cursor = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
+        let ranges = editor_sentence_ranges(&source);
+        let Some(range) = ranges
+            .iter()
+            .find(|range| range.start <= cursor && cursor <= range.end)
+            .or_else(|| ranges.iter().find(|range| range.start >= cursor))
+            .or_else(|| ranges.last())
+        else {
+            self.editor_selection = None;
+            self.message = "There is no sentence at or near the editor cursor".into();
+            return;
+        };
+
+        // An unpunctuated multi-line paragraph is ambiguous: deleting its one
+        // inferred sentence would erase every physical line. Use the current
+        // line as the conservative fallback so neighboring prose survives.
+        let selected = &source[range.clone()];
+        if selected.contains('\n')
+            && !selected
+                .chars()
+                .any(|character| matches!(character, '.' | '!' | '?' | '…'))
+        {
+            let row = self.cursor.0.min(self.editor.len().saturating_sub(1));
+            let line_start = self
+                .editor
+                .iter()
+                .take(row)
+                .map(|line| line.len() + 1)
+                .sum::<usize>();
+            let line_end = line_start + self.editor[row].len();
+            let (start, end) = if line_end < source.len() {
+                (line_start, line_end + 1)
+            } else if line_start > 0 {
+                (line_start - 1, line_end)
+            } else {
+                (line_start, line_end)
+            };
+            self.replace_editor_range(start, end, "", "Unpunctuated line deleted as sentence");
+            return;
+        }
+
+        let row = self.cursor.0.min(self.editor.len().saturating_sub(1));
+        let line_start = self
+            .editor
+            .iter()
+            .take(row)
+            .map(|line| line.len() + 1)
+            .sum::<usize>();
+        let line_end = line_start + self.editor[row].len();
+        let only_line_content = source[line_start..range.start].trim().is_empty()
+            && source[range.end..line_end].trim().is_empty();
+        if only_line_content {
+            let start = line_start;
+            let mut end = line_end;
+            if end < source.len() && source.as_bytes().get(end) == Some(&b'\n') {
+                end += 1;
+            } else if start > 0 && source.as_bytes().get(start - 1) == Some(&b'\n') {
+                self.replace_editor_range(start - 1, end, "", "Sentence deleted");
+                return;
+            }
+            self.replace_editor_range(start, end, "", "Sentence deleted");
+        } else {
+            self.select_editor_byte_range(range.start, range.end, "Selected sentence");
+            if self.selected_text().is_some() {
+                self.delete_current_selection_with_spacing(false);
+            }
         }
     }
     fn delete_paragraph_at_cursor(&mut self) {
@@ -24870,18 +24934,12 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                                 &mention_ranges,
                             )
                         });
-                        if selected {
-                            spans.push(Span::styled(
-                                shown.to_owned(),
-                                Style::default().fg(Color::White).bg(Color::Blue),
-                            ));
+                        let mut style = if selected {
+                            Style::default().fg(Color::White).bg(Color::Blue)
                         } else if decorated {
-                            spans.push(Span::styled(
-                                shown.to_owned(),
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::UNDERLINED),
-                            ));
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::UNDERLINED)
                         } else if let Some(style) = projected_graphemes
                             .as_ref()
                             .and_then(|items| items.get(&(byte_offset as usize)))
@@ -24904,11 +24962,27 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                             } else if style.code || style.heading_level.is_some() {
                                 terminal_style = terminal_style.fg(Color::Yellow);
                             }
-                            spans.push(Span::styled(shown.to_owned(), terminal_style));
+                            terminal_style
                         } else {
-                            spans.push(Span::raw(shown.to_owned()));
+                            Style::default()
+                        };
+                        if !s.reference_focused && row == view_cursor.0 && col == view_cursor.1 {
+                            style = style.add_modifier(Modifier::REVERSED);
                         }
+                        spans.push(Span::styled(shown.to_owned(), style));
                         byte_offset += ch.len() as u64;
+                    }
+                    if !s.reference_focused
+                        && row == view_cursor.0
+                        && view_cursor.1 >= grapheme_count(line)
+                    {
+                        spans.push(Span::styled(
+                            " ",
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::White)
+                                .add_modifier(Modifier::REVERSED),
+                        ));
                     }
                     if s.editor_preferences.show_formatting_marks
                         && let Some(marker) =
@@ -43303,6 +43377,118 @@ mod tests {
         .unwrap();
         assert_eq!(state.editor_selection, None);
         assert_eq!(state.cursor, (0, 3));
+
+        state.editor = vec!["alpha".into(), "beta".into(), "gamma".into()];
+        state.cursor = (0, 0);
+        state.select_all_text();
+        let original = state.editor.clone();
+        handle(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.editor_selection, None);
+        assert_eq!(state.cursor, (1, 4));
+        handle(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.cursor, (0, 4));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.cursor, (0, 5));
+        assert_eq!(state.editor, original);
+        assert!(!state.dirty);
+        assert!(state.undo_stack.is_empty());
+    }
+
+    #[test]
+    fn editor_caret_remains_visible_after_select_all_and_arrow_navigation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let expected_hash = app.load_scene_text(scene).unwrap().1;
+        let original = "alpha\nbeta\ngamma";
+        app.save_scene_text(scene, Some(&expected_hash), original)
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.select_all_text();
+        handle(&mut state, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)).unwrap();
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(screen.contains("beta "), "{screen}");
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .any(|cell| cell.modifier.contains(Modifier::REVERSED))
+        );
+        assert_eq!(state.editor.join("\n"), original);
+        assert!(!state.dirty);
+        assert!(state.undo_stack.is_empty());
+    }
+
+    #[test]
+    fn delete_sentence_uses_safe_line_fallback_for_unpunctuated_multiline_text() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let original = "First thought\nSecond thought\nThird thought\nFourth thought";
+        let expected_hash = app.load_scene_text(scene).unwrap().1;
+        app.save_scene_text(scene, Some(&expected_hash), original)
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.cursor = (2, 4);
+
+        state
+            .dispatch_registered_command_id("edit.delete-sentence")
+            .unwrap();
+
+        assert_eq!(
+            state.editor.join("\n"),
+            "First thought\nSecond thought\nFourth thought"
+        );
+        assert!(state.message.contains("Unpunctuated line deleted"));
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), original);
+    }
+
+    #[test]
+    fn delete_sentence_removes_only_the_current_punctuated_line() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let original = "First sentence.\nSecond sentence.\nThird sentence.\nFourth sentence.";
+        let expected_hash = app.load_scene_text(scene).unwrap().1;
+        app.save_scene_text(scene, Some(&expected_hash), original)
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.cursor = (2, 5);
+
+        state
+            .dispatch_registered_command_id("edit.delete-sentence")
+            .unwrap();
+
+        assert_eq!(
+            state.editor.join("\n"),
+            "First sentence.\nSecond sentence.\nFourth sentence."
+        );
+        state.undo_edit();
+        assert_eq!(state.editor.join("\n"), original);
     }
 
     #[test]
