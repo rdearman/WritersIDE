@@ -66,6 +66,9 @@ pub struct PipelineContentUnit {
     pub title: String,
     pub language_code: Option<String>,
     pub text: String,
+    /// Global manuscript inclusion state. Explicit publication assemblies may
+    /// include excluded documents through their own item selection.
+    pub included: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1046,7 +1049,7 @@ pub fn compile_ir(input: &PipelineInput) -> story_document::CompileIr {
     for content in input
         .content_units
         .iter()
-        .filter(|unit| unit.kind == story_document::ContentUnitKind::FrontMatter)
+        .filter(|unit| unit.included && unit.kind == story_document::ContentUnitKind::FrontMatter)
     {
         push_content(&mut ir, content);
         used_content.insert(content.id.clone());
@@ -1062,7 +1065,7 @@ pub fn compile_ir(input: &PipelineInput) -> story_document::CompileIr {
         for content in input
             .content_units
             .iter()
-            .filter(|unit| unit.parent_id.as_deref() == Some(id))
+            .filter(|unit| unit.included && unit.parent_id.as_deref() == Some(id))
         {
             push_content(ir, content);
             used_content.insert(content.id.clone());
@@ -1104,13 +1107,13 @@ pub fn compile_ir(input: &PipelineInput) -> story_document::CompileIr {
     for content in input
         .content_units
         .iter()
-        .filter(|unit| unit.kind == story_document::ContentUnitKind::BackMatter)
+        .filter(|unit| unit.included && unit.kind == story_document::ContentUnitKind::BackMatter)
     {
         push_content(&mut ir, content);
         used_content.insert(content.id.clone());
     }
     for content in &input.content_units {
-        if !used_content.contains(&content.id) {
+        if content.included && !used_content.contains(&content.id) {
             push_content(&mut ir, content);
         }
     }
@@ -1380,6 +1383,7 @@ mod tests {
             title: "Chapter".into(),
             language_code: None,
             text: "Chapter-level introduction.".into(),
+            included: true,
         });
         let (compiled, _) = compile_ir(&novel).render_markdown();
         assert!(compiled.starts_with(

@@ -753,3 +753,43 @@ passed, including 337 terminal unit tests, 3 author workflows, 24 Linux PTY
 tests and all library/CLI/doc tests. The Ollama test used only the previously
 authorised local loopback socket. This renderer correction is ready to commit;
 human visual and publication acceptance remain outstanding.
+
+## Scrivener content-unit compile inclusion — implementation in progress
+
+The next #68/#53 fidelity gap was that `IncludeInCompile=No` was retained for
+scenes but ignored for prose stored directly on section/chapter content units.
+Migration 52 adds recoverable per-content-unit inclusion state (included by
+default). The unified outline now displays this state and Space toggles it
+without removing the prose. The shared Compile IR omits excluded content units
+from ordinary compilation, while named assembly item selection remains an
+independent, explicit way to include selected text in an alternate edition.
+The Scrivener importer maps an explicit `No` flag on section/chapter prose to
+that state. Heading visibility and structural container inclusion remain
+separate and are not conflated with body inclusion.
+
+Focused storage, application, pipeline, importer, and outline-key regressions
+pass, including reopen persistence, default compile omission, explicit assembly
+inclusion, and synthetic Scrivener chapter-prose exclusion. Migration downgrade
+tests were updated and rerun. Workspace Clippy and the final full offline
+workspace suite passed: 338 terminal unit tests, 3 author workflows, 24 Linux
+PTY tests, and all library, CLI, import, storage, Ollama and documentation tests.
+The suite required the previously authorised permission for the Ollama test's
+loopback-only fixture socket. This is not yet a complete per-profile Scrivener
+compile-settings mapping or human-accepted workflow.
+
+The full private three-book regression then ran at the dirty working revision
+based on `ed6a40d`: `reports/content-inclusion2-20261126/`, with generated
+projects and EPUBs under `generated/content-inclusion2-20261126/`. Output EPUBs:
+
+- `generated/content-inclusion2-20261126/book-01.epub`
+- `generated/content-inclusion2-20261126/book-02.epub`
+- `generated/content-inclusion2-20261126/book-03.epub`
+
+All three source trees were unchanged and fixture checksums passed. Import body
+fidelity was exact for the 39/39, 36/36 and 68/68 manuscript bodies and 6/6,
+6/6 and 12/12 research bodies respectively. Imports remain marked incomplete
+because source mapping/unsupported-content review is unresolved. Generated
+EPUBs each passed EPUBCheck 4.2.6 with zero errors and warnings. The run is
+provisional: it does not establish that all Scrivener compile exclusions or
+historical publication differences are correctly resolved, and human visual
+publication acceptance remains outstanding.

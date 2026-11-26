@@ -24332,9 +24332,9 @@ fn workspace_action_hint(state: &AppState) -> String {
         Workspace::Outline => {
             let inclusion = effective_shortcut_label(state, "scene.toggle-inclusion", "Space");
             if inclusion == "Space" {
-                "↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude · Insert creates content · Edit > Remove/Move".into()
+                "↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude scene/prose · Insert creates content · Edit > Remove/Move".into()
             } else {
-                format!("↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude · {inclusion}: Include/Exclude · Insert creates content · Edit > Remove/Move")
+                format!("↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude scene/prose · {inclusion}: Include/Exclude · Insert creates content · Edit > Remove/Move")
             }
         }
         Workspace::Editor => "Esc: Outline".into(),
@@ -25850,7 +25850,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     .cloned()
                     .unwrap_or_else(|| "No outline row selected".into());
                 format!(
-                    "{row}\n\nEnter opens this item in the manuscript. Space expands or collapses headings, or changes whether a scene is included."
+                    "{row}\n\nEnter opens this item in the manuscript. Space expands/collapses headings or includes/excludes the selected scene or prose document."
                 )
             } else if s.workspace == Workspace::Research && s.proposal_review_active {
                 format!(
@@ -30194,7 +30194,12 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                     |_| format!("  <missing content unit {id}>"),
                     |unit| {
                         format!(
-                            "  {}{} · {} · {} words",
+                            "  {} · {}{} · {} · {} words",
+                            if unit.included {
+                                "Included"
+                            } else {
+                                "Excluded"
+                            },
                             if unit.archived { "Removed · " } else { "" },
                             unit.title,
                             unit.kind.as_str(),
@@ -34032,8 +34037,25 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                         )
                     };
                 }
-                Some(OutlineRow::ContentUnit(_)) | None => {
-                    s.message = "Select a heading or scene to change its outline state".into();
+                Some(OutlineRow::ContentUnit(id)) => {
+                    let included = s.app.content_unit_is_included(id)?;
+                    s.app.set_content_unit_included(id, !included)?;
+                    s.refresh()?;
+                    s.selected = outline_rows(s)
+                        .iter()
+                        .position(|row| *row == OutlineRow::ContentUnit(id))
+                        .unwrap_or(s.selected);
+                    let title = s.app.get_content_unit(id)?.title;
+                    s.message = if included {
+                        format!("Moved “{title}” to Excluded · its prose and metadata are retained")
+                    } else {
+                        format!("Moved “{title}” to Included · it will appear in Compile")
+                    };
+                }
+                None => {
+                    s.message =
+                        "Select a heading, chapter text or scene to change its outline state"
+                            .into();
                 }
             }
         }
@@ -34156,7 +34178,7 @@ mod tests {
         assert_eq!(detail_panel_title(&state), "Selected outline item");
         assert_eq!(
             workspace_action_hint(&state),
-            "↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude · Insert creates content · Edit > Remove/Move"
+            "↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude scene/prose · Insert creates content · Edit > Remove/Move"
         );
 
         state.workspace = Workspace::StoryBible;
@@ -34362,6 +34384,54 @@ mod tests {
             .unwrap();
         assert_eq!(state.workspace, Workspace::Outline);
         assert_eq!(selected_scene_for_workspace(&state), Some(created.scene.id));
+    }
+
+    #[test]
+    fn outline_space_toggles_prose_document_inclusion_without_removing_its_text() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let prose = app
+            .create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "Chapter One prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, hash) = app.load_content_unit_text(prose).unwrap();
+        app.save_content_unit_text(prose, Some(&hash), "The author keeps this draft.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.workspace = Workspace::Outline;
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| *row == OutlineRow::ContentUnit(prose))
+            .unwrap();
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        assert!(!state.app.content_unit_is_included(prose).unwrap());
+        assert!(
+            state
+                .app
+                .load_content_unit_text(prose)
+                .unwrap()
+                .0
+                .contains("keeps this draft")
+        );
+        assert!(state.message.contains("prose and metadata are retained"));
+        assert!(
+            workspace_items(&state)
+                .iter()
+                .any(|row| row.contains("Excluded"))
+        );
     }
 
     #[test]

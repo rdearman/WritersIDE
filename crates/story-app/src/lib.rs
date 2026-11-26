@@ -1378,6 +1378,12 @@ impl WriterApp {
     ) -> Result<String> {
         Ok(self.store.save_content_unit_text(id, expected, text)?)
     }
+    pub fn content_unit_is_included(&self, id: ContentUnitId) -> Result<bool> {
+        Ok(self.store.content_unit_is_included(id)?)
+    }
+    pub fn set_content_unit_included(&mut self, id: ContentUnitId, included: bool) -> Result<()> {
+        Ok(self.store.set_content_unit_included(id, included)?)
+    }
     pub fn rename_content_unit(&mut self, id: ContentUnitId, title: &str) -> Result<()> {
         Ok(self.store.rename_content_unit(id, title)?)
     }
@@ -3396,6 +3402,7 @@ impl WriterApp {
                 title: unit.title,
                 language_code,
                 text,
+                included: unit.included,
             });
         }
         let mut snapshots = 0usize;
@@ -4599,6 +4606,9 @@ impl WriterApp {
                         )?;
                         let (_, expected) = self.load_content_unit_text(unit)?;
                         self.save_content_unit_text(unit, Some(&expected), &text)?;
+                        if item.include_in_compile == Some(false) {
+                            self.set_content_unit_included(unit, false)?;
+                        }
                         destinations.push(("content_unit", unit.to_string(), "content_markdown"));
                     }
                 }
@@ -4635,6 +4645,9 @@ impl WriterApp {
                         )?;
                         let (_, expected) = self.load_content_unit_text(unit)?;
                         self.save_content_unit_text(unit, Some(&expected), &text)?;
+                        if item.include_in_compile == Some(false) {
+                            self.set_content_unit_included(unit, false)?;
+                        }
                         destinations.push(("content_unit", unit.to_string(), "content_markdown"));
                     }
                     destinations.push(("structural_node", node.to_string(), "chapter"));
@@ -7288,6 +7301,58 @@ unexpected_prose = "must not be silently discarded"
     }
 
     #[test]
+    fn excluded_chapter_prose_is_retained_but_omitted_from_default_compile() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let body = app
+            .create_content_unit(
+                ContentUnitKind::ChapterBody,
+                "Chapter One",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let (_, hash) = app.load_content_unit_text(body).unwrap();
+        app.save_content_unit_text(body, Some(&hash), "Private introduction remains editable.")
+            .unwrap();
+
+        app.set_content_unit_included(body, false).unwrap();
+        assert!(!app.get_content_unit(body).unwrap().included);
+        assert_eq!(
+            app.load_content_unit_text(body).unwrap().0,
+            "Private introduction remains editable."
+        );
+        let compiled = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        assert!(
+            !String::from_utf8(compiled.bytes)
+                .unwrap()
+                .contains("Private introduction remains editable.")
+        );
+
+        let assembly = app.create_assembly("Selected draft excerpt").unwrap();
+        app.add_assembly_content_unit(assembly, body, 0).unwrap();
+        assert!(
+            app.compile_assembly_markdown(assembly)
+                .unwrap()
+                .contains("Private introduction remains editable.")
+        );
+
+        app.set_content_unit_included(body, true).unwrap();
+        let compiled = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        assert!(
+            String::from_utf8(compiled.bytes)
+                .unwrap()
+                .contains("Private introduction remains editable.")
+        );
+    }
+
+    #[test]
     fn unplaced_scene_is_persistent_but_omitted_until_explicitly_placed() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("Novel");
@@ -8315,7 +8380,7 @@ unexpected_prose = "must not be silently discarded"
             source.join("SeriesBook.scrivx"),
             r#"<ScrivenerProject Version="2.0"><Binder>
               <BinderItem UUID="section-1" Type="Folder"><Title>Part One</Title><Children/></BinderItem>
-              <BinderItem UUID="chapter-1" Type="DraftFolder"><Title>Chapter One</Title><Children>
+              <BinderItem UUID="chapter-1" Type="DraftFolder"><Title>Chapter One</Title><IncludeInCompile>No</IncludeInCompile><Children>
                 <BinderItem UUID="scene-1" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
               </Children></BinderItem>
               <BinderItem UUID="research-1" Type="Folder"><Title>Research</Title><Children/></BinderItem>
@@ -8397,6 +8462,13 @@ unexpected_prose = "must not be silently discarded"
             app.load_content_unit_text(chapter_body.id).unwrap().0,
             "Chapter introduction."
         );
+        assert!(!chapter_body.included);
+        let compiled = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        let compiled = String::from_utf8(compiled.bytes).unwrap();
+        assert!(!compiled.contains("Chapter introduction."));
+        assert!(compiled.contains("Élodie entered."));
         let scene = app.get_scene(scenes[0]).unwrap();
         assert_eq!(scene.scene.synopsis, "The door opens");
         assert_eq!(app.list_structural_nodes().unwrap().len(), 2);
