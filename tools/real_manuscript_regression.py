@@ -82,12 +82,104 @@ class TextCollector(html.parser.HTMLParser):
             self._heading_parts.append(data)
 
 
+class RecoveringXhtmlTree(html.parser.HTMLParser):
+    """Build a forgiving element tree for malformed historical EPUB XHTML.
+
+    The original bytes are still reported as non-well-formed. This tree is
+    only an analysis aid so a broken list or URI does not hide every paragraph
+    in an otherwise readable reference chapter.
+    """
+
+    _VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+    _BLOCK_STARTS = {"address", "article", "blockquote", "div", "dl", "fieldset", "footer", "form", "h1", "h2", "h3", "h4", "h5", "h6", "header", "hr", "ol", "p", "pre", "section", "table", "ul"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.root: ET.Element | None = None
+        self.stack: list[ET.Element] = []
+
+    def _close_through(self, name: str) -> None:
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index].tag.lower() == name:
+                del self.stack[index:]
+                return
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        name = tag.lower()
+        if name == "p" and self.stack and self.stack[-1].tag.lower() == "p":
+            self.stack.pop()
+        if name == "li":
+            self._close_through("li")
+        elif name == "tr":
+            self._close_through("tr")
+        elif name in {"td", "th"}:
+            self._close_through("td")
+            self._close_through("th")
+        elif name in self._BLOCK_STARTS:
+            self._close_through("p")
+        node = ET.Element(name, {key.lower(): value or "" for key, value in attrs})
+        if self.stack:
+            self.stack[-1].append(node)
+        elif self.root is None:
+            self.root = node
+        else:
+            # Preserve multiple top-level fragments under a synthetic root.
+            wrapper = ET.Element("recovered-document")
+            wrapper.append(self.root)
+            wrapper.append(node)
+            self.root = wrapper
+        if name not in self._VOID:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        self.handle_starttag(tag, attrs)
+        if tag.lower() not in self._VOID:
+            self.handle_endtag(tag)
+
+    def handle_endtag(self, tag: str) -> None:
+        self._close_through(tag.lower())
+
+    def handle_data(self, data: str) -> None:
+        if not self.stack:
+            return
+        current = self.stack[-1]
+        if len(current):
+            current[-1].tail = (current[-1].tail or "") + data
+        else:
+            current.text = (current.text or "") + data
+
+
 def epub_document_details(source: str, document_path: str) -> dict:
     """Extract source-located semantic blocks from one EPUB XHTML document."""
+    parse_error = None
+    recovered = False
     try:
         root = ET.fromstring(source)
     except ET.ParseError as error:
-        return {"path": document_path, "parse_error": str(error)}
+        parse_error = str(error)
+        builder = RecoveringXhtmlTree()
+        try:
+            builder.feed(source)
+            builder.close()
+            root = builder.root
+        except Exception as recovery_error:
+            return {
+                "path": document_path,
+                "parse_error": parse_error,
+                "recovery_error": str(recovery_error),
+                "blocks": [],
+                "paragraphs": [],
+                "preformatted": [],
+                "headings": [],
+                "visible_markdown_artifacts": [],
+                "tables": [],
+                "images": [],
+                "links": [],
+                "unicode_counts": {},
+            }
+        if root is None:
+            return {"path": document_path, "parse_error": parse_error, "blocks": [], "paragraphs": [], "preformatted": [], "headings": [], "visible_markdown_artifacts": [], "tables": [], "images": [], "links": [], "unicode_counts": {}}
+        recovered = True
 
     def tag_name(node: ET.Element) -> str:
         return node.tag.rsplit("}", 1)[-1].lower()
@@ -145,6 +237,8 @@ def epub_document_details(source: str, document_path: str) -> dict:
     all_text = "\n".join(block["text"] for block in blocks)
     return {
         "path": document_path,
+        "parse_error": parse_error,
+        "recovered_from_malformed_xhtml": recovered,
         "blocks": blocks,
         "paragraphs": [block for block in blocks if block["kind"] == "p"],
         "preformatted": [block for block in blocks if block["kind"] == "pre"],
@@ -185,10 +279,60 @@ def detailed_epub_difference(reference: dict, generated: dict) -> dict:
     for operation, a0, a1, b0, b1 in matcher.get_opcodes():
         if operation == "equal":
             continue
+        expected = left[a0:a1]
+        actual = right[b0:b1]
+        character_differences = []
+        # Pair paragraphs only when the changed region has matching cardinality.
+        # Otherwise the outer report still records the full insertion/deletion
+        # region without implying a paragraph correspondence that is not known.
+        if len(expected) == len(actual):
+            for expected_paragraph, actual_paragraph in zip(expected, actual):
+                expected_text = unicodedata.normalize("NFC", expected_paragraph["text"])
+                actual_text = unicodedata.normalize("NFC", actual_paragraph["text"])
+                char_matcher = difflib.SequenceMatcher(
+                    a=expected_text, b=actual_text, autojunk=False
+                )
+                edits = []
+                for char_operation, ca0, ca1, cb0, cb1 in char_matcher.get_opcodes():
+                    if char_operation == "equal":
+                        continue
+                    removed = expected_text[ca0:ca1]
+                    inserted = actual_text[cb0:cb1]
+                    removed_counts = collections.Counter(removed)
+                    inserted_counts = collections.Counter(inserted)
+
+                    def describe_chars(counts: collections.Counter[str]) -> list[dict]:
+                        return [
+                            {
+                                "character": character,
+                                "codepoint": f"U+{ord(character):04X}",
+                                "name": unicodedata.name(character, "UNNAMED"),
+                                "count": count,
+                            }
+                            for character, count in sorted(counts.items())
+                        ]
+
+                    edits.append({
+                        "operation": char_operation,
+                        "reference_range": [ca0, ca1],
+                        "generated_range": [cb0, cb1],
+                        "reference_text": removed,
+                        "generated_text": inserted,
+                        "missing_characters": describe_chars(removed_counts),
+                        "additional_characters": describe_chars(inserted_counts),
+                    })
+                character_differences.append({
+                    "reference_document": expected_paragraph["document"],
+                    "reference_location": expected_paragraph["path"],
+                    "generated_document": actual_paragraph["document"],
+                    "generated_location": actual_paragraph["path"],
+                    "edits": edits,
+                })
         paragraph_changes.append({
             "operation": operation,
-            "reference": left[a0:a1],
-            "generated": right[b0:b1],
+            "reference": expected,
+            "generated": actual,
+            "character_differences": character_differences,
             "probable_stage": "historical source revision, compile selection, or WIDE pipeline; compare current Scrivener source and persisted WIDE body",
         })
 

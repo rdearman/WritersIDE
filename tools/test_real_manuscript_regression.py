@@ -39,6 +39,20 @@ class EpubSemanticTests(unittest.TestCase):
         self.assertEqual(details["links"][0]["href"], "#chapter")
         self.assertIn("U+2013 EN DASH", details["unicode_counts"])
 
+    def test_malformed_reference_xhtml_is_reported_and_recovered_for_differential(self):
+        details = epub_document_details(
+            '<html><body><ul><li><p>First row</p><p>Second row</li></ul>'
+            '<p><a href="mailto:editor@example.org?subject=Erratum&bcc=copy@example.org">Contact</a></p>'
+            '</body></html>',
+            "OPS/legacy.xhtml",
+        )
+        self.assertTrue(details["recovered_from_malformed_xhtml"])
+        self.assertIsNotNone(details["parse_error"])
+        self.assertEqual([paragraph["text"] for paragraph in details["paragraphs"]], [
+            "First row", "Second row", "Contact",
+        ])
+        self.assertEqual(details["links"][0]["href"], "mailto:editor@example.org?subject=Erratum&bcc=copy@example.org")
+
     def test_detailed_comparison_reports_paragraph_location_and_unicode_delta(self):
         reference = {"documents": [{"path": "ref/chapter.xhtml", "paragraphs": [
             {"path": "/body/p[1]", "text": "The garden–wall."},
@@ -52,7 +66,30 @@ class EpubSemanticTests(unittest.TestCase):
         change = difference["paragraphs"]["changed_regions"][0]
         self.assertEqual(change["reference"][0]["path"], "/body/p[1]")
         self.assertIn("U+2013", str(difference["characters"]["missing_from_generated"]))
+        char_edit = change["character_differences"][0]["edits"][0]
+        self.assertEqual(char_edit["operation"], "delete")
+        self.assertEqual(char_edit["reference_text"], "–")
+        self.assertEqual(char_edit["missing_characters"][0]["codepoint"], "U+2013")
         self.assertIn("Scrivener source", change["probable_stage"])
+
+    def test_character_report_distinguishes_substitution_and_added_accent(self):
+        difference = detailed_epub_difference(
+            {"documents": [{"path": "reference.xhtml", "paragraphs": [
+                {"path": "/p[1]", "text": "café — stone"},
+            ]}], "css_summary": {}, "metadata": {}, "navigation_entries": []},
+            {"documents": [{"path": "generated.xhtml", "paragraphs": [
+                {"path": "/p[1]", "text": "cafe – stone!"},
+            ]}], "css_summary": {}, "metadata": {}, "navigation_entries": []},
+        )
+        char_edits = difference["paragraphs"]["changed_regions"][0]["character_differences"][0]["edits"]
+        codepoints = {
+            entry["codepoint"]
+            for edit in char_edits
+            for key in ("missing_characters", "additional_characters")
+            for entry in edit[key]
+        }
+        self.assertTrue({"U+00E9", "U+2014", "U+2013", "U+0021"}.issubset(codepoints))
+        self.assertTrue(all(edit["reference_range"] and edit["generated_range"] for edit in char_edits))
 
     def test_ambiguous_binder_items_are_preserved_as_non_publication_research(self):
         inventory = {
