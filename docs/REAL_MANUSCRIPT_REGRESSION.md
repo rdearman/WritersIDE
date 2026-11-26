@@ -376,3 +376,25 @@ and generated EPUBCheck 4.2.6 reported zero errors/warnings. The controlled
 projects have `IncludeInCompile=Yes` for inventoried binder items, so these
 results show no regression in them; the excluded-item behaviour is covered by
 synthetic fixtures. Publication fidelity and human acceptance remain open.
+
+## 26 November 2026 — preserve source quotation characters at compile
+
+Visual/differential analysis found Pandoc's implicit Markdown `smart` extension
+changed ASCII closing quote pairs to curly quotes while the matching legacy
+opening double-backticks remained literal. The RTF source and canonical
+Markdown retain the author's ASCII characters; the transformation originated
+in the WIDE renderer. The production Pandoc input format now disables implicit
+smart typography. A synthetic HTML regression verifies the original quote
+pairs and apostrophes survive unchanged.
+
+The three persisted projects were recompiled through the production pipeline:
+`reports/no-smart-quotes-compile-20261126/`, with generated EPUBs in
+`generated/no-smart-quotes-compile-20261126/`. All three passed EPUBCheck 4.2.6
+with zero errors/warnings; no generated output contains unexpected
+preformatted blocks. The book-01 generated XHTML retains the source's ASCII
+quote pairs. Local PDF rendering and visual comparison were performed with
+Calibre 9.17.0 and Poppler; detailed comparisons and generated page images are
+in ignored local-only paths documented in `DEVELOPMENT_STATUS.md`. Current
+WIDE book design typography and heading/layout differences from the historical
+reference remain unresolved; the historical edition is not an exact text
+baseline. No source files were modified.

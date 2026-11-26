@@ -545,3 +545,29 @@ tests, 3 author-workflow tests, 24 real-PTY tests and all other workspace and
 documentation tests). The locally authorised Ollama test bound only its
 loopback fixture socket; no external network was used. The 14 Python regression
 tests passed in the preceding batch.
+
+## Pandoc quote preservation — in progress
+
+A local visual comparison of matching book-01 passages traced a second
+compiler-introduced difference: Pandoc's implicit `smart` Markdown extension
+converted ASCII quote pairs (`''`) to curly quotes while leaving the legacy
+opening double-backticks unchanged. The production renderer now disables that
+implicit conversion, and a synthetic HTML-render test verifies literal quote
+pair preservation. A compile-only run of all three persisted books passed
+EPUBCheck 4.2.6 with zero errors/warnings; generated book-01 XHTML retains 209
+ASCII quote pairs, and the matched passage page has the source's five ASCII
+closing pairs with no curly double quote substitutions.
+
+The local visual inspection report is
+`reports/no-smart-quotes-compile-20261126/visual-book01.md`; rendered PDFs and
+page images remain in ignored `generated/visual-book01-20261126/`. That report
+also records that WIDE's current book design uses Georgia while the reference
+uses Times New Roman, and that heading/section pagination differs. These are
+not random font changes; matching the author's intended compile layout remains
+unresolved. The compile-only three-book regression passed EPUBCheck 4.2.6 with
+zero errors/warnings for every generated EPUB. `cargo fmt --all -- --check`,
+workspace Clippy with warnings denied and the full offline workspace test suite
+passed, including 337 terminal unit tests, 3 author workflows, 24 Linux PTY
+tests and all library/CLI/doc tests. The Ollama test used only the previously
+authorised local loopback socket. This renderer correction is ready to commit;
+human visual and publication acceptance remain outstanding.

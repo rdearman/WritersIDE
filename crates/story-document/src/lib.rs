@@ -2069,7 +2069,7 @@ impl PandocRenderer {
             let mut command = Command::new(&self.program);
             command
                 .arg(
-                    "--from=markdown+footnotes+pipe_tables+task_lists+strikeout+fenced_code_blocks+fenced_divs+bracketed_spans",
+                    "--from=markdown-smart+footnotes+pipe_tables+task_lists+strikeout+fenced_code_blocks+fenced_divs+bracketed_spans",
                 )
                 .arg(match format {
                     CompileFormat::PlainText => unreachable!(),
@@ -3172,6 +3172,31 @@ output = "exports/old.md"
             assert!(pdf.auxiliary_files[1].name.ends_with(".log"));
             assert!(!pdf.auxiliary_files[1].bytes.is_empty());
         }
+    }
+
+    #[test]
+    fn pandoc_renderer_preserves_literal_ascii_quote_pairs_without_smart_typography() {
+        if Command::new("pandoc").arg("--version").output().is_err() {
+            return;
+        }
+        let mut ir = CompileIr::new("Quote preservation");
+        ir.push(CompileUnit {
+            id: "scene".into(),
+            parent_id: None,
+            kind: ContentUnitKind::Scene,
+            title: "Quotes".into(),
+            language_code: None,
+            segments: vec![CompileSegment::new(
+                "scene",
+                "He said ``Hello'' and it's fine.",
+            )],
+        });
+        let artifact = PandocRenderer::default()
+            .render(&ir, CompileFormat::Html, None)
+            .unwrap();
+        let html = String::from_utf8(artifact.bytes).unwrap();
+        assert!(html.contains("He said ``Hello'' and it's fine."), "{html}");
+        assert!(!html.contains("Hello”"), "{html}");
     }
 
     #[test]
