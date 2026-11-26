@@ -260,6 +260,48 @@ class EpubSemanticTests(unittest.TestCase):
             ["Research", "Research"],
         )
 
+    def test_selected_matter_under_project_notes_is_mapped_without_publishing_private_root(self):
+        inventory = {
+            "items": [
+                {"source_document_id": "notes", "type_code": "Folder", "area": "unknown", "parent_source_id": None},
+                {"source_document_id": "front", "type_code": "Text", "area": "unknown", "parent_source_id": "notes"},
+                {"source_document_id": "back", "type_code": "Text", "area": "unknown", "parent_source_id": "notes"},
+            ],
+            "compile_settings": {"formats": [{
+                "add_default_front_matter": True,
+                "default_front_matter_id": "front",
+                "add_default_back_matter": True,
+                "default_back_matter_id": "back",
+            }]},
+        }
+        plan = make_plan(inventory, "fiction")
+        kinds = {item["source_document_id"]: item["destination_kind"] for item in plan["decisions"]}
+        self.assertEqual(kinds, {"notes": "Research", "front": "FrontMatter", "back": "BackMatter"})
+
+    def test_conflicting_compile_matter_roles_remain_unmapped(self):
+        inventory = {
+            "items": [{"source_document_id": "matter", "type_code": "Text", "area": "unknown", "parent_source_id": None}],
+            "compile_settings": {"formats": [
+                {"add_default_front_matter": True, "default_front_matter_id": "matter"},
+                {"add_default_back_matter": True, "default_back_matter_id": "matter"},
+            ]},
+        }
+        plan = make_plan(inventory, "fiction")
+        self.assertEqual(plan["decisions"][0]["destination_kind"], "Unmapped")
+        self.assertTrue(plan["decisions"][0]["include_in_import"])
+
+    def test_trash_remains_excluded_even_if_selected_as_compile_matter(self):
+        inventory = {
+            "items": [{"source_document_id": "discarded", "type_code": "Text", "area": "trash", "parent_source_id": None}],
+            "compile_settings": {"formats": [{
+                "add_default_front_matter": True,
+                "default_front_matter_id": "discarded",
+            }]},
+        }
+        plan = make_plan(inventory, "fiction")
+        self.assertEqual(plan["decisions"][0]["destination_kind"], "Skip")
+        self.assertFalse(plan["decisions"][0]["include_in_import"])
+
     def test_acceptance_does_not_claim_epubcheck_is_missing_after_success(self):
         books = {
             "book-01": {"compile": {"epubcheck": {"status": "passed", "errors": 0, "warnings": 0}}},

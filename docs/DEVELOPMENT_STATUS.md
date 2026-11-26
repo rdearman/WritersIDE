@@ -1288,3 +1288,22 @@ publication fidelity. Scrivener per-format layout and inclusion settings have
 also been translated into WIDE named assemblies and are available to the CLI,
 but selection/output destination still need to be integrated into the
 terminal Publish workflow and verified against the expanded private corpus.
+
+### Regression planner parity for format-selected matter — 26 November 2026
+
+The private controlled-book harness now applies Scrivener's explicit
+format-selected front/back matter IDs when building its reviewable mapping.
+Items selected under a private Project Notes root retain their private parent
+classification while the selected documents receive their publication-matter
+roles. Conflicting front/back role assignments remain Unmapped, and Trash
+always remains excluded. This brings the harness mapping in line with the
+production import planner instead of losing valid matter during review.
+
+`python3 -m unittest discover -s tools -p 'test_real_manuscript_regression.py'`
+passed 20 tests. A fresh book-03 full regression at
+`reports/profile-matter-harness-20261126/` records selected FrontMatter and
+BackMatter mappings, unchanged source fingerprints, and EPUBCheck 4.2.6 with
+zero generated EPUB errors or warnings. Fixture SHA256SUMS passed before and
+after the run. The import remains incomplete with unsupported mappings and
+publication fidelity remains provisional; this harness correction does not
+resolve Scrivener's missing section-layout rules or establish acceptance.

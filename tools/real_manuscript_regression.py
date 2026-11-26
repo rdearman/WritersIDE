@@ -656,6 +656,33 @@ def make_plan(inventory: dict, book_type: str) -> dict:
             children[parent].append(item)
     decisions: dict[str, dict] = {}
 
+    # Mirror the production import planner's explicit compile-matter mapping.
+    # Scrivener can select a document under Project Notes as front/back matter
+    # for one format; that document must not be lost as private Research in the
+    # regression import. Conflicting assignments remain unresolved.
+    matter_roles: dict[str, str] = {}
+    for source_format in inventory.get("compile_settings", {}).get("formats", []):
+        for enabled_key, source_key, role in (
+            ("add_default_front_matter", "default_front_matter_id", "FrontMatter"),
+            ("add_default_back_matter", "default_back_matter_id", "BackMatter"),
+        ):
+            source_id = source_format.get(source_key)
+            if source_format.get(enabled_key) is not True or source_id not in by_id:
+                continue
+            prior = matter_roles.get(source_id)
+            matter_roles[source_id] = role if prior in (None, role) else "Unmapped"
+
+    matter_containers: set[str] = set()
+    for source_id in matter_roles:
+        parent_id = by_id[source_id].get("parent_source_id")
+        while parent_id in by_id:
+            parent = by_id[parent_id]
+            if parent.get("area") == "trash":
+                break
+            if parent.get("area") == "manuscript" and parent_id not in matter_roles:
+                matter_containers.add(parent_id)
+            parent_id = parent.get("parent_source_id")
+
     def descendants_have_nested_structure(item: dict) -> bool:
         descendants = children[item["source_document_id"]]
         return any(
@@ -673,6 +700,10 @@ def make_plan(inventory: dict, book_type: str) -> dict:
 
         if area == "trash":
             kind = "Skip"
+        elif source_id in matter_roles:
+            kind = matter_roles[source_id]
+        elif source_id in matter_containers:
+            kind = "Section"
         elif area in {"research", "unknown"}:
             kind = "Research"
         elif book_type == "nonfiction":
