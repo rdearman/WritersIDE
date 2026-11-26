@@ -145,7 +145,10 @@ fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty(
         .arg(&initial)
         .arg(&home)
         .arg("scrivener-import")
-        .env("WIDE_PTY_COMPILE_PROFILE", "1")
+        .env(
+            "WIDE_PTY_COMPILE_PROFILE",
+            std::env::var("WIDE_PTY_COMPILE_PROFILE").unwrap_or_else(|_| "1".into()),
+        )
         .env("WIDE_PTY_TEST_DIRECT_PROSE", "1")
         .output()
         .expect("run Scrivener import through Linux PTY");
@@ -285,7 +288,11 @@ fn protected_arrowmaking_project_imports_through_the_production_pty_without_sour
         .env("WIDE_PTY_TEST_DIRECT_PROSE", "1")
         .env("WIDE_PTY_DIRECT_PROSE_MARKER", "")
         .env("WIDE_PTY_DIRECT_PROSE_SAVED_MARKER", "Edited ")
-        .env("WIDE_PTY_DIRECT_PROSE_ROW_MARKER", "chapter_body")
+        .env(
+            "WIDE_PTY_DIRECT_PROSE_ROW_MARKER",
+            std::env::var("WIDE_PTY_DIRECT_PROSE_ROW_MARKER")
+                .unwrap_or_else(|_| "chapter_body".into()),
+        )
         .output()
         .expect("run protected Scrivener project through Linux PTY");
     assert!(
@@ -325,6 +332,15 @@ fn protected_arrowmaking_project_imports_through_the_production_pty_without_sour
         reopened.list_scenes(false).unwrap().len(),
         expected_scenes,
         "all automatically mapped scenes must remain visible after direct-prose editing and reopen"
+    );
+    let content_units = reopened.list_content_units(false).unwrap();
+    assert!(
+        content_units.iter().any(|unit| {
+            reopened
+                .load_content_unit_text(unit.id)
+                .is_ok_and(|(text, _)| text.contains("Edited "))
+        }),
+        "the direct-prose edit must remain persisted after closing and reopening the imported project"
     );
     let actual = story_import::inspect_scrivener_project(&source)
         .unwrap()

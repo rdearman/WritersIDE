@@ -93,6 +93,8 @@ Next actionable development is the already-planned integration of Scrivener
 per-format layouts and inclusion into persistent WIDE compile profiles, then
 the remaining approved v1.0 backlog.
 
+### #38 persistence reproduction follow-up — 26 November 2026
+
 ## Current checkpoint — Alpha UAT 30 and imported Scrivener profile fidelity, 26 November 2026
 
 ### Alpha UAT 30

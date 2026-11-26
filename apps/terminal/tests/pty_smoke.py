@@ -562,6 +562,18 @@ def main():
                         "scene row disappeared or scene text changed after direct-prose autosave; screen: "
                         + repr(terminal_snapshot(output, 24, 80))
                     )
+            if os.environ.get("WIDE_PTY_SKIP_COMPILE") == "1":
+                os.write(master, b"\x11")  # Ctrl+Q after persistence checks
+                quit_deadline = time.monotonic() + 8.0
+                finished_pid = 0
+                status = 0
+                while finished_pid == 0 and time.monotonic() < quit_deadline:
+                    read_for(0.1)
+                    finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                    raise AssertionError("application did not exit cleanly after persistence checks")
+                print("PTY Scrivener persistence workflow passed: import → direct prose edit/autosave → scene navigation → promotion → reopen; compile deliberately skipped.")
+                return
             menu_start = len(output)
             os.write(master, b"\x1b[21~")
             read_for(0.2)
