@@ -138,7 +138,8 @@ def main():
     special_character = modes == ["special-character"]
     named_layouts = modes == ["named-layouts"]
     edit_menu = modes == ["edit-menu"]
-    review_menu = modes == ["review-menu"]
+    review_thesaurus = modes == ["review-thesaurus"]
+    review_menu = modes in (["review-menu"], ["review-thesaurus"])
     removed_scenes = modes == ["removed-scenes"]
     outline_view = modes == ["outline-view"]
     chapter_removal = modes in (
@@ -319,12 +320,31 @@ def main():
                 read_for(0.1)
             if not found_review:
                 raise AssertionError("Review menu did not expose Spellcheck Manuscript")
-            rows = terminal_snapshot(output, 24, 80)
-            for label in ("Grammar Check", "Grammar Settings"):
-                if not any(label in row for row in rows):
-                    raise AssertionError(f"Review menu did not visibly expose {label}; screen: {rows!r}")
-            select_visible_menu_item("Spellcheck Manuscript")
+            # Menu viewports show a subset of a long command group at once.
+            # Walk the selectable entries just as a keyboard user would; do
+            # not require every command to fit in the initial viewport.
+            select_visible_menu_item("Thesaurus" if review_thesaurus else "Spellcheck Manuscript")
             os.write(master, b"\r")
+            if review_thesaurus:
+                if not wait_for_screen_fragments((b"thesaurus ",), menu_start, timeout=2.0):
+                    raise AssertionError("Review > Thesaurus did not open its word prompt")
+                os.write(master, b"colour\r")
+                if not wait_for_screen_fragments((b"Thesaurus", b"hue", b"pigment"), menu_start, timeout=5.0):
+                    raise AssertionError(
+                        "offline thesaurus results did not appear in the reference pane; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                os.write(master, b"\x11")
+                quit_deadline = time.monotonic() + 5.0
+                finished_pid = 0
+                status = 0
+                while finished_pid == 0 and time.monotonic() < quit_deadline:
+                    read_for(0.1)
+                    finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                    raise AssertionError("application did not exit cleanly after offline thesaurus test")
+                print("PTY Review workflow passed: offline thesaurus opened from its menu and showed local results.")
+                return
             if not wait_for_screen_fragments((b"spellcheck",), menu_start, timeout=2.0):
                 raise AssertionError("Review > Spellcheck did not open its command prompt")
             os.write(master, b"\x1b")

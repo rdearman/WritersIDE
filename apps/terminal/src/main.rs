@@ -1081,6 +1081,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "edit.resolve-save-conflict",
         "issue.create",
         "analysis.spellcheck",
+        "analysis.thesaurus",
         "proofread.grammar-check",
         "proofread.grammar-settings",
         "reading.list-annotations",
@@ -3614,6 +3615,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("analysis.coverage-list", "List Coverage Rules", "List project-local coverage requirements", "Plot", "coverage-list", false),
         legacy_command("analysis.coverage-remove", "Remove Coverage Rule", "Remove a coverage requirement by ID", "Plot", "coverage-remove", true),
         legacy_command("analysis.spellcheck", "Spellcheck Manuscript", "Run local Aspell without changing prose", "Review", "spellcheck", true),
+        legacy_command("analysis.thesaurus", "Thesaurus", "Look up synonyms in an installed offline thesaurus", "Review", "thesaurus", true),
         legacy_command("proofread.grammar-check", "Grammar Check", "Check the current scene or manuscript using the offline grammar engine", "Review", "grammar-check", false),
         legacy_command("proofread.grammar-settings", "Grammar Settings", "Enable or disable proofreading categories, change severity, or exclude terms", "Review", "grammar-settings", false),
         legacy_command(
@@ -21026,6 +21028,52 @@ impl AppState {
                     .collect::<Vec<_>>()
                     .join(" | ")
             };
+        } else if cmd == "thesaurus" || cmd.starts_with("thesaurus ") {
+            let word = cmd.strip_prefix("thesaurus").unwrap_or_default().trim();
+            if word.is_empty() {
+                self.message = "Enter a word to look up; Esc cancels".into();
+                return Ok(());
+            }
+            let language = self.app.get_project()?.language_code.clone();
+            let (dictionary_path, fallback_note) = thesaurus_data_path(&language)
+                .ok_or_else(|| format!("No local thesaurus data is installed for {language}; set WIDE_THESAURUS_DATA to a local MyThes .dat file"))?;
+            let bytes = fs::read(&dictionary_path)?;
+            let thesaurus = story_analysis::OfflineThesaurus::parse_mythes_bytes(&bytes)?;
+            let senses = thesaurus.lookup(word);
+            let mut body = format!(
+                "Thesaurus — {word}\nTerm: {word}\nLanguage: {language}\nSource: {}\n\n",
+                dictionary_path.display()
+            );
+            if let Some(note) = fallback_note.as_deref() {
+                body.push_str(&format!("{note}\n\n"));
+            }
+            match senses {
+                Some(senses) if !senses.is_empty() => {
+                    for sense in senses {
+                        body.push_str(sense.part_of_speech.as_deref().unwrap_or("Related terms"));
+                        body.push_str(":\n");
+                        for synonym in &sense.synonyms {
+                            body.push_str("  • ");
+                            body.push_str(synonym);
+                            body.push('\n');
+                        }
+                        body.push('\n');
+                    }
+                }
+                _ => body.push_str("No thesaurus entry was found for this term.\n"),
+            }
+            // Show the read-only result in the integrated reference workspace,
+            // including when the author launched the command from the welcome
+            // screen or outline where no manuscript pane exists yet.
+            self.workspace = Workspace::Reading;
+            self.reading_document = None;
+            self.reading_text = body;
+            self.scroll = 0;
+            self.message = if fallback_note.is_some() {
+                "Offline thesaurus opened using an available English variant; results are suggestions only".into()
+            } else {
+                "Offline thesaurus opened; results are suggestions only and manuscript text is unchanged".into()
+            };
         } else if cmd == "query-list" {
             self.message = self
                 .app
@@ -23903,6 +23951,57 @@ fn handle_interactive_result(
             false
         }
     }
+}
+
+fn thesaurus_data_path(language: &str) -> Option<(PathBuf, Option<String>)> {
+    let override_path = std::env::var_os("WIDE_THESAURUS_DATA").map(PathBuf::from);
+    thesaurus_data_path_from(
+        language,
+        override_path.as_deref(),
+        &[
+            PathBuf::from("/usr/share/mythes"),
+            PathBuf::from("/usr/local/share/mythes"),
+        ],
+    )
+}
+
+fn thesaurus_data_path_from(
+    language: &str,
+    override_path: Option<&Path>,
+    directories: &[PathBuf],
+) -> Option<(PathBuf, Option<String>)> {
+    if let Some(path) = override_path
+        && path.is_file()
+    {
+        return Some((path.to_owned(), None));
+    }
+    let normalized = language.replace('-', "_");
+    let mut candidates = vec![(normalized.clone(), None)];
+    if normalized.eq_ignore_ascii_case("en_GB") {
+        candidates.push((
+            "en_AU".into(),
+            Some(
+                "No British English thesaurus dataset was found; using Australian English data."
+                    .into(),
+            ),
+        ));
+        candidates.push(("en_US".into(), Some("No British or Australian English thesaurus dataset was found; using US English data.".into())));
+    }
+    for (locale, note) in candidates {
+        for directory in directories {
+            for name in [
+                format!("th_{locale}_v2.dat"),
+                format!("th_{locale}.dat"),
+                format!("thes_{locale}.dat"),
+            ] {
+                let path = directory.join(name);
+                if path.is_file() {
+                    return Some((path, note));
+                }
+            }
+        }
+    }
+    None
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -39643,6 +39742,34 @@ mod tests {
     }
 
     #[test]
+    fn thesaurus_lookup_is_review_menu_discoverable_and_uses_local_locale_fallbacks() {
+        let command = command_by_id("analysis.thesaurus").unwrap();
+        assert_eq!(command.category, "Review");
+        assert!(command.takes_arguments);
+        assert_eq!(
+            command_palette_invocation("thesaurus colour").unwrap().0.id,
+            "analysis.thesaurus"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let australian = directory.path().join("th_en_AU_v2.dat");
+        fs::write(&australian, "ISO8859-1\ncolour|1\n(noun)|hue\n").unwrap();
+        let (selected, warning) =
+            thesaurus_data_path_from("en-GB", None, &[directory.path().to_path_buf()]).unwrap();
+        assert_eq!(selected, australian);
+        assert!(warning.unwrap().contains("Australian English"));
+        let explicit = directory.path().join("custom.dat");
+        fs::write(&explicit, "UTF-8\n1\nword|0\n").unwrap();
+        assert_eq!(
+            thesaurus_data_path_from("fr-FR", Some(&explicit), &[])
+                .unwrap()
+                .0,
+            explicit
+        );
+        assert!(thesaurus_data_path_from("fr-FR", None, &[]).is_none());
+    }
+
+    #[test]
     fn terminal_persists_and_checks_saved_query_assertions() {
         let root = tempfile::tempdir().unwrap();
         let mut project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
@@ -45907,6 +46034,7 @@ mod tests {
             if *category == "Review" {
                 for id in [
                     "analysis.spellcheck",
+                    "analysis.thesaurus",
                     "proofread.grammar-check",
                     "proofread.grammar-settings",
                 ] {

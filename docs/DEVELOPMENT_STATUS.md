@@ -2,6 +2,25 @@
 
 Updated: 2026-11-26
 
+## Current checkpoint — terminal offline thesaurus workflow, 26 November 2026
+
+The offline MyThes foundation is now reachable as Review → Thesaurus. The
+terminal prompts for a word, selects a locally installed dataset based on the
+project language (or `WIDE_THESAURUS_DATA`), and displays read-only results in
+the integrated Reading workspace. British English looks for `en_GB`, then
+Australian and US English with a visible fallback notice. The implementation
+does not call a network service or change manuscript content. A Linux PTY
+regression exercises the menu, prompt, local lookup results and clean exit;
+targeted terminal unit coverage verifies menu registration and locale selection.
+
+This is still partial #33 work: dictionary definitions, broader locale filename
+discovery and full author acceptance criteria remain. `cargo fmt --all -- --check`,
+workspace Clippy with warnings denied, and the complete offline
+workspace suite passed for this checkpoint. The suite included 339 terminal
+unit tests, 3 author-workflow tests and 26 Linux PTY tests. The thesaurus only
+supports locally available MyThes-compatible synonym data; human menu and
+authoring acceptance remains outstanding.
+
 ## Current checkpoint — offline MyThes lookup foundation, 26 November 2026
 
 Issue #33 now has an optional offline MyThes-compatible data reader in
@@ -14,10 +33,9 @@ installed English US UTF-8 and Australian ISO-8859-1 datasets. Synthetic tests
 cover lookup, multiple senses, case-insensitive terms, legacy encoding and
 malformed files.
 
-This is partial: there is no author-facing terminal thesaurus dialogue,
-dictionary-definition source, bundled dictionary data or language-to-dataset
-selection policy. Do not claim dictionary definitions are available. Continue
-#33 after this foundation and retain en-GB as the project language default.
+The author-facing lookup is documented in the newer checkpoint above. There is
+no bundled dictionary data or dictionary-definition source; continue #33 after
+this foundation and retain en-GB as the project language default.
 
 ## Current checkpoint — explicit Scrivener layout translation, 26 November 2026
 

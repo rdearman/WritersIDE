@@ -630,6 +630,41 @@ fn review_menu_exposes_spellcheck_and_grammar_actions_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn offline_thesaurus_runs_from_the_review_menu_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Thesaurus Project");
+    WriterApp::create_project(&project, "Thesaurus Project").unwrap();
+    let dictionary = root.path().join("test-mythes.dat");
+    std::fs::write(&dictionary, "UTF-8\n1\ncolour|1\n(noun)|hue|pigment\n").unwrap();
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY thesaurus workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("review-thesaurus")
+        .env("WIDE_THESAURUS_DATA", &dictionary)
+        .output()
+        .expect("run the Linux PTY thesaurus workflow");
+    assert!(
+        result.status.success(),
+        "PTY thesaurus workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
     let _guard = lock_pty_test();
     use std::process::Command;
