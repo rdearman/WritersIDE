@@ -2416,7 +2416,11 @@ impl WriterApp {
         let destination = if destination.is_absolute() {
             destination.to_path_buf()
         } else {
-            self.store.project_root().join(destination)
+            // `project_root` is already canonical and absolute. Joining the
+            // output to the original user-supplied project path can leave a
+            // relative destination when the CLI opened a relative path, which
+            // then fails the absolute-path/symlink safety validation below.
+            project_root.join(destination)
         };
         reject_absolute_symlink_components(&destination)?;
         let file_name = destination
@@ -9611,6 +9615,51 @@ unexpected_prose = "must not be silently discarded"
         let ordinary = String::from_utf8(ordinary.bytes).unwrap();
         assert!(ordinary.contains("PROFILEBODYMUSTBEHIDDEN"));
         assert!(!ordinary.contains("SOURCEEXCLUDEDPROSE"));
+    }
+
+    #[test]
+    fn scrivener_profile_cli_output_resolves_from_a_relative_project_path() {
+        let dir = tempfile::tempdir_in("../../target").unwrap();
+        let working_directory = std::env::current_dir().unwrap();
+        let relative_temp = dir.path().strip_prefix(&working_directory).unwrap();
+        let project_path = relative_temp.join("Relative Profile Project");
+        assert!(!project_path.is_absolute());
+        let mut app = WriterApp::create_project(&project_path, "Relative Profile").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, expected_hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(
+            scene,
+            Some(&expected_hash),
+            "Relative project paths compile safely.",
+        )
+        .unwrap();
+        let assembly = app.create_assembly("Relative path edition").unwrap();
+        app.add_assembly_scene(assembly, scene, 0).unwrap();
+        let profile = ScrivenerEditionProfile {
+            version: 1,
+            source_format_id: "synthetic-format".into(),
+            display_name: "Synthetic format".into(),
+            assembly_id: assembly.to_string(),
+            presentation: story_document::CompilePresentation::default(),
+            warnings: Vec::new(),
+        };
+
+        let outputs = app
+            .compile_scrivener_edition_profile(
+                &profile,
+                story_document::CompileFormat::Markdown,
+                "exports/profile-test.md",
+                false,
+            )
+            .unwrap();
+        let compiled_path = outputs
+            .iter()
+            .find(|path| path.extension().is_some_and(|extension| extension == "md"))
+            .unwrap();
+        assert!(compiled_path.is_absolute());
+        let compiled = fs::read_to_string(compiled_path).unwrap();
+        assert!(compiled.contains("Relative project paths compile safely."));
     }
 
     #[test]

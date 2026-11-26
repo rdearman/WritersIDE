@@ -226,6 +226,33 @@ checks are in that directory's `SHA256SUMS`; bundle checksum verification and
 both sample project validations passed. The bundle contains no private
 regression corpus content.
 
+### Scrivener profile follow-up — 26 November 2026
+
+Fresh book-03 regression at `reports/alpha34-profile-test-20261126/` confirms
+that the normal compile path preserves all 68 manuscript bodies and produces
+an EPUB passing EPUBCheck 4.2.6 with zero errors and warnings. The imported
+project offers two saved Scrivener profiles; compiling the source's selected
+EPUB profile applies its selected matter and document inclusion settings.
+The profile still reports two source section types without layout assignments,
+and the independent extraction report identifies two research bodies without
+destinations. Those remain unresolved; the successful compile is not a fidelity
+pass.
+
+That real-profile exercise also exposed a CLI failure when a project is opened
+using a relative path: its project-relative output was joined to the relative
+input path and rejected by absolute-path safety validation. The publisher now
+joins project-relative output against its already canonical absolute project
+root. A regression test compiles a Scrivener-style profile from a relative
+project path and verifies both the generated Markdown and its absolute output
+path. The profile's missing section mappings remain an open publication task.
+
+Verification for the path fix: targeted story-app regression passed; formatting
+and workspace Clippy with warnings denied passed. The first parallel workspace
+run hit a transient `ETXTBSY` while starting a temporary Pandoc mock; that test
+passed in isolation, and the complete workspace suite passed on a serial rerun
+(`--test-threads=1`), including 351 terminal unit tests, 3 author-workflow
+tests, and 29 production PTYs (one protected-corpus PTY ignored by default).
+
 ## Current checkpoint — selected Scrivener matter import safety, 26 November 2026
 
 Selected Scrivener front- and back-matter documents are now classified as
