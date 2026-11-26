@@ -3508,8 +3508,13 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
                     continue;
                 }
                 if !next.is_ascii_alphabetic() {
-                    if !style.skip && next == '~' {
-                        runs.push((' ', style));
+                    if !style.skip {
+                        match next {
+                            '~' => runs.push(('\u{00a0}', style)),
+                            '_' => runs.push(('\u{2011}', style)),
+                            '-' => runs.push(('\u{00ad}', style)),
+                            _ => {}
+                        }
                     }
                     continue;
                 }
@@ -3561,6 +3566,13 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
                     }
                     "par" | "line" if !style.skip => runs.push(('\n', Style::default())),
                     "tab" if !style.skip => runs.push(('\t', Style::default())),
+                    "endash" if !style.skip => runs.push(('\u{2013}', style)),
+                    "emdash" if !style.skip => runs.push(('\u{2014}', style)),
+                    "lquote" if !style.skip => runs.push(('\u{2018}', style)),
+                    "rquote" if !style.skip => runs.push(('\u{2019}', style)),
+                    "ldblquote" if !style.skip => runs.push(('\u{201c}', style)),
+                    "rdblquote" if !style.skip => runs.push(('\u{201d}', style)),
+                    "bullet" if !style.skip => runs.push(('\u{2022}', style)),
                     "u" if !style.skip => {
                         if let Ok(code) = number.parse::<i32>() {
                             runs.push((char::from_u32(code as u16 as u32).unwrap_or('�'), style));
@@ -4107,6 +4119,18 @@ mod tests {
             r#"{\rtf1\ansi\ansicpg65001 UTF-8 \'c3\'a9; {\cpg1252 \'e9} \u54620?\u44544?}"#;
         let markdown = extract_rtf_markdown(source);
         assert_eq!(markdown, r"UTF\-8 é; é 한글");
+    }
+
+    #[test]
+    fn scrivener_rtf_named_punctuation_controls_preserve_dashes_quotes_and_special_hyphens() {
+        let source = r#"{\rtf1\ansi 1185\endash 1333; em\emdash dash, \lquote single\rquote  and \ldblquote double\rdblquote. no\~break, non\_break, soft\-hyphen.}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert!(markdown.contains("1185–1333"), "{markdown:?}");
+        assert!(markdown.contains("em—dash"), "{markdown:?}");
+        assert!(markdown.contains("‘single’ and “double”"), "{markdown:?}");
+        assert!(markdown.contains("no\u{00a0}break"), "{markdown:?}");
+        assert!(markdown.contains("non\u{2011}break"), "{markdown:?}");
+        assert!(markdown.contains("soft\u{00ad}hyphen"), "{markdown:?}");
     }
 
     #[test]

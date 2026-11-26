@@ -308,3 +308,32 @@ publication fidelity result. It does not import/compile all 26 projects, and
 historical formats lacking extractable text or matching evidence remain
 unmatched. Use small targeted subsets first; do a corpus-wide sweep at the next
 significant import/compile milestone.
+
+## 26 November 2026 — RTF punctuation control words
+
+The second human UAT reported a missing en dash in book 02. A fresh production
+inventory established that the source RTF uses named controls (`\endash` and
+related punctuation controls), which the previous parser silently discarded.
+The importer now maps RTF en/em dashes, single/double quotation controls,
+bullets, non-breaking spaces, non-breaking hyphens and discretionary hyphens to
+their corresponding Unicode characters. It does not rewrite manuscript text.
+Synthetic coverage is
+`scrivener_rtf_named_punctuation_controls_preserve_dashes_quotes_and_special_hyphens`.
+
+The targeted fresh book-02 run is
+`reports/rtf-punctuation-book02-20261126/`; the full fresh three-book run is
+`reports/rtf-punctuation-all-20261126/`, with EPUBs in
+`generated/rtf-punctuation-all-20261126/`. Checksums passed pre/post. All
+persisted manuscript and research bodies exactly matched importer output.
+The en dash and reported date range survived into generated EPUB XHTML; 44
+illustration/figure placements and 43 distinct image payloads remain. All
+three EPUBs passed EPUBCheck 4.2.6 with zero errors/warnings and have no
+unintended `<pre>` elements. The full offline workspace suite passed,
+including 337 terminal tests, 3 author journeys and 24 PTY tests; formatting,
+Clippy with warnings denied and all 14 Python harness tests passed.
+
+This repairs one source-to-import punctuation defect and confirms no detected
+regression in the controlled books. Publication human acceptance remains open;
+Scrivener compile inclusion/layout, variables, alternative publication matter,
+formatting and remaining differential discrepancies still require work and
+review.

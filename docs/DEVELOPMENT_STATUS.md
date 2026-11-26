@@ -401,7 +401,7 @@ in the exported EPUB. The production importer now serializes leading RTF
 indentation without Markdown code-block semantics. Added synthetic regression
 coverage; original prose and internal tabs are preserved.
 
-Latest three-book outputs are local and uncommitted:
+The earlier paragraph-indentation check outputs are retained locally:
 
 - `generated/rtf-indent-full-20261125/book-01.epub`
 - `generated/rtf-indent-full-20261125/book-02.epub`
@@ -423,16 +423,16 @@ pipeline context and keeps all content-bearing details local. Historical EPUBs
 are not exact source baselines. Overall fidelity remains failed human UAT; this
 repair only addresses the verified unintended code-block defect.
 
-Next safe checkpoint: refresh all open v1.0 issues/comments, then inventory the
-private expanded `fixtures/back-catalogue/` using read-only analysis and a local
-manifest. Continue from that into Scrivener compile selection/layout integration
-in the shared Compile IR and named publication profiles. Keep all private
-manifests, generated output and detailed reports out of Git. The root `.gitignore`,
-`README_TMP.md` and `UAT/` are user-owned changes; do not stage or alter them.
+The differential tooling, punctuation repair and inventory are separate
+checkpoints; latest outputs and reports are recorded below. The next work is
+Scrivener compile selection/layout integration in the shared Compile IR and
+named publication profiles. Keep all private manifests, generated output and
+detailed reports out of Git. The root `.gitignore`, `README_TMP.md` and `UAT/`
+are user-owned changes; do not stage or alter them.
 
 ## Expanded private regression corpus — 26 November 2026
 
-The read-only expanded-corpus inventory tooling is ready for commit. Its latest
+Commit `3db2360` added the read-only expanded-corpus inventory tooling. Its latest
 local report is `reports/back-catalogue-20261126-release/manifest.json`;
 temporary converted MOBI text is removed after analysis.
 The inventory inspected 26 Scrivener manifests and classified 47 publication
@@ -446,44 +446,33 @@ the controlled fixture checksum manifest passed pre/post, no symlinks were
 found, and Git tracks no private files. Five focused inventory tests and all
 14 Python regression harness tests passed.
 
-Next: refresh GitHub after this batch, then integrate the inventoried Scrivener
-compile settings into existing shared Compile IR/profile handling, starting
-with private-by-default per-document selection, structural heading suppression,
-numbering, scene separators, and variables. Continue the three-book publication
-regression, then use targeted back-catalogue projects. After these repairs,
-resume the open v1.0 issues in the current priority order. Keep all local
-manifests, extracted MOBI text, generated publications and detailed reports
-out of Git. `.gitignore`, `README_TMP.md` and `UAT/` remain user-owned and must
-not be staged.
+## RTF punctuation repair — 26 November 2026
 
-## Expanded private regression corpus — 26 November 2026
+The expanded corpus uncovered a confirmed defect: the production Scrivener RTF
+decoder dropped named punctuation controls including `\endash`. The importer
+now preserves en/em dashes, typographic quotation controls, bullets, NBSP,
+non-breaking hyphen and discretionary hyphen. Synthetic unit coverage passes.
 
-Commit `e8c4201` fixed a confirmed Scrivener RTF indentation serialization
-defect and expanded the real-EPUB differential report. The full workspace test
-run, formatting, Clippy, 9 existing regression harness tests, fixture checksum
-verification and fresh three-book production import/compile passed. This did
-not establish overall publication fidelity; human Calibre UAT remains failed.
+The latest three-book results are in
+`reports/rtf-punctuation-all-20261126/`, with exact local EPUB paths:
 
-The read-only expanded-corpus inventory tooling is currently in progress. Its
-latest local report is `reports/back-catalogue-20261126-final/manifest.json`;
-converted MOBI text is staged below `generated/back-catalogue-inventory-*/`.
-It inspected 26 Scrivener manifests and classified 47 files in the publication
-corpus. It records Scrivener Creator/version hints, manifest revisions, binder
-types/counts, language candidates, warnings, unsupported markers, SHA-256
-checksums, publication metadata, candidate matches and possible related
-projects. It detected exact normalized content for each of the three controlled
-Scrivener projects in the expanded corpus. Potential project/publication
-matches and archery-series similarities are not author-confirmed. Independent
-project-tree and publication hashes matched across inventory runs, the
-controlled SHA256SUMS passed pre/post, no symlinks were present, and Git tracks
-no expanded fixture files.
+- `generated/rtf-punctuation-all-20261126/book-01.epub`
+- `generated/rtf-punctuation-all-20261126/book-02.epub`
+- `generated/rtf-punctuation-all-20261126/book-03.epub`
 
-Next: finish verification and commit the inventory harness/documentation as a
-separate batch, then refresh GitHub issues and begin applying the recovered
-Scrivener compile semantics (per-document/profile inclusion, structural
-heading suppression, chapter numbering, scene separators and compile-time
-variables) to the existing shared Compile IR. Continue with table/reference
-and publication diagnostic repairs, then resume the remaining v1.0 backlog.
-Do not claim matching editions until source/edition evidence is inspected. Keep
-the feature freeze and all private fixture, generated-text and detailed-report
-exclusions in force.
+Source body persistence matched exactly (39/39, 36/36 and 68/68; research
+6/6, 6/6 and 12/12). Book 02 retains the reported date-range en dash, all 44
+illustration placements and 43 distinct embedded payloads. All three generated
+EPUBs passed EPUBCheck 4.2.6 (zero errors/warnings) and contain no unintended
+preformatted blocks. Fixture checksum validation passed before and after.
+`cargo fmt --all -- --check`, workspace Clippy with warnings denied, full
+`cargo test --workspace --offline` (337 terminal tests, 3 author workflows,
+24 PTY tests and all other workspace/doc tests), and all 14 Python regression
+tests passed. The Ollama test used the previously authorized loopback-only
+socket access; no external network service was used.
+
+Next: finish final checks, commit/push this punctuation repair, update #53/#7/#73,
+then continue compile inclusion/layout/variable mapping in the shared Compile
+IR and named profiles. Publication fidelity remains failed human UAT. Never
+commit the private reports or generated EPUBs. Do not stage the unrelated root
+`.gitignore`, `README_TMP.md` or `UAT/`.
