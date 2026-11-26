@@ -901,11 +901,32 @@ Verification and outputs for the fresh three-book production run:
   authorised local socket permission. This included 338 terminal unit tests,
   3 author-workflow tests, 25 Linux PTY tests, all other workspace tests and
   doc tests.
-- GitHub REST issue-comment requests were unavailable during this checkpoint;
-  retry sanitized issue updates when the API is reachable.
+- Sanitized implementation updates were subsequently posted to #7, #53, #61
+  and #73 via GitHub REST, with the checked commit recorded.
 
 The private regression run tested the dirty tree based on `622328c`, and must
 not be attributed to a later source commit. Commit/push only the importer,
 renderer test, comparator, regression tests and documentation. Do not stage
 user changes in `.gitignore`, `README_TMP.md`, or `UAT/` and do not commit any
 private corpus, generated files or reports.
+
+## Terminal rendering of imported underline — implementation and workspace verification, 26 November 2026
+
+The previous importer change stored Scrivener underline as a semantic Pandoc
+`{.underline}` span, but the terminal's CommonMark projection could not parse
+Pandoc attributes. This made the author-facing editor show the delimiters and
+did not style the text. The projection now lowers only recognized underline
+spans in temporary parser input, maps all resulting grapheme ranges back to
+the untouched canonical Markdown, and renders underline distinctly from
+strikethrough. Inline code and escaped literal markers are excluded from this
+projection. Regression tests cover nested bold/underline, combining Unicode,
+source ranges, and literal spans.
+
+Verification: `cargo fmt --all -- --check`, workspace Clippy with warnings
+denied, and `cargo test --offline --workspace -- --test-threads=1` passed.
+The workspace run included all unit, integration, author-workflow and 25 Linux
+PTY tests. No private manuscript files were used for this projection-only
+change; the preceding real three-book import/compile evidence belongs to the
+prior importer commit and is not claimed as verification of this editor fix.
+The new behavior is implemented and automated verification passed; visual
+human UAT remains outstanding.

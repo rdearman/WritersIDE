@@ -34,6 +34,7 @@ pub struct SourceRange {
 pub struct ProjectionStyle {
     pub bold: bool,
     pub italic: bool,
+    pub underline: bool,
     pub code: bool,
     pub strikethrough: bool,
     pub link: bool,
@@ -188,6 +189,8 @@ impl SemanticDocument {
                 _ => false,
             });
 
+        let projected_source = ProjectionMarkdown::from_source(&self.source);
+
         let mut projection = RenderedProjection {
             text: String::new(),
             graphemes: Vec::new(),
@@ -280,7 +283,9 @@ impl SemanticDocument {
             }
         };
 
-        for (event, range) in Parser::new_ext(&self.source, markdown_options()).into_offset_iter() {
+        for (event, range) in
+            Parser::new_ext(&projected_source.markdown, markdown_options()).into_offset_iter()
+        {
             match event {
                 Event::Start(tag) => {
                     let mut next = style;
@@ -313,7 +318,11 @@ impl SemanticDocument {
                             false
                         }
                         Tag::Strikethrough => {
-                            next.strikethrough = true;
+                            if projected_source.underline_markers.contains(&range.start) {
+                                next.underline = true;
+                            } else {
+                                next.strikethrough = true;
+                            }
                             false
                         }
                         Tag::Link(..) => {
@@ -324,15 +333,21 @@ impl SemanticDocument {
                         Tag::FootnoteDefinition(..) => true,
                     };
                     if block {
-                        append_break(&mut projection, 2, range.start, style);
+                        append_break(
+                            &mut projection,
+                            2,
+                            projected_source.original_offset(range.start),
+                            style,
+                        );
                     }
                     if matches!(tag, Tag::Item) {
+                        let offset = projected_source.original_offset(range.start);
                         append(
                             &mut projection,
                             "• ",
                             SourceRange {
-                                start: range.start,
-                                end: range.start,
+                                start: offset,
+                                end: offset,
                             },
                             style,
                         );
@@ -344,13 +359,18 @@ impl SemanticDocument {
                     if let Some(frame) = frames.pop() {
                         style = frame.style;
                         if frame.block {
-                            append_break(&mut projection, 2, range.end, style);
+                            append_break(
+                                &mut projection,
+                                2,
+                                projected_source.original_offset(range.end),
+                                style,
+                            );
                         }
                     }
                 }
                 Event::Text(value) => {
                     let value = value.as_ref();
-                    let raw = self.source.get(range.clone()).unwrap_or("");
+                    let raw = projected_source.markdown.get(range.clone()).unwrap_or("");
                     // Entities and backslash escapes do not have a one-to-one
                     // grapheme map. Keep their source spelling visible until a
                     // precise decoder map is available instead of misplacing edits.
@@ -358,15 +378,12 @@ impl SemanticDocument {
                     append(
                         &mut projection,
                         shown,
-                        SourceRange {
-                            start: range.start,
-                            end: range.end,
-                        },
+                        projected_source.original_range(range.clone()),
                         style,
                     );
                 }
                 Event::Code(value) => {
-                    let raw = self.source.get(range.clone()).unwrap_or("");
+                    let raw = projected_source.markdown.get(range.clone()).unwrap_or("");
                     let mut raw_style = style;
                     raw_style.code = true;
                     let delimiter_len = raw.bytes().take_while(|byte| *byte == b'`').count();
@@ -380,56 +397,45 @@ impl SemanticDocument {
                         None
                     };
                     let (shown, source_range) = rendered.map_or(
-                        (
-                            raw,
-                            SourceRange {
-                                start: range.start,
-                                end: range.end,
-                            },
-                        ),
+                        (raw, projected_source.original_range(range.clone())),
                         |inner| {
                             (
                                 inner,
-                                SourceRange {
-                                    start: range.start + delimiter_len,
-                                    end: range.end - delimiter_len,
-                                },
+                                projected_source.original_range(
+                                    range.start + delimiter_len..range.end - delimiter_len,
+                                ),
                             )
                         },
                     );
                     append(&mut projection, shown, source_range, raw_style);
                 }
                 Event::Html(_) => {
-                    let raw = self.source.get(range.clone()).unwrap_or("");
+                    let raw = projected_source.markdown.get(range.clone()).unwrap_or("");
                     append(
                         &mut projection,
                         raw,
-                        SourceRange {
-                            start: range.start,
-                            end: range.end,
-                        },
+                        projected_source.original_range(range.clone()),
                         style,
                     );
                 }
                 Event::SoftBreak => append(
                     &mut projection,
                     " ",
-                    SourceRange {
-                        start: range.start,
-                        end: range.end,
-                    },
+                    projected_source.original_range(range.clone()),
                     style,
                 ),
-                Event::HardBreak => append_break(&mut projection, 1, range.end, style),
+                Event::HardBreak => append_break(
+                    &mut projection,
+                    1,
+                    projected_source.original_offset(range.end),
+                    style,
+                ),
                 Event::FootnoteReference(_) | Event::Rule | Event::TaskListMarker(_) => {
-                    let raw = self.source.get(range.clone()).unwrap_or("");
+                    let raw = projected_source.markdown.get(range.clone()).unwrap_or("");
                     append(
                         &mut projection,
                         raw,
-                        SourceRange {
-                            start: range.start,
-                            end: range.end,
-                        },
+                        projected_source.original_range(range.clone()),
                         style,
                     );
                 }
@@ -462,6 +468,7 @@ pub enum SemanticKind {
     Emphasis,
     Strong,
     Strikethrough,
+    Underline,
     Link { destination: String, title: String },
     Image { destination: String, title: String },
     Text { value: String },
@@ -492,10 +499,204 @@ pub struct SemanticDocument {
     pub nodes: Vec<SemanticNode>,
 }
 
+/// Markdown fed to the CommonMark projection parser, with provenance back to
+/// canonical source bytes. Pandoc's `{.underline}` span is lowered to a
+/// temporary strike delimiter because this parser has no attribute-span
+/// event. The generated delimiter is tracked so it renders as underline only.
+struct ProjectionMarkdown {
+    markdown: String,
+    source_ranges: Vec<SourceRange>,
+    underline_markers: std::collections::BTreeSet<usize>,
+}
+
+impl ProjectionMarkdown {
+    fn from_source(source: &str) -> Self {
+        const SUFFIX: &str = "]{.underline}";
+        let mut markdown = String::with_capacity(source.len());
+        let mut source_ranges = Vec::with_capacity(source.len());
+        let mut underline_markers = std::collections::BTreeSet::new();
+        let mut cursor = 0;
+        let mut scan = 0;
+        while scan < source.len() {
+            let Some(relative) = source[scan..].find('[') else {
+                break;
+            };
+            let open = scan + relative;
+            if preceded_by_odd_backslashes(source.as_bytes(), open)
+                || inside_backtick_span(source, open)
+            {
+                scan = open + 1;
+                continue;
+            }
+            let Some(close) = matching_bracket(source, open) else {
+                scan = open + 1;
+                continue;
+            };
+            let suffix_end = close.saturating_add(SUFFIX.len());
+            if source.get(close..suffix_end) != Some(SUFFIX) || close == open + 1 {
+                scan = open + 1;
+                continue;
+            }
+
+            Self::append_source(source, cursor..open, &mut markdown, &mut source_ranges);
+            let marker = markdown.len();
+            Self::append_generated("~~", open..open + 1, &mut markdown, &mut source_ranges);
+            underline_markers.insert(marker);
+            Self::append_source(source, open + 1..close, &mut markdown, &mut source_ranges);
+            Self::append_generated("~~", close..suffix_end, &mut markdown, &mut source_ranges);
+            cursor = suffix_end;
+            scan = suffix_end;
+        }
+        Self::append_source(
+            source,
+            cursor..source.len(),
+            &mut markdown,
+            &mut source_ranges,
+        );
+        Self {
+            markdown,
+            source_ranges,
+            underline_markers,
+        }
+    }
+
+    fn append_source(
+        source: &str,
+        range: std::ops::Range<usize>,
+        markdown: &mut String,
+        source_ranges: &mut Vec<SourceRange>,
+    ) {
+        if range.is_empty() {
+            return;
+        }
+        markdown.push_str(&source[range.clone()]);
+        source_ranges.extend(range.map(|offset| SourceRange {
+            start: offset,
+            end: offset + 1,
+        }));
+    }
+
+    fn append_generated(
+        value: &str,
+        source_range: std::ops::Range<usize>,
+        markdown: &mut String,
+        source_ranges: &mut Vec<SourceRange>,
+    ) {
+        markdown.push_str(value);
+        source_ranges.extend(value.bytes().map(|_| SourceRange {
+            start: source_range.start,
+            end: source_range.end,
+        }));
+    }
+
+    fn original_offset(&self, offset: usize) -> usize {
+        self.source_ranges
+            .get(offset)
+            .map(|range| range.start)
+            .or_else(|| self.source_ranges.last().map(|range| range.end))
+            .unwrap_or(0)
+    }
+
+    fn original_range(&self, range: std::ops::Range<usize>) -> SourceRange {
+        if range.is_empty() {
+            let offset = self.original_offset(range.start);
+            return SourceRange {
+                start: offset,
+                end: offset,
+            };
+        }
+        match (
+            self.source_ranges.get(range.start),
+            self.source_ranges.get(range.end - 1),
+        ) {
+            (Some(first), Some(last)) => SourceRange {
+                start: first.start,
+                end: last.end,
+            },
+            _ => SourceRange { start: 0, end: 0 },
+        }
+    }
+}
+
+fn preceded_by_odd_backslashes(source: &[u8], offset: usize) -> bool {
+    source[..offset]
+        .iter()
+        .rev()
+        .take_while(|byte| **byte == b'\\')
+        .count()
+        % 2
+        == 1
+}
+
+fn matching_bracket(source: &str, opening: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut cursor = opening;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor = (cursor + 2).min(bytes.len()),
+            b'[' if !preceded_by_odd_backslashes(bytes, cursor) => {
+                depth += 1;
+                cursor += 1;
+            }
+            b']' if !preceded_by_odd_backslashes(bytes, cursor) => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(cursor);
+                }
+                cursor += 1;
+            }
+            b'`' => {
+                let run = bytes[cursor..]
+                    .iter()
+                    .take_while(|byte| **byte == b'`')
+                    .count();
+                let delimiter = &source[cursor..cursor + run];
+                let search_start = cursor + run;
+                if let Some(relative) = source[search_start..].find(delimiter) {
+                    cursor = search_start + relative + run;
+                } else {
+                    cursor += run;
+                }
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn inside_backtick_span(source: &str, offset: usize) -> bool {
+    let bytes = source.as_bytes();
+    let mut cursor = 0;
+    let mut active_run = None;
+    while cursor < offset {
+        if bytes[cursor] == b'`' && !preceded_by_odd_backslashes(bytes, cursor) {
+            let run = bytes[cursor..]
+                .iter()
+                .take_while(|byte| **byte == b'`')
+                .count();
+            if cursor + run > offset {
+                return active_run.is_some();
+            }
+            if active_run == Some(run) {
+                active_run = None;
+            } else if active_run.is_none() {
+                active_run = Some(run);
+            }
+            cursor += run;
+        } else {
+            cursor += 1;
+        }
+    }
+    active_run.is_some()
+}
+
 impl SemanticDocument {
     pub fn parse(source: impl Into<String>) -> Self {
         let source = source.into();
-        let parser = Parser::new_ext(&source, markdown_options()).into_offset_iter();
+        let projected_source = ProjectionMarkdown::from_source(&source);
+        let parser =
+            Parser::new_ext(&projected_source.markdown, markdown_options()).into_offset_iter();
         let mut nodes: Vec<SemanticNode> = Vec::new();
         let mut parents: Vec<usize> = Vec::new();
         for (event, range) in parser {
@@ -503,26 +704,26 @@ impl SemanticDocument {
                 Event::Start(tag) => {
                     let index = nodes.len();
                     nodes.push(SemanticNode {
-                        kind: kind_from_tag(tag),
-                        source: SourceRange {
-                            start: range.start,
-                            end: range.end,
+                        kind: if matches!(&tag, Tag::Strikethrough)
+                            && projected_source.underline_markers.contains(&range.start)
+                        {
+                            SemanticKind::Underline
+                        } else {
+                            kind_from_tag(tag)
                         },
+                        source: projected_source.original_range(range.clone()),
                         parent: parents.last().copied(),
                     });
                     parents.push(index);
                 }
                 Event::End(_) => {
                     if let Some(index) = parents.pop() {
-                        nodes[index].source.end = range.end;
+                        nodes[index].source.end = projected_source.original_offset(range.end);
                     }
                 }
                 event => nodes.push(SemanticNode {
                     kind: kind_from_leaf(event),
-                    source: SourceRange {
-                        start: range.start,
-                        end: range.end,
-                    },
+                    source: projected_source.original_range(range),
                     parent: parents.last().copied(),
                 }),
             }
@@ -3064,6 +3265,60 @@ output = "exports/old.md"
             projection.display_to_source(projection.text.len(), ProjectionBias::After),
             Some(source.len())
         );
+    }
+
+    #[test]
+    fn rendered_projection_hides_pandoc_underline_spans_and_preserves_source_ranges() {
+        let source = "Before [**Élodie\u{301} and Sam**]{.underline} after [second]{.underline}.";
+        let projection = SemanticDocument::parse(source).rendered_projection();
+        assert_eq!(
+            projection.text,
+            "Before Élodie\u{301} and Sam after second."
+        );
+        assert_eq!(projection.source_len, source.len());
+        let document = SemanticDocument::parse(source);
+        assert!(document.validate_ranges());
+        let underline = document
+            .nodes
+            .iter()
+            .find(|node| node.kind == SemanticKind::Underline)
+            .unwrap();
+        assert_eq!(
+            &source[underline.source.start..underline.source.end],
+            "[**Élodie\u{301} and Sam**]{.underline}"
+        );
+
+        let start = projection.text.find("Élodie").unwrap();
+        let lead = projection
+            .graphemes
+            .iter()
+            .find(|item| item.display.start == start)
+            .unwrap();
+        assert!(lead.style.bold);
+        assert!(lead.style.underline);
+        assert_eq!(&source[lead.source.start..lead.source.end], "É");
+
+        let after = projection.text.find("after").unwrap();
+        let outside = projection
+            .graphemes
+            .iter()
+            .find(|item| item.display.start == after)
+            .unwrap();
+        assert!(!outside.style.underline);
+        assert_eq!(&source[outside.source.start..outside.source.end], "a");
+        assert!(projection.graphemes.iter().all(|item| {
+            source.is_char_boundary(item.source.start) && source.is_char_boundary(item.source.end)
+        }));
+    }
+
+    #[test]
+    fn underline_projection_does_not_rewrite_literals_inside_code_or_escaped_markers() {
+        let source = "`[literal]{.underline}` and \\[also literal\\] and [real]{.underline}.";
+        let projected = ProjectionMarkdown::from_source(source);
+        assert!(projected.markdown.contains("`[literal]{.underline}`"));
+        assert!(projected.markdown.contains("\\[also literal\\]"));
+        assert!(projected.markdown.ends_with("~~real~~."));
+        assert_eq!(projected.underline_markers.len(), 1);
     }
 
     #[test]

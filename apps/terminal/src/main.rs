@@ -25332,6 +25332,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                             if style.strikethrough {
                                 terminal_style = terminal_style.add_modifier(Modifier::CROSSED_OUT);
                             }
+                            if style.underline {
+                                terminal_style = terminal_style.add_modifier(Modifier::UNDERLINED);
+                            }
                             if style.link {
                                 terminal_style = terminal_style
                                     .fg(Color::Cyan)
