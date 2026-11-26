@@ -1,9 +1,64 @@
 # Writer's IDE Development Status
 
-Updated: 2026-11-25
+Updated: 2026-11-26
 
 This is the handover note for ongoing implementation. GitHub issues remain the
 authoritative source for approved requirements and human UAT findings.
+
+## Current checkpoint — 26 November 2026
+
+The author expanded the local private corpus under `fixtures/back-catalogue/`.
+The inventory harness now distinguishes publication candidates from image
+assets and records binder depth and nested Scrivener projects. Its local
+manifest at `reports/back-catalogue-20261126-expanded-v2/manifest.json`
+contains 26 inspectable `.scrivx` projects, 45 candidate publication documents
+and 2 supporting image assets. One manifest is nested within another project.
+The 26 includes the three controlled Scrivener fixtures. Creator tags are
+source metadata hints, not verified desktop-version compatibility. Match
+rankings and related-project similarities are unconfirmed leads; zero exact
+normalized-text duplicate groups were found. The originals passed
+`fixtures/SHA256SUMS` before and after inventory. No private data is tracked.
+
+Targeted testing with an explicit local mapping (not an author-approved
+publication layout) found a compiler defect not present in the three
+controlled manuscripts: repeated
+structural and manuscript heading titles could be emitted with duplicate
+XHTML IDs, causing EPUBCheck failures and invalid navigation. The shared
+Pandoc path now adds deterministic, distinct heading IDs derived from Compile
+IR source identities for HTML-family output only. Plain Markdown and TXT
+remain unchanged. The repeated-title synthetic EPUB test passes. The local
+renderer smoke-test output (not a fidelity-approved publication)
+`generated/back-catalogue-adderand-anchor-fix-20261126/Adderand.epub` passes
+EPUBCheck 4.2.6 with zero errors and warnings, and each XHTML document has
+unique IDs. The explicit test mapping is retained in local reports and does
+not establish the right compile layout for that project. The earlier,
+intentionally retained failing artifact is
+`generated/back-catalogue-adderand-20261126/Adderand.epub`; do not treat it as
+the corrected output.
+
+The controlled fresh import/reopen/compile regression at
+`generated/back-catalogue-anchor-control-20261126/` preserved 39/39, 36/36 and
+68/68 manuscript bodies plus 6/6, 6/6 and 12/12 research bodies. All three
+Scrivener source fingerprints were unchanged and all generated EPUBs passed
+EPUBCheck 4.2.6 with zero errors or warnings. Its differential reports are
+under `reports/back-catalogue-anchor-control-20261126/`; these results were
+produced from the working tree immediately before the renderer fix was
+committed, so repeat compile-only validation after commit for an exact-commit
+record. Publication fidelity remains provisional and human UAT has not passed.
+
+For the renderer/inventory batch, `cargo fmt --all -- --check`, workspace
+Clippy with `-D warnings`, all 16 Python tooling tests, and the full offline
+workspace suite passed. The workspace suite included 337 terminal unit tests,
+3 author-workflow tests and 24 Linux PTY tests, plus all crate, integration
+and documentation tests. The Ollama localhost-only test ran under the
+previously authorised local-socket permission. Fixture checksums passed after
+both the expanded inventory and the complete controlled regression.
+
+GitHub open issues and recent comments were refreshed using the REST API at
+this checkpoint. #7, #53 and #73 carry current compile/import/publishing
+requirements; #15, #33, #44, #67 and #68 remain open with the approved
+diagnostic, acceptance, assets and outliner updates. #75 is outside the v1.0
+feature freeze. Continue the v1.0 backlog; do not begin v2.0 work.
 
 ## Current checkpoint — 25 November 2026
 

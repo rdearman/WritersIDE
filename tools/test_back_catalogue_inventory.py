@@ -13,6 +13,19 @@ SPEC.loader.exec_module(inventory)
 
 
 class BackCatalogueInventoryTests(unittest.TestCase):
+    def test_publication_candidates_are_distinguished_from_image_assets(self):
+        self.assertEqual(inventory.classify_file(Path("book.epub")), "publication_candidate")
+        self.assertEqual(inventory.classify_file(Path("cover.JPG")), "supporting_asset")
+        self.assertEqual(inventory.classify_file(Path("project.scrivx")), "other_resource")
+
+    def test_binder_depths_follow_nested_parent_relationships(self):
+        items = [
+            {"source_document_id": "section", "parent_source_id": None},
+            {"source_document_id": "chapter", "parent_source_id": "section"},
+            {"source_document_id": "scene", "parent_source_id": "chapter"},
+        ]
+        self.assertEqual(inventory.binder_depths(items), {"section": 0, "chapter": 1, "scene": 2})
+
     def test_word_normalization_preserves_unicode_words_and_apostrophes(self):
         self.assertEqual(
             inventory.norm_words("Les Retraités – l’été 1185–1333"),

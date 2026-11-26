@@ -127,6 +127,53 @@ is still required.
 - A missing fixture or unavailable validator is explicitly unverified, not a
   pass. Provisional baselines must not replace a better result automatically.
 
+## Expanded private back-catalogue
+
+The optional, uncurated corpus under `fixtures/back-catalogue/` supplements,
+but does not replace, the three controlled books above. Inventory it with the
+production `inspect-scrivener` command and cautious local matching:
+
+```sh
+(cd fixtures && sha256sum --quiet -c SHA256SUMS)
+python3 tools/back_catalogue_inventory.py \
+  --output reports/back-catalogue-RUN_ID/manifest.json
+(cd fixtures && sha256sum --quiet -c SHA256SUMS)
+python3 -m unittest discover -s tools -p 'test_back_catalogue_inventory.py'
+```
+
+The manifest records project fingerprints, source-reported Scrivener creator
+tags, binder type and depth counts, source inclusion flags, text-size and
+language hints, publication metadata and checksums. It separates candidate
+publication documents from supporting images. Project/edition matches and
+similar project pairs are ranked leads only; inspect source and revision
+evidence before confirming them. A matching publication is not assumed to be
+the exact edition compiled from the current Scrivener project. The harness
+does not execute files found in the corpus. Any conversion is staged beneath
+ignored `generated/`; reports remain local beneath ignored `reports/`.
+
+For a manually mapped candidate, use the production import CLI with a reviewed
+mapping JSON, then validate, reopen, compile and compare its publication. Do
+not invent a generic mapping merely to make an unfinished or ambiguous project
+import. Private local run `reports/back-catalogue-20261126-expanded-v2/`
+inventoried 26 Scrivener manifests (one nested project), 45 publication
+candidates and 2 supporting image assets; all 26 projects were inspected and
+no exact normalized text duplicates were found. This count includes the
+controlled projects also present in the expanded corpus.
+
+The targeted back-catalogue import used an explicit local test mapping, not an
+author-approved publication layout. It exposed a compiler defect: same-titled
+structural and manuscript headings received duplicate XHTML IDs, causing
+EPUBCheck errors and a navigation-order warning. The Pandoc renderer
+now assigns stable distinct IDs derived from source entity identity to
+generated structural and unit headings in HTML-family formats; Markdown and
+plain-text exports remain unchanged. Synthetic repeated-heading coverage and
+a fresh local project compile verified unique XHTML IDs and zero EPUBCheck
+errors or warnings. See the current `DEVELOPMENT_STATUS.md` handover for the
+run directory. This output validates the repeated-heading renderer path only;
+it does not establish the correct compile mapping for that project. This
+targeted case and the three controlled books remain provisional comparisons;
+they do not establish human publication acceptance.
+
 ## 25 November 2026 — publication UAT failure and safe-import checkpoint
 
 The author's Calibre review of an earlier set of generated publications failed

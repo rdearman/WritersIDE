@@ -29,6 +29,10 @@ from xml.etree import ElementTree
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SCRIVENER = ROOT / "fixtures/back-catalogue/scrivener"
 DEFAULT_PUBLICATIONS = ROOT / "fixtures/back-catalogue/epub"
+PUBLICATION_FORMATS = {
+    "doc", "docx", "epub", "html", "htm", "mobi", "odt", "pdf", "rtf", "txt"
+}
+ASSET_FORMATS = {"jpg", "jpeg", "png", "gif", "svg", "webp"}
 
 
 class TextExtractor(HTMLParser):
@@ -68,6 +72,38 @@ def tree_hash(path: Path) -> str:
             digest.update(child.relative_to(path).as_posix().encode("utf-8"))
             digest.update(bytes.fromhex(sha256_file(child)))
     return digest.hexdigest()
+
+
+def classify_file(path: Path) -> str:
+    """Separate candidate publications from supporting visual assets."""
+    suffix = path.suffix.lower().lstrip(".")
+    if suffix in ASSET_FORMATS:
+        return "supporting_asset"
+    if suffix in PUBLICATION_FORMATS:
+        return "publication_candidate"
+    return "other_resource"
+
+
+def binder_depths(items: list[dict]) -> dict[str, int]:
+    """Calculate each binder item's depth without assuming a flat outline."""
+    by_id = {item.get("source_document_id"): item for item in items}
+    depths: dict[str, int] = {}
+    for item in items:
+        source_id = item.get("source_document_id")
+        if not source_id:
+            continue
+        cursor = item
+        seen: set[str] = set()
+        depth = 0
+        while cursor.get("parent_source_id"):
+            parent = cursor["parent_source_id"]
+            if parent in seen or parent not in by_id:
+                break
+            seen.add(parent)
+            depth += 1
+            cursor = by_id[parent]
+        depths[source_id] = depth
+    return depths
 
 
 def norm_words(value: str) -> list[str]:
@@ -261,6 +297,14 @@ def main() -> int:
             "manifest_path": manifest.relative_to(ROOT).as_posix() if manifest.is_relative_to(ROOT) else str(manifest),
             "sha256_tree": tree_hash(project),
             "inspection_status": "ok" if result.returncode == 0 else "failed",
+            "nested_within_scrivener_project": next(
+                (
+                    parent.relative_to(ROOT).as_posix() if parent.is_relative_to(ROOT) else str(parent)
+                    for parent in project.parents
+                    if parent != args.scrivener_root and parent.suffix.lower() == ".scriv"
+                ),
+                None,
+            ),
         }
         if result.returncode:
             record["error"] = result.stderr.strip()[:1000]
@@ -269,6 +313,7 @@ def main() -> int:
         payload = json.loads(result.stdout)
         inv = payload["inventory"]
         items = inv.get("items", [])
+        depths = binder_depths(items)
         text = "\n".join(item.get("content_markdown") or "" for item in items)
         project_words[record["path"]] = norm_words(text)
         record.update({
@@ -280,6 +325,9 @@ def main() -> int:
             "binder_item_count": len(items),
             "document_type_counts": _count(item.get("type_code", "unknown") for item in items),
             "included_flags": _count(str(item.get("include_in_compile", "unknown")) for item in items),
+            "binder_depth_counts": _count(str(depth) for depth in depths.values()),
+            "maximum_binder_depth": max(depths.values(), default=0),
+            "top_level_item_count": sum(not item.get("parent_source_id") for item in items),
             "content_bearing_items": sum(bool(item.get("content_markdown")) for item in items),
             "word_count_estimate": len(norm_words(text)),
             "content_fingerprint": hashlib.sha256(" ".join(norm_words(text)).encode()).hexdigest(),
@@ -306,6 +354,7 @@ def main() -> int:
         publications.append({
             "path": relative_path,
             "format": path.suffix.lower().lstrip("."),
+            "classification": classify_file(path),
             "size_bytes": path.stat().st_size,
             "sha256": sha256_file(path),
             "metadata": metadata,
@@ -322,6 +371,8 @@ def main() -> int:
         source_tokens = set(norm_words(source_name))
         ranked = []
         for publication in publications:
+            if publication["classification"] != "publication_candidate":
+                continue
             title = str(publication.get("metadata", {}).get("title", ""))
             stem_tokens = set(norm_words(Path(str(publication["path"])).stem))
             title_tokens = set(norm_words(title))
@@ -359,6 +410,15 @@ def main() -> int:
         if fingerprint:
             by_content.setdefault(str(fingerprint), []).append(str(project["path"]))
     duplicates = [{"basis": "exact normalized extracted text", "paths": paths} for paths in by_content.values() if len(paths) > 1]
+    by_source_fingerprint: dict[str, list[str]] = {}
+    for project in projects:
+        fingerprint = project.get("source_fingerprint")
+        if fingerprint:
+            by_source_fingerprint.setdefault(str(fingerprint), []).append(str(project["path"]))
+    duplicates.extend(
+        {"basis": "identical Scrivener source fingerprint", "paths": paths}
+        for paths in by_source_fingerprint.values() if len(paths) > 1
+    )
     project_similarity = []
     project_paths = sorted(project_words)
     project_shingles = {path: word_shingles(project_words[path]) for path in project_paths}
@@ -410,7 +470,9 @@ def main() -> int:
         "generated_utc": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
         "notice": "Private local inventory. Language and publication matches are candidates, not authoritative classifications.",
         "scrivener_project_manifest_count": len(projects),
-        "publication_file_count": len(publications),
+        "publication_file_count": sum(p["classification"] == "publication_candidate" for p in publications),
+        "supporting_asset_file_count": sum(p["classification"] == "supporting_asset" for p in publications),
+        "other_resource_file_count": sum(p["classification"] == "other_resource" for p in publications),
         "mobi_conversion_staging": f"{staging_relative} (temporary extracted text removed after analysis)",
         "projects": projects,
         "publications": publications,
@@ -424,7 +486,9 @@ def main() -> int:
     print(json.dumps({
         "output": output.relative_to(ROOT).as_posix() if output.is_relative_to(ROOT) else str(output),
         "scrivener_project_manifest_count": len(projects),
-        "publication_file_count": len(publications),
+        "publication_file_count": sum(p["classification"] == "publication_candidate" for p in publications),
+        "supporting_asset_file_count": sum(p["classification"] == "supporting_asset" for p in publications),
+        "other_resource_file_count": sum(p["classification"] == "other_resource" for p in publications),
         "projects_inspected": sum(p.get("inspection_status") == "ok" for p in projects),
         "inspection_failures": sum(p.get("inspection_status") != "ok" for p in projects),
         "publication_match_candidates": len(matches),

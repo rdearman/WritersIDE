@@ -786,12 +786,13 @@ impl CompileIr {
     }
 
     pub fn render_markdown(&self) -> (String, Vec<CompileSourceMapEntry>) {
-        self.render_markdown_with_language_markup(true)
+        self.render_markdown_with_language_markup(true, false)
     }
 
     fn render_markdown_with_language_markup(
         &self,
         include_language_markup: bool,
+        include_stable_heading_ids: bool,
     ) -> (String, Vec<CompileSourceMapEntry>) {
         let mut output = String::new();
         let mut source_map = Vec::new();
@@ -844,6 +845,11 @@ impl CompileIr {
                     output.push_str(&"#".repeat(level));
                     output.push(' ');
                     output.push_str(&group.title);
+                    if include_stable_heading_ids {
+                        output.push_str(" {#");
+                        output.push_str(&compile_heading_id("group", &group.id));
+                        output.push('}');
+                    }
                     output.push_str("\n\n");
                 }
             }
@@ -856,6 +862,11 @@ impl CompileIr {
                 output.push_str(&"#".repeat(level));
                 output.push(' ');
                 output.push_str(&unit.title);
+                if include_stable_heading_ids {
+                    output.push_str(" {#");
+                    output.push_str(&compile_heading_id("unit", &unit.id));
+                    output.push('}');
+                }
                 output.push_str("\n\n");
             }
             for (index, segment) in unit.segments.iter().enumerate() {
@@ -897,6 +908,19 @@ impl CompileIr {
         }
         (output, source_map)
     }
+}
+
+fn compile_heading_id(kind: &str, source_id: &str) -> String {
+    let digest = Sha256::digest(source_id.as_bytes());
+    let mut result = String::with_capacity(kind.len() + 67);
+    result.push_str("wide-");
+    result.push_str(kind);
+    result.push('-');
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut result, "{byte:02x}").expect("writing into a String cannot fail");
+    }
+    result
 }
 
 fn segment_valid(segment: &CompileSegment) -> bool {
@@ -2034,8 +2058,16 @@ impl PandocRenderer {
         } else {
             None
         };
-        let (markdown, source_map) =
-            ir.render_markdown_with_language_markup(format != CompileFormat::PlainText);
+        let (markdown, source_map) = ir.render_markdown_with_language_markup(
+            format != CompileFormat::PlainText,
+            !matches!(
+                format,
+                CompileFormat::Markdown
+                    | CompileFormat::PlainText
+                    | CompileFormat::Pdf
+                    | CompileFormat::Latex
+            ),
+        );
         let mut auxiliary_files = Vec::new();
         let mut renderer_diagnostics = Vec::new();
         let bytes = if format == CompileFormat::PlainText {
@@ -2953,7 +2985,7 @@ output = "exports/old.md"
         assert!(ir.validate());
         let (markdown, _) = ir.render_markdown();
         assert!(markdown.contains("Hello, [bonjour]{lang=fr-FR}."));
-        let (plain_markdown, _) = ir.render_markdown_with_language_markup(false);
+        let (plain_markdown, _) = ir.render_markdown_with_language_markup(false, false);
         assert!(plain_markdown.contains(text));
         assert!(!plain_markdown.contains("{lang=fr-FR}"));
 
@@ -3172,6 +3204,60 @@ output = "exports/old.md"
             assert!(pdf.auxiliary_files[1].name.ends_with(".log"));
             assert!(!pdf.auxiliary_files[1].bytes.is_empty());
         }
+    }
+
+    #[test]
+    fn pandoc_epub_heading_ids_are_unique_for_repeated_structural_titles() {
+        if Command::new("pandoc").arg("--version").output().is_err() {
+            return;
+        }
+        let mut ir = CompileIr::new("A Book");
+        ir.push_group(CompileGroup {
+            id: "chapter-stable-id".into(),
+            parent_id: None,
+            kind: StructuralKind::Chapter,
+            title: "Adderand".into(),
+        });
+        ir.push(CompileUnit {
+            id: "scene-stable-id".into(),
+            parent_id: Some("chapter-stable-id".into()),
+            kind: ContentUnitKind::Scene,
+            title: "Adderand".into(),
+            language_code: None,
+            segments: vec![CompileSegment::new("source-scene", "A short paragraph.")],
+        });
+
+        let (markdown, _) = ir.render_markdown();
+        assert!(!markdown.contains("{#wide-"));
+
+        let artifact = PandocRenderer::default()
+            .render(&ir, CompileFormat::Epub, None)
+            .unwrap();
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(artifact.bytes)).unwrap();
+        let mut identifiers = std::collections::BTreeSet::new();
+        let mut found_group = false;
+        let mut found_unit = false;
+        for index in 0..archive.len() {
+            let mut entry = archive.by_index(index).unwrap();
+            if !entry.name().ends_with(".xhtml") {
+                continue;
+            }
+            let mut source = String::new();
+            entry.read_to_string(&mut source).unwrap();
+            for fragment in source.split(" id=\"").skip(1) {
+                let Some(identifier) = fragment.split('"').next() else {
+                    continue;
+                };
+                assert!(
+                    identifiers.insert(identifier.to_owned()),
+                    "duplicate EPUB element id: {identifier}"
+                );
+                found_group |= identifier == compile_heading_id("group", "chapter-stable-id");
+                found_unit |= identifier == compile_heading_id("unit", "scene-stable-id");
+            }
+        }
+        assert!(found_group, "the structural heading must have a stable ID");
+        assert!(found_unit, "the manuscript heading must have a stable ID");
     }
 
     #[test]
