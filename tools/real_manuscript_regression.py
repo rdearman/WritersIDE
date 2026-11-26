@@ -233,6 +233,21 @@ def epub_document_details(source: str, document_path: str) -> dict:
             node = parent
         return "/" + "/".join(reversed(parts))
 
+    def containing_text_block(node: ET.Element) -> tuple[str | None, str | None]:
+        block_names = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figcaption"}
+        current = node
+        while True:
+            name = tag_name(current)
+            if name in block_names:
+                return (
+                    "heading" if name.startswith("h") else name,
+                    unicodedata.normalize("NFC", text_of(current)),
+                )
+            parent = parents.get(id(current))
+            if parent is None:
+                return None, None
+            current = parent
+
     for index, node in enumerate(root.iter(), 1):
         name = tag_name(node)
         attrs = {key.rsplit("}", 1)[-1].lower(): value for key, value in node.attrib.items()}
@@ -263,11 +278,14 @@ def epub_document_details(source: str, document_path: str) -> dict:
             if any(token in style_properties.get("text-decoration", "") for token in ("line-through", "strikethrough")):
                 semantic_kinds.append("strikethrough")
         for semantic_kind in dict.fromkeys(semantic_kinds):
+            container_kind, container_text = containing_text_block(node)
             formatting.append({
                 "kind": semantic_kind,
                 "source_element": name,
                 "path": element_path(node),
                 "text": unicodedata.normalize("NFC", text_of(node)),
+                "container_kind": container_kind,
+                "container_text": container_text,
             })
         if name == "table":
             rows = []
@@ -460,30 +478,48 @@ def detailed_epub_difference(
     ref_docs = reference.get("documents", [])
     gen_docs = generated.get("documents", [])
     reference_formatting = [
-        {"document": document["path"], **mark}
-        for document in ref_docs for mark in document.get("formatting", [])
+        {"document": document["path"], "spine_index": spine_index, **mark}
+        for spine_index, document in enumerate(ref_docs)
+        for mark in document.get("formatting", [])
     ]
     generated_formatting = [
-        {"document": document["path"], **mark}
-        for document in gen_docs for mark in document.get("formatting", [])
+        {"document": document["path"], "spine_index": spine_index, **mark}
+        for spine_index, document in enumerate(gen_docs)
+        for mark in document.get("formatting", [])
     ]
-    def formatting_key(mark: dict) -> tuple[str, str]:
-        # Equivalent XHTML elements (for example <b> and <strong>) compare by
-        # semantic kind and text, while retaining source paths for diagnosis.
-        return (mark["kind"], unicodedata.normalize("NFC", mark["text"]))
+
+    def formatting_key(mark: dict) -> tuple[int, str, str, str, str]:
+        # Equivalent XHTML elements compare by meaning, while paragraph text
+        # and spine order keep repeated or moved phrases from masking changes.
+        return (
+            mark["spine_index"], mark["kind"],
+            str(mark.get("container_kind") or ""),
+            unicodedata.normalize("NFC", mark.get("container_text") or mark["text"]),
+            unicodedata.normalize("NFC", mark["text"]),
+        )
 
     ref_marks = collections.Counter(formatting_key(mark) for mark in reference_formatting)
     gen_marks = collections.Counter(formatting_key(mark) for mark in generated_formatting)
 
     def formatting_delta(before: collections.Counter, after: collections.Counter, source_marks: list[dict]) -> list[dict]:
         result = []
-        for (kind, text), count in sorted((before - after).items()):
+        for (spine_index, kind, container_kind, container_text, text), count in sorted((before - after).items()):
             locations = [
-                {"document": mark["document"], "path": mark["path"], "source_element": mark["source_element"]}
+                {
+                    "document": mark["document"], "path": mark["path"],
+                    "source_element": mark["source_element"],
+                    "spine_index": mark["spine_index"],
+                    "container_kind": mark.get("container_kind"),
+                    "container_text": mark.get("container_text"),
+                }
                 for mark in source_marks
-                if formatting_key(mark) == (kind, text)
+                if formatting_key(mark) == (spine_index, kind, container_kind, container_text, text)
             ]
-            result.append({"kind": kind, "text": text, "count": count, "locations": locations})
+            result.append({
+                "kind": kind, "text": text, "count": count, "locations": locations,
+                "spine_index": spine_index, "container_kind": container_kind,
+                "container_text": container_text,
+            })
         return result
 
     formatting_difference = {

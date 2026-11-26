@@ -148,9 +148,13 @@ class EpubSemanticTests(unittest.TestCase):
         missing = difference["semantic_formatting"]["missing_from_generated"]
         self.assertEqual(missing, [{
             "kind": "bold", "text": "this phrase", "count": 1,
+            "spine_index": 0, "container_kind": "p",
+            "container_text": "Keep this phrase prominent.",
             "locations": [{
                 "document": "ref/chapter.xhtml", "path": "/html/body[1]/p[1]/strong[1]",
                 "source_element": "strong",
+                "spine_index": 0, "container_kind": "p",
+                "container_text": "Keep this phrase prominent.",
             }],
         }])
         self.assertEqual(
@@ -171,6 +175,28 @@ class EpubSemanticTests(unittest.TestCase):
         )
         self.assertEqual(difference["semantic_formatting"]["missing_from_generated"], [])
         self.assertEqual(difference["semantic_formatting"]["additional_in_generated"], [])
+
+    def test_detailed_comparison_reports_emphasis_moved_between_paragraphs(self):
+        reference_doc = epub_document_details(
+            '<html><body><p><strong>same words</strong> here.</p><p>Elsewhere.</p></body></html>',
+            "ref.xhtml",
+        )
+        generated_doc = epub_document_details(
+            '<html><body><p>same words here.</p><p><strong>same words</strong> elsewhere.</p></body></html>',
+            "wide.xhtml",
+        )
+        difference = detailed_epub_difference(
+            {"documents": [reference_doc], "css_summary": {}, "metadata": {}, "navigation_entries": []},
+            {"documents": [generated_doc], "css_summary": {}, "metadata": {}, "navigation_entries": []},
+        )
+        self.assertEqual(
+            difference["semantic_formatting"]["missing_from_generated"][0]["container_text"],
+            "same words here.",
+        )
+        self.assertEqual(
+            difference["semantic_formatting"]["additional_in_generated"][0]["container_text"],
+            "same words elsewhere.",
+        )
 
     def test_character_report_distinguishes_substitution_and_added_accent(self):
         difference = detailed_epub_difference(

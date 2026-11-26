@@ -843,15 +843,17 @@ from actual markup, including bold, italic, underline, strikethrough, subscript
 and superscript. Equivalent XHTML forms (for example `<b>` and `<strong>`) are
 normalised for comparison while original element paths remain in the detailed
 report. Differences identify missing or additional emphasized text; manuscript
-content is never altered. The full Python tooling suite passes (23 tests) and
+content is never altered. The full Python tooling suite passes (24 tests) and
 all tooling modules compile. Regenerate reports during the next relevant real
 manuscript run so they include this new field; earlier local reports do not.
 The new comparator was then applied to the existing BowString candidate pair
 without re-importing or modifying fixtures. Its fresh local report is
-`reports/back-catalogue-targeted/bowstring-semantic-format-20261126b/differential.json`.
+`reports/back-catalogue-targeted/bowstring-semantic-format-20261126c/differential.json`.
 The candidate reference remains unconfirmed; the report found 1 reference and
 2 generated semantic emphasis runs. This is a discrepancy lead requiring
 source-side investigation, not a confirmed formatting defect or acceptance
 result. This refreshed comparison reused the already imported/generated private
 artefact; it did not repeat import, reopen or EPUBCheck. Fixture checksums passed
-before and after comparison.
+before and after comparison. The comparison keys now include the reading-order
+document and containing paragraph, so emphasis moved to another paragraph is
+reported instead of being counted as preserved.

@@ -213,7 +213,9 @@ The report also records semantic inline emphasis (bold, italic, underline,
 strikethrough, superscript and subscript) with XHTML element paths and compares
 the marked text after normalising equivalent elements such as `<b>` and
 `<strong>`. This exposes missing or added emphasis that tag totals alone would
-miss. It remains structural evidence; visual layout still requires rendering.
+miss. Comparison includes spine order and containing block text, so identical
+phrases moved to a different paragraph are not counted as preserved. It remains
+structural evidence; visual layout still requires rendering.
 
 The exact-commit compile-only differential rerun is
 `reports/diff-stage-20261126/`; generated publications are
