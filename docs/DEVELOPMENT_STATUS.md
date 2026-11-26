@@ -1,5 +1,38 @@
 # Writer's IDE Development Status
 
+## Current checkpoint — Alpha UAT 36, issue #76 workflow audit, 26 November 2026
+
+The focused command/workflow repair batch is frozen at commit
+`328109b11be804d87b05ac383e8571a2aa6cc85f`. The isolated Linux x86_64 UAT
+bundle is `test-builds/alpha-uat-36-328109b/`; launch it from the repository
+with:
+
+```sh
+cd test-builds/alpha-uat-36-328109b
+./run.sh "Authoring Audit Project"
+```
+
+`UAT-CHECKLIST.md` contains the acceptance steps. The bundle includes two
+synthetic sample projects and sanitised synthetic Scrivener fixtures, with
+preferences and HOME isolated inside the bundle. It does not include private
+manuscript regression fixtures. `SHA256SUMS` was generated and verified after
+packaging; SQLite integrity checks passed for all bundled sample projects.
+The binary SHA-256 values and frozen source revision are in `BUILD-MANIFEST.md`.
+
+The production Linux PTY authoring-audit workflow passed against the release
+terminal executable. Formatting, workspace Clippy with warnings denied, and
+the complete offline workspace suite passed at the frozen commit. The audit
+covers section/chapter/scene creation, inclusion feedback, manuscript editing
+and save, return to the originating outline by identity, searchable story-link
+selection, and editable book type. Remaining registered commands are inventoried
+in `docs/COMMAND_WORKFLOW_AUDIT.md`, with their individual verification status
+made explicit. Human UAT is pending; no human-acceptance issue is closed.
+
+Known limitation: Scrivener import is synchronous and may appear idle during a
+long import. This remains open for #53/#76. Next implementation task is to
+resume Scrivener per-format layout/inclusion integration with the shared compile
+presentation controls, then continue the remaining actionable v1.0 backlog.
+
 ## Current checkpoint — issue #76 command/workflow audit, 26 November 2026
 
 The current working batch audits the Alpha UAT 35 author-facing command
