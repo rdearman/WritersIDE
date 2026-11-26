@@ -53,6 +53,31 @@ Linux PTY tests. The Ollama localhost-only test required the previously
 authorised loopback socket permission. This automated evidence does not
 replace human UAT; #7/#53/#73/#44 remain open for acceptance.
 
+The differential harness now includes source-body evidence in each detailed
+paragraph discrepancy. For an imported project, compile-only comparisons also
+recheck extracted Scrivener body hashes against the persisted project. Reports
+state which pipeline stages are supported or ruled out by those checks, instead
+of labeling every difference with the same generic cause. They also enumerate
+added/removed CSS declarations and font settings and field-level metadata
+differences. This narrows investigation; it does not infer that a historical
+edition difference is a WIDE defect or fully render the browser CSS cascade.
+All 21 Python tooling tests pass.
+
+An exact-commit compile-only rerun of the three imported projects is at
+`reports/diff-stage-20261126/`; its latest EPUBs for local visual review are:
+
+- `generated/diff-stage-20261126/book-01.epub`
+- `generated/diff-stage-20261126/book-02.epub`
+- `generated/diff-stage-20261126/book-03.epub`
+
+The rerun verified 39/39, 36/36 and 68/68 manuscript bodies against their
+persisted source bodies, with zero missing or changed destinations. Each
+generated EPUB passed EPUBCheck with zero errors and warnings. Material
+paragraph, typography, metadata, heading, navigation and inclusion differences
+remain in the local reports. Fixture checksums passed. This comparator
+instrumentation batch does not change generated publication content and does
+not constitute human acceptance.
+
 ## Current checkpoint — 26 November 2026
 
 The author expanded the local private corpus under `fixtures/back-catalogue/`.

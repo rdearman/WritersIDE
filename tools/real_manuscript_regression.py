@@ -258,8 +258,63 @@ def epub_document_details(source: str, document_path: str) -> dict:
     }
 
 
-def detailed_epub_difference(reference: dict, generated: dict) -> dict:
+def detailed_epub_difference(
+    reference: dict,
+    generated: dict,
+    source_fidelity: dict | None = None,
+) -> dict:
     """Return content-bearing, source-located comparison evidence for local reports."""
+    if source_fidelity is None:
+        stage_evidence = {
+            "status": "not-available",
+            "evidence": "This comparison did not include source-to-persisted body verification.",
+            "probable_stages": [
+                "historical source revision or conversion",
+                "Scrivener compile selection",
+                "WIDE Compile IR or renderer",
+            ],
+            "ruled_out": [],
+        }
+    else:
+        checked = source_fidelity.get("manuscript_bodies_checked", 0)
+        exact = source_fidelity.get("exactly_preserved", 0)
+        missing = source_fidelity.get("missing_destination_count", 0)
+        changed = source_fidelity.get("changed_body_count", 0)
+        if checked and exact == checked and not missing and not changed:
+            stage_evidence = {
+                "status": "source-bodies-exact-after-reopen",
+                "evidence": (
+                    f"All {exact} checked manuscript bodies match the extracted Scrivener "
+                    "bodies after save/reopen; extraction and persistence are not indicated "
+                    "by those body checks."
+                ),
+                "probable_stages": [
+                    "Scrivener compile selection and section-layout mapping",
+                    "WIDE Compile IR inclusion or structural presentation",
+                    "publication renderer",
+                    "historical source revision or Calibre conversion",
+                ],
+                "ruled_out": [
+                    "RTF extraction for the checked manuscript bodies",
+                    "canonical manuscript persistence for the checked manuscript bodies",
+                ],
+            }
+        else:
+            stage_evidence = {
+                "status": "source-body-mismatch",
+                "evidence": (
+                    f"{exact}/{checked} checked manuscript bodies match after reopen; "
+                    f"{missing} destinations are missing and {changed} persisted bodies differ."
+                ),
+                "probable_stages": [
+                    "Scrivener extraction or import mapping",
+                    "canonical manuscript persistence",
+                    "Scrivener compile selection and section-layout mapping",
+                    "WIDE Compile IR or renderer",
+                    "historical source revision or Calibre conversion",
+                ],
+                "ruled_out": [],
+            }
     left = [
         {"document": document["path"], "paragraph": index,
          "path": block.get("path"), "text": block["text"]}
@@ -333,7 +388,8 @@ def detailed_epub_difference(reference: dict, generated: dict) -> dict:
             "reference": expected,
             "generated": actual,
             "character_differences": character_differences,
-            "probable_stage": "historical source revision, compile selection, or WIDE pipeline; compare current Scrivener source and persisted WIDE body",
+            "probable_stage": "; ".join(stage_evidence["probable_stages"]),
+            "stage_evidence": stage_evidence,
         })
 
     left_text = "\n".join(left_values)
@@ -352,6 +408,23 @@ def detailed_epub_difference(reference: dict, generated: dict) -> dict:
     }
     ref_docs = reference.get("documents", [])
     gen_docs = generated.get("documents", [])
+    reference_css = reference.get("css_summary", {})
+    generated_css = generated.get("css_summary", {})
+    css_differences = {}
+    for key in ("font_families", "font_sizes", "font_weights", "font_styles", "declarations"):
+        before = collections.Counter(reference_css.get(key, []))
+        after = collections.Counter(generated_css.get(key, []))
+        removed = sorted((before - after).elements())
+        added = sorted((after - before).elements())
+        if removed or added:
+            css_differences[key] = {"removed_from_generated": removed, "added_in_generated": added}
+    reference_metadata = reference.get("metadata", {})
+    generated_metadata = generated.get("metadata", {})
+    metadata_differences = {
+        key: {"reference": reference_metadata.get(key), "generated": generated_metadata.get(key)}
+        for key in sorted(reference_metadata.keys() | generated_metadata.keys())
+        if reference_metadata.get(key) != generated_metadata.get(key)
+    }
     return {
         "paragraphs": {
             "reference_count": len(left), "generated_count": len(right),
@@ -362,8 +435,16 @@ def detailed_epub_difference(reference: dict, generated: dict) -> dict:
             "reference": [{key: doc.get(key) for key in ("path", "headings", "preformatted", "visible_markdown_artifacts", "tables", "images", "links")} for doc in ref_docs],
             "generated": [{key: doc.get(key) for key in ("path", "headings", "preformatted", "visible_markdown_artifacts", "tables", "images", "links")} for doc in gen_docs],
         },
-        "css": {"reference": reference.get("css_summary", {}), "generated": generated.get("css_summary", {})},
-        "metadata": {"reference": reference.get("metadata", {}), "generated": generated.get("metadata", {})},
+        "css": {
+            "reference": reference_css,
+            "generated": generated_css,
+            "differences": css_differences,
+        },
+        "metadata": {
+            "reference": reference_metadata,
+            "generated": generated_metadata,
+            "differences": metadata_differences,
+        },
         "navigation": {"reference": reference.get("navigation_entries", []), "generated": generated.get("navigation_entries", [])},
         "limitations": [
             "Historical EPUBs may reflect an earlier Scrivener revision or Calibre conversion; paragraph differences require source-side evidence before defect classification.",
@@ -1116,11 +1197,15 @@ def main() -> int:
             report["generated"] = {key: value for key, value in generated_semantics.items() if key != "tokens_private"}
             report["semantic_comparison"] = semantic_diff
             report["publication_structure_differences"] = structure_diff
-            report["detailed_publication_differences"] = detailed_epub_difference(
-                reference_semantics, generated_semantics
-            )
             if "canonical_markdown_diagnostics" not in report and project.is_dir():
                 report["canonical_markdown_diagnostics"] = canonical_markdown_diagnostics(project)
+            if "source_content_fidelity" not in report and project.is_dir():
+                report["source_content_fidelity"] = verify_imported_source_content(project)
+            report["detailed_publication_differences"] = detailed_epub_difference(
+                reference_semantics,
+                generated_semantics,
+                report.get("source_content_fidelity"),
+            )
             if previous and book_id in previous.get("books", {}):
                 old = previous["books"][book_id].get("generated")
                 report["baseline_comparison"] = (

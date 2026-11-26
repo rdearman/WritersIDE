@@ -158,6 +158,28 @@ Use the local detailed comparison in the run report to trace each discrepancy
 to source extraction, canonical storage, Compile IR or renderer before
 classifying it. Human publication acceptance remains outstanding.
 
+The differential report also lists concrete added/removed CSS declarations,
+font properties, publication metadata and ordered navigation entries. For each
+changed paragraph it records both XHTML document/path locations, the expected
+and generated paragraph text, and Unicode character edits. A compile-only run
+rechecks extracted source bodies against persisted WIDE documents; if all
+checked bodies are exact it narrows the candidate causes to historical edition
+revision/conversion, Scrivener compile selection, Compile IR structure or the
+renderer. If source bodies differ, extraction/import and persistence remain
+candidates. These stage hints are evidence-based leads, not automatic defect
+classifications. The report also explicitly notes that CSS declaration
+comparison is not a full browser cascade or visual layout test.
+
+The exact-commit compile-only differential rerun is
+`reports/diff-stage-20261126/`; generated publications are
+`generated/diff-stage-20261126/book-01.epub`,
+`generated/diff-stage-20261126/book-02.epub` and
+`generated/diff-stage-20261126/book-03.epub`. It rechecked 39/39, 36/36 and
+68/68 manuscript bodies after persistence/reopen, reported zero missing or
+changed destinations, and verified zero EPUBCheck errors and warnings for all
+three generated EPUBs. Substantial historical-reference and compile-layout
+differences remain; use the run's local reports for investigation.
+
 ## Integrity and privacy
 
 - Never modify the original Scrivener projects, reference publications or

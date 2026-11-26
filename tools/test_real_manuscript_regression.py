@@ -62,7 +62,16 @@ class EpubSemanticTests(unittest.TestCase):
             {"path": "/body/p[1]", "text": "The gardenwall."},
             {"path": "/body/p[2]", "text": "A second paragraph."},
         ]}], "css_summary": {}, "metadata": {}, "navigation_entries": []}
-        difference = detailed_epub_difference(reference, generated)
+        difference = detailed_epub_difference(
+            reference,
+            generated,
+            {
+                "manuscript_bodies_checked": 2,
+                "exactly_preserved": 2,
+                "missing_destination_count": 0,
+                "changed_body_count": 0,
+            },
+        )
         change = difference["paragraphs"]["changed_regions"][0]
         self.assertEqual(change["reference"][0]["path"], "/body/p[1]")
         self.assertIn("U+2013", str(difference["characters"]["missing_from_generated"]))
@@ -70,7 +79,57 @@ class EpubSemanticTests(unittest.TestCase):
         self.assertEqual(char_edit["operation"], "delete")
         self.assertEqual(char_edit["reference_text"], "–")
         self.assertEqual(char_edit["missing_characters"][0]["codepoint"], "U+2013")
-        self.assertIn("Scrivener source", change["probable_stage"])
+        self.assertIn("Compile IR", change["probable_stage"])
+        self.assertEqual(change["stage_evidence"]["status"], "source-bodies-exact-after-reopen")
+        self.assertTrue(any(
+            "canonical manuscript persistence" in stage
+            for stage in change["stage_evidence"]["ruled_out"]
+        ))
+
+    def test_detailed_comparison_reports_import_mismatch_as_candidate_stage(self):
+        reference = {"documents": [{"path": "ref.xhtml", "paragraphs": [
+            {"path": "/body/p[1]", "text": "Expected source paragraph."},
+        ]}], "css_summary": {}, "metadata": {}, "navigation_entries": []}
+        generated = {"documents": [{"path": "wide.xhtml", "paragraphs": [
+            {"path": "/body/p[1]", "text": "Different paragraph."},
+        ]}], "css_summary": {}, "metadata": {}, "navigation_entries": []}
+        difference = detailed_epub_difference(
+            reference,
+            generated,
+            {
+                "manuscript_bodies_checked": 3,
+                "exactly_preserved": 2,
+                "missing_destination_count": 1,
+                "changed_body_count": 0,
+            },
+        )
+        evidence = difference["paragraphs"]["changed_regions"][0]["stage_evidence"]
+        self.assertEqual(evidence["status"], "source-body-mismatch")
+        self.assertIn("Scrivener extraction or import mapping", evidence["probable_stages"])
+        self.assertEqual(evidence["evidence"], "2/3 checked manuscript bodies match after reopen; 1 destinations are missing and 0 persisted bodies differ.")
+
+    def test_detailed_comparison_lists_css_and_metadata_differences(self):
+        reference = {
+            "documents": [],
+            "css_summary": {"font_families": ["Serif"], "declarations": ["font-size: 10pt"]},
+            "metadata": {"title": "Reference", "language": "fr"},
+            "navigation_entries": [],
+        }
+        generated = {
+            "documents": [],
+            "css_summary": {"font_families": ["Sans"], "declarations": ["font-size: 12pt"]},
+            "metadata": {"title": "Generated", "language": "fr"},
+            "navigation_entries": [],
+        }
+        difference = detailed_epub_difference(reference, generated)
+        self.assertEqual(
+            difference["css"]["differences"]["font_families"],
+            {"removed_from_generated": ["Serif"], "added_in_generated": ["Sans"]},
+        )
+        self.assertEqual(
+            difference["metadata"]["differences"]["title"],
+            {"reference": "Reference", "generated": "Generated"},
+        )
 
     def test_character_report_distinguishes_substitution_and_added_accent(self):
         difference = detailed_epub_difference(
