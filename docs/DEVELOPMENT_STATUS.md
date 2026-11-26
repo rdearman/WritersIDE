@@ -43,8 +43,23 @@ Scrivener source fingerprints were unchanged and all generated EPUBs passed
 EPUBCheck 4.2.6 with zero errors or warnings. Its differential reports are
 under `reports/back-catalogue-anchor-control-20261126/`; these results were
 produced from the working tree immediately before the renderer fix was
-committed, so repeat compile-only validation after commit for an exact-commit
-record. Publication fidelity remains provisional and human UAT has not passed.
+committed. An exact-commit compile-only rerun at
+`reports/e2dd238-controlled-recompile-20261126/` used `e2dd2387bf77bd47485c0ec81dce3cce43b60176` and confirmed all three source fingerprints unchanged and all generated EPUBs EPUBCheck-clean. Publication fidelity remains provisional: each historical EPUB comparison still has paragraph-level differences, import previews still report incomplete mappings, and human UAT has not passed.
+
+Latest controlled generated EPUBs for local inspection (not human-accepted):
+
+- `generated/e2dd238-controlled-recompile-20261126/book-01.epub`
+- `generated/e2dd238-controlled-recompile-20261126/book-02.epub`
+- `generated/e2dd238-controlled-recompile-20261126/book-03.epub`
+
+The expanded-corpus DOCX candidate also produced a local structural report
+at `reports/back-catalogue-20261126-expanded/adderand-docx-diff.json`. Source
+RTF Markdown and the imported canonical scene body matched exactly. The
+historical DOCX has 417 paragraphs (204 non-empty), versus 208 generated
+paragraphs; source extraction has 205 non-empty Markdown blocks before the
+three generated structural/unit headings. This is not yet a full paragraph
+text comparison or proof of a defect: the reason for the historical blank
+paragraphs and remaining structural difference needs investigation.
 
 For the renderer/inventory batch, `cargo fmt --all -- --check`, workspace
 Clippy with `-D warnings`, all 16 Python tooling tests, and the full offline
