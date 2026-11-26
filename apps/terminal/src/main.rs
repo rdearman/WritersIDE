@@ -10415,7 +10415,22 @@ impl AppState {
                 if let Some((name, is_dir)) = browser.entries.get(browser.selected).cloned() {
                     if is_dir {
                         let path = browser.current_dir.join(name);
-                        if browser.purpose == FileBrowserPurpose::OpenProject
+                        if browser.purpose == FileBrowserPurpose::ImportScrivenerSource
+                            && path
+                                .extension()
+                                .is_some_and(|extension| extension == "scriv")
+                        {
+                            match self.start_scrivener_import_from_browser(&browser) {
+                                Ok(()) => close = true,
+                                Err(error) => {
+                                    self.message = format!(
+                                        "Scrivener import could not start: {error}. The source project was not changed."
+                                    );
+                                    self.file_browser = Some(browser);
+                                    return Ok(());
+                                }
+                            }
+                        } else if browser.purpose == FileBrowserPurpose::OpenProject
                             && path.join("project.toml").is_file()
                         {
                             match self.request_open_project(path) {

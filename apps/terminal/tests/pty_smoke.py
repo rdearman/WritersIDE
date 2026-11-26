@@ -328,8 +328,7 @@ def main():
                 (b"Import Scrivener", b"Folder contents"), menu_start, timeout=5.0
             ):
                 raise AssertionError("File > Import Scrivener did not open the file browser")
-            os.write(master, b"\t")  # focus project list
-            os.write(master, b"\x1b[15~")  # import selected .scriv folder directly to staging
+            os.write(master, b"\t\r")  # select .scriv folder; Enter imports directly into staging
             if expected_titles:
                 imported_outline_ready = wait_for_screen_fragments(
                     tuple(title.encode("utf-8") for title in expected_titles),
