@@ -27,9 +27,13 @@ corpus still needs per-format inspection to confirm that all Scrivener layout
 constructs have an equivalent WIDE presentation, and the author must verify
 that the Publish workflow is discoverable and produces acceptable output.
 Issues #7, #53, #68 and #73 remain open for further fidelity work and human
-UAT. The last frozen UAT bundle is Alpha UAT 28 at
-`test-builds/alpha-uat-28-16103dc/`; build a new candidate from a clean commit
-before sharing the changes in this checkpoint.
+UAT. Alpha UAT 29 is frozen at commit `79739f05faa2bd2a2a3dbc404b689ab703081488`
+in `test-builds/alpha-uat-29-79739f0/`. Launch it with
+`test-builds/alpha-uat-29-79739f0/run.sh`; isolated preferences and disposable
+fiction, non-fiction and synthetic Scrivener fixtures are bundled. SHA-256
+checks are in that directory's `SHA256SUMS`; bundle checksum verification and
+both sample project validations passed. The bundle contains no private
+regression corpus content.
 
 ## Current checkpoint — selected Scrivener matter import safety, 26 November 2026
 
