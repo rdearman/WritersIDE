@@ -52,14 +52,17 @@ Latest controlled generated EPUBs for local inspection (not human-accepted):
 - `generated/e2dd238-controlled-recompile-20261126/book-02.epub`
 - `generated/e2dd238-controlled-recompile-20261126/book-03.epub`
 
-The expanded-corpus DOCX candidate also produced a local structural report
-at `reports/back-catalogue-20261126-expanded/adderand-docx-diff.json`. Source
-RTF Markdown and the imported canonical scene body matched exactly. The
-historical DOCX has 417 paragraphs (204 non-empty), versus 208 generated
-paragraphs; source extraction has 205 non-empty Markdown blocks before the
-three generated structural/unit headings. This is not yet a full paragraph
-text comparison or proof of a defect: the reason for the historical blank
-paragraphs and remaining structural difference needs investigation.
+The expanded-corpus DOCX candidate also produced a detailed local report at
+`reports/back-catalogue-20261126-expanded/adderand-docx-diff-detailed.json`.
+RTF-extracted canonical text and persisted scene text matched exactly. After
+excluding the generated metadata title and two structural headings, the 205
+source paragraphs and generated DOCX body paragraphs match exactly in order
+and content (NFC plus whitespace normalization; boundaries retained). The
+historical DOCX has 417 paragraphs (204 non-empty); it differs from the
+current source in 30 paragraph-change regions. The source revision and
+historical formatting/spacing differences remain unresolved; they are not
+evidence of WIDE body corruption. This candidate is not an author-approved
+edition or a human publication acceptance result.
 
 For the renderer/inventory batch, `cargo fmt --all -- --check`, workspace
 Clippy with `-D warnings`, all 16 Python tooling tests, and the full offline
