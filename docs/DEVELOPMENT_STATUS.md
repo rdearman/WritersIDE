@@ -1,5 +1,27 @@
 # Writer's IDE Development Status
 
+## Dependency, licence and coverage-tool audit — 26 November 2026
+
+The independent Rust tooling is available on this machine: cargo-audit 0.23.0,
+cargo-deny 0.22.1, cargo-machete 0.10.1, and cargo-llvm-cov 0.9.2. `cargo
+machete --with-metadata --skip-target-dir` passed and found no unused
+dependencies.
+
+Security and licence audit results are not yet conclusive. `cargo audit
+--no-fetch --stale` could not run because the local advisory database is absent.
+`cargo deny check advisories ...` could not obtain its advisory database lock
+under the read-only Cargo home. `cargo deny check licenses bans sources` ran
+without a repository `deny.toml`, so its fallback policy rejected dependencies
+because no licences were explicitly allowed; this is not evidence that those
+licences are incompatible with WIDE. No license allowlist was invented.
+
+The workspace Cargo manifests declare `MIT`, but the repository has no tracked
+root `LICENSE` or `COPYING` file. This declaration is an unresolved release
+documentation/licensing consistency issue; do not present WIDE as MIT-licensed
+or make an open-source claim until the author resolves it. No dependency was
+upgraded, no runtime dependency was added, and cargo-llvm-cov was verified as
+installed but not run in this checkpoint.
+
 ## Scrivener profile warning scope — 26 November 2026
 
 Scrivener profile warnings about missing section-layout assignments now apply
