@@ -429,3 +429,61 @@ manifest. Continue from that into Scrivener compile selection/layout integration
 in the shared Compile IR and named publication profiles. Keep all private
 manifests, generated output and detailed reports out of Git. The root `.gitignore`,
 `README_TMP.md` and `UAT/` are user-owned changes; do not stage or alter them.
+
+## Expanded private regression corpus — 26 November 2026
+
+The read-only expanded-corpus inventory tooling is ready for commit. Its latest
+local report is `reports/back-catalogue-20261126-release/manifest.json`;
+temporary converted MOBI text is removed after analysis.
+The inventory inspected 26 Scrivener manifests and classified 47 publication
+and resource files. It records Creator/version hints, manifest revisions,
+binder structure counts, candidate language, SHA-256 hashes, publication
+metadata, uncertain project/publication matches and possible related editions.
+All three controlled projects have an exact normalized-text match in this
+back-catalogue; the possible match and revision candidates are not confirmed.
+Project-tree and publication-file hashes remained identical between runs,
+the controlled fixture checksum manifest passed pre/post, no symlinks were
+found, and Git tracks no private files. Five focused inventory tests and all
+14 Python regression harness tests passed.
+
+Next: refresh GitHub after this batch, then integrate the inventoried Scrivener
+compile settings into existing shared Compile IR/profile handling, starting
+with private-by-default per-document selection, structural heading suppression,
+numbering, scene separators, and variables. Continue the three-book publication
+regression, then use targeted back-catalogue projects. After these repairs,
+resume the open v1.0 issues in the current priority order. Keep all local
+manifests, extracted MOBI text, generated publications and detailed reports
+out of Git. `.gitignore`, `README_TMP.md` and `UAT/` remain user-owned and must
+not be staged.
+
+## Expanded private regression corpus — 26 November 2026
+
+Commit `e8c4201` fixed a confirmed Scrivener RTF indentation serialization
+defect and expanded the real-EPUB differential report. The full workspace test
+run, formatting, Clippy, 9 existing regression harness tests, fixture checksum
+verification and fresh three-book production import/compile passed. This did
+not establish overall publication fidelity; human Calibre UAT remains failed.
+
+The read-only expanded-corpus inventory tooling is currently in progress. Its
+latest local report is `reports/back-catalogue-20261126-final/manifest.json`;
+converted MOBI text is staged below `generated/back-catalogue-inventory-*/`.
+It inspected 26 Scrivener manifests and classified 47 files in the publication
+corpus. It records Scrivener Creator/version hints, manifest revisions, binder
+types/counts, language candidates, warnings, unsupported markers, SHA-256
+checksums, publication metadata, candidate matches and possible related
+projects. It detected exact normalized content for each of the three controlled
+Scrivener projects in the expanded corpus. Potential project/publication
+matches and archery-series similarities are not author-confirmed. Independent
+project-tree and publication hashes matched across inventory runs, the
+controlled SHA256SUMS passed pre/post, no symlinks were present, and Git tracks
+no expanded fixture files.
+
+Next: finish verification and commit the inventory harness/documentation as a
+separate batch, then refresh GitHub issues and begin applying the recovered
+Scrivener compile semantics (per-document/profile inclusion, structural
+heading suppression, chapter numbering, scene separators and compile-time
+variables) to the existing shared Compile IR. Continue with table/reference
+and publication diagnostic repairs, then resume the remaining v1.0 backlog.
+Do not claim matching editions until source/edition evidence is inspected. Keep
+the feature freeze and all private fixture, generated-text and detailed-report
+exclusions in force.

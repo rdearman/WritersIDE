@@ -247,3 +247,64 @@ including expected/actual paragraph text and source document/path. A compact
 summary only records structural counts and validator status. Visual layout
 comparison remains follow-up work where equivalent reference sections and
 safe local rendering tools are available.
+
+## Expanded private back-catalogue inventory — 26 November 2026
+
+The additional corpus is separate from the three controlled regression books
+and is deliberately not considered a curated reference set. Generate a local
+manifest after building the production CLI:
+
+```sh
+(cd fixtures && sha256sum --quiet -c SHA256SUMS)
+python3 -B tools/back_catalogue_inventory.py \
+  --output reports/back-catalogue-RUN_ID/manifest.json
+(cd fixtures && sha256sum --quiet -c SHA256SUMS)
+python3 -B -m unittest discover -s tools -p 'test_back_catalogue_inventory.py' -v
+```
+
+The tool recursively uses the production read-only `inspect-scrivener` command,
+records per-project and per-publication SHA-256 values, counts binder structures,
+extracts available metadata/text without executing corpus files, and ranks
+publication associations using names, metadata and normalized three-word
+content shingles. It also compares candidate projects to the original three
+controlled books and lists possible related revisions. Similarity results are
+not confirmed matches. The report is local and content-bearing; never commit
+it. Extracted MOBI text, when Calibre is available, is staged under ignored
+`generated/`.
+
+The latest read-only inventory is
+`reports/back-catalogue-20261126-release/manifest.json`. Temporary MOBI text
+was removed after content matching. It found 25 top-level
+`.scriv` folders containing 26 `.scrivx` manifests (one nested project), and
+47 publication/resource files: 13 EPUB, 16 MOBI, 4 ODT, 4 RTF, 2 DOCX, 2 HTML,
+2 TXT, 1 DOC, 1 PDF and 2 image files. The Scrivener Creator tags indicate 24
+projects tagged `SCRWIN-3.1.5.1`, one `SCRWIN-3.1.1.0`, and one `SCRWIN-1.0.0`;
+these are source-reported Creator/version hints, not independently verified
+application/platform compatibility. Manifest revisions are 2.0 for 25 and 1.0
+for one. Binder item counts range from 5 to 129 (1,322 total); extracted
+content ranges from empty to approximately 70,829 words. The local detector
+suggests English for 24, with one Latin-script language unclassified and one
+CJK-script project whose language remains uncertain. Treat all detector output
+as candidate metadata, not ground truth.
+
+The top-ranked project/publication candidates comprise 6 strong, 6 possible
+and 14 uncertain suggestions; all remain unconfirmed pending source/edition
+inspection. Each project also has lower-ranked suggestions, which are not
+asserted as matches. Exact normalized-text duplicate groups were not found.
+Pairwise content-shingle analysis produced potential
+relationships among the archery manuscripts; these are candidate shared-source
+or revision relationships, not proof of duplicate editions. Each original
+controlled project had an exact normalized-content match to its corresponding
+back-catalogue project. The same 26 project-tree checksums and 47 publication
+file checksums matched across the initial and final inventory passes. The
+controlled fixture checksum manifest also passed before and after; the corpus
+contains no symlinks and Git tracks no back-catalogue files. Text extraction
+was available for all publications except two image-only resources; all four
+ODT files were parsed for text and metadata. The inventory's synthetic suite
+passed 5 tests, and the complete Python harness suite passed 14 tests.
+
+This inventory is useful for selecting targeted compatibility tests, not a
+publication fidelity result. It does not import/compile all 26 projects, and
+historical formats lacking extractable text or matching evidence remain
+unmatched. Use small targeted subsets first; do a corpus-wide sweep at the next
+significant import/compile milestone.
