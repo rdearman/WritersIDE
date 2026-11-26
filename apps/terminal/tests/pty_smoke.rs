@@ -42,7 +42,7 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
     }
     let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
     let result = Command::new("python3")
-        .arg(harness)
+        .arg(&harness)
         .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
         .arg(&project)
         .arg(root.path())
@@ -78,6 +78,7 @@ fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty(
     let source = home.join("0 Import.scriv");
     let files = source.join("Files/Data");
     std::fs::create_dir_all(files.join("scene-id")).unwrap();
+    std::fs::create_dir_all(files.join("chapter-id")).unwrap();
     std::fs::create_dir_all(files.join("research-id")).unwrap();
     std::fs::create_dir_all(source.join("Settings")).unwrap();
     std::fs::write(
@@ -100,6 +101,11 @@ fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty(
     std::fs::write(
         source.join("Settings/compile.xml"),
         r#"<CompileSettings><FormatSettings><Format ID="DEFAULT"/></FormatSettings></CompileSettings>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        files.join("chapter-id/content.rtf"),
+        r"{\rtf1\ansi Chapter prose survives direct editing and scene navigation.}",
     )
     .unwrap();
     std::fs::write(
@@ -134,12 +140,13 @@ fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty(
     }
     let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
     let result = Command::new("python3")
-        .arg(harness)
+        .arg(&harness)
         .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
         .arg(&initial)
         .arg(&home)
         .arg("scrivener-import")
         .env("WIDE_PTY_COMPILE_PROFILE", "1")
+        .env("WIDE_PTY_TEST_DIRECT_PROSE", "1")
         .output()
         .expect("run Scrivener import through Linux PTY");
     assert!(
@@ -177,6 +184,18 @@ fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty(
     let prose = reopened.load_scene_text(scenes[0].scene.id).unwrap().0;
     assert!(prose.contains("The patient blacksmith"));
     assert!(prose.contains("Additional UAT sentence."));
+    let chapter_prose = reopened
+        .list_content_units(false)
+        .unwrap()
+        .into_iter()
+        .find(|unit| {
+            unit.title == "Chapter One" && unit.kind == story_core::ContentUnitKind::ChapterBody
+        })
+        .expect("chapter-level Scrivener prose should remain an editable content unit");
+    assert_eq!(
+        reopened.load_content_unit_text(chapter_prose.id).unwrap().0,
+        "Edited Chapter prose survives direct editing and scene navigation."
+    );
     let artifact = destination.join(format!("{} - Default.docx", inventory.title));
     assert!(
         artifact.is_file(),
@@ -537,6 +556,8 @@ fn full_screen_terminal_creates_a_fiction_project_and_saves_a_scene_in_a_pty() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
+    let starting_project = home.join("Starting Project");
+    WriterApp::create_project(&starting_project, "Starting Project").unwrap();
     let python = Command::new("python3").arg("--version").output();
     if python.is_err() {
         eprintln!("skipping Linux PTY workflow: python3 is unavailable");
@@ -544,9 +565,9 @@ fn full_screen_terminal_creates_a_fiction_project_and_saves_a_scene_in_a_pty() {
     }
     let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
     let result = Command::new("python3")
-        .arg(harness)
+        .arg(&harness)
         .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
-        .arg("-")
+        .arg(&starting_project)
         .arg(&home)
         .arg("create-fiction")
         .output()
@@ -569,16 +590,93 @@ fn full_screen_terminal_creates_a_fiction_project_and_saves_a_scene_in_a_pty() {
         "First passage."
     );
 
-    // Complete the same project-service path used by the UI after the PTY
-    // writing step: place the independent scene, reopen it and compile it.
-    let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
-    app.move_scene(scenes[0].scene.id, chapter, 0).unwrap();
+    let resumed = Command::new("python3")
+        .arg(&harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project_path)
+        .arg(&home)
+        .arg("continue-fiction")
+        .output()
+        .expect("resume the saved fiction project through a second PTY session");
+    assert!(
+        resumed.status.success(),
+        "PTY reopen/continue workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&resumed.stdout),
+        String::from_utf8_lossy(&resumed.stderr)
+    );
+    app = WriterApp::open_project(&project_path).unwrap();
+    assert_eq!(
+        app.load_scene_text(scenes[0].scene.id).unwrap().0,
+        "First passage. Continued."
+    );
+
+    // The PTY created both the chapter and its scene through the author UI.
+    // Verify that the persisted structure is used by the production compiler.
+    assert!(
+        app.list_structural_nodes()
+            .unwrap()
+            .iter()
+            .any(|node| node.title == "Opening Chapter")
+    );
     let compiled = app
         .compile_artifact(CompileFormat::Markdown, false)
         .unwrap();
     let manuscript = String::from_utf8(compiled.bytes).unwrap();
-    assert!(manuscript.contains("Chapter One"));
+    assert!(manuscript.contains("Opening Chapter"));
     assert!(manuscript.contains("First passage."));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn full_screen_terminal_creates_and_writes_a_nonfiction_chapter_without_scenes() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+    use story_core::BookType;
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let starting_project = home.join("Starting Project");
+    WriterApp::create_project(&starting_project, "Starting Project").unwrap();
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(&harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&starting_project)
+        .arg(&home)
+        .arg("create-nonfiction")
+        .output()
+        .expect("run the Linux PTY non-fiction lifecycle");
+    assert!(
+        result.status.success(),
+        "PTY non-fiction workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let project_path = home.join("My Book");
+    let app = WriterApp::open_project(&project_path).unwrap();
+    assert_eq!(app.get_project().unwrap().book_type, BookType::Nonfiction);
+    assert!(app.list_scenes(false).unwrap().is_empty());
+    let chapters = app.list_structural_nodes().unwrap();
+    assert!(chapters.iter().any(|node| node.title == "Opening Chapter"));
+    assert!(chapters.iter().all(|node| node.kind != "scene"));
+    let chapter_id = chapters
+        .iter()
+        .find(|node| node.title == "Opening Chapter")
+        .unwrap()
+        .id;
+    let content = app.list_content_units(false).unwrap();
+    let chapter_text = content
+        .iter()
+        .find(|unit| {
+            unit.kind == story_core::ContentUnitKind::ChapterBody
+                && unit.parent_id == Some(chapter_id)
+        })
+        .map(|unit| app.load_content_unit_text(unit.id).unwrap().0)
+        .unwrap();
+    assert!(chapter_text.contains("A chapter written without compulsory scenes."));
 }
 
 #[cfg(target_os = "linux")]

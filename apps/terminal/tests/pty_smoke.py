@@ -125,6 +125,8 @@ def set_size(fd, rows, columns):
 def main():
     binary, project, isolated_home, *modes = sys.argv[1:]
     create_fiction = modes == ["create-fiction"]
+    create_nonfiction = modes == ["create-nonfiction"]
+    continue_fiction = modes == ["continue-fiction"]
     tutorial_navigation = modes == ["tutorial-navigation"]
     scene_rename = modes == ["scene-rename"]
     heading_rename = modes == ["heading-rename"]
@@ -158,6 +160,16 @@ def main():
     section_removal_rehome = modes == ["section-removal-rehome"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
+    if create_fiction or create_nonfiction:
+        # Keep this workflow focused on project lifecycle rather than allowing
+        # first-run onboarding to consume editing keys.
+        onboarding = os.path.join(isolated_home, "config", "writers-ide")
+        os.makedirs(onboarding, exist_ok=True)
+        with open(os.path.join(onboarding, "tutorial-state.json"), "w", encoding="utf-8") as state_file:
+            state_file.write(
+                '{"version":1,"welcome_seen":true,"tutorial_dismissed":true,'
+                '"tutorial_completed":false,"active_tutorial":null}'
+            )
     child_pid, master = pty.fork()
     if child_pid == 0:
         environment = os.environ.copy()
@@ -260,18 +272,11 @@ def main():
             raise AssertionError("Scene Cards presentation did not render its Included and Excluded collections")
 
     def show_outline_tree_presentation():
-        """Open the single hierarchical Outline from the Navigate menu."""
+        """Open the unified hierarchical Outline with its advertised F2 shortcut."""
         menu_start = len(output)
-        os.write(master, b"\x1b[21~")  # F10
-        read_for(0.2)
-        os.write(master, b"\x1b[C" * 3 + b"\x1b[B\r")  # Navigate > Outline
-        if not wait_for_screen_fragments(
-            (b"Outline",), menu_start, timeout=3.0
-        ):
-            raise AssertionError(
-                "Navigate > Outline did not open the hierarchical manuscript view; visible tail: "
-                + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
-            )
+        os.write(master, b"\x1bOQ")  # F2: Outline
+        if not wait_for_workspace_title("Outline", timeout=3.0):
+            raise AssertionError("F2 did not open the unified hierarchical manuscript outline")
 
     def select_visible_menu_item(label):
         for _ in range(64):
@@ -324,25 +329,7 @@ def main():
             ):
                 raise AssertionError("File > Import Scrivener did not open the file browser")
             os.write(master, b"\t")  # focus project list
-            os.write(master, b"\x1b[15~")  # F5 inspect selected .scriv folder
-            if not wait_for_screen_fragments(
-                (b"Scrivener Import", b"Import Details"),
-                menu_start,
-                timeout=10.0,
-            ):
-                raise AssertionError(
-                    "Scrivener selection did not show the concise import preview; screen: "
-                    + repr(terminal_snapshot(output, 24, 80))
-                )
-            screen = "\n".join(terminal_snapshot(output, 24, 80))
-            if "Series Books" in screen or "draft-internal-id" in screen or "unmapped" in screen.lower():
-                raise AssertionError("import preview exposed the old series/mapping failure: " + screen)
-            if not wait_for_screen_fragments((b"Enter Import to WIDE temporary workspace",), timeout=2.0):
-                raise AssertionError(
-                    "preview did not offer automatic import into persistent WIDE working storage; screen: "
-                    + repr(terminal_snapshot(output, 24, 80))
-                )
-            os.write(master, b"\r")  # automatic import; permanent destination is deferred
+            os.write(master, b"\x1b[15~")  # import selected .scriv folder directly to staging
             if expected_titles:
                 imported_outline_ready = wait_for_screen_fragments(
                     tuple(title.encode("utf-8") for title in expected_titles),
@@ -408,6 +395,78 @@ def main():
                     "editor did not return to the imported outline; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
                 )
+            if os.environ.get("WIDE_PTY_TEST_DIRECT_PROSE") == "1":
+                # Chapter-owned prose and scene prose are independent
+                # documents. Revisit both in one session, allow direct-prose
+                # autosave, and ensure switching documents neither creates a
+                # false conflict nor drops scene rows from the outline.
+                output_before_direct_edit = len(output)
+                os.write(master, b"\x1b[A")  # scene -> preceding chapter prose row
+                os.write(master, b"\r")
+                if not wait_for_screen_fragments(
+                    (b"direct prose", b"Chapter prose survives direct editing"),
+                    output_before_direct_edit,
+                    timeout=5.0,
+                ):
+                    raise AssertionError(
+                        "chapter-level prose did not open from its outliner row; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                os.write(master, b"Edited ")
+                if not wait_for_screen_fragments(
+                    (b"Autosaved",), output_before_direct_edit, timeout=8.0
+                ):
+                    raise AssertionError(
+                        "direct chapter prose did not autosave cleanly; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                if b"Autosave could not save" in output[output_before_direct_edit:]:
+                    raise AssertionError("direct chapter prose autosave reported a conflict")
+                navigation_start = len(output)
+                os.write(master, b"\x1b")  # return to outliner
+                if not wait_for_screen_fragments((b"Outline",), navigation_start, timeout=3.0):
+                    raise AssertionError("Escape did not return from direct prose to the outline")
+                os.write(master, b"\x1b[B")  # chapter prose -> scene row
+                os.write(master, b"\r")
+                if not wait_for_screen_fragments(
+                    (b"The patient blacksmith", b"Additional UAT sentence."),
+                    output_before_direct_edit,
+                    timeout=5.0,
+                ):
+                    raise AssertionError(
+                        "scene row disappeared or scene text changed after direct-prose autosave; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                navigation_start = len(output)
+                os.write(master, b"\x1b")
+                if not wait_for_screen_fragments((b"Outline",), navigation_start, timeout=3.0):
+                    raise AssertionError("Escape did not return from the scene to the outline")
+                os.write(master, b"\x1b[A")
+                os.write(master, b"\r")
+                if not wait_for_screen_fragments(
+                    (b"Edited Chapter prose survives direct editing",),
+                    output_before_direct_edit,
+                    timeout=5.0,
+                ):
+                    raise AssertionError(
+                        "reopening direct chapter prose did not show the autosaved edit; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                navigation_start = len(output)
+                os.write(master, b"\x1b")
+                if not wait_for_screen_fragments((b"Outline",), navigation_start, timeout=3.0):
+                    raise AssertionError("Escape did not leave reopened chapter prose")
+                os.write(master, b"\x1b[B")
+                os.write(master, b"\r")
+                if not wait_for_screen_fragments(
+                    (b"The patient blacksmith", b"Additional UAT sentence."),
+                    output_before_direct_edit,
+                    timeout=5.0,
+                ):
+                    raise AssertionError(
+                        "repeated scene navigation lost the imported scene; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
             menu_start = len(output)
             os.write(master, b"\x1b[21~")
             read_for(0.2)
@@ -1144,11 +1203,13 @@ def main():
 
             def create_chapter(title):
                 menu_start = len(output)
-                os.write(master, b"\x1b[21~")  # F10
-                read_for(0.15)
-                os.write(master, b"\x1b[C" * 2)  # Insert menu
-                read_for(0.15)
-                os.write(master, b"\x1b[B\r")  # New Chapter
+                os.write(master, b"\x10")  # Ctrl+P: searchable command palette
+                if not wait_for_screen_fragments((b"Search commands",), menu_start, timeout=3.0):
+                    raise AssertionError("command palette did not open for chapter creation")
+                os.write(master, b"New Chapter")
+                if not wait_for_screen_fragments((b"New Chapter",), menu_start, timeout=3.0):
+                    raise AssertionError("command palette did not find New Chapter")
+                os.write(master, b"\r")
                 if not wait_for_fragments((b":chapter_",), menu_start, timeout=3.0):
                     raise AssertionError(
                         "Insert > New Chapter did not open its title prompt; output tail: "
@@ -1268,43 +1329,117 @@ def main():
             print("PTY publishing workflow passed: menu → DOCX file browser → compiled output and success feedback.")
             return
 
-        if create_fiction:
-            startup_deadline = time.monotonic() + 5.0
-            while (
-                (b"Open" not in output or b"Scrivener" not in output)
-                and time.monotonic() < startup_deadline
-            ):
-                read_for(0.25)
-            if b"Open" not in output or b"Scrivener" not in output:
-                raise AssertionError(
-                    "first-run project chooser was not rendered; output tail: "
-                    + repr(bytes(output[-2400:]))
-                )
-            os.write(master, b"\r")  # select New Project from the start screen
-            read_for(0.4)
+        if create_fiction or create_nonfiction:
+            read_for(0.5)
+            if not wait_for_screen_fragments((b"No scenes yet",), timeout=3.0):
+                raise AssertionError("welcome panel did not reveal the starting project")
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10, File menu
+            read_for(0.2)
+            select_visible_menu_item("New Project")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"New Project", b"Fiction"), menu_start, timeout=3.0):
+                raise AssertionError("File > New Project did not open its title/type dialogue")
             browser_deadline = time.monotonic() + 5.0
             while (
-                (b"Directory" not in output or b"type" not in output)
+                (b"New Project" not in output or b"Fiction" not in output)
                 and time.monotonic() < browser_deadline
             ):
                 read_for(0.25)
-            if b"Directory" not in output or b"type" not in output:
-                raise AssertionError("New Project did not open the type-aware folder browser")
-            # The title field is initially focused. Tab to the required
-            # Fiction/Non-fiction selector, choose its visible default, then
-            # tab to Create Project and confirm.
-            os.write(master, b"\t\r\t\r")
-            if not wait_for_fragments(
-                (b"Included", b"Excluded"), timeout=5.0
-            ):
+            if b"New Project" not in output or b"Fiction" not in output:
+                raise AssertionError("New Project did not open the compact title/type dialogue")
+            if b"Directory tree" in ANSI_CONTROL.sub(b"", output[-1200:]):
+                raise AssertionError("New Project unexpectedly displayed a directory browser")
+            # Select Non-fiction when requested, then create directly into
+            # managed temporary storage without a location picker.
+            if create_nonfiction:
+                os.write(master, b"\t\x1b[C\t\r")
+            else:
+                os.write(master, b"\t\t\r")
+            expected_project_markers = (b"Created",) if create_nonfiction else (b"Created My Novel", b"Included", b"Excluded")
+            if not wait_for_screen_fragments(expected_project_markers, timeout=5.0):
                 raise AssertionError(
                     "Enter on Create Project did not open the new fiction project; output tail: "
                     + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
                 )
-            os.write(master, b"\x1b[2~")  # Insert: create a scene
-            read_for(0.2)
+            exited_pid, exited_status = os.waitpid(child_pid, os.WNOHANG)
+            if exited_pid == child_pid:
+                raise AssertionError(
+                    f"application exited after creating the staged project with status {exited_status}; "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1200:]))
+                )
+            read_for(0.3)
+            menu_start = len(output)
+            os.write(master, b"\x10")  # Ctrl+P: searchable command palette
+            if not wait_for_screen_fragments((b"Search commands",), menu_start, timeout=3.0):
+                raise AssertionError(
+                    "command palette did not open for chapter creation; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"New Chapter")
+            if not wait_for_screen_fragments((b"New Chapter",), menu_start, timeout=3.0):
+                raise AssertionError("command palette did not find New Chapter")
+            os.write(master, b"\r")
+            if not wait_for_fragments((b":chapter_",), menu_start, timeout=3.0):
+                raise AssertionError("New Chapter did not open its title prompt")
+            os.write(master, b"Opening Chapter\r")
+            if not wait_for_screen_fragments((b"Opening Chapter",), timeout=3.0):
+                raise AssertionError("New Chapter was not shown in the outline")
+            if create_nonfiction:
+                menu_start = len(output)
+                os.write(master, b"\x10")  # command palette: write chapter prose
+                if not wait_for_screen_fragments((b"Search commands",), menu_start, timeout=3.0):
+                    raise AssertionError("command palette did not open for chapter writing")
+                os.write(master, b"Write Selected Chapter")
+                if not wait_for_screen_fragments((b"Write Selected Chapter",), menu_start, timeout=3.0):
+                    raise AssertionError("command palette did not find Write Selected Chapter")
+                os.write(master, b"\r")
+                if not wait_for_workspace_title("Editor"):
+                    raise AssertionError(
+                        "selected non-fiction chapter did not open for writing; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                os.write(master, b"A chapter written without compulsory scenes.")
+                edit_start = len(output)
+                if not wait_for_screen_fragments((b"Autosaved",), edit_start, timeout=10.0):
+                    raise AssertionError(
+                        "non-fiction chapter prose did not autosave; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                os.write(master, b"\x13")
+                if not wait_for(b"Save Project As", edit_start):
+                    raise AssertionError("first non-fiction Save did not request a permanent location")
+                os.write(master, b"\x1b[15~")
+                if not wait_for_screen_fragments((b"Confirm Save Copy",), timeout=3.0):
+                    raise AssertionError("non-fiction Save As did not ask before creating its destination")
+                os.write(master, b"\x1b[15~")
+                if not wait_for_screen_fragments((b"Saved project at",), timeout=3.0):
+                    raise AssertionError("non-fiction project was not promoted to permanent storage")
+                os.write(master, b"\x11")
+                quit_deadline = time.monotonic() + 5.0
+                finished_pid = 0
+                status = 0
+                while finished_pid == 0 and time.monotonic() < quit_deadline:
+                    read_for(0.1)
+                    finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                    raise AssertionError("application did not exit cleanly after non-fiction writing")
+                print("PTY non-fiction lifecycle passed: created a chapter-only project, wrote, autosaved and promoted it.")
+                return
+            menu_start = len(output)
+            os.write(master, b"\x10")  # Ctrl+P: searchable command palette
+            if not wait_for_screen_fragments((b"Search commands",), menu_start, timeout=3.0):
+                raise AssertionError("command palette did not open for scene creation")
+            os.write(master, b"New Scene")
+            if not wait_for_screen_fragments((b"New Scene",), menu_start, timeout=3.0):
+                raise AssertionError("command palette did not find New Scene")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"New scene",), menu_start, timeout=3.0):
+                raise AssertionError("New Scene did not open its title prompt")
             os.write(master, b"Opening\r")
-            read_for(0.5)
+            if not wait_for_screen_fragments((b"Opening",), timeout=3.0):
+                raise AssertionError("New Scene was not shown in the outline")
+            read_for(0.3)
             os.write(master, b"\r")  # Open the selected scene
             read_for(0.4)
             os.write(master, b"First passage.")
@@ -1346,6 +1481,56 @@ def main():
             print(
                 "PTY fiction workflow passed: choose Fiction, create project, insert scene, write, save and exit."
             )
+            return
+
+        if continue_fiction:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")
+            menu_start = len(output)
+            os.write(master, b"\x10")  # Open Project through the shared command registry
+            if not wait_for_screen_fragments((b"Search commands",), menu_start, timeout=3.0):
+                raise AssertionError("Open Project could not be discovered after reopening the project")
+            os.write(master, b"Open Project")
+            if not wait_for_screen_fragments((b"Open Project",), menu_start, timeout=3.0):
+                raise AssertionError("command palette did not find Open Project")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Open Project", b"Projects"), menu_start, timeout=5.0):
+                raise AssertionError(
+                    "Open Project did not show its folder browser; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            # Open the Projects pane and select the project folder. Open Project
+            # treats a recognised WIDE directory as one project, not as a folder
+            # whose internal files need to be browsed.
+            os.write(master, b"\t\x1b[B\x1b[B\r")
+            if not wait_for_screen_fragments((b"Opening Chapter", b"Opening"), timeout=10.0):
+                raise AssertionError("Open Project did not enter the selected project workspace")
+            # Explicitly route through the outliner and open the selected
+            # manuscript item. Old terminal output can otherwise make a
+            # historical scene preview look like the currently focused editor.
+            show_outline_tree_presentation()
+            os.write(master, b"\r")
+            if not wait_for_workspace_title("Editor", timeout=5.0):
+                raise AssertionError("reopened manuscript item did not open in the editor")
+            if not wait_for_screen_fragments((b"First passage.",), timeout=5.0):
+                raise AssertionError("reopened scene content was not visible for continued writing")
+            os.write(master, b"\x1b[1;5F Continued.")  # Ctrl+End, then append at document end
+            edit_start = len(output)
+            if not wait_for_screen_fragments((b"Autosaved",), edit_start, timeout=5.0):
+                raise AssertionError("continued writing was not autosaved after reopening")
+            os.write(master, b"\x13")  # Ctrl+S: save the promoted project
+            if not wait_for_screen_fragments((b"Saved",), edit_start, timeout=5.0):
+                raise AssertionError("continued writing did not report a successful save")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after continuing the project")
+            print("PTY reopen passed: reopened the promoted project, continued writing, autosaved and saved.")
             return
 
         # A fresh isolated profile shows the welcome panel. Use its visible
@@ -1730,14 +1915,17 @@ def main():
         os.write(master, b"\x1b[21~")  # F10 opens File
         read_for(0.2)
         os.write(master, b"n")
-        if not wait_for_screen_fragments((b"Project title", b"Create Project"), timeout=3.0):
-            raise AssertionError("File > n did not open the New Project dialogue")
+        if not wait_for_screen_fragments((b"Title", b"Create"), timeout=3.0):
+            raise AssertionError(
+                "File > n did not open the New Project dialogue; screen: "
+                + repr(terminal_snapshot(output, 24, 80))
+            )
         os.write(master, b"\x1b")  # cancel without creating a project
         read_for(0.3)
         assert_sample_prose_visible(output, 24, 80, "screen after cancelling New Project")
 
         os.write(master, b"\x0e")  # Ctrl+N
-        if not wait_for_screen_fragments((b"Project title", b"Create Project"), timeout=3.0):
+        if not wait_for_screen_fragments((b"Title", b"Create"), timeout=3.0):
             raise AssertionError("Ctrl+N did not open the New Project dialogue")
         os.write(master, b"\x1b")  # cancel without creating a project
         read_for(0.3)
@@ -1773,7 +1961,13 @@ def main():
         read_for(0.2)
         select_visible_menu_item("Manuscript")
         os.write(master, b"\r")
-        read_for(0.4)
+        if not wait_for_workspace_title("Editor", timeout=3.0):
+            raise AssertionError(
+                "Navigate > Manuscript did not restore the editor; screen: "
+                + repr(terminal_snapshot(output, 24, 80))
+            )
+        if not wait_for_screen_fragments((b"The opening paragraph remains readable.",), timeout=3.0):
+            raise AssertionError("manuscript prose was not rendered after returning from Reference Library")
         assert_sample_prose_visible(output, 24, 80, "screen after returning from Reference Library")
         if any("Reference only stays clear." in row for row in terminal_snapshot(output, 24, 80)):
             raise AssertionError("reference prose leaked into the manuscript editor")

@@ -298,6 +298,7 @@ struct AppState {
     quit_requested: bool,
     quit_after_project_save: bool,
     close_after_project_save: bool,
+    pending_project_open: Option<PathBuf>,
     pending_command_sequence: Option<PendingCommandSequence>,
     keybinding_manager: Option<KeybindingManagerState>,
     revision_diff: Option<story_core::SnapshotId>,
@@ -7878,6 +7879,7 @@ impl AppState {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -9844,7 +9846,8 @@ impl AppState {
             name,
             folder_name,
             folder_name_overridden: false,
-            new_project_book_type: None,
+            new_project_book_type: (purpose == FileBrowserPurpose::NewProject)
+                .then_some(story_core::BookType::Fiction),
             overwrite_confirmed: false,
             compile_profile: None,
             org_import_mode: story_import::OrgImportMode::SingleDocument,
@@ -9869,6 +9872,8 @@ impl AppState {
                 .into()
         } else if purpose == FileBrowserPurpose::ImportDocument {
             "Choose a text, Markdown, or Org file · F5 previews import options".into()
+        } else if purpose == FileBrowserPurpose::OpenProject {
+            "Choose a Writer's IDE project · Enter opens a project or browses a folder · Esc cancels".into()
         } else {
             "Choose a folder or filename · F5 confirms · F7 creates folder · Esc cancels".into()
         };
@@ -10145,10 +10150,16 @@ impl AppState {
                 {
                     self.close_after_project_save = false;
                     self.mode = Some('X');
-                    self.prompt =
-                        "Save Project and Close (s) · Discard and Close (d) · Cancel (Esc)".into();
-                    self.message =
-                        "Project copy cancelled; your temporary project remains open.".into();
+                    if self.pending_project_open.is_some() {
+                        self.prompt = "Save Project and Open Selected (s) · Discard and Open Selected (d) · Cancel (Esc)".into();
+                        self.message = "Save As cancelled; your current project remains open and the selected project has not been opened.".into();
+                    } else {
+                        self.prompt =
+                            "Save Project and Close (s) · Discard and Close (d) · Cancel (Esc)"
+                                .into();
+                        self.message =
+                            "Project copy cancelled; your temporary project remains open.".into();
+                    }
                 } else {
                     self.message = "File selection cancelled".into();
                 }
@@ -10168,6 +10179,12 @@ impl AppState {
                     5 => 4,
                     _ => 5,
                 };
+            }
+            KeyCode::Tab if browser.purpose == FileBrowserPurpose::OpenProject => {
+                browser.focus = (browser.focus + 1) % 2;
+            }
+            KeyCode::BackTab if browser.purpose == FileBrowserPurpose::OpenProject => {
+                browser.focus = (browser.focus + 1) % 2;
             }
             KeyCode::Tab => browser.focus = (browser.focus + 1) % 3,
             KeyCode::BackTab => browser.focus = (browser.focus + 2) % 3,
@@ -10322,9 +10339,24 @@ impl AppState {
             {
                 let ancestors = file_browser_ancestors(&browser.current_dir);
                 if let Some(path) = ancestors.get(browser.tree_selected).cloned() {
-                    match set_file_browser_directory(&mut browser, path) {
-                        Ok(()) => browser.overwrite_confirmed = false,
-                        Err(error) => self.message = format!("Could not open folder: {error}"),
+                    if browser.purpose == FileBrowserPurpose::OpenProject
+                        && path.join("project.toml").is_file()
+                    {
+                        match self.request_open_project(path) {
+                            Ok(()) => close = self.file_browser.is_none(),
+                            Err(error) => {
+                                self.message = format!(
+                                    "That Writer's IDE project could not be opened: {error}. The current project is unchanged."
+                                );
+                                self.file_browser = Some(browser);
+                                return Ok(());
+                            }
+                        }
+                    } else {
+                        match set_file_browser_directory(&mut browser, path) {
+                            Ok(()) => browser.overwrite_confirmed = false,
+                            Err(error) => self.message = format!("Could not open folder: {error}"),
+                        }
                     }
                 }
             }
@@ -10332,6 +10364,22 @@ impl AppState {
                 if browser.purpose == FileBrowserPurpose::NewProject && browser.focus == 2 =>
             {
                 browser.focus = 4;
+            }
+            KeyCode::Left | KeyCode::Right
+                if browser.purpose == FileBrowserPurpose::NewProject && browser.focus == 4 =>
+            {
+                let selected_type = match browser.new_project_book_type {
+                    Some(story_core::BookType::Nonfiction) => story_core::BookType::Fiction,
+                    _ => story_core::BookType::Nonfiction,
+                };
+                if browser.name == "My Novel" || browser.name == "My Book" {
+                    browser.name = match selected_type {
+                        story_core::BookType::Nonfiction => "My Book",
+                        _ => "My Novel",
+                    }
+                    .to_owned();
+                }
+                browser.new_project_book_type = Some(selected_type);
             }
             KeyCode::Enter
                 if browser.focus == 2
@@ -10367,9 +10415,26 @@ impl AppState {
                 if let Some((name, is_dir)) = browser.entries.get(browser.selected).cloned() {
                     if is_dir {
                         let path = browser.current_dir.join(name);
-                        match set_file_browser_directory(&mut browser, path) {
-                            Ok(()) => browser.overwrite_confirmed = false,
-                            Err(error) => self.message = format!("Could not open folder: {error}"),
+                        if browser.purpose == FileBrowserPurpose::OpenProject
+                            && path.join("project.toml").is_file()
+                        {
+                            match self.request_open_project(path) {
+                                Ok(()) => close = self.file_browser.is_none(),
+                                Err(error) => {
+                                    self.message = format!(
+                                        "That Writer's IDE project could not be opened: {error}. The current project is unchanged."
+                                    );
+                                    self.file_browser = Some(browser);
+                                    return Ok(());
+                                }
+                            }
+                        } else {
+                            match set_file_browser_directory(&mut browser, path) {
+                                Ok(()) => browser.overwrite_confirmed = false,
+                                Err(error) => {
+                                    self.message = format!("Could not open folder: {error}")
+                                }
+                            }
                         }
                     } else if matches!(
                         browser.purpose,
@@ -10378,7 +10443,7 @@ impl AppState {
                             | FileBrowserPurpose::ImportScrivenerSeries
                     ) {
                         if !name.ends_with(".scrivx") {
-                            self.message = "Select a .scrivx manifest and press Enter for preview, or F5 to inspect/import".into();
+                            self.message = "Select a Scrivener project or .scrivx manifest and press Enter or F5 to import into temporary workspace".into();
                             self.file_browser = Some(browser);
                             return Ok(());
                         } else {
@@ -10398,6 +10463,11 @@ impl AppState {
                         browser.overwrite_confirmed = false;
                     }
                 }
+            }
+            KeyCode::F(7) if browser.purpose == FileBrowserPurpose::OpenProject => {
+                self.message =
+                    "Open Project only opens existing WIDE projects; select a project folder"
+                        .into();
             }
             KeyCode::F(7) if browser.purpose != FileBrowserPurpose::NewProject => {
                 let folder = browser.name.trim();
@@ -10450,26 +10520,31 @@ impl AppState {
                 let destination = browser.current_dir.join(name);
                 match browser.purpose {
                     FileBrowserPurpose::OpenProject => {
-                        let selected = browser
+                        let tree_project = file_browser_ancestors(&browser.current_dir)
+                            .get(browser.tree_selected)
+                            .filter(|path| path.join("project.toml").is_file())
+                            .cloned();
+                        let listed_project = browser
                             .entries
                             .get(browser.selected)
-                            .map(|entry| entry.0.as_str());
-                        let project_path = selected
-                            .map(|item| browser.current_dir.join(item))
+                            .map(|entry| browser.current_dir.join(&entry.0))
                             .filter(|path| path.is_dir() && path.join("project.toml").is_file());
+                        let project_path = if browser.focus == 0 {
+                            tree_project.or(listed_project)
+                        } else {
+                            listed_project.or(tree_project)
+                        };
                         let Some(project_path) = project_path else {
-                            self.message =
-                                "Select a folder containing project.toml, then press F5".into();
+                            self.message = "Select a Writer's IDE project folder and press Enter or F5. Ordinary folders open for browsing.".into();
                             self.file_browser = Some(browser);
                             return Ok(());
                         };
-                        match self.switch_to_project(
-                            project_path.clone(),
-                            format!("Opened project: {}", project_path.display()),
-                        ) {
-                            Ok(()) => close = true,
+                        match self.request_open_project(project_path) {
+                            Ok(()) => close = self.file_browser.is_none(),
                             Err(error) => {
-                                self.message = format!("Could not open project: {error}");
+                                self.message = format!(
+                                    "That Writer's IDE project could not be opened: {error}. The current project is unchanged."
+                                );
                                 self.file_browser = Some(browser);
                                 return Ok(());
                             }
@@ -10752,7 +10827,19 @@ impl AppState {
                                 }
                                 if close_after_save {
                                     self.close_after_project_save = false;
-                                    self.close_project_to_start_screen()?;
+                                    if let Some(target) = self.pending_project_open.take() {
+                                        self.mode = None;
+                                        self.prompt.clear();
+                                        self.switch_to_project(
+                                            target.clone(),
+                                            format!(
+                                                "Saved current project · opened {}",
+                                                target.display()
+                                            ),
+                                        )?;
+                                    } else {
+                                        self.close_project_to_start_screen()?;
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -11079,6 +11166,30 @@ impl AppState {
             notice,
         )
     }
+    fn request_open_project(&mut self, path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+        // Validate the selected project before prompting to leave the current
+        // one. An invalid target must not disturb the active workspace.
+        drop(WriterApp::open_project(&path)?);
+        if self.dirty || self.temporary_project {
+            self.pending_project_open = Some(path.clone());
+            self.mode = Some('X');
+            self.prompt = if self.temporary_project {
+                "Save Project and Open Selected (s) · Discard and Open Selected (d) · Cancel (Esc)"
+                    .into()
+            } else {
+                "Save and Open Selected (s) · Discard Changes and Open Selected (d) · Cancel (Esc)"
+                    .into()
+            };
+            self.message = format!(
+                "Open {}? Your current project remains active until you choose.",
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("the selected project")
+            );
+            return Ok(());
+        }
+        self.switch_to_project(path.clone(), format!("Opened project: {}", path.display()))
+    }
     fn switch_to_open_project(
         &mut self,
         path: PathBuf,
@@ -11185,8 +11296,6 @@ impl AppState {
         let series_root = staged_projects_root();
         fs::create_dir_all(&series_root)?;
         let plan = story_import::ScrivenerImportPlan::proposed(&inventory);
-        let item_count = inventory.items.len();
-        let preview = plan.preview(&inventory)?;
         let book_title = inventory
             .project_title()
             .unwrap_or(&inventory.title)
@@ -11202,14 +11311,12 @@ impl AppState {
         });
         self.series_reference_view = false;
         self.selected = 0;
-        self.workspace = Workspace::Series;
-        self.message = format!(
-            "Import preview: {item_count} binder items · {} manuscript · {} private research · {} review notes · Enter imports to WIDE temporary storage · Save later chooses a permanent location · Esc cancel",
-            preview.manuscript_items,
-            preview.research_items,
-            preview.unsupported.len()
-        );
-        Ok(())
+        self.message = "Importing Scrivener project into WIDE's temporary workspace…".into();
+        // The ordinary Import command is safe to run directly into persistent
+        // WIDE staging. Keep mapping review available to advanced workflows,
+        // but do not force authors through a second confirmation screen for
+        // a non-destructive import into a temporary project.
+        self.commit_scrivener_import()
     }
     fn start_scrivener_import_current(
         &mut self,
@@ -30057,6 +30164,13 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         return;
     }
     let area = f.area();
+    if browser.purpose == FileBrowserPurpose::NewProject {
+        if area.width < 32 || area.height < 9 {
+            return;
+        }
+        draw_new_project_dialog(f, area, browser, &s.message);
+        return;
+    }
     if area.width < 30 || area.height < 12 {
         return;
     }
@@ -30168,11 +30282,18 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             .highlight_style(Style::default().bg(Color::Blue).fg(Color::White))
             .block(
                 Block::default()
-                    .title(if browser.focus == 1 {
-                        "Folder contents · focused"
-                    } else {
-                        "Folder contents"
-                    })
+                    .title(
+                        if browser.purpose == FileBrowserPurpose::OpenProject && browser.focus == 1
+                        {
+                            "Projects · focused"
+                        } else if browser.purpose == FileBrowserPurpose::OpenProject {
+                            "Projects"
+                        } else if browser.focus == 1 {
+                            "Folder contents · focused"
+                        } else {
+                            "Folder contents"
+                        },
+                    )
                     .borders(Borders::ALL),
             ),
         columns[1],
@@ -30211,20 +30332,22 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         .wrap(Wrap { trim: true }),
         chunks[1],
     );
-    let title_label = if browser.purpose == FileBrowserPurpose::NewProject {
-        "Project title"
-    } else {
-        "Name"
-    };
-    f.render_widget(
-        Paragraph::new(format!(
-            "{title_label}: {}{}",
-            browser.name,
-            if browser.focus == 2 { "▏" } else { "" }
-        ))
-        .style(Style::default().fg(Color::Yellow)),
-        chunks[2],
-    );
+    if browser.purpose != FileBrowserPurpose::OpenProject {
+        let title_label = if browser.purpose == FileBrowserPurpose::NewProject {
+            "Project title"
+        } else {
+            "Name"
+        };
+        f.render_widget(
+            Paragraph::new(format!(
+                "{title_label}: {}{}",
+                browser.name,
+                if browser.focus == 2 { "▏" } else { "" }
+            ))
+            .style(Style::default().fg(Color::Yellow)),
+            chunks[2],
+        );
+    }
     if browser.purpose == FileBrowserPurpose::NewProject {
         f.render_widget(
             Paragraph::new("Temporary project folder will be assigned automatically")
@@ -30284,8 +30407,8 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         )
     } else if browser.purpose == FileBrowserPurpose::OpenProject {
         (
-            "F5 Open Project · Enter Browse/Open · Esc Cancel",
-            "Tab/Shift+Tab: panes · Home: Home · /: Root · Backspace: Parent",
+            "Enter Open project / browse folder · F5 Open selected project · Esc Cancel",
+            "Tab/Shift+Tab: tree and projects · Home: Home · /: Root · Backspace: Parent",
         )
     } else if browser.purpose == FileBrowserPurpose::OpenTextFile {
         (
@@ -30332,6 +30455,115 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             Line::from(truncate_display_cells(navigation, chunks[7].width as usize)),
         ]),
         chunks[7],
+    );
+}
+
+fn draw_new_project_dialog(
+    f: &mut ratatui::Frame<'_>,
+    area: Rect,
+    browser: &FileBrowserState,
+    message: &str,
+) {
+    let width = area.width.clamp(32, 58);
+    let height = area.height.clamp(9, 13);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" New Project ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(1),
+        ])
+        .split(inner);
+    f.render_widget(Paragraph::new("Title"), rows[0]);
+    f.render_widget(
+        Paragraph::new(format!(
+            "{}{}",
+            browser.name,
+            if browser.focus == 2 { "▏" } else { "" }
+        ))
+        .block(Block::default().borders(Borders::ALL))
+        .style(if browser.focus == 2 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default()
+        }),
+        rows[1],
+    );
+    f.render_widget(Paragraph::new("Book type"), rows[2]);
+    let fiction = browser.new_project_book_type == Some(story_core::BookType::Fiction);
+    let type_line = Line::from(vec![
+        Span::styled(
+            if fiction {
+                "[ Fiction ]"
+            } else {
+                "  Fiction  "
+            },
+            if browser.focus == 4 && fiction {
+                Style::default().fg(Color::White).bg(Color::Blue)
+            } else {
+                Style::default().fg(Color::Cyan)
+            },
+        ),
+        Span::raw("   "),
+        Span::styled(
+            if fiction {
+                "  Non-fiction  "
+            } else {
+                "[ Non-fiction ]"
+            },
+            if browser.focus == 4 && !fiction {
+                Style::default().fg(Color::White).bg(Color::Blue)
+            } else {
+                Style::default().fg(Color::Cyan)
+            },
+        ),
+    ]);
+    f.render_widget(Paragraph::new(type_line), rows[3]);
+    f.render_widget(
+        Paragraph::new(format!(
+            "{}   {}",
+            if browser.focus == 5 {
+                "[ Create ]"
+            } else {
+                "  Create  "
+            },
+            if browser.focus == 6 {
+                "[ Cancel ]"
+            } else {
+                "  Cancel  "
+            }
+        ))
+        .style(Style::default().fg(Color::Green)),
+        rows[4],
+    );
+    let instructions = if message.is_empty() {
+        "Type a title · Tab changes choice · Enter selects · Esc cancels"
+    } else {
+        message
+    };
+    f.render_widget(
+        Paragraph::new(truncate_display_cells(
+            instructions,
+            rows[5].width.saturating_sub(1) as usize,
+        ))
+        .style(Style::default().fg(Color::Gray)),
+        rows[5],
     );
 }
 
@@ -34039,7 +34271,12 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 KeyCode::Esc => {
                     s.mode = None;
                     s.prompt.clear();
-                    s.message = "Close Project cancelled · the project remains open".into();
+                    if s.pending_project_open.take().is_some() {
+                        s.message =
+                            "Open Project cancelled · your current project remains open".into();
+                    } else {
+                        s.message = "Close Project cancelled · the project remains open".into();
+                    }
                 }
                 KeyCode::Char('s' | 'S') => {
                     if s.temporary_project {
@@ -34053,7 +34290,19 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                             Ok(()) if !s.dirty => {
                                 s.mode = None;
                                 s.prompt.clear();
-                                if let Err(error) = s.close_project_to_start_screen() {
+                                if let Some(target) = s.pending_project_open.take() {
+                                    if let Err(error) = s.switch_to_project(
+                                        target.clone(),
+                                        format!(
+                                            "Saved current project · opened {}",
+                                            target.display()
+                                        ),
+                                    ) {
+                                        s.message = format!(
+                                            "Current project is saved and remains open; selected project failed to open: {error}"
+                                        );
+                                    }
+                                } else if let Err(error) = s.close_project_to_start_screen() {
                                     s.message = format!("Project remains open: {error}");
                                 }
                             }
@@ -34072,7 +34321,20 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     s.dirty = false;
                     s.mode = None;
                     s.prompt.clear();
-                    if let Err(error) = s.close_project_to_start_screen() {
+                    if let Some(target) = s.pending_project_open.take() {
+                        if let Err(error) = s.close_project_to_start_screen() {
+                            s.message = format!(
+                                "Current project was not closed; selected project remains unopened: {error}"
+                            );
+                        } else if let Err(error) = s.switch_to_project(
+                            target.clone(),
+                            format!("Discarded temporary changes · opened {}", target.display()),
+                        ) {
+                            s.message = format!(
+                                "The current project was closed, but the selected project failed to open: {error}"
+                            );
+                        }
+                    } else if let Err(error) = s.close_project_to_start_screen() {
                         s.message = format!("Project remains open: {error}");
                     }
                 }
@@ -36115,12 +36377,89 @@ mod tests {
                 .unwrap();
         }
         state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
 
         assert_eq!(state.app.get_project().unwrap().title, "Target Novel");
         assert_eq!(state.app.project_root(), target_path);
         assert!(state.message.contains("Opened project"));
+    }
+
+    #[test]
+    fn opening_a_project_from_a_temporary_workspace_offers_cancel_without_switching() {
+        let current_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let current =
+            WriterApp::create_project(current_root.path().join("Current"), "Current").unwrap();
+        let target_path = target_root.path().join("Target");
+        drop(WriterApp::create_project(&target_path, "Target").unwrap());
+        let mut state = AppState::new(current, default_bindings());
+        state.temporary_project = true;
+        state
+            .dispatch_registered_command_id("file.open-project")
+            .unwrap();
+        {
+            let browser = state.file_browser.as_mut().unwrap();
+            browser.current_dir = target_root.path().to_owned();
+            browser.entries = file_browser_entries(target_root.path()).unwrap();
+            browser.selected = 0;
+            browser.focus = 1;
+        }
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(state.mode, Some('X'));
+        assert!(state.prompt.contains("Save Project and Open Selected"));
+        assert_eq!(state.app.get_project().unwrap().title, "Current");
+        assert_eq!(
+            state.pending_project_open.as_deref(),
+            Some(target_path.as_path())
+        );
+
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+
+        assert_eq!(state.app.get_project().unwrap().title, "Current");
+        assert!(state.pending_project_open.is_none());
+        assert_eq!(state.mode, None);
+    }
+
+    #[test]
+    fn cancelling_save_as_during_open_keeps_the_open_target_and_temporary_work() {
+        let current_root = tempfile::tempdir().unwrap();
+        let target_root = tempfile::tempdir().unwrap();
+        let current =
+            WriterApp::create_project(current_root.path().join("Current"), "Current").unwrap();
+        let target_path = target_root.path().join("Target");
+        drop(WriterApp::create_project(&target_path, "Target").unwrap());
+        let mut state = AppState::new(current, default_bindings());
+        state.temporary_project = true;
+        state.request_open_project(target_path.clone()).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::SaveProjectAs
+        );
+
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(state.app.get_project().unwrap().title, "Current");
+        assert!(state.temporary_project);
+        assert_eq!(state.mode, Some('X'));
+        assert!(state.prompt.contains("Save Project and Open Selected"));
+        assert_eq!(
+            state.pending_project_open.as_deref(),
+            Some(target_path.as_path())
+        );
     }
 
     #[test]
@@ -36308,9 +36647,6 @@ mod tests {
         assert!(state.file_browser.is_some());
         state.file_browser.as_mut().unwrap().name = "A New Project".into();
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
-            .unwrap();
-        state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
 
@@ -36415,9 +36751,6 @@ mod tests {
             let browser = state.file_browser.as_mut().unwrap();
             browser.name = "Existing".into();
         }
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
-            .unwrap();
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
@@ -37418,19 +37751,10 @@ mod tests {
             .start_scrivener_import_standalone(source.clone())
             .unwrap();
         assert!(state.selected_series_root.is_none());
-        assert!(state.message.contains("Import preview"));
-        let wizard = state.scrivener_import.as_ref().unwrap();
-        wizard
-            .plan
-            .validate_for_import(&wizard.inventory)
-            .expect("automatic mapping should preserve and validate the full binder");
-        assert!(wizard.destination_selected);
-        assert!(
-            state
-                .message
-                .contains("Save later chooses a permanent location")
-        );
-        state.commit_scrivener_import().unwrap();
+        assert!(state.scrivener_import.is_none());
+        assert_eq!(state.workspace, Workspace::Outline);
+        assert!(state.temporary_project);
+        assert!(state.message.contains("temporary workspace"));
 
         assert_eq!(state.app.get_project().unwrap().title, "Windows Regression");
         let prose_units = state.app.list_content_units(false).unwrap();
@@ -37505,7 +37829,7 @@ mod tests {
     }
 
     #[test]
-    fn scrivener_browser_f5_inspects_selected_project_before_workspace_shortcuts() {
+    fn normal_scrivener_browser_f5_imports_selected_project_without_review_confirmation() {
         fn copy_tree(source: &Path, destination: &Path) {
             fs::create_dir_all(destination).unwrap();
             for entry in fs::read_dir(source).unwrap() {
@@ -37524,6 +37848,8 @@ mod tests {
             .join("../cli/tests/fixtures/scrivener-windows-311/Windows Regression.scriv");
         let source = root.path().join("Windows Regression.scriv");
         copy_tree(&fixture, &source);
+        let staged_root = staged_projects_root();
+        let _ = fs::remove_dir_all(&staged_root);
         let app = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
         let mut state = AppState::new(app, default_bindings());
         state.workspace = Workspace::Editor;
@@ -37540,10 +37866,13 @@ mod tests {
         handle(&mut state, KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)).unwrap();
 
         assert!(state.file_browser.is_none());
-        let preview = state.scrivener_import.as_ref().unwrap();
-        assert_eq!(preview.target, ScrivenerImportTarget::Standalone);
-        assert!(!preview.inventory.items.is_empty());
-        assert!(state.message.contains("Import preview"));
+        assert!(state.scrivener_import.is_none());
+        assert_eq!(state.workspace, Workspace::Outline);
+        assert_eq!(state.app.get_project().unwrap().title, "Windows Regression");
+        assert!(state.temporary_project);
+        assert!(state.message.contains("temporary workspace"));
+        drop(state);
+        let _ = fs::remove_dir_all(staged_root);
     }
 
     #[test]
@@ -37635,7 +37964,11 @@ mod tests {
         )
         .unwrap();
         assert!(state.file_browser.is_some());
-        assert!(state.message.contains("Select a .scrivx manifest"));
+        assert!(
+            state
+                .message
+                .contains("Select a Scrivener project or .scrivx manifest")
+        );
 
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
@@ -37647,7 +37980,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(screen.contains("Select a .scrivx manifest"));
+        assert!(screen.contains("Select a Scrivener project or .scrivx manifest"));
     }
 
     #[test]
@@ -41648,6 +41981,7 @@ mod tests {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -45532,6 +45866,7 @@ mod tests {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -45696,6 +46031,7 @@ mod tests {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -45968,6 +46304,7 @@ mod tests {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -46136,6 +46473,7 @@ mod tests {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -46454,6 +46792,7 @@ mod tests {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -46622,6 +46961,7 @@ mod tests {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -48432,6 +48772,7 @@ mod tests {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -48735,6 +49076,7 @@ mod tests {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -50367,6 +50709,7 @@ mod tests {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -50546,6 +50889,7 @@ mod tests {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -50777,6 +51121,7 @@ mod tests {
             quit_requested: false,
             quit_after_project_save: false,
             close_after_project_save: false,
+            pending_project_open: None,
             pending_command_sequence: None,
             keybinding_manager: None,
             revision_diff: None,
@@ -52863,9 +53208,6 @@ mod tests {
         browser.folder_name = "Novel Files".into();
         browser.folder_name_overridden = true;
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
-            .unwrap();
-        state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
         let project_path = state.app.project_root().to_owned();
@@ -52923,9 +53265,6 @@ mod tests {
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
             .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
-            .unwrap();
         assert!(state.message.contains("Non-fiction"));
         assert_eq!(state.file_browser.as_ref().unwrap().name, "My Book");
         state
@@ -52947,7 +53286,7 @@ mod tests {
     }
 
     #[test]
-    fn new_project_requires_an_explicit_book_type_choice() {
+    fn new_project_defaults_to_fiction_and_creates_without_a_destination() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
         let mut state = AppState::new(app, default_bindings());
@@ -52959,13 +53298,16 @@ mod tests {
             browser.current_dir = directory.path().to_owned();
             browser.name = "Unchosen".into();
         }
+        assert_eq!(
+            state.file_browser.as_ref().unwrap().new_project_book_type,
+            Some(story_core::BookType::Fiction)
+        );
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
-
-        assert!(state.message.contains("Choose Fiction or Non-fiction"));
-        assert!(!directory.path().join("Unchosen").exists());
-        assert!(state.file_browser.is_some());
+        assert!(state.app.project_root().starts_with(staged_projects_root()));
+        assert_eq!(state.app.get_project().unwrap().title, "Unchosen");
+        assert_eq!(state.workspace, Workspace::Cards);
     }
 
     #[test]
@@ -52996,7 +53338,7 @@ mod tests {
     }
 
     #[test]
-    fn new_project_browser_explains_actions_and_path_at_compact_terminal_size() {
+    fn new_project_dialog_is_compact_and_does_not_show_a_directory_picker() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
         let mut state = AppState::new(app, default_bindings());
@@ -53014,17 +53356,15 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("Directory tree"));
-        assert!(!rendered.contains("Directory tree · focused"));
-        assert!(rendered.contains("Folder contents"));
-        assert!(rendered.contains("WIDE-managed temporary storage:"));
-        assert!(rendered.contains("Project title:"));
-        assert!(rendered.contains("Temporary project folder"));
-        assert!(rendered.contains("Book type: Choose Fiction or Non-fiction"));
-        assert!(rendered.contains("F2 Change"));
-        assert!(rendered.contains("Create Project"));
+        assert!(rendered.contains("New Project"));
+        assert!(!rendered.contains("Directory tree"));
+        assert!(!rendered.contains("Folder contents"));
+        assert!(!rendered.contains("Selected path:"));
+        assert!(rendered.contains("Title"));
+        assert!(rendered.contains("Fiction"));
+        assert!(rendered.contains("Non-fiction"));
+        assert!(rendered.contains("Create"));
         assert!(rendered.contains("Cancel"));
-        assert!(rendered.contains("temporary"));
     }
 
     #[test]
@@ -53155,12 +53495,106 @@ mod tests {
             .iter()
             .position(|entry| entry.0 == "Target")
             .unwrap();
+        // The highlighted folder remains openable from either pane.
+        browser.focus = 0;
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
         assert_eq!(state.app.project_root(), target);
         assert_eq!(state.app.get_project().unwrap().title, "Target");
         assert!(state.file_browser.is_none());
+    }
+
+    #[test]
+    fn open_project_enter_opens_project_as_an_atomic_folder() {
+        let directory = tempfile::tempdir().unwrap();
+        let current =
+            WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
+        let target = directory.path().join("Target");
+        drop(WriterApp::create_project(&target, "Target").unwrap());
+        let mut state = AppState::new(current, default_bindings());
+        state
+            .dispatch_registered_command_id("file.open-project")
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = directory.path().to_owned();
+        browser.entries = file_browser_entries(directory.path()).unwrap();
+        browser.selected = browser
+            .entries
+            .iter()
+            .position(|entry| entry.0 == "Target")
+            .unwrap();
+
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(state.app.project_root(), target);
+        assert_eq!(state.app.get_project().unwrap().title, "Target");
+        assert!(state.file_browser.is_none());
+    }
+
+    #[test]
+    fn open_project_enter_on_tree_project_opens_the_project_object() {
+        let directory = tempfile::tempdir().unwrap();
+        let current =
+            WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
+        let target = directory.path().join("Target");
+        drop(WriterApp::create_project(&target, "Target").unwrap());
+        let mut state = AppState::new(current, default_bindings());
+        state
+            .dispatch_registered_command_id("file.open-project")
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = target.clone();
+        browser.entries = file_browser_entries(&target).unwrap();
+        browser.focus = 0;
+        browser.tree_selected = file_browser_ancestors(&target).len() - 1;
+
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+
+        assert_eq!(state.app.project_root(), target);
+        assert_eq!(state.app.get_project().unwrap().title, "Target");
+        assert!(state.file_browser.is_none());
+    }
+
+    #[test]
+    fn open_project_browser_does_not_offer_new_folder_or_a_filename_field() {
+        let directory = tempfile::tempdir().unwrap();
+        let current =
+            WriterApp::create_project(directory.path().join("Current"), "Current").unwrap();
+        let mut state = AppState::new(current, default_bindings());
+        state
+            .dispatch_registered_command_id("file.open-project")
+            .unwrap();
+
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(7), KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.message.contains("only opens existing WIDE projects"));
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().count(),
+            1,
+            "F7 must not create a folder in Open Project"
+        );
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(!screen.contains("Name:"));
+        assert!(!screen.contains("F7 New Folder"));
     }
 
     #[test]

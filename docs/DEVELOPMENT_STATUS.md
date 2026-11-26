@@ -1307,3 +1307,61 @@ zero generated EPUB errors or warnings. Fixture SHA256SUMS passed before and
 after the run. The import remains incomplete with unsupported mappings and
 publication fidelity remains provisional; this harness correction does not
 resolve Scrivener's missing section-layout rules or establish acceptance.
+
+### Alpha UAT 30 project lifecycle repair — 26 November 2026
+
+The immediate authoring priority has shifted from publication-profile work to
+project creation, writing, saving and reopening. The New Project interaction
+now opens a compact title and Fiction/Non-fiction chooser; Fiction is the
+default. Creating a project allocates persistent application-managed staging
+storage and opens the normal workspace without requiring a permanent folder.
+The first explicit Save promotes the staged project through the existing
+collision-safe Save As flow; later saves use that permanent location.
+
+Open Project treats a folder containing `project.toml` as one project object.
+Enter opens it rather than showing its internal files, and F5 uses the
+currently focused file-browser selection. If an uncommitted or temporary
+project is active, selecting a different project first offers Save, Discard or
+Cancel; the target is validated before changing workspaces, and Cancel keeps
+the current project open. The Scrivener automatic-import path continues to
+create and open a staged project without compulsory mapping review.
+
+Production PTY regression now exercises a new fiction project from its
+title/type dialog through chapter and scene creation, prose editing, autosave,
+first Save promotion, exit, reopen and another edit/save. A second PTY journey
+creates a Non-fiction project, writes directly into chapter prose without
+creating scenes, autosaves and promotes it; persistence is then verified by
+reopening through the application service. Existing synthetic Scrivener PTY
+coverage exercises import, editing, saving, reopen and compile. Unit tests
+cover atomic project-folder opening, temporary-project Open cancellation, and
+staging lifecycle; the reported false external-change conflict and missing
+scene rows have not reproduced in the direct chapter-prose navigation/import
+PTY regression. Conflict detection remains enabled. These are automated
+results only; issues #37, #38, #44, #46, #52, #53, #54 and #55 remain open for
+the author's requested UAT.
+
+The report of an external-change conflict while switching to direct chapter
+prose and the reported disappearance of eleven scene rows have not reproduced
+in the new/import/save/reopen PTY journeys or the persistence suite. No root
+cause is confirmed, and conflict detection has not been weakened. These two
+reports remain open for further reproduction and source-project comparison.
+
+Verification on the lifecycle candidate:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --offline --workspace --all-targets -- -D warnings` — passed.
+- `cargo test --offline --workspace` — passed; 29 production PTY tests passed,
+  one protected-corpus test is ignored by default, and doc tests passed.
+- `WIDE_PRIVATE_ARROWMAKING_PROJECT=fixtures/back-catalogue/scrivener/ArrowMaking.scriv cargo test --offline -p writers-ide-terminal --test pty_smoke protected_arrowmaking_project_imports_through_the_production_pty_without_source_changes -- --ignored --exact --nocapture`
+  — passed separately; fixture SHA256SUMS passed before and after.
+- Fiction, non-fiction and synthetic Scrivener import workflows were exercised
+  through the production terminal PTY. The private ArrowMaking project was
+  imported via PTY into isolated staging storage and its source fingerprint
+  remained unchanged.
+
+The real user-managed Alpha UAT 30 directory was not modified. Alpha UAT 31 is
+being prepared from the verified commit; its build manifest records the
+commit, executable hashes and isolated disposable project data. Scrivener's
+per-format presentation and inclusion controls remain outstanding after this
+lifecycle checkpoint and resume as the next publication task after the bundle
+is made available.
