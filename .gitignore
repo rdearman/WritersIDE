@@ -2,3 +2,11 @@
 /test-builds/
 *.db-wal
 *.db-shm
+
+# Private manuscript regression fixtures and outputs
+/fixtures/
+/generated/
+/reports/
+/baselines/
+/test-fixtures/
+/test-reports/
