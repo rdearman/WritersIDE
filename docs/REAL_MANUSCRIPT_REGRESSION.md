@@ -337,3 +337,23 @@ regression in the controlled books. Publication human acceptance remains open;
 Scrivener compile inclusion/layout, variables, alternative publication matter,
 formatting and remaining differential discrepancies still require work and
 review.
+
+## 26 November 2026 — RTF emphasis whitespace
+
+Book 01's fresh generated EPUB exposed literal Markdown bold markers when a
+Scrivener bold RTF run included leading or trailing whitespace. The importer
+now leaves that whitespace outside the Markdown emphasis delimiters, so the
+renderer receives valid semantic emphasis. The synthetic regression is
+`scrivener_rtf_emphasis_keeps_surrounding_whitespace_outside_markdown_delimiters`.
+
+The full production run is `reports/rtf-emphasis-all-20261126/`; the three EPUBs
+are in `generated/rtf-emphasis-all-20261126/`. The checked manuscript and
+research bodies matched exactly across save/reopen (39/39, 36/36, 68/68 and
+6/6, 6/6, 12/12). EPUBCheck 4.2.6 reported zero errors/warnings for all three;
+no generated output contained `<pre>` blocks, and book 01 no longer has visible
+asterisk formatting markers. A `***` paragraph in book 03 is present as
+escaped literal content in the canonical source imported from RTF, so it is
+source-origin, not introduced by this change; its intended scene-break meaning
+remains a separate compile-layout question. Fixture checksums passed before
+and after the run. The detailed reports and EPUBs are private local data and
+must remain untracked. This repair is not overall publication acceptance.

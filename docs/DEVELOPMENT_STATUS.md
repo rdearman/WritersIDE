@@ -481,3 +481,37 @@ tests and the controlled three-book regression. Issues #53, #7 and #73 now have
 sanitized status comments; all remain open for human acceptance. Publication
 fidelity remains failed human UAT. Never commit the private reports or generated
 EPUBs. Do not stage the unrelated root `.gitignore`, `README_TMP.md` or `UAT/`.
+
+## RTF emphasis whitespace repair — 26 November 2026
+
+Fresh Calibre inspection of book 01 exposed literal Markdown bold markers around
+Scrivener bold runs whose content began or ended with whitespace. The production
+RTF importer now keeps leading and trailing whitespace outside the emphasis
+delimiters, preserving semantic emphasis without visible `**` artefacts. The
+focused regression and all 31 `story-import` tests pass.
+
+Full fresh import, persistence/reopen and compile results are in
+`reports/rtf-emphasis-all-20261126/`; private EPUBs for further local inspection
+are:
+
+- `generated/rtf-emphasis-all-20261126/book-01.epub`
+- `generated/rtf-emphasis-all-20261126/book-02.epub`
+- `generated/rtf-emphasis-all-20261126/book-03.epub`
+
+All 143 checked manuscript bodies survived persistence exactly (39/39, 36/36,
+68/68); all 24 checked research bodies did also (6/6, 6/6, 12/12). Generated
+EPUBCheck 4.2.6 results are zero errors and warnings, and no generated book
+contains `<pre>` blocks. Book 01's visible prose contains no literal asterisk
+formatting delimiters. Book 03 contains one `***` paragraph as literal source
+content in the imported Markdown; it is not introduced by the emphasis fix and
+requires a separate semantic scene-break/layout decision. Fixture checksums
+passed before and after the run. The EPUBs remain provisional; overall
+publication fidelity has not passed human UAT.
+
+The regression JSON identifies base commit `a55a0f2` and a dirty tree because
+the tested whitespace correction was not yet committed when the run started.
+Next: run formatting, Clippy and the full workspace suite, then commit/push the
+small importer correction and update #53/#7/#73 with sanitised test evidence.
+Continue with shared Compile IR inclusion/layout/profile integration; do not
+stage private reports/EPUBs or the user-owned root `.gitignore`,
+`README_TMP.md` and `UAT/`.

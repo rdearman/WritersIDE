@@ -3595,14 +3595,29 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
             return;
         }
         let characters = text.chars().collect::<Vec<_>>();
-        let mut escaped = String::with_capacity(text.len());
+        let leading_end = characters
+            .iter()
+            .take_while(|character| character.is_whitespace())
+            .count();
+        let trailing_start = characters
+            .iter()
+            .rev()
+            .take_while(|character| character.is_whitespace())
+            .count()
+            .min(characters.len() - leading_end);
+        let trailing_start = characters.len() - trailing_start;
+        let (mut leading, mut escaped, mut trailing) = (
+            String::new(),
+            String::with_capacity(text.len()),
+            String::new(),
+        );
         for (index, character) in characters.iter().copied().enumerate() {
             let ordered_list_marker = character == '.'
                 && index + 1 < characters.len()
                 && characters[index + 1].is_whitespace()
                 && characters[..index].iter().all(char::is_ascii_digit)
                 && index > 0;
-            if matches!(
+            let escaped_character = if matches!(
                 character,
                 '\\' | '`'
                     | '*'
@@ -3622,21 +3637,31 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
                     | '^'
             ) || ordered_list_marker
             {
-                escaped.push('\\');
+                format!("\\{character}")
+            } else {
+                character.to_string()
+            };
+            if index < leading_end {
+                leading.push_str(&escaped_character);
+            } else if index >= trailing_start {
+                trailing.push_str(&escaped_character);
+            } else {
+                escaped.push_str(&escaped_character);
             }
-            escaped.push(character);
         }
-        let value = match (style.bold, style.italic, style.strike) {
-            (true, true, true) => format!("~~***{escaped}***~~"),
-            (true, true, false) => format!("***{escaped}***"),
-            (true, false, true) => format!("~~**{escaped}**~~"),
-            (false, true, true) => format!("~~*{escaped}*~~"),
-            (true, false, false) => format!("**{escaped}**"),
-            (false, true, false) => format!("*{escaped}*"),
-            (false, false, true) => format!("~~{escaped}~~"),
+        let formatted = match (style.bold, style.italic, style.strike) {
+            (true, true, true) if !escaped.is_empty() => format!("~~***{escaped}***~~"),
+            (true, true, false) if !escaped.is_empty() => format!("***{escaped}***"),
+            (true, false, true) if !escaped.is_empty() => format!("~~**{escaped}**~~"),
+            (false, true, true) if !escaped.is_empty() => format!("~~*{escaped}*~~"),
+            (true, false, false) if !escaped.is_empty() => format!("**{escaped}**"),
+            (false, true, false) if !escaped.is_empty() => format!("*{escaped}*"),
+            (false, false, true) if !escaped.is_empty() => format!("~~{escaped}~~"),
             _ => escaped,
         };
-        output.push_str(&value);
+        output.push_str(&leading);
+        output.push_str(&formatted);
+        output.push_str(&trailing);
         text.clear();
     };
     for (ch, next_style) in runs {
@@ -4131,6 +4156,14 @@ mod tests {
         assert!(markdown.contains("no\u{00a0}break"), "{markdown:?}");
         assert!(markdown.contains("non\u{2011}break"), "{markdown:?}");
         assert!(markdown.contains("soft\u{00ad}hyphen"), "{markdown:?}");
+    }
+
+    #[test]
+    fn scrivener_rtf_emphasis_keeps_surrounding_whitespace_outside_markdown_delimiters() {
+        let source = r#"{\rtf1\ansi Start{\b  Travel: }next and {\i phrase }ends.}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert_eq!(markdown, "Start **Travel:** next and *phrase* ends.");
+        assert!(!markdown.contains("** Travel: **"));
     }
 
     #[test]
