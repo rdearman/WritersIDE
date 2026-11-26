@@ -26,6 +26,31 @@ class BackCatalogueInventoryTests(unittest.TestCase):
         ]
         self.assertEqual(inventory.binder_depths(items), {"section": 0, "chapter": 1, "scene": 2})
 
+    def test_binder_manifest_preserves_structure_without_copying_prose(self):
+        item = {
+            "source_document_id": "scene",
+            "parent_source_id": "chapter",
+            "position": 2,
+            "title": "A scene",
+            "type_code": "Text",
+            "area": "manuscript",
+            "include_in_compile": False,
+            "section_type_id": "layout-kind",
+            "content_markdown": "private prose",
+            "notes_markdown": "author note",
+            "synopsis": "short summary",
+            "fields": {"CustomField": "private value"},
+            "embedded_assets": [{"media_type": "image/png", "sha256": "a" * 64, "bytes": b"payload"}],
+        }
+        result = inventory.binder_structure([item])[0]
+        self.assertEqual(result["content_bytes"], len("private prose".encode()))
+        self.assertTrue(result["has_notes"])
+        self.assertTrue(result["has_synopsis"])
+        self.assertEqual(result["metadata_field_names"], ["CustomField"])
+        self.assertEqual(result["embedded_assets"], [{"media_type": "image/png", "sha256": "a" * 64}])
+        self.assertNotIn("content_markdown", result)
+        self.assertNotIn("private value", str(result))
+
     def test_word_normalization_preserves_unicode_words_and_apostrophes(self):
         self.assertEqual(
             inventory.norm_words("Les Retraités – l’été 1185–1333"),

@@ -106,6 +106,33 @@ def binder_depths(items: list[dict]) -> dict[str, int]:
     return depths
 
 
+def binder_structure(items: list[dict]) -> list[dict[str, object]]:
+    """Keep hierarchy and classification evidence while omitting manuscript text."""
+    depths = binder_depths(items)
+    return [
+        {
+            "source_document_id": item.get("source_document_id"),
+            "parent_source_id": item.get("parent_source_id"),
+            "position": item.get("position"),
+            "depth": depths.get(item.get("source_document_id"), 0),
+            "title": item.get("title"),
+            "type_code": item.get("type_code"),
+            "area": item.get("area"),
+            "include_in_compile": item.get("include_in_compile"),
+            "section_type_id": item.get("section_type_id"),
+            "content_bytes": len((item.get("content_markdown") or "").encode("utf-8")),
+            "has_notes": bool(item.get("notes_markdown")),
+            "has_synopsis": bool(item.get("synopsis")),
+            "metadata_field_names": sorted((item.get("fields") or {}).keys()),
+            "embedded_assets": [
+                {"media_type": asset.get("media_type"), "sha256": asset.get("sha256")}
+                for asset in item.get("embedded_assets", [])
+            ],
+        }
+        for item in items
+    ]
+
+
 def norm_words(value: str) -> list[str]:
     value = unicodedata.normalize("NFC", html.unescape(value)).casefold()
     return re.findall(r"[^\W_]+(?:['’][^\W_]+)?", value, flags=re.UNICODE)
@@ -321,6 +348,7 @@ def main() -> int:
             "scrivener_creator": inv.get("creator"),
             "creator_version_hint": f"Scrivener creator tag {inv.get('creator')} (source-reported; platform/version compatibility not independently established)",
             "manifest_revision": inv.get("format_version"),
+            "project_metadata": inv.get("project_metadata", {}),
             "source_fingerprint": inv.get("source_fingerprint"),
             "binder_item_count": len(items),
             "document_type_counts": _count(item.get("type_code", "unknown") for item in items),
@@ -328,11 +356,23 @@ def main() -> int:
             "binder_depth_counts": _count(str(depth) for depth in depths.values()),
             "maximum_binder_depth": max(depths.values(), default=0),
             "top_level_item_count": sum(not item.get("parent_source_id") for item in items),
+            "binder_structure": binder_structure(items),
             "content_bearing_items": sum(bool(item.get("content_markdown")) for item in items),
             "word_count_estimate": len(norm_words(text)),
             "content_fingerprint": hashlib.sha256(" ".join(norm_words(text)).encode()).hexdigest(),
             "language": language_hint(text, inv.get("project_metadata", {}).get("Language")),
             "section_type_names": sorted(set(inv.get("section_types", {}).values())),
+            "section_type_definitions": inv.get("section_types", {}),
+            "embedded_asset_count": sum(len(item.get("embedded_assets", [])) for item in items),
+            "embedded_asset_media_types": _count(
+                asset.get("media_type", "unknown")
+                for item in items for asset in item.get("embedded_assets", [])
+            ),
+            "metadata_field_name_counts": _count(
+                field_name for item in items for field_name in (item.get("fields") or {})
+            ),
+            "items_with_notes": sum(bool(item.get("notes_markdown")) for item in items),
+            "items_with_synopsis": sum(bool(item.get("synopsis")) for item in items),
             "source_warnings": inv.get("warnings", []),
             "unsupported_count": len(inv.get("unsupported", [])) + sum(len(item.get("unsupported", [])) for item in items),
             "preview": {key: payload.get("preview", {}).get(key) for key in ("total_items", "manuscript_items", "research_items", "skipped_items")},
@@ -455,6 +495,14 @@ def main() -> int:
             "manifest_revision": inv.get("format_version"),
             "word_count_estimate": len(words),
             "nearest_back_catalogue_projects": candidates[:5],
+            "exact_content_matches": [
+                path for path in project_paths
+                if jaccard(shingles, project_shingles[path]) == 1.0
+            ],
+            "matching_source_fingerprints": [
+                project["path"] for project in projects
+                if project.get("source_fingerprint") == inv.get("source_fingerprint")
+            ],
             "classification": "similarity leads only; confirm with source metadata and revision evidence",
         })
 
