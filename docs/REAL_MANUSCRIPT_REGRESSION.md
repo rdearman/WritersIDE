@@ -472,6 +472,14 @@ was available for all publications except two image-only resources; all four
 ODT files were parsed for text and metadata. The inventory's synthetic suite
 passed 5 tests, and the complete Python harness suite passed 14 tests.
 
+Refreshed expanded-corpus inventory, 26 November 2026:
+`reports/back-catalogue-20261126-expanded-final/manifest.json`. It reinspected
+all 26 Scrivener manifests and 47 publication/resource files, with zero
+inspection failures, zero exact normalized-text duplicate groups, 130 ranked
+project/publication candidates and 85 possible related-project pairs. These
+candidate relationships remain unconfirmed; no source files were executed or
+modified, and the fixture SHA-256 manifest passed after inventory.
+
 This inventory is useful for selecting targeted compatibility tests, not a
 publication fidelity result. It does not import/compile all 26 projects, and
 historical formats lacking extractable text or matching evidence remain
@@ -600,3 +608,17 @@ in ignored local-only paths documented in `DEVELOPMENT_STATUS.md`. Current
 WIDE book design typography and heading/layout differences from the historical
 reference remain unresolved; the historical edition is not an exact text
 baseline. No source files were modified.
+
+## 26 November 2026 — Compile heading presentation and terminal underline
+
+The follow-up editor projection change is committed as `968316e`; it hides
+Pandoc underline delimiters in the rendered terminal editor while mapping text
+back to unchanged canonical Markdown. The shared Compile IR heading-presentation
+slice is committed as `365c098`. Its fresh controlled regression is
+`reports/compile-presentation-20261126/`; generated EPUBs are in the matching
+`generated/compile-presentation-20261126/` directory. All three EPUBs passed
+EPUBCheck 4.2.6, but their import status remains incomplete and publication
+fidelity remains provisional. See `docs/DEVELOPMENT_STATUS.md` for exact body
+counts, checksums, limitations and feature status. These generated artifacts
+used default presentation, so they do not establish Scrivener-specific layout
+equivalence or human acceptance.
