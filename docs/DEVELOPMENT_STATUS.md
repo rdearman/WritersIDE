@@ -2,6 +2,50 @@
 
 Updated: 2026-11-26
 
+## Current checkpoint — selected Scrivener matter import safety, 26 November 2026
+
+Selected Scrivener front- and back-matter documents are now classified as
+typed WIDE content units instead of falling through the `unknown` binder area
+to Research. They remain editable in the project and are excluded from the
+ordinary compile by default, preventing alternative edition matter from
+leaking into a publication. The terminal import-mapping chooser exposes both
+destination types. When multiple Scrivener formats assign conflicting front
+or back roles to the same source document, the import plan leaves that item
+unmapped for an explicit author decision.
+
+Synthetic importer and application tests cover typed mapping, conflicting
+roles, persisted prose and default compile exclusion. Verification passed:
+`cargo fmt --all -- --check`, workspace Clippy with warnings denied, and the
+full offline workspace suite with loopback permission for the existing local
+Ollama test (339 terminal unit tests, 3 author-workflow tests and 26 PTY
+tests, plus all other crate, integration and doc tests).
+
+The fresh real-manuscript run is
+`reports/scrivener-matter-compile-20261126/`; generated projects and EPUBs are
+under `generated/scrivener-matter-compile-20261126/`. All current source
+fingerprints were unchanged, manuscript bodies survived exactly (39/39,
+36/36, 68/68), research bodies survived exactly (6/6, 6/6, 12/12), and all
+three generated EPUBs passed EPUBCheck 4.2.6 with zero errors and warnings.
+The run remains provisional and all three imports report incomplete; the
+historical comparisons remain discrepant. Fixture checksums passed before and
+after the run.
+
+This does not complete the next publication task. Per-format layout proposals
+are inspectable, but source-format inclusion overrides and selected matter are
+not yet bound to named WIDE edition assemblies/configurations. The imported
+matter is intentionally excluded until an author chooses it. Do not claim
+publication fidelity or close #7, #53, #68 or #73; their latest comments still
+require full source-format-to-edition integration and human publication UAT.
+The next implementation step is to connect each reviewed Scrivener source
+format to a persistent, user-selectable WIDE assembly/profile, applying its
+per-document inclusion and matter ordering in the shared Compile IR without
+changing canonical project inclusion or prose.
+
+The GitHub issue register currently has 72 open v1.0 issues; #75 remains
+outside the feature freeze. Latest issue bodies and the latest available
+comments were refreshed on 26 November. Continue with the P0/data-integrity
+and author-workflow priority order after the Scrivener profile integration.
+
 ## Current checkpoint — terminal offline thesaurus workflow, 26 November 2026
 
 The offline MyThes foundation is now reachable as Review → Thesaurus. The

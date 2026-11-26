@@ -10488,6 +10488,8 @@ impl AppState {
             Kind::Section,
             Kind::Chapter,
             Kind::Scene,
+            Kind::FrontMatter,
+            Kind::BackMatter,
             Kind::Research,
             Kind::Skip,
         ];
@@ -30163,6 +30165,10 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                                 story_import::ScrivenerDestinationKind::Section => "section",
                                 story_import::ScrivenerDestinationKind::Chapter => "chapter",
                                 story_import::ScrivenerDestinationKind::Scene => "scene",
+                                story_import::ScrivenerDestinationKind::FrontMatter => {
+                                    "front matter"
+                                }
+                                story_import::ScrivenerDestinationKind::BackMatter => "back matter",
                                 story_import::ScrivenerDestinationKind::Research => "research",
                                 story_import::ScrivenerDestinationKind::Skip => "skip",
                             }

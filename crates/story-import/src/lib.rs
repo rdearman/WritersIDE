@@ -538,6 +538,8 @@ pub enum ScrivenerDestinationKind {
     Section,
     Chapter,
     Scene,
+    FrontMatter,
+    BackMatter,
     Research,
     Skip,
 }
@@ -574,24 +576,65 @@ pub struct ScrivenerImportPlan {
 
 impl ScrivenerImportPlan {
     pub fn proposed(inventory: &ScrivenerProjectInventory) -> Self {
+        let mut matter_roles = BTreeMap::<&str, ScrivenerDestinationKind>::new();
+        if let Some(settings) = &inventory.compile_settings {
+            for format in &settings.formats {
+                for (enabled, source_id, kind) in [
+                    (
+                        format.add_default_front_matter,
+                        format.default_front_matter_id.as_deref(),
+                        ScrivenerDestinationKind::FrontMatter,
+                    ),
+                    (
+                        format.add_default_back_matter,
+                        format.default_back_matter_id.as_deref(),
+                        ScrivenerDestinationKind::BackMatter,
+                    ),
+                ] {
+                    if enabled == Some(true)
+                        && let Some(source_id) = source_id
+                        && inventory
+                            .items
+                            .iter()
+                            .any(|item| item.source_document_id == source_id)
+                    {
+                        matter_roles
+                            .entry(source_id)
+                            .and_modify(|role| {
+                                if *role != kind {
+                                    // Do not silently classify a document selected
+                                    // as both front and back matter. Leave it for
+                                    // explicit author mapping in the import preview.
+                                    *role = ScrivenerDestinationKind::Unmapped;
+                                }
+                            })
+                            .or_insert(kind);
+                    }
+                }
+            }
+        }
         let decisions = inventory
             .items
             .iter()
             .map(|item| {
-                let destination_kind = match item.area.as_str() {
-                    "research" | "unknown" => ScrivenerDestinationKind::Research,
-                    "trash" => ScrivenerDestinationKind::Skip,
-                    // Binder folder roles vary by project; make the author
-                    // choose section vs chapter in the preview.
-                    _ if item.type_code.as_deref().is_some_and(|value| {
-                        value.eq_ignore_ascii_case("folder") || value.eq_ignore_ascii_case("draft")
-                    }) =>
-                    {
-                        ScrivenerDestinationKind::Unmapped
-                    }
-                    _ if item.content_markdown.is_some() => ScrivenerDestinationKind::Scene,
-                    _ => ScrivenerDestinationKind::Unmapped,
-                };
+                let destination_kind = matter_roles
+                    .get(item.source_document_id.as_str())
+                    .copied()
+                    .unwrap_or_else(|| match item.area.as_str() {
+                        "research" | "unknown" => ScrivenerDestinationKind::Research,
+                        "trash" => ScrivenerDestinationKind::Skip,
+                        // Binder folder roles vary by project; make the author
+                        // choose section vs chapter in the preview.
+                        _ if item.type_code.as_deref().is_some_and(|value| {
+                            value.eq_ignore_ascii_case("folder")
+                                || value.eq_ignore_ascii_case("draft")
+                        }) =>
+                        {
+                            ScrivenerDestinationKind::Unmapped
+                        }
+                        _ if item.content_markdown.is_some() => ScrivenerDestinationKind::Scene,
+                        _ => ScrivenerDestinationKind::Unmapped,
+                    });
                 ScrivenerMappingDecision {
                     source_document_id: item.source_document_id.clone(),
                     destination_kind,
@@ -656,6 +699,9 @@ impl ScrivenerImportPlan {
                         ));
                     }
                 }
+                ScrivenerDestinationKind::FrontMatter | ScrivenerDestinationKind::BackMatter => {
+                    preview.manuscript_items += 1
+                }
                 ScrivenerDestinationKind::Research => preview.research_items += 1,
                 ScrivenerDestinationKind::Skip => unreachable!(),
             }
@@ -719,6 +765,13 @@ impl ScrivenerImportPlan {
                     }
                     ScrivenerDestinationKind::Research => {
                         parent.destination_kind == ScrivenerDestinationKind::Research
+                            || parent.destination_kind == ScrivenerDestinationKind::Section
+                            || parent.destination_kind == ScrivenerDestinationKind::Chapter
+                    }
+                    ScrivenerDestinationKind::FrontMatter
+                    | ScrivenerDestinationKind::BackMatter => {
+                        parent.destination_kind == decision.destination_kind
+                            || parent.destination_kind == ScrivenerDestinationKind::Unmapped
                             || parent.destination_kind == ScrivenerDestinationKind::Section
                             || parent.destination_kind == ScrivenerDestinationKind::Chapter
                     }
@@ -4801,6 +4854,112 @@ This is an addition to the old file.}"#;
         assert_eq!(
             compile_settings.available_layouts["retailer"]["layout-chapter"],
             *layout
+        );
+    }
+
+    #[test]
+    fn format_selected_front_and_back_matter_receive_typed_import_destinations() {
+        let make_item = |id: &str, parent: Option<&str>| ScrivenerBinderItem {
+            source_document_id: id.into(),
+            parent_source_id: parent.map(str::to_owned),
+            position: 0,
+            title: id.into(),
+            type_code: Some("Text".into()),
+            area: "unknown".into(),
+            include_in_compile: Some(true),
+            section_type_id: None,
+            synopsis: None,
+            notes_markdown: None,
+            content_markdown: Some(format!("Content for {id}")),
+            embedded_assets: Vec::new(),
+            fields: BTreeMap::new(),
+            unsupported: Vec::new(),
+        };
+        let inventory = ScrivenerProjectInventory {
+            source_path: "fixture.scriv".into(),
+            source_fingerprint: "fingerprint".into(),
+            title: "Book".into(),
+            format_version: Some("2.0".into()),
+            creator: None,
+            project_metadata: BTreeMap::new(),
+            compile_settings: Some(ScrivenerCompileSettings {
+                content_scope: Some("Included".into()),
+                formats: vec![ScrivenerCompileFormatSettings {
+                    source_format_id: "retailer".into(),
+                    default_front_matter_id: Some("front".into()),
+                    add_default_front_matter: Some(true),
+                    default_back_matter_id: Some("back".into()),
+                    add_default_back_matter: Some(true),
+                    ..ScrivenerCompileFormatSettings::default()
+                }],
+                ..ScrivenerCompileSettings::default()
+            }),
+            section_types: BTreeMap::new(),
+            items: vec![
+                ScrivenerBinderItem {
+                    source_document_id: "draft".into(),
+                    parent_source_id: None,
+                    position: 0,
+                    title: "Draft".into(),
+                    type_code: Some("DraftFolder".into()),
+                    area: "manuscript".into(),
+                    include_in_compile: Some(true),
+                    section_type_id: None,
+                    synopsis: None,
+                    notes_markdown: None,
+                    content_markdown: None,
+                    embedded_assets: Vec::new(),
+                    fields: BTreeMap::new(),
+                    unsupported: Vec::new(),
+                },
+                make_item("front", Some("draft")),
+                make_item("back", Some("draft")),
+                make_item("alternate", Some("draft")),
+            ],
+            warnings: Vec::new(),
+            unsupported: Vec::new(),
+        };
+        let plan = ScrivenerImportPlan::proposed(&inventory);
+        let mapping = plan
+            .decisions
+            .iter()
+            .map(|decision| {
+                (
+                    decision.source_document_id.as_str(),
+                    decision.destination_kind,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(mapping["front"], ScrivenerDestinationKind::FrontMatter);
+        assert_eq!(mapping["back"], ScrivenerDestinationKind::BackMatter);
+        assert_eq!(mapping["alternate"], ScrivenerDestinationKind::Research);
+        let mut plan = plan;
+        plan.decisions
+            .iter_mut()
+            .find(|decision| decision.source_document_id == "draft")
+            .unwrap()
+            .destination_kind = ScrivenerDestinationKind::Section;
+        plan.validate_for_import(&inventory).unwrap();
+
+        let mut conflicting = inventory.clone();
+        conflicting.compile_settings.as_mut().unwrap().formats.push(
+            ScrivenerCompileFormatSettings {
+                source_format_id: "alternate-retailer".into(),
+                default_front_matter_id: Some("back".into()),
+                add_default_front_matter: Some(true),
+                ..ScrivenerCompileFormatSettings::default()
+            },
+        );
+        let conflicting_plan = ScrivenerImportPlan::proposed(&conflicting);
+        assert_eq!(
+            conflicting_plan
+                .decisions
+                .iter()
+                .find(|decision| decision.source_document_id == "back")
+                .unwrap()
+                .destination_kind,
+            ScrivenerDestinationKind::Unmapped,
+            "conflicting format roles must require an explicit import decision"
         );
     }
 

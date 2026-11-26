@@ -4712,6 +4712,8 @@ impl WriterApp {
             *position = (*position).max(next);
         }
         let mut scene_positions = std::collections::BTreeMap::<NodeId, u32>::new();
+        let mut front_matter_position = 0u32;
+        let mut back_matter_position = 0u32;
         let mut imported_scenes = Vec::new();
         let mut unsupported = preview.unsupported.clone();
 
@@ -4860,6 +4862,32 @@ impl WriterApp {
                     }
                     imported_scenes.push(scene);
                     destinations.push(("scene", scene.to_string(), "scene"));
+                }
+                Target::FrontMatter | Target::BackMatter => {
+                    if item.content_markdown.is_some() {
+                        let kind = if decision.destination_kind == Target::FrontMatter {
+                            ContentUnitKind::FrontMatter
+                        } else {
+                            ContentUnitKind::BackMatter
+                        };
+                        let position = if kind == ContentUnitKind::FrontMatter {
+                            &mut front_matter_position
+                        } else {
+                            &mut back_matter_position
+                        };
+                        let unit = self.create_content_unit(kind, title, None, *position, None)?;
+                        *position = position.checked_add(1).ok_or_else(|| {
+                            AppError::Domain("matter ordering position overflow".into())
+                        })?;
+                        let text = self.materialize_scrivener_assets(item)?;
+                        let (_, expected) = self.load_content_unit_text(unit)?;
+                        self.save_content_unit_text(unit, Some(&expected), &text)?;
+                        // Alternative matter belongs to named publication
+                        // editions. Keep it in the project but exclude it
+                        // from ordinary compilation until selected explicitly.
+                        self.set_content_unit_included(unit, false)?;
+                        destinations.push(("content_unit", unit.to_string(), kind.as_str()));
+                    }
                 }
                 Target::Research => {
                     let source_text = item
@@ -8832,6 +8860,94 @@ unexpected_prose = "must not be silently discarded"
         let compiled = ir.render_markdown().0;
         assert!(compiled.contains("PUBLICMANUSCRIPTSENTINEL"));
         assert!(!compiled.contains("PRIVATEPLANNINGSENTINEL"));
+    }
+
+    #[test]
+    fn scrivener_selected_matter_is_imported_as_editable_private_by_default_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Matter.scriv");
+        for id in ["front-id", "back-id"] {
+            fs::create_dir_all(source.join("Files/Data").join(id)).unwrap();
+        }
+        fs::create_dir_all(source.join("Settings")).unwrap();
+        fs::write(
+            source.join("Matter.scrivx"),
+            r#"<ScrivenerProject Version="2.0"><Binder>
+              <BinderItem UUID="draft" Type="DraftFolder"><Title>Draft</Title><Children>
+                <BinderItem UUID="front-id" Type="Text"><Title>Opening Matter</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
+                <BinderItem UUID="back-id" Type="Text"><Title>Retailer Back Matter</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
+              </Children></BinderItem>
+            </Binder></ScrivenerProject>"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("Settings/compile.xml"),
+            r#"<CompileSettings><ProjectSettings><Content Scope="Included"/></ProjectSettings><FormatSettings>
+              <Format ID="ebook"><FrontAndBackMatter><DefaultFrontMatter Add="Yes">front-id</DefaultFrontMatter><DefaultBackMatter Add="Yes">back-id</DefaultBackMatter></FrontAndBackMatter></Format>
+            </FormatSettings></CompileSettings>"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("Files/Data/front-id/content.rtf"),
+            r"{\rtf1\ansi FRONTMATTERPRIVATETEST}",
+        )
+        .unwrap();
+        fs::write(
+            source.join("Files/Data/back-id/content.rtf"),
+            r"{\rtf1\ansi BACKMATTERPRIVATETEST}",
+        )
+        .unwrap();
+
+        let inventory = story_import::inspect_scrivener_project(&source).unwrap();
+        let mut plan = story_import::ScrivenerImportPlan::proposed(&inventory);
+        plan.decisions
+            .iter_mut()
+            .find(|decision| decision.source_document_id == "draft")
+            .unwrap()
+            .destination_kind = story_import::ScrivenerDestinationKind::Section;
+        assert_eq!(
+            plan.decisions
+                .iter()
+                .find(|decision| decision.source_document_id == "front-id")
+                .unwrap()
+                .destination_kind,
+            story_import::ScrivenerDestinationKind::FrontMatter
+        );
+        assert_eq!(
+            plan.decisions
+                .iter()
+                .find(|decision| decision.source_document_id == "back-id")
+                .unwrap()
+                .destination_kind,
+            story_import::ScrivenerDestinationKind::BackMatter
+        );
+        let mut app = WriterApp::create_project(dir.path().join("Imported"), "Matter").unwrap();
+        app.import_scrivener_inventory(
+            &inventory,
+            &plan,
+            story_import::ScrivenerImportMode::Editable,
+        )
+        .unwrap();
+        let units = app.list_content_units(false).unwrap();
+        assert_eq!(units.len(), 2);
+        for (title, expected) in [
+            ("Opening Matter", "FRONTMATTERPRIVATETEST"),
+            ("Retailer Back Matter", "BACKMATTERPRIVATETEST"),
+        ] {
+            let unit = units.iter().find(|unit| unit.title == title).unwrap();
+            assert!(
+                !unit.included,
+                "alternative matter must not leak by default"
+            );
+            let actual = app.load_content_unit_text(unit.id).unwrap().0;
+            assert!(actual.contains(expected), "imported body was: {actual:?}");
+        }
+        let compiled = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        let compiled = String::from_utf8(compiled.bytes).unwrap();
+        assert!(!compiled.contains("FRONTMATTERPRIVATETEST"));
+        assert!(!compiled.contains("BACKMATTERPRIVATETEST"));
     }
 
     #[test]
