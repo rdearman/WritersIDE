@@ -357,3 +357,22 @@ source-origin, not introduced by this change; its intended scene-break meaning
 remains a separate compile-layout question. Fixture checksums passed before
 and after the run. The detailed reports and EPUBs are private local data and
 must remain untracked. This repair is not overall publication acceptance.
+
+## 26 November 2026 — retain compile-excluded Scrivener scenes
+
+Scrivener binder items marked `IncludeInCompile=No` were previously proposed as
+`Skip`, which removed them from the imported project. The importer now retains
+such items; when mapped as scenes, it applies WIDE's existing persistent scene
+exclusion so the content remains editable but stays out of default compilation.
+Synthetic importer and application tests verify this. This does not yet apply
+Scrivener compile flags to structural headings or chapter-level prose, or
+recover per-format inclusion overrides.
+
+The fresh three-book run is
+`reports/scrivener-inclusion-retain-20261126/`, with EPUBs in
+`generated/scrivener-inclusion-retain-20261126/`. All source fixture checksums
+passed before and after; all checked source bodies matched after persistence,
+and generated EPUBCheck 4.2.6 reported zero errors/warnings. The controlled
+projects have `IncludeInCompile=Yes` for inventoried binder items, so these
+results show no regression in them; the excluded-item behaviour is covered by
+synthetic fixtures. Publication fidelity and human acceptance remain open.

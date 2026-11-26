@@ -564,7 +564,6 @@ impl ScrivenerImportPlan {
                 let destination_kind = match item.area.as_str() {
                     "research" | "unknown" => ScrivenerDestinationKind::Research,
                     "trash" => ScrivenerDestinationKind::Skip,
-                    _ if item.include_in_compile == Some(false) => ScrivenerDestinationKind::Skip,
                     // Binder folder roles vary by project; make the author
                     // choose section vs chapter in the preview.
                     _ if item.type_code.as_deref().is_some_and(|value| {
@@ -4459,6 +4458,17 @@ This is an addition to the old file.}"#;
             inventory.project_metadata.get("ProjectTitle").unwrap(),
             "Imported title"
         );
+        let plan = ScrivenerImportPlan::proposed(&inventory);
+        let excluded_folder = plan
+            .decisions
+            .iter()
+            .find(|decision| decision.source_document_id == "folder")
+            .unwrap();
+        assert_eq!(
+            excluded_folder.destination_kind,
+            ScrivenerDestinationKind::Research
+        );
+        assert!(excluded_folder.include_in_import);
         assert_eq!(
             inventory.project_metadata.get("Authors").unwrap(),
             "Author name"

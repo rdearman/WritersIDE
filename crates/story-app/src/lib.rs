@@ -4624,6 +4624,12 @@ impl WriterApp {
                     let position = *scene_positions.get(&chapter).unwrap_or(&0);
                     let scene = self.create_scene(chapter, title, position)?;
                     scene_positions.insert(chapter, position.saturating_add(1));
+                    if item.include_in_compile == Some(false) {
+                        // Scrivener compile exclusion is not a request to drop
+                        // the binder item from the imported project. Keep its
+                        // identity and prose available for later editing.
+                        self.set_scene_included(scene, false)?;
+                    }
                     let mut metadata = self.get_scene(scene)?.scene;
                     metadata.synopsis = item.synopsis.clone().unwrap_or_default();
                     self.update_scene_metadata(&metadata)?;
@@ -8351,7 +8357,7 @@ unexpected_prose = "must not be silently discarded"
     fn scrivener_ambiguous_planning_material_is_preserved_but_never_enters_compile_ir() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("Safe Import.scriv");
-        for id in ["scene-1", "private-notes"] {
+        for id in ["scene-1", "excluded-scene", "private-notes"] {
             fs::create_dir_all(source.join("Files/Data").join(id)).unwrap();
         }
         fs::write(
@@ -8360,6 +8366,7 @@ unexpected_prose = "must not be silently discarded"
               <BinderItem UUID="draft-root" Type="DraftFolder"><Title>Working Draft</Title><Children>
                 <BinderItem UUID="chapter-1" Type="Folder"><Title>Opening</Title><Children>
                   <BinderItem UUID="scene-1" Type="Text"><Title>First Scene</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
+                  <BinderItem UUID="excluded-scene" Type="Text"><Title>Excluded Draft</Title><IncludeInCompile>No</IncludeInCompile><Children/></BinderItem>
                 </Children></BinderItem>
               </Children></BinderItem>
               <BinderItem UUID="planning-folder" Type="Folder"><Title>Character Profiles</Title><Children>
@@ -8376,6 +8383,11 @@ unexpected_prose = "must not be silently discarded"
         fs::write(
             source.join("Files/Data/private-notes/content.rtf"),
             r#"{\rtf1\ansi PRIVATEPLANNINGSENTINEL}"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("Files/Data/excluded-scene/content.rtf"),
+            r#"{\rtf1\ansi RETAINEDBUTEXCLUDEDSENTINEL}"#,
         )
         .unwrap();
 
@@ -8407,7 +8419,7 @@ unexpected_prose = "must not be silently discarded"
         let (_, scenes) = app
             .import_scrivener_inventory(&inventory, &plan, story_import::ScrivenerImportMode::Both)
             .unwrap();
-        assert_eq!(scenes.len(), 1);
+        assert_eq!(scenes.len(), 2);
         assert!(
             app.load_scene_text(scenes[0])
                 .unwrap()
@@ -8420,6 +8432,28 @@ unexpected_prose = "must not be silently discarded"
                 .iter()
                 .any(|document| { document.extracted_text.contains("PRIVATEPLANNINGSENTINEL") })
         );
+
+        let excluded = app
+            .list_scenes(false)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.scene.title == "Excluded Draft")
+            .unwrap()
+            .scene
+            .id;
+        assert!(!app.scene_is_included(excluded).unwrap());
+        assert!(
+            app.load_scene_text(excluded)
+                .unwrap()
+                .0
+                .contains("RETAINEDBUTEXCLUDEDSENTINEL")
+        );
+        let default_compile = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        let default_compile = String::from_utf8(default_compile.bytes).unwrap();
+        assert!(default_compile.contains("PUBLICMANUSCRIPTSENTINEL"));
+        assert!(!default_compile.contains("RETAINEDBUTEXCLUDEDSENTINEL"));
 
         let assembly = app.create_assembly("Publication").unwrap();
         app.add_assembly_scene(assembly, scenes[0], 0).unwrap();

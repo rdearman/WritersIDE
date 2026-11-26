@@ -515,3 +515,33 @@ small importer correction and update #53/#7/#73 with sanitised test evidence.
 Continue with shared Compile IR inclusion/layout/profile integration; do not
 stage private reports/EPUBs or the user-owned root `.gitignore`,
 `README_TMP.md` and `UAT/`.
+
+## Scrivener compile-excluded document retention — in progress
+
+The importer previously mapped any binder item with `IncludeInCompile=No` to
+`Skip`, which discarded it from the editable WIDE project. Import planning now
+keeps the document and its provenance. For mapped scenes, the application also
+sets the existing persistent scene exclusion so the prose remains editable but
+is absent from default compilation. Synthetic application and importer tests
+cover retention and compile omission. This does not yet apply compile flags to
+section/chapter headings or chapter-level prose, nor does it recover per-format
+overrides; those still require shared Compile IR and publication-profile work.
+The targeted importer tests pass. A fresh three-book run and full workspace
+verification now pass. The synthetic application test confirms a source scene
+marked `No` remains editable, carries an excluded compile status and is absent
+from the default Markdown artifact. The source fixture is unchanged.
+
+The fresh controlled run is `reports/scrivener-inclusion-retain-20261126/`
+with outputs under `generated/scrivener-inclusion-retain-20261126/`; all source
+checksums passed before and after. All source/reopened manuscript and research
+bodies matched exactly and all generated EPUBs passed EPUBCheck 4.2.6 with zero
+errors/warnings. The current controlled books mark all binder items included,
+so the `No`-flag path is verified synthetically rather than by these three
+sources.
+
+Verification passed: `cargo fmt --all -- --check`, workspace Clippy with
+warnings denied, and the full offline workspace test suite (337 terminal unit
+tests, 3 author-workflow tests, 24 real-PTY tests and all other workspace and
+documentation tests). The locally authorised Ollama test bound only its
+loopback fixture socket; no external network was used. The 14 Python regression
+tests passed in the preceding batch.
