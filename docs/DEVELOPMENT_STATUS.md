@@ -1439,6 +1439,14 @@ in the new/import/save/reopen PTY journeys or the persistence suite. No root
 cause is confirmed, and conflict detection has not been weakened. These two
 reports remain open for further reproduction and source-project comparison.
 
+Scrivener scene statuses are also resolved through the project's status-ID
+table when binder metadata stores a numeric identifier instead of its label.
+Recognised source labels map to WIDE's typed statuses; absent/empty source
+status does not classify already-written prose as an idea. The raw imported
+status field remains in provenance metadata. Synthetic importer coverage
+verifies ID lookup and status classification. This corrects the Alpha UAT 30
+outliner status presentation; human confirmation remains outstanding.
+
 Verification on the lifecycle candidate:
 
 - `cargo fmt --all -- --check` — passed.

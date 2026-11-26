@@ -107,22 +107,38 @@ pub struct ScrivenerEditionProfile {
 type ScrivenerPublicationEntities =
     std::collections::BTreeMap<String, Vec<(Option<SceneId>, Option<ContentUnitId>)>>;
 
-fn scrivener_scene_status(item: &story_import::ScrivenerBinderItem) -> SceneStatus {
-    let explicit = item
+fn scrivener_scene_status(
+    inventory: &story_import::ScrivenerProjectInventory,
+    item: &story_import::ScrivenerBinderItem,
+) -> SceneStatus {
+    let source_status = item
         .fields
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("Status"))
-        .map(|(_, value)| value.trim().to_ascii_lowercase().replace(['-', '_'], " "));
+        .map(|(_, value)| {
+            inventory
+                .status_labels
+                .get(value.trim())
+                .map_or_else(|| value.trim().to_owned(), Clone::clone)
+        });
+    let explicit = source_status
+        .as_deref()
+        .filter(|value| !value.trim().is_empty() && !value.eq_ignore_ascii_case("No Status"))
+        .map(|value| value.trim().to_ascii_lowercase().replace(['-', '_'], " "));
     match explicit.as_deref() {
-        Some("idea") => return SceneStatus::Idea,
+        Some("idea") | Some("to do") => return SceneStatus::Idea,
         Some("outline") | Some("outlined") => return SceneStatus::Outlined,
         Some("ready to draft") | Some("ready") => return SceneStatus::ReadyToDraft,
         Some("drafting") | Some("in progress") | Some("draft") => {
             return SceneStatus::Drafting;
         }
         Some("first draft") | Some("draft complete") => return SceneStatus::DraftComplete,
-        Some("revising") | Some("revised") => return SceneStatus::Revising,
-        Some("complete") | Some("finished") | Some("final") => return SceneStatus::Complete,
+        Some("revising") | Some("revised") | Some("revised draft") => {
+            return SceneStatus::Revising;
+        }
+        Some("complete") | Some("finished") | Some("final") | Some("final draft") => {
+            return SceneStatus::Complete;
+        }
         Some("archived") => return SceneStatus::Archived,
         _ => {}
     }
@@ -4929,7 +4945,7 @@ impl WriterApp {
                     }
                     let mut metadata = self.get_scene(scene)?.scene;
                     metadata.synopsis = item.synopsis.clone().unwrap_or_default();
-                    metadata.status = scrivener_scene_status(item);
+                    metadata.status = scrivener_scene_status(inventory, item);
                     self.update_scene_metadata(&metadata)?;
                     if item.content_markdown.is_some() {
                         let text = self.materialize_scrivener_assets(item)?;
@@ -6651,6 +6667,20 @@ mod tests {
 
     #[test]
     fn scrivener_scene_status_respects_source_and_does_not_call_written_prose_an_idea() {
+        let inventory = story_import::ScrivenerProjectInventory {
+            source_path: "source.scriv".into(),
+            source_fingerprint: "fingerprint".into(),
+            title: "Book".into(),
+            format_version: Some("2.0".into()),
+            creator: None,
+            project_metadata: std::collections::BTreeMap::new(),
+            compile_settings: None,
+            section_types: std::collections::BTreeMap::new(),
+            status_labels: std::collections::BTreeMap::from([("1".into(), "First Draft".into())]),
+            items: Vec::new(),
+            warnings: Vec::new(),
+            unsupported: Vec::new(),
+        };
         let item = |fields, synopsis, content| story_import::ScrivenerBinderItem {
             source_document_id: "source-scene".into(),
             parent_source_id: Some("chapter".into()),
@@ -6673,7 +6703,10 @@ mod tests {
             None,
             Some("A draft.".into()),
         );
-        assert_eq!(scrivener_scene_status(&written), SceneStatus::Imported);
+        assert_eq!(
+            scrivener_scene_status(&inventory, &written),
+            SceneStatus::Imported
+        );
 
         let explicitly_complete = item(
             std::collections::BTreeMap::from([("Status".into(), "Complete".into())]),
@@ -6681,8 +6714,18 @@ mod tests {
             Some("A draft.".into()),
         );
         assert_eq!(
-            scrivener_scene_status(&explicitly_complete),
+            scrivener_scene_status(&inventory, &explicitly_complete),
             SceneStatus::Complete
+        );
+
+        let source_id_status = item(
+            std::collections::BTreeMap::from([("Status".into(), "1".into())]),
+            None,
+            Some("A draft.".into()),
+        );
+        assert_eq!(
+            scrivener_scene_status(&inventory, &source_id_status),
+            SceneStatus::DraftComplete
         );
 
         let outlined = item(
@@ -6690,10 +6733,16 @@ mod tests {
             Some("A beat".into()),
             None,
         );
-        assert_eq!(scrivener_scene_status(&outlined), SceneStatus::Outlined);
+        assert_eq!(
+            scrivener_scene_status(&inventory, &outlined),
+            SceneStatus::Outlined
+        );
 
         let empty = item(std::collections::BTreeMap::new(), None, None);
-        assert_eq!(scrivener_scene_status(&empty), SceneStatus::Idea);
+        assert_eq!(
+            scrivener_scene_status(&inventory, &empty),
+            SceneStatus::Idea
+        );
     }
 
     #[test]
@@ -6712,6 +6761,7 @@ mod tests {
             ]),
             compile_settings: None,
             section_types: std::collections::BTreeMap::new(),
+            status_labels: std::collections::BTreeMap::new(),
             items: Vec::new(),
             warnings: Vec::new(),
             unsupported: Vec::new(),
@@ -8983,11 +9033,11 @@ unexpected_prose = "must not be silently discarded"
         fs::create_dir_all(&chapter_files).unwrap();
         fs::write(
             source.join("SeriesBook.scrivx"),
-            r#"<ScrivenerProject Version="2.0"><Binder>
+            r#"<ScrivenerProject Version="2.0"><StatusSettings><StatusItems><Status ID="3">Final Draft</Status></StatusItems></StatusSettings><Binder>
               <BinderItem UUID="section-1" Type="Folder"><Title>Part One</Title><Children/></BinderItem>
                 <BinderItem UUID="chapter-1" Type="DraftFolder"><Title>Chapter One</Title><IncludeInCompile>No</IncludeInCompile><Children>
                   <BinderItem UUID="scene-1" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
-                  <BinderItem UUID="scene-2" Type="Text"><Title>Decision</Title><MetaData><Status>Complete</Status></MetaData><Children/></BinderItem>
+                  <BinderItem UUID="scene-2" Type="Text"><Title>Decision</Title><MetaData><Status>3</Status></MetaData><Children/></BinderItem>
                 </Children></BinderItem>
               <BinderItem UUID="research-1" Type="Folder"><Title>Research</Title><Children/></BinderItem>
             </Binder></ScrivenerProject>"#,
@@ -9018,6 +9068,19 @@ unexpected_prose = "must not be silently discarded"
         let source_fingerprint = source_before.source_fingerprint.clone();
         let mut app = WriterApp::create_project(dir.path().join("Imported"), "Imported").unwrap();
         let inventory = story_import::inspect_scrivener_project(&source).unwrap();
+        assert_eq!(
+            inventory.status_labels.get("3").map(String::as_str),
+            Some("Final Draft")
+        );
+        assert_eq!(
+            inventory
+                .items
+                .iter()
+                .find(|item| item.source_document_id == "scene-2")
+                .and_then(|item| item.fields.get("Status"))
+                .map(String::as_str),
+            Some("3")
+        );
         let mut plan = story_import::ScrivenerImportPlan::proposed(&inventory);
         plan.decisions
             .iter_mut()
@@ -10255,6 +10318,7 @@ unexpected_prose = "must not be silently discarded"
                 ..ScrivenerCompileSettings::default()
             }),
             section_types: BTreeMap::new(),
+            status_labels: BTreeMap::new(),
             items: vec![item("chapter", "chapter-type"), item("scene", "scene-type")],
             warnings: Vec::new(),
             unsupported: Vec::new(),

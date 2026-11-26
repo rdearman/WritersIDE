@@ -418,6 +418,11 @@ pub struct ScrivenerProjectInventory {
     /// Source-defined section type names keyed by stable Scrivener type ID.
     #[serde(default)]
     pub section_types: BTreeMap<String, String>,
+    /// Project-defined status labels keyed by their source IDs. Binder items
+    /// may store only the numeric ID, so retain this lookup to translate
+    /// source statuses without losing their original field values.
+    #[serde(default)]
+    pub status_labels: BTreeMap<String, String>,
     pub items: Vec<ScrivenerBinderItem>,
     pub warnings: Vec<String>,
     pub unsupported: Vec<String>,
@@ -1758,6 +1763,7 @@ pub fn inspect_scrivener_project(
         project_metadata: BTreeMap::new(),
         compile_settings: None,
         section_types: scrivener_section_type_names(&root),
+        status_labels: scrivener_status_labels(&root),
         items: Vec::new(),
         warnings: Vec::new(),
         unsupported: Vec::new(),
@@ -2141,6 +2147,29 @@ fn scrivener_section_type_names(root: &ScrivenerXmlNode) -> BTreeMap<String, Str
             let id = node.attributes.get("ID")?;
             let name = node.text.trim();
             (!name.is_empty()).then(|| (id.clone(), name.to_owned()))
+        })
+        .collect()
+}
+
+fn scrivener_status_labels(root: &ScrivenerXmlNode) -> BTreeMap<String, String> {
+    let Some(settings) = find_scrivener_node(root, "StatusSettings") else {
+        return BTreeMap::new();
+    };
+    let Some(items) = settings
+        .children
+        .iter()
+        .find(|child| child.name.eq_ignore_ascii_case("StatusItems"))
+    else {
+        return BTreeMap::new();
+    };
+    items
+        .children
+        .iter()
+        .filter(|node| node.name.eq_ignore_ascii_case("Status"))
+        .filter_map(|node| {
+            let id = node.attributes.get("ID")?;
+            let label = node.text.trim();
+            (!label.is_empty()).then(|| (id.clone(), label.to_owned()))
         })
         .collect()
 }
@@ -5036,6 +5065,7 @@ This is an addition to the old file.}"#;
                 ..ScrivenerCompileSettings::default()
             }),
             section_types: BTreeMap::new(),
+            status_labels: BTreeMap::new(),
             items: vec![
                 ScrivenerBinderItem {
                     source_document_id: "draft".into(),
@@ -5174,6 +5204,7 @@ This is an addition to the old file.}"#;
                 ..ScrivenerCompileSettings::default()
             }),
             section_types: BTreeMap::new(),
+            status_labels: BTreeMap::new(),
             items: vec![
                 make_item("trash-root", None, "Trash", "TrashFolder", "trash"),
                 make_item(
@@ -5246,6 +5277,7 @@ This is an addition to the old file.}"#;
             project_metadata: BTreeMap::new(),
             compile_settings: None,
             section_types: BTreeMap::new(),
+            status_labels: BTreeMap::new(),
             items: vec![
                 ScrivenerBinderItem {
                     source_document_id: "same".into(),
