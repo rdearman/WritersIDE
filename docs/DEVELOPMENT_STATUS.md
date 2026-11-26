@@ -1,5 +1,21 @@
 # Writer's IDE Development Status
 
+## P0 #62 — empty previous-position command safety verified, 26 November 2026
+
+The production terminal already handles empty location history as a non-fatal
+status result. It preserves the editor buffer, cursor and dirty state; the
+command dispatcher keeps the application running. The terminal unit test
+`previous_position_without_history_is_a_nonfatal_menu_action_and_preserves_unsaved_text`
+and the production Linux PTY
+`empty_previous_position_from_navigate_menu_keeps_the_terminal_running`
+both passed in this checkpoint. The PTY selects the command through Navigate,
+checks the visible nonfatal message, reopens the menu and exits cleanly.
+
+This verifies the reported empty-history failure automatically; it does not
+establish human UAT. The issue's populated-history/boundary and ordinary
+terminal acceptance criteria remain open for the author's retest. Continue to
+the next independent P0 defect rather than waiting for that acceptance.
+
 ## UX interaction design proposal — awaiting author review, 26 November 2026
 
 `docs/WIDE_UX_INTERACTION_DESIGN_v1.0_PROPOSAL.md` is a proposed, unapproved
