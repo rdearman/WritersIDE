@@ -34,6 +34,14 @@ across private/unselected entries. This remains provisional: profile fidelity
 and exact intended rendering of those source section types are unresolved, and
 human publication review is still required.
 
+The exact-commit compile-only validation is
+`reports/scrivener-layout-warning-a599ba3-20261126/`; the EPUB for local
+Calibre review is
+`generated/scrivener-layout-warning-a599ba3-20261126/book-03.epub`. It was
+compiled at commit `a599ba355abe7e2136065442ec58f9a24ad91270`. Its comparison is
+still provisional and requires investigation of source/reference differences
+and human review.
+
 ## Book 03 regression-harness classification correction — 26 November 2026
 
 The earlier 68/68 manuscript and 10/12 research-body counts were a harness
