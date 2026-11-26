@@ -107,6 +107,43 @@ pub struct ScrivenerEditionProfile {
 type ScrivenerPublicationEntities =
     std::collections::BTreeMap<String, Vec<(Option<SceneId>, Option<ContentUnitId>)>>;
 
+fn scrivener_scene_status(item: &story_import::ScrivenerBinderItem) -> SceneStatus {
+    let explicit = item
+        .fields
+        .iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case("Status"))
+        .map(|(_, value)| value.trim().to_ascii_lowercase().replace(['-', '_'], " "));
+    match explicit.as_deref() {
+        Some("idea") => return SceneStatus::Idea,
+        Some("outline") | Some("outlined") => return SceneStatus::Outlined,
+        Some("ready to draft") | Some("ready") => return SceneStatus::ReadyToDraft,
+        Some("drafting") | Some("in progress") | Some("draft") => {
+            return SceneStatus::Drafting;
+        }
+        Some("first draft") | Some("draft complete") => return SceneStatus::DraftComplete,
+        Some("revising") | Some("revised") => return SceneStatus::Revising,
+        Some("complete") | Some("finished") | Some("final") => return SceneStatus::Complete,
+        Some("archived") => return SceneStatus::Archived,
+        _ => {}
+    }
+
+    if item
+        .content_markdown
+        .as_deref()
+        .is_some_and(|content| !content.trim().is_empty())
+    {
+        SceneStatus::Imported
+    } else if item
+        .synopsis
+        .as_deref()
+        .is_some_and(|synopsis| !synopsis.trim().is_empty())
+    {
+        SceneStatus::Outlined
+    } else {
+        SceneStatus::Idea
+    }
+}
+
 fn scrivener_format_display_name(source_id: &str, index: usize) -> String {
     if uuid::Uuid::parse_str(source_id).is_ok() {
         return format!("Imported layout {}", index + 1);
@@ -4892,6 +4929,7 @@ impl WriterApp {
                     }
                     let mut metadata = self.get_scene(scene)?.scene;
                     metadata.synopsis = item.synopsis.clone().unwrap_or_default();
+                    metadata.status = scrivener_scene_status(item);
                     self.update_scene_metadata(&metadata)?;
                     if item.content_markdown.is_some() {
                         let text = self.materialize_scrivener_assets(item)?;
@@ -6610,6 +6648,53 @@ fn _storage_result(_: StorageResult<()>) {}
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn scrivener_scene_status_respects_source_and_does_not_call_written_prose_an_idea() {
+        let item = |fields, synopsis, content| story_import::ScrivenerBinderItem {
+            source_document_id: "source-scene".into(),
+            parent_source_id: Some("chapter".into()),
+            position: 0,
+            title: "Imported scene".into(),
+            type_code: Some("Text".into()),
+            area: "manuscript".into(),
+            include_in_compile: Some(true),
+            section_type_id: None,
+            synopsis,
+            notes_markdown: None,
+            content_markdown: content,
+            embedded_assets: Vec::new(),
+            fields,
+            unsupported: Vec::new(),
+        };
+
+        let written = item(
+            std::collections::BTreeMap::new(),
+            None,
+            Some("A draft.".into()),
+        );
+        assert_eq!(scrivener_scene_status(&written), SceneStatus::Imported);
+
+        let explicitly_complete = item(
+            std::collections::BTreeMap::from([("Status".into(), "Complete".into())]),
+            None,
+            Some("A draft.".into()),
+        );
+        assert_eq!(
+            scrivener_scene_status(&explicitly_complete),
+            SceneStatus::Complete
+        );
+
+        let outlined = item(
+            std::collections::BTreeMap::new(),
+            Some("A beat".into()),
+            None,
+        );
+        assert_eq!(scrivener_scene_status(&outlined), SceneStatus::Outlined);
+
+        let empty = item(std::collections::BTreeMap::new(), None, None);
+        assert_eq!(scrivener_scene_status(&empty), SceneStatus::Idea);
+    }
 
     #[test]
     fn scrivener_project_metadata_populates_only_available_book_fields() {
@@ -8889,18 +8974,21 @@ unexpected_prose = "must not be silently discarded"
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("SeriesBook.scriv");
         let scene_files = source.join("Files/Data/scene-1");
+        let scene_two_files = source.join("Files/Data/scene-2");
         let section_files = source.join("Files/Data/section-1");
         let chapter_files = source.join("Files/Data/chapter-1");
         fs::create_dir_all(&scene_files).unwrap();
+        fs::create_dir_all(&scene_two_files).unwrap();
         fs::create_dir_all(&section_files).unwrap();
         fs::create_dir_all(&chapter_files).unwrap();
         fs::write(
             source.join("SeriesBook.scrivx"),
             r#"<ScrivenerProject Version="2.0"><Binder>
               <BinderItem UUID="section-1" Type="Folder"><Title>Part One</Title><Children/></BinderItem>
-              <BinderItem UUID="chapter-1" Type="DraftFolder"><Title>Chapter One</Title><IncludeInCompile>No</IncludeInCompile><Children>
-                <BinderItem UUID="scene-1" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
-              </Children></BinderItem>
+                <BinderItem UUID="chapter-1" Type="DraftFolder"><Title>Chapter One</Title><IncludeInCompile>No</IncludeInCompile><Children>
+                  <BinderItem UUID="scene-1" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
+                  <BinderItem UUID="scene-2" Type="Text"><Title>Decision</Title><MetaData><Status>Complete</Status></MetaData><Children/></BinderItem>
+                </Children></BinderItem>
               <BinderItem UUID="research-1" Type="Folder"><Title>Research</Title><Children/></BinderItem>
             </Binder></ScrivenerProject>"#,
         )
@@ -8921,6 +9009,11 @@ unexpected_prose = "must not be silently discarded"
         )
         .unwrap();
         fs::write(scene_files.join("synopsis.txt"), "The door opens").unwrap();
+        fs::write(
+            scene_two_files.join("content.rtf"),
+            r"{\rtf1\ansi The choice is made.}",
+        )
+        .unwrap();
         let source_before = story_import::inspect_scrivener_project(&source).unwrap();
         let source_fingerprint = source_before.source_fingerprint.clone();
         let mut app = WriterApp::create_project(dir.path().join("Imported"), "Imported").unwrap();
@@ -8938,6 +9031,11 @@ unexpected_prose = "must not be silently discarded"
             .destination_kind = story_import::ScrivenerDestinationKind::Scene;
         plan.decisions
             .iter_mut()
+            .find(|decision| decision.source_document_id == "scene-2")
+            .unwrap()
+            .destination_kind = story_import::ScrivenerDestinationKind::Scene;
+        plan.decisions
+            .iter_mut()
             .find(|decision| decision.source_document_id == "section-1")
             .unwrap()
             .destination_kind = story_import::ScrivenerDestinationKind::Section;
@@ -8951,7 +9049,7 @@ unexpected_prose = "must not be silently discarded"
         let (run, scenes) = app
             .import_scrivener_inventory(&inventory, &plan, story_import::ScrivenerImportMode::Both)
             .unwrap();
-        assert_eq!(scenes.len(), 1);
+        assert_eq!(scenes.len(), 2);
         let imported_scene_text = app.load_scene_text(scenes[0]).unwrap().0;
         assert!(imported_scene_text.contains("Élodie entered."));
         assert!(imported_scene_text.contains(r"\# Not a heading"));
@@ -8993,7 +9091,12 @@ unexpected_prose = "must not be silently discarded"
         assert!(!compiled.contains("Chapter introduction."));
         assert!(compiled.contains("Élodie entered."));
         let scene = app.get_scene(scenes[0]).unwrap();
+        assert_eq!(scene.scene.status, SceneStatus::Imported);
         assert_eq!(scene.scene.synopsis, "The door opens");
+        assert_eq!(
+            app.get_scene(scenes[1]).unwrap().scene.status,
+            SceneStatus::Complete
+        );
         assert_eq!(app.list_structural_nodes().unwrap().len(), 2);
         assert_eq!(app.list_reading_documents().unwrap().len(), 1);
         if std::process::Command::new("pandoc")
@@ -9020,8 +9123,8 @@ unexpected_prose = "must not be silently discarded"
         let snapshots = fs::read_dir(snapshot_root).unwrap().count();
         assert_eq!(snapshots, 1);
         let summary = app.get_import_run_summary(run).unwrap();
-        assert_eq!(summary.source_items, 4);
-        assert_eq!(summary.provenance_records, 6);
+        assert_eq!(summary.source_items, 5);
+        assert_eq!(summary.provenance_records, 7);
         assert_eq!(summary.status, "incomplete");
         assert!(
             summary

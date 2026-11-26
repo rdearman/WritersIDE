@@ -33155,6 +33155,7 @@ fn parse_terminal_status(value: &str) -> Result<SceneStatus, Box<dyn std::error:
         "draft_complete" => SceneStatus::DraftComplete,
         "revising" => SceneStatus::Revising,
         "complete" => SceneStatus::Complete,
+        "imported" => SceneStatus::Imported,
         "archived" => SceneStatus::Archived,
         _ => return Err(format!("unknown scene status: {value}").into()),
     })

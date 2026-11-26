@@ -11611,6 +11611,7 @@ fn parse_status(s: &str) -> SceneStatus {
         "draft_complete" => SceneStatus::DraftComplete,
         "revising" => SceneStatus::Revising,
         "complete" => SceneStatus::Complete,
+        "imported" => SceneStatus::Imported,
         "archived" => SceneStatus::Archived,
         _ => SceneStatus::Idea,
     }

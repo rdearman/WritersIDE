@@ -1771,6 +1771,10 @@ pub enum SceneStatus {
     DraftComplete,
     Revising,
     Complete,
+    /// The scene was imported with prose but the source did not provide a
+    /// recognised authoring status. This avoids presenting existing writing
+    /// as a new idea while making no claim that the draft is complete.
+    Imported,
     Archived,
 }
 impl SceneStatus {
@@ -1783,6 +1787,7 @@ impl SceneStatus {
             Self::DraftComplete => "draft_complete",
             Self::Revising => "revising",
             Self::Complete => "complete",
+            Self::Imported => "imported",
             Self::Archived => "archived",
         }
     }
