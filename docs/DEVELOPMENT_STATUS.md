@@ -2,6 +2,30 @@
 
 Updated: 2026-11-26
 
+## Current checkpoint — explicit Scrivener layout translation, 26 November 2026
+
+Added an application-level translation from one selected Scrivener compile
+format to WIDE's existing compile heading/separator controls. Translation uses
+the import plan's explicit Section/Chapter/Scene assignments and project-local
+section-type and layout IDs; it never classifies documents from their titles.
+Unmapped layouts, conflicting heading policies, unsupported separator kinds,
+layout title/body prefixes or suffixes, body-text suppression, and Scrivener
+front/back-matter defaults are surfaced as warnings rather than silently
+discarded or guessed. A synthetic application test verifies chapter and scene
+heading suppression, a custom scene separator, unchanged source titles, and
+warnings for an unmapped section type.
+
+This is a translation seam, not completion of Scrivener profile integration:
+the selected mapping is not yet persisted as a named WIDE edition recipe,
+format-level body inclusion and front/back matter are not yet applied to the
+shared Compile IR, and the terminal/CLI does not yet expose a profile creation
+workflow. Issues #7, #53, #68 and #73 remain open. The application crate's 59
+unit tests passed, including the full `story-app` test suite. Workspace
+formatting and Clippy with warnings denied passed. A full workspace test
+attempt did not complete in this execution; do not record it as passed. The
+current source tree also contains unrelated user-owned changes in `.gitignore`,
+`README_TMP.md`, `UAT/` and `tools/__pycache__/`; do not stage those paths.
+
 This is the handover note for ongoing implementation. GitHub issues remain the
 authoritative source for approved requirements and human UAT findings.
 

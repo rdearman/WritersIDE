@@ -532,7 +532,7 @@ pub struct ScrivenerEmbeddedAsset {
 /// Explicit destination choice shown in a Scrivener import preview. `Unmapped`
 /// is intentional: folder names and binder roles are not sufficient evidence
 /// to invent chapter/scene boundaries.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum ScrivenerDestinationKind {
     Unmapped,
     Section,

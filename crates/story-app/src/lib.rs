@@ -79,6 +79,160 @@ pub struct CompileRunRecord {
     pub stale: bool,
 }
 
+/// Translation of one explicitly selected Scrivener compile format into WIDE's
+/// renderer-neutral heading and separator controls. The import plan is
+/// required because Scrivener section-type IDs have project-local meanings;
+/// this function never infers a role from a binder title.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScrivenerCompilePresentation {
+    pub presentation: story_document::CompilePresentation,
+    pub warnings: Vec<String>,
+}
+
+pub fn scrivener_compile_presentation(
+    inventory: &story_import::ScrivenerProjectInventory,
+    plan: &story_import::ScrivenerImportPlan,
+    format_id: &str,
+) -> Result<ScrivenerCompilePresentation> {
+    use story_import::ScrivenerDestinationKind as Destination;
+
+    let settings = inventory
+        .compile_settings
+        .as_ref()
+        .ok_or_else(|| AppError::Domain("Scrivener compile settings are unavailable".into()))?;
+    let format = settings
+        .formats
+        .iter()
+        .find(|format| format.source_format_id == format_id)
+        .ok_or_else(|| {
+            AppError::Domain(format!(
+                "Scrivener compile format '{format_id}' was not found"
+            ))
+        })?;
+    let decisions = plan
+        .decisions
+        .iter()
+        .map(|decision| {
+            (
+                decision.source_document_id.as_str(),
+                decision.destination_kind,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut presentation = story_document::CompilePresentation::default();
+    let mut warnings = Vec::new();
+    let mut title_policies =
+        std::collections::BTreeMap::<Destination, std::collections::BTreeSet<bool>>::new();
+    let mut separators = std::collections::BTreeSet::new();
+    let mut body_exclusions = Vec::new();
+
+    for item in &inventory.items {
+        let Some(section_type_id) = item.section_type_id.as_deref() else {
+            continue;
+        };
+        let Some(layout_id) = format.section_layouts.get(section_type_id) else {
+            warnings.push(format!("source section type '{section_type_id}' has no layout mapping in format '{format_id}'"));
+            continue;
+        };
+        let Some(layout) = format.layouts.get(layout_id) else {
+            warnings.push(format!("layout '{layout_id}' for source section type '{section_type_id}' is not available for format '{format_id}'"));
+            continue;
+        };
+        let destination = decisions
+            .get(item.source_document_id.as_str())
+            .copied()
+            .unwrap_or(Destination::Unmapped);
+        if matches!(
+            destination,
+            Destination::Section | Destination::Chapter | Destination::Scene
+        ) && let Some(include_titles) = layout.include_titles
+        {
+            title_policies
+                .entry(destination)
+                .or_default()
+                .insert(include_titles);
+        }
+        if layout.title_prefix.is_some() || layout.title_suffix.is_some() {
+            warnings.push(format!("Scrivener layout '{layout_id}' has title prefix/suffix content that is not represented by WIDE's heading visibility controls"));
+        }
+        if layout.text_prefix.is_some() || layout.text_suffix.is_some() {
+            warnings.push(format!("Scrivener layout '{layout_id}' has body prefix/suffix content that requires a richer Compile IR mapping"));
+        }
+        if layout.include_text == Some(false)
+            && matches!(
+                destination,
+                Destination::Section | Destination::Chapter | Destination::Scene
+            )
+        {
+            body_exclusions.push(item.source_document_id.clone());
+        }
+        if matches!(destination, Destination::Scene)
+            && let (Some(kind), Some(text)) = (
+                &layout.between_separator_kind,
+                &layout.between_separator_text,
+            )
+        {
+            separators.insert((kind.clone(), text.clone()));
+        }
+    }
+
+    for (destination, policies) in title_policies {
+        if policies.len() > 1 {
+            warnings.push(format!("Scrivener format '{format_id}' assigns conflicting heading visibility to {destination:?} documents; WIDE left that setting unchanged"));
+            continue;
+        }
+        let include = *policies.iter().next().expect("non-empty policies");
+        match destination {
+            Destination::Section => presentation.include_section_titles = include,
+            Destination::Chapter => presentation.include_chapter_titles = include,
+            Destination::Scene => presentation.include_scene_titles = include,
+            _ => {}
+        }
+    }
+    if separators.len() == 1 {
+        let (kind, text) = separators.into_iter().next().expect("one separator");
+        if matches!(
+            kind.to_ascii_lowercase().as_str(),
+            "text" | "custom" | "separator"
+        ) && !text.trim().is_empty()
+        {
+            presentation.scene_separator = Some(text);
+        } else if !matches!(kind.to_ascii_lowercase().as_str(), "none" | "") {
+            warnings.push(format!("Scrivener scene separator kind '{kind}' is not represented in WIDE's text-separator setting"));
+        }
+    } else if separators.len() > 1 {
+        warnings.push(format!("Scrivener format '{format_id}' uses multiple scene separators; WIDE left the single separator setting unchanged"));
+    }
+    if !body_exclusions.is_empty() {
+        body_exclusions.sort();
+        body_exclusions.dedup();
+        warnings.push(format!("{} source document(s) use layouts with body text disabled; per-document layout body suppression is not yet represented by CompilePresentation", body_exclusions.len()));
+    }
+    for (label, id, enabled) in [
+        (
+            "front matter",
+            format.default_front_matter_id.as_deref(),
+            format.add_default_front_matter,
+        ),
+        (
+            "back matter",
+            format.default_back_matter_id.as_deref(),
+            format.add_default_back_matter,
+        ),
+    ] {
+        if id.is_some() || enabled.is_some() {
+            warnings.push(format!("Scrivener {label} selection is retained in import provenance but is not yet translated into the WIDE edition assembly"));
+        }
+    }
+    presentation.validate().map_err(AppError::Domain)?;
+    warnings.sort();
+    warnings.dedup();
+    Ok(ScrivenerCompilePresentation {
+        presentation,
+        warnings,
+    })
+}
+
 /// Optional, per-book chronology behavior. Story-time fields remain stored even
 /// while the feature is disabled; disabling it only suppresses timeline analysis
 /// and any optional missing-time prompts.
@@ -9317,5 +9471,112 @@ unexpected_prose = "must not be silently discarded"
                 .unwrap();
         assert!(artifact.contains("Second canonical prose."));
         assert!(!artifact.contains("First canonical prose."));
+    }
+
+    #[test]
+    fn scrivener_layout_rules_translate_using_import_roles_and_report_gaps() {
+        use std::collections::BTreeMap;
+        use story_import::{
+            ScrivenerBinderItem, ScrivenerCompileFormatSettings, ScrivenerCompileLayout,
+            ScrivenerCompileSettings, ScrivenerDestinationKind as Destination, ScrivenerImportPlan,
+            ScrivenerMappingDecision, ScrivenerProjectInventory,
+        };
+        let item = |id: &str, type_id: &str| ScrivenerBinderItem {
+            source_document_id: id.into(),
+            parent_source_id: None,
+            position: 0,
+            title: format!("Internal {id}"),
+            type_code: None,
+            area: "draft".into(),
+            include_in_compile: Some(true),
+            section_type_id: Some(type_id.into()),
+            synopsis: None,
+            notes_markdown: None,
+            content_markdown: Some("canonical".into()),
+            embedded_assets: Vec::new(),
+            fields: BTreeMap::new(),
+            unsupported: Vec::new(),
+        };
+        let format = ScrivenerCompileFormatSettings {
+            source_format_id: "ebook".into(),
+            section_layouts: BTreeMap::from([
+                ("chapter-type".into(), "hide-chapter".into()),
+                ("scene-type".into(), "hide-scene".into()),
+            ]),
+            layouts: BTreeMap::from([
+                (
+                    "hide-chapter".into(),
+                    ScrivenerCompileLayout {
+                        source_layout_id: "hide-chapter".into(),
+                        include_titles: Some(false),
+                        include_text: Some(true),
+                        ..ScrivenerCompileLayout::default()
+                    },
+                ),
+                (
+                    "hide-scene".into(),
+                    ScrivenerCompileLayout {
+                        source_layout_id: "hide-scene".into(),
+                        include_titles: Some(false),
+                        include_text: Some(true),
+                        between_separator_kind: Some("Custom".into()),
+                        between_separator_text: Some("* * *".into()),
+                        ..ScrivenerCompileLayout::default()
+                    },
+                ),
+            ]),
+            ..ScrivenerCompileFormatSettings::default()
+        };
+        let inventory = ScrivenerProjectInventory {
+            source_path: "source.scriv".into(),
+            source_fingerprint: "fingerprint".into(),
+            title: "Book".into(),
+            format_version: Some("2.0".into()),
+            creator: None,
+            project_metadata: BTreeMap::new(),
+            compile_settings: Some(ScrivenerCompileSettings {
+                formats: vec![format],
+                ..ScrivenerCompileSettings::default()
+            }),
+            section_types: BTreeMap::new(),
+            items: vec![item("chapter", "chapter-type"), item("scene", "scene-type")],
+            warnings: Vec::new(),
+            unsupported: Vec::new(),
+        };
+        let plan = ScrivenerImportPlan {
+            decisions: vec![
+                ScrivenerMappingDecision {
+                    source_document_id: "chapter".into(),
+                    destination_kind: Destination::Chapter,
+                    title_override: None,
+                    include_in_import: true,
+                },
+                ScrivenerMappingDecision {
+                    source_document_id: "scene".into(),
+                    destination_kind: Destination::Scene,
+                    title_override: None,
+                    include_in_import: true,
+                },
+            ],
+        };
+        let mapped = scrivener_compile_presentation(&inventory, &plan, "ebook").unwrap();
+        assert!(!mapped.presentation.include_chapter_titles);
+        assert!(!mapped.presentation.include_scene_titles);
+        assert_eq!(
+            mapped.presentation.scene_separator.as_deref(),
+            Some("* * *")
+        );
+        assert!(mapped.warnings.is_empty());
+        assert_eq!(inventory.items[0].title, "Internal chapter");
+
+        let mut ambiguous = inventory.clone();
+        ambiguous.items[1].section_type_id = Some("unmapped-type".into());
+        let mapped = scrivener_compile_presentation(&ambiguous, &plan, "ebook").unwrap();
+        assert!(
+            mapped
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("no layout mapping"))
+        );
     }
 }
