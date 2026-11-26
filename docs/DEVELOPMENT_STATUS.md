@@ -1,5 +1,44 @@
 # Writer's IDE Development Status
 
+## Current checkpoint — Alpha UAT 33 and lifecycle verification, 26 November 2026
+
+Frozen Linux x86_64 release build from commit `f5bad1b93f878db4b409ae1e4fb3ae8920b47a0e` is available at `test-builds/alpha-uat-33-f5bad1b/`. Launch it with:
+
+```sh
+cd /home/rick/Development/Active/WritersIDE/test-builds/alpha-uat-33-f5bad1b
+./run.sh
+```
+
+The bundle has isolated preferences/HOME data, disposable fiction and
+non-fiction projects, and sanitised synthetic Scrivener fixtures. Its UAT
+checklist is `UAT-CHECKLIST.md`; SHA-256 checksums are in `SHA256SUMS` and were
+verified after packaging and frozen-binary PTY checks. The release executable
+passed production PTY workflows for creating/writing/saving a fiction project
+and creating/writing/autosaving/promoting a non-fiction chapter-only project.
+The isolated bundle contains no private manuscript corpus.
+
+Verification on commit `f5bad1b`:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --offline --workspace --all-targets -- -D warnings` — passed.
+- `cargo test --offline --workspace` — passed, including 351 terminal unit
+  tests, 3 author-workflow tests, 29 production PTYs and all other workspace
+  and documentation tests; one protected-corpus PTY is intentionally ignored
+  unless its private fixture variable is configured.
+- Focused PTYs for fiction, non-fiction, staged Scrivener import/edit/reopen/
+  compile, and abrupt-exit recovery — passed.
+- Protected ArrowMaking import PTY and fixture checksums — passed in the
+  preceding checkpoint; original source remained unchanged.
+- Alpha UAT 33 bundle checksums and frozen release executable workflows — passed.
+
+Human acceptance is pending. The reported false external-change conflict and
+eleven disappearing outline scenes from #38 still have not reproduced, and
+their root cause is not established. Hash-based conflict detection remains
+enabled. Issues #37, #38, #44, #46, #52, #53, #54 and #55 remain open for
+human verification and any further author findings. Next, continue the
+Scrivener per-format layout and inclusion integration, then the outstanding
+approved v1.0 backlog.
+
 Updated: 2026-11-26
 
 ## Current checkpoint — Alpha UAT 32 and direct Scrivener import, 26 November 2026
