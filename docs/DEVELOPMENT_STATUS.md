@@ -941,6 +941,10 @@ human UAT remains outstanding.
 
 ## Configurable compile heading presentation — in progress, 26 November 2026
 
+Implementation commit: `365c098` (pushed); the accompanying regression
+documentation is `e3b1ca8` (pushed). Current repository HEAD at this checkpoint
+is `e3b1ca8`.
+
 The shared Compile IR and named edition recipes now support generated-output
 rules for showing or hiding section, chapter, generic group, scene and matter
 headings. Edition recipes can replace chapter titles with a sequential
