@@ -3392,7 +3392,7 @@ output = "exports/old.md"
             segments: vec![
                 CompileSegment::new(
                     "scene-uuid",
-                    "Élodie *opened* the **door**.\n\n- One\n- Two\n",
+                    "Élodie *opened* the **door** and [checked the latch]{.underline}.\n\n- One\n- Two\n",
                 )
                 .with_language_spans(vec![CompileLanguageSpan {
                     start_byte: 0,
@@ -3419,9 +3419,13 @@ output = "exports/old.md"
                 assert!(html.contains("lang=\"en-GB\""), "{html}");
                 assert!(html.contains("lang=\"fr-FR\""), "{html}");
                 assert!(html.contains("lang=\"it-IT\""), "{html}");
+                assert!(html.contains("<u>checked the latch</u>"), "{html}");
             }
             if format == CompileFormat::Latex {
                 assert!(String::from_utf8_lossy(&artifact.bytes).contains("\\documentclass"));
+                assert!(
+                    String::from_utf8_lossy(&artifact.bytes).contains("\\ul{checked the latch}")
+                );
             }
         }
         let docx = renderer.render(&ir, CompileFormat::Docx, None).unwrap();
@@ -3433,6 +3437,8 @@ output = "exports/old.md"
             .read_to_string(&mut document)
             .unwrap();
         assert!(document.contains("Élodie"));
+        assert!(document.contains("<w:u w:val=\"single\""), "{document}");
+        assert!(document.contains("checked the latch"), "{document}");
         assert!(document.contains("fr-FR"), "{document}");
         assert!(document.contains("it-IT"), "{document}");
         let epub = renderer.render(&ir, CompileFormat::Epub, None).unwrap();

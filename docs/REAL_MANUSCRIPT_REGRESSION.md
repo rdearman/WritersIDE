@@ -507,6 +507,39 @@ Scrivener compile inclusion/layout, variables, alternative publication matter,
 formatting and remaining differential discrepancies still require work and
 review.
 
+## 26 November 2026 — RTF underline and CSS-aware emphasis comparison
+
+The importer now preserves Scrivener RTF underline controls as a semantic
+Pandoc span, composable with bold, italic and strike formatting. Synthetic
+coverage verifies underline start/end controls and combined bold/underline;
+the production renderer test verifies semantic underline in HTML, DOCX and
+LaTeX output. The differential analyser also reads simple CSS class rules for
+semantic emphasis, so historical EPUBs that encode bold/italic/underline via
+classes can be compared with generated EPUBs using semantic tags. This is a
+focused semantic comparison, not a complete CSS cascade/layout engine.
+
+Fresh three-book import, persistence/reopen and compile run:
+
+- Reports: `reports/rtf-underline-all-20261126/`
+- Generated EPUBs: `generated/rtf-underline-all-20261126/book-01.epub`,
+  `generated/rtf-underline-all-20261126/book-02.epub`, and
+  `generated/rtf-underline-all-20261126/book-03.epub`
+- EPUBCheck 4.2.6: all three generated EPUBs pass with zero errors/warnings.
+- Current source fingerprints and fixture checksum manifest: unchanged.
+- Mapped included source bodies persisted exactly: book 01 39/39, book 02
+  36/36, book 03 68/68; research bodies: 6/6, 6/6, 12/12.
+- The generated book 02 contains the semantic underline recovered from its
+  RTF source; all three outputs have zero unintended preformatted/code blocks.
+- Comparison against historical EPUBs still reports semantic-formatting
+  differences (missing/additional runs: book 01 177/115, book 02 92/7,
+  book 03 86/84). These counts are investigation evidence, not proof of a
+  WIDE defect or a publication-fidelity pass; historical source revisions and
+  formatting/layout mapping remain to be classified.
+
+The real comparison ran with an uncommitted working tree based on commit
+`622328c`; do not associate its generated EPUBs with a later commit without
+rerunning. Detailed reports and artifacts are private and remain untracked.
+
 ## 26 November 2026 — RTF emphasis whitespace
 
 Book 01's fresh generated EPUB exposed literal Markdown bold markers when a

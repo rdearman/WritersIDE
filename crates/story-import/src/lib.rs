@@ -2944,8 +2944,8 @@ fn extract_rtf_text(source: &str) -> String {
 
 /// Converts the subset of RTF inline formatting supported by the importer to
 /// Markdown. Unsupported document-level formatting is reported by the caller.
-/// This intentionally preserves bold, italic and strike runs without trying
-/// to reproduce page layout or embedded objects.
+/// This intentionally preserves bold, italic, underline and strike runs
+/// without trying to reproduce page layout or embedded objects.
 fn find_rtf_group_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut index = start;
@@ -3597,6 +3597,7 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
     struct Style {
         bold: bool,
         italic: bool,
+        underline: bool,
         strike: bool,
         skip: bool,
         unicode_fallback: usize,
@@ -3608,6 +3609,7 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
             Self {
                 bold: false,
                 italic: false,
+                underline: false,
                 strike: false,
                 skip: false,
                 unicode_fallback: 1,
@@ -3782,10 +3784,17 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
                         // marker cease to be a list marker.
                         style.bold = false;
                         style.italic = false;
+                        style.underline = false;
                         style.strike = false;
                     }
                     "b" => style.bold = number != "0",
                     "i" => style.italic = number != "0",
+                    "ul" | "uld" | "uldash" | "uldashd" | "uldashdd" | "uldb" | "ulhair"
+                    | "ulth" | "ulthd" | "ulthdash" | "ulthdashd" | "ulthdashdd" | "ulthldash"
+                    | "ulthldashd" | "ulthldashdd" | "ulthwave" | "ulw" | "ulwave" => {
+                        style.underline = number != "0"
+                    }
+                    "ulnone" => style.underline = false,
                     "strike" | "strikethrough" => style.strike = number != "0",
                     "ansicpg" | "cpg" => {
                         if let Ok(code_page) = number.parse::<u32>() {
@@ -3882,7 +3891,7 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
                 escaped.push_str(&escaped_character);
             }
         }
-        let formatted = match (style.bold, style.italic, style.strike) {
+        let mut formatted = match (style.bold, style.italic, style.strike) {
             (true, true, true) if !escaped.is_empty() => format!("~~***{escaped}***~~"),
             (true, true, false) if !escaped.is_empty() => format!("***{escaped}***"),
             (true, false, true) if !escaped.is_empty() => format!("~~**{escaped}**~~"),
@@ -3892,6 +3901,9 @@ fn extract_rtf_markdown_without_assets(source: &str) -> String {
             (false, false, true) if !escaped.is_empty() => format!("~~{escaped}~~"),
             _ => escaped,
         };
+        if style.underline && !formatted.is_empty() {
+            formatted = format!("[{formatted}]{{.underline}}");
+        }
         output.push_str(&leading);
         output.push_str(&formatted);
         output.push_str(&trailing);
@@ -4397,6 +4409,16 @@ mod tests {
         let markdown = extract_rtf_markdown(source);
         assert_eq!(markdown, "Start **Travel:** next and *phrase* ends.");
         assert!(!markdown.contains("** Travel: **"));
+    }
+
+    #[test]
+    fn scrivener_rtf_underline_uses_semantic_pandoc_span_and_composes_with_emphasis() {
+        let source = r#"{\rtf1\ansi Start {\ul underlined words\ulnone} and {\b\ul bold underlined\b0\ul0}.}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert_eq!(
+            markdown,
+            "Start [underlined words]{.underline} and [**bold underlined**]{.underline}."
+        );
     }
 
     #[test]

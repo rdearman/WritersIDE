@@ -860,3 +860,52 @@ artefact; it did not repeat import, reopen or EPUBCheck. Fixture checksums passe
 before and after comparison. The comparison keys now include the reading-order
 document and containing paragraph, so emphasis moved to another paragraph is
 reported instead of being counted as preserved.
+
+## Current checkpoint — RTF underline and CSS-aware EPUB comparison, 26 November 2026
+
+RTF underline controls were missing from the Scrivener importer. The importer
+now converts underline runs into semantic Pandoc underline spans and composes
+them with bold/italic/strike runs. The production renderer test checks HTML,
+DOCX and LaTeX representations. The actual controlled-book EPUB comparison
+also identified one underline recovered from book 02's RTF source; book 01
+and book 03 contain no newly detected underline runs from this import path.
+
+The differential tool now interprets simple direct CSS class rules for
+semantic formatting. This prevents a historical EPUB's class-styled emphasis
+from being treated as absent merely because WIDE emits semantic elements. It
+does not simulate the full CSS cascade or establish visual equivalence.
+
+Verification and outputs for the fresh three-book production run:
+
+- Reports: `reports/rtf-underline-all-20261126/`
+- EPUBs for local inspection: `generated/rtf-underline-all-20261126/book-01.epub`,
+  `generated/rtf-underline-all-20261126/book-02.epub`,
+  `generated/rtf-underline-all-20261126/book-03.epub`
+- Fixture checksum verification passed before and after. All three source
+  fingerprints remained unchanged.
+- Mapped manuscript body counts preserved exactly after persistence/reopen:
+  39/39, 36/36, and 68/68; research bodies 6/6, 6/6, and 12/12.
+- EPUBCheck 4.2.6: each generated EPUB passed with 0 errors and 0 warnings.
+- No unintended `<pre>` or `<code>` blocks were found.
+- Historical semantic formatting comparison remains materially different:
+  missing/additional semantic runs 177/115, 92/7, and 86/84 respectively.
+  This is not a fidelity pass; differences still require investigation against
+  the authoritative Scrivener sources and compile layout.
+- `python3 -B -m unittest discover -s tools -v`: 25 tests passed.
+- Focused importer and production renderer tests passed. Focused Clippy passed
+  for `story-document` and `story-import`.
+- `cargo fmt --all -- --check`, workspace Clippy with warnings denied, and
+  `cargo test --offline --workspace -- --test-threads=1` all passed. The first
+  non-escalated test run hit the sandbox's loopback bind restriction in the
+  Ollama-only test; the full suite passed on retry with the previously
+  authorised local socket permission. This included 338 terminal unit tests,
+  3 author-workflow tests, 25 Linux PTY tests, all other workspace tests and
+  doc tests.
+- GitHub REST issue-comment requests were unavailable during this checkpoint;
+  retry sanitized issue updates when the API is reachable.
+
+The private regression run tested the dirty tree based on `622328c`, and must
+not be attributed to a later source commit. Commit/push only the importer,
+renderer test, comparator, regression tests and documentation. Do not stage
+user changes in `.gitignore`, `README_TMP.md`, or `UAT/` and do not commit any
+private corpus, generated files or reports.

@@ -149,7 +149,48 @@ class RecoveringXhtmlTree(html.parser.HTMLParser):
             current.text = (current.text or "") + data
 
 
-def epub_document_details(source: str, document_path: str) -> dict:
+def epub_semantic_css_rules(css_sources: list[tuple[str, str]]) -> list[dict]:
+    """Extract simple class rules that directly carry semantic formatting.
+
+    This is deliberately not a CSS cascade engine. Structural and font rules
+    remain in the CSS diff; these simple selectors let semantic formatting
+    compare correctly when an EPUB encodes emphasis in a class rather than an
+    XHTML ``b``/``i`` element.
+    """
+    rules = []
+    rule_pattern = re.compile(r"([^{}]+)\{([^{}]*)\}", re.DOTALL)
+    selector_pattern = re.compile(r"(?:(?P<tag>[A-Za-z][\w-]*))?(?P<classes>(?:\.[\w-]+)+)\Z")
+    for css_path, stylesheet in css_sources:
+        stylesheet = re.sub(r"/\*.*?\*/", "", stylesheet, flags=re.DOTALL)
+        for selectors, declarations in rule_pattern.findall(stylesheet):
+            properties = {
+                key.strip().lower(): value.strip().lower()
+                for declaration in declarations.split(";")
+                if ":" in declaration
+                for key, value in [declaration.split(":", 1)]
+            }
+            if not properties:
+                continue
+            for selector in selectors.split(","):
+                selector = selector.strip()
+                match = selector_pattern.fullmatch(selector)
+                if not match:
+                    continue
+                rules.append({
+                    "source": css_path,
+                    "selector": selector,
+                    "tag": (match.group("tag") or "").lower(),
+                    "classes": set(re.findall(r"\.([\w-]+)", match.group("classes"))),
+                    "properties": properties,
+                })
+    return rules
+
+
+def epub_document_details(
+    source: str,
+    document_path: str,
+    semantic_css_rules: list[dict] | None = None,
+) -> dict:
     """Extract source-located semantic blocks from one EPUB XHTML document."""
     parse_error = None
     recovered = False
@@ -251,13 +292,19 @@ def epub_document_details(source: str, document_path: str) -> dict:
     for index, node in enumerate(root.iter(), 1):
         name = tag_name(node)
         attrs = {key.rsplit("}", 1)[-1].lower(): value for key, value in node.attrib.items()}
-        style = attrs.get("style", "")
-        style_properties = {
+        classes = set(attrs.get("class", "").split())
+        style_properties = {}
+        matched_css = []
+        for rule in semantic_css_rules or []:
+            if rule["classes"].issubset(classes) and (not rule["tag"] or rule["tag"] == name):
+                style_properties.update(rule["properties"])
+                matched_css.append(rule["selector"])
+        style_properties.update({
             key.strip().lower(): value.strip().lower()
-            for declaration in style.split(";")
+            for declaration in attrs.get("style", "").split(";")
             if ":" in declaration
             for key, value in [declaration.split(":", 1)]
-        }
+        })
         semantic_kinds = []
         semantic_kind = {
             "b": "bold", "strong": "bold",
@@ -268,15 +315,16 @@ def epub_document_details(source: str, document_path: str) -> dict:
         }.get(name)
         if semantic_kind:
             semantic_kinds.append(semantic_kind)
-        if name == "span":
-            if style_properties.get("font-weight", "") in {"bold", "bolder", "600", "700", "800", "900"}:
-                semantic_kinds.append("bold")
-            if style_properties.get("font-style", "") in {"italic", "oblique"}:
-                semantic_kinds.append("italic")
-            if "underline" in style_properties.get("text-decoration", ""):
-                semantic_kinds.append("underline")
-            if any(token in style_properties.get("text-decoration", "") for token in ("line-through", "strikethrough")):
-                semantic_kinds.append("strikethrough")
+        if style_properties.get("font-weight", "") in {"bold", "bolder", "600", "700", "800", "900"}:
+            semantic_kinds.append("bold")
+        if style_properties.get("font-style", "") in {"italic", "oblique"}:
+            semantic_kinds.append("italic")
+        if "underline" in style_properties.get("text-decoration", ""):
+            semantic_kinds.append("underline")
+        if any(token in style_properties.get("text-decoration", "") for token in ("line-through", "strikethrough")):
+            semantic_kinds.append("strikethrough")
+        if "small-caps" in style_properties.get("font-variant", ""):
+            semantic_kinds.append("small-caps")
         for semantic_kind in dict.fromkeys(semantic_kinds):
             container_kind, container_text = containing_text_block(node)
             formatting.append({
@@ -286,6 +334,7 @@ def epub_document_details(source: str, document_path: str) -> dict:
                 "text": unicodedata.normalize("NFC", text_of(node)),
                 "container_kind": container_kind,
                 "container_text": container_text,
+                "css_selectors": matched_css,
             })
         if name == "table":
             rows = []
@@ -678,6 +727,13 @@ def epub_semantics(path: pathlib.Path) -> dict:
         collectors = []
         documents = []
         css_sources = []
+        for node in package.findall("opf:manifest/opf:item", ns):
+            if node.attrib.get("media-type") != "text/css":
+                continue
+            css_path = (package_dir / unquote(node.attrib["href"])).as_posix()
+            if css_path in names:
+                css_sources.append((css_path, archive.read(css_path).decode("utf-8", errors="replace")))
+        semantic_css_rules = epub_semantic_css_rules(css_sources)
         nav_collector = None
         for item_id in spine:
             href = manifest[item_id]
@@ -687,13 +743,7 @@ def epub_semantics(path: pathlib.Path) -> dict:
             collector = TextCollector()
             collector.feed(source)
             collectors.append((href, collector))
-            documents.append(epub_document_details(source, href))
-        for node in package.findall("opf:manifest/opf:item", ns):
-            if node.attrib.get("media-type") != "text/css":
-                continue
-            css_path = (package_dir / unquote(node.attrib["href"])).as_posix()
-            if css_path in names:
-                css_sources.append((css_path, archive.read(css_path).decode("utf-8", errors="replace")))
+            documents.append(epub_document_details(source, href, semantic_css_rules))
         nav_item = next(
             (node for node in package.findall("opf:manifest/opf:item", ns)
              if "nav" in node.attrib.get("properties", "").split()),

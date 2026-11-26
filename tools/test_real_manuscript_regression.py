@@ -9,6 +9,7 @@ from real_manuscript_regression import (
     detailed_epub_difference,
     epub_document_details,
     epub_semantics,
+    epub_semantic_css_rules,
     epubcheck_command,
     epubcheck_result,
     make_plan,
@@ -164,7 +165,9 @@ class EpubSemanticTests(unittest.TestCase):
 
     def test_detailed_comparison_normalises_equivalent_bold_xhtml_elements(self):
         reference_doc = epub_document_details(
-            '<html><body><p><b>meaningful emphasis</b></p></body></html>', "ref.xhtml"
+            '<html><body><p class="scrivener-bold">meaningful emphasis</p></body></html>',
+            "ref.xhtml",
+            epub_semantic_css_rules([("book.css", ".scrivener-bold { font-weight: bold; }")]),
         )
         generated_doc = epub_document_details(
             '<html><body><p><strong>meaningful emphasis</strong></p></body></html>', "wide.xhtml"
@@ -175,6 +178,23 @@ class EpubSemanticTests(unittest.TestCase):
         )
         self.assertEqual(difference["semantic_formatting"]["missing_from_generated"], [])
         self.assertEqual(difference["semantic_formatting"]["additional_in_generated"], [])
+
+    def test_semantic_css_comparison_handles_mixed_emphasis_and_small_caps(self):
+        rules = epub_semantic_css_rules([(
+            "book.css",
+            ".bold-italic { font-weight: bold; font-style: italic; }\n"
+            "span.small-caps { font-variant: small-caps; }",
+        )])
+        details = epub_document_details(
+            '<html><body><p><span class="bold-italic">important</span> '
+            '<span class="small-caps">NOTE</span></p></body></html>',
+            "chapter.xhtml",
+            rules,
+        )
+        self.assertEqual(
+            [(mark["kind"], mark["text"]) for mark in details["formatting"]],
+            [("bold", "important"), ("italic", "important"), ("small-caps", "NOTE")],
+        )
 
     def test_detailed_comparison_reports_emphasis_moved_between_paragraphs(self):
         reference_doc = epub_document_details(
