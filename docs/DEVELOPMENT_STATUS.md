@@ -825,3 +825,13 @@ EPUBs each passed EPUBCheck 4.2.6 with zero errors and warnings. The run is
 provisional: it does not establish that all Scrivener compile exclusions or
 historical publication differences are correctly resolved, and human visual
 publication acceptance remains outstanding.
+
+## Proofreading command discoverability — implementation complete, UAT pending
+
+The Review menu now exposes the existing offline spellcheck, grammar check and
+grammar settings commands directly. Spellcheck is categorised with Review and
+Proofreading & Diagnostics rather than Tools. Regression assertions verify both
+the command taxonomy and its visible inclusion in the curated Review menu.
+Focused terminal tests and terminal-package Clippy passed. This improves access
+to existing checks; offline dictionary definitions and thesaurus support remain
+unimplemented, and the menu workflow still needs human usability verification.

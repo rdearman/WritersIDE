@@ -1080,6 +1080,9 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
     &[
         "edit.resolve-save-conflict",
         "issue.create",
+        "analysis.spellcheck",
+        "proofread.grammar-check",
+        "proofread.grammar-settings",
         "reading.list-annotations",
         "reading.list-bookmarks",
         "revision.history",
@@ -3610,7 +3613,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("analysis.coverage-check", "Check Coverage Rules", "Evaluate saved coverage requirements without changing story data", "Plot", "coverage-check", false),
         legacy_command("analysis.coverage-list", "List Coverage Rules", "List project-local coverage requirements", "Plot", "coverage-list", false),
         legacy_command("analysis.coverage-remove", "Remove Coverage Rule", "Remove a coverage requirement by ID", "Plot", "coverage-remove", true),
-        legacy_command("analysis.spellcheck", "Spellcheck Manuscript", "Run local Aspell without changing prose", "Tools", "spellcheck", true),
+        legacy_command("analysis.spellcheck", "Spellcheck Manuscript", "Run local Aspell without changing prose", "Review", "spellcheck", true),
         legacy_command("proofread.grammar-check", "Grammar Check", "Check the current scene or manuscript using the offline grammar engine", "Review", "grammar-check", false),
         legacy_command("proofread.grammar-settings", "Grammar Settings", "Enable or disable proofreading categories, change severity, or exclude terms", "Review", "grammar-settings", false),
         legacy_command(
@@ -4746,7 +4749,11 @@ fn task_group_for_command(command: CommandSpec) -> &'static str {
             "Search & Navigation"
         }
         "Navigate" => "Scenes & Documents",
-        "Review" if id.starts_with("proofread.") || id.starts_with("diagnostic.") => {
+        "Review"
+            if id.starts_with("proofread.")
+                || id.starts_with("diagnostic.")
+                || id == "analysis.spellcheck" =>
+        {
             "Proofreading & Diagnostics"
         }
         "Review"
@@ -36869,6 +36876,12 @@ mod tests {
         let compile = command_by_id("compile.run").unwrap();
         assert_eq!(compile.label, "Compile");
         assert_eq!(compile.category, "Compile");
+        let spellcheck = command_by_id("analysis.spellcheck").unwrap();
+        assert_eq!(spellcheck.category, "Review");
+        assert_eq!(
+            task_group_for_command(spellcheck),
+            "Proofreading & Diagnostics"
+        );
         assert_eq!(command_palette_invocation("process").unwrap().0, compile);
         assert_eq!(
             command_palette_invocation("compile-format").unwrap().0.id,
@@ -45888,6 +45901,15 @@ mod tests {
                 ids, expected,
                 "{category} should keep common actions directly accessible"
             );
+            if *category == "Review" {
+                for id in [
+                    "analysis.spellcheck",
+                    "proofread.grammar-check",
+                    "proofread.grammar-settings",
+                ] {
+                    assert!(ids.contains(&id), "Review menu must expose {id}");
+                }
+            }
             assert!(
                 entries.iter().all(|command| !command.id.is_empty()),
                 "{category} contains a non-command menu row"
