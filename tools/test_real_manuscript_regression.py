@@ -2,6 +2,7 @@ import tempfile
 import unittest
 import zipfile
 import os
+import sqlite3
 from unittest import mock
 from pathlib import Path
 
@@ -14,10 +15,125 @@ from real_manuscript_regression import (
     epubcheck_result,
     make_plan,
     regression_acceptance,
+    verify_imported_source_content,
 )
 
 
 class EpubSemanticTests(unittest.TestCase):
+    def test_import_fidelity_classifies_unknown_source_area_by_persisted_destination(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / "manuscript").mkdir()
+            (project / "manuscript/front.md").write_text("Front matter text.", encoding="utf-8")
+            db = sqlite3.connect(project / "story.db")
+            db.executescript(
+                """CREATE TABLE import_source_item (
+                       id TEXT PRIMARY KEY, source_document_id TEXT, raw_fields TEXT,
+                       mapping_decision TEXT);
+                   CREATE TABLE entity_provenance (
+                       source_item_id TEXT, destination_type TEXT, destination_id TEXT);
+                   CREATE TABLE content_unit (id TEXT PRIMARY KEY, relative_path TEXT);
+                   CREATE TABLE scene_content (scene_id TEXT PRIMARY KEY, relative_path TEXT);
+                   CREATE TABLE reading_document (id TEXT PRIMARY KEY, extracted_text TEXT);"""
+            )
+            db.execute(
+                "INSERT INTO import_source_item VALUES (?, ?, ?, ?)",
+                ("source-front", "scriv-front", '{"binder_item":{"area":"unknown","content_markdown":"Front matter text."}}', "FrontMatter"),
+            )
+            db.execute(
+                "INSERT INTO entity_provenance VALUES (?, ?, ?)",
+                ("source-front", "content_unit", "front-unit"),
+            )
+            db.execute("INSERT INTO content_unit VALUES (?, ?)", ("front-unit", "manuscript/front.md"))
+            db.execute(
+                "INSERT INTO import_source_item VALUES (?, ?, ?, ?)",
+                ("source-research", "scriv-research", '{"binder_item":{"area":"unknown","content_markdown":"Research note."}}', "Research"),
+            )
+            db.execute(
+                "INSERT INTO entity_provenance VALUES (?, ?, ?)",
+                ("source-research", "reading", "reading-note"),
+            )
+            db.execute(
+                "INSERT INTO reading_document VALUES (?, ?)",
+                ("reading-note", "Research note."),
+            )
+            db.commit()
+            db.close()
+
+            result = verify_imported_source_content(project)
+
+        self.assertEqual(result["source_body_items_total"], 2)
+        self.assertEqual(result["manuscript_bodies_checked"], 1)
+        self.assertEqual(result["exactly_preserved"], 1)
+        self.assertEqual(result["research_bodies_checked"], 1)
+        self.assertEqual(result["research_bodies_exactly_preserved"], 1)
+        self.assertEqual(result["missing_destination_count"], 0)
+        self.assertEqual(result["changed_body_count"], 0)
+
+    def test_unmapped_unknown_binder_body_is_missing_not_misreported_as_research(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            db = sqlite3.connect(project / "story.db")
+            db.executescript(
+                """CREATE TABLE import_source_item (
+                       id TEXT PRIMARY KEY, source_document_id TEXT, raw_fields TEXT,
+                       mapping_decision TEXT);
+                   CREATE TABLE entity_provenance (
+                       source_item_id TEXT, destination_type TEXT, destination_id TEXT);
+                   CREATE TABLE content_unit (id TEXT PRIMARY KEY, relative_path TEXT);
+                   CREATE TABLE scene_content (scene_id TEXT PRIMARY KEY, relative_path TEXT);
+                   CREATE TABLE reading_document (id TEXT PRIMARY KEY, extracted_text TEXT);"""
+            )
+            db.execute(
+                "INSERT INTO import_source_item VALUES (?, ?, ?, ?)",
+                ("source", "scriv-unmapped", '{"binder_item":{"area":"unknown","content_markdown":"Needs mapping."}}', "Unmapped"),
+            )
+            db.commit()
+            db.close()
+
+            result = verify_imported_source_content(project)
+
+        self.assertEqual(result["source_body_items_total"], 1)
+        self.assertEqual(result["research_bodies_checked"], 0)
+        self.assertEqual(result["manuscript_bodies_checked"], 0)
+        self.assertEqual(result["missing_destination_count"], 1)
+
+    def test_manuscript_destination_takes_precedence_over_secondary_reading_index(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / "manuscript").mkdir()
+            (project / "manuscript/scene.md").write_text("Manuscript text.", encoding="utf-8")
+            db = sqlite3.connect(project / "story.db")
+            db.executescript(
+                """CREATE TABLE import_source_item (
+                       id TEXT PRIMARY KEY, source_document_id TEXT, raw_fields TEXT,
+                       mapping_decision TEXT);
+                   CREATE TABLE entity_provenance (
+                       source_item_id TEXT, destination_type TEXT, destination_id TEXT);
+                   CREATE TABLE content_unit (id TEXT PRIMARY KEY, relative_path TEXT);
+                   CREATE TABLE scene_content (scene_id TEXT PRIMARY KEY, relative_path TEXT);
+                   CREATE TABLE reading_document (id TEXT PRIMARY KEY, extracted_text TEXT);"""
+            )
+            db.execute(
+                "INSERT INTO import_source_item VALUES (?, ?, ?, ?)",
+                ("source", "scriv-scene", '{"binder_item":{"area":"manuscript","content_markdown":"Manuscript text."}}', "Scene"),
+            )
+            db.executemany(
+                "INSERT INTO entity_provenance VALUES (?, ?, ?)",
+                [("source", "reading", "reading-copy"), ("source", "scene", "scene-copy")],
+            )
+            db.execute("INSERT INTO scene_content VALUES (?, ?)", ("scene-copy", "manuscript/scene.md"))
+            db.execute("INSERT INTO reading_document VALUES (?, ?)", ("reading-copy", "Manuscript text."))
+            db.commit()
+            db.close()
+
+            result = verify_imported_source_content(project)
+
+        self.assertEqual(result["manuscript_bodies_checked"], 1)
+        self.assertEqual(result["exactly_preserved"], 1)
+        self.assertEqual(result["research_bodies_checked"], 0)
+        self.assertEqual(result["missing_destination_count"], 0)
+
     def test_xhtml_details_retain_paragraph_formatting_tables_assets_and_links(self):
         details = epub_document_details(
             '''<html xmlns="http://www.w3.org/1999/xhtml"><body>

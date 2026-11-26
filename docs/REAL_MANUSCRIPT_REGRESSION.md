@@ -622,3 +622,20 @@ fidelity remains provisional. See `docs/DEVELOPMENT_STATUS.md` for exact body
 counts, checksums, limitations and feature status. These generated artifacts
 used default presentation, so they do not establish Scrivener-specific layout
 equivalence or human acceptance.
+
+## 26 November 2026 — manuscript/research destination classification
+
+The Book 03 source-body verifier now classifies a source item with a manuscript
+destination (`scene` or `content_unit`) as manuscript content even if the
+importer also creates a secondary `reading` index record. This corrects the
+earlier 68/68 manuscript and 10/12 research result: it was a verifier category
+error, not missing imported bodies. Synthetic tests cover mixed destinations,
+front matter whose source area is unknown, research and unmapped content.
+
+The targeted compile-only rerun is
+`reports/scrivener-profile-fidelity-rerun-20261126/`; its generated EPUB is
+`generated/scrivener-profile-fidelity-rerun-20261126/book-03.epub`. It reports
+70/70 manuscript and 10/10 research bodies exactly preserved after reopen,
+with no missing or changed bodies. EPUBCheck 4.2.6 reports zero errors and
+warnings. The report remains provisional because it uses a prior same-day
+import, does not resolve source layout assignments, and is not human accepted.

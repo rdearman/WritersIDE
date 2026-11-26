@@ -1,5 +1,32 @@
 # Writer's IDE Development Status
 
+## Book 03 regression-harness classification correction — 26 November 2026
+
+The earlier 68/68 manuscript and 10/12 research-body counts were a harness
+classification error, not two missing imported source bodies. Two source
+documents have both a canonical manuscript destination and a secondary
+reading-index record; the verifier chose the reading record first and compared
+it with the complete source body. The verifier now gives manuscript
+destinations (`scene` or `content_unit`) precedence and treats the reading
+index as a research destination only when there is no manuscript destination.
+The production project itself was not changed.
+
+Synthetic coverage now exercises unknown-area front matter, research
+destinations, unmapped bodies and mixed manuscript/reading destinations. The
+Python regression tests passed: 23 tests. The corrected offline compile-only
+report is `reports/scrivener-profile-fidelity-rerun-20261126/`; its EPUB is
+`generated/scrivener-profile-fidelity-rerun-20261126/book-03.epub`. Against the
+persisted Book 03 project from the same-day fresh import, all 80 body-bearing
+source items reconcile: 70/70 manuscript bodies and 10/10 research bodies;
+zero missing or changed bodies, zero Trash bodies. The source checksum
+manifest passed before and after. EPUBCheck 4.2.6 reports zero errors and
+warnings. Overall publication acceptance remains provisional: this was a
+targeted compile-only run, the import still reports unresolved Scrivener
+layout assignments, and human publication review remains outstanding.
+
+The expanded private corpus remains excluded from Git. Do not attach or publish
+the local content-bearing reports or generated EPUB.
+
 ## P0 #62 — empty previous-position command safety verified, 26 November 2026
 
 The production terminal already handles empty location history as a non-fatal

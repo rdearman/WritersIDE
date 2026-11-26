@@ -1068,7 +1068,16 @@ def verify_imported_source_content(project: pathlib.Path) -> dict:
                 (source["id"],),
             ).fetchall()
             source_hash = hashlib.sha256(original.encode("utf-8")).hexdigest()
-            if area in {"research", "unknown"}:
+            destination_types = {destination["destination_type"] for destination in destinations}
+            manuscript_destination_types = {"content_unit", "scene"}
+            # Scrivener's `area` is not a semantic destination. In particular,
+            # selected front/back matter can arrive with area `unknown` but be
+            # persisted as a content unit. Some imported manuscript documents
+            # also have a reading-index record, so a manuscript destination
+            # takes precedence over the secondary reading index.
+            if not destination_types & manuscript_destination_types and (
+                "reading" in destination_types or area == "research"
+            ):
                 research_checked += 1
                 exact_research = False
                 for destination in destinations:
@@ -1087,6 +1096,8 @@ def verify_imported_source_content(project: pathlib.Path) -> dict:
                     missing.append(source["source_document_id"])
                 continue
             if not destinations:
+                if area == "research":
+                    research_checked += 1
                 missing.append(source["source_document_id"])
                 continue
             checked += 1
