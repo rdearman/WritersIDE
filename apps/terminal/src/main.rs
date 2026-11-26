@@ -14571,6 +14571,12 @@ impl AppState {
             }
             return Ok(());
         }
+        if self.dirty && self.editing_scene.is_none() && self.editing_content_unit.is_none() {
+            return Err(io::Error::other(
+                "This edited buffer is not attached to a manuscript document. Its text remains open and unsaved; open or create a document before saving.",
+            )
+            .into());
+        }
         if let Some(id) = self.editing_scene {
             let canonical_text = self.editor.join("\n");
             let text = if self.editor_preferences.line_ending == "crlf" {
@@ -25325,6 +25331,7 @@ fn run(
                     } else {
                         s.push_undo();
                         s.paste_text(&text);
+                        autosave_deadline = Some(Instant::now() + Duration::from_secs(2));
                     }
                     if s.active_challenge.as_ref().is_some_and(|challenge| {
                         s.count_words_for_project(&s.editor.join("\n")) >= challenge.target_words
@@ -25334,7 +25341,6 @@ fn run(
                     if s.active_challenge.is_some() {
                         s.persist_challenge_draft()?;
                     }
-                    autosave_deadline = Some(Instant::now() + Duration::from_secs(2));
                     if let Err(error) = s.save_session() {
                         s.message = format!("Session state could not be saved: {error}");
                     }
@@ -47579,6 +47585,32 @@ mod tests {
             let mut terminal = ratatui::Terminal::new(backend).unwrap();
             terminal.draw(|frame| draw(frame, &mut state)).unwrap();
         }
+    }
+
+    #[test]
+    fn unattached_dirty_editor_buffer_cannot_be_reported_as_successfully_saved() {
+        let root = tempfile::tempdir().unwrap();
+        let project = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state.workspace = Workspace::Editor;
+        state.editor = vec!["unattached text that must remain visible".into()];
+        state.dirty = true;
+
+        let error = state.save().unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("not attached to a manuscript document")
+        );
+        assert!(state.dirty);
+        assert_eq!(
+            state.editor.join("\n"),
+            "unattached text that must remain visible"
+        );
+        assert!(state.editing_scene.is_none());
+        assert!(state.editing_content_unit.is_none());
+        assert_eq!(state.app.list_scenes(false).unwrap().len(), 0);
     }
 
     #[test]
