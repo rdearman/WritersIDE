@@ -85,6 +85,45 @@ python3 tools/real_manuscript_regression.py --phase compile \
 python3 -m unittest discover -s tools -p 'test_real_manuscript_regression.py'
 ```
 
+## Expanded private back-catalogue
+
+The uncurated corpus under `fixtures/back-catalogue/` is additional test data,
+not a replacement for the three controlled books above. Its project/reference
+relationships are ranked candidates only. A close title or text match does not
+prove edition lineage. Rebuild its local content-bearing manifest with:
+
+```sh
+cargo build --offline -p writers-ide
+python3 tools/back_catalogue_inventory.py \
+  --cli target/debug/writers-ide \
+  --output reports/back-catalogue/RUN_ID/manifest.json
+```
+
+For a targeted production import/reopen/compile test, supply a reviewed mapping
+JSON. This prevents uncertain binder items from being silently assigned an
+authoritative manuscript role. An optional reference is explicitly reported
+as an unconfirmed candidate unless edition lineage has independent evidence:
+
+```sh
+python3 tools/expanded_scrivener_regression.py \
+  --source 'fixtures/back-catalogue/scrivener/PROJECT.scriv' \
+  --mapping reports/back-catalogue/RUN_ID/reviewed-mapping.json \
+  --book-type nonfiction \
+  --reference 'fixtures/back-catalogue/epub/CANDIDATE.epub' \
+  --run-id UNIQUE_RUN_ID
+```
+
+The targeted harness uses the production CLI and the same local EPUB
+comparators as the controlled suite. It refuses to reuse run directories,
+fingerprints the selected source project, checks `fixtures/SHA256SUMS` before
+and after, stores full source-derived reports only under ignored
+`reports/back-catalogue/`, and puts imported projects and publications under
+ignored `generated/back-catalogue/`. A missing or incomplete mapping is a test
+failure; inspect the source inventory, then review the plan explicitly.
+Unmatched or unfinished projects can still be tested for import-body fidelity,
+reopen integrity, source preservation and generated EPUB validity without
+supplying a historical publication.
+
 Reports contain private paths, structural measurements and detailed local
 validator diagnostics. Do not copy whole reports into GitHub. Sanitised issue
 updates may report code-level changes, status counts and test outcomes only.

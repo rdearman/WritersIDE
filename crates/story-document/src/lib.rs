@@ -2210,6 +2210,18 @@ impl PandocRenderer {
         design: &BookDesignProfile,
         metadata: &CompileMetadata,
     ) -> Result<CompileArtifact, String> {
+        // Renderer subprocesses run from a temporary working directory. Keep
+        // project resource paths anchored to the caller's working directory;
+        // otherwise relative project paths stop resolving when Pandoc looks
+        // for images and other linked resources.
+        let absolute_resource_root = resource_root
+            .map(|root| {
+                root.canonicalize().map_err(|error| {
+                    format!("resolve project resource root {}: {error}", root.display())
+                })
+            })
+            .transpose()?;
+        let resource_root = absolute_resource_root.as_deref();
         if !ir.validate() {
             return Err("refusing to render invalid Compile IR".into());
         }
@@ -3734,6 +3746,53 @@ output = "exports/old.md"
                     .contains("project-local regular file")
             );
         }
+    }
+
+    #[test]
+    fn epub_renderer_resolves_resources_from_a_relative_project_root() {
+        let project = tempfile::Builder::new()
+            .prefix(".wide-relative-epub-project-")
+            .tempdir_in(".")
+            .unwrap();
+        let relative_project = project
+            .path()
+            .strip_prefix(std::env::current_dir().unwrap())
+            .unwrap()
+            .to_path_buf();
+        assert!(relative_project.is_relative());
+        let attachments = project.path().join("attachments");
+        std::fs::create_dir_all(&attachments).unwrap();
+        const ONE_PIXEL_PNG: &[u8] = &[
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
+            0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xda, 0x63, 0xfc, 0xff, 0x1f, 0x00, 0x03, 0x03, 0x02, 0x00, 0xef, 0xa3, 0x35, 0x2b,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+        std::fs::write(attachments.join("one.png"), ONE_PIXEL_PNG).unwrap();
+        let mut ir = CompileIr::new("Image resource regression");
+        ir.push(CompileUnit {
+            id: "chapter-one".into(),
+            parent_id: None,
+            kind: ContentUnitKind::Scene,
+            title: "Chapter One".into(),
+            language_code: None,
+            segments: vec![CompileSegment::new(
+                "chapter-one",
+                "![A demonstration image](attachments/one.png)",
+            )],
+        });
+
+        let artifact = PandocRenderer::default()
+            .render(&ir, CompileFormat::Epub, Some(&relative_project))
+            .unwrap();
+        let archive = zip::ZipArchive::new(std::io::Cursor::new(artifact.bytes)).unwrap();
+        assert!(
+            archive
+                .file_names()
+                .any(|name| name.to_ascii_lowercase().ends_with(".png")),
+            "relative project resources must be packaged into the EPUB"
+        );
     }
 
     #[test]

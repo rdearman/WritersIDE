@@ -5,6 +5,38 @@ Updated: 2026-11-26
 This is the handover note for ongoing implementation. GitHub issues remain the
 authoritative source for approved requirements and human UAT findings.
 
+## Current checkpoint — expanded-corpus RTF and EPUB resource regressions, 26 November 2026
+
+The expanded local corpus was used to target `fixtures/back-catalogue/scrivener/BowString.scriv`, which contains a real 8-row, 2-column RTF table and embedded illustrations. Its best automated publication match is `fixtures/back-catalogue/epub/How_To_Make_a_Bowstring.epub`; the relationship remains an **unconfirmed candidate**, not an asserted edition match.
+
+This run exposed and repaired three general defects:
+
+- Relative project resource roots were passed to Pandoc before the process changed into its temporary render directory. Images were left as unresolved EPUB references. The renderer now canonicalises the root before launching subprocesses; a synthetic relative-root EPUB test verifies image packaging.
+- Scrivener RTF table row and cell controls were treated as ordinary formatting. Simple rectangular tables are now represented as Markdown tables at extraction time. A synthetic 2×2 RTF table test verifies row and cell preservation.
+- Scrivener list indentation after list markers could be interpreted as a nested Markdown code block. RTF alignment whitespace following the list marker is now removed while preserving the list body; a synthetic regression test covers the nested-code failure.
+
+`tools/expanded_scrivener_regression.py` now provides a repeatable one-project
+extension of the controlled regression harness. It requires a reviewed mapping,
+uses only the production import and compile CLI, fingerprints the fixture tree,
+and writes a machine-readable source-fidelity and full EPUB differential report
+to ignored local directories. Usage is documented in
+`docs/REAL_MANUSCRIPT_REGRESSION.md`.
+
+A fresh production import, save/reopen and EPUB compile for BowString is at:
+
+- Project: `generated/back-catalogue-targeted-20261126/BowString-WIDE-repaired-import/`
+- EPUB: `generated/back-catalogue-targeted-20261126/BowString-WIDE-repaired.epub`
+- Latest harness EPUB: `generated/back-catalogue-targeted/bowstring-harness-20261126b/publication.epub`
+- Local comparison report (contains manuscript-derived material): `reports/back-catalogue-targeted-20261126/bowstring-structural-comparison.json`
+- Detailed differential report: `reports/back-catalogue-targeted/bowstring-harness-20261126b/summary.json`
+- Import inventory and mapping: `reports/back-catalogue-targeted-20261126/`
+
+The repaired EPUB preserves 11 image placements backed by 9 unique embedded assets, 8 table rows/16 cells, and has zero `pre`/`code` blocks. EPUBCheck 4.2.6 reports zero errors and warnings. The candidate historical EPUB has 8 rows/16 cells and 11 image placements, but its pairing with the Scrivener project is unconfirmed; the detailed local comparison records 23 changed paragraph regions, character evidence, CSS, metadata and navigation differences. The current source bodies are exact in the imported project (20/20), ruling out extraction or persistence for those mapped bodies; compile selection/layout and historical revision remain unresolved. These differences are investigation leads, not automatic WIDE defect classifications. Publication acceptance remains provisional.
+
+The original three controlled books were then run through the production full regression harness at `reports/expanded-corpus-bowstring-fix-20261126/`; their EPUBs are in `generated/expanded-corpus-bowstring-fix-20261126/`. Source checksums and fingerprints remained unchanged; imported manuscript-body verification was exact for 39/39, 36/36 and 68/68 bodies after persistence/reopen. Each generated EPUB passed EPUBCheck 4.2.6 with zero errors and warnings. All three import reports remain incomplete, and the run remains provisional pending discrepancy triage and human publication review.
+
+Targeted verification completed: RTF table extraction, RTF list-indentation regression, RTF Unicode fallback regression, relative-root EPUB image packaging, and the existing renderer artifact test passed. All 21 Python tooling tests passed. Workspace `cargo fmt --all -- --check`, `cargo clippy --offline --workspace --all-targets -- -D warnings`, and the full offline workspace suite passed after retrying the localhost-only Ollama test with the previously authorised socket permission: 338 terminal tests, 3 author-workflow tests, 24 Linux PTY tests, and all other workspace unit, integration and doc tests. The controlled regression run preceded only the additional warning for unsupported merged/nested RTF tables; table conversion and list whitespace code were included in that run. Fixture checksums passed before and after the regression runs. No candidate reference match has been promoted to confirmed.
+
 ## Current checkpoint — Scrivener compile variables, 26 November 2026
 
 Scrivener project metadata is now carried into new standalone imports when it

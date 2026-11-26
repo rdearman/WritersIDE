@@ -2257,8 +2257,13 @@ fn collect_scrivener_item(
             if let Some(file) = find_case_insensitive_child(&item_dir, "content.rtf", false)? {
                 let bytes = fs::read(&file).map_err(|error| ImportError::Io(error.to_string()))?;
                 let rtf = String::from_utf8_lossy(&bytes);
-                let (markdown, assets, unsupported_picture_count, unsupported_link_count) =
-                    extract_rtf_markdown_with_assets(&rtf);
+                let (
+                    markdown,
+                    assets,
+                    unsupported_picture_count,
+                    unsupported_link_count,
+                    unsupported_table_count,
+                ) = extract_rtf_markdown_with_assets(&rtf);
                 content_markdown = Some(markdown);
                 embedded_assets = assets;
                 if unsupported_picture_count > 0 {
@@ -2271,6 +2276,12 @@ fn collect_scrivener_item(
                     unsupported.push(format!(
                         "{} RTF hyperlink field(s) use unsupported or unsafe destinations",
                         unsupported_link_count
+                    ));
+                }
+                if unsupported_table_count > 0 {
+                    unsupported.push(format!(
+                        "{} RTF table(s) contain malformed rows, merged cells, or nested table structures that need review",
+                        unsupported_table_count
                     ));
                 }
                 unsupported.push(
@@ -3274,7 +3285,7 @@ fn extract_rtf_list_text(source: &str) -> (String, Vec<(String, String)>) {
 
 fn extract_rtf_markdown_with_assets(
     source: &str,
-) -> (String, Vec<ScrivenerEmbeddedAsset>, usize, usize) {
+) -> (String, Vec<ScrivenerEmbeddedAsset>, usize, usize, usize) {
     let (source, unsupported_link_count, links) = extract_rtf_hyperlinks(source);
     let (source, list_markers) = extract_rtf_list_text(&source);
     let source = source.as_str();
@@ -3349,12 +3360,16 @@ fn extract_rtf_markdown_with_assets(
     }
     prepared.push_str(&source[cursor..]);
 
+    let (prepared, table_markers, unsupported_table_count) = extract_rtf_tables(&prepared);
     let mut markdown = extract_rtf_markdown_without_assets(&prepared);
+    for (placeholder, table) in table_markers {
+        markdown = markdown.replace(&placeholder, &table);
+    }
     for (placeholder, link) in links {
         markdown = markdown.replace(&placeholder, &link);
     }
     for (placeholder, marker) in list_markers {
-        markdown = markdown.replace(&placeholder, &marker);
+        markdown = replace_rtf_list_marker(&markdown, &placeholder, &marker);
     }
     for asset in &assets {
         let reference = format!(
@@ -3368,7 +3383,209 @@ fn extract_rtf_markdown_with_assets(
         assets,
         unsupported_picture_count,
         unsupported_link_count,
+        unsupported_table_count,
     )
+}
+
+fn replace_rtf_list_marker(source: &str, placeholder: &str, marker: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut cursor = 0usize;
+    while let Some(relative) = source[cursor..].find(placeholder) {
+        let start = cursor + relative;
+        output.push_str(&source[cursor..start]);
+        output.push_str(marker);
+        cursor = start + placeholder.len();
+        // RTF list paragraphs carry alignment tabs and indentation after the
+        // marker. They are layout metadata, not a Markdown code-block indent.
+        while source[cursor..]
+            .chars()
+            .next()
+            .is_some_and(|character| matches!(character, ' ' | '\t'))
+        {
+            cursor += source[cursor..].chars().next().unwrap().len_utf8();
+        }
+    }
+    output.push_str(&source[cursor..]);
+    output
+}
+
+fn rtf_control_at(bytes: &[u8], start: usize) -> Option<(String, usize)> {
+    if bytes.get(start) != Some(&b'\\') {
+        return None;
+    }
+    let next = *bytes.get(start + 1)?;
+    if next.is_ascii_alphabetic() {
+        let word_start = start + 1;
+        let mut end = word_start;
+        while bytes.get(end).is_some_and(u8::is_ascii_alphabetic) {
+            end += 1;
+        }
+        let word = std::str::from_utf8(&bytes[word_start..end])
+            .ok()?
+            .to_owned();
+        if bytes.get(end) == Some(&b'-') {
+            end += 1;
+        }
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if bytes.get(end) == Some(&b' ') {
+            end += 1;
+        }
+        Some((word, end))
+    } else if next == b'\'' {
+        Some(("'".into(), (start + 4).min(bytes.len())))
+    } else {
+        Some(((next as char).to_string(), (start + 2).min(bytes.len())))
+    }
+}
+
+fn find_rtf_control(source: &str, from: usize, name: &str) -> Option<(usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut index = from;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && let Some((word, end)) = rtf_control_at(bytes, index)
+        {
+            if word == name {
+                return Some((index, end));
+            }
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+fn rtf_gap_has_visible_text(source: &str) -> bool {
+    let bytes = source.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] == b'\\'
+            && let Some((word, end)) = rtf_control_at(bytes, index)
+        {
+            // RTF control symbols (escaped punctuation, nonbreaking spaces,
+            // and hex escapes) represent visible characters. Control words
+            // between adjacent rows are formatting instructions.
+            if word.len() == 1 || word == "'" {
+                return true;
+            }
+            index = end;
+        } else if !matches!(
+            bytes[index],
+            b'{' | b'}' | b';' | b' ' | b'\t' | b'\r' | b'\n'
+        ) {
+            return true;
+        } else {
+            index += 1;
+        }
+    }
+    false
+}
+
+/// Extracts simple rectangular RTF tables as portable Markdown pipe tables.
+/// RTF row and cell controls are structural; treating their tabs and row
+/// indentation as prose can turn ordinary table content into code blocks.
+fn extract_rtf_tables(source: &str) -> (String, Vec<(String, String)>, usize) {
+    let mut output = String::with_capacity(source.len());
+    let mut markers = Vec::new();
+    let mut cursor = 0usize;
+    let mut search_from = 0usize;
+    let mut table_index = 0usize;
+    let mut unsupported_table_count = 0usize;
+    while let Some((table_start, _)) = find_rtf_control(source, search_from, "trowd") {
+        let mut row_start = table_start;
+        let mut rows = Vec::<Vec<String>>::new();
+        let table_end;
+        loop {
+            let Some((row_end, row_control_end)) = find_rtf_control(source, row_start, "row")
+            else {
+                // A malformed or unsupported table must remain visible to the
+                // normal parser rather than silently deleting its source.
+                rows.clear();
+                table_end = table_start;
+                unsupported_table_count = unsupported_table_count.saturating_add(1);
+                break;
+            };
+            let mut cells = Vec::new();
+            let mut cell_cursor = row_start;
+            let mut cell_search = row_start;
+            while let Some((cell_start, cell_end)) = find_rtf_control(source, cell_search, "cell") {
+                if cell_start >= row_end {
+                    break;
+                }
+                let cell = extract_rtf_markdown_without_assets(&source[cell_cursor..cell_start]);
+                let cell = cell.replace('\n', " <br /> ").replace('|', "\\|");
+                cells.push(cell.trim().to_owned());
+                cell_cursor = cell_end;
+                cell_search = cell_end;
+            }
+            if cells.is_empty() {
+                rows.clear();
+                table_end = table_start;
+                unsupported_table_count = unsupported_table_count.saturating_add(1);
+                break;
+            }
+            rows.push(cells);
+
+            let Some((next_row_start, _)) = find_rtf_control(source, row_control_end, "trowd")
+            else {
+                table_end = row_control_end;
+                break;
+            };
+            if rtf_gap_has_visible_text(&source[row_control_end..next_row_start]) {
+                table_end = row_control_end;
+                break;
+            }
+            row_start = next_row_start;
+        }
+
+        if rows.is_empty() || table_end <= table_start {
+            search_from = table_start + "\\trowd".len();
+            continue;
+        }
+        let table_source = &source[table_start..table_end];
+        let row_width = rows.first().map(Vec::len).unwrap_or(0);
+        if rows.iter().any(|row| row.len() != row_width)
+            || ["\\clmgf", "\\clmrg", "\\clvmgf", "\\clvmrg"]
+                .iter()
+                .any(|control| table_source.contains(control))
+            || table_source.contains("\\itap2")
+        {
+            unsupported_table_count = unsupported_table_count.saturating_add(1);
+        }
+        output.push_str(&source[cursor..table_start]);
+        let placeholder = format!("WIDESCRIVENTABLE{table_index}END");
+        table_index += 1;
+        let width = rows.iter().map(Vec::len).max().unwrap_or(0);
+        let mut table = String::new();
+        for (row_index, mut row) in rows.into_iter().enumerate() {
+            row.resize(width, String::new());
+            table.push('|');
+            for cell in row {
+                table.push(' ');
+                table.push_str(cell.trim());
+                table.push_str(" |");
+            }
+            table.push('\n');
+            if row_index == 0 {
+                table.push('|');
+                for _ in 0..width {
+                    table.push_str(" --- |");
+                }
+                table.push('\n');
+            }
+        }
+        markers.push((placeholder.clone(), table));
+        output.push_str("\\par ");
+        output.push_str(&placeholder);
+        output.push_str(" \\par ");
+        cursor = table_end;
+        search_from = table_end;
+    }
+    output.push_str(&source[cursor..]);
+    (output, markers, unsupported_table_count)
 }
 
 fn extract_rtf_markdown(source: &str) -> String {
@@ -4213,12 +4430,43 @@ This is an addition to the old file.}"#;
     }
 
     #[test]
+    fn scrivener_rtf_tables_preserve_rows_and_cells_as_markdown_tables() {
+        let source = r#"{\rtf1\ansi Before table.\par\trowd\trgaph0\cellx2000\cellx4000\pard\intbl Label\cell\pard\intbl Value\cell\row\trowd\trgaph0\cellx2000\cellx4000\pard\intbl First\cell\pard\intbl Second\cell\row\pard After table.}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert!(markdown.contains("| Label | Value |"), "{markdown:?}");
+        assert!(markdown.contains("| First | Second |"), "{markdown:?}");
+        assert!(markdown.contains("| --- | --- |"), "{markdown:?}");
+        assert!(markdown.contains("Before table."), "{markdown:?}");
+        assert!(markdown.contains("After table."), "{markdown:?}");
+        assert!(!markdown.contains("\\trowd"), "{markdown:?}");
+    }
+
+    #[test]
+    fn scrivener_rtf_merged_table_cells_are_reported_for_review() {
+        let source = r#"{\rtf1\ansi\trowd\clmgf\cellx4000\pard\intbl Combined\cell\row}"#;
+        let (markdown, _, _, _, unsupported_tables) = extract_rtf_markdown_with_assets(source);
+        assert!(markdown.contains("Combined"), "{markdown:?}");
+        assert_eq!(unsupported_tables, 1);
+    }
+
+    #[test]
+    fn scrivener_rtf_irregular_table_rows_are_reported_for_review() {
+        let source = r#"{\rtf1\ansi\trowd\cellx2000\cellx4000\pard\intbl A\cell\pard\intbl B\cell\row\trowd\cellx2000\pard\intbl C\cell\row}"#;
+        let (markdown, _, _, _, unsupported_tables) = extract_rtf_markdown_with_assets(source);
+        assert!(markdown.contains("A"), "{markdown:?}");
+        assert!(markdown.contains("B"), "{markdown:?}");
+        assert!(markdown.contains("C"), "{markdown:?}");
+        assert_eq!(unsupported_tables, 1);
+    }
+
+    #[test]
     fn scrivener_rtf_extracts_png_payloads_as_stable_markdown_assets() {
         let source = r#"{\rtf1\ansi Before\par {\*\shppict{\pict\pngblip\picw1\pich1 89504e470d0a1a0a}}\par After}"#;
-        let (markdown, assets, unsupported, unsupported_links) =
+        let (markdown, assets, unsupported, unsupported_links, unsupported_tables) =
             extract_rtf_markdown_with_assets(source);
         assert_eq!(unsupported, 0);
         assert_eq!(unsupported_links, 0);
+        assert_eq!(unsupported_tables, 0);
         assert_eq!(assets.len(), 1);
         let asset = &assets[0];
         assert_eq!(asset.media_type, "image/png");
@@ -4240,18 +4488,19 @@ This is an addition to the old file.}"#;
     #[test]
     fn scrivener_rtf_reports_unsupported_or_malformed_picture_data() {
         let source = r#"{\rtf1\ansi Text {\pict\emfblip 00112233} tail}"#;
-        let (markdown, assets, unsupported, unsupported_links) =
+        let (markdown, assets, unsupported, unsupported_links, unsupported_tables) =
             extract_rtf_markdown_with_assets(source);
         assert!(assets.is_empty());
         assert_eq!(unsupported, 1);
         assert_eq!(unsupported_links, 0);
+        assert_eq!(unsupported_tables, 0);
         assert!(!markdown.contains("00112233"));
     }
 
     #[test]
     fn scrivener_shppict_control_is_not_mistaken_for_pict_and_does_not_discard_following_text() {
         let source = r#"{\rtf1\ansi Before\par {\*\shppict unsupported shape}\par {\listtext\f0\u9679?}\tab Preserved item\par After.}"#;
-        let (markdown, assets, unsupported, _) = extract_rtf_markdown_with_assets(source);
+        let (markdown, assets, unsupported, _, _) = extract_rtf_markdown_with_assets(source);
         assert!(assets.is_empty());
         assert_eq!(unsupported, 0);
         assert!(markdown.contains("- Preserved item"), "{markdown:?}");
@@ -4261,7 +4510,7 @@ This is an addition to the old file.}"#;
     #[test]
     fn scrivener_rtf_hyperlink_fields_preserve_visible_text_and_safe_destinations() {
         let source = r#"{\rtf1\ansi Read {\field{\*\fldinst HYPERLINK "https://example.org/a(b)"}{\fldrslt helpful page}} now}"#;
-        let (markdown, assets, unsupported_pictures, unsupported_links) =
+        let (markdown, assets, unsupported_pictures, unsupported_links, _) =
             extract_rtf_markdown_with_assets(source);
         assert!(assets.is_empty());
         assert_eq!(unsupported_pictures, 0);
@@ -4269,7 +4518,7 @@ This is an addition to the old file.}"#;
         assert!(markdown.contains("[helpful page](https://example.org/a%28b%29)"));
 
         let unsafe_target = r#"{\rtf1\ansi {\field{\*\fldinst HYPERLINK "javascript:alert(1)"}{\fldrslt visible}}}"#;
-        let (safe_markdown, _, _, unsupported_links) =
+        let (safe_markdown, _, _, unsupported_links, _) =
             extract_rtf_markdown_with_assets(unsafe_target);
         assert_eq!(unsupported_links, 1);
         assert!(!safe_markdown.contains("javascript:"));
@@ -4302,6 +4551,15 @@ This is an addition to the old file.}"#;
             "unexpected RTF list output: {markdown:?}"
         );
         assert!(!markdown.contains("•?"));
+    }
+
+    #[test]
+    fn scrivener_rtf_list_indentation_does_not_create_nested_code_blocks() {
+        let source = r#"{\rtf1\ansi \pard\li720{\listtext\f0\u9679?}\tab     Ordinary list prose\par \pard\li720{\listtext\f0\u9679?}\tab     Second item}"#;
+        let markdown = extract_rtf_markdown(source);
+        assert!(markdown.contains("- Ordinary list prose"), "{markdown:?}");
+        assert!(markdown.contains("- Second item"), "{markdown:?}");
+        assert!(!markdown.contains("-     "), "{markdown:?}");
     }
 
     #[test]
