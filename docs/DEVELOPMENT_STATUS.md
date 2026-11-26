@@ -1,5 +1,39 @@
 # Writer's IDE Development Status
 
+## Scrivener profile warning scope — 26 November 2026
+
+Scrivener profile warnings about missing section-layout assignments now apply
+only to documents actually selected for the publication: mapped manuscript
+documents included by the source, plus front/back matter explicitly selected
+by that format. Private research, compile-excluded documents, and alternate
+matter not selected for the format no longer produce irrelevant layout
+warnings. The rule uses source destination and compile settings, not binder
+names. Selected documents without source layout assignments remain warnings;
+WIDE does not infer how they should print.
+
+Regression: `scrivener_layout_rules_translate_using_import_roles_and_report_gaps`
+covers included manuscript layout gaps while also ensuring private research
+and compile-excluded content do not add warnings. The existing
+`scrivener_selected_matter_is_imported_as_editable_private_by_default_content`
+test verifies that format-selected back matter still receives its configured
+heading behavior and included body. All 64 `story-app` tests pass. The full
+offline workspace suite passes with the authorised loopback socket permission:
+356 terminal unit tests, 3 author-workflow tests, and 30 PTY tests passed; the
+protected ArrowMaking PTY is the single intentional ignore without its local
+fixture environment variable. Workspace Clippy with warnings denied and
+`cargo fmt --all -- --check` pass.
+
+A fresh Book 03 import/save/reopen/compile run is
+`reports/scrivener-layout-warning-20261126/`; its EPUB is
+`generated/scrivener-layout-warning-20261126/book-03.epub`. All 80 body-bearing
+source records reconcile (70 manuscript, 10 research), with no missing or
+changed bodies; fixture checksums pass before and after; EPUBCheck 4.2.6 reports
+zero errors/warnings. The imported profile now presents three unresolved
+layout warnings tied to selected source entries, down from unrelated warnings
+across private/unselected entries. This remains provisional: profile fidelity
+and exact intended rendering of those source section types are unresolved, and
+human publication review is still required.
+
 ## Book 03 regression-harness classification correction — 26 November 2026
 
 The earlier 68/68 manuscript and 10/12 research-body counts were a harness

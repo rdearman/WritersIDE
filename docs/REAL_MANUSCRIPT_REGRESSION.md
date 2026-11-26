@@ -639,3 +639,11 @@ The targeted compile-only rerun is
 with no missing or changed bodies. EPUBCheck 4.2.6 reports zero errors and
 warnings. The report remains provisional because it uses a prior same-day
 import, does not resolve source layout assignments, and is not human accepted.
+
+The subsequent full Book 03 production run after profile-warning scoping is
+`reports/scrivener-layout-warning-20261126/`. It freshly imported, persisted,
+reopened and compiled the project. Its profile warnings now name only selected
+source items with unresolved layouts; private research and unselected material
+do not contribute. Source-body preservation remains 70/70 manuscript and 10/10
+research, and EPUBCheck remains clean. See `DEVELOPMENT_STATUS.md` for the
+verification details and the exact remaining limitation.

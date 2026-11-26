@@ -242,12 +242,7 @@ pub fn scrivener_compile_presentation(
     let decisions = plan
         .decisions
         .iter()
-        .map(|decision| {
-            (
-                decision.source_document_id.as_str(),
-                decision.destination_kind,
-            )
-        })
+        .map(|decision| (decision.source_document_id.as_str(), decision))
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut presentation = story_document::CompilePresentation::default();
     let mut warnings = Vec::new();
@@ -258,6 +253,39 @@ pub fn scrivener_compile_presentation(
     let mut separators = std::collections::BTreeSet::new();
 
     for item in &inventory.items {
+        let Some(decision) = decisions.get(item.source_document_id.as_str()) else {
+            continue;
+        };
+        let destination = decision.destination_kind;
+        let publication_kind = matches!(
+            destination,
+            Destination::Section
+                | Destination::Chapter
+                | Destination::Scene
+                | Destination::FrontMatter
+                | Destination::BackMatter
+        );
+        if !publication_kind {
+            continue;
+        }
+        let selected_matter = match destination {
+            Destination::FrontMatter => {
+                decision.include_in_import
+                    && format.add_default_front_matter == Some(true)
+                    && format.default_front_matter_id.as_deref()
+                        == Some(item.source_document_id.as_str())
+            }
+            Destination::BackMatter => {
+                decision.include_in_import
+                    && format.add_default_back_matter == Some(true)
+                    && format.default_back_matter_id.as_deref()
+                        == Some(item.source_document_id.as_str())
+            }
+            _ => decision.include_in_import && item.include_in_compile != Some(false),
+        };
+        if !selected_matter {
+            continue;
+        }
         let Some(section_type_id) = item.section_type_id.as_deref() else {
             continue;
         };
@@ -280,10 +308,6 @@ pub fn scrivener_compile_presentation(
             ));
             continue;
         };
-        let destination = decisions
-            .get(item.source_document_id.as_str())
-            .copied()
-            .unwrap_or(Destination::Unmapped);
         if matches!(
             destination,
             Destination::Section
@@ -5256,7 +5280,10 @@ impl WriterApp {
                     _ => {}
                 }
 
-                if publication_kind && let Some(section_type) = item.section_type_id.as_deref() {
+                if included
+                    && publication_kind
+                    && let Some(section_type) = item.section_type_id.as_deref()
+                {
                     let section_type_name = inventory
                         .section_types
                         .get(section_type)
@@ -10596,6 +10623,10 @@ unexpected_prose = "must not be silently discarded"
             ]),
             ..ScrivenerCompileFormatSettings::default()
         };
+        let mut private_research = item("private-research", "unmapped-type");
+        private_research.area = "research".into();
+        let mut excluded_chapter = item("excluded-chapter", "unmapped-type");
+        excluded_chapter.include_in_compile = Some(false);
         let inventory = ScrivenerProjectInventory {
             source_path: "source.scriv".into(),
             source_fingerprint: "fingerprint".into(),
@@ -10613,7 +10644,12 @@ unexpected_prose = "must not be silently discarded"
                 ("unmapped-type".into(), "Appendix Note".into()),
             ]),
             status_labels: BTreeMap::new(),
-            items: vec![item("chapter", "chapter-type"), item("scene", "scene-type")],
+            items: vec![
+                item("chapter", "chapter-type"),
+                item("scene", "scene-type"),
+                private_research,
+                excluded_chapter,
+            ],
             warnings: Vec::new(),
             unsupported: Vec::new(),
         };
@@ -10628,6 +10664,18 @@ unexpected_prose = "must not be silently discarded"
                 ScrivenerMappingDecision {
                     source_document_id: "scene".into(),
                     destination_kind: Destination::Scene,
+                    title_override: None,
+                    include_in_import: true,
+                },
+                ScrivenerMappingDecision {
+                    source_document_id: "private-research".into(),
+                    destination_kind: Destination::Research,
+                    title_override: None,
+                    include_in_import: true,
+                },
+                ScrivenerMappingDecision {
+                    source_document_id: "excluded-chapter".into(),
+                    destination_kind: Destination::Chapter,
                     title_override: None,
                     include_in_import: true,
                 },
