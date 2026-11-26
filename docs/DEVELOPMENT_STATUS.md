@@ -1,6 +1,45 @@
 # Writer's IDE Development Status
 
-## Current checkpoint — Alpha UAT 33 and lifecycle verification, 26 November 2026
+## Current checkpoint — Alpha UAT 35 and lifecycle integrity, 26 November 2026
+
+Frozen Linux x86_64 release build from commit `b55c981b88d5702c769178964fa7506219ba0738` is available at `test-builds/alpha-uat-35-b55c981/`. Launch with:
+
+```sh
+cd /home/rick/Development/Active/WritersIDE/test-builds/alpha-uat-35-b55c981
+./run.sh
+```
+
+The bundle has isolated preferences/HOME, disposable fiction and non-fiction
+projects, and sanitised synthetic Scrivener fixtures. Its acceptance checklist
+is `UAT-CHECKLIST.md`; SHA-256 entries are in `SHA256SUMS` and were verified
+after packaging and after release-binary PTY runs. Release-binary PTYs passed
+the fiction and non-fiction project-creation workflows. No private manuscript
+corpus is included.
+
+Verification on commit `b55c981`:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --offline --workspace --all-targets -- -D warnings` — passed.
+- `cargo test --offline --workspace -- --test-threads=1` — passed with
+  loopback permission; includes 352 terminal unit tests, 3 author workflows,
+  29 production PTYs (one protected-corpus PTY intentionally ignored unless
+  its private fixture path is configured), all crate/integration tests and
+  doc tests.
+- Frozen release executable PTY smoke: fiction and non-fiction project
+  creation/write/save paths passed. Bundle manifest and binary hashes are
+  recorded in `test-builds/alpha-uat-35-b55c981/`.
+- The protected ArrowMaking import PTY remains separately verified on the
+  prior code commit `2dff9e0`; its fixture checksums passed before and after.
+- Human acceptance of the Alpha UAT 30 lifecycle findings remains pending.
+
+The latest #38 investigation found an edge case where a dirty buffer without a
+document identity could be treated as a successful no-op Save. Save now fails
+explicitly while preserving the buffer, and a rejected paste does not schedule
+autosave. This does not reproduce the reported false external-hash conflict or
+confirm why eleven scene rows disappeared. Hash-based conflict detection is
+unchanged; those findings remain open for reproduction and human UAT.
+
+The previous UAT 33/34 entries below are retained as historical build records.
 
 Frozen Linux x86_64 release build from commit `f5bad1b93f878db4b409ae1e4fb3ae8920b47a0e` is available at `test-builds/alpha-uat-33-f5bad1b/`. Launch it with:
 
