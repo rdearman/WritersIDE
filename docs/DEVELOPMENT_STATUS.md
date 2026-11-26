@@ -2,6 +2,23 @@
 
 Updated: 2026-11-26
 
+## Current checkpoint — offline MyThes lookup foundation, 26 November 2026
+
+Issue #33 now has an optional offline MyThes-compatible data reader in
+`story-analysis` and a developer CLI lookup command:
+`writers-ide thesaurus <local-MyThes-data.dat> <word>`. It parses senses,
+parts of speech and synonyms, validates record counts where the source format
+provides them, and decodes the encoding declared in the data file. No runtime
+service or network call is used. The command was exercised against the
+installed English US UTF-8 and Australian ISO-8859-1 datasets. Synthetic tests
+cover lookup, multiple senses, case-insensitive terms, legacy encoding and
+malformed files.
+
+This is partial: there is no author-facing terminal thesaurus dialogue,
+dictionary-definition source, bundled dictionary data or language-to-dataset
+selection policy. Do not claim dictionary definitions are available. Continue
+#33 after this foundation and retain en-GB as the project language default.
+
 ## Current checkpoint — explicit Scrivener layout translation, 26 November 2026
 
 Added an application-level translation from one selected Scrivener compile

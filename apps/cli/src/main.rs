@@ -2491,6 +2491,23 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let staging = story_import::inspect_manuscript(&source)?;
             println!("{}", serde_json::to_string_pretty(&staging)?);
         }
+        "thesaurus" => {
+            let dictionary = args.next().ok_or("missing local MyThes .dat file")?;
+            let word = args.next().ok_or("missing word to look up")?;
+            if args.next().is_some() {
+                return Err("thesaurus accepts one lookup word".into());
+            }
+            let source = fs::read(&dictionary)?;
+            let thesaurus = story_analysis::OfflineThesaurus::parse_mythes_bytes(&source)?;
+            let result = serde_json::json!({
+                "source": dictionary,
+                "term": word,
+                "senses": thesaurus.lookup(&word).unwrap_or_default(),
+                "found": thesaurus.lookup(&word).is_some(),
+                "network_used": false,
+            });
+            println!("{}", serde_json::to_string_pretty(&result)?);
+        }
         "inspect-scrivener" => {
             let source = args
                 .next()
@@ -3598,6 +3615,7 @@ fn usage() {
     eprintln!(
         "writers-ide inspect-scrivener <.scriv-project-directory|.scrivx-manifest> (experimental inventory only)"
     );
+    eprintln!("writers-ide thesaurus <local-MyThes-data.dat> <word> (offline lookup)");
     eprintln!(
         "writers-ide import-scrivener <source> <new-project-directory> [mapping.json] [title] [--book-type=fiction|nonfiction|custom] [--editable]"
     );

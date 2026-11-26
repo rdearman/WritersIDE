@@ -10,6 +10,160 @@ use std::collections::{BTreeMap, BTreeSet};
 use story_core::{ParticipationRole, TimeOrdering};
 use unicode_segmentation::UnicodeSegmentation;
 
+/// A locally loaded MyThes-compatible dictionary. The parser accepts the
+/// redistributable text data format used by LibreOffice's Mythes packages; no
+/// network access or native runtime library is required.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct OfflineThesaurus {
+    pub encoding: String,
+    pub entries: BTreeMap<String, Vec<ThesaurusSense>>,
+}
+
+#[cfg(test)]
+mod thesaurus_tests {
+    use super::OfflineThesaurus;
+
+    #[test]
+    fn mythes_lookup_is_offline_case_insensitive_and_groups_senses() {
+        let source =
+            "UTF-8\n2\ncolour|2\n(noun)|color|hue\n(verb)|tint|paint\nbook|1\n(noun)|volume|tome\n";
+        let thesaurus = OfflineThesaurus::parse_mythes_data(source).unwrap();
+        let senses = thesaurus.lookup("COLOUR").unwrap();
+        assert_eq!(senses.len(), 2);
+        assert_eq!(senses[0].part_of_speech.as_deref(), Some("noun"));
+        assert_eq!(senses[0].synonyms, ["color", "hue"]);
+        assert_eq!(thesaurus.lookup("missing"), None);
+    }
+
+    #[test]
+    fn malformed_or_inconsistent_mythes_data_is_rejected() {
+        assert!(OfflineThesaurus::parse_mythes_data("UTF-16\n0\n").is_err());
+        assert!(OfflineThesaurus::parse_mythes_data("UTF-8\n2\nword|1\n(noun)|term\n").is_err());
+        assert!(OfflineThesaurus::parse_mythes_data("UTF-8\n1\nword|2\n(noun)|term\n").is_err());
+    }
+
+    #[test]
+    fn mythes_bytes_decode_declared_legacy_encodings() {
+        let data = b"ISO8859-1\ncaf\xe9|1\n(noun)|infusion\n";
+        let thesaurus = OfflineThesaurus::parse_mythes_bytes(data).unwrap();
+        assert_eq!(thesaurus.encoding, "ISO8859-1");
+        assert_eq!(thesaurus.lookup("CAFÉ").unwrap()[0].synonyms, ["infusion"]);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ThesaurusSense {
+    pub part_of_speech: Option<String>,
+    pub synonyms: Vec<String>,
+}
+
+impl OfflineThesaurus {
+    pub fn parse_mythes_bytes(bytes: &[u8]) -> Result<Self, String> {
+        let header_end = bytes
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or_else(|| "MyThes data is missing its encoding header".to_owned())?;
+        let source_encoding = std::str::from_utf8(&bytes[..header_end])
+            .map_err(|_| "MyThes encoding header is not ASCII/UTF-8".to_owned())?
+            .trim();
+        let encoding = encoding_rs::Encoding::for_label(source_encoding.as_bytes())
+            .ok_or_else(|| format!("unsupported MyThes encoding '{source_encoding}'"))?;
+        let (decoded, had_errors) = encoding.decode_without_bom_handling(&bytes[header_end + 1..]);
+        if had_errors {
+            return Err(format!(
+                "MyThes data contains invalid {source_encoding} sequences"
+            ));
+        }
+        let normalized = format!("UTF-8\n{decoded}");
+        let mut result = Self::parse_mythes_data(&normalized)?;
+        result.encoding = source_encoding.to_owned();
+        Ok(result)
+    }
+
+    pub fn parse_mythes_data(source: &str) -> Result<Self, String> {
+        let mut lines = source.lines();
+        let encoding = lines
+            .next()
+            .ok_or_else(|| "MyThes data is empty".to_owned())?
+            .trim()
+            .to_owned();
+        if !encoding.eq_ignore_ascii_case("UTF-8") {
+            return Err(format!("unsupported MyThes encoding '{encoding}'"));
+        }
+        // The companion .idx has a total-entry count after its encoding
+        // header; the .dat data file begins directly with the first headword.
+        // Accept either form while parsing the .dat file itself.
+        let remaining = lines.collect::<Vec<_>>();
+        let declared = remaining
+            .first()
+            .and_then(|line| line.trim().parse::<usize>().ok());
+        let records = if declared.is_some() {
+            &remaining[1..]
+        } else {
+            &remaining[..]
+        };
+        let mut result = Self {
+            encoding,
+            entries: BTreeMap::new(),
+        };
+        let mut parsed = 0usize;
+        let mut lines = records.iter().copied();
+        while let Some(header) = lines.next() {
+            let header = header.trim_end_matches('\r');
+            if header.is_empty() {
+                continue;
+            }
+            let (word, count) = header
+                .rsplit_once('|')
+                .ok_or_else(|| format!("invalid MyThes headword record: {header}"))?;
+            if word.is_empty() {
+                return Err("MyThes headword cannot be empty".into());
+            }
+            let count = count
+                .parse::<usize>()
+                .map_err(|_| format!("invalid MyThes sense count for '{word}'"))?;
+            let mut senses = Vec::with_capacity(count);
+            for _ in 0..count {
+                let line = lines
+                    .next()
+                    .ok_or_else(|| format!("truncated MyThes senses for '{word}'"))?
+                    .trim_end_matches('\r');
+                let mut fields = line.split('|');
+                let first = fields.next().unwrap_or_default();
+                let (part_of_speech, first_synonym) =
+                    if first.starts_with('(') && first.ends_with(')') {
+                        (Some(first[1..first.len() - 1].to_owned()), None)
+                    } else {
+                        (None, Some(first))
+                    };
+                let synonyms = first_synonym
+                    .into_iter()
+                    .chain(fields)
+                    .filter(|term| !term.trim().is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                senses.push(ThesaurusSense {
+                    part_of_speech,
+                    synonyms,
+                });
+            }
+            result.entries.insert(word.to_lowercase(), senses);
+            parsed += 1;
+        }
+        if declared.is_some_and(|declared| parsed != declared) {
+            let declared = declared.unwrap_or_default();
+            return Err(format!(
+                "MyThes data declares {declared} entries but contains {parsed}"
+            ));
+        }
+        Ok(result)
+    }
+
+    pub fn lookup(&self, word: &str) -> Option<&[ThesaurusSense]> {
+        self.entries.get(&word.to_lowercase()).map(Vec::as_slice)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProofreadingConfig {
