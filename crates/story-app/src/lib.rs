@@ -253,6 +253,8 @@ pub fn scrivener_compile_presentation(
     let mut warnings = Vec::new();
     let mut title_policies =
         std::collections::BTreeMap::<Destination, std::collections::BTreeSet<bool>>::new();
+    let mut chapter_title_templates = std::collections::BTreeSet::new();
+    let mut untemplated_chapter_titles = false;
     let mut separators = std::collections::BTreeSet::new();
 
     for item in &inventory.items {
@@ -304,7 +306,20 @@ pub fn scrivener_compile_presentation(
                 .or_default()
                 .insert(include_titles);
         }
-        if layout.title_prefix.is_some() || layout.title_suffix.is_some() {
+        let numbered_chapter_template = (destination == Destination::Chapter
+            && layout.include_titles != Some(false))
+        .then(|| scrivener_chapter_title_template(layout))
+        .flatten();
+        if destination == Destination::Chapter && layout.include_titles != Some(false) {
+            if let Some(template) = numbered_chapter_template.as_ref() {
+                chapter_title_templates.insert(template.clone());
+            } else {
+                untemplated_chapter_titles = true;
+            }
+        }
+        if (layout.title_prefix.is_some() || layout.title_suffix.is_some())
+            && numbered_chapter_template.is_none()
+        {
             warnings.push(format!("Scrivener layout '{layout_id}' has title prefix/suffix content that is not represented by WIDE's heading visibility controls"));
         }
         if layout.text_prefix.is_some() || layout.text_suffix.is_some() {
@@ -336,6 +351,11 @@ pub fn scrivener_compile_presentation(
             _ => {}
         }
     }
+    if chapter_title_templates.len() == 1 && !untemplated_chapter_titles {
+        presentation.chapter_title_template = chapter_title_templates.into_iter().next();
+    } else if !chapter_title_templates.is_empty() {
+        warnings.push(format!("Scrivener format '{format_id}' uses chapter title prefixes that cannot be represented by one WIDE chapter heading rule"));
+    }
     if separators.len() == 1 {
         let (kind, text) = separators.into_iter().next().expect("one separator");
         if matches!(
@@ -357,6 +377,50 @@ pub fn scrivener_compile_presentation(
         presentation,
         warnings,
     })
+}
+
+/// Translate the simple Scrivener title-prefix pattern used for sequential
+/// chapter headings into WIDE's renderer-neutral chapter template. Scrivener
+/// `$n` and `$t` are automatic counters; WIDE currently presents these as
+/// decimal chapter numbers. More complex variable expressions remain visible
+/// as import/profile warnings rather than being guessed.
+fn scrivener_chapter_title_template(
+    layout: &story_import::ScrivenerCompileLayout,
+) -> Option<String> {
+    let prefix = layout.title_prefix.as_deref().unwrap_or_default();
+    let suffix = layout.title_suffix.as_deref().unwrap_or_default();
+    if prefix.is_empty() && suffix.is_empty() {
+        return None;
+    }
+
+    let source = format!("{prefix}{suffix}");
+    let mut output = String::with_capacity(source.len());
+    let mut remaining = source.as_str();
+    let mut counters = 0usize;
+    while let Some(open) = remaining.find("<$") {
+        output.push_str(&remaining[..open]);
+        let token_start = open + 2;
+        let close = remaining[token_start..].find('>')? + token_start;
+        let token = remaining[token_start..close].trim().to_ascii_lowercase();
+        if matches!(token.as_str(), "n" | "t" | "n:chapter" | "t:chapter") {
+            output.push_str("{number}");
+            counters += 1;
+        } else {
+            return None;
+        }
+        remaining = &remaining[close + 1..];
+    }
+    output.push_str(remaining);
+    if counters != 1 {
+        return None;
+    }
+
+    let template = output.split_whitespace().collect::<Vec<_>>().join(" ");
+    let presentation = story_document::CompilePresentation {
+        chapter_title_template: Some(template.clone()),
+        ..story_document::CompilePresentation::default()
+    };
+    presentation.validate().ok().map(|()| template)
 }
 
 /// Optional, per-book chronology behavior. Story-time fields remain stored even
@@ -5320,7 +5384,10 @@ impl WriterApp {
     ) -> Result<Vec<PathBuf>> {
         let recipe = scrivener_profile_recipe(profile, format, output)?;
         let artifact = self.compile_edition_artifact_recording_failure(&recipe)?;
-        self.publish_compile_artifact(self.project_root().join(output), &artifact, overwrite)
+        // `publish_compile_artifact` interprets relative destinations against
+        // the canonical project root. Pre-joining the possibly relative root
+        // here would cause that path to be joined a second time.
+        self.publish_compile_artifact(output, &artifact, overwrite)
     }
 
     /// Render a saved Scrivener layout for an author-selected destination in
@@ -9499,6 +9566,124 @@ unexpected_prose = "must not be silently discarded"
     }
 
     #[test]
+    fn scrivener_profile_renders_sequential_chapter_numbers_from_layout_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Numbered Chapters.scriv");
+        for id in ["chapter-one", "scene-one", "chapter-two", "scene-two"] {
+            fs::create_dir_all(source.join("Files/Data").join(id)).unwrap();
+        }
+        fs::create_dir_all(source.join("Settings/Compile Formats")).unwrap();
+        fs::write(
+            source.join("Numbered Chapters.scrivx"),
+            r#"<ScrivenerProject Version="2.0"><Binder>
+              <BinderItem UUID="draft" Type="DraftFolder"><Title>Draft</Title><Children>
+                <BinderItem UUID="chapter-one" Type="Folder"><Title>...</Title><SectionType>chapter-type</SectionType><Children>
+                  <BinderItem UUID="scene-one" Type="Text"><Title>Event 1</Title><SectionType>scene-type</SectionType><Children/></BinderItem>
+                </Children></BinderItem>
+                <BinderItem UUID="chapter-two" Type="Folder"><Title>...</Title><SectionType>chapter-type</SectionType><Children>
+                  <BinderItem UUID="scene-two" Type="Text"><Title>Event 2</Title><SectionType>scene-type</SectionType><Children/></BinderItem>
+                </Children></BinderItem>
+              </Children></BinderItem>
+            </Binder></ScrivenerProject>"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("Settings/compile.xml"),
+            r#"<CompileSettings><FormatSettings><Format ID="ebook"><SectionLayouts>
+              <Type ID="chapter-type">chapter-layout</Type><Type ID="scene-type">scene-layout</Type>
+            </SectionLayouts></Format></FormatSettings></CompileSettings>"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("Settings/Compile Formats/ebook.scrformat"),
+            r#"<CompileFormat ID="ebook"><Layouts>
+              <Layout ID="chapter-layout" Name="Numbered chapter"><Include Titles="Yes" Text="Yes"/><Titles><Prefix>Chapter &lt;$t&gt;</Prefix></Titles></Layout>
+              <Layout ID="scene-layout" Name="Scene boundary"><Include Titles="No" Text="Yes"/><Separators><Between Type="Custom">* * *</Between></Separators></Layout>
+            </Layouts></CompileFormat>"#,
+        )
+        .unwrap();
+        for (id, text) in [
+            ("scene-one", "The blacksmith opens the forge."),
+            ("scene-two", "The apprentice lifts the hammer."),
+        ] {
+            fs::write(
+                source.join("Files/Data").join(id).join("content.rtf"),
+                format!(r"{{\rtf1\ansi {text}}}"),
+            )
+            .unwrap();
+        }
+
+        let inventory = story_import::inspect_scrivener_project(&source).unwrap();
+        let mut plan = story_import::ScrivenerImportPlan::proposed(&inventory);
+        for (id, kind) in [
+            ("draft", story_import::ScrivenerDestinationKind::Section),
+            (
+                "chapter-one",
+                story_import::ScrivenerDestinationKind::Chapter,
+            ),
+            (
+                "chapter-two",
+                story_import::ScrivenerDestinationKind::Chapter,
+            ),
+            ("scene-one", story_import::ScrivenerDestinationKind::Scene),
+            ("scene-two", story_import::ScrivenerDestinationKind::Scene),
+        ] {
+            plan.decisions
+                .iter_mut()
+                .find(|decision| decision.source_document_id == id)
+                .unwrap()
+                .destination_kind = kind;
+        }
+
+        let mut app = WriterApp::create_project(dir.path().join("Imported"), "Numbered").unwrap();
+        app.import_scrivener_inventory(
+            &inventory,
+            &plan,
+            story_import::ScrivenerImportMode::Editable,
+        )
+        .unwrap();
+        let profile = app
+            .list_scrivener_edition_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.source_format_id == "ebook")
+            .unwrap();
+        assert_eq!(
+            profile.presentation.chapter_title_template.as_deref(),
+            Some("Chapter {number}")
+        );
+        assert_eq!(
+            profile.presentation.scene_separator.as_deref(),
+            Some("* * *")
+        );
+        assert!(!profile.warnings.iter().any(|warning| {
+            warning.contains("title prefix/suffix") || warning.contains("chapter title prefixes")
+        }));
+
+        let artifact = app
+            .compile_scrivener_edition_profile_artifact(
+                &profile,
+                story_document::CompileFormat::Markdown,
+            )
+            .unwrap();
+        let text = String::from_utf8(artifact.bytes).unwrap();
+        assert!(text.contains("## Chapter 1"));
+        assert!(text.contains("## Chapter 2"));
+        assert!(!text.contains("## ..."));
+        assert!(!text.contains("Event 1"));
+        assert!(!text.contains("Event 2"));
+        assert!(!text.contains("<$t>"));
+        assert!(text.contains("The blacksmith opens the forge."));
+        assert!(text.contains("The apprentice lifts the hammer."));
+        assert!(
+            app.load_scene_text(app.list_scenes(false).unwrap()[0].scene.id)
+                .unwrap()
+                .0
+                .contains("The blacksmith opens the forge.")
+        );
+    }
+
+    #[test]
     fn scrivener_profile_applies_source_exclusions_and_suppresses_only_layout_body() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("Profile Layout.scriv");
@@ -9707,6 +9892,13 @@ unexpected_prose = "must not be silently discarded"
             .find(|path| path.extension().is_some_and(|extension| extension == "md"))
             .unwrap();
         assert!(compiled_path.is_absolute());
+        assert_eq!(
+            compiled_path,
+            &project_path
+                .canonicalize()
+                .unwrap()
+                .join("exports/profile-test.md")
+        );
         let compiled = fs::read_to_string(compiled_path).unwrap();
         assert!(compiled.contains("Relative project paths compile safely."));
     }
@@ -10462,5 +10654,22 @@ unexpected_prose = "must not be silently discarded"
                     && warning.contains("Appendix Note")
                     && warning.contains("no layout assignment"))
         );
+
+        let mut numbered = inventory.clone();
+        let chapter_layout = numbered.compile_settings.as_mut().unwrap().formats[0]
+            .layouts
+            .get_mut("hide-chapter")
+            .unwrap();
+        chapter_layout.include_titles = Some(true);
+        chapter_layout.title_prefix = Some("Chapter <$t>\n".into());
+        let mapped = scrivener_compile_presentation(&numbered, &plan, "ebook").unwrap();
+        assert_eq!(
+            mapped.presentation.chapter_title_template.as_deref(),
+            Some("Chapter {number}")
+        );
+        assert!(!mapped.warnings.iter().any(|warning| {
+            warning.contains("title prefix/suffix") || warning.contains("chapter title prefixes")
+        }));
+        assert_eq!(numbered.items[0].title, "Internal chapter");
     }
 }

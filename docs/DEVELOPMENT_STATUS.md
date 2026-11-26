@@ -1,5 +1,45 @@
 # Writer's IDE Development Status
 
+## Current checkpoint — Scrivener compile profile mapping, 26 November 2026
+
+The current follow-up adds translation for a simple Scrivener chapter title
+layout prefix containing one automatic chapter counter (for example,
+`Chapter <$t>`). It becomes WIDE's shared `Chapter {number}` presentation rule;
+the canonical binder title, scene names and prose remain unchanged. A
+synthetic production import/profile test verifies sequential chapter headings,
+scene separators, source preservation and no visible source variable. The same
+batch fixes a relative-output-path bug in the profile compile service, with a
+regression asserting that output is written beneath the canonical project
+root exactly once.
+
+Verification on this working tree:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --offline --workspace --all-targets -- -D warnings` — passed.
+- `cargo test --offline --workspace -- --test-threads=1` — passed: 356
+  terminal unit tests, 3 end-to-end author workflows, 30 production PTYs,
+  remaining workspace/integration/doc tests; one private-corpus PTY is
+  intentionally ignored unless its protected fixture path is configured.
+- Focused relative-project profile output test — passed.
+- Fresh Book 03 regression `scrivener-numbered-layout-20261126` — fixture
+  checksums passed before and after; 68/68 manuscript bodies and 10/12
+  research bodies matched the current source on import/reopen; 0 Trash bodies
+  were imported. The import status remains **incomplete** because two research
+  bodies are not exact.
+- A real imported `DEFAULT` profile EPUB was generated at
+  `generated/scrivener-numbered-layout-20261126/book-03-project/exports/book-03-default-layout.epub`.
+  EPUBCheck 4.2.6 reported zero errors and warnings, and the EPUB contains no
+  literal unresolved Scrivener placeholders. Its fidelity remains provisional:
+  seven source section-layout assignments remain unmapped and are reported to
+  the author. They have not been guessed from binder names. The local details
+  are in the ignored run directory `reports/scrivener-numbered-layout-20261126/`.
+
+Human publication acceptance remains outstanding. Continue investigating
+generic Scrivener per-format layout assignment recovery and the research-body
+discrepancies, then return to the remaining v1.0 author-workflow and publication
+backlog. This checkpoint does not supersede the Alpha UAT 36 build record or
+claim that the broader #76 end-to-end journey audit has passed human review.
+
 ## Current checkpoint — Alpha UAT 36, issue #76 workflow audit, 26 November 2026
 
 The focused command/workflow repair batch is frozen at commit
