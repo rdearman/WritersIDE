@@ -460,6 +460,10 @@ The latest three-book results are in
 - `generated/rtf-punctuation-all-20261126/book-02.epub`
 - `generated/rtf-punctuation-all-20261126/book-03.epub`
 
+The harness report records base commit `3db2360` and a dirty working tree
+because the punctuation change was being exercised. Commit `895d71f` contains
+the tested importer patch and is the resulting source revision.
+
 Source body persistence matched exactly (39/39, 36/36 and 68/68; research
 6/6, 6/6 and 12/12). Book 02 retains the reported date-range en dash, all 44
 illustration placements and 43 distinct embedded payloads. All three generated
@@ -471,8 +475,9 @@ preformatted blocks. Fixture checksum validation passed before and after.
 tests passed. The Ollama test used the previously authorized loopback-only
 socket access; no external network service was used.
 
-Next: finish final checks, commit/push this punctuation repair, update #53/#7/#73,
-then continue compile inclusion/layout/variable mapping in the shared Compile
-IR and named profiles. Publication fidelity remains failed human UAT. Never
-commit the private reports or generated EPUBs. Do not stage the unrelated root
-`.gitignore`, `README_TMP.md` or `UAT/`.
+Next: integrate Scrivener's imported compile inclusion/layout and metadata into
+the shared Compile IR and existing named publication profiles, with synthetic
+tests and the controlled three-book regression. Issues #53, #7 and #73 now have
+sanitized status comments; all remain open for human acceptance. Publication
+fidelity remains failed human UAT. Never commit the private reports or generated
+EPUBs. Do not stage the unrelated root `.gitignore`, `README_TMP.md` or `UAT/`.
