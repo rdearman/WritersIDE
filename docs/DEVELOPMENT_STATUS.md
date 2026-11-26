@@ -835,3 +835,23 @@ the command taxonomy and its visible inclusion in the curated Review menu.
 Focused terminal tests and terminal-package Clippy passed. This improves access
 to existing checks; offline dictionary definitions and thesaurus support remain
 unimplemented, and the menu workflow still needs human usability verification.
+
+## EPUB differential emphasis detail — implementation and targeted real comparison complete
+
+The local EPUB XHTML comparison now records source-located semantic emphasis
+from actual markup, including bold, italic, underline, strikethrough, subscript
+and superscript. Equivalent XHTML forms (for example `<b>` and `<strong>`) are
+normalised for comparison while original element paths remain in the detailed
+report. Differences identify missing or additional emphasized text; manuscript
+content is never altered. The full Python tooling suite passes (23 tests) and
+all tooling modules compile. Regenerate reports during the next relevant real
+manuscript run so they include this new field; earlier local reports do not.
+The new comparator was then applied to the existing BowString candidate pair
+without re-importing or modifying fixtures. Its fresh local report is
+`reports/back-catalogue-targeted/bowstring-semantic-format-20261126b/differential.json`.
+The candidate reference remains unconfirmed; the report found 1 reference and
+2 generated semantic emphasis runs. This is a discrepancy lead requiring
+source-side investigation, not a confirmed formatting defect or acceptance
+result. This refreshed comparison reused the already imported/generated private
+artefact; it did not repeat import, reopen or EPUBCheck. Fixture checksums passed
+before and after comparison.

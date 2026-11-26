@@ -131,6 +131,47 @@ class EpubSemanticTests(unittest.TestCase):
             {"reference": "Reference", "generated": "Generated"},
         )
 
+    def test_detailed_comparison_finds_missing_semantic_emphasis_by_location(self):
+        reference_doc = epub_document_details(
+            '<html><body><p>Keep <strong>this phrase</strong> prominent.</p></body></html>',
+            "ref/chapter.xhtml",
+        )
+        generated_doc = epub_document_details(
+            '<html><body><p>Keep this phrase prominent.</p></body></html>',
+            "wide/chapter.xhtml",
+        )
+        difference = detailed_epub_difference(
+            {"documents": [reference_doc], "css_summary": {}, "metadata": {}, "navigation_entries": []},
+            {"documents": [generated_doc], "css_summary": {}, "metadata": {}, "navigation_entries": []},
+        )
+        self.assertEqual(reference_doc["formatting"][0]["kind"], "bold")
+        missing = difference["semantic_formatting"]["missing_from_generated"]
+        self.assertEqual(missing, [{
+            "kind": "bold", "text": "this phrase", "count": 1,
+            "locations": [{
+                "document": "ref/chapter.xhtml", "path": "/html/body[1]/p[1]/strong[1]",
+                "source_element": "strong",
+            }],
+        }])
+        self.assertEqual(
+            difference["semantic_formatting"]["reference"][0]["document"],
+            "ref/chapter.xhtml",
+        )
+
+    def test_detailed_comparison_normalises_equivalent_bold_xhtml_elements(self):
+        reference_doc = epub_document_details(
+            '<html><body><p><b>meaningful emphasis</b></p></body></html>', "ref.xhtml"
+        )
+        generated_doc = epub_document_details(
+            '<html><body><p><strong>meaningful emphasis</strong></p></body></html>', "wide.xhtml"
+        )
+        difference = detailed_epub_difference(
+            {"documents": [reference_doc], "css_summary": {}, "metadata": {}, "navigation_entries": []},
+            {"documents": [generated_doc], "css_summary": {}, "metadata": {}, "navigation_entries": []},
+        )
+        self.assertEqual(difference["semantic_formatting"]["missing_from_generated"], [])
+        self.assertEqual(difference["semantic_formatting"]["additional_in_generated"], [])
+
     def test_character_report_distinguishes_substitution_and_added_accent(self):
         difference = detailed_epub_difference(
             {"documents": [{"path": "reference.xhtml", "paragraphs": [

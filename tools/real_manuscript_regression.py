@@ -175,10 +175,11 @@ def epub_document_details(source: str, document_path: str) -> dict:
                 "tables": [],
                 "images": [],
                 "links": [],
+                "formatting": [],
                 "unicode_counts": {},
             }
         if root is None:
-            return {"path": document_path, "parse_error": parse_error, "blocks": [], "paragraphs": [], "preformatted": [], "headings": [], "visible_markdown_artifacts": [], "tables": [], "images": [], "links": [], "unicode_counts": {}}
+            return {"path": document_path, "parse_error": parse_error, "blocks": [], "paragraphs": [], "preformatted": [], "headings": [], "visible_markdown_artifacts": [], "tables": [], "images": [], "links": [], "formatting": [], "unicode_counts": {}}
         recovered = True
 
     def tag_name(node: ET.Element) -> str:
@@ -211,14 +212,63 @@ def epub_document_details(source: str, document_path: str) -> dict:
     tables = []
     images = []
     links = []
+    formatting = []
     parents = {
         id(child): parent
         for parent in root.iter()
         for child in list(parent)
     }
+
+    def element_path(node: ET.Element) -> str:
+        parts = []
+        while True:
+            name = tag_name(node)
+            parent = parents.get(id(node))
+            if parent is None:
+                parts.append(name)
+                break
+            same_tag_siblings = [child for child in list(parent) if tag_name(child) == name]
+            position = same_tag_siblings.index(node) + 1
+            parts.append(f"{name}[{position}]")
+            node = parent
+        return "/" + "/".join(reversed(parts))
+
     for index, node in enumerate(root.iter(), 1):
         name = tag_name(node)
         attrs = {key.rsplit("}", 1)[-1].lower(): value for key, value in node.attrib.items()}
+        style = attrs.get("style", "")
+        style_properties = {
+            key.strip().lower(): value.strip().lower()
+            for declaration in style.split(";")
+            if ":" in declaration
+            for key, value in [declaration.split(":", 1)]
+        }
+        semantic_kinds = []
+        semantic_kind = {
+            "b": "bold", "strong": "bold",
+            "i": "italic", "em": "italic",
+            "u": "underline", "ins": "underline",
+            "s": "strikethrough", "strike": "strikethrough", "del": "strikethrough",
+            "sup": "superscript", "sub": "subscript",
+        }.get(name)
+        if semantic_kind:
+            semantic_kinds.append(semantic_kind)
+        if name == "span":
+            if style_properties.get("font-weight", "") in {"bold", "bolder", "600", "700", "800", "900"}:
+                semantic_kinds.append("bold")
+            if style_properties.get("font-style", "") in {"italic", "oblique"}:
+                semantic_kinds.append("italic")
+            if "underline" in style_properties.get("text-decoration", ""):
+                semantic_kinds.append("underline")
+            if any(token in style_properties.get("text-decoration", "") for token in ("line-through", "strikethrough")):
+                semantic_kinds.append("strikethrough")
+        for semantic_kind in dict.fromkeys(semantic_kinds):
+            formatting.append({
+                "kind": semantic_kind,
+                "source_element": name,
+                "path": element_path(node),
+                "text": unicodedata.normalize("NFC", text_of(node)),
+            })
         if name == "table":
             rows = []
             for row in node.iter():
@@ -251,6 +301,7 @@ def epub_document_details(source: str, document_path: str) -> dict:
         "tables": tables,
         "images": images,
         "links": links,
+        "formatting": formatting,
         "unicode_counts": dict(sorted(collections.Counter(
             f"U+{ord(character):04X} {unicodedata.name(character, 'UNNAMED')}"
             for character in all_text if not character.isalnum() and not character.isspace()
@@ -408,6 +459,39 @@ def detailed_epub_difference(
     }
     ref_docs = reference.get("documents", [])
     gen_docs = generated.get("documents", [])
+    reference_formatting = [
+        {"document": document["path"], **mark}
+        for document in ref_docs for mark in document.get("formatting", [])
+    ]
+    generated_formatting = [
+        {"document": document["path"], **mark}
+        for document in gen_docs for mark in document.get("formatting", [])
+    ]
+    def formatting_key(mark: dict) -> tuple[str, str]:
+        # Equivalent XHTML elements (for example <b> and <strong>) compare by
+        # semantic kind and text, while retaining source paths for diagnosis.
+        return (mark["kind"], unicodedata.normalize("NFC", mark["text"]))
+
+    ref_marks = collections.Counter(formatting_key(mark) for mark in reference_formatting)
+    gen_marks = collections.Counter(formatting_key(mark) for mark in generated_formatting)
+
+    def formatting_delta(before: collections.Counter, after: collections.Counter, source_marks: list[dict]) -> list[dict]:
+        result = []
+        for (kind, text), count in sorted((before - after).items()):
+            locations = [
+                {"document": mark["document"], "path": mark["path"], "source_element": mark["source_element"]}
+                for mark in source_marks
+                if formatting_key(mark) == (kind, text)
+            ]
+            result.append({"kind": kind, "text": text, "count": count, "locations": locations})
+        return result
+
+    formatting_difference = {
+        "reference": reference_formatting,
+        "generated": generated_formatting,
+        "missing_from_generated": formatting_delta(ref_marks, gen_marks, reference_formatting),
+        "additional_in_generated": formatting_delta(gen_marks, ref_marks, generated_formatting),
+    }
     reference_css = reference.get("css_summary", {})
     generated_css = generated.get("css_summary", {})
     css_differences = {}
@@ -431,9 +515,10 @@ def detailed_epub_difference(
             "changed_regions": paragraph_changes,
         },
         "characters": character_diff,
+        "semantic_formatting": formatting_difference,
         "document_details": {
-            "reference": [{key: doc.get(key) for key in ("path", "headings", "preformatted", "visible_markdown_artifacts", "tables", "images", "links")} for doc in ref_docs],
-            "generated": [{key: doc.get(key) for key in ("path", "headings", "preformatted", "visible_markdown_artifacts", "tables", "images", "links")} for doc in gen_docs],
+            "reference": [{key: doc.get(key) for key in ("path", "headings", "preformatted", "visible_markdown_artifacts", "tables", "images", "links", "formatting")} for doc in ref_docs],
+            "generated": [{key: doc.get(key) for key in ("path", "headings", "preformatted", "visible_markdown_artifacts", "tables", "images", "links", "formatting")} for doc in gen_docs],
         },
         "css": {
             "reference": reference_css,
