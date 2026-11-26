@@ -2,6 +2,35 @@
 
 Updated: 2026-11-26
 
+## Current checkpoint — Scrivener layout selection in Publish, 26 November 2026
+
+Imported Scrivener compile layouts are now selectable from the curated
+Publish menu through **Compile with Imported Layout…**. The author chooses a
+readable layout name, then uses the existing Save As browser to choose the
+WIDE output format and destination. The selected profile is passed through the
+shared Compile IR pipeline and the resulting artifact is written to the
+chosen location. The status message confirms the layout and output path. The
+terminal no longer requires a CLI command or a binder UUID for this workflow.
+
+Regression coverage verifies layout selection, visible chooser controls,
+format selection, output-file selection and generated manuscript content.
+The real Scrivener import PTY test now continues through this Publish workflow.
+It passes with the protected `ArrowMaking.scriv` source; a synthetic Scrivener
+project also passes import → layout selection → DOCX compile in the production
+terminal. Workspace format, Clippy (`-D warnings`) and tests passed on the
+current working tree: 341 terminal unit tests, 3 author-workflow integration
+tests, 27 PTY tests (1 ignored), plus the other workspace and documentation
+tests. The run also verified private fixture checksums before and after.
+
+This is implementation evidence, not publication acceptance. The expanded
+corpus still needs per-format inspection to confirm that all Scrivener layout
+constructs have an equivalent WIDE presentation, and the author must verify
+that the Publish workflow is discoverable and produces acceptable output.
+Issues #7, #53, #68 and #73 remain open for further fidelity work and human
+UAT. The last frozen UAT bundle is Alpha UAT 28 at
+`test-builds/alpha-uat-28-16103dc/`; build a new candidate from a clean commit
+before sharing the changes in this checkpoint.
+
 ## Current checkpoint — selected Scrivener matter import safety, 26 November 2026
 
 Selected Scrivener front- and back-matter documents are now classified as

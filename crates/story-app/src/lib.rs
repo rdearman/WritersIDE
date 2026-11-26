@@ -96,6 +96,8 @@ pub struct ScrivenerCompilePresentation {
 pub struct ScrivenerEditionProfile {
     pub version: u16,
     pub source_format_id: String,
+    #[serde(default)]
+    pub display_name: String,
     pub assembly_id: String,
     pub presentation: story_document::CompilePresentation,
     #[serde(default)]
@@ -104,6 +106,65 @@ pub struct ScrivenerEditionProfile {
 
 type ScrivenerPublicationEntities =
     std::collections::BTreeMap<String, Vec<(Option<SceneId>, Option<ContentUnitId>)>>;
+
+fn scrivener_format_display_name(source_id: &str, index: usize) -> String {
+    if uuid::Uuid::parse_str(source_id).is_ok() {
+        return format!("Imported layout {}", index + 1);
+    }
+    let words = source_id
+        .split(|character: char| !character.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            chars
+                .next()
+                .map(|first| {
+                    first.to_uppercase().collect::<String>() + &chars.as_str().to_lowercase()
+                })
+                .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        format!("Imported layout {}", index + 1)
+    } else {
+        words.join(" ")
+    }
+}
+
+fn scrivener_profile_recipe(
+    profile: &ScrivenerEditionProfile,
+    format: story_document::CompileFormat,
+    output: &str,
+) -> Result<story_document::EditionRecipe> {
+    if profile.version != 1 || uuid::Uuid::parse_str(&profile.assembly_id).is_err() {
+        return Err(AppError::Domain("invalid Scrivener edition profile".into()));
+    }
+    let name = if profile.display_name.trim().is_empty() {
+        scrivener_format_display_name(&profile.source_format_id, 0)
+    } else {
+        profile.display_name.clone()
+    };
+    let recipe = story_document::EditionRecipe {
+        version: 1,
+        name: format!("Scrivener · {name}"),
+        format,
+        assembly_id: Some(profile.assembly_id.clone()),
+        output: output.to_owned(),
+        metadata_title: None,
+        metadata_author: None,
+        cover_image: None,
+        design: story_document::BookDesign::default(),
+        expand_transclusions: false,
+        spellcheck: false,
+        language: None,
+        dictionary: None,
+        spelling_engine: story_document::SpellcheckEngine::default(),
+        diagnostics: story_document::DiagnosticPolicy::default(),
+        presentation: profile.presentation.clone(),
+    };
+    recipe.validate().map_err(AppError::Domain)?;
+    Ok(recipe)
+}
 
 pub fn scrivener_compile_presentation(
     inventory: &story_import::ScrivenerProjectInventory,
@@ -5092,6 +5153,7 @@ impl WriterApp {
             let profile = ScrivenerEditionProfile {
                 version: 1,
                 source_format_id: format.source_format_id.clone(),
+                display_name: scrivener_format_display_name(&format.source_format_id, format_index),
                 assembly_id: assembly.to_string(),
                 presentation: proposed.presentation,
                 warnings: profile_warnings,
@@ -5123,9 +5185,10 @@ impl WriterApp {
         paths.sort();
         paths
             .into_iter()
-            .map(|path| {
-                let bytes = fs::read(path)?;
-                let profile: ScrivenerEditionProfile =
+            .enumerate()
+            .map(|(index, path)| {
+                let bytes = fs::read(&path)?;
+                let mut profile: ScrivenerEditionProfile =
                     serde_json::from_slice(&bytes).map_err(|error| {
                         AppError::Domain(format!("invalid Scrivener edition profile: {error}"))
                     })?;
@@ -5136,6 +5199,10 @@ impl WriterApp {
                     return Err(AppError::Domain(
                         "invalid Scrivener edition profile identity".into(),
                     ));
+                }
+                if profile.display_name.trim().is_empty() {
+                    profile.display_name =
+                        scrivener_format_display_name(&profile.source_format_id, index);
                 }
                 profile.presentation.validate().map_err(AppError::Domain)?;
                 Ok(profile)
@@ -5152,30 +5219,22 @@ impl WriterApp {
         output: &str,
         overwrite: bool,
     ) -> Result<Vec<PathBuf>> {
-        if profile.version != 1 || uuid::Uuid::parse_str(&profile.assembly_id).is_err() {
-            return Err(AppError::Domain("invalid Scrivener edition profile".into()));
-        }
-        let recipe = story_document::EditionRecipe {
-            version: 1,
-            name: format!("Scrivener · {}", profile.source_format_id),
-            format,
-            assembly_id: Some(profile.assembly_id.clone()),
-            output: output.to_owned(),
-            metadata_title: None,
-            metadata_author: None,
-            cover_image: None,
-            design: story_document::BookDesign::default(),
-            expand_transclusions: false,
-            spellcheck: false,
-            language: None,
-            dictionary: None,
-            spelling_engine: story_document::SpellcheckEngine::default(),
-            diagnostics: story_document::DiagnosticPolicy::default(),
-            presentation: profile.presentation.clone(),
-        };
-        recipe.validate().map_err(AppError::Domain)?;
+        let recipe = scrivener_profile_recipe(profile, format, output)?;
         let artifact = self.compile_edition_artifact_recording_failure(&recipe)?;
         self.publish_compile_artifact(self.project_root().join(output), &artifact, overwrite)
+    }
+
+    /// Render a saved Scrivener layout for an author-selected destination in
+    /// the terminal Save As browser. Publication remains a separate operation
+    /// so the browser can safely write outside the project directory.
+    pub fn compile_scrivener_edition_profile_artifact(
+        &self,
+        profile: &ScrivenerEditionProfile,
+        format: story_document::CompileFormat,
+    ) -> Result<story_document::CompileArtifact> {
+        let output = format!("exports/scrivener-edition.{}", format.extension());
+        let recipe = scrivener_profile_recipe(profile, format, &output)?;
+        self.compile_edition_artifact_recording_failure(&recipe)
     }
 
     fn materialize_scrivener_assets(
@@ -9146,6 +9205,7 @@ unexpected_prose = "must not be silently discarded"
             .iter()
             .find(|profile| profile.source_format_id == "ebook")
             .unwrap();
+        assert_eq!(profile.display_name, "Ebook");
         let assembly = story_core::AssemblyId(uuid::Uuid::parse_str(&profile.assembly_id).unwrap());
         let profile_ir = app.compile_assembly_ir(assembly).unwrap();
         let profile_text = profile_ir.render_markdown().0;
@@ -9199,6 +9259,17 @@ unexpected_prose = "must not be silently discarded"
         let published = fs::read_to_string(published_path).unwrap();
         assert!(published.contains("FRONTMATTERPRIVATETEST"));
         assert!(published.contains("BACKMATTERPRIVATETEST"));
+        let artifact = app
+            .compile_scrivener_edition_profile_artifact(
+                profile,
+                story_document::CompileFormat::Markdown,
+            )
+            .unwrap();
+        assert!(
+            String::from_utf8(artifact.bytes)
+                .unwrap()
+                .contains("FRONTMATTERPRIVATETEST")
+        );
     }
 
     #[test]

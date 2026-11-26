@@ -687,6 +687,7 @@ struct FileBrowserState {
     folder_name_overridden: bool,
     new_project_book_type: Option<story_core::BookType>,
     overwrite_confirmed: bool,
+    compile_profile: Option<story_app::ScrivenerEditionProfile>,
     org_import_mode: story_import::OrgImportMode,
     text_import_preview: Option<story_import::TextDocumentPreview>,
     preview_scroll: usize,
@@ -1095,6 +1096,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
     &[
         "compile.run",
         "compile.format",
+        "compile.scrivener-layout",
         "compile.results",
         "compile.configuration",
         "assembly.compile",
@@ -1648,6 +1650,7 @@ enum CommandAction {
     ProcessSelected { expand_transclusions: bool },
     LegacyPalette,
     CompileWorkflow,
+    CompileScrivenerLayout,
     ToggleFormattingMarks,
     ToggleRenderedMarkdown,
     ToggleBoldSelection,
@@ -2230,6 +2233,21 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::CompileWorkflow,
             task_group: "Compile",
             menu_priority: 1,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "compile.scrivener-layout",
+            label: "Compile with Imported Layout…",
+            description: "Choose a saved Scrivener layout, then select a WIDE output format and destination",
+            category: "Publish",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["scrivener layout", "source compile format"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::CompileScrivenerLayout,
+            task_group: "Compile",
+            menu_priority: 2,
             advanced: false,
         },
         legacy_command(
@@ -9208,6 +9226,7 @@ impl AppState {
             folder_name_overridden: false,
             new_project_book_type: None,
             overwrite_confirmed: false,
+            compile_profile: None,
             org_import_mode: story_import::OrgImportMode::SingleDocument,
             text_import_preview: None,
             preview_scroll: 0,
@@ -10063,22 +10082,37 @@ impl AppState {
                             self.file_browser = Some(browser);
                             return Ok(());
                         }
-                        let artifact = self.app.compile_artifact_recording_failure(
-                            format,
-                            false,
-                            story_document::BookDesign::default().profile(),
-                        )?;
+                        let artifact = if let Some(profile) = browser.compile_profile.as_ref() {
+                            self.app
+                                .compile_scrivener_edition_profile_artifact(profile, format)?
+                        } else {
+                            self.app.compile_artifact_recording_failure(
+                                format,
+                                false,
+                                story_document::BookDesign::default().profile(),
+                            )?
+                        };
                         match self.app.publish_compile_artifact(
                             &destination,
                             &artifact,
                             browser.overwrite_confirmed,
                         ) {
                             Ok(files) => {
-                                self.message = format!(
-                                    "Compiled {} · {} output file(s)",
-                                    destination.display(),
-                                    files.len()
-                                );
+                                self.message =
+                                    if let Some(profile) = browser.compile_profile.as_ref() {
+                                        format!(
+                                            "Compiled with {} to {} · {} output file(s)",
+                                            profile.display_name,
+                                            destination.display(),
+                                            files.len()
+                                        )
+                                    } else {
+                                        format!(
+                                            "Compiled {} · {} output file(s)",
+                                            destination.display(),
+                                            files.len()
+                                        )
+                                    };
                                 if format == story_document::CompileFormat::Epub {
                                     self.record_tutorial_action("compile");
                                 }
@@ -15836,6 +15870,33 @@ impl AppState {
                     story_document::CompileFormat::Docx,
                 )) {
                     self.message = format!("Could not open the Compile browser: {error}");
+                }
+            }
+            CommandAction::CompileScrivenerLayout => {
+                match self.app.list_scrivener_edition_profiles() {
+                    Ok(profiles) if !profiles.is_empty() => {
+                        self.help_panel = Some(HelpPanel {
+                            title: "Choose Scrivener Layout".into(),
+                            lines: profiles
+                                .iter()
+                                .map(|profile| {
+                                    format!(
+                                        "{} · imported publication layout",
+                                        profile.display_name
+                                    )
+                                })
+                                .collect(),
+                            scroll: 0,
+                        });
+                        self.message =
+                            "Choose an imported layout · Enter selects · Esc cancels".into();
+                    }
+                    Ok(_) => {
+                        self.message = "No imported Scrivener layouts are available. Import a Scrivener project first.".into();
+                    }
+                    Err(error) => {
+                        self.message = format!("Could not read imported layouts: {error}");
+                    }
                 }
             }
             CommandAction::ToggleFormattingMarks => {
@@ -26756,6 +26817,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
     };
     let area = f.area();
     let tutorial = panel.title.starts_with("Tutorial ·");
+    let scrivener_layout_chooser = panel.title == "Choose Scrivener Layout";
     let width = if tutorial {
         area.width.saturating_sub(2).clamp(1, 78)
     } else {
@@ -26821,6 +26883,25 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
                 }
             })
             .collect::<Text>()
+    } else if scrivener_layout_chooser {
+        panel
+            .lines
+            .iter()
+            .enumerate()
+            .map(|(index, line)| {
+                let selected = index == panel.scroll;
+                Line::styled(
+                    format!("{} {line}", if selected { "›" } else { " " }),
+                    if selected {
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    },
+                )
+            })
+            .collect::<Text>()
     } else {
         panel
             .lines
@@ -26835,6 +26916,8 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
             Block::default()
                 .title(if tutorial {
                     format!(" {} ", panel.title)
+                } else if scrivener_layout_chooser {
+                    " Choose Scrivener Layout · ↑/↓ select · Enter continue · Esc cancel ".into()
                 } else {
                     format!(" {} · Esc closes ", panel.title)
                 })
@@ -29140,6 +29223,10 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             story_document::CompileFormat::Mobi => "Compile · MOBI",
         },
     };
+    let purpose = browser.compile_profile.as_ref().map_or_else(
+        || purpose.to_owned(),
+        |profile| format!("Compile with {} · {}", profile.display_name, purpose),
+    );
     let block = Block::default()
         .title(format!(" {purpose} "))
         .borders(Borders::ALL)
@@ -32778,6 +32865,64 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     }
                 }
                 KeyCode::F(1) => s.close_context_help(),
+                _ => {}
+            }
+            return Ok(false);
+        }
+        if panel_title == Some("Choose Scrivener Layout") {
+            match k.code {
+                KeyCode::Esc | KeyCode::F(1) => {
+                    s.help_panel = None;
+                    s.message = "Layout selection cancelled · manuscript unchanged".into();
+                }
+                KeyCode::Up => {
+                    if let Some(panel) = s.help_panel.as_mut() {
+                        panel.scroll = panel.scroll.saturating_sub(1);
+                    }
+                }
+                KeyCode::Down => {
+                    if let Some(panel) = s.help_panel.as_mut() {
+                        let max = panel.lines.len().saturating_sub(1);
+                        panel.scroll = (panel.scroll + 1).min(max);
+                    }
+                }
+                KeyCode::PageUp | KeyCode::Home => {
+                    if let Some(panel) = s.help_panel.as_mut() {
+                        panel.scroll = 0;
+                    }
+                }
+                KeyCode::PageDown | KeyCode::End => {
+                    if let Some(panel) = s.help_panel.as_mut() {
+                        panel.scroll = panel.lines.len().saturating_sub(1);
+                    }
+                }
+                KeyCode::Enter => {
+                    let selected = s.help_panel.as_ref().map(|panel| panel.scroll).unwrap_or(0);
+                    let profiles = s.app.list_scrivener_edition_profiles()?;
+                    if let Some(profile) = profiles.get(selected).cloned() {
+                        s.help_panel = None;
+                        s.start_file_browser(FileBrowserPurpose::Compile(
+                            story_document::CompileFormat::Docx,
+                        ))?;
+                        let title = s
+                            .app
+                            .get_project()
+                            .map(|project| safe_filename(&project.title))
+                            .unwrap_or_else(|_| "Manuscript".into());
+                        if let Some(browser) = s.file_browser.as_mut() {
+                            browser.compile_profile = Some(profile.clone());
+                            browser.name =
+                                format!("{title} - {}.docx", safe_filename(&profile.display_name));
+                        }
+                        s.message = format!(
+                            "Compile with {} · F2 changes output format · choose a destination",
+                            profile.display_name
+                        );
+                    } else {
+                        s.help_panel = None;
+                        s.message = "That imported layout is no longer available; refresh the project and try again.".into();
+                    }
+                }
                 _ => {}
             }
             return Ok(false);
@@ -51466,6 +51611,87 @@ mod tests {
         .unwrap();
         assert!(document.contains("The manuscript reaches the reader."));
         assert!(state.message.starts_with("Compiled"), "{}", state.message);
+        assert!(state.file_browser.is_none());
+    }
+
+    #[test]
+    fn imported_scrivener_layout_is_selectable_and_compiles_through_publish_save_as() {
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("Imported Book");
+        let mut app = WriterApp::create_project(&project_path, "Imported Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "The Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "This prose uses the imported edition.")
+            .unwrap();
+        let assembly = app.create_assembly("Default").unwrap();
+        app.add_assembly_scene(assembly, scene, 0).unwrap();
+        let profiles = project_path.join(".writers-ide/scrivener-profiles");
+        fs::create_dir_all(&profiles).unwrap();
+        let profile = story_app::ScrivenerEditionProfile {
+            version: 1,
+            source_format_id: "DEFAULT".into(),
+            display_name: "Default".into(),
+            assembly_id: assembly.to_string(),
+            presentation: story_document::CompilePresentation::default(),
+            warnings: Vec::new(),
+        };
+        fs::write(
+            profiles.join("profile.json"),
+            serde_json::to_vec_pretty(&profile).unwrap(),
+        )
+        .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+
+        state
+            .dispatch_registered_command_id("compile.scrivener-layout")
+            .unwrap();
+        let chooser = state.help_panel.as_ref().unwrap();
+        assert_eq!(chooser.title, "Choose Scrivener Layout");
+        assert!(chooser.lines[0].contains("Default"));
+        let mut screen =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        screen.draw(|frame| draw(frame, &mut state)).unwrap();
+        let visible = screen
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(visible.contains("Enter continue"));
+        assert!(visible.contains("Default"));
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let browser = state.file_browser.as_ref().unwrap();
+        assert_eq!(
+            browser.compile_profile.as_ref().unwrap().display_name,
+            "Default"
+        );
+        assert!(browser.name.contains("Imported Book - Default.docx"));
+        for _ in 0..6 {
+            state
+                .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+                .unwrap();
+        }
+        assert!(matches!(
+            state.file_browser.as_ref().unwrap().purpose,
+            FileBrowserPurpose::Compile(story_document::CompileFormat::Markdown)
+        ));
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = project_path.clone();
+        browser.entries = file_browser_entries(&project_path).unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        let output = project_path.join("Imported Book - Default.md");
+        let rendered = fs::read_to_string(&output).unwrap();
+        assert!(rendered.contains("This prose uses the imported edition."));
+        assert!(state.message.contains("Compiled with Default"));
         assert!(state.file_browser.is_none());
     }
 

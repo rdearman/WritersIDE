@@ -79,6 +79,7 @@ fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty(
     let files = source.join("Files/Data");
     std::fs::create_dir_all(files.join("scene-id")).unwrap();
     std::fs::create_dir_all(files.join("research-id")).unwrap();
+    std::fs::create_dir_all(source.join("Settings")).unwrap();
     std::fs::write(
         source.join("0 Import.scrivx"),
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -94,6 +95,11 @@ fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty(
             <BinderItem UUID="research-id" Type="Text"><Title>Private Note</Title><Children/></BinderItem>
           </Children></BinderItem>
         </Binder></ScrivenerProject>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        source.join("Settings/compile.xml"),
+        r#"<CompileSettings><FormatSettings><Format ID="DEFAULT"/></FormatSettings></CompileSettings>"#,
     )
     .unwrap();
     std::fs::write(
@@ -133,6 +139,7 @@ fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty(
         .arg(&initial)
         .arg(&home)
         .arg("scrivener-import")
+        .env("WIDE_PTY_COMPILE_PROFILE", "1")
         .output()
         .expect("run Scrivener import through Linux PTY");
     assert!(
@@ -158,7 +165,7 @@ fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty(
     let prose = reopened.load_scene_text(scenes[0].scene.id).unwrap().0;
     assert!(prose.contains("The patient blacksmith"));
     assert!(prose.contains("Additional UAT sentence."));
-    let artifact = destination.join(format!("{}.docx", inventory.title));
+    let artifact = destination.join(format!("{} - Default.docx", inventory.title));
     assert!(
         artifact.is_file(),
         "the visible compile workflow did not create {artifact:?}"
@@ -198,6 +205,7 @@ fn protected_arrowmaking_project_imports_through_the_production_pty_without_sour
         .arg("scrivener-import")
         .env("WIDE_PTY_IMPORT_TITLES", "")
         .env("WIDE_PTY_IMPORT_TEXT", "")
+        .env("WIDE_PTY_COMPILE_PROFILE", "1")
         .output()
         .expect("run protected Scrivener project through Linux PTY");
     assert!(

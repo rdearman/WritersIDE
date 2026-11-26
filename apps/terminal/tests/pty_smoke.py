@@ -414,17 +414,40 @@ def main():
             menu_start = len(output)
             os.write(master, b"\x1b[21~")
             read_for(0.2)
-            selected_publish = False
-            for _ in range(10):
-                if wait_for_screen_fragments((b"Compile / Export",), menu_start, timeout=0.2):
-                    selected_publish = True
-                    break
-                os.write(master, b"\x1b[C")
-                read_for(0.05)
-            if not selected_publish:
-                raise AssertionError("Publish menu did not expose Compile / Export")
-            select_visible_menu_item("Compile / Export")
-            os.write(master, b"\r")
+            if os.environ.get("WIDE_PTY_COMPILE_PROFILE") == "1":
+                for _ in range(10):
+                    if wait_for_screen_fragments(
+                        (b"Compile with Imported Layout",), menu_start, timeout=0.2
+                    ):
+                        break
+                    os.write(master, b"\x1b[C")
+                    read_for(0.05)
+                else:
+                    raise AssertionError(
+                        "Publish menu did not expose imported Scrivener layouts; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                        + "\nvisible output tail: "
+                        + repr(ANSI_CONTROL.sub(b"", output[-3000:]))
+                    )
+                select_visible_menu_item("Compile with Imported Layout")
+                os.write(master, b"\r")
+                if not wait_for_screen_fragments(
+                    (b"Choose Scrivener Layout", b"Default"), menu_start, timeout=5.0
+                ):
+                    raise AssertionError("imported Scrivener layout chooser was not shown")
+                os.write(master, b"\r")  # select the source's default layout
+            else:
+                selected_publish = False
+                for _ in range(10):
+                    if wait_for_screen_fragments((b"Compile / Export",), menu_start, timeout=0.2):
+                        selected_publish = True
+                        break
+                    os.write(master, b"\x1b[C")
+                    read_for(0.05)
+                if not selected_publish:
+                    raise AssertionError("Publish menu did not expose Compile / Export")
+                select_visible_menu_item("Compile / Export")
+                os.write(master, b"\r")
             if not wait_for_screen_fragments((b"Selected path:", b".docx", b"F5 Compile"), timeout=5.0):
                 raise AssertionError("imported project did not reach the publication file browser")
             os.write(master, b"\x1b[15~")
