@@ -647,18 +647,26 @@ are user-owned changes; do not stage or alter them.
 ## Expanded private regression corpus — 26 November 2026
 
 Commit `3db2360` added the read-only expanded-corpus inventory tooling. Its latest
-local report is `reports/back-catalogue-20261126-release/manifest.json`;
-temporary converted MOBI text is removed after analysis.
-The inventory inspected 26 Scrivener manifests and classified 47 publication
-and resource files. It records Creator/version hints, manifest revisions,
-binder structure counts, candidate language, SHA-256 hashes, publication
-metadata, uncertain project/publication matches and possible related editions.
-All three controlled projects have an exact normalized-text match in this
-back-catalogue; the possible match and revision candidates are not confirmed.
-Project-tree and publication-file hashes remained identical between runs,
-the controlled fixture checksum manifest passed pre/post, no symlinks were
-found, and Git tracks no private files. Five focused inventory tests and all
-14 Python regression harness tests passed.
+The refreshed report `reports/back-catalogue-20261126-expanded-final/manifest.json`
+inspected 26 Scrivener manifests and classified 47 publication/resource files
+(13 EPUB, 16 MOBI, 4 ODT, 4 RTF, 2 DOCX, 2 HTML, 2 TXT, 1 DOC, 1 PDF and 2
+image files). It records Creator/version hints, manifest revisions, binder
+structure counts, candidate language, SHA-256 hashes, publication metadata,
+uncertain project/publication matches and possible related editions. Source
+Creator hints identify 24 `SCRWIN-3.1.5.1` tags, one `SCRWIN-3.1.1.0`, and one
+`SCRWIN-1.0.0`; these are not independently verified compatibility claims.
+The classifier suggests English for 24 projects, one unclassified Latin-script
+project and one uncertain CJK-script project. The corpus has 941 Text, 284
+Folder, 26 DraftFolder, 26 ResearchFolder, 26 TrashFolder, 15 PDF and 4 Image
+binder items; maximum binder depth ranges from 1 to 4. Exact normalized-text
+duplicate groups: 0. The matcher ranks 130 project/publication candidates and
+85 possible related-project pairs; these remain unconfirmed. The controlled
+fixtures have close/exact normalized-content candidates, but lineage is not
+established. The controlled fixture checksum manifest passed before and
+after, no symlinks were found, and Git tracks no private corpus files. The
+tool does not execute corpus files. Focused tooling tests are synthetic; the
+expanded private projects are targeted compatibility data, not accepted
+publication references.
 
 ## RTF punctuation repair — 26 November 2026
 
@@ -930,3 +938,43 @@ change; the preceding real three-book import/compile evidence belongs to the
 prior importer commit and is not claimed as verification of this editor fix.
 The new behavior is implemented and automated verification passed; visual
 human UAT remains outstanding.
+
+## Configurable compile heading presentation — in progress, 26 November 2026
+
+The shared Compile IR and named edition recipes now support generated-output
+rules for showing or hiding section, chapter, generic group, scene and matter
+headings. Edition recipes can replace chapter titles with a sequential
+`{number}` template and insert a configured separator between consecutive
+scenes when scene headings are hidden. These settings only affect generated
+output; canonical titles and prose remain unchanged. This provides a general
+mechanism for internal container headings, numbered chapter placeholders and
+scene-boundary presentation without matching literal binder names.
+
+Focused document and application tests pass, including a saved named
+configuration that suppresses internal section and scene titles, numbers two
+chapters, inserts scene separators, and verifies the stored prose is unchanged.
+The full workspace suite passed (338 terminal unit tests, 3 author-workflow
+tests and 25 Linux PTY tests, plus all other workspace and doc tests). Workspace
+Clippy with warnings denied and formatting passed. A focused re-run against the
+final template-validation code passed. The full run was based on commit
+`968316e` with the compile-presentation changes in a dirty working tree.
+
+Fresh production regressions for all three controlled books are recorded in
+`reports/compile-presentation-20261126/`; generated EPUBs are
+`generated/compile-presentation-20261126/book-01.epub`,
+`generated/compile-presentation-20261126/book-02.epub`, and
+`generated/compile-presentation-20261126/book-03.epub`. Import bodies survived
+save/reopen exactly (39, 36 and 68 manuscript bodies; 6, 6 and 12 research
+bodies); all source fingerprints were unchanged. EPUBCheck 4.2.6 reported zero
+errors and warnings for all three generated EPUBs. The run is provisional: all
+three imports report `incomplete`, and historical publication discrepancies
+remain. The generated EPUBs use default presentation; the new policy itself is
+verified by synthetic output tests, not by Scrivener-specific profile mapping.
+Fixture checksums passed before and after.
+
+Scrivener's source format/layout settings are still inventoried but are not
+translated automatically into these WIDE presentation rules; the user must
+configure a named recipe. Per-Scrivener format profiles, front/back matter
+selection and a guided terminal configuration editor remain outstanding. This
+is partial #7/#53/#68/#73 work, not a claim that Scrivener publication mapping
+is complete. The human publication fidelity gate remains failed/pending review.

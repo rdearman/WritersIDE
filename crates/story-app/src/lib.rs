@@ -2050,25 +2050,25 @@ impl WriterApp {
             cover_image: recipe.cover_image.clone(),
         };
         let design = recipe.design.profile();
-        if let Some(assembly) = recipe.assembly_id.as_deref() {
+        let mut ir = if let Some(assembly) = recipe.assembly_id.as_deref() {
             let assembly =
                 AssemblyId(uuid::Uuid::parse_str(assembly).map_err(|error| {
                     AppError::Domain(format!("invalid assembly UUID: {error}"))
                 })?);
-            self.compile_artifact_for_assembly_with_metadata(
-                assembly,
-                recipe.format,
-                design,
-                &metadata,
-            )
+            self.compile_assembly_ir(assembly)?
         } else {
-            self.compile_artifact_with_profile_and_metadata(
+            story_pipeline::compile_ir(&self.processing_input_mode(recipe.expand_transclusions)?)
+        };
+        ir.presentation = recipe.presentation.clone();
+        story_document::PandocRenderer::default()
+            .render_with_profile_and_metadata(
+                &ir,
                 recipe.format,
-                recipe.expand_transclusions,
-                design,
+                Some(self.store.project_root()),
+                &design,
                 &metadata,
             )
-        }
+            .map_err(AppError::Domain)
     }
 
     /// Publish a one-off Compile result without touching canonical project files.
@@ -2398,6 +2398,7 @@ impl WriterApp {
             dictionary: None,
             spelling_engine: story_document::SpellcheckEngine::default(),
             diagnostics: story_document::DiagnosticPolicy::default(),
+            presentation: story_document::CompilePresentation::default(),
         };
         self.create_compile_configuration(name, &recipe)
     }
@@ -7452,6 +7453,7 @@ unexpected_prose = "must not be silently discarded"
             dictionary: None,
             spelling_engine: story_document::SpellcheckEngine::default(),
             diagnostics: story_document::DiagnosticPolicy::default(),
+            presentation: story_document::CompilePresentation::default(),
         };
         app.create_compile_configuration("plain", &recipe).unwrap();
         assert!(app.create_compile_configuration("plain", &recipe).is_err());
@@ -7532,6 +7534,66 @@ unexpected_prose = "must not be silently discarded"
         let (source, actual_hash) = app.load_scene_text(scene).unwrap();
         assert_eq!(source, "Canonical prose remains here. TODO");
         assert_eq!(actual_hash, expected_hash);
+    }
+
+    #[test]
+    fn compile_configuration_applies_presentation_rules_without_mutating_manuscript() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Novel");
+        let mut app = WriterApp::create_project(&project, "Novel").unwrap();
+        let section = app.create_section("Internal container", 0).unwrap();
+        let first_chapter = app.create_chapter(Some(section), "...", 0).unwrap();
+        let second_chapter = app.create_chapter(Some(section), "...", 1).unwrap();
+        let first_scene = app.create_scene(first_chapter, "Event 1", 0).unwrap();
+        let second_scene = app.create_scene(first_chapter, "Event 2", 1).unwrap();
+        let third_scene = app.create_scene(second_chapter, "Event 3", 0).unwrap();
+        for (scene, text) in [
+            (first_scene, "The first paragraph."),
+            (second_scene, "The second paragraph."),
+            (third_scene, "The final paragraph."),
+        ] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), text).unwrap();
+        }
+        let source_before = app.load_scene_text(first_scene).unwrap();
+        let presentation = story_document::CompilePresentation {
+            include_section_titles: false,
+            include_scene_titles: false,
+            chapter_title_template: Some("Chapter {number}".into()),
+            scene_separator: Some("* * *".into()),
+            ..story_document::CompilePresentation::default()
+        };
+        let recipe = story_document::EditionRecipe {
+            version: 1,
+            name: "Retail E-book".into(),
+            format: story_document::CompileFormat::Markdown,
+            assembly_id: None,
+            output: "exports/compile/retail/manuscript.md".into(),
+            metadata_title: None,
+            metadata_author: None,
+            cover_image: None,
+            design: story_document::BookDesign::Manuscript,
+            expand_transclusions: false,
+            spellcheck: false,
+            language: None,
+            dictionary: None,
+            spelling_engine: story_document::SpellcheckEngine::default(),
+            diagnostics: story_document::DiagnosticPolicy::default(),
+            presentation,
+        };
+        app.create_compile_configuration("retail", &recipe).unwrap();
+        app.compile_configuration("retail", false).unwrap();
+        let output = fs::read_to_string(project.join(&recipe.output)).unwrap();
+        assert!(!output.contains("Internal container"));
+        assert!(!output.contains("Event 1"));
+        assert!(!output.contains("..."));
+        assert!(
+            output
+                .contains("## Chapter 1\n\nThe first paragraph.\n\n* * *\n\nThe second paragraph.")
+        );
+        assert!(output.contains("## Chapter 2\n\nThe final paragraph."));
+        assert!(!output.contains("Chapter 3"));
+        assert_eq!(app.load_scene_text(first_scene).unwrap(), source_before);
     }
 
     #[test]
@@ -7931,6 +7993,7 @@ unexpected_prose = "must not be silently discarded"
             dictionary: None,
             spelling_engine: story_document::SpellcheckEngine::default(),
             diagnostics: story_document::DiagnosticPolicy::default(),
+            presentation: story_document::CompilePresentation::default(),
         };
         assert!(app.create_compile_configuration("unsafe", &recipe).is_err());
 
@@ -9245,6 +9308,7 @@ unexpected_prose = "must not be silently discarded"
             dictionary: None,
             spelling_engine: story_document::SpellcheckEngine::default(),
             diagnostics: story_document::DiagnosticPolicy::default(),
+            presentation: story_document::CompilePresentation::default(),
         };
         app.create_compile_configuration("audio", &recipe).unwrap();
         app.compile_configuration("audio", false).unwrap();

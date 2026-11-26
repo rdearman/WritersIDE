@@ -913,6 +913,10 @@ pub struct CompileIr {
     pub author: Option<String>,
     #[serde(default)]
     pub language_code: Option<String>,
+    /// Presentation choices for structural and scene headings. This affects
+    /// generated Compile output only and never changes canonical documents.
+    #[serde(default)]
+    pub presentation: CompilePresentation,
     pub groups: Vec<CompileGroup>,
     pub units: Vec<CompileUnit>,
 }
@@ -924,6 +928,7 @@ impl CompileIr {
             title: title.into(),
             author: None,
             language_code: None,
+            presentation: CompilePresentation::default(),
             groups: Vec::new(),
             units: Vec::new(),
         }
@@ -939,6 +944,9 @@ impl CompileIr {
 
     pub fn validate(&self) -> bool {
         if self.version != COMPILE_IR_VERSION {
+            return false;
+        }
+        if self.presentation.validate().is_err() {
             return false;
         }
         if self
@@ -1013,6 +1021,9 @@ impl CompileIr {
             .map(|group| (group.id.as_str(), group))
             .collect::<std::collections::BTreeMap<_, _>>();
         let mut active_group_path: Vec<&str> = Vec::new();
+        let mut chapter_numbers = std::collections::BTreeMap::<String, u64>::new();
+        let mut next_chapter_number = 1u64;
+        let mut previous_scene_parent: Option<&str> = None;
         for unit in &self.units {
             let language_wrapper = unit
                 .language_code
@@ -1040,40 +1051,90 @@ impl CompileIr {
                 .count();
             for id in target_group_path.iter().skip(shared) {
                 if let Some(group) = groups.get(id) {
+                    if group.kind == StructuralKind::Chapter {
+                        let number =
+                            *chapter_numbers.entry(group.id.clone()).or_insert_with(|| {
+                                let number = next_chapter_number;
+                                next_chapter_number = next_chapter_number.saturating_add(1);
+                                number
+                            });
+                        if !self.presentation.include_chapter_titles {
+                            continue;
+                        }
+                        let title = self
+                            .presentation
+                            .chapter_title_template
+                            .as_ref()
+                            .map_or_else(
+                                || group.title.clone(),
+                                |template| {
+                                    template
+                                        .replace("{number}", &number.to_string())
+                                        .replace("{title}", &group.title)
+                                },
+                            );
+                        append_compile_heading(
+                            &mut output,
+                            &title,
+                            2,
+                            include_stable_heading_ids,
+                            "group",
+                            &group.id,
+                        );
+                        continue;
+                    }
+                    let include_title = match group.kind {
+                        StructuralKind::Section => self.presentation.include_section_titles,
+                        StructuralKind::Group => self.presentation.include_group_titles,
+                        StructuralKind::Chapter => unreachable!(),
+                    };
+                    if !include_title {
+                        continue;
+                    }
                     let level = match group.kind {
                         StructuralKind::Section => 1,
-                        StructuralKind::Chapter => 2,
+                        StructuralKind::Chapter => unreachable!(),
                         StructuralKind::Group => 3,
                     };
-                    if !output.is_empty() && !output.ends_with("\n\n") {
-                        output.push_str("\n\n");
-                    }
-                    output.push_str(&"#".repeat(level));
-                    output.push(' ');
-                    output.push_str(&group.title);
-                    if include_stable_heading_ids {
-                        output.push_str(" {#");
-                        output.push_str(&compile_heading_id("group", &group.id));
-                        output.push('}');
-                    }
-                    output.push_str("\n\n");
+                    append_compile_heading(
+                        &mut output,
+                        &group.title,
+                        level,
+                        include_stable_heading_ids,
+                        "group",
+                        &group.id,
+                    );
                 }
             }
             active_group_path = target_group_path;
-            if matches!(
-                unit.kind,
-                ContentUnitKind::Scene | ContentUnitKind::FrontMatter | ContentUnitKind::BackMatter
-            ) {
-                let level = if active_group_path.is_empty() { 2 } else { 3 };
-                output.push_str(&"#".repeat(level));
-                output.push(' ');
-                output.push_str(&unit.title);
-                if include_stable_heading_ids {
-                    output.push_str(" {#");
-                    output.push_str(&compile_heading_id("unit", &unit.id));
-                    output.push('}');
+            if unit.kind == ContentUnitKind::Scene
+                && !self.presentation.include_scene_titles
+                && previous_scene_parent == unit.parent_id.as_deref()
+                && let Some(separator) = self.presentation.scene_separator.as_deref()
+            {
+                if !output.is_empty() && !output.ends_with("\n\n") {
+                    output.push_str("\n\n");
                 }
+                output.push_str(separator);
                 output.push_str("\n\n");
+            }
+            let include_unit_title = match unit.kind {
+                ContentUnitKind::Scene => self.presentation.include_scene_titles,
+                ContentUnitKind::FrontMatter | ContentUnitKind::BackMatter => {
+                    self.presentation.include_matter_titles
+                }
+                ContentUnitKind::SectionBody | ContentUnitKind::ChapterBody => false,
+            };
+            if include_unit_title {
+                let level = if active_group_path.is_empty() { 2 } else { 3 };
+                append_compile_heading(
+                    &mut output,
+                    &unit.title,
+                    level,
+                    include_stable_heading_ids,
+                    "unit",
+                    &unit.id,
+                );
             }
             for (index, segment) in unit.segments.iter().enumerate() {
                 if index > 0 {
@@ -1113,9 +1174,111 @@ impl CompileIr {
             if language_wrapper.is_some() {
                 output.push_str(":::\n\n");
             }
+            previous_scene_parent = (unit.kind == ContentUnitKind::Scene)
+                .then_some(unit.parent_id.as_deref())
+                .flatten();
         }
         (output, source_map)
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompilePresentation {
+    pub include_section_titles: bool,
+    pub include_chapter_titles: bool,
+    pub include_group_titles: bool,
+    pub include_scene_titles: bool,
+    pub include_matter_titles: bool,
+    /// Optional replacement chapter heading template using `{number}` and
+    /// `{title}`. For example, `Chapter {number}` replaces binder titles.
+    pub chapter_title_template: Option<String>,
+    /// Optional single-line separator inserted between consecutive scenes
+    /// when their scene titles are suppressed.
+    pub scene_separator: Option<String>,
+}
+
+impl Default for CompilePresentation {
+    fn default() -> Self {
+        Self {
+            include_section_titles: true,
+            include_chapter_titles: true,
+            include_group_titles: true,
+            include_scene_titles: true,
+            include_matter_titles: true,
+            chapter_title_template: None,
+            scene_separator: None,
+        }
+    }
+}
+
+impl CompilePresentation {
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(template) = self.chapter_title_template.as_deref()
+            && (!template.contains("{number}")
+                || !valid_chapter_title_template(template)
+                || template.chars().any(|character| character.is_control()))
+        {
+            return Err(
+                "chapter title template must contain {number}, may use {title}, and cannot contain control characters"
+                    .into(),
+            );
+        }
+        if let Some(separator) = self.scene_separator.as_deref()
+            && (separator.trim().is_empty()
+                || separator.len() > 80
+                || separator.chars().any(char::is_control))
+        {
+            return Err(
+                "scene separator must be a non-empty, single-line value up to 80 bytes".into(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn valid_chapter_title_template(template: &str) -> bool {
+    let mut cursor = 0;
+    while cursor < template.len() {
+        let Some(relative_open) = template[cursor..].find(['{', '}']) else {
+            return true;
+        };
+        let open = cursor + relative_open;
+        if template.as_bytes()[open] == b'}' {
+            return false;
+        }
+        let Some(relative_close) = template[open + 1..].find('}') else {
+            return false;
+        };
+        let close = open + 1 + relative_close;
+        if !matches!(&template[open + 1..close], "number" | "title") {
+            return false;
+        }
+        cursor = close + 1;
+    }
+    true
+}
+
+fn append_compile_heading(
+    output: &mut String,
+    title: &str,
+    level: usize,
+    include_stable_heading_ids: bool,
+    source_kind: &str,
+    source_id: &str,
+) {
+    if !output.is_empty() && !output.ends_with("\n\n") {
+        output.push_str("\n\n");
+    }
+    output.push_str(&"#".repeat(level));
+    output.push(' ');
+    output.push_str(title);
+    if include_stable_heading_ids {
+        output.push_str(" {#");
+        output.push_str(&compile_heading_id(source_kind, source_id));
+        output.push('}');
+    }
+    output.push_str("\n\n");
 }
 
 fn compile_heading_id(kind: &str, source_id: &str) -> String {
@@ -1662,6 +1825,8 @@ pub struct EditionRecipe {
     pub spelling_engine: SpellcheckEngine,
     #[serde(default)]
     pub diagnostics: DiagnosticPolicy,
+    #[serde(default)]
+    pub presentation: CompilePresentation,
 }
 
 /// Optional local command-line spelling backends. Neither engine is required
@@ -1766,6 +1931,7 @@ impl EditionRecipe {
                 );
             }
         }
+        self.presentation.validate()?;
         if self.spellcheck && self.language.as_deref().is_none_or(str::is_empty) {
             return Err("spellcheck editions require a language tag".into());
         }
@@ -2954,6 +3120,7 @@ mod tests {
             dictionary: None,
             spelling_engine: SpellcheckEngine::default(),
             diagnostics: DiagnosticPolicy::default(),
+            presentation: CompilePresentation::default(),
         };
         assert_eq!(
             EditionRecipe::from_toml(&recipe.to_toml().unwrap()).unwrap(),
@@ -3433,6 +3600,74 @@ output = "exports/old.md"
         let json = serde_json::to_vec(&ir).unwrap();
         assert_eq!(serde_json::from_slice::<CompileIr>(&json).unwrap(), ir);
         assert!(ir.validate());
+    }
+
+    #[test]
+    fn compile_presentation_suppresses_container_and_scene_titles_and_numbers_chapters() {
+        let mut ir = CompileIr::new("Novel");
+        ir.push_group(CompileGroup {
+            id: "part".into(),
+            parent_id: None,
+            kind: StructuralKind::Section,
+            title: "Internal Part Container".into(),
+        });
+        for (chapter_id, binder_title, scene_id, scene_title, text) in [
+            ("chapter-a", "...", "scene-a", "Event 1", "Mara entered."),
+            ("chapter-a", "...", "scene-b", "Event 2", "The door closed."),
+            ("chapter-b", "...", "scene-c", "Event 3", "Morning came."),
+        ] {
+            if !ir.groups.iter().any(|group| group.id == chapter_id) {
+                ir.push_group(CompileGroup {
+                    id: chapter_id.into(),
+                    parent_id: Some("part".into()),
+                    kind: StructuralKind::Chapter,
+                    title: binder_title.into(),
+                });
+            }
+            ir.push(CompileUnit {
+                id: scene_id.into(),
+                parent_id: Some(chapter_id.into()),
+                kind: ContentUnitKind::Scene,
+                title: scene_title.into(),
+                language_code: None,
+                segments: vec![CompileSegment::new(scene_id, text)],
+            });
+        }
+        ir.presentation.include_section_titles = false;
+        ir.presentation.include_scene_titles = false;
+        ir.presentation.chapter_title_template = Some("Chapter {number}".into());
+        ir.presentation.scene_separator = Some("* * *".into());
+
+        let (compiled, _) = ir.render_markdown();
+        assert!(ir.validate());
+        assert!(!compiled.contains("Internal Part Container"));
+        assert!(!compiled.contains("..."));
+        assert!(!compiled.contains("Event 1"));
+        assert!(!compiled.contains("Event 2"));
+        assert!(!compiled.contains("Event 3"));
+        assert!(compiled.contains("## Chapter 1\n\nMara entered.\n\n* * *\n\nThe door closed."));
+        assert!(compiled.contains("## Chapter 2\n\nMorning came."));
+        assert!(!compiled.contains("Chapter 3"));
+    }
+
+    #[test]
+    fn compile_presentation_rejects_ambiguous_or_multiline_rules() {
+        let presentation = CompilePresentation {
+            chapter_title_template: Some("Chapter".into()),
+            ..CompilePresentation::default()
+        };
+        assert!(presentation.validate().is_err());
+        let presentation = CompilePresentation {
+            chapter_title_template: Some("Chapter {number}".into()),
+            scene_separator: Some("\n---".into()),
+            ..CompilePresentation::default()
+        };
+        assert!(presentation.validate().is_err());
+        let presentation = CompilePresentation {
+            scene_separator: Some(" * * * ".into()),
+            ..presentation
+        };
+        assert!(presentation.validate().is_ok());
     }
 
     #[test]
