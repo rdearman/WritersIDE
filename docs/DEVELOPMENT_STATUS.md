@@ -1468,3 +1468,15 @@ the 41-entry `SHA256SUMS` manifest verifies, and the acceptance checklist is
 data are isolated within the bundle. Scrivener's per-format presentation and
 inclusion controls remain outstanding and resume as the next publication
 task; author UAT for the lifecycle changes remains open.
+
+Frozen Alpha UAT 34 is available at
+`test-builds/alpha-uat-34-1073cf3/`, built from
+`1073cf34fccab773cf998540cd5b2cd66e40a2e8`. It includes the imported
+Scrivener status-ID resolution change. The offline workspace suite, formatting,
+Clippy, release build, release-fiction PTY workflow and bundle checksum
+verification passed. The complete workspace PTY suite covers both fiction and
+non-fiction lifecycle workflows; a separate release-binary non-fiction run was
+not verified because the creation-only PTY helper assumes an initial empty
+scene view. Checklist: `test-builds/alpha-uat-34-1073cf3/UAT-CHECKLIST.md`.
+Human verification remains pending. Launch with `./run.sh` from the bundle
+directory; preferences and disposable project data are bundle-local.
