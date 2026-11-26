@@ -1379,6 +1379,68 @@ fn empty_chapters_created_from_the_scene_outliner_persist_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn production_menu_authoring_workflow_creates_edits_and_links_manuscript_documents() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Authoring Audit Project");
+    WriterApp::create_project(&project, "Authoring Audit Project").unwrap();
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("authoring-audit")
+        .output()
+        .expect("run the production authoring-audit PTY workflow");
+    assert!(
+        result.status.success(),
+        "production authoring audit failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.get_project().unwrap().book_type,
+        story_core::BookType::Nonfiction
+    );
+    let nodes = reopened.list_structural_nodes().unwrap();
+    let section = nodes.iter().find(|node| node.title == "Part One").unwrap();
+    let chapter = nodes
+        .iter()
+        .find(|node| node.title == "Chapter One")
+        .unwrap();
+    assert_eq!(chapter.parent_id, Some(section.id));
+    let scenes = reopened.list_scenes(false).unwrap();
+    let opening = scenes
+        .iter()
+        .find(|scene| scene.scene.title == "Opening")
+        .unwrap();
+    let discovery = scenes
+        .iter()
+        .find(|scene| scene.scene.title == "Discovery")
+        .unwrap();
+    assert!(reopened.scene_is_included(opening.scene.id).unwrap());
+    assert_eq!(opening.chapter_id, Some(chapter.id));
+    assert_eq!(
+        reopened.load_scene_text(opening.scene.id).unwrap().0,
+        "The map revealed a hidden pass."
+    );
+    assert_eq!(
+        reopened
+            .outgoing_links(story_core::EntityRef::Scene(opening.scene.id))
+            .unwrap()[0]
+            .target,
+        story_core::EntityRef::Scene(discovery.scene.id)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn structural_undo_and_redo_work_from_outline_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

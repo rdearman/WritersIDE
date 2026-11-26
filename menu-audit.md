@@ -46,6 +46,7 @@ Current location records the pre-change menu from the previous inventory. Propos
 | `command.palette-open` | Command Palette | Tools > Direct actions | Tools > Search All Commands…; also listed in other menus as a universal action | Frequent | Retain as direct action; user-facing label is Search All Commands… |
 | `file.new-project` | New Project | File > Direct actions | File > direct action | Frequent | Retain as direct action |
 | `file.open-project` | Open Project | File > Direct actions | File > direct action | Frequent | Retain as direct action |
+| `file.book-type` | Book Type… | File > Direct actions | File > direct action | Occasional | Retain as a direct project setting; show current type on Dashboard |
 | `file.import-scrivener` | Import Scrivener as New Project… | File > Direct actions | File > direct action | Frequent | Retain as direct action |
 | `file.import-scrivener-current` | Import Scrivener into Current Project… | File > Projects & Files | Search All Commands (flat command palette) | Occasional | Keep capability; remove from primary menu and expose through command search |
 | `file.recent-projects` | Recent Projects | File > Direct actions | File > direct action | Frequent | Retain as direct action |

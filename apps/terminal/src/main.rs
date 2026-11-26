@@ -364,6 +364,7 @@ struct AppState {
     series_references: Vec<SeriesReferenceRow>,
     scrivener_import: Option<ScrivenerImportWizard>,
     series_form: Option<SeriesActionForm>,
+    book_type_dialog: Option<story_core::BookType>,
     recent_project_picker: Option<RecentProjectPicker>,
     recent_projects_path: Option<PathBuf>,
     file_browser: Option<FileBrowserState>,
@@ -657,6 +658,9 @@ struct SeriesActionForm {
     kind: SeriesFormKind,
     values: Vec<String>,
     input: String,
+    entity_choices: Vec<(String, story_core::EntityRef)>,
+    selected_entities: Vec<story_core::EntityRef>,
+    selected_choice: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -976,6 +980,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
     &[
         "file.new-project",
         "file.open-project",
+        "file.book-type",
         "file.recent-projects",
         "file.close-project",
         "file.import-scrivener",
@@ -1660,6 +1665,7 @@ enum CommandAction {
     OpenRecentProjects,
     NewProject,
     OpenProject,
+    ChangeProjectType,
     CloseProject,
     OpenTextFile,
     ImportDocument,
@@ -1718,6 +1724,8 @@ enum CommandAction {
     WindowClose,
     WindowOnly,
     WriteSelectedChapter,
+    CreateSection,
+    CreateChapter,
     RenameSelectedStructuralNode,
     MoveOutlineUp,
     MoveOutlineDown,
@@ -1892,6 +1900,21 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 2,
             advanced: false,
             action: CommandAction::OpenProject,
+        },
+        CommandSpec {
+            id: "file.book-type",
+            label: "Book Type…",
+            description: "View or change whether this project is Fiction, Non-fiction, or Custom",
+            category: "File",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["book type", "fiction or non-fiction"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Projects & Books",
+            menu_priority: 3,
+            advanced: false,
+            action: CommandAction::ChangeProjectType,
         },
         CommandSpec {
             id: "file.close-project",
@@ -3018,22 +3041,36 @@ fn command_registry() -> Vec<CommandSpec> {
             advanced: false,
             action: CommandAction::InsertFile,
         },
-        legacy_command(
-            "structure.section",
-            "New Section",
-            "Create a top-level section",
-            "Insert",
-            "section",
-            true,
-        ),
-        legacy_command(
-            "structure.chapter",
-            "New Chapter",
-            "Create a top-level chapter",
-            "Insert",
-            "chapter",
-            true,
-        ),
+        CommandSpec {
+            id: "structure.section",
+            label: "New Section",
+            description: "Create a section in the manuscript outline",
+            category: "Insert",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["new section"],
+            palette_prefix: Some("section"),
+            takes_arguments: true,
+            action: CommandAction::CreateSection,
+            task_group: "Manuscript Structure",
+            menu_priority: 1,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "structure.chapter",
+            label: "New Chapter",
+            description: "Create a chapter at the selected outline location",
+            category: "Insert",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["new chapter"],
+            palette_prefix: Some("chapter"),
+            takes_arguments: true,
+            action: CommandAction::CreateChapter,
+            task_group: "Manuscript Structure",
+            menu_priority: 2,
+            advanced: false,
+        },
         CommandSpec {
             id: "document.write-selected-chapter",
             label: "Write Selected Chapter",
@@ -7869,6 +7906,7 @@ impl AppState {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -10990,6 +11028,9 @@ impl AppState {
                     kind: SeriesFormKind::CreateSeriesThenImport,
                     values: Vec::new(),
                     input: String::new(),
+                    entity_choices: Vec::new(),
+                    selected_entities: Vec::new(),
+                    selected_choice: 0,
                 });
                 self.menu = None;
                 self.message = "Create a series, then choose the Scrivener source · Enter continues · Esc cancels".into();
@@ -11019,22 +11060,64 @@ impl AppState {
             kind,
             values: Vec::new(),
             input: String::new(),
+            entity_choices: if matches!(
+                kind,
+                SeriesFormKind::CreateStoryLink | SeriesFormKind::DeleteStoryLink
+            ) {
+                story_link_entity_choices(&self.app)?
+            } else {
+                Vec::new()
+            },
+            selected_entities: Vec::new(),
+            selected_choice: 0,
         });
         self.menu = None;
-        self.message = "Enter a value · Enter continues · Esc cancels".into();
+        self.message = if matches!(
+            kind,
+            SeriesFormKind::CreateStoryLink | SeriesFormKind::DeleteStoryLink
+        ) {
+            "Filter existing entities by typing · ↑/↓ choose · Enter selects · Esc cancels".into()
+        } else {
+            "Enter a value · Enter continues · Esc cancels".into()
+        };
         Ok(())
     }
     fn handle_series_form_key(&mut self, key: KeyEvent) -> Result<(), Box<dyn std::error::Error>> {
         let Some(mut form) = self.series_form.take() else {
             return Ok(());
         };
+        let entity_picker = matches!(
+            form.kind,
+            SeriesFormKind::CreateStoryLink | SeriesFormKind::DeleteStoryLink
+        ) && form.selected_entities.len() < 2;
         match key.code {
             KeyCode::Esc => {
                 self.message = "Action cancelled; no project or source was changed".into();
             }
             KeyCode::Enter => {
+                if entity_picker {
+                    let options = filtered_story_link_choices(&form);
+                    if options.is_empty() {
+                        self.message = "No matching existing story entities · change the filter or Esc cancels".into();
+                        self.series_form = Some(form);
+                        return Ok(());
+                    }
+                    let selected = form.selected_choice.min(options.len() - 1);
+                    form.selected_entities.push(options[selected].1);
+                    form.selected_choice = 0;
+                    form.input.clear();
+                    self.message = if form.selected_entities.len() < 2 {
+                        "Choose the target entity · type to filter · ↑/↓ choose · Enter selects"
+                            .into()
+                    } else {
+                        "Choose a relationship type · Enter continues · Esc cancels".into()
+                    };
+                    self.series_form = Some(form);
+                    return Ok(());
+                }
                 let optional_label = form.kind == SeriesFormKind::CreateStoryLink
-                    && form.values.len() + 1 == form.kind.fields().len();
+                    && form.selected_entities.len() + form.values.len() + 1
+                        == form.kind.fields().len();
                 if form.input.trim().is_empty() && !optional_label {
                     self.message = "This field is required".into();
                     self.series_form = Some(form);
@@ -11042,8 +11125,13 @@ impl AppState {
                 }
                 form.values.push(form.input.trim().to_owned());
                 form.input.clear();
-                if form.values.len() == form.kind.fields().len() {
-                    if let Err(error) = self.complete_series_form(form.kind, &form.values) {
+                if form.selected_entities.len() + form.values.len() == form.kind.fields().len() {
+                    if let Err(error) = self.complete_series_form(
+                        form.kind,
+                        &form.values,
+                        &form.selected_entities,
+                        &form.entity_choices,
+                    ) {
                         self.message = format!("Action failed: {error}");
                     }
                 } else {
@@ -11052,12 +11140,28 @@ impl AppState {
             }
             KeyCode::Backspace => {
                 form.input.pop();
+                form.selected_choice = 0;
+                self.series_form = Some(form);
+            }
+            KeyCode::Up if entity_picker => {
+                let count = filtered_story_link_choices(&form).len();
+                if count > 0 {
+                    form.selected_choice = form.selected_choice.saturating_sub(1);
+                }
+                self.series_form = Some(form);
+            }
+            KeyCode::Down if entity_picker => {
+                let count = filtered_story_link_choices(&form).len();
+                if count > 0 {
+                    form.selected_choice = (form.selected_choice + 1).min(count - 1);
+                }
                 self.series_form = Some(form);
             }
             KeyCode::Char(character)
                 if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
             {
                 form.input.push(character);
+                form.selected_choice = 0;
                 self.series_form = Some(form);
             }
             _ => self.series_form = Some(form),
@@ -11068,6 +11172,8 @@ impl AppState {
         &mut self,
         kind: SeriesFormKind,
         values: &[String],
+        entities: &[story_core::EntityRef],
+        entity_choices: &[(String, story_core::EntityRef)],
     ) -> Result<(), Box<dyn std::error::Error>> {
         match kind {
             SeriesFormKind::CreateSeries => {
@@ -11108,9 +11214,9 @@ impl AppState {
             }
             SeriesFormKind::NewBook => self.create_series_book(&values[0], &values[1])?,
             SeriesFormKind::CreateStoryLink => {
-                let source = resolve_named_link_entity(&self.app, &values[0])?;
-                let target = resolve_named_link_entity(&self.app, &values[1])?;
-                let kind = parse_terminal_link_kind(&values[2])?;
+                let source = *entities.first().ok_or("choose a source entity")?;
+                let target = *entities.get(1).ok_or("choose a target entity")?;
+                let kind = parse_terminal_link_kind(&values[0])?;
                 self.app.create_story_link(&story_core::StoryLink {
                     id: story_core::LinkId::new(),
                     source,
@@ -11118,19 +11224,29 @@ impl AppState {
                     target,
                     target_anchor: None,
                     kind,
-                    label: values[3].clone(),
+                    label: values.get(1).cloned().unwrap_or_default(),
                 })?;
+                let source_name = entity_choices
+                    .iter()
+                    .find(|(_, candidate)| *candidate == source)
+                    .map(|(name, _)| name.as_str())
+                    .unwrap_or("selected source");
+                let target_name = entity_choices
+                    .iter()
+                    .find(|(_, candidate)| *candidate == target)
+                    .map(|(name, _)| name.as_str())
+                    .unwrap_or("selected target");
                 self.message = format!(
                     "Created {} relationship: {} → {}",
                     kind.as_str(),
-                    source.id(),
-                    target.id()
+                    source_name,
+                    target_name
                 );
             }
             SeriesFormKind::DeleteStoryLink => {
-                let source = resolve_named_link_entity(&self.app, &values[0])?;
-                let target = resolve_named_link_entity(&self.app, &values[1])?;
-                let kind = parse_terminal_link_kind(&values[2])?;
+                let source = *entities.first().ok_or("choose a source entity")?;
+                let target = *entities.get(1).ok_or("choose a target entity")?;
+                let kind = parse_terminal_link_kind(&values[0])?;
                 let matching = self
                     .app
                     .outgoing_links(source)?
@@ -14741,6 +14857,28 @@ impl AppState {
         }
     }
     fn selected_scene(&self) -> String {
+        if let Some(id) = self.editing_content_unit {
+            let Ok(unit) = self.app.get_content_unit(id) else {
+                return "Manuscript document unavailable".into();
+            };
+            let book = self
+                .app
+                .get_project()
+                .map(|project| project.title)
+                .unwrap_or_else(|_| "Manuscript".into());
+            let parent = unit.parent_id.and_then(|id| {
+                self.app
+                    .list_structural_nodes()
+                    .ok()?
+                    .into_iter()
+                    .find(|node| node.id == id)
+                    .map(|node| node.title)
+            });
+            return parent.map_or_else(
+                || format!("{book} > {}", unit.title),
+                |parent| format!("{book} > {parent} > {}", unit.title),
+            );
+        }
         let Some(id) = self.editing_scene.or_else(|| self.active_scene()) else {
             return "No manuscript open".into();
         };
@@ -15482,6 +15620,8 @@ impl AppState {
                 | "edit.select-word"
                 | "edit.select-sentence"
                 | "edit.select-paragraph"
+                | "edit.insert-date"
+                | "edit.insert-time"
                 | "edit.insert-date-time"
                 | "edit.insert-file"
                 | "edit.insert-special-character"
@@ -15511,6 +15651,8 @@ impl AppState {
                 | "edit.select-word"
                 | "edit.select-sentence"
                 | "edit.select-paragraph"
+                | "edit.insert-date"
+                | "edit.insert-time"
                 | "edit.insert-date-time"
                 | "edit.insert-file"
                 | "edit.insert-special-character"
@@ -15523,6 +15665,15 @@ impl AppState {
         ) && self.reference_focused
         {
             return Some("Focus the manuscript pane first");
+        }
+        if matches!(
+            spec.id,
+            "edit.insert-date" | "edit.insert-time" | "edit.insert-date-time"
+        ) && self.workspace == Workspace::Editor
+            && self.editing_scene.is_none()
+            && self.editing_content_unit.is_none()
+        {
+            return Some("Open a chapter, section, or scene document first");
         }
         match spec.id {
             "edit.undo"
@@ -16215,6 +16366,14 @@ impl AppState {
                             self.start_series_form(spec.id)?;
                             return Ok(());
                         }
+                        if matches!(
+                            spec.action,
+                            CommandAction::CreateSection | CommandAction::CreateChapter
+                        ) {
+                            self.menu = None;
+                            self.prompt_for_registered_command(spec)?;
+                            return Ok(());
+                        }
                         let prefix = spec
                             .palette_prefix
                             .ok_or("menu command has no command-palette route")?;
@@ -16273,6 +16432,14 @@ impl AppState {
                             || matches!(spec.id, "link.create" | "link.delete")
                         {
                             self.start_series_form(spec.id)?;
+                            return Ok(());
+                        }
+                        if matches!(
+                            spec.action,
+                            CommandAction::CreateSection | CommandAction::CreateChapter
+                        ) {
+                            self.menu = None;
+                            self.prompt_for_registered_command(spec)?;
                             return Ok(());
                         }
                         let prefix = spec
@@ -16665,6 +16832,15 @@ impl AppState {
                     self.message = format!("Could not open the project browser: {error}");
                 }
             }
+            CommandAction::ChangeProjectType => match self.app.get_project() {
+                Ok(project) => {
+                    self.book_type_dialog = Some(project.book_type);
+                    self.menu = None;
+                    self.command_palette = None;
+                    self.message = "Book Type · ↑/↓ choose · Enter applies · Esc cancels".into();
+                }
+                Err(error) => self.message = format!("Could not read book type: {error}"),
+            },
             CommandAction::CloseProject => self.request_close_project()?,
             CommandAction::OpenTextFile => {
                 if let Err(error) = self.start_file_browser(FileBrowserPurpose::OpenTextFile) {
@@ -16790,6 +16966,32 @@ impl AppState {
             CommandAction::WindowClose => self.close_focused_window()?,
             CommandAction::WindowOnly => self.keep_only_focused_window()?,
             CommandAction::WriteSelectedChapter => self.write_selected_chapter()?,
+            CommandAction::CreateSection => {
+                let Some(title) = arguments.map(str::trim).filter(|title| !title.is_empty()) else {
+                    self.prompt_for_registered_command(
+                        command_by_id("structure.section").unwrap(),
+                    )?;
+                    return Ok(());
+                };
+                let position = self.app.next_structural_node_position(None)?;
+                let id = self.app.create_section(title, position)?;
+                self.refresh()?;
+                self.workspace = Workspace::Outline;
+                self.selected = outline_rows(self)
+                    .iter()
+                    .position(|row| matches!(row, OutlineRow::Section { id: row_id, .. } if *row_id == id))
+                    .unwrap_or(0);
+                self.message = format!("Created section ‘{title}’");
+            }
+            CommandAction::CreateChapter => {
+                let Some(title) = arguments.map(str::trim).filter(|title| !title.is_empty()) else {
+                    self.prompt_for_registered_command(
+                        command_by_id("structure.chapter").unwrap(),
+                    )?;
+                    return Ok(());
+                };
+                self.create_empty_chapter_at_selection(title)?;
+            }
             CommandAction::RenameSelectedStructuralNode => self.start_structural_node_rename()?,
             CommandAction::MoveOutlineUp => self.move_selected_outline_item(false)?,
             CommandAction::MoveOutlineDown => self.move_selected_outline_item(true)?,
@@ -17002,6 +17204,22 @@ impl AppState {
         &mut self,
         command: CommandSpec,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        match command.action {
+            CommandAction::CreateSection => {
+                self.mode = Some('P');
+                self.prompt.clear();
+                self.message =
+                    "New section · enter a title · Enter creates it · Esc cancels".into();
+                return Ok(());
+            }
+            CommandAction::CreateChapter => {
+                self.mode = Some('H');
+                self.prompt.clear();
+                self.message = "New chapter · enter a title · Enter creates it at the selected outline location · Esc cancels".into();
+                return Ok(());
+            }
+            _ => {}
+        }
         if command.id == "scene.subchapter" {
             self.execute_legacy_palette_command("subchapter")?;
             return Ok(());
@@ -17041,6 +17259,25 @@ impl AppState {
                 return Ok(());
             }
             self.create_empty_chapter_at_selection(&cmd)?;
+            return Ok(());
+        }
+        if mode == Some('P') {
+            let title = cmd.trim();
+            if title.is_empty() {
+                self.message = "Section not created · enter a title or press Esc to cancel".into();
+                return Ok(());
+            }
+            let position = self.app.next_structural_node_position(None)?;
+            let id = self.app.create_section(title, position)?;
+            self.refresh()?;
+            self.workspace = Workspace::Outline;
+            self.selected = outline_rows(self)
+                .iter()
+                .position(
+                    |row| matches!(row, OutlineRow::Section { id: row_id, .. } if *row_id == id),
+                )
+                .unwrap_or(0);
+            self.message = format!("Created section ‘{title}’");
             return Ok(());
         }
         if mode == Some('h') {
@@ -24191,6 +24428,11 @@ impl AppState {
     }
 
     fn insert_formatted_date_time(&mut self, kind: DateTimeInsertion) {
+        if self.editing_scene.is_none() && self.editing_content_unit.is_none() {
+            self.message =
+                "Date and time can only be inserted into an open manuscript document".into();
+            return;
+        }
         let now = time::OffsetDateTime::now_utc();
         let local_offset = time::UtcOffset::current_local_offset().ok();
         let locale = system_date_locale();
@@ -27664,6 +27906,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.series_form.is_some() {
         draw_series_form_overlay(f, s);
     }
+    if let Some(book_type) = s.book_type_dialog {
+        draw_book_type_dialog(f, book_type);
+    }
     if s.keybinding_manager.is_some() {
         draw_keybinding_manager_overlay(f, s);
     }
@@ -29973,6 +30218,56 @@ fn draw_structural_node_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState
     );
 }
 
+fn book_type_label(book_type: story_core::BookType) -> &'static str {
+    match book_type {
+        story_core::BookType::Fiction => "Fiction",
+        story_core::BookType::Nonfiction => "Non-fiction",
+        story_core::BookType::Custom => "Custom",
+    }
+}
+
+fn draw_book_type_dialog(f: &mut ratatui::Frame<'_>, book_type: story_core::BookType) {
+    let outer = f.area();
+    let width = 44.min(outer.width.saturating_sub(2));
+    let height = 9.min(outer.height.saturating_sub(2));
+    let area = Rect {
+        x: outer.x + outer.width.saturating_sub(width) / 2,
+        y: outer.y + outer.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, area);
+    let choices = [
+        story_core::BookType::Fiction,
+        story_core::BookType::Nonfiction,
+        story_core::BookType::Custom,
+    ];
+    let lines = choices
+        .iter()
+        .map(|choice| {
+            format!(
+                "{} {}",
+                if *choice == book_type { "›" } else { " " },
+                book_type_label(*choice)
+            )
+        })
+        .collect::<Vec<_>>();
+    let content = std::iter::once("Choose the kind of book this project contains".to_owned())
+        .chain(std::iter::once(String::new()))
+        .chain(lines)
+        .chain(std::iter::once(String::new()))
+        .chain(std::iter::once(
+            "↑/↓ Choose · Enter Apply · Esc Cancel".to_owned(),
+        ))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let block = Block::default()
+        .title(" Book Type ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    f.render_widget(Paragraph::new(content).block(block), area);
+}
+
 fn draw_series_book_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let Some(book) = &s.pending_series_book_removal else {
         return;
@@ -30010,7 +30305,11 @@ fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     };
     let area = f.area();
     let width = area.width.min(76);
-    let height = 8.min(area.height);
+    let link_picker = matches!(
+        form.kind,
+        SeriesFormKind::CreateStoryLink | SeriesFormKind::DeleteStoryLink
+    ) && form.selected_entities.len() < 2;
+    let height = if link_picker { 13 } else { 8 }.min(area.height);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -30018,35 +30317,51 @@ fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         height,
     };
     let fields = form.kind.fields();
-    let field = fields.get(form.values.len()).copied().unwrap_or("Value");
+    let step = form.selected_entities.len() + form.values.len();
+    let field = fields.get(step).copied().unwrap_or("Value");
     let title = match form.kind {
         SeriesFormKind::CreateStoryLink => " Create Story Relationship ",
         SeriesFormKind::DeleteStoryLink => " Remove Story Relationship ",
         _ => " Series setup ",
     };
     f.render_widget(Clear, popup);
+    let mut lines = vec![
+        Line::from(format!("Step {} of {} · {}", step + 1, fields.len(), field)),
+        Line::from(vec![
+            Span::raw("Filter / value: "),
+            Span::styled(
+                format!("{}▏", form.input),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+    if link_picker {
+        lines.push(Line::from("Existing story entities:"));
+        let choices = filtered_story_link_choices(form);
+        if choices.is_empty() {
+            lines.push(Line::from("  No matching entities"));
+        } else {
+            let start = form.selected_choice.saturating_sub(2);
+            for (index, (label, _)) in choices.iter().enumerate().skip(start).take(5) {
+                lines.push(Line::from(format!(
+                    "{} {}",
+                    if index == form.selected_choice {
+                        "▸"
+                    } else {
+                        " "
+                    },
+                    label
+                )));
+            }
+        }
+        lines.push(Line::from("↑/↓ choose · Enter selects · Esc cancels"));
+    } else {
+        lines.push(Line::from("Enter continues · Esc cancels"));
+    }
     f.render_widget(
-        Paragraph::new(vec![
-            Line::from(format!(
-                "Step {} of {} · {}",
-                form.values.len() + 1,
-                fields.len(),
-                field
-            )),
-            Line::from(""),
-            Line::from(vec![
-                Span::raw("> "),
-                Span::styled(
-                    format!("{}▏", form.input),
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(""),
-            Line::from("Enter continues · Esc cancels"),
-        ])
-        .block(
+        Paragraph::new(lines).block(
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
@@ -31758,6 +32073,14 @@ fn workspace_items(s: &AppState) -> Vec<String> {
     }
     match s.workspace {
         Workspace::Dashboard if s.scenes.is_empty() => vec![
+            format!(
+                "{} book · project type can be changed from File → Book Type…",
+                book_type_label(
+                    s.app
+                        .get_project()
+                        .map_or(story_core::BookType::Fiction, |project| project.book_type)
+                )
+            ),
             "Start Writing · create a chapter and first scene".into(),
             "Open or Import · bring in an existing manuscript".into(),
             "Guided Tutorial · start or resume in a disposable sample project".into(),
@@ -31765,6 +32088,14 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             "Offline Help · workflows and shortcuts".into(),
         ],
         Workspace::Dashboard => vec![
+            format!(
+                "{} book · project type can be changed from File → Book Type…",
+                book_type_label(
+                    s.app
+                        .get_project()
+                        .map_or(story_core::BookType::Fiction, |project| project.book_type)
+                )
+            ),
             format!("{} scenes", s.scenes.len()),
             format!(
                 "{} drafted",
@@ -31796,8 +32127,20 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 OutlineRow::Scene(id) => s.scenes.iter().find(|scene| scene.0 == id).map_or_else(
                     || format!("  <missing scene {id}>"),
                     |scene| {
+                        let inclusion = if s.app.scene_is_included(id).unwrap_or(true) {
+                            "Included"
+                        } else {
+                            "Excluded"
+                        };
+                        let placement = s
+                            .app
+                            .get_scene(id)
+                            .ok()
+                            .filter(|record| record.chapter_id.is_none())
+                            .map(|_| " · Unplaced")
+                            .unwrap_or_default();
                         format!(
-                            "  {}{}   {}   {} words",
+                            "  [{inclusion}] {}{}   {}   {} words{placement}",
                             if s.selected_scenes.contains(&id) {
                                 "[x] "
                             } else {
@@ -33097,61 +33440,52 @@ fn parse_entity(kind: &str, id: &str) -> Result<story_core::EntityRef, Box<dyn s
     })
 }
 
-fn resolve_named_link_entity(
+fn story_link_entity_choices(
     app: &WriterApp,
-    input: &str,
-) -> Result<story_core::EntityRef, Box<dyn std::error::Error>> {
-    let (kind_filter, name) = input
-        .split_once(':')
-        .map(|(kind, name)| (Some(kind.trim()), name.trim()))
-        .unwrap_or((None, input.trim()));
-    let mut candidates = Vec::new();
-    if kind_filter.is_none() || kind_filter == Some("scene") {
-        candidates.extend(
-            app.list_scenes(false)?
-                .into_iter()
-                .filter(|item| item.scene.title.eq_ignore_ascii_case(name))
-                .map(|item| ("scene", story_core::EntityRef::Scene(item.scene.id))),
-        );
-    }
-    if kind_filter.is_none() || kind_filter == Some("character") {
-        candidates.extend(
-            app.list_characters()?
-                .into_iter()
-                .filter(|item| item.name.eq_ignore_ascii_case(name))
-                .map(|item| ("character", story_core::EntityRef::Character(item.id))),
-        );
-    }
-    if kind_filter.is_none() || kind_filter == Some("plotline") {
-        candidates.extend(
-            app.list_plotlines()?
-                .into_iter()
-                .filter(|item| item.name.eq_ignore_ascii_case(name))
-                .map(|item| ("plotline", story_core::EntityRef::Plotline(item.id))),
-        );
-    }
-    if kind_filter.is_none() || kind_filter == Some("research") {
-        candidates.extend(
-            app.list_research_items()?
-                .into_iter()
-                .filter(|item| item.title.eq_ignore_ascii_case(name))
-                .map(|item| ("research", story_core::EntityRef::Research(item.id))),
-        );
-    }
-    if kind_filter.is_none() || kind_filter == Some("reading") {
-        candidates.extend(
-            app.list_reading_documents()?
-                .into_iter()
-                .filter(|item| item.title.eq_ignore_ascii_case(name))
-                .map(|item| ("reading", story_core::EntityRef::Reading(item.id))),
-        );
-    }
-    match candidates.as_slice() {
-        [(_, entity)] => Ok(*entity),
-        [] => Err(format!("no story entity matches '{input}'").into()),
-        _ => Err(format!("'{name}' is ambiguous; prefix it with scene:, character:, plotline:, research:, or reading:").into()),
-    }
+) -> Result<Vec<(String, story_core::EntityRef)>, Box<dyn std::error::Error>> {
+    let mut choices = Vec::new();
+    choices.extend(app.list_scenes(false)?.into_iter().map(|item| {
+        (
+            format!("Scene · {}", item.scene.title),
+            story_core::EntityRef::Scene(item.scene.id),
+        )
+    }));
+    choices.extend(app.list_characters()?.into_iter().map(|item| {
+        (
+            format!("Character · {}", item.name),
+            story_core::EntityRef::Character(item.id),
+        )
+    }));
+    choices.extend(app.list_plotlines()?.into_iter().map(|item| {
+        (
+            format!("Plotline · {}", item.name),
+            story_core::EntityRef::Plotline(item.id),
+        )
+    }));
+    choices.extend(app.list_research_items()?.into_iter().map(|item| {
+        (
+            format!("Research · {}", item.title),
+            story_core::EntityRef::Research(item.id),
+        )
+    }));
+    choices.extend(app.list_reading_documents()?.into_iter().map(|item| {
+        (
+            format!("Reference · {}", item.title),
+            story_core::EntityRef::Reading(item.id),
+        )
+    }));
+    choices.sort_by_key(|(label, _)| label.to_lowercase());
+    Ok(choices)
 }
+
+fn filtered_story_link_choices(form: &SeriesActionForm) -> Vec<&(String, story_core::EntityRef)> {
+    let filter = form.input.trim().to_lowercase();
+    form.entity_choices
+        .iter()
+        .filter(|(label, _)| filter.is_empty() || label.to_lowercase().contains(&filter))
+        .collect()
+}
+
 fn parse_terminal_status(value: &str) -> Result<SceneStatus, Box<dyn std::error::Error>> {
     Ok(match value {
         "idea" => SceneStatus::Idea,
@@ -33537,6 +33871,13 @@ fn begin_command_arguments(
         s.command_palette = None;
         s.message = format!("{} unavailable: {reason}", command.label);
         return Ok(());
+    }
+    if matches!(
+        command.action,
+        CommandAction::CreateSection | CommandAction::CreateChapter
+    ) {
+        s.command_palette = None;
+        return s.prompt_for_registered_command(command);
     }
     let prefix = command_palette_alias(&command);
     s.command_palette = None;
@@ -34257,6 +34598,47 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             KeyCode::Esc => {
                 s.macro_preview = None;
                 s.message = format!("Cancelled preview for macro {}", preview.name);
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if s.book_type_dialog.is_some() {
+        match k.code {
+            KeyCode::Esc => {
+                s.book_type_dialog = None;
+                s.message = "Book type unchanged".into();
+            }
+            KeyCode::Up | KeyCode::Down => {
+                let types = [
+                    story_core::BookType::Fiction,
+                    story_core::BookType::Nonfiction,
+                    story_core::BookType::Custom,
+                ];
+                let current = s.book_type_dialog.unwrap_or(story_core::BookType::Fiction);
+                let index = types.iter().position(|kind| *kind == current).unwrap_or(0);
+                let next = if k.code == KeyCode::Up {
+                    (index + types.len() - 1) % types.len()
+                } else {
+                    (index + 1) % types.len()
+                };
+                s.book_type_dialog = Some(types[next]);
+            }
+            KeyCode::Enter => {
+                if let Some(book_type) = s.book_type_dialog.take() {
+                    match s.app.set_project_book_type(book_type) {
+                        Ok(()) => {
+                            s.message = format!(
+                                "Book type set to {} · manuscript structure and content were preserved",
+                                book_type_label(book_type)
+                            );
+                        }
+                        Err(error) => {
+                            s.book_type_dialog = Some(book_type);
+                            s.message = format!("Book type was not changed: {error}");
+                        }
+                    }
+                }
             }
             _ => {}
         }
@@ -35383,6 +35765,8 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.insert(c)
             }
             KeyCode::Esc => {
+                let scene = s.editing_scene;
+                let content_unit = s.editing_content_unit;
                 let previous = s
                     .history
                     .get(s.history_index)
@@ -35391,6 +35775,28 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     .filter(|workspace| *workspace != Workspace::Dashboard)
                     .unwrap_or(Workspace::Outline);
                 s.switch(previous);
+                if previous == Workspace::Outline
+                    && let Some(scene) = scene
+                {
+                    if let Some(index) = outline_rows(s)
+                        .iter()
+                        .position(|row| *row == OutlineRow::Scene(scene))
+                    {
+                        s.selected = index;
+                    }
+                } else if previous == Workspace::Outline
+                    && let Some(content_unit) = content_unit
+                    && let Some(index) = outline_rows(s)
+                        .iter()
+                        .position(|row| *row == OutlineRow::ContentUnit(content_unit))
+                {
+                    s.selected = index;
+                } else if previous == Workspace::Cards
+                    && let Some(scene) = scene
+                    && let Some(index) = scene_card_ids(s).iter().position(|id| *id == scene)
+                {
+                    s.selected = index;
+                }
                 s.record_tutorial_action("return");
             }
             _ => {}
@@ -41993,6 +42399,7 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -45878,6 +46285,7 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -46043,6 +46451,7 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -46316,6 +46725,7 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -46485,6 +46895,7 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -46804,6 +47215,7 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -46973,6 +47385,7 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -47650,6 +48063,7 @@ mod tests {
             [
                 "file.new-project",
                 "file.open-project",
+                "file.book-type",
                 "file.recent-projects",
                 "file.close-project",
                 "file.import-scrivener",
@@ -48810,6 +49224,7 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -49114,6 +49529,7 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -50747,6 +51163,7 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -50927,6 +51344,7 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -51159,6 +51577,7 @@ mod tests {
             series_references: Vec::new(),
             scrivener_import: None,
             series_form: None,
+            book_type_dialog: None,
             recent_project_picker: None,
             recent_projects_path: None,
             file_browser: None,
@@ -54504,6 +54923,154 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.editor.join("\n"), "Opening");
+    }
+
+    #[test]
+    fn insertion_actions_are_unavailable_without_a_manuscript_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Editor;
+        state.editor = vec!["Temporary container text".into()];
+        for id in [
+            "edit.insert-date",
+            "edit.insert-time",
+            "edit.insert-date-time",
+        ] {
+            let command = command_by_id(id).unwrap();
+            assert!(state.command_disabled_reason(command).is_some(), "{id}");
+            state.dispatch_registered_command_id(id).unwrap();
+            assert!(!state.dirty, "{id} must not dirty an unattached buffer");
+            assert_eq!(state.editor, ["Temporary container text"]);
+            assert!(state.message.contains("document first"));
+        }
+    }
+
+    #[test]
+    fn unified_outline_states_inclusion_and_unplaced_position_separately_from_selection() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let included = app.create_scene(chapter, "Included Scene", 0).unwrap();
+        let excluded = app.create_scene(chapter, "Excluded Scene", 1).unwrap();
+        let unplaced = app.create_unplaced_scene("Unplaced Scene").unwrap();
+        app.set_scene_included(excluded, false).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        let rows = workspace_items(&state);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("[Included]") && row.contains("Included Scene"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("[Excluded]") && row.contains("Excluded Scene"))
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Unplaced Scene") && row.contains("Unplaced"))
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains(&included.to_string())
+                    || row.contains(&unplaced.to_string()))
+        );
+    }
+
+    #[test]
+    fn direct_prose_breadcrumb_and_escape_return_use_the_active_document_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter Four", 0).unwrap();
+        let first = app.create_scene(chapter, "First Scene", 0).unwrap();
+        let second = app.create_scene(chapter, "Second Scene", 1).unwrap();
+        let prose = app
+            .create_content_unit(
+                story_core::ContentUnitKind::ChapterBody,
+                "Chapter Four prose",
+                Some(chapter),
+                0,
+                None,
+            )
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.refresh().unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| *row == OutlineRow::Scene(second))
+            .unwrap();
+        state.open_content_unit(prose).unwrap();
+        assert!(state.selected_scene().contains("Chapter Four prose"));
+        assert!(!state.selected_scene().contains("Second Scene"));
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.workspace, Workspace::Outline);
+        assert_eq!(
+            outline_rows(&state)[state.selected],
+            OutlineRow::ContentUnit(prose)
+        );
+        state.open_scene(first).unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            outline_rows(&state)[state.selected],
+            OutlineRow::Scene(first)
+        );
+    }
+
+    #[test]
+    fn story_link_form_selects_existing_entities_from_a_searchable_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let one = app.create_scene(chapter, "Opening", 0).unwrap();
+        let two = app.create_scene(chapter, "Discovery", 1).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.start_series_form("link.create").unwrap();
+        for ch in "Opening".chars() {
+            state
+                .handle_series_form_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .unwrap();
+        }
+        state
+            .handle_series_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(
+            state.series_form.as_ref().unwrap().selected_entities[0],
+            story_core::EntityRef::Scene(one)
+        );
+        for ch in "Discovery".chars() {
+            state
+                .handle_series_form_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .unwrap();
+        }
+        state
+            .handle_series_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        for ch in "related".chars() {
+            state
+                .handle_series_form_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))
+                .unwrap();
+        }
+        state
+            .handle_series_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_series_form_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(
+            state.message.contains("Scene · Opening")
+                && state.message.contains("Scene · Discovery")
+        );
+        assert_eq!(
+            state
+                .app
+                .outgoing_links(story_core::EntityRef::Scene(one))
+                .unwrap()[0]
+                .target,
+            story_core::EntityRef::Scene(two)
+        );
     }
 
     #[test]

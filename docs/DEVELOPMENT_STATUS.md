@@ -1,5 +1,52 @@
 # Writer's IDE Development Status
 
+## Current checkpoint — issue #76 command/workflow audit, 26 November 2026
+
+The current working batch audits the Alpha UAT 35 author-facing command
+failures and preserves the in-progress Scrivener format-profile integration.
+`docs/COMMAND_WORKFLOW_AUDIT.md` inventories 384 current or historically
+advertised command entries, their expected effect, context, entry point and
+verification status. Seven core actions are directly exercised by the new
+production PTY workflow; the remaining registered commands are explicitly
+marked as not individually exercised by this focused audit. Existing
+issue-specific tests continue to cover other workflows.
+
+The focused audit PTY creates a section, chapter and scenes through menus,
+checks included/excluded feedback, edits and saves manuscript text, creates a
+story link by selecting existing entities, and changes the book type through
+File → Book Type. Regression coverage also verifies stable direct-prose
+breadcrumbs and Escape navigation, persisted book-type changes without
+restructuring, and menu-driven chapter prompts. The previously hard-coded
+Outline return has been corrected to return to the originating outline view
+(including Scene Cards) while restoring the selected document by identity.
+Date/time insertion without an active manuscript identity is disabled with a
+plain-language reason.
+
+Automated verification on the current candidate working tree:
+
+- Formatting and workspace Clippy with warnings denied — passed.
+- Focused authoring PTY, direct-prose identity test, and three previously
+  mismatching production PTY journeys — passed after updating their assertions
+  to match the author-facing prompts and inclusion indicator.
+- `cargo test --offline --workspace` — passed: 356 terminal unit tests, 3
+  author workflow tests, 30 active production PTYs, all other unit/integration
+  tests and doc tests. One protected-corpus PTY is ignored unless its private
+  fixture path is configured. The run used the user's previously authorised
+  loopback access for the local Ollama test.
+- The earlier full run found four stale PTY expectations; those assertions were
+  updated to recognise the explicit chapter prompt and the separate inclusion
+  indicator. The rerun above passed.
+- Synchronous Scrivener import still does not expose incremental progress; the
+  import eventually completes in the tested fixture, but long imports may
+  appear idle. This remains an open #53/#76 limitation.
+
+The implementation is ready for an isolated Alpha UAT 36 build from its
+verified commit. The release will exclude private manuscripts and use bundle-
+local preferences and disposable synthetic projects. After recording and
+packaging that commit, resume the persistent v1.0 backlog with the Scrivener
+per-format layout/inclusion work already in progress. Human UAT remains
+pending.
+
 ## Current checkpoint — Alpha UAT 35 and lifecycle integrity, 26 November 2026
 
 Frozen Linux x86_64 release build from commit `b55c981b88d5702c769178964fa7506219ba0738` is available at `test-builds/alpha-uat-35-b55c981/`. Launch with:

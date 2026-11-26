@@ -1515,7 +1515,7 @@ impl ProjectStore {
             }
         }
         let config_text = fs::read_to_string(root.join("project.toml"))?;
-        let cfg: ProjectConfig =
+        let mut cfg: ProjectConfig =
             toml::from_str(&config_text).map_err(|e| StorageError::Config(e.to_string()))?;
         let conn = Connection::open(root.join("story.db"))?;
         let initial_id: String = conn
@@ -1757,12 +1757,20 @@ impl ProjectStore {
             [],
             |row| row.get(0),
         )?;
-        if BookType::parse(&db_book_type) != Some(cfg.book_type) {
-            return Err(StorageError::Config(format!(
-                "project book type mismatch: config {}, database {}",
-                cfg.book_type.as_str(),
-                db_book_type
-            )));
+        let authoritative_book_type = BookType::parse(&db_book_type).ok_or_else(|| {
+            StorageError::Config(format!("invalid project book type {db_book_type}"))
+        })?;
+        if cfg.book_type != authoritative_book_type {
+            // The database is authoritative for editable book classification.
+            // Repair a stale portable config after a crash between the
+            // transactional database update and its atomic TOML refresh.
+            cfg.book_type = authoritative_book_type;
+            atomic_write(
+                &root.join("project.toml"),
+                toml::to_string_pretty(&cfg)
+                    .map_err(|error| StorageError::Config(error.to_string()))?
+                    .as_bytes(),
+            )?;
         }
         let db_template_id: Option<String> = conn.query_row(
             "SELECT template_id FROM project WHERE singleton=1",
@@ -1978,6 +1986,25 @@ impl ProjectStore {
             )?;
         }
         tx.commit()?;
+        Ok(())
+    }
+    pub fn set_project_book_type(&mut self, book_type: BookType) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE project SET book_type=?1,updated_at=?2 WHERE singleton=1",
+            params![book_type.as_str(), now()],
+        )?;
+        tx.commit()?;
+
+        let path = self.root.join("project.toml");
+        let mut config: ProjectConfig = toml::from_str(&fs::read_to_string(&path)?)
+            .map_err(|error| StorageError::Config(error.to_string()))?;
+        config.book_type = book_type;
+        let serialized = toml::to_string_pretty(&config)
+            .map_err(|error| StorageError::Config(error.to_string()))?;
+        atomic_write(&path, serialized.as_bytes())?;
         Ok(())
     }
     pub fn set_project_language(&mut self, language_code: &str) -> Result<()> {
@@ -12677,6 +12704,32 @@ mod tests {
             "A chapter with prose and no scenes."
         );
         st.validate().unwrap();
+    }
+
+    #[test]
+    fn changing_book_type_persists_in_database_and_portable_config_without_restructuring() {
+        let d = tempdir().unwrap();
+        let project = d.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter One", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Opening").unwrap();
+
+        store.set_project_book_type(BookType::Nonfiction).unwrap();
+        assert_eq!(store.get_project().unwrap().book_type, BookType::Nonfiction);
+        assert_eq!(store.get_scene(scene).unwrap().scene.title, "Opening");
+        drop(store);
+
+        let config: ProjectConfig =
+            toml::from_str(&fs::read_to_string(project.join("project.toml")).unwrap()).unwrap();
+        assert_eq!(config.book_type, BookType::Nonfiction);
+        let reopened = ProjectStore::open(&project).unwrap();
+        assert_eq!(
+            reopened.get_project().unwrap().book_type,
+            BookType::Nonfiction
+        );
+        assert_eq!(reopened.get_scene(scene).unwrap().chapter_id, Some(chapter));
     }
 
     #[test]

@@ -133,6 +133,7 @@ def main():
     previous_position = modes == ["previous-position"]
     removal_dialogs = modes == ["removal-dialogs"]
     chapter_creation = modes == ["chapter-creation"]
+    authoring_audit = modes == ["authoring-audit"]
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
     scrivener_import = modes == ["scrivener-import"]
@@ -388,7 +389,7 @@ def main():
                     + repr(terminal_snapshot(output, 24, 80))
                 )
             if expected_titles and not wait_for_screen_fragments(
-                ("▸ [ ] Opening Scene".encode("utf-8"),), timeout=2.0
+                ("▸ [Included] [ ] Opening Scene".encode("utf-8"),), timeout=2.0
             ):
                 raise AssertionError(
                     "the imported project did not focus its first scene in the outline; screen: "
@@ -1317,7 +1318,7 @@ def main():
                 if not wait_for_screen_fragments((b"New Chapter",), menu_start, timeout=3.0):
                     raise AssertionError("command palette did not find New Chapter")
                 os.write(master, b"\r")
-                if not wait_for_fragments((b":chapter_",), menu_start, timeout=3.0):
+                if not wait_for_screen_fragments((b"New chapter", b"Enter creates"), menu_start, timeout=3.0):
                     raise AssertionError(
                         "Insert > New Chapter did not open its title prompt; output tail: "
                         + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
@@ -1348,6 +1349,86 @@ def main():
             print(
                 "PTY chapter-creation workflow passed: Insert > New Chapter displays and persists multiple empty chapters."
             )
+            return
+
+        if authoring_audit:
+            os.write(master, b"\x1b")  # dismiss first-run onboarding
+            read_for(0.25)
+            show_outline_tree_presentation()
+
+            def insert_command(label, text=None):
+                start = len(output)
+                os.write(master, b"\x1b[21~" + b"\x1b[C" * 2)  # F10 > Insert
+                if not wait_for_screen_fragments((label.encode("utf-8"),), start, timeout=3.0):
+                    raise AssertionError(f"Insert menu did not show {label!r}")
+                select_visible_menu_item(label)
+                os.write(master, b"\r")
+                if text is not None:
+                    prompt_marker = b"New scene" if label == "New Scene" else b"Enter creates"
+                    if not wait_for_screen_fragments((prompt_marker,), start, timeout=3.0):
+                        raise AssertionError(f"{label} did not open a clear title dialogue")
+                    os.write(master, text.encode("utf-8") + b"\r")
+                    if not wait_for_screen_fragments((text.encode("utf-8"),), start, timeout=3.0):
+                        raise AssertionError(f"{label} did not reveal the created item")
+
+            insert_command("New Section", "Part One")
+            insert_command("New Chapter", "Chapter One")
+            insert_command("New Scene", "Opening")
+            if not wait_for_screen_fragments((b"[Included]", b"Opening"), timeout=3.0):
+                raise AssertionError("unified outline did not display the scene inclusion state")
+            toggle_start = len(output)
+            os.write(master, b" ")
+            if not wait_for_screen_fragments((b"[Excluded]", b"Opening"), toggle_start, timeout=3.0):
+                raise AssertionError("Space did not visibly move the scene to Excluded")
+            os.write(master, b" ")
+            if not wait_for_screen_fragments((b"[Included]", b"Opening"), toggle_start, timeout=3.0):
+                raise AssertionError("Space did not visibly restore the scene to Included")
+            insert_command("New Scene", "Discovery")
+
+            os.write(master, b"\x1b[A")  # select Opening
+            edit_start = len(output)
+            os.write(master, b"\r")
+            if not wait_for_workspace_title("Editor", timeout=3.0):
+                raise AssertionError("Enter did not open the selected scene")
+            read_for(0.15)
+            os.write(master, b"The map revealed a hidden pass.")
+            if not wait_for_screen_fragments((b"hidden pass",), edit_start, timeout=3.0):
+                raise AssertionError("manuscript typing was not visible; screen: " + repr(terminal_snapshot(output, 24, 80)) + "\noutput tail: " + repr(ANSI_CONTROL.sub(b"", output[-1600:])))
+            os.write(master, b"\x13")  # Ctrl+S
+            if not wait_for_screen_fragments((b"[SAVED]",), edit_start, timeout=3.0):
+                raise AssertionError("scene save did not provide visible success feedback")
+            return_start = len(output)
+            os.write(master, b"\x1b")
+            if not wait_for_screen_fragments((b"[Included]", b"Opening"), return_start, timeout=3.0):
+                raise AssertionError("Esc did not return to the active scene in the outline")
+
+            link_start = len(output)
+            os.write(master, b"\x1b[21~" + b"\x1b[C" * 2)
+            select_visible_menu_item("Create Story Link")
+            os.write(master, b"\rOpening\rDiscovery\rrelated\r\r")
+            if not wait_for_screen_fragments((b"Created related relationship", b"Scene", b"Opening", b"Discovery"), link_start, timeout=5.0):
+                raise AssertionError("searchable story-link selection did not create a named link; screen: " + repr(terminal_snapshot(output, 24, 80)))
+            type_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10 > File
+            if not wait_for_screen_fragments((b"Book Type",), type_start, timeout=3.0):
+                raise AssertionError("File menu did not expose Book Type")
+            select_visible_menu_item("Book Type")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Choose the kind of book", b"Fiction", b"Non-fiction"), type_start, timeout=3.0):
+                raise AssertionError("Book Type did not open a visible choice dialogue")
+            os.write(master, b"\x1b[B\r")  # Fiction -> Non-fiction
+            if not wait_for_screen_fragments((b"Book type set to Non-fiction",), type_start, timeout=3.0):
+                raise AssertionError("Book Type did not confirm its selection")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after authoring audit")
+            print("PTY authoring audit passed: menu-driven structure, scene inclusion feedback, editing/save, identity-based outline return, searchable story links and editable book type.")
             return
 
         if reference_removal:
@@ -1487,7 +1568,7 @@ def main():
             if not wait_for_screen_fragments((b"New Chapter",), menu_start, timeout=3.0):
                 raise AssertionError("command palette did not find New Chapter")
             os.write(master, b"\r")
-            if not wait_for_fragments((b":chapter_",), menu_start, timeout=3.0):
+            if not wait_for_screen_fragments((b"New chapter", b"Enter creates"), menu_start, timeout=3.0):
                 raise AssertionError("New Chapter did not open its title prompt")
             os.write(master, b"Opening Chapter\r")
             if not wait_for_screen_fragments((b"Opening Chapter",), timeout=3.0):

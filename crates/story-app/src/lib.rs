@@ -259,12 +259,23 @@ pub fn scrivener_compile_presentation(
         let Some(section_type_id) = item.section_type_id.as_deref() else {
             continue;
         };
+        let section_type_name = inventory
+            .section_types
+            .get(section_type_id)
+            .map(String::as_str)
+            .unwrap_or("unlabelled");
         let Some(layout_id) = format.section_layouts.get(section_type_id) else {
-            warnings.push(format!("source section type '{section_type_id}' has no layout mapping in format '{format_id}'"));
+            warnings.push(format!(
+                "'{}' (Scrivener section type '{section_type_name}') has no layout assignment in format '{format_id}'",
+                item.title
+            ));
             continue;
         };
         let Some(layout) = format.layouts.get(layout_id) else {
-            warnings.push(format!("layout '{layout_id}' for source section type '{section_type_id}' is not available for format '{format_id}'"));
+            warnings.push(format!(
+                "layout '{layout_id}' for '{}' (Scrivener section type '{section_type_name}') is not available in format '{format_id}'",
+                item.title
+            ));
             continue;
         };
         let destination = decisions
@@ -273,11 +284,23 @@ pub fn scrivener_compile_presentation(
             .unwrap_or(Destination::Unmapped);
         if matches!(
             destination,
-            Destination::Section | Destination::Chapter | Destination::Scene
+            Destination::Section
+                | Destination::Chapter
+                | Destination::Scene
+                | Destination::FrontMatter
+                | Destination::BackMatter
         ) && let Some(include_titles) = layout.include_titles
         {
+            let policy_destination = if matches!(
+                destination,
+                Destination::FrontMatter | Destination::BackMatter
+            ) {
+                Destination::FrontMatter
+            } else {
+                destination
+            };
             title_policies
-                .entry(destination)
+                .entry(policy_destination)
                 .or_default()
                 .insert(include_titles);
         }
@@ -307,6 +330,9 @@ pub fn scrivener_compile_presentation(
             Destination::Section => presentation.include_section_titles = include,
             Destination::Chapter => presentation.include_chapter_titles = include,
             Destination::Scene => presentation.include_scene_titles = include,
+            Destination::FrontMatter | Destination::BackMatter => {
+                presentation.include_matter_titles = include;
+            }
             _ => {}
         }
     }
@@ -1408,6 +1434,9 @@ impl WriterApp {
     }
     pub fn get_project(&self) -> Result<Project> {
         Ok(self.store.get_project()?)
+    }
+    pub fn set_project_book_type(&mut self, book_type: BookType) -> Result<()> {
+        Ok(self.store.set_project_book_type(book_type)?)
     }
     pub fn chronology_preferences(&self) -> Result<ChronologyPreferences> {
         let path = self
@@ -5160,25 +5189,30 @@ impl WriterApp {
                             && format.default_back_matter_id.as_deref()
                                 == Some(item.source_document_id.as_str());
                     }
-                    Destination::Scene | Destination::Chapter | Destination::Section => {
-                        if let Some(section_type) = item.section_type_id.as_deref() {
-                            if let Some(layout_id) = format.section_layouts.get(section_type) {
-                                if let Some(layout) = format.layouts.get(layout_id) {
-                                    suppress_body = layout.include_text == Some(false);
-                                } else {
-                                    profile_warnings.push(format!(
-                                        "Scrivener layout '{layout_id}' is missing for source section type '{section_type}'"
-                                    ));
-                                }
-                            } else {
-                                profile_warnings.push(format!(
-                                    "Scrivener source section type '{section_type}' has no layout mapping in format '{}'",
-                                    format.source_format_id
-                                ));
-                            }
-                        }
-                    }
                     _ => {}
+                }
+
+                if publication_kind && let Some(section_type) = item.section_type_id.as_deref() {
+                    let section_type_name = inventory
+                        .section_types
+                        .get(section_type)
+                        .map(String::as_str)
+                        .unwrap_or("unlabelled");
+                    if let Some(layout_id) = format.section_layouts.get(section_type) {
+                        if let Some(layout) = format.layouts.get(layout_id) {
+                            suppress_body = layout.include_text == Some(false);
+                        } else {
+                            profile_warnings.push(format!(
+                                "Scrivener layout '{layout_id}' for '{}' (section type '{section_type_name}') is unavailable in format '{}'",
+                                item.title, format.source_format_id,
+                            ));
+                        }
+                    } else {
+                        profile_warnings.push(format!(
+                            "'{}' (Scrivener section type '{section_type_name}') has no layout assignment in format '{}'",
+                            item.title, format.source_format_id,
+                        ));
+                    }
                 }
 
                 for (scene, content) in entities {
@@ -9317,13 +9351,13 @@ unexpected_prose = "must not be silently discarded"
         for id in ["front-id", "back-id"] {
             fs::create_dir_all(source.join("Files/Data").join(id)).unwrap();
         }
-        fs::create_dir_all(source.join("Settings")).unwrap();
+        fs::create_dir_all(source.join("Settings/Compile Formats")).unwrap();
         fs::write(
             source.join("Matter.scrivx"),
             r#"<ScrivenerProject Version="2.0"><Binder>
               <BinderItem UUID="draft" Type="DraftFolder"><Title>Draft</Title><Children>
-                <BinderItem UUID="front-id" Type="Text"><Title>Opening Matter</Title><IncludeInCompile>No</IncludeInCompile><Children/></BinderItem>
-                <BinderItem UUID="back-id" Type="Text"><Title>Retailer Back Matter</Title><IncludeInCompile>No</IncludeInCompile><Children/></BinderItem>
+                <BinderItem UUID="front-id" Type="Text"><Title>Opening Matter</Title><IncludeInCompile>No</IncludeInCompile><SectionType>matter-type</SectionType><Children/></BinderItem>
+                <BinderItem UUID="back-id" Type="Text"><Title>Retailer Back Matter</Title><IncludeInCompile>No</IncludeInCompile><SectionType>matter-type</SectionType><Children/></BinderItem>
               </Children></BinderItem>
             </Binder></ScrivenerProject>"#,
         )
@@ -9331,9 +9365,19 @@ unexpected_prose = "must not be silently discarded"
         fs::write(
             source.join("Settings/compile.xml"),
             r#"<CompileSettings><ProjectSettings><Content Scope="Included"/></ProjectSettings><FormatSettings>
-              <Format ID="ebook"><FrontAndBackMatter><DefaultFrontMatter Add="Yes">front-id</DefaultFrontMatter><DefaultBackMatter Add="Yes">back-id</DefaultBackMatter></FrontAndBackMatter></Format>
-              <Format ID="kobo"><FrontAndBackMatter><DefaultFrontMatter Add="No">front-id</DefaultFrontMatter><DefaultBackMatter Add="Yes">back-id</DefaultBackMatter></FrontAndBackMatter></Format>
+              <Format ID="ebook"><SectionLayouts><Type ID="matter-type">ebook-matter-layout</Type></SectionLayouts><FrontAndBackMatter><DefaultFrontMatter Add="Yes">front-id</DefaultFrontMatter><DefaultBackMatter Add="Yes">back-id</DefaultBackMatter></FrontAndBackMatter></Format>
+              <Format ID="kobo"><SectionLayouts><Type ID="matter-type">kobo-matter-layout</Type></SectionLayouts><FrontAndBackMatter><DefaultFrontMatter Add="No">front-id</DefaultFrontMatter><DefaultBackMatter Add="Yes">back-id</DefaultBackMatter></FrontAndBackMatter></Format>
             </FormatSettings></CompileSettings>"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("Settings/Compile Formats/ebook.scrformat"),
+            r#"<CompileFormat ID="ebook"><Layouts><Layout ID="ebook-matter-layout" Name="Matter heading only"><Include Titles="Yes" Text="No"/></Layout></Layouts></CompileFormat>"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("Settings/Compile Formats/kobo.scrformat"),
+            r#"<CompileFormat ID="kobo"><Layouts><Layout ID="kobo-matter-layout" Name="Matter body only"><Include Titles="No" Text="Yes"/></Layout></Layouts></CompileFormat>"#,
         )
         .unwrap();
         fs::write(
@@ -9384,22 +9428,25 @@ unexpected_prose = "must not be silently discarded"
             .unwrap();
         assert_eq!(profile.display_name, "Ebook");
         let assembly = story_core::AssemblyId(uuid::Uuid::parse_str(&profile.assembly_id).unwrap());
-        let profile_ir = app.compile_assembly_ir(assembly).unwrap();
+        let mut profile_ir = app.compile_assembly_ir(assembly).unwrap();
+        profile_ir.presentation = profile.presentation.clone();
         let profile_text = profile_ir.render_markdown().0;
-        assert!(profile_text.contains("FRONTMATTERPRIVATETEST"));
-        assert!(profile_text.contains("BACKMATTERPRIVATETEST"));
+        assert!(profile_text.contains("Opening Matter"));
+        assert!(profile_text.contains("Retailer Back Matter"));
+        assert!(!profile_text.contains("FRONTMATTERPRIVATETEST"));
+        assert!(!profile_text.contains("BACKMATTERPRIVATETEST"));
         let kobo_profile = profiles
             .iter()
             .find(|profile| profile.source_format_id == "kobo")
             .unwrap();
         let kobo_assembly =
             story_core::AssemblyId(uuid::Uuid::parse_str(&kobo_profile.assembly_id).unwrap());
-        let kobo_text = app
-            .compile_assembly_ir(kobo_assembly)
-            .unwrap()
-            .render_markdown()
-            .0;
+        let mut kobo_ir = app.compile_assembly_ir(kobo_assembly).unwrap();
+        kobo_ir.presentation = kobo_profile.presentation.clone();
+        let kobo_text = kobo_ir.render_markdown().0;
+        assert!(!kobo_text.contains("Opening Matter"));
         assert!(!kobo_text.contains("FRONTMATTERPRIVATETEST"));
+        assert!(!kobo_text.contains("Retailer Back Matter"));
         assert!(kobo_text.contains("BACKMATTERPRIVATETEST"));
         let units = app.list_content_units(false).unwrap();
         assert_eq!(units.len(), 2);
@@ -9434,19 +9481,21 @@ unexpected_prose = "must not be silently discarded"
             .find(|path| path.extension().is_some_and(|extension| extension == "md"))
             .unwrap();
         let published = fs::read_to_string(published_path).unwrap();
-        assert!(published.contains("FRONTMATTERPRIVATETEST"));
-        assert!(published.contains("BACKMATTERPRIVATETEST"));
+        assert!(published.contains("Opening Matter"));
+        assert!(published.contains("Retailer Back Matter"));
+        assert!(!published.contains("FRONTMATTERPRIVATETEST"));
+        assert!(!published.contains("BACKMATTERPRIVATETEST"));
         let artifact = app
             .compile_scrivener_edition_profile_artifact(
                 profile,
                 story_document::CompileFormat::Markdown,
             )
             .unwrap();
-        assert!(
-            String::from_utf8(artifact.bytes)
-                .unwrap()
-                .contains("FRONTMATTERPRIVATETEST")
-        );
+        let artifact = String::from_utf8(artifact.bytes).unwrap();
+        assert!(artifact.contains("Opening Matter"));
+        assert!(artifact.contains("Retailer Back Matter"));
+        assert!(!artifact.contains("FRONTMATTERPRIVATETEST"));
+        assert!(!artifact.contains("BACKMATTERPRIVATETEST"));
     }
 
     #[test]
@@ -10366,7 +10415,11 @@ unexpected_prose = "must not be silently discarded"
                 formats: vec![format],
                 ..ScrivenerCompileSettings::default()
             }),
-            section_types: BTreeMap::new(),
+            section_types: BTreeMap::from([
+                ("chapter-type".into(), "Chapter Heading".into()),
+                ("scene-type".into(), "Scene Break".into()),
+                ("unmapped-type".into(), "Appendix Note".into()),
+            ]),
             status_labels: BTreeMap::new(),
             items: vec![item("chapter", "chapter-type"), item("scene", "scene-type")],
             warnings: Vec::new(),
@@ -10405,7 +10458,9 @@ unexpected_prose = "must not be silently discarded"
             mapped
                 .warnings
                 .iter()
-                .any(|warning| warning.contains("no layout mapping"))
+                .any(|warning| warning.contains("Internal scene")
+                    && warning.contains("Appendix Note")
+                    && warning.contains("no layout assignment"))
         );
     }
 }
