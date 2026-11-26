@@ -1,5 +1,33 @@
 # Writer's IDE Development Status
 
+## UX interaction design proposal — awaiting author review, 26 November 2026
+
+`docs/WIDE_UX_INTERACTION_DESIGN_v1.0_PROPOSAL.md` is a proposed, unapproved
+interaction design for the author's review. It incorporates the manuscript-
+centred direction supplied on 26 November: a hierarchical document editor
+with integrated novel-development tools; common author-facing document nodes;
+GrandView-inspired structural editing; Scrivener-informed document
+organisation; WordPerfect-style semantic editing/Reveal Codes; Emacs-style
+flexible panes; compact menus; and a shared focus/selection/identity model to
+investigate. It offers alternatives, trade-offs, terminal mock-ups and explicit
+decisions for review. No interface redesign or behavior change is authorized
+by that draft, and the implementation remains unchanged pending approval.
+
+GitHub's current open issue list and latest comments were refreshed through
+`gh` on 26 November. #76 remains the P0 production terminal workflow/release
+gate, and its human acceptance is still pending. Issues #7/#53 retain
+actionable Scrivener profile fidelity work. Issue #75 is explicitly post-
+freeze/vNext and is excluded from the v1.0 goal. Other open issues remain in
+the persistent backlog and should be assessed against their latest comments.
+
+The immediately actionable continuation is Scrivener publication-profile
+mapping, without changing the terminal interaction model. Latest GitHub
+comments report that the research-body fidelity improved to 12/12 in a fresh
+Book 03 run, while two source section types still lack profile layout mappings;
+the earlier 10/12 figure in the checkpoint below is superseded. Confirm this
+from the local regression artifacts before relying on it. Human publication
+acceptance remains open.
+
 ## Current checkpoint — Scrivener compile profile mapping, 26 November 2026
 
 The current follow-up adds translation for a simple Scrivener chapter title
