@@ -2113,19 +2113,16 @@ impl ProjectStore {
             let mut hashes = std::collections::BTreeMap::new();
             for relative in &files {
                 let bytes = fs::read(payload.join(relative))?;
-                hashes.insert(
-                    relative.to_string_lossy().replace('\\', "/"),
-                    hash_bytes(&bytes),
-                );
+                hashes.insert(archive_relative_name(relative)?, hash_bytes(&bytes));
             }
             let project_id = self.get_project()?.id.to_string();
             let mut directory_names = directories
                 .iter()
-                .map(|path| path.to_string_lossy().replace('\\', "/"))
-                .collect::<Vec<_>>();
+                .map(|path| archive_relative_name(path))
+                .collect::<Result<Vec<_>>>()?;
             directory_names.sort();
             let manifest = BackupManifest {
-                format_version: 1,
+                format_version: 2,
                 project_id,
                 files: hashes,
                 directories: directory_names,
@@ -2135,11 +2132,11 @@ impl ProjectStore {
             let options = zip::write::FileOptions::default()
                 .compression_method(zip::CompressionMethod::Deflated);
             for relative in &directories {
-                let name = relative.to_string_lossy().replace('\\', "/");
+                let name = archive_relative_name(relative)?;
                 archive.add_directory(format!("{name}/"), options)?;
             }
             for relative in &files {
-                let name = relative.to_string_lossy().replace('\\', "/");
+                let name = archive_relative_name(relative)?;
                 archive.start_file(name, options)?;
                 archive.write_all(&fs::read(payload.join(relative))?)?;
             }
@@ -2177,6 +2174,19 @@ impl ProjectStore {
         let result = (|| -> Result<()> {
             let file = File::open(archive_path)?;
             let mut archive = zip::ZipArchive::new(file)?;
+            let manifest: BackupManifest = {
+                let mut entry = archive.by_name("manifest.json")?;
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes)?;
+                serde_json::from_slice(&bytes).map_err(|error| {
+                    StorageError::Invalid(format!("invalid backup manifest: {error}"))
+                })?
+            };
+            if !matches!(manifest.format_version, 1 | 2) {
+                return Err(StorageError::Invalid(
+                    "unsupported project backup format version".into(),
+                ));
+            }
             let mut observed = std::collections::BTreeMap::new();
             let mut observed_directories = std::collections::BTreeSet::new();
             for index in 0..archive.len() {
@@ -2185,7 +2195,8 @@ impl ProjectStore {
                 if name == "manifest.json" {
                     continue;
                 }
-                let relative = safe_archive_path(name.trim_end_matches('/'))?;
+                let archive_name = name.trim_end_matches('/').to_owned();
+                let relative = safe_archive_path(&archive_name, manifest.format_version == 2)?;
                 let is_directory = entry.is_dir();
                 if let Some(mode) = entry.unix_mode() {
                     let kind = mode & 0o170000;
@@ -2200,10 +2211,11 @@ impl ProjectStore {
                 }
                 let output = stage.join(&relative);
                 if is_directory {
-                    let normalized = relative.to_string_lossy().replace('\\', "/");
-                    if !observed_directories.insert(normalized) {
+                    let normalized = archive_name.clone();
+                    if !observed_directories.insert(normalized.clone()) {
                         return Err(StorageError::Invalid(
-                            "backup archive contains a duplicate directory".into(),
+                            "backup archive contains a duplicate directory after path encoding"
+                                .into(),
                         ));
                     }
                     fs::create_dir_all(&output)?;
@@ -2219,19 +2231,9 @@ impl ProjectStore {
                     .open(&output)?;
                 std::io::copy(&mut entry, &mut target)?;
                 target.sync_all()?;
-                let normalized = relative.to_string_lossy().replace('\\', "/");
-                observed.insert(normalized, hash_file(&output)?);
+                observed.insert(archive_name, hash_file(&output)?);
             }
-            let manifest: BackupManifest = {
-                let mut entry = archive.by_name("manifest.json")?;
-                let mut bytes = Vec::new();
-                entry.read_to_end(&mut bytes)?;
-                serde_json::from_slice(&bytes).map_err(|error| {
-                    StorageError::Invalid(format!("invalid backup manifest: {error}"))
-                })?
-            };
-            if manifest.format_version != 1
-                || observed != manifest.files
+            if observed != manifest.files
                 || observed_directories.into_iter().collect::<Vec<_>>() != manifest.directories
             {
                 return Err(StorageError::Invalid(
@@ -11291,7 +11293,63 @@ fn collect_project_directories(
     Ok(())
 }
 
-fn safe_archive_path(value: &str) -> Result<PathBuf> {
+const ARCHIVE_ESCAPED_COMPONENT_PREFIX: &str = "~wide-os~";
+
+fn archive_relative_name(path: &Path) -> Result<String> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(StorageError::Invalid(
+                "project backup path contains a non-relative component".into(),
+            ));
+        };
+        components.push(archive_component_name(component)?);
+    }
+    if components.is_empty() {
+        return Err(StorageError::Invalid("project backup path is empty".into()));
+    }
+    Ok(components.join("/"))
+}
+
+#[cfg(unix)]
+fn archive_component_name(component: &std::ffi::OsStr) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let bytes = component.as_bytes();
+    let text = std::str::from_utf8(bytes).ok();
+    if let Some(text) = text
+        && !text.starts_with(ARCHIVE_ESCAPED_COMPONENT_PREFIX)
+        && !text.contains('\\')
+    {
+        return Ok(text.to_owned());
+    }
+    Ok(format!(
+        "{ARCHIVE_ESCAPED_COMPONENT_PREFIX}{}",
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    ))
+}
+
+#[cfg(not(unix))]
+fn archive_component_name(component: &std::ffi::OsStr) -> Result<String> {
+    let text = component
+        .to_str()
+        .ok_or_else(|| StorageError::Invalid("project path is not valid Unicode".into()))?;
+    if !text.starts_with(ARCHIVE_ESCAPED_COMPONENT_PREFIX) && !text.contains('\\') {
+        Ok(text.to_owned())
+    } else {
+        Ok(format!(
+            "{ARCHIVE_ESCAPED_COMPONENT_PREFIX}{}",
+            text.as_bytes()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        ))
+    }
+}
+
+fn safe_archive_path(value: &str, decode_escaped_components: bool) -> Result<PathBuf> {
     if value.is_empty() || value.contains(['\\', ':']) {
         return Err(StorageError::Invalid("unsafe backup archive path".into()));
     }
@@ -11303,7 +11361,67 @@ fn safe_archive_path(value: &str) -> Result<PathBuf> {
     {
         return Err(StorageError::Invalid("unsafe backup archive path".into()));
     }
-    Ok(path.to_path_buf())
+    if !decode_escaped_components {
+        return Ok(path.to_path_buf());
+    }
+    let mut decoded = PathBuf::new();
+    for component in path.components() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(StorageError::Invalid("unsafe backup archive path".into()));
+        };
+        let component = component
+            .to_str()
+            .ok_or_else(|| StorageError::Invalid("invalid archive path encoding".into()))?;
+        if let Some(encoded) = component.strip_prefix(ARCHIVE_ESCAPED_COMPONENT_PREFIX) {
+            if encoded.len() % 2 != 0 || !encoded.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(StorageError::Invalid("invalid encoded archive path".into()));
+            }
+            let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+            if !remainder.is_empty() {
+                return Err(StorageError::Invalid("invalid encoded archive path".into()));
+            }
+            let bytes = pairs
+                .iter()
+                .map(|pair| {
+                    let pair = std::str::from_utf8(pair).map_err(|_| {
+                        StorageError::Invalid("invalid encoded archive path".into())
+                    })?;
+                    u8::from_str_radix(pair, 16)
+                        .map_err(|_| StorageError::Invalid("invalid encoded archive path".into()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if bytes.is_empty() || bytes.contains(&0) || bytes.contains(&b'/') {
+                return Err(StorageError::Invalid("unsafe encoded archive path".into()));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::ffi::OsStringExt;
+                let decoded_component = std::ffi::OsString::from_vec(bytes);
+                if decoded_component == "." || decoded_component == ".." {
+                    return Err(StorageError::Invalid("unsafe encoded archive path".into()));
+                }
+                decoded.push(decoded_component);
+            }
+            #[cfg(not(unix))]
+            {
+                let decoded_component = String::from_utf8(bytes).map_err(|_| {
+                    StorageError::Invalid(
+                        "archive contains a filename not representable on this platform".into(),
+                    )
+                })?;
+                if decoded_component == "."
+                    || decoded_component == ".."
+                    || decoded_component.contains(['/', '\\'])
+                {
+                    return Err(StorageError::Invalid("unsafe encoded archive path".into()));
+                }
+                decoded.push(decoded_component);
+            }
+        } else {
+            decoded.push(component);
+        }
+    }
+    Ok(decoded)
 }
 
 fn copy_synced(source: &Path, destination: &Path) -> Result<()> {
@@ -15017,6 +15135,62 @@ mod tests {
             );
         }
         assert!(ProjectStore::restore_archive_to(&archive, &relocated).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_archives_preserve_non_utf8_and_backslash_path_components() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let project_path = directory.path().join("Original");
+        let mut project = ProjectStore::create(&project_path, "Portable Names").unwrap();
+        let non_utf8 = std::ffi::OsString::from_vec(b"asset-\xff".to_vec());
+        let backslash = std::ffi::OsString::from_vec(b"literal\\name".to_vec());
+        fs::create_dir_all(project_path.join("attachments").join(&non_utf8)).unwrap();
+        fs::write(
+            project_path
+                .join("attachments")
+                .join(&non_utf8)
+                .join("file.bin"),
+            b"asset bytes",
+        )
+        .unwrap();
+        fs::create_dir_all(project_path.join("attachments").join(&backslash)).unwrap();
+        fs::write(
+            project_path
+                .join("attachments")
+                .join(&backslash)
+                .join("notes.txt"),
+            b"portable path component",
+        )
+        .unwrap();
+        let archive = directory.path().join("portable-names.zip");
+        project.backup_archive_to(&archive).unwrap();
+        drop(project);
+
+        let restored_path = directory.path().join("Relocated");
+        ProjectStore::restore_archive_to(&archive, &restored_path).unwrap();
+        assert_eq!(
+            fs::read(
+                restored_path
+                    .join("attachments")
+                    .join(non_utf8)
+                    .join("file.bin")
+            )
+            .unwrap(),
+            b"asset bytes"
+        );
+        assert_eq!(
+            fs::read(
+                restored_path
+                    .join("attachments")
+                    .join(backslash)
+                    .join("notes.txt")
+            )
+            .unwrap(),
+            b"portable path component"
+        );
     }
 
     #[cfg(unix)]

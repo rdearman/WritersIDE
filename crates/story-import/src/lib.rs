@@ -623,12 +623,10 @@ impl ScrivenerImportPlan {
                 }
             }
         }
-        // A format-selected matter document can live inside an otherwise
-        // private/unknown binder container (including a text document with
-        // children). Keep each ancestor in the hierarchy as an organisational
-        // section so the explicit selection is valid. Text on a promoted
-        // section is retained as SectionBody; unselected siblings keep their
-        // private Research role.
+        // Promote only manuscript ancestors needed to retain a selected
+        // matter document's hierarchy. A private Project Notes/Research root
+        // must not become a manuscript section just because it contains an
+        // explicitly selected publication document.
         let mut matter_container_ids = BTreeSet::new();
         for source_id in matter_roles.keys() {
             let mut parent_id = inventory
@@ -647,7 +645,9 @@ impl ScrivenerImportPlan {
                 if parent.area == "trash" {
                     break;
                 }
-                if !matter_roles.contains_key(parent.source_document_id.as_str()) {
+                if parent.area == "manuscript"
+                    && !matter_roles.contains_key(parent.source_document_id.as_str())
+                {
                     matter_container_ids.insert(parent.source_document_id.as_str());
                 }
                 parent_id = parent.parent_source_id.as_deref();
@@ -659,6 +659,9 @@ impl ScrivenerImportPlan {
             .map(|item| (item.source_document_id.as_str(), item))
             .collect::<BTreeMap<_, _>>();
         let default_kind = |item: &ScrivenerBinderItem| {
+            if item.area == "trash" {
+                return ScrivenerDestinationKind::Skip;
+            }
             if let Some(kind) = matter_roles.get(item.source_document_id.as_str()) {
                 return *kind;
             }
@@ -892,6 +895,7 @@ impl ScrivenerImportPlan {
                             || parent.destination_kind == ScrivenerDestinationKind::Unmapped
                             || parent.destination_kind == ScrivenerDestinationKind::Section
                             || parent.destination_kind == ScrivenerDestinationKind::Chapter
+                            || parent.destination_kind == ScrivenerDestinationKind::Research
                     }
                     ScrivenerDestinationKind::Unmapped | ScrivenerDestinationKind::Skip => true,
                 };
@@ -2345,6 +2349,14 @@ fn scrivener_named_value(node: &ScrivenerXmlNode, name: &str) -> Option<String> 
 }
 
 fn classify_scrivener_area(title: &str, type_code: Option<&str>, inherited: &str) -> String {
+    // Trash and private Research are subtree roles. A descendant's title or
+    // section metadata must never promote it back into the publishable draft.
+    if inherited.eq_ignore_ascii_case("trash") {
+        return "trash".into();
+    }
+    if inherited.eq_ignore_ascii_case("research") {
+        return "research".into();
+    }
     match type_code.map(str::to_ascii_lowercase).as_deref() {
         Some("draftfolder") => return "manuscript".into(),
         Some("researchfolder") => return "research".into(),
@@ -2472,6 +2484,12 @@ fn collect_scrivener_item(
         }
         if content_markdown.is_none()
             && area == "manuscript"
+            && !type_code.as_deref().is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "folder" | "draftfolder" | "researchfolder" | "trashfolder" | "group"
+                )
+            })
             && !scrivener_child_items(node).is_empty()
         {
             unsupported.push(
@@ -5078,7 +5096,11 @@ This is an addition to the old file.}"#;
             .collect::<BTreeMap<_, _>>();
         assert_eq!(mapping["front"], ScrivenerDestinationKind::FrontMatter);
         assert_eq!(mapping["back"], ScrivenerDestinationKind::BackMatter);
-        assert_eq!(mapping["matter-folder"], ScrivenerDestinationKind::Section);
+        assert_eq!(
+            mapping["matter-folder"],
+            ScrivenerDestinationKind::Research,
+            "a private Project Notes container must not become a publishable section"
+        );
         assert_eq!(
             mapping["private-sibling"],
             ScrivenerDestinationKind::Research
@@ -5111,6 +5133,96 @@ This is an addition to the old file.}"#;
                 .destination_kind,
             ScrivenerDestinationKind::Unmapped,
             "conflicting format roles must require an explicit import decision"
+        );
+    }
+
+    #[test]
+    fn trash_subtrees_stay_excluded_and_empty_organisational_folders_are_not_errors() {
+        let make_item =
+            |id: &str, parent: Option<&str>, title: &str, type_code: &str, area: &str| {
+                ScrivenerBinderItem {
+                    source_document_id: id.into(),
+                    parent_source_id: parent.map(str::to_owned),
+                    position: 0,
+                    title: title.into(),
+                    type_code: Some(type_code.into()),
+                    area: area.into(),
+                    include_in_compile: Some(true),
+                    section_type_id: None,
+                    synopsis: None,
+                    notes_markdown: None,
+                    content_markdown: None,
+                    embedded_assets: Vec::new(),
+                    fields: BTreeMap::new(),
+                    unsupported: Vec::new(),
+                }
+            };
+        let mut inventory = ScrivenerProjectInventory {
+            source_path: "fixture.scriv".into(),
+            source_fingerprint: "fingerprint".into(),
+            title: "Book".into(),
+            format_version: Some("2.0".into()),
+            creator: None,
+            project_metadata: BTreeMap::new(),
+            compile_settings: Some(ScrivenerCompileSettings {
+                formats: vec![ScrivenerCompileFormatSettings {
+                    source_format_id: "retailer".into(),
+                    default_front_matter_id: Some("trashed-page".into()),
+                    add_default_front_matter: Some(true),
+                    ..ScrivenerCompileFormatSettings::default()
+                }],
+                ..ScrivenerCompileSettings::default()
+            }),
+            section_types: BTreeMap::new(),
+            items: vec![
+                make_item("trash-root", None, "Trash", "TrashFolder", "trash"),
+                make_item(
+                    "trashed-page",
+                    Some("trash-root"),
+                    "Former Manuscript Page",
+                    "DraftFolder",
+                    "trash",
+                ),
+            ],
+            warnings: Vec::new(),
+            unsupported: Vec::new(),
+        };
+        assert_eq!(
+            classify_scrivener_area("Former Manuscript Page", Some("DraftFolder"), "trash"),
+            "trash"
+        );
+        let plan = ScrivenerImportPlan::proposed(&inventory);
+        assert!(plan.decisions.iter().all(|decision| {
+            decision.destination_kind == ScrivenerDestinationKind::Skip
+                && !decision.include_in_import
+        }));
+        plan.validate_for_import(&inventory).unwrap();
+
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("Empty Group.scriv");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(
+            source.join("Empty Group.scrivx"),
+            r#"<ScrivenerProject Version="2.0"><Binder>
+              <BinderItem UUID="draft" Type="DraftFolder"><Title>Draft</Title><Children>
+                <BinderItem UUID="part" Type="Folder"><Title>Part One</Title><Children>
+                  <BinderItem UUID="chapter" Type="Folder"><Title>Chapter One</Title><Children/></BinderItem>
+                </Children></BinderItem>
+              </Children></BinderItem>
+            </Binder></ScrivenerProject>"#,
+        )
+        .unwrap();
+        inventory = inspect_scrivener_project(&source).unwrap();
+        assert!(inventory.items.iter().all(|item| {
+            !item
+                .unsupported
+                .iter()
+                .any(|warning| warning.contains("no readable content.rtf"))
+        }));
+        assert!(
+            ScrivenerImportPlan::proposed(&inventory)
+                .validate_for_import(&inventory)
+                .is_ok()
         );
     }
 

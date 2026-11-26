@@ -70,7 +70,9 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - New Scene
 - Create Direct Prose Unit
 - Write Selected Chapter
-- Insert Date/Time
+- Insert Date
+- Insert Time
+- Insert Date and Time
 - Insert File…
 - Special Character… (search by name, or type a Unicode code point such as `U+2014`)
 - Create Story Link

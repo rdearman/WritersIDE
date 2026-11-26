@@ -2,6 +2,56 @@
 
 Updated: 2026-11-26
 
+## Current checkpoint — persistent working projects and deferred Save As, 26 November 2026
+
+Design details: [Engineering Design v2.44 addendum](engineering-design-v2.44-addendum.md).
+
+
+New projects and standalone Scrivener imports now open from WIDE-managed,
+persistent staging storage. Authors can edit, autosave, navigate and compile
+before choosing a permanent folder. The first explicit Save or Save As opens
+the existing destination browser; it creates a validated independent copy,
+then switches the open workspace to that copy. The original staged copy stays
+available if saving fails. Linux uses `$XDG_DATA_HOME/writers-ide/staging`
+(or `~/.local/share/writers-ide/staging`); macOS and Windows use their normal
+per-user application-data locations. Staged directories are private on Unix.
+
+Startup resumes staged projects after an abrupt exit. Save As writes a durable
+promotion intent before copying; on restart WIDE verifies project identity
+before cleaning up a duplicate staged copy. A missing destination clears the
+intent and keeps the stage. An identity mismatch preserves both projects and
+reports the conflict. New Project and import cancellation do not create a
+permanent destination. Import remains separate from publication configuration.
+
+The Scrivener automatic mapping also now propagates Trash exclusion to all
+descendants, retains Project Notes roots as private research rather than
+promoting them to manuscript sections, and does not flag normal empty
+organizational folders as missing prose. The import PTY workflow exercises
+source selection, default mapping, immediate editing, first Save As, reopen
+and compilation. A separate PTY test simulates SIGKILL and verifies staged
+work reopens; synthetic tests cover promotion recovery and identity conflicts.
+The private real-project PTY command is:
+`WIDE_PRIVATE_ARROWMAKING_PROJECT="$PWD/fixtures/back-catalogue/scrivener/ArrowMaking.scriv" cargo test --offline -p writers-ide-terminal --test pty_smoke protected_arrowmaking_project_imports_through_the_production_pty_without_source_changes -- --ignored --nocapture`.
+Automated verification passed on the final working tree:
+
+```text
+cargo fmt --all -- --check
+git diff --check
+cargo clippy --offline --workspace --all-targets -- -D warnings
+cargo test --offline --workspace
+```
+
+The workspace run passed (346 terminal unit tests,
+3 author-workflow integration tests, 28 Linux PTY tests passed; 1 private-corpus
+PTY is separately run and 1 PTY is intentionally ignored without its private
+fixture). The protected ArrowMaking import/edit/compile PTY also passed with its
+source fingerprint unchanged. Fixture checksum verification passed before and
+after.
+
+The same batch includes #61's locale-aware date/time insertion controls and
+their menu listing. These are automated results only; #44, #46, #52 and #53
+remain open for human acceptance.
+
 ## Current checkpoint — Scrivener layout selection in Publish, 26 November 2026
 
 Imported Scrivener compile layouts are now selectable from the curated

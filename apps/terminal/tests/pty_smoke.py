@@ -260,18 +260,16 @@ def main():
             raise AssertionError("Scene Cards presentation did not render its Included and Excluded collections")
 
     def show_outline_tree_presentation():
-        """Reach the hierarchical Outline from both the welcome and manuscript views."""
-        show_scene_cards_presentation()
+        """Open the single hierarchical Outline from the Navigate menu."""
         menu_start = len(output)
         os.write(master, b"\x1b[21~")  # F10
         read_for(0.2)
-        os.write(master, b"\x1b[C" * 4)  # View
-        if not wait_for_screen_fragments((b"Show Outline Tree",), menu_start, timeout=2.0):
-            raise AssertionError("View menu did not offer the tree presentation from Scene Cards")
-        os.write(master, b"\r")
-        if not wait_for_screen_fragments((b"Selected outline item", b"No outline row selected"), menu_start, timeout=3.0):
+        os.write(master, b"\x1b[C" * 3 + b"\x1b[B\r")  # Navigate > Outline
+        if not wait_for_screen_fragments(
+            (b"Outline",), menu_start, timeout=3.0
+        ):
             raise AssertionError(
-                "Outline tree did not show the empty-project state; visible tail: "
+                "Navigate > Outline did not open the hierarchical manuscript view; visible tail: "
                 + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
             )
 
@@ -339,25 +337,12 @@ def main():
             screen = "\n".join(terminal_snapshot(output, 24, 80))
             if "Series Books" in screen or "draft-internal-id" in screen or "unmapped" in screen.lower():
                 raise AssertionError("import preview exposed the old series/mapping failure: " + screen)
-            if not wait_for_screen_fragments((b"Enter Choose Destination",), timeout=2.0):
+            if not wait_for_screen_fragments((b"Enter Import to WIDE temporary workspace",), timeout=2.0):
                 raise AssertionError(
-                    "preview did not advertise the destination step; screen: "
+                    "preview did not offer automatic import into persistent WIDE working storage; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
                 )
-            os.write(master, b"\r")
-            if not wait_for_screen_fragments(
-                (b"writable project destination", b"F4 Select Destination"),
-                menu_start,
-                timeout=5.0,
-            ):
-                raise AssertionError("destination browser was not shown after the preview")
-            os.write(master, b"\x1bOS")  # F4 selects the displayed parent folder
-            if not wait_for_screen_fragments((b"Destination:",), timeout=3.0):
-                raise AssertionError(
-                    "destination selection did not confirm the full path; screen: "
-                    + repr(terminal_snapshot(output, 24, 80))
-                )
-            os.write(master, b"\r")  # Enter imports using the automatic mapping
+            os.write(master, b"\r")  # automatic import; permanent destination is deferred
             if expected_titles:
                 imported_outline_ready = wait_for_screen_fragments(
                     tuple(title.encode("utf-8") for title in expected_titles),
@@ -398,9 +383,21 @@ def main():
                 )
             os.write(master, b"Additional UAT sentence.")
             os.write(master, b"\x13")  # Ctrl+S
-            if not wait_for_screen_fragments((b"Saved", b"Additional UAT sentence"), timeout=5.0):
+            if not wait_for_screen_fragments((b"Save Project As", b"Folder contents"), timeout=5.0):
                 raise AssertionError(
-                    "edited imported prose did not show save feedback; screen: "
+                    "first explicit Save did not open the permanent-location browser; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x1b[15~")  # F5: use the proposed permanent project path
+            if not wait_for_screen_fragments((b"F5 Confirm Save Copy",), timeout=3.0):
+                raise AssertionError(
+                    "Save As did not show its no-overwrite confirmation; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x1b[15~")
+            if not wait_for_screen_fragments((b"Saved project at",), timeout=10.0):
+                raise AssertionError(
+                    "edited import was not promoted to a permanent project; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
                 )
             os.write(master, b"\x1b")  # return to the manuscript outline
@@ -462,7 +459,7 @@ def main():
                 finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after importing and compiling")
-            print("PTY Scrivener workflow passed: menu → source browser → automatic mapping → destination → edit/save → compile → exit.")
+            print("PTY Scrivener workflow passed: menu → source browser → automatic staging import → edit → first Save promotion → compile → exit.")
             return
 
         if review_menu:
@@ -831,8 +828,10 @@ def main():
 
             date_start = len(output)
             os.write(master, b"\x1b[21~")  # F10
-            read_for(0.15)
-            os.write(master, b"\x1b[C" * 2 + b"\x1b[B" * 5 + b"\r")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 2)  # Insert
+            select_visible_menu_item("Insert Date and Time")
+            os.write(master, b"\r")
             if not wait_for_fragments(
                 (b"Inserted", b"UTC"), date_start, timeout=3.0
             ):
@@ -843,8 +842,10 @@ def main():
 
             file_start = len(output)
             os.write(master, b"\x1b[21~")  # F10
-            read_for(0.15)
-            os.write(master, b"\x1b[C" * 2 + b"\x1b[B" * 6 + b"\r")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 2)  # Insert
+            select_visible_menu_item("Insert File…")
+            os.write(master, b"\r")
             if not wait_for_fragments(
                 (b"Selectedpath:", b"F5Confirm"),
                 file_start,
@@ -941,7 +942,9 @@ def main():
             os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
             read_for(0.25)
             picker_start = len(output)
-            os.write(master, b"\x1b[21~" + b"\x1b[C" * 2 + b"\x1b[B" * 7 + b"\r")
+            os.write(master, b"\x1b[21~" + b"\x1b[C" * 2)
+            select_visible_menu_item("Special Character…")
+            os.write(master, b"\r")
             if not wait_for_fragments(
                 (b"Insert Special Character", b"U+XXXX"), picker_start, timeout=3.0
             ):
@@ -1136,7 +1139,7 @@ def main():
             os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
             read_for(0.3)
 
-            # Exercise structural creation in the primary hierarchical view.
+            # Open the unified hierarchical Outline from the Navigate menu.
             show_outline_tree_presentation()
 
             def create_chapter(title):
@@ -1287,9 +1290,10 @@ def main():
                 read_for(0.25)
             if b"Directory" not in output or b"type" not in output:
                 raise AssertionError("New Project did not open the type-aware folder browser")
-            # Use the visible, focusable book-type and Create Project controls.
-            # Tab: tree -> contents -> title -> folder -> book type.
-            os.write(master, b"\t\t\t\t\r\t\r")
+            # The title field is initially focused. Tab to the required
+            # Fiction/Non-fiction selector, choose its visible default, then
+            # tab to Create Project and confirm.
+            os.write(master, b"\t\r\t\r")
             if not wait_for_fragments(
                 (b"Included", b"Excluded"), timeout=5.0
             ):
@@ -1305,12 +1309,24 @@ def main():
             read_for(0.4)
             os.write(master, b"First passage.")
             edit_start = len(output)
-            if not wait_for(b"[UNSAVED]", edit_start):
-                raise AssertionError("typed passage did not produce visible unsaved feedback")
+            if not wait_for_screen_fragments((b"Autosaved",), edit_start, timeout=5.0) and not wait_for_screen_fragments((b"[UNSAVED]",), edit_start, timeout=0.2):
+                raise AssertionError(
+                    "typed passage was neither autosaved nor visibly unsaved; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-2200:]))
+                )
             save_request_offset = len(output)
             os.write(master, b"\x13")  # Ctrl+S
-            if not wait_for(b"[SAVED]", save_request_offset):
-                raise AssertionError("Ctrl+S did not produce visible saved feedback")
+            if not wait_for(b"Save Project As", save_request_offset):
+                raise AssertionError("first Ctrl+S did not open the permanent-location browser")
+            os.write(master, b"\x1b[15~")
+            if not wait_for_screen_fragments((b"Confirm Save Copy",), timeout=3.0):
+                raise AssertionError(
+                    "Save As did not request collision-safe confirmation; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-2200:]))
+                )
+            os.write(master, b"\x1b[15~")
+            if not wait_for_screen_fragments((b"Saved project at",), timeout=3.0):
+                raise AssertionError("temporary project did not promote to the chosen location")
             os.write(master, b"\x11")  # Ctrl+Q
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0
@@ -1549,7 +1565,9 @@ def main():
                     "Navigate > Outline did not show the non-fiction section tree; visible tail: "
                     + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
                 )
-            os.write(master, b"\x1b[B")  # select the populated child heading
+            # The outline restores selection on the owned prose row; move to
+            # its section heading before testing structural removal.
+            os.write(master, b"\x1b[A")
             read_for(0.2)
             dialog_start = len(output)
             os.write(master, b"\x1b[3~")
@@ -1560,7 +1578,7 @@ def main():
             ):
                 raise AssertionError(
                     "non-fiction section removal did not preview direct heading prose; visible tail: "
-                    + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
+                    + "\n".join(terminal_snapshot(output, 24, 80))
                 )
             if section_removal_rehome:
                 if not wait_for_screen_fragments(

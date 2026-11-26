@@ -1038,6 +1038,8 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "scene.create",
         "document.new-content-unit",
         "document.write-selected-chapter",
+        "edit.insert-date",
+        "edit.insert-time",
         "edit.insert-date-time",
         "edit.insert-file",
         "edit.insert-special-character",
@@ -1533,6 +1535,27 @@ struct EditorPreferences {
     rendered_markdown: bool,
     #[serde(default)]
     recent_special_characters: Vec<String>,
+    #[serde(default = "default_date_format")]
+    date_format: String,
+    #[serde(default = "default_custom_date_format")]
+    custom_date_format: String,
+    #[serde(default = "default_time_format")]
+    time_format: String,
+    #[serde(default = "default_time_zone")]
+    time_zone: String,
+}
+
+fn default_date_format() -> String {
+    "auto".into()
+}
+fn default_custom_date_format() -> String {
+    "dd/MM/yyyy".into()
+}
+fn default_time_format() -> String {
+    "auto".into()
+}
+fn default_time_zone() -> String {
+    "local".into()
 }
 
 impl Default for EditorPreferences {
@@ -1544,6 +1567,10 @@ impl Default for EditorPreferences {
             show_formatting_marks: false,
             rendered_markdown: false,
             recent_special_characters: Vec::new(),
+            date_format: default_date_format(),
+            custom_date_format: default_custom_date_format(),
+            time_format: default_time_format(),
+            time_zone: default_time_zone(),
         }
     }
 }
@@ -1661,6 +1688,8 @@ enum CommandAction {
     UppercaseText,
     LowercaseText,
     TitleCaseText,
+    InsertDate,
+    InsertTime,
     InsertDateTime,
     InsertFile,
     OpenSpecialCharacterPicker,
@@ -2914,9 +2943,39 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::TitleCaseText,
         },
         CommandSpec {
+            id: "edit.insert-date",
+            label: "Insert Date",
+            description: "Insert today's date using the project date format",
+            category: "Insert",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["insert current date"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Insertion",
+            menu_priority: 10,
+            advanced: false,
+            action: CommandAction::InsertDate,
+        },
+        CommandSpec {
+            id: "edit.insert-time",
+            label: "Insert Time",
+            description: "Insert the current local time using the project time format",
+            category: "Insert",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["insert current time"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Editor Insertion",
+            menu_priority: 11,
+            advanced: false,
+            action: CommandAction::InsertTime,
+        },
+        CommandSpec {
             id: "edit.insert-date-time",
-            label: "Insert Date/Time",
-            description: "Insert the current UTC date and time at the manuscript cursor",
+            label: "Insert Date and Time",
+            description: "Insert the current date and time using project formats",
             category: "Insert",
             default_shortcuts: &[],
             mnemonic: None,
@@ -2924,7 +2983,7 @@ fn command_registry() -> Vec<CommandSpec> {
             palette_prefix: None,
             takes_arguments: false,
             task_group: "Editor Insertion",
-            menu_priority: 10,
+            menu_priority: 12,
             advanced: false,
             action: CommandAction::InsertDateTime,
         },
@@ -5906,6 +5965,17 @@ fn validate_editor_preferences(
     {
         return Err("editor preferences require line_ending=lf|crlf, indentation=tabs|spaces, and indent_width=1..8".into());
     }
+    if !matches!(
+        preferences.date_format.as_str(),
+        "auto" | "en-GB" | "en-US" | "european" | "korean" | "iso" | "long" | "custom"
+    ) || !matches!(
+        preferences.time_format.as_str(),
+        "auto" | "12-hour" | "24-hour"
+    ) || !matches!(preferences.time_zone.as_str(), "local" | "utc")
+        || validate_custom_date_format(&preferences.custom_date_format).is_err()
+    {
+        return Err("date/time preferences require a supported date format, time format, timezone and valid custom date pattern".into());
+    }
     if preferences.recent_special_characters.len() > 12
         || preferences
             .recent_special_characters
@@ -5926,6 +5996,257 @@ fn validate_editor_preferences(
         );
     }
     Ok(())
+}
+
+fn validate_custom_date_format(pattern: &str) -> Result<(), String> {
+    if pattern.is_empty() || pattern.len() > 64 {
+        return Err("custom date format must contain 1 to 64 characters".into());
+    }
+    let mut index = 0;
+    let mut has_year = false;
+    let mut has_month = false;
+    let mut has_day = false;
+    while index < pattern.len() {
+        let remaining = &pattern[index..];
+        let token = ["yyyy", "MMMM", "MMM", "yy", "MM", "dd", "M", "d"]
+            .into_iter()
+            .find(|token| remaining.starts_with(token));
+        if let Some(token) = token {
+            match token {
+                "yyyy" | "yy" => has_year = true,
+                "MMMM" | "MMM" | "MM" | "M" => has_month = true,
+                "dd" | "d" => has_day = true,
+                _ => {}
+            }
+            index += token.len();
+        } else {
+            let character = remaining.chars().next().expect("non-empty remainder");
+            if character.is_ascii_alphanumeric() || character.is_control() {
+                return Err(format!(
+                    "unsupported custom date format token near '{character}'"
+                ));
+            }
+            index += character.len_utf8();
+        }
+    }
+    if !has_year || !has_month || !has_day {
+        return Err("custom date format must include year, month and day".into());
+    }
+    Ok(())
+}
+
+fn format_date_pattern(date: time::Date, pattern: &str, locale: &str) -> String {
+    let year = date.year();
+    let month = date.month() as u8;
+    let day = date.day();
+    let month_names = match locale {
+        "fr" => [
+            "janvier",
+            "février",
+            "mars",
+            "avril",
+            "mai",
+            "juin",
+            "juillet",
+            "août",
+            "septembre",
+            "octobre",
+            "novembre",
+            "décembre",
+        ],
+        "de" => [
+            "Januar",
+            "Februar",
+            "März",
+            "April",
+            "Mai",
+            "Juni",
+            "Juli",
+            "August",
+            "September",
+            "Oktober",
+            "November",
+            "Dezember",
+        ],
+        "it" => [
+            "gennaio",
+            "febbraio",
+            "marzo",
+            "aprile",
+            "maggio",
+            "giugno",
+            "luglio",
+            "agosto",
+            "settembre",
+            "ottobre",
+            "novembre",
+            "dicembre",
+        ],
+        "es" => [
+            "enero",
+            "febrero",
+            "marzo",
+            "abril",
+            "mayo",
+            "junio",
+            "julio",
+            "agosto",
+            "septiembre",
+            "octubre",
+            "noviembre",
+            "diciembre",
+        ],
+        _ => [
+            "January",
+            "February",
+            "March",
+            "April",
+            "May",
+            "June",
+            "July",
+            "August",
+            "September",
+            "October",
+            "November",
+            "December",
+        ],
+    };
+    let mut result = String::new();
+    let mut index = 0;
+    while index < pattern.len() {
+        let remaining = &pattern[index..];
+        if remaining.starts_with("yyyy") {
+            result.push_str(&format!("{year:04}"));
+            index += 4;
+        } else if remaining.starts_with("MMMM") {
+            result.push_str(month_names[usize::from(month - 1)]);
+            index += 4;
+        } else if remaining.starts_with("MMM") {
+            let name = month_names[usize::from(month - 1)];
+            result.push_str(name.chars().take(3).collect::<String>().as_str());
+            index += 3;
+        } else if remaining.starts_with("yy") {
+            result.push_str(&format!("{:02}", year.rem_euclid(100)));
+            index += 2;
+        } else if remaining.starts_with("MM") {
+            result.push_str(&format!("{month:02}"));
+            index += 2;
+        } else if remaining.starts_with("dd") {
+            result.push_str(&format!("{day:02}"));
+            index += 2;
+        } else if remaining.starts_with('M') {
+            result.push_str(&month.to_string());
+            index += 1;
+        } else if remaining.starts_with('d') {
+            result.push_str(&day.to_string());
+            index += 1;
+        } else {
+            let character = remaining.chars().next().expect("non-empty remainder");
+            result.push(character);
+            index += character.len_utf8();
+        }
+    }
+    result
+}
+
+fn system_date_locale() -> &'static str {
+    let locale = ["LC_ALL", "LC_TIME", "LANG"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.is_empty())
+        .unwrap_or_default();
+    let language = locale
+        .split(['.', '@'])
+        .next()
+        .unwrap_or_default()
+        .replace('-', "_");
+    if language.ends_with("_US") {
+        "en-US"
+    } else if language.starts_with("ko") {
+        "ko"
+    } else if language.starts_with("fr") {
+        "fr"
+    } else if language.starts_with("de") {
+        "de"
+    } else if language.starts_with("it") {
+        "it"
+    } else if language.starts_with("es") {
+        "es"
+    } else {
+        "en-GB"
+    }
+}
+
+fn effective_date_pattern(preferences: &EditorPreferences, locale: &str) -> String {
+    match preferences.date_format.as_str() {
+        "en-GB" => "dd/MM/yyyy".into(),
+        "en-US" => "MM/dd/yyyy".into(),
+        "european" => "dd.MM.yyyy".into(),
+        "korean" => "yyyy.MM.dd".into(),
+        "iso" => "yyyy-MM-dd".into(),
+        "long" if locale == "en-US" => "MMMM d, yyyy".into(),
+        "long" if locale == "ko" => "yyyy년 M월 d일".into(),
+        "long" if locale == "fr" => "d MMMM yyyy".into(),
+        "long" if locale == "de" => "d. MMMM yyyy".into(),
+        "long" if locale == "it" || locale == "es" => "d MMMM yyyy".into(),
+        "long" => "d MMMM yyyy".into(),
+        "custom" => preferences.custom_date_format.clone(),
+        _ if locale == "en-US" => "MM/dd/yyyy".into(),
+        _ if locale == "ko" => "yyyy.MM.dd".into(),
+        _ if matches!(locale, "fr" | "de" | "it" | "es") => "dd.MM.yyyy".into(),
+        _ => "dd/MM/yyyy".into(),
+    }
+}
+
+fn format_insert_date_time(
+    now: time::OffsetDateTime,
+    preferences: &EditorPreferences,
+    locale: &str,
+    local_offset: Option<time::UtcOffset>,
+    kind: DateTimeInsertion,
+) -> Result<String, String> {
+    let utc = preferences.time_zone == "utc";
+    let timestamp = if utc {
+        now.to_offset(time::UtcOffset::UTC)
+    } else if let Some(offset) = local_offset {
+        now.to_offset(offset)
+    } else {
+        now.to_offset(time::UtcOffset::UTC)
+    };
+    let date_pattern = effective_date_pattern(preferences, locale);
+    let date = format_date_pattern(timestamp.date(), &date_pattern, locale);
+    let use_twelve_hour = match preferences.time_format.as_str() {
+        "12-hour" => true,
+        "24-hour" => false,
+        _ => locale == "en-US",
+    };
+    let hour = timestamp.hour();
+    let time = if use_twelve_hour {
+        let suffix = if hour < 12 { "am" } else { "pm" };
+        format!(
+            "{}:{:02} {suffix}",
+            match hour % 12 {
+                0 => 12,
+                value => value,
+            },
+            timestamp.minute()
+        )
+    } else {
+        format!("{hour:02}:{:02}", timestamp.minute())
+    };
+    let time = if utc { format!("{time} UTC") } else { time };
+    match kind {
+        DateTimeInsertion::Date => Ok(date),
+        DateTimeInsertion::Time => Ok(time),
+        DateTimeInsertion::DateAndTime => Ok(format!("{date} {time}")),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DateTimeInsertion {
+    Date,
+    Time,
+    DateAndTime,
 }
 
 fn formatting_line_marker(line: &str, next_line: Option<&str>) -> Option<&'static str> {
@@ -6220,6 +6541,285 @@ fn user_tutorial_project_path() -> PathBuf {
     data_root.join("writers-ide/tutorial/sample-project")
 }
 
+const STAGED_PROJECT_MARKER: &str = ".writers-ide/staging.json";
+const STAGED_PROMOTION_INTENT: &str = ".writers-ide/promotion.json";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StagedProjectMarker {
+    version: u32,
+    created_at: i64,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct StagedPromotionIntent {
+    version: u32,
+    destination: PathBuf,
+    project_id: String,
+}
+
+#[cfg(not(test))]
+fn application_data_root() -> PathBuf {
+    if cfg!(target_os = "windows") {
+        return std::env::var_os("LOCALAPPDATA")
+            .or_else(|| std::env::var_os("APPDATA"))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("WIDE");
+    }
+    if cfg!(target_os = "macos") {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("Library/Application Support/WIDE");
+    }
+    std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from(".local/share"))
+        .join("writers-ide")
+}
+
+#[cfg(test)]
+fn staged_projects_root() -> PathBuf {
+    let test_name = std::thread::current()
+        .name()
+        .unwrap_or("unnamed-test")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '-' {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    std::env::temp_dir().join(format!(
+        "writers-ide-staging-tests-{}-{test_name}",
+        std::process::id()
+    ))
+}
+
+#[cfg(not(test))]
+fn staged_projects_root() -> PathBuf {
+    application_data_root().join("staging")
+}
+
+fn set_private_directory_permissions(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn is_staged_project(path: &Path) -> bool {
+    path.join(STAGED_PROJECT_MARKER).is_file()
+}
+
+fn write_staged_project_marker(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let marker_path = path.join(STAGED_PROJECT_MARKER);
+    set_private_directory_permissions(path)?;
+    if let Some(parent) = marker_path.parent() {
+        fs::create_dir_all(parent)?;
+        set_private_directory_permissions(parent)?;
+    }
+    let value = serde_json::to_value(StagedProjectMarker {
+        version: 1,
+        created_at: time::OffsetDateTime::now_utc().unix_timestamp(),
+    })?;
+    write_json_atomically(&marker_path, &value)
+}
+
+fn reconcile_staged_promotions() -> (Vec<PathBuf>, Vec<String>) {
+    reconcile_staged_promotions_from(&staged_projects_root())
+}
+
+fn reconcile_staged_promotions_from(root: &Path) -> (Vec<PathBuf>, Vec<String>) {
+    let mut promoted = Vec::new();
+    let mut conflicts = Vec::new();
+    let Ok(entries) = fs::read_dir(root) else {
+        return (promoted, conflicts);
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let staged = entry.path();
+        let intent_path = staged.join(STAGED_PROMOTION_INTENT);
+        if !staged.is_dir() || !is_staged_project(&staged) || !intent_path.is_file() {
+            continue;
+        }
+        let intent = match fs::read(&intent_path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| {
+                serde_json::from_slice::<StagedPromotionIntent>(&bytes)
+                    .map_err(|error| error.to_string())
+            }) {
+            Ok(intent) if intent.version == 1 => intent,
+            Ok(_) => {
+                conflicts.push(format!(
+                    "A staged project at {} has an unsupported Save As recovery record; its files were preserved",
+                    staged.display()
+                ));
+                continue;
+            }
+            Err(error) => {
+                conflicts.push(format!(
+                    "A staged project at {} has an unreadable Save As recovery record ({error}); its files were preserved",
+                    staged.display()
+                ));
+                continue;
+            }
+        };
+        if !intent.destination.exists() {
+            if let Err(error) = fs::remove_file(&intent_path) {
+                conflicts.push(format!(
+                    "The interrupted Save As for {} could not be cleared ({error}); the staged project remains available",
+                    staged.display()
+                ));
+            }
+            continue;
+        }
+        let source_id = WriterApp::open_project(&staged)
+            .and_then(|app| app.get_project().map(|project| project.id.to_string()));
+        let destination_id = WriterApp::open_project(&intent.destination)
+            .and_then(|app| app.get_project().map(|project| project.id.to_string()));
+        match (source_id, destination_id) {
+            (Ok(source_id), Ok(destination_id))
+                if source_id == destination_id && source_id == intent.project_id =>
+            {
+                match fs::remove_dir_all(&staged) {
+                    Ok(()) => promoted.push(intent.destination),
+                    Err(error) => conflicts.push(format!(
+                        "The saved project is available at {}, but temporary recovery data remains at {} ({error})",
+                        intent.destination.display(), staged.display()
+                    )),
+                }
+            }
+            _ => conflicts.push(format!(
+                "Save As recovery found different or unreadable projects at {} and {}; both were preserved for review",
+                staged.display(), intent.destination.display()
+            )),
+        }
+    }
+    (promoted, conflicts)
+}
+
+fn create_staged_project_directory(title: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    let root = staged_projects_root();
+    fs::create_dir_all(&root)?;
+    set_private_directory_permissions(&root)?;
+    let stem = safe_filename(title);
+    for _ in 0..8 {
+        let path = root.join(format!("{}-{stem}", uuid::Uuid::new_v4()));
+        match fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err("could not allocate a unique temporary working-project folder".into())
+}
+
+fn allocate_staged_project_path(title: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    fs::create_dir_all(staged_projects_root())?;
+    Ok(staged_projects_root().join(format!("{}-{}", uuid::Uuid::new_v4(), safe_filename(title))))
+}
+
+fn recoverable_staged_projects() -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(staged_projects_root()) else {
+        return Vec::new();
+    };
+    let mut paths = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_dir() && path.join("project.toml").is_file() && is_staged_project(path)
+        })
+        .collect::<Vec<_>>();
+    paths.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    paths.reverse();
+    paths
+}
+
+fn mark_staged_project_for_discard(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    if !is_staged_project(path) {
+        return Ok(());
+    }
+    let marker = path.join(".writers-ide/discard-on-exit");
+    if let Some(parent) = marker.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = fs::File::create(marker)?;
+    use std::io::Write;
+    file.write_all(b"discard requested by author\n")?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn cleanup_staged_project_discards() -> Vec<String> {
+    let Ok(entries) = fs::read_dir(staged_projects_root()) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.is_dir() && path.join(".writers-ide/discard-on-exit").is_file()).then_some(path)
+        })
+        .filter_map(|path| {
+            fs::remove_dir_all(&path)
+                .err()
+                .map(|error| format!("{}: {error}", path.display()))
+        })
+        .collect()
+}
+
+fn cleanup_incomplete_staged_projects() -> Vec<String> {
+    cleanup_incomplete_staged_projects_from(&staged_projects_root())
+}
+
+fn cleanup_incomplete_staged_projects_from(root: &Path) -> Vec<String> {
+    let Ok(root_metadata) = fs::symlink_metadata(root) else {
+        return Vec::new();
+    };
+    if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+        return vec![format!(
+            "WIDE staging location {} is not a safe directory; incomplete work was left untouched",
+            root.display()
+        )];
+    }
+    let Ok(entries) = fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path).ok()?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let is_wide_transaction = name.starts_with(".tmp")
+                || name
+                    .get(..36)
+                    .filter(|_| name.as_bytes().get(36) == Some(&b'-'))
+                    .is_some_and(|prefix| uuid::Uuid::parse_str(prefix).is_ok());
+            (metadata.is_dir()
+                && !metadata.file_type().is_symlink()
+                && is_wide_transaction
+                && !is_staged_project(&path))
+            .then_some(path)
+        })
+        .filter_map(|path| {
+            fs::remove_dir_all(&path)
+                .err()
+                .map(|error| format!("{}: {error}", path.display()))
+        })
+        .collect()
+}
+
 fn load_recent_projects(path: &Path) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let file = match fs::read(path) {
         Ok(bytes) => serde_json::from_slice::<RecentProjectsFile>(&bytes)?,
@@ -6250,6 +6850,19 @@ fn remember_recent_project(
     paths.retain(|path| path != &project_path);
     paths.insert(0, project_path);
     paths.truncate(12);
+    let value = serde_json::to_value(RecentProjectsFile { version: 1, paths })?;
+    write_json_atomically(store_path, &value)
+}
+
+fn forget_recent_project(
+    store_path: &Path,
+    project_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let project_path = project_path
+        .canonicalize()
+        .unwrap_or_else(|_| project_path.to_owned());
+    let mut paths = load_recent_projects(store_path)?;
+    paths.retain(|path| path != &project_path);
     let value = serde_json::to_value(RecentProjectsFile { version: 1, paths })?;
     write_json_atomically(store_path, &value)
 }
@@ -9157,12 +9770,12 @@ impl AppState {
         let fallback = std::env::current_dir()?;
         let current_dir = match purpose {
             FileBrowserPurpose::Compile(_) => self.app.project_root().to_owned(),
+            FileBrowserPurpose::NewProject => staged_projects_root(),
             FileBrowserPurpose::SaveProjectAs => std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .filter(|path| path.is_dir())
                 .unwrap_or(fallback),
-            FileBrowserPurpose::NewProject
-            | FileBrowserPurpose::OpenProject
+            FileBrowserPurpose::OpenProject
             | FileBrowserPurpose::OpenTextFile
             | FileBrowserPurpose::InsertFile
             | FileBrowserPurpose::ImportDocument
@@ -9177,6 +9790,9 @@ impl AppState {
                 .filter(|path| path.is_dir())
                 .unwrap_or(fallback),
         };
+        if purpose == FileBrowserPurpose::NewProject {
+            fs::create_dir_all(&current_dir)?;
+        }
         let name = match purpose {
             FileBrowserPurpose::NewProject => "My Novel".to_owned(),
             FileBrowserPurpose::SaveProjectAs => self
@@ -9220,7 +9836,11 @@ impl AppState {
             entries,
             selected: 0,
             tree_selected,
-            focus: 0,
+            focus: if purpose == FileBrowserPurpose::NewProject {
+                2
+            } else {
+                0
+            },
             name,
             folder_name,
             folder_name_overridden: false,
@@ -9232,7 +9852,7 @@ impl AppState {
             preview_scroll: 0,
         });
         self.message = if purpose == FileBrowserPurpose::NewProject {
-            "Choose a parent, project title and folder · Tab to Book type · Enter selects and creates".into()
+            "Temporary workspace is stored privately by WIDE · enter a title and choose Fiction or Non-fiction · Save later to choose a permanent location".into()
         } else if purpose == FileBrowserPurpose::SaveProjectAs {
             "Choose a parent folder and new project folder name · existing projects are never overwritten".into()
         } else if matches!(
@@ -9287,11 +9907,50 @@ impl AppState {
                 "the destination already exists; Writer's IDE never overwrites a project".into(),
             );
         }
-        let staging = tempfile::tempdir()?;
+        let source = self.app.project_root().to_owned();
+        let resume_scene = self.editing_scene;
+        let resume_content_unit = self.editing_content_unit;
+        let resume_workspace = self.workspace;
+        let resume_cursor = self.cursor;
+        let parent = destination
+            .parent()
+            .ok_or("choose a destination inside a parent folder")?;
+        fs::create_dir_all(parent)?;
+        let source_canonical = source.canonicalize()?;
+        let parent_canonical = parent.canonicalize()?;
+        let destination_leaf = destination
+            .file_name()
+            .ok_or("choose a valid project folder name")?;
+        let resolved_destination = parent_canonical.join(destination_leaf);
+        if resolved_destination.starts_with(&source_canonical) {
+            return Err("choose a permanent location outside the current working project".into());
+        }
+        let promoting_staged_project = is_staged_project(&source);
+        if promoting_staged_project {
+            let intent = serde_json::to_value(StagedPromotionIntent {
+                version: 1,
+                destination: resolved_destination.clone(),
+                project_id: self.app.get_project()?.id.to_string(),
+            })?;
+            write_json_atomically(&source.join(STAGED_PROMOTION_INTENT), &intent)?;
+        }
+        let staging = tempfile::tempdir_in(parent)?;
         let archive = staging.path().join("project.writers-ide.zip");
         self.save_session()?;
         self.app.backup_project_archive(&archive)?;
-        WriterApp::restore_project_archive(&archive, destination)?;
+        let prepared = staging.path().join("project");
+        WriterApp::restore_project_archive(&archive, &prepared)?;
+        if promoting_staged_project {
+            fs::remove_file(prepared.join(STAGED_PROJECT_MARKER))?;
+            let copied_intent = prepared.join(STAGED_PROMOTION_INTENT);
+            if copied_intent.is_file() {
+                fs::remove_file(copied_intent)?;
+            }
+        }
+        let copied = WriterApp::open_project(&prepared)?;
+        copied.validate_project()?;
+        fs::rename(&prepared, destination)?;
+        fs::File::open(parent)?.sync_all()?;
         let copied = WriterApp::open_project(destination)?;
         copied.validate_project()?;
         self.switch_to_open_project(
@@ -9302,6 +9961,26 @@ impl AppState {
                 destination.display()
             ),
         )?;
+        if let Some(scene) = resume_scene {
+            self.open_scene(scene)?;
+        } else if let Some(content_unit) = resume_content_unit {
+            self.open_content_unit(content_unit)?;
+        } else {
+            self.switch(resume_workspace);
+        }
+        self.cursor.0 = resume_cursor.0.min(self.editor.len().saturating_sub(1));
+        self.cursor.1 = resume_cursor
+            .1
+            .min(grapheme_count(&self.editor[self.cursor.0]));
+        self.message = format!("Saved project at {}", destination.display());
+        if is_staged_project(&source)
+            && let Err(error) = fs::remove_dir_all(&source)
+        {
+            self.message = format!(
+                "Project saved permanently; temporary recovery data remains at {} and can be removed later: {error}",
+                source.display()
+            );
+        }
         Ok(())
     }
 
@@ -9315,6 +9994,13 @@ impl AppState {
         let key = if browser.purpose == FileBrowserPurpose::NewProject && key.code == KeyCode::Enter
         {
             match browser.focus {
+                2 => {
+                    browser.focus = 4;
+                    self.message =
+                        "Choose Fiction or Non-fiction · Enter selects the book type".into();
+                    self.file_browser = Some(browser);
+                    return Ok(());
+                }
                 4 => KeyEvent::new(KeyCode::F(2), key.modifiers),
                 5 => KeyEvent::new(KeyCode::F(5), key.modifiers),
                 6 => KeyEvent::new(KeyCode::Esc, key.modifiers),
@@ -9467,24 +10153,26 @@ impl AppState {
                     self.message = "File selection cancelled".into();
                 }
             }
-            KeyCode::Tab => {
-                let focus_count = if browser.purpose == FileBrowserPurpose::NewProject {
-                    7
-                } else {
-                    3
+            KeyCode::Tab if browser.purpose == FileBrowserPurpose::NewProject => {
+                browser.focus = match browser.focus {
+                    2 => 4,
+                    4 => 5,
+                    5 => 6,
+                    _ => 2,
                 };
-                browser.focus = (browser.focus + 1) % focus_count;
             }
-            KeyCode::BackTab => {
-                let focus_count = if browser.purpose == FileBrowserPurpose::NewProject {
-                    7
-                } else {
-                    3
+            KeyCode::BackTab if browser.purpose == FileBrowserPurpose::NewProject => {
+                browser.focus = match browser.focus {
+                    2 => 6,
+                    4 => 2,
+                    5 => 4,
+                    _ => 5,
                 };
-                browser.focus = (browser.focus + focus_count - 1) % focus_count;
             }
+            KeyCode::Tab => browser.focus = (browser.focus + 1) % 3,
+            KeyCode::BackTab => browser.focus = (browser.focus + 2) % 3,
             KeyCode::Up => {
-                if browser.focus == 0 {
+                if browser.focus == 0 && browser.purpose != FileBrowserPurpose::NewProject {
                     browser.tree_selected = browser.tree_selected.saturating_sub(1);
                     browser.overwrite_confirmed = false;
                 } else if browser.focus == 1 && !browser.entries.is_empty() {
@@ -9493,7 +10181,7 @@ impl AppState {
                 }
             }
             KeyCode::Down => {
-                if browser.focus == 0 {
+                if browser.focus == 0 && browser.purpose != FileBrowserPurpose::NewProject {
                     browser.tree_selected = (browser.tree_selected + 1).min(
                         file_browser_ancestors(&browser.current_dir)
                             .len()
@@ -9505,7 +10193,9 @@ impl AppState {
                     browser.overwrite_confirmed = false;
                 }
             }
-            KeyCode::Home if browser.focus == 0 => {
+            KeyCode::Home
+                if browser.focus == 0 && browser.purpose != FileBrowserPurpose::NewProject =>
+            {
                 if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
                     && home.is_dir()
                 {
@@ -9609,19 +10299,27 @@ impl AppState {
             {
                 browser.focus = 2;
                 browser.overwrite_confirmed = false;
-                self.message = format!(
-                    "Selected parent folder {} · enter a project name",
-                    browser.current_dir.display()
-                );
+                self.message = if browser.purpose == FileBrowserPurpose::NewProject {
+                    "Enter the book title · WIDE chooses temporary storage automatically".into()
+                } else {
+                    format!(
+                        "Selected parent folder {} · enter a project name",
+                        browser.current_dir.display()
+                    )
+                };
             }
-            KeyCode::Char('/') if browser.focus == 0 => {
+            KeyCode::Char('/')
+                if browser.focus == 0 && browser.purpose != FileBrowserPurpose::NewProject =>
+            {
                 let root = PathBuf::from(std::path::MAIN_SEPARATOR.to_string());
                 match set_file_browser_directory(&mut browser, root) {
                     Ok(()) => browser.overwrite_confirmed = false,
                     Err(error) => self.message = format!("Could not open filesystem root: {error}"),
                 }
             }
-            KeyCode::Enter if browser.focus == 0 => {
+            KeyCode::Enter
+                if browser.focus == 0 && browser.purpose != FileBrowserPurpose::NewProject =>
+            {
                 let ancestors = file_browser_ancestors(&browser.current_dir);
                 if let Some(path) = ancestors.get(browser.tree_selected).cloned() {
                     match set_file_browser_directory(&mut browser, path) {
@@ -9632,11 +10330,6 @@ impl AppState {
             }
             KeyCode::Enter
                 if browser.purpose == FileBrowserPurpose::NewProject && browser.focus == 2 =>
-            {
-                browser.focus = 3;
-            }
-            KeyCode::Enter
-                if browser.purpose == FileBrowserPurpose::NewProject && browser.focus == 3 =>
             {
                 browser.focus = 4;
             }
@@ -9656,7 +10349,9 @@ impl AppState {
                     }
                 }
             }
-            KeyCode::Backspace | KeyCode::Left if browser.focus != 2 => {
+            KeyCode::Backspace | KeyCode::Left
+                if browser.focus != 2 && browser.purpose != FileBrowserPurpose::NewProject =>
+            {
                 if let Some(parent) = browser.current_dir.parent().map(Path::to_owned) {
                     match set_file_browser_directory(&mut browser, parent) {
                         Ok(()) => browser.overwrite_confirmed = false,
@@ -9666,7 +10361,9 @@ impl AppState {
                     }
                 }
             }
-            KeyCode::Enter if browser.focus == 1 => {
+            KeyCode::Enter
+                if browser.focus == 1 && browser.purpose != FileBrowserPurpose::NewProject =>
+            {
                 if let Some((name, is_dir)) = browser.entries.get(browser.selected).cloned() {
                     if is_dir {
                         let path = browser.current_dir.join(name);
@@ -9702,7 +10399,7 @@ impl AppState {
                     }
                 }
             }
-            KeyCode::F(7) => {
+            KeyCode::F(7) if browser.purpose != FileBrowserPurpose::NewProject => {
                 let folder = browser.name.trim();
                 if !file_browser_leaf_name_is_safe(folder) {
                     self.message = "Enter a valid folder name before pressing F7".into();
@@ -9728,18 +10425,25 @@ impl AppState {
             }
             KeyCode::F(5) => {
                 let name = browser.name.trim();
-                if !matches!(
-                    browser.purpose,
-                    FileBrowserPurpose::OpenProject
-                        | FileBrowserPurpose::OpenTextFile
-                        | FileBrowserPurpose::InsertFile
-                        | FileBrowserPurpose::ImportDocument
-                        | FileBrowserPurpose::ImportScrivenerSource
-                        | FileBrowserPurpose::ImportScrivenerCurrent
-                        | FileBrowserPurpose::ImportScrivenerSeries
-                ) && !file_browser_leaf_name_is_safe(name)
+                if (browser.purpose == FileBrowserPurpose::NewProject && name.is_empty())
+                    || (browser.purpose != FileBrowserPurpose::NewProject
+                        && !matches!(
+                            browser.purpose,
+                            FileBrowserPurpose::OpenProject
+                                | FileBrowserPurpose::OpenTextFile
+                                | FileBrowserPurpose::InsertFile
+                                | FileBrowserPurpose::ImportDocument
+                                | FileBrowserPurpose::ImportScrivenerSource
+                                | FileBrowserPurpose::ImportScrivenerCurrent
+                                | FileBrowserPurpose::ImportScrivenerSeries
+                        )
+                        && !file_browser_leaf_name_is_safe(name))
                 {
-                    self.message = "Enter a valid name".into();
+                    self.message = if browser.purpose == FileBrowserPurpose::NewProject {
+                        "Enter a book title before continuing".into()
+                    } else {
+                        "Enter a valid name".into()
+                    };
                     self.file_browser = Some(browser);
                     return Ok(());
                 }
@@ -9985,21 +10689,8 @@ impl AppState {
                         }
                     }
                     FileBrowserPurpose::NewProject => {
-                        let folder_name = browser.folder_name.trim();
-                        if !file_browser_leaf_name_is_safe(folder_name) {
-                            self.message = "Enter a valid project folder name".into();
-                            self.file_browser = Some(browser);
-                            return Ok(());
-                        }
-                        let destination = browser.current_dir.join(folder_name);
                         if self.dirty || self.active_challenge.is_some() {
                             self.message = "Save or finish the active writing session before creating a project".into();
-                            self.file_browser = Some(browser);
-                            return Ok(());
-                        }
-                        if fs::symlink_metadata(&destination).is_ok() {
-                            self.message =
-                                "That project folder already exists; choose another name".into();
                             self.file_browser = Some(browser);
                             return Ok(());
                         }
@@ -10008,23 +10699,23 @@ impl AppState {
                             self.file_browser = Some(browser);
                             return Ok(());
                         };
-                        if let Err(error) = fs::create_dir(&destination) {
-                            self.message = format!(
-                                "Could not create project folder {}: {error}",
-                                destination.display()
-                            );
-                            self.file_browser = Some(browser);
-                            return Ok(());
-                        }
+                        let destination = create_staged_project_directory(name)?;
                         if let Err(error) =
                             WriterApp::create_project_with_type(&destination, name, book_type)
                         {
-                            let _ = fs::remove_dir(&destination);
+                            let _ = fs::remove_dir_all(&destination);
                             self.message = format!("Project creation failed: {error}");
                             return Ok(());
                         }
-                        let created_message =
-                            format!("Created and opened {name} in {}", destination.display());
+                        if let Err(error) = write_staged_project_marker(&destination) {
+                            let _ = fs::remove_dir_all(&destination);
+                            self.message =
+                                format!("Could not mark the working project for recovery: {error}");
+                            return Ok(());
+                        }
+                        let created_message = format!(
+                            "Created {name} in WIDE's temporary workspace · edit now, then Save to choose a permanent location"
+                        );
                         self.switch_to_project(destination, created_message)?;
                         self.switch(match book_type {
                             story_core::BookType::Fiction => Workspace::Cards,
@@ -10431,7 +11122,7 @@ impl AppState {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let recent_projects_path = self.recent_projects_path.clone();
         let mut next = Self::new(app, function_bindings);
-        next.temporary_project = false;
+        next.temporary_project = is_staged_project(&path);
         next.recent_projects_path = recent_projects_path.clone();
         next.command_bindings = command_bindings;
         next.context_command_bindings = context_command_bindings;
@@ -10490,11 +11181,9 @@ impl AppState {
         source: PathBuf,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let inventory = story_import::inspect_scrivener_project(&source)?;
-        let folder_name = format!("{} (Writer's IDE)", safe_filename(&inventory.title));
-        let series_root = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .filter(|path| path.is_dir())
-            .unwrap_or(std::env::current_dir()?);
+        let folder_name = safe_filename(&inventory.title);
+        let series_root = staged_projects_root();
+        fs::create_dir_all(&series_root)?;
         let plan = story_import::ScrivenerImportPlan::proposed(&inventory);
         let item_count = inventory.items.len();
         let preview = plan.preview(&inventory)?;
@@ -10505,7 +11194,7 @@ impl AppState {
         self.scrivener_import = Some(ScrivenerImportWizard {
             series_root,
             folder_name,
-            destination_selected: false,
+            destination_selected: true,
             book_title,
             target: ScrivenerImportTarget::Standalone,
             inventory,
@@ -10515,7 +11204,7 @@ impl AppState {
         self.selected = 0;
         self.workspace = Workspace::Series;
         self.message = format!(
-            "Import preview: {item_count} binder items · {} manuscript · {} private research · {} review notes · Enter choose destination · Esc cancel",
+            "Import preview: {item_count} binder items · {} manuscript · {} private research · {} review notes · Enter imports to WIDE temporary storage · Save later chooses a permanent location · Esc cancel",
             preview.manuscript_items,
             preview.research_items,
             preview.unsupported.len()
@@ -10657,9 +11346,6 @@ impl AppState {
             .scrivener_import
             .as_ref()
             .ok_or("no Scrivener import preview is open")?;
-        if wizard.target == ScrivenerImportTarget::Standalone && !wizard.destination_selected {
-            return Err("choose a writable destination folder before importing".into());
-        }
         wizard
             .plan
             .validate_for_import(&wizard.inventory)
@@ -10671,14 +11357,6 @@ impl AppState {
                 preview.unresolved_source_ids.len()
             )
             .into());
-        }
-        if wizard.target == ScrivenerImportTarget::Standalone {
-            validate_scrivener_destination(
-                &wizard.inventory,
-                &wizard.series_root,
-                &wizard.folder_name,
-            )
-            .map_err(|error| error.to_owned())?;
         }
         let series_root = wizard.series_root.clone();
         let target = wizard.target;
@@ -10716,14 +11394,26 @@ impl AppState {
             );
             return Ok(());
         }
-        let destination = series_root.join(&folder_name);
+        let destination = if target == ScrivenerImportTarget::Standalone {
+            allocate_staged_project_path(&title)?
+        } else {
+            series_root.join(&folder_name)
+        };
         if destination.exists() {
             return Err(
                 "book folder appeared after preview; import cancelled without overwriting it"
                     .into(),
             );
         }
-        let staging = tempfile::tempdir_in(&series_root)?;
+        let staging_parent = if target == ScrivenerImportTarget::Standalone {
+            let root = staged_projects_root();
+            fs::create_dir_all(&root)?;
+            set_private_directory_permissions(&root)?;
+            root
+        } else {
+            series_root.clone()
+        };
+        let staging = tempfile::tempdir_in(&staging_parent)?;
         let staging_project = staging.path().join("book");
         let mut app = WriterApp::create_project_from_scrivener_inventory(
             &staging_project,
@@ -10748,6 +11438,9 @@ impl AppState {
             &staging_project.join("exports/scrivener-import-report.json"),
             &report,
         )?;
+        if target == ScrivenerImportTarget::Standalone {
+            write_staged_project_marker(&staging_project)?;
+        }
         let project_id = app.get_project()?.id;
         drop(app);
         fs::rename(&staging_project, &destination)?;
@@ -10767,7 +11460,11 @@ impl AppState {
             (target == ScrivenerImportTarget::Series).then_some(series_root);
         self.switch_to_project(
             destination,
-            if target == ScrivenerImportTarget::Series {
+            if target == ScrivenerImportTarget::Standalone {
+                format!(
+                    "Imported {title} into WIDE's temporary workspace · edit now, then Save to choose a permanent location"
+                )
+            } else if target == ScrivenerImportTarget::Series {
                 format!("Imported {title} into the selected series")
             } else {
                 format!("Imported {title} as a new Writer's IDE project")
@@ -15927,6 +16624,8 @@ impl AppState {
             CommandAction::UppercaseText => self.transform_text_case("upper"),
             CommandAction::LowercaseText => self.transform_text_case("lower"),
             CommandAction::TitleCaseText => self.transform_text_case("title"),
+            CommandAction::InsertDate => self.insert_current_date(),
+            CommandAction::InsertTime => self.insert_current_time(),
             CommandAction::InsertDateTime => self.insert_current_datetime(),
             CommandAction::InsertFile => self.start_file_browser(FileBrowserPurpose::InsertFile)?,
             CommandAction::OpenSpecialCharacterPicker => self.open_special_character_picker(),
@@ -16133,6 +16832,8 @@ impl AppState {
             );
         }
         self.save_session()?;
+        let discarded_stage =
+            is_staged_project(self.app.project_root()).then(|| self.app.project_root().to_owned());
         let _closed_scratch_guard = self.scratch_guard.take();
         let scratch = tempfile::Builder::new()
             .prefix("writers-ide-startup-")
@@ -16153,6 +16854,20 @@ impl AppState {
         next.help_panel = Some(welcome_panel(tutorial_active));
         next.message = "Project closed · choose New Project, Open Project, Recent Projects, Import, or a tutorial".into();
         *self = next;
+        if let Some(path) = discarded_stage.as_deref() {
+            if let Err(error) = fs::remove_dir_all(path) {
+                self.message = format!(
+                    "Project closed, but temporary data could not be removed and remains recoverable at {}: {error}",
+                    path.display()
+                );
+            } else if let Some(recent_path) = self.recent_projects_path.as_deref()
+                && let Err(error) = forget_recent_project(recent_path, path)
+            {
+                self.message = format!(
+                    "Temporary project was discarded, but its Recent Projects entry could not be removed: {error}"
+                );
+            }
+        }
         Ok(())
     }
     fn prompt_for_registered_command(
@@ -17578,14 +18293,27 @@ impl AppState {
             let mut parts = value.split_whitespace();
             match parts
                 .next()
-                .ok_or("use editor-preferences show|line-ending|indentation|indent-width")?
+                .ok_or("use editor-preferences show|line-ending|indentation|indent-width|date-format|custom-date-format|time-format|time-zone")?
             {
                 "show" if parts.next().is_none() => {
+                    let preview = format_insert_date_time(
+                        time::OffsetDateTime::now_utc(),
+                        &self.editor_preferences,
+                        system_date_locale(),
+                        time::UtcOffset::current_local_offset().ok(),
+                        DateTimeInsertion::DateAndTime,
+                    )
+                    .unwrap_or_else(|_| "unavailable".into());
                     self.message = format!(
-                        "line-ending={} · indentation={} · indent-width={}",
+                        "line-ending={} · indentation={} · indent-width={} · date-format={} · custom-date-format={} · time-format={} · time-zone={} · preview={}",
                         self.editor_preferences.line_ending,
                         self.editor_preferences.indentation,
-                        self.editor_preferences.indent_width
+                        self.editor_preferences.indent_width,
+                        self.editor_preferences.date_format,
+                        self.editor_preferences.custom_date_format,
+                        self.editor_preferences.time_format,
+                        self.editor_preferences.time_zone,
+                        preview,
                     );
                 }
                 "line-ending" => {
@@ -17600,9 +18328,37 @@ impl AppState {
                     self.editor_preferences.indent_width =
                         parts.next().ok_or("choose a width from 1 to 8")?.parse()?;
                 }
+                "date-format" => {
+                    self.editor_preferences.date_format = parts
+                        .next()
+                        .ok_or("choose auto, en-GB, en-US, european, korean, iso, long or custom")?
+                        .to_owned();
+                }
+                "custom-date-format" => {
+                    let pattern = parts.clone().collect::<Vec<_>>().join(" ");
+                    if pattern.is_empty() {
+                        return Err("enter a pattern such as dd/MM/yyyy or d MMM yyyy".into());
+                    }
+                    validate_custom_date_format(&pattern)?;
+                    self.editor_preferences.custom_date_format = pattern;
+                    self.editor_preferences.date_format = "custom".into();
+                    parts.by_ref().for_each(drop);
+                }
+                "time-format" => {
+                    self.editor_preferences.time_format = parts
+                        .next()
+                        .ok_or("choose auto, 12-hour or 24-hour")?
+                        .to_owned();
+                }
+                "time-zone" => {
+                    self.editor_preferences.time_zone = parts
+                        .next()
+                        .ok_or("choose local or utc")?
+                        .to_owned();
+                }
                 _ => {
                     return Err(
-                        "use editor-preferences show|line-ending|indentation|indent-width".into(),
+                        "use editor-preferences show|line-ending|indentation|indent-width|date-format|custom-date-format|time-format|time-zone".into(),
                     );
                 }
             }
@@ -17611,7 +18367,7 @@ impl AppState {
             }
             save_editor_preferences(self.app.project_root(), &self.editor_preferences)?;
             if !value.starts_with("show") {
-                self.message = "Saved project editor preferences; existing text changes on the next scene save".into();
+                self.message = "Saved project editor preferences".into();
             }
         } else if let Some(name) = cmd.strip_prefix("manuscript-bookmark-save ") {
             let name = name.trim();
@@ -23294,10 +24050,40 @@ impl AppState {
             true
         }
     }
+    fn insert_current_date(&mut self) {
+        self.insert_formatted_date_time(DateTimeInsertion::Date);
+    }
+
+    fn insert_current_time(&mut self) {
+        self.insert_formatted_date_time(DateTimeInsertion::Time);
+    }
+
     fn insert_current_datetime(&mut self) {
+        self.insert_formatted_date_time(DateTimeInsertion::DateAndTime);
+    }
+
+    fn insert_formatted_date_time(&mut self, kind: DateTimeInsertion) {
         let now = time::OffsetDateTime::now_utc();
-        let stamp = format!("{} {} UTC", now.date(), now.time());
-        self.insert_text_undoably(&stamp, "Inserted current date and time");
+        let local_offset = time::UtcOffset::current_local_offset().ok();
+        let locale = system_date_locale();
+        match format_insert_date_time(now, &self.editor_preferences, locale, local_offset, kind) {
+            Ok(value) => {
+                let label = match kind {
+                    DateTimeInsertion::Date => "Inserted date",
+                    DateTimeInsertion::Time => "Inserted time",
+                    DateTimeInsertion::DateAndTime => "Inserted date and time",
+                };
+                let inserted = self.insert_text_undoably(&value, label);
+                if inserted
+                    && self.editor_preferences.time_zone == "local"
+                    && local_offset.is_none()
+                {
+                    self.message
+                        .push_str(" · local timezone unavailable; used UTC");
+                }
+            }
+            Err(error) => self.message = format!("Date/time could not be formatted: {error}"),
+        }
     }
     fn delete_selected_text(&mut self) {
         if self.selected_text().is_none() {
@@ -24082,8 +24868,24 @@ fn open_default_manuscript_if_unrestored(
     state: &mut AppState,
     has_saved_session: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if !has_saved_session && let Some(scene) = state.scenes.first().map(|scene| scene.0) {
-        state.open_scene(scene)?;
+    if !has_saved_session {
+        if let Some(scene) = state.scenes.first().map(|scene| scene.0) {
+            state.open_scene(scene)?;
+        } else if let Some(unit) = state
+            .app
+            .list_content_units(false)?
+            .first()
+            .map(|unit| unit.id)
+        {
+            state.open_content_unit(unit)?;
+        } else {
+            state.switch(match state.app.get_project()?.book_type {
+                story_core::BookType::Fiction => Workspace::Cards,
+                story_core::BookType::Nonfiction | story_core::BookType::Custom => {
+                    Workspace::Outline
+                }
+            });
+        }
     }
     Ok(())
 }
@@ -24158,8 +24960,20 @@ fn thesaurus_data_path_from(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let (project_path, startup_scratch) =
-        prepare_startup_project(env::args().nth(1).map(Into::into))?;
+    let incomplete_cleanup_failures = cleanup_incomplete_staged_projects();
+    let discard_cleanup_failures = cleanup_staged_project_discards();
+    let (completed_promotions, promotion_conflicts) = reconcile_staged_promotions();
+    let recoverable_stages = recoverable_staged_projects();
+    let explicit_project = env::args().nth(1).map(Into::into);
+    let (project_path, startup_scratch) = if explicit_project.is_none() {
+        if let Some(path) = completed_promotions.last() {
+            (path.clone(), None)
+        } else {
+            prepare_startup_project(None)?
+        }
+    } else {
+        prepare_startup_project(explicit_project)?
+    };
     let (function_bindings, function_warning) = load_bindings_or_default(&project_path);
     let (command_bindings, command_warning) = load_command_bindings_or_default(&project_path);
     let (context_command_bindings, context_command_warning) =
@@ -24167,7 +24981,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = WriterApp::open_project(&project_path)?;
     app.recover_interrupted_writing_challenges()?;
     let mut state = AppState::new(app, function_bindings);
-    state.temporary_project = startup_scratch.is_some();
+    state.temporary_project = startup_scratch.is_some() || is_staged_project(&project_path);
     let recent_projects_path = user_recent_projects_path();
     state.recent_projects_path = Some(recent_projects_path.clone());
     state.command_bindings = command_bindings;
@@ -24189,12 +25003,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>()
         .join(" · ");
     }
+    if startup_scratch.is_none() && is_staged_project(&project_path) {
+        for staged in recoverable_stages.iter().rev() {
+            if let Err(error) = remember_recent_project(&recent_projects_path, staged) {
+                state.message = format!(
+                    "Recovered work is open; another staged project could not be added to Recent Projects: {error}"
+                );
+                break;
+            }
+        }
+        if state.message.is_empty() {
+            state.message = "Recovered your temporary working project · it is saved locally and can be continued or saved to a permanent location".into();
+        } else {
+            state.message = format!(
+                "Recovered your temporary working project · {}",
+                state.message
+            );
+        }
+    }
+    if !discard_cleanup_failures.is_empty() {
+        state.message = format!(
+            "{} · A previously discarded temporary project could not be removed: {}",
+            state.message,
+            discard_cleanup_failures.join("; ")
+        );
+    }
+    if !incomplete_cleanup_failures.is_empty() {
+        state.message = format!(
+            "{} · Incomplete temporary work could not be cleaned up: {}",
+            state.message,
+            incomplete_cleanup_failures.join("; ")
+        )
+        .trim_start_matches(" · ")
+        .to_owned();
+    }
+    if !completed_promotions.is_empty() {
+        let path = completed_promotions.last().expect("non-empty above");
+        state.message = format!(
+            "Recovered a completed Save As at {} · the permanent copy is open",
+            path.display()
+        );
+    }
+    if !promotion_conflicts.is_empty() {
+        state.message = format!("{} · {}", state.message, promotion_conflicts.join(" · "))
+            .trim_start_matches(" · ")
+            .to_owned();
+    }
     let has_saved_session = state.session_path().exists();
     state.restore_session()?;
     state.refresh()?;
     open_default_manuscript_if_unrestored(&mut state, has_saved_session)?;
     let onboarding_path = user_tutorial_preferences_path();
     match onboarding::load(&onboarding_path) {
+        Ok(preferences) if is_staged_project(&project_path) => {
+            if let Some(progress) = preferences.active_tutorial.as_ref() {
+                state.help_panel = Some(tutorial_panel_at(
+                    progress.track,
+                    progress.step,
+                    &onboarding_path,
+                ));
+            }
+        }
         Ok(preferences) if startup_scratch.is_some() => {
             state.help_panel = Some(welcome_panel(preferences.active_tutorial.is_some()));
             state.message = "Start screen · choose New Project, Open Project, Recent Projects, Import, or a tutorial".into();
@@ -24213,6 +25082,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = setup()?;
     let result = run(&mut terminal, &mut state);
     restore(&mut terminal)?;
+    drop(state);
+    for failure in cleanup_staged_project_discards() {
+        eprintln!("Could not remove discarded temporary project: {failure}");
+    }
     result
 }
 
@@ -24220,6 +25093,9 @@ fn prepare_startup_project(
     explicit_path: Option<std::path::PathBuf>,
 ) -> Result<(std::path::PathBuf, Option<tempfile::TempDir>), Box<dyn std::error::Error>> {
     if let Some(path) = explicit_path {
+        return Ok((path, None));
+    }
+    if let Some(path) = recoverable_staged_projects().into_iter().next() {
         return Ok((path, None));
     }
     let scratch = tempfile::Builder::new()
@@ -24627,7 +25503,9 @@ fn scrivener_import_detail(
     message: &str,
 ) -> String {
     let preview = wizard.plan.preview(&wizard.inventory).ok();
-    let destination = if wizard.destination_selected {
+    let destination = if wizard.target == ScrivenerImportTarget::Standalone {
+        "WIDE-managed temporary working storage; Save chooses a permanent location".to_owned()
+    } else if wizard.destination_selected {
         wizard
             .series_root
             .join(&wizard.folder_name)
@@ -26482,14 +27360,14 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     }
                 )
             } else if let Some(wizard) = s.scrivener_import.as_ref() {
-                if wizard.target == ScrivenerImportTarget::Standalone
-                    && !wizard.destination_selected
-                {
-                    " Enter Choose Destination · ←/→ Advanced Mapping · Esc Cancel".to_owned()
+                let destination = if wizard.target == ScrivenerImportTarget::Standalone {
+                    "WIDE temporary workspace"
                 } else {
-                    " Enter Import · ←/→ Advanced Mapping · Space Include/Exclude · Esc Cancel"
-                        .to_owned()
-                }
+                    "selected project"
+                };
+                format!(
+                    " Enter Import to {destination} · ←/→ Advanced Mapping · Space Include/Exclude · Esc Cancel"
+                )
             } else if s.workspace == Workspace::Cards {
                 format!(
                     " {} · {}",
@@ -26614,15 +27492,14 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             };
             let menu_hint = display_shortcut_label(effective_shortcut_label(s, "menu.main", "F10"));
             let actions = if let Some(wizard) = s.scrivener_import.as_ref() {
-                if wizard.target == ScrivenerImportTarget::Standalone
-                    && !wizard.destination_selected
-                {
-                    "↑↓ Select · Enter Choose Destination · Esc Cancel · ←/→ Advanced Mapping"
-                        .to_owned()
+                let destination = if wizard.target == ScrivenerImportTarget::Standalone {
+                    "temporary working project"
                 } else {
-                    "Enter Import · Esc Cancel · ←/→ Advanced Mapping · Space Include/Exclude"
-                        .to_owned()
-                }
+                    "current project"
+                };
+                format!(
+                    "Enter Import to {destination} · Esc Cancel · ←/→ Mapping · Space Include/Exclude"
+                )
             } else if let Some(tutorial) = tutorial_footer_status(s) {
                 format!(
                     " Save {} · Esc: Outline · {tutorial}",
@@ -29191,7 +30068,9 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     };
     f.render_widget(Clear, popup);
     let purpose = match browser.purpose {
-        FileBrowserPurpose::NewProject => "New Project · choose parent folder and project name",
+        FileBrowserPurpose::NewProject => {
+            "New Project · choose book type and title; WIDE manages temporary storage"
+        }
         FileBrowserPurpose::SaveProjectAs => "Save Project As · create an independent project copy",
         FileBrowserPurpose::OpenProject => "Open Project · choose a Writer's IDE project folder",
         FileBrowserPurpose::OpenTextFile => "Open Text File · read-only reference",
@@ -29300,9 +30179,9 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         &mut ListState::default()
             .with_selected((!browser.entries.is_empty()).then_some(browser.selected)),
     );
-    let selected_path = if browser.purpose == FileBrowserPurpose::NewProject
-        || browser.purpose == FileBrowserPurpose::ImportScrivenerDestination
-    {
+    let selected_path = if browser.purpose == FileBrowserPurpose::NewProject {
+        staged_projects_root()
+    } else if browser.purpose == FileBrowserPurpose::ImportScrivenerDestination {
         browser.current_dir.join(&browser.folder_name)
     } else if matches!(
         browser.purpose,
@@ -29321,8 +30200,15 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         browser.current_dir.join(&browser.name)
     };
     f.render_widget(
-        Paragraph::new(format!("Selected path: {}", selected_path.display()))
-            .wrap(Wrap { trim: true }),
+        Paragraph::new(if browser.purpose == FileBrowserPurpose::NewProject {
+            format!(
+                "WIDE-managed temporary storage: {} · permanent location chosen when you Save",
+                selected_path.display()
+            )
+        } else {
+            format!("Selected path: {}", selected_path.display())
+        })
+        .wrap(Wrap { trim: true }),
         chunks[1],
     );
     let title_label = if browser.purpose == FileBrowserPurpose::NewProject {
@@ -29341,12 +30227,8 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     );
     if browser.purpose == FileBrowserPurpose::NewProject {
         f.render_widget(
-            Paragraph::new(format!(
-                "Project folder: {}{}",
-                browser.folder_name,
-                if browser.focus == 3 { "▏" } else { "" }
-            ))
-            .style(Style::default().fg(Color::Yellow)),
+            Paragraph::new("Temporary project folder will be assigned automatically")
+                .style(Style::default().fg(Color::Yellow)),
             chunks[3],
         );
         let book_type = match browser.new_project_book_type {
@@ -29427,8 +30309,8 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         )
     } else if browser.purpose == FileBrowserPurpose::NewProject {
         (
-            "Tab: choose controls · Enter: activate · Esc: cancel · F-keys are optional",
-            "Choose a book type, then Create Project · current folder is the parent",
+            "Tab: title → book type → Create → Cancel · Enter activates · Esc cancels",
+            "WIDE saves a private working copy now; first Save asks where to keep the project",
         )
     } else if browser.purpose == FileBrowserPurpose::SaveProjectAs {
         (
@@ -33458,6 +34340,21 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     return Ok(true);
                 }
                 KeyCode::Char('d' | 'D') => {
+                    if let Err(error) = mark_staged_project_for_discard(s.app.project_root()) {
+                        s.message = format!(
+                            "Temporary project was not discarded; it remains available for recovery: {error}"
+                        );
+                        return Ok(false);
+                    }
+                    if is_staged_project(s.app.project_root())
+                        && let Some(recent_path) = s.recent_projects_path.as_deref()
+                        && let Err(error) = forget_recent_project(recent_path, s.app.project_root())
+                    {
+                        s.message = format!(
+                            "The project is marked for discard, but its Recent Projects entry could not be removed: {error}"
+                        );
+                        return Ok(false);
+                    }
                     s.mode = None;
                     s.message =
                         "Quit without saving; the existing on-disk manuscript was left unchanged"
@@ -34224,19 +35121,6 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.message =
                     "Scrivener import preview cancelled; the source and series were not changed"
                         .into();
-                return Ok(false);
-            }
-            KeyCode::Enter
-                if s.scrivener_import.as_ref().is_some_and(|wizard| {
-                    wizard.target == ScrivenerImportTarget::Standalone
-                        && !wizard.destination_selected
-                }) =>
-            {
-                if let Err(error) =
-                    s.start_file_browser(FileBrowserPurpose::ImportScrivenerDestination)
-                {
-                    s.message = format!("Could not choose an import destination: {error}");
-                }
                 return Ok(false);
             }
             KeyCode::Left => {
@@ -35422,46 +36306,18 @@ mod tests {
         )
         .unwrap();
         assert!(state.file_browser.is_some());
-        {
-            let browser = state.file_browser.as_mut().unwrap();
-            browser.current_dir = root.path().to_owned();
-            browser.entries = file_browser_entries(root.path()).unwrap();
-        }
+        state.file_browser.as_mut().unwrap().name = "A New Project".into();
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE))
-            .unwrap();
-        for _ in 0.."My Novel".chars().count() {
-            state
-                .handle_file_browser_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
-                .unwrap();
-        }
-        for character in "A New Project".chars() {
-            state
-                .handle_file_browser_key(KeyEvent::new(
-                    KeyCode::Char(character),
-                    KeyModifiers::NONE,
-                ))
-                .unwrap();
-        }
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
             .unwrap();
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
 
         assert_eq!(state.app.get_project().unwrap().title, "A New Project");
-        assert_eq!(state.app.project_root(), root.path().join("A New Project"));
-        assert!(state.message.contains("Created and opened A New Project"));
+        assert!(state.app.project_root().starts_with(staged_projects_root()));
+        assert!(is_staged_project(state.app.project_root()));
+        assert!(state.temporary_project);
         assert_eq!(
             state.app.get_project().unwrap().book_type,
             story_core::BookType::Fiction
@@ -35546,7 +36402,7 @@ mod tests {
     }
 
     #[test]
-    fn new_project_action_rejects_an_existing_directory_without_switching() {
+    fn new_project_does_not_overwrite_an_existing_directory() {
         let root = tempfile::tempdir().unwrap();
         let current = WriterApp::create_project(root.path().join("Current"), "Current").unwrap();
         let target_path = root.path().join("Existing");
@@ -35557,10 +36413,7 @@ mod tests {
             .unwrap();
         {
             let browser = state.file_browser.as_mut().unwrap();
-            browser.current_dir = root.path().to_owned();
-            browser.entries = file_browser_entries(root.path()).unwrap();
             browser.name = "Existing".into();
-            browser.folder_name = "Existing".into();
         }
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
@@ -35569,8 +36422,9 @@ mod tests {
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
 
-        assert_eq!(state.app.get_project().unwrap().title, "Current");
-        assert!(state.message.contains("already exists"));
+        assert_eq!(state.app.get_project().unwrap().title, "Existing");
+        assert!(state.app.project_root().starts_with(staged_projects_root()));
+        assert_ne!(state.app.project_root(), target_path);
         assert_eq!(
             WriterApp::open_project(&target_path)
                 .unwrap()
@@ -36570,20 +37424,12 @@ mod tests {
             .plan
             .validate_for_import(&wizard.inventory)
             .expect("automatic mapping should preserve and validate the full binder");
-        let (parent, destination) = validate_scrivener_destination(
-            &wizard.inventory,
-            root.path(),
-            "Windows Regression (Writer's IDE)",
-        )
-        .unwrap();
-        assert_eq!(
-            destination,
-            root.path().join("Windows Regression (Writer's IDE)")
+        assert!(wizard.destination_selected);
+        assert!(
+            state
+                .message
+                .contains("Save later chooses a permanent location")
         );
-        let wizard = state.scrivener_import.as_mut().unwrap();
-        wizard.series_root = parent;
-        wizard.folder_name = "Windows Regression (Writer's IDE)".into();
-        wizard.destination_selected = true;
         state.commit_scrivener_import().unwrap();
 
         assert_eq!(state.app.get_project().unwrap().title, "Windows Regression");
@@ -36611,6 +37457,7 @@ mod tests {
                 .join("exports/scrivener-import-report.json")
                 .is_file()
         );
+        assert!(is_staged_project(state.app.project_root()));
         assert!(story_series::SeriesStore::open_for_book(state.app.project_root()).is_err());
     }
 
@@ -39272,6 +40119,46 @@ mod tests {
         assert_eq!(reopened.editor_preferences.line_ending, "crlf");
         assert_eq!(reopened.editor_preferences.indentation, "spaces");
         assert_eq!(reopened.editor_preferences.indent_width, 2);
+    }
+
+    #[test]
+    fn project_date_time_preferences_validate_preview_and_survive_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let project =
+            WriterApp::create_project(root.path().join("Date Format"), "Date Format").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state
+            .execute_legacy_palette_command("editor-preferences date-format custom")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("editor-preferences custom-date-format d MMM yy")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("editor-preferences time-format 12-hour")
+            .unwrap();
+        state
+            .execute_legacy_palette_command("editor-preferences time-zone utc")
+            .unwrap();
+        assert!(
+            state
+                .execute_legacy_palette_command("editor-preferences show")
+                .is_ok()
+        );
+        assert!(state.message.contains("preview="));
+        assert!(
+            state
+                .execute_legacy_palette_command("editor-preferences custom-date-format dd/QQ/yyyy")
+                .is_err()
+        );
+
+        let reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        assert_eq!(reopened.editor_preferences.date_format, "custom");
+        assert_eq!(reopened.editor_preferences.custom_date_format, "d MMM yy");
+        assert_eq!(reopened.editor_preferences.time_format, "12-hour");
+        assert_eq!(reopened.editor_preferences.time_zone, "utc");
     }
 
     #[test]
@@ -51713,6 +52600,7 @@ mod tests {
             "[core]\nrepositoryformatversion = 0\n",
         )
         .unwrap();
+        let git_config = fs::read(temporary_root.join(".git/config")).unwrap();
         fs::create_dir_all(temporary_root.join("attachments")).unwrap();
         fs::write(
             temporary_root.join("attachments/research.txt"),
@@ -51721,6 +52609,7 @@ mod tests {
         .unwrap();
         fs::create_dir_all(temporary_root.join("templates/empty-nested")).unwrap();
         fs::create_dir_all(temporary_root.join("exports")).unwrap();
+        write_staged_project_marker(&temporary_root).unwrap();
 
         let mut state = AppState::new(project, default_bindings());
         state.temporary_project = true;
@@ -51773,16 +52662,115 @@ mod tests {
         );
         assert_eq!(
             fs::read(destination.join(".git/config")).unwrap(),
-            fs::read(temporary_root.join(".git/config")).unwrap()
+            git_config
         );
+        assert!(!destination.join(STAGED_PROJECT_MARKER).exists());
+        assert!(!destination.join(STAGED_PROMOTION_INTENT).exists());
         assert!(destination.join("templates/empty-nested").is_dir());
         assert!(destination.join("exports").is_dir());
-        assert!(temporary_root.join("project.toml").is_file());
+        assert!(
+            !temporary_root.exists(),
+            "successful promotion removes staged copy"
+        );
         let reopened = WriterApp::open_project(&destination).unwrap();
         assert_eq!(
             reopened.load_scene_text(scene).unwrap().0,
             "Beginning with saved changes."
         );
+    }
+
+    #[test]
+    fn interrupted_save_as_reopens_the_verified_permanent_copy_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_root = directory.path().join("staging");
+        fs::create_dir(&staging_root).unwrap();
+        let staged = staging_root.join("working-copy");
+        let mut app = WriterApp::create_project(&staged, "Recovered Copy").unwrap();
+        let project_id = app.get_project().unwrap().id.to_string();
+        write_staged_project_marker(&staged).unwrap();
+        let destination = directory.path().join("permanent");
+        let archive = directory.path().join("project.zip");
+        app.backup_project_archive(&archive).unwrap();
+        WriterApp::restore_project_archive(&archive, &destination).unwrap();
+        fs::remove_file(destination.join(STAGED_PROJECT_MARKER)).unwrap();
+        let intent = serde_json::to_value(StagedPromotionIntent {
+            version: 1,
+            destination: destination.clone(),
+            project_id,
+        })
+        .unwrap();
+        write_json_atomically(&staged.join(STAGED_PROMOTION_INTENT), &intent).unwrap();
+
+        let (promoted, conflicts) = reconcile_staged_promotions_from(&staging_root);
+
+        assert_eq!(promoted, vec![destination.clone()]);
+        assert!(conflicts.is_empty());
+        assert!(!staged.exists());
+        assert_eq!(
+            WriterApp::open_project(destination)
+                .unwrap()
+                .get_project()
+                .unwrap()
+                .title,
+            "Recovered Copy"
+        );
+    }
+
+    #[test]
+    fn interrupted_save_as_preserves_both_projects_when_identity_conflicts() {
+        let directory = tempfile::tempdir().unwrap();
+        let staging_root = directory.path().join("staging");
+        fs::create_dir(&staging_root).unwrap();
+        let staged = staging_root.join("working-copy");
+        let staged_app = WriterApp::create_project(&staged, "Working Copy").unwrap();
+        write_staged_project_marker(&staged).unwrap();
+        let destination = directory.path().join("existing");
+        WriterApp::create_project(&destination, "Unrelated Project").unwrap();
+        let intent = serde_json::to_value(StagedPromotionIntent {
+            version: 1,
+            destination: destination.clone(),
+            project_id: staged_app.get_project().unwrap().id.to_string(),
+        })
+        .unwrap();
+        write_json_atomically(&staged.join(STAGED_PROMOTION_INTENT), &intent).unwrap();
+
+        let (promoted, conflicts) = reconcile_staged_promotions_from(&staging_root);
+
+        assert!(promoted.is_empty());
+        assert_eq!(conflicts.len(), 1);
+        assert!(staged.join("project.toml").is_file());
+        assert_eq!(
+            WriterApp::open_project(destination)
+                .unwrap()
+                .get_project()
+                .unwrap()
+                .title,
+            "Unrelated Project"
+        );
+    }
+
+    #[test]
+    fn startup_cleanup_removes_only_uncommitted_wide_staging_directories() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("staging");
+        fs::create_dir(&root).unwrap();
+        let incomplete = root.join(format!("{}-partial", uuid::Uuid::new_v4()));
+        fs::create_dir(&incomplete).unwrap();
+        fs::write(incomplete.join("partial.db"), b"unfinished").unwrap();
+        let unrelated = root.join("author-folder");
+        fs::create_dir(&unrelated).unwrap();
+        let recovered = root.join(format!("{}-saved", uuid::Uuid::new_v4()));
+        fs::create_dir(&recovered).unwrap();
+        WriterApp::create_project(&recovered, "Saved Work").unwrap();
+        write_staged_project_marker(&recovered).unwrap();
+
+        let failures = cleanup_incomplete_staged_projects_from(&root);
+
+        assert!(failures.is_empty());
+        assert!(!incomplete.exists());
+        assert!(unrelated.exists());
+        assert!(recovered.join("project.toml").is_file());
+        assert!(is_staged_project(&recovered));
     }
 
     #[test]
@@ -51853,7 +52841,7 @@ mod tests {
     }
 
     #[test]
-    fn new_project_browser_creates_project_inside_selected_parent() {
+    fn new_project_browser_creates_a_persistent_wide_managed_working_project() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("Projects");
         fs::create_dir(&root).unwrap();
@@ -51869,28 +52857,22 @@ mod tests {
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(4), KeyModifiers::NONE))
             .unwrap();
         assert_eq!(state.file_browser.as_ref().unwrap().focus, 2);
-        assert!(state.message.contains(&root.display().to_string()));
+        assert!(state.message.contains("temporary storage"));
         let browser = state.file_browser.as_mut().unwrap();
         browser.name = "New Novel".into();
         browser.folder_name = "Novel Files".into();
         browser.folder_name_overridden = true;
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
             .unwrap();
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            .unwrap();
-        assert_eq!(state.app.project_root(), root.join("Novel Files"));
-        assert!(root.join("Novel Files/project.toml").is_file());
+        let project_path = state.app.project_root().to_owned();
+        assert!(project_path.starts_with(staged_projects_root()));
+        assert!(project_path.join("project.toml").is_file());
+        assert!(is_staged_project(&project_path));
+        assert!(!root.join("Novel Files").exists());
         assert!(state.file_browser.is_none());
         assert_eq!(
             state.app.get_project().unwrap().book_type,
@@ -51917,27 +52899,8 @@ mod tests {
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
             .unwrap();
-        // Focus the visible Cancel action and activate it with Enter.
         state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
-            .unwrap();
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
 
         assert!(!directory.path().join("Cancelled Novel").exists());
@@ -51976,7 +52939,8 @@ mod tests {
             state.app.get_project().unwrap().book_type,
             story_core::BookType::Nonfiction
         );
-        assert_eq!(state.app.project_root(), directory.path().join("My Book"));
+        assert!(state.app.project_root().starts_with(staged_projects_root()));
+        assert!(is_staged_project(state.app.project_root()));
         assert_eq!(state.workspace, Workspace::Outline);
         assert!(state.app.list_scenes(false).unwrap().is_empty());
         assert!(state.app.list_content_units(false).unwrap().is_empty());
@@ -52051,16 +53015,16 @@ mod tests {
             .collect::<String>();
 
         assert!(rendered.contains("Directory tree"));
-        assert!(rendered.contains("Directory tree · focused"));
+        assert!(!rendered.contains("Directory tree · focused"));
         assert!(rendered.contains("Folder contents"));
-        assert!(rendered.contains("Selected path:"));
+        assert!(rendered.contains("WIDE-managed temporary storage:"));
         assert!(rendered.contains("Project title:"));
-        assert!(rendered.contains("Project folder:"));
+        assert!(rendered.contains("Temporary project folder"));
         assert!(rendered.contains("Book type: Choose Fiction or Non-fiction"));
         assert!(rendered.contains("F2 Change"));
         assert!(rendered.contains("Create Project"));
         assert!(rendered.contains("Cancel"));
-        assert!(rendered.contains("Tab: choose controls"));
+        assert!(rendered.contains("temporary"));
     }
 
     #[test]
@@ -52071,24 +53035,24 @@ mod tests {
         state
             .start_file_browser(FileBrowserPurpose::NewProject)
             .unwrap();
-        assert_eq!(state.file_browser.as_ref().unwrap().focus, 0);
+        assert_eq!(state.file_browser.as_ref().unwrap().focus, 2);
 
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
-        assert_eq!(state.file_browser.as_ref().unwrap().focus, 1);
+        assert_eq!(state.file_browser.as_ref().unwrap().focus, 4);
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
             .unwrap();
+        assert_eq!(state.file_browser.as_ref().unwrap().focus, 5);
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .unwrap();
+        assert_eq!(state.file_browser.as_ref().unwrap().focus, 4);
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
+            .unwrap();
         assert_eq!(state.file_browser.as_ref().unwrap().focus, 2);
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
-            .unwrap();
-        assert_eq!(state.file_browser.as_ref().unwrap().focus, 1);
-        state
-            .handle_file_browser_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT))
-            .unwrap();
-        assert_eq!(state.file_browser.as_ref().unwrap().focus, 0);
     }
 
     #[cfg(unix)]
@@ -52162,11 +53126,14 @@ mod tests {
             browser.name = "../Escaped".into();
         }
         state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .unwrap();
+        state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
             .unwrap();
         assert!(!directory.path().join("Escaped").exists());
-        assert!(state.file_browser.is_some());
-        assert!(state.message.contains("valid name"));
+        assert!(state.app.project_root().starts_with(staged_projects_root()));
+        assert!(is_staged_project(state.app.project_root()));
     }
 
     #[test]
@@ -52979,6 +53946,7 @@ mod tests {
         let mut state = AppState::new(app, default_bindings());
         state.open_scene(scene).unwrap();
         state.cursor = (0, "Opening".graphemes(true).count());
+        state.editor_preferences.time_zone = "utc".into();
         state.open_menu_category(2);
         let date_time = state
             .menu_visible_entries()
@@ -52996,6 +53964,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.editor.join("\n"), "Opening");
+
+        for (command_id, expected_label) in [
+            ("edit.insert-date", "Inserted date"),
+            ("edit.insert-time", "Inserted time"),
+        ] {
+            state.open_menu_category(2);
+            let selected = state
+                .menu_visible_entries()
+                .iter()
+                .position(|command| command.id == command_id)
+                .unwrap();
+            state.menu.as_mut().unwrap().selected = selected;
+            state
+                .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap();
+            assert!(state.message.contains(expected_label));
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL),
+            )
+            .unwrap();
+            assert_eq!(state.editor.join("\n"), "Opening");
+        }
 
         state.open_menu_category(2);
         let insert_file = state
@@ -53031,6 +54022,74 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.editor.join("\n"), "Opening");
+    }
+
+    #[test]
+    fn regional_date_time_formats_are_deterministic_and_custom_patterns_validate() {
+        let date = time::Date::from_calendar_date(2026, time::Month::November, 6).unwrap();
+        let stamp = date.with_hms(13, 5, 0).unwrap().assume_utc();
+        let mut preferences = EditorPreferences {
+            time_zone: "utc".into(),
+            ..EditorPreferences::default()
+        };
+        assert_eq!(
+            format_insert_date_time(
+                stamp,
+                &preferences,
+                "en-GB",
+                None,
+                DateTimeInsertion::DateAndTime
+            )
+            .unwrap(),
+            "06/11/2026 13:05 UTC"
+        );
+        preferences.date_format = "en-US".into();
+        preferences.time_format = "12-hour".into();
+        assert_eq!(
+            format_insert_date_time(
+                stamp,
+                &preferences,
+                "en-US",
+                None,
+                DateTimeInsertion::DateAndTime
+            )
+            .unwrap(),
+            "11/06/2026 1:05 pm UTC"
+        );
+        preferences.date_format = "european".into();
+        assert_eq!(
+            format_insert_date_time(stamp, &preferences, "de", None, DateTimeInsertion::Date)
+                .unwrap(),
+            "06.11.2026"
+        );
+        preferences.date_format = "korean".into();
+        assert_eq!(
+            format_insert_date_time(stamp, &preferences, "ko", None, DateTimeInsertion::Date)
+                .unwrap(),
+            "2026.11.06"
+        );
+        preferences.date_format = "iso".into();
+        assert_eq!(
+            format_insert_date_time(stamp, &preferences, "en-GB", None, DateTimeInsertion::Date)
+                .unwrap(),
+            "2026-11-06"
+        );
+        preferences.date_format = "long".into();
+        assert_eq!(
+            format_insert_date_time(stamp, &preferences, "fr", None, DateTimeInsertion::Date)
+                .unwrap(),
+            "6 novembre 2026"
+        );
+        preferences.date_format = "custom".into();
+        preferences.custom_date_format = "d MMM yy".into();
+        assert_eq!(
+            format_insert_date_time(stamp, &preferences, "en-GB", None, DateTimeInsertion::Date)
+                .unwrap(),
+            "6 Nov 26"
+        );
+        assert!(validate_custom_date_format("dd/MM/yyyy").is_ok());
+        assert!(validate_custom_date_format("yyyy-MM").is_err());
+        assert!(validate_custom_date_format("dd/MM/yyyy/QQ").is_err());
     }
 
     #[test]

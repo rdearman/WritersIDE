@@ -151,7 +151,19 @@ fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty(
 
     let inventory = story_import::inspect_scrivener_project(&source).unwrap();
     assert_eq!(inventory.source_fingerprint, source_fingerprint);
-    let destination = home.join(format!("{} (Writer's IDE)", inventory.title));
+    let expected_title = inventory.project_title().unwrap_or(&inventory.title);
+    let destination = std::fs::read_dir(&home)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.join("project.toml").is_file()
+                && WriterApp::open_project(path)
+                    .ok()
+                    .and_then(|app| app.get_project().ok())
+                    .is_some_and(|project| project.title == expected_title)
+        })
+        .expect("first Save should promote the staged import into the selected permanent location");
     let reopened = WriterApp::open_project(&destination).unwrap();
     let nodes = reopened.list_structural_nodes().unwrap();
     for expected in ["Part One", "Chapter One"] {
@@ -169,6 +181,51 @@ fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty(
     assert!(
         artifact.is_file(),
         "the visible compile workflow did not create {artifact:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn staged_working_project_recovers_after_an_abrupt_pty_exit() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("isolated-home");
+    let staged = home.join("data/writers-ide/staging").join("working-novel");
+    std::fs::create_dir_all(&staged).unwrap();
+    let mut app = WriterApp::create_project(&staged, "Working Novel").unwrap();
+    let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+    let scene = app.create_scene(chapter, "Recovery Opening", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "Recovery checkpoint.")
+        .unwrap();
+    std::fs::create_dir_all(staged.join(".writers-ide")).unwrap();
+    std::fs::write(
+        staged.join(".writers-ide/staging.json"),
+        serde_json::json!({"version": 1, "created_at": 1}).to_string(),
+    )
+    .unwrap();
+    drop(app);
+
+    let harness =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_staging_recovery.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&home)
+        .output()
+        .expect("run staged-work recovery through Linux PTY");
+    assert!(
+        result.status.success(),
+        "staged recovery PTY failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !staged.exists(),
+        "the explicit discard after recovery should remove only the staged project"
     );
 }
 
@@ -214,7 +271,19 @@ fn protected_arrowmaking_project_imports_through_the_production_pty_without_sour
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
-    let destination = home.join("0 Import (Writer's IDE)");
+    let expected_title = inventory.project_title().unwrap_or(&inventory.title);
+    let destination = std::fs::read_dir(&home)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.join("project.toml").is_file()
+                && WriterApp::open_project(path)
+                    .ok()
+                    .and_then(|app| app.get_project().ok())
+                    .is_some_and(|project| project.title == expected_title)
+        })
+        .expect("protected import should have a promoted permanent project");
     let reopened = WriterApp::open_project(&destination).unwrap();
     assert!(
         !reopened.list_structural_nodes().unwrap().is_empty(),
@@ -584,6 +653,12 @@ fn insert_date_time_and_file_work_through_the_real_insert_menu() {
     app.save_scene_text(scene, Some(&hash), "Opening paragraph.")
         .unwrap();
     drop(app);
+    std::fs::create_dir_all(project.join(".writers-ide")).unwrap();
+    std::fs::write(
+        project.join(".writers-ide/editor-preferences.toml"),
+        "[editor]\ntime_zone = \"utc\"\n",
+    )
+    .unwrap();
 
     if Command::new("python3").arg("--version").output().is_err() {
         eprintln!("skipping Linux PTY insertion workflow: python3 is unavailable");
