@@ -831,10 +831,13 @@ publication acceptance remains outstanding.
 The Review menu now exposes the existing offline spellcheck, grammar check and
 grammar settings commands directly. Spellcheck is categorised with Review and
 Proofreading & Diagnostics rather than Tools. Regression assertions verify both
-the command taxonomy and its visible inclusion in the curated Review menu.
-Focused terminal tests and terminal-package Clippy passed. This improves access
-to existing checks; offline dictionary definitions and thesaurus support remain
-unimplemented, and the menu workflow still needs human usability verification.
+the command taxonomy and its visible inclusion in the curated Review menu. A
+real Linux PTY check now opens Review at 80x24, sees all three actions, selects
+Spellcheck and verifies its prompt opens. The full terminal package passed:
+338 unit tests, 3 author workflow tests and 25 real PTY tests; formatting and
+terminal-package Clippy with warnings denied passed. This improves access to
+existing checks; offline dictionary definitions and thesaurus support remain
+unimplemented, and human menu usability verification remains outstanding.
 
 ## EPUB differential emphasis detail — implementation and targeted real comparison complete
 

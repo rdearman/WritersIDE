@@ -138,6 +138,7 @@ def main():
     special_character = modes == ["special-character"]
     named_layouts = modes == ["named-layouts"]
     edit_menu = modes == ["edit-menu"]
+    review_menu = modes == ["review-menu"]
     removed_scenes = modes == ["removed-scenes"]
     outline_view = modes == ["outline-view"]
     chapter_removal = modes in (
@@ -303,6 +304,43 @@ def main():
 
     try:
         read_for(1.0)
+        if review_menu:
+            os.write(master, b"\x1b")  # dismiss the visible first-run welcome
+            read_for(0.25)
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.2)
+            found_review = False
+            for _ in range(10):
+                if wait_for_screen_fragments((b"Spellcheck Manuscript",), menu_start, timeout=0.15):
+                    found_review = True
+                    break
+                os.write(master, b"\x1b[C")
+                read_for(0.1)
+            if not found_review:
+                raise AssertionError("Review menu did not expose Spellcheck Manuscript")
+            rows = terminal_snapshot(output, 24, 80)
+            for label in ("Grammar Check", "Grammar Settings"):
+                if not any(label in row for row in rows):
+                    raise AssertionError(f"Review menu did not visibly expose {label}; screen: {rows!r}")
+            select_visible_menu_item("Spellcheck Manuscript")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"spellcheck",), menu_start, timeout=2.0):
+                raise AssertionError("Review > Spellcheck did not open its command prompt")
+            os.write(master, b"\x1b")
+            read_for(0.2)
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after Review menu test")
+            print("PTY Review workflow passed: spellcheck and grammar actions are visible and keyboard-selectable.")
+            return
+
         if tutorial_navigation:
             if not wait_for_screen_fragments(
                 (b"Welcome to Writer's IDE", b"Guided Tour", b"Quick Start"), timeout=10.0

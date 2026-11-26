@@ -595,6 +595,41 @@ fn edit_menu_is_visible_and_selection_commands_dispatch_from_writing_mode_in_a_p
 
 #[cfg(target_os = "linux")]
 #[test]
+fn review_menu_exposes_spellcheck_and_grammar_actions_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Review Menu Project");
+    let mut app = WriterApp::create_project(&project, "Review Menu Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    app.create_scene(chapter, "Arrival", 0).unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY Review-menu workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("review-menu")
+        .output()
+        .expect("run the Linux PTY Review-menu workflow");
+    assert!(
+        result.status.success(),
+        "PTY Review-menu workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
     let _guard = lock_pty_test();
     use std::process::Command;
