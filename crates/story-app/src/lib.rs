@@ -920,6 +920,37 @@ impl WriterApp {
         };
         Self::create_project_with_metadata(path, &project)
     }
+
+    /// Create a standalone project from inspected Scrivener publication
+    /// metadata. Only explicitly present source values are carried over;
+    /// absent author or language fields remain unset/defaulted.
+    pub fn create_project_from_scrivener_inventory(
+        path: impl AsRef<Path>,
+        title: &str,
+        book_type: BookType,
+        inventory: &story_import::ScrivenerProjectInventory,
+    ) -> Result<Self> {
+        let preferences = Self::user_preferences()?;
+        let metadata_value = |names: &[&str]| inventory.metadata_value(names).map(str::to_owned);
+        let language_code = metadata_value(&["EbookLanguage", "Language"])
+            .filter(|value| is_valid_language_tag(value))
+            .unwrap_or(preferences.default_writing_language);
+        let project = Project {
+            id: ProjectId::new(),
+            title: title.to_owned(),
+            author: metadata_value(&["Author", "Authors", "FullName"]).unwrap_or_default(),
+            genre: metadata_value(&["Genre"]).unwrap_or_default(),
+            synopsis: metadata_value(&["Synopsis", "Description"]).unwrap_or_default(),
+            book_type,
+            template_id: None,
+            target_words: None,
+            story_epoch_label: "Day 0".into(),
+            story_calendar_id: None,
+            language_code,
+            word_count_policy: WordCountPolicy::default(),
+        };
+        Self::create_project_with_metadata(path, &project)
+    }
     pub fn create_project_from_template(
         path: impl AsRef<Path>,
         title: &str,
@@ -6110,6 +6141,57 @@ fn _storage_result(_: StorageResult<()>) {}
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn scrivener_project_metadata_populates_only_available_book_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let inventory = story_import::ScrivenerProjectInventory {
+            source_path: "source.scriv".into(),
+            source_fingerprint: "fingerprint".into(),
+            title: "Source folder".into(),
+            format_version: Some("2.0".into()),
+            creator: None,
+            project_metadata: std::collections::BTreeMap::from([
+                ("ProjectTitle".into(), "Metadata title".into()),
+                ("Author".into(), "Ada Example".into()),
+                ("EbookLanguage".into(), "fr-CA".into()),
+            ]),
+            compile_settings: None,
+            section_types: std::collections::BTreeMap::new(),
+            items: Vec::new(),
+            warnings: Vec::new(),
+            unsupported: Vec::new(),
+        };
+        assert_eq!(inventory.project_title(), Some("Metadata title"));
+        let project = dir.path().join("Imported");
+        let app = WriterApp::create_project_from_scrivener_inventory(
+            &project,
+            "Chosen title",
+            BookType::Fiction,
+            &inventory,
+        )
+        .unwrap();
+        let metadata = app.get_project().unwrap();
+        assert_eq!(metadata.title, "Chosen title");
+        assert_eq!(metadata.author, "Ada Example");
+        assert_eq!(metadata.language_code, "fr-CA");
+        drop(app);
+        let reopened = WriterApp::open_project(project).unwrap();
+        assert_eq!(reopened.get_project().unwrap().author, "Ada Example");
+
+        let inventory_without_author = story_import::ScrivenerProjectInventory {
+            project_metadata: std::collections::BTreeMap::new(),
+            ..inventory
+        };
+        let app = WriterApp::create_project_from_scrivener_inventory(
+            dir.path().join("No Author"),
+            "Untitled source",
+            BookType::Fiction,
+            &inventory_without_author,
+        )
+        .unwrap();
+        assert!(app.get_project().unwrap().author.is_empty());
+    }
 
     #[test]
     fn chronology_is_disabled_by_default_and_preferences_survive_reopen_and_relocation() {

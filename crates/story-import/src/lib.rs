@@ -423,6 +423,23 @@ pub struct ScrivenerProjectInventory {
     pub unsupported: Vec<String>,
 }
 
+impl ScrivenerProjectInventory {
+    /// Return a non-empty source metadata value by case-insensitive field name.
+    pub fn metadata_value(&self, names: &[&str]) -> Option<&str> {
+        self.project_metadata
+            .iter()
+            .find(|(key, value)| {
+                !value.trim().is_empty() && names.iter().any(|name| key.eq_ignore_ascii_case(name))
+            })
+            .map(|(_, value)| value.trim())
+    }
+
+    /// The compile title recorded in Scrivener metadata, if the author set it.
+    pub fn project_title(&self) -> Option<&str> {
+        self.metadata_value(&["ProjectTitle"])
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScrivenerCompileSettings {
     #[serde(default)]

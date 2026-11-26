@@ -10392,10 +10392,14 @@ impl AppState {
         }
         let plan = story_import::ScrivenerImportPlan::proposed(&inventory);
         let item_count = inventory.items.len();
+        let book_title = inventory
+            .project_title()
+            .unwrap_or(&inventory.title)
+            .to_owned();
         self.scrivener_import = Some(ScrivenerImportWizard {
             series_root,
             folder_name,
-            book_title: inventory.title.clone(),
+            book_title,
             target: ScrivenerImportTarget::Standalone,
             inventory,
             plan,
@@ -10458,8 +10462,12 @@ impl AppState {
             }
             FileBrowserPurpose::ImportScrivenerSeries => {
                 let inventory = story_import::inspect_scrivener_project(&source)?;
-                let folder = safe_filename(&inventory.title);
-                self.start_scrivener_import(source, folder, inventory.title)
+                let title = inventory
+                    .project_title()
+                    .unwrap_or(&inventory.title)
+                    .to_owned();
+                let folder = safe_filename(&title);
+                self.start_scrivener_import(source, folder, title)
             }
             _ => Err("the active file browser is not selecting a Scrivener source".into()),
         }
@@ -10590,7 +10598,12 @@ impl AppState {
         }
         let staging = tempfile::tempdir_in(&series_root)?;
         let staging_project = staging.path().join("book");
-        let mut app = WriterApp::create_project(&staging_project, &title)?;
+        let mut app = WriterApp::create_project_from_scrivener_inventory(
+            &staging_project,
+            &title,
+            story_core::BookType::Fiction,
+            &inventory,
+        )?;
         let (run, scenes) = app.import_scrivener_inventory(
             &inventory,
             &plan,

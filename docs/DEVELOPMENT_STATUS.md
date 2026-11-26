@@ -5,6 +5,54 @@ Updated: 2026-11-26
 This is the handover note for ongoing implementation. GitHub issues remain the
 authoritative source for approved requirements and human UAT findings.
 
+## Current checkpoint — Scrivener compile variables, 26 November 2026
+
+Scrivener project metadata is now carried into new standalone imports when it
+is explicitly present in the source inventory. Project title metadata is used
+as the suggested import title unless the author supplies a title; available
+author, language, genre and synopsis fields are also retained. Missing author
+data remains empty, and an invalid or absent source language falls back to the
+configured writing language. Importing into an existing project does not
+replace its metadata.
+
+The shared Compile IR renderer now resolves the supported Scrivener variables
+`<$PROJECTTITLE>`, `<$TITLE>`, `<$FULLNAME>`, `<$AUTHOR>` and sequential
+`<$n>`/`<$N>` without changing canonical manuscript text. Unresolved supported
+variables and unsupported variables produce source-mapped diagnostics. The
+current implementation does not yet recover every Scrivener format-specific
+variable or numbering rule. In particular, the current Les Retraités-Pirates
+output still exposes structural binder headings (`Manuscript`, sections,
+ellipsis chapter placeholders and event headings); resolving variables does
+not complete the Scrivener compile-layout mapping in #7/#53/#73.
+
+Fresh production import/reopen/compile run on the working tree:
+
+- Reports: `reports/compile-vars-full-20261126/`
+- Projects and EPUBs: `generated/compile-vars-full-20261126/`
+- EPUBs: `generated/compile-vars-full-20261126/book-01.epub`,
+  `generated/compile-vars-full-20261126/book-02.epub`,
+  `generated/compile-vars-full-20261126/book-03.epub`
+- All three generated EPUBs pass EPUBCheck 4.2.6 with zero errors and warnings.
+- Source body text is exact after persistence/reopen: book-01 39/39 manuscript
+  and 6/6 research items; book-02 36/36 and 6/6; book-03 68/68 and 12/12.
+- All three source fingerprints are unchanged. Import remains marked
+  incomplete for each project; no publication fidelity acceptance is claimed.
+- Historical EPUB comparison remains materially different (719/79,
+  1040/156 and 1657/1568 missing/additional token instances respectively).
+  These are investigation leads, not a classification or acceptance metric.
+- The generated book-02 retains all 44 inventoried images; the run also reports
+  the existing content/navigation differences for continued investigation.
+- Fixture checksums passed before and after the complete run.
+
+Verification for the compile-variable batch: `cargo fmt --all -- --check`,
+`cargo clippy --offline --workspace --all-targets -- -D warnings`,
+`cargo test --offline --workspace -- --test-threads=1`, and
+`python3 -m unittest discover -s tools -v` all passed. The workspace suite
+included 337 terminal unit tests, 3 author-workflow integration tests and 24
+Linux PTY tests. The Ollama localhost-only test required the previously
+authorised loopback socket permission. This automated evidence does not
+replace human UAT; #7/#53/#73/#44 remain open for acceptance.
+
 ## Current checkpoint — 26 November 2026
 
 The author expanded the local private corpus under `fixtures/back-catalogue/`.

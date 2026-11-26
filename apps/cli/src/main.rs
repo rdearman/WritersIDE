@@ -2523,11 +2523,15 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 fs::create_dir_all(parent)?;
                 let staging_parent = tempfile::tempdir_in(parent)?;
                 let staging_project = staging_parent.path().join("book");
-                let title = requested_title.as_deref().unwrap_or(&inventory.title);
-                let mut app = WriterApp::create_project_with_type(
+                let title = requested_title
+                    .as_deref()
+                    .or_else(|| inventory.project_title())
+                    .unwrap_or(&inventory.title);
+                let mut app = WriterApp::create_project_from_scrivener_inventory(
                     &staging_project,
                     title,
                     options.book_type,
+                    &inventory,
                 )?;
                 let (run, scenes) = app.import_scrivener_inventory(&inventory, &plan, mode)?;
                 app.validate_project()?;

@@ -115,6 +115,49 @@ remain unresolved. These results do not constitute import/publication fidelity
 acceptance or a promoted WIDE baseline. Human review of generated publications
 is still required.
 
+## Compile-variable and project-metadata verification — 26 November 2026
+
+Standalone Scrivener imports now preserve available project author, language,
+genre and synopsis metadata without inventing absent values. Project title
+metadata supplies the suggested destination title, while an author-provided
+title takes precedence. Existing-project imports do not overwrite project
+metadata.
+
+The shared compiler resolves the currently supported title/author variables
+and sequential number token from Compile IR. Replacement is render-only:
+canonical Markdown remains unchanged, source hashes remain tied to the source,
+and diagnostic ranges use original UTF-8 byte offsets. Missing supported
+metadata and unsupported Scrivener variables are reported as source-linked
+warnings. Format-specific Scrivener variable syntax, section layout rules,
+numbering schemes and compile selection are not fully mapped yet.
+
+Run a fresh private regression with:
+
+```sh
+(cd fixtures && sha256sum --quiet -c SHA256SUMS)
+python3 tools/real_manuscript_regression.py --book all --phase full \
+  --run-id UNIQUE_RUN_ID
+(cd fixtures && sha256sum --quiet -c SHA256SUMS)
+```
+
+The 26 November run `reports/compile-vars-full-20261126/` used the production
+import, save/reopen and compile paths. Its generated EPUBs are under
+`generated/compile-vars-full-20261126/`; each passed EPUBCheck 4.2.6 with zero
+errors and warnings. All checked manuscript and research bodies matched their
+source extraction exactly after reopen, and source fingerprints did not
+change. Import status was incomplete for all three projects. Historical EPUBs
+remain invalid in the first two cases (two reference errors each); those are
+reference-only and must not be copied into generated EPUBs.
+
+This run does not establish publication fidelity. Meaningful differences in
+text sequence, paragraph count, headings, navigation, compile inclusion and
+structure remain. The current Book 03 output still publishes internal
+structural headings and literal chapter placeholders; metadata-variable
+resolution alone is not the approved Scrivener compile-layout implementation.
+Use the local detailed comparison in the run report to trace each discrepancy
+to source extraction, canonical storage, Compile IR or renderer before
+classifying it. Human publication acceptance remains outstanding.
+
 ## Integrity and privacy
 
 - Never modify the original Scrivener projects, reference publications or

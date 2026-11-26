@@ -637,6 +637,9 @@ pub enum ContentUnitKind {
 pub struct CompileSegment {
     pub source_entity_id: String,
     pub document: SemanticDocument,
+    /// Original UTF-8 byte length before compile-only substitutions.
+    #[serde(default)]
+    pub source_length: Option<usize>,
     #[serde(default)]
     pub language_spans: Vec<CompileLanguageSpan>,
 }
@@ -650,9 +653,11 @@ pub struct CompileLanguageSpan {
 
 impl CompileSegment {
     pub fn new(source_entity_id: impl Into<String>, text: impl Into<String>) -> Self {
+        let text = text.into();
         Self {
             source_entity_id: source_entity_id.into(),
-            document: SemanticDocument::parse(text),
+            document: SemanticDocument::parse(text.clone()),
+            source_length: Some(text.len()),
             language_spans: Vec::new(),
         }
     }
@@ -897,7 +902,9 @@ impl CompileIr {
                     source_sha256: segment.document.source_sha256.clone(),
                     source: SourceRange {
                         start: 0,
-                        end: segment.document.source.len(),
+                        end: segment
+                            .source_length
+                            .unwrap_or(segment.document.source.len()),
                     },
                 });
             }
@@ -921,6 +928,194 @@ fn compile_heading_id(kind: &str, source_id: &str) -> String {
         write!(&mut result, "{byte:02x}").expect("writing into a String cannot fail");
     }
     result
+}
+
+fn escape_markdown_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(
+            character,
+            '\\' | '`'
+                | '*'
+                | '_'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '<'
+                | '>'
+                | '#'
+                | '+'
+                | '-'
+                | '.'
+                | '!'
+                | '|'
+                | '~'
+                | '^'
+        ) {
+            escaped.push('\\');
+        }
+        if character == '&' {
+            escaped.push_str("&amp;");
+        } else {
+            escaped.push(character);
+        }
+    }
+    escaped
+}
+
+fn placeholder_case(value: &str, name: &str) -> String {
+    if name
+        .chars()
+        .all(|character| !character.is_ascii_alphabetic() || character.is_ascii_uppercase())
+    {
+        return value.to_uppercase();
+    }
+    value.to_owned()
+}
+
+fn resolve_variables_in_source(
+    source: &str,
+    source_entity_id: &str,
+    title: &str,
+    author: Option<&str>,
+    sequence_number: &mut u64,
+) -> (String, Vec<CompileDiagnostic>) {
+    let mut output = String::with_capacity(source.len());
+    let mut diagnostics = Vec::new();
+    let mut cursor = 0;
+    while let Some(relative_open) = source[cursor..].find('<') {
+        let open = cursor + relative_open;
+        if source.as_bytes().get(open + 1) != Some(&b'$') {
+            output.push_str(&source[cursor..=open]);
+            cursor = open + 1;
+            continue;
+        }
+        let mut name_end = open + 2;
+        while source
+            .as_bytes()
+            .get(name_end)
+            .is_some_and(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-'))
+        {
+            name_end += 1;
+        }
+        if name_end == open + 2 {
+            output.push_str(&source[cursor..=open]);
+            cursor = open + 1;
+            continue;
+        }
+        let name = &source[open + 2..name_end];
+        let close_end = if source.as_bytes().get(name_end..name_end + 2) == Some(b"\\>") {
+            name_end + 2
+        } else if source.as_bytes().get(name_end) == Some(&b'>') {
+            name_end + 1
+        } else {
+            output.push_str(&source[cursor..=open]);
+            cursor = open + 1;
+            continue;
+        };
+        let start = if open > cursor && source.as_bytes()[open - 1] == b'\\' {
+            open - 1
+        } else {
+            open
+        };
+        output.push_str(&source[cursor..start]);
+        let replacement = match name.to_ascii_lowercase().as_str() {
+            "projecttitle" | "title" if !title.trim().is_empty() => Some(title.to_owned()),
+            "fullname" | "author" if author.is_some_and(|value| !value.trim().is_empty()) => {
+                author.map(str::to_owned)
+            }
+            "n" => {
+                *sequence_number = sequence_number.saturating_add(1);
+                Some(sequence_number.to_string())
+            }
+            "projecttitle" | "title" | "fullname" | "author" => None,
+            _ => None,
+        };
+        if let Some(value) = replacement {
+            output.push_str(&escape_markdown_literal(&placeholder_case(&value, name)));
+        } else {
+            let token = &source[open..close_end];
+            let metadata_missing = matches!(
+                name.to_ascii_lowercase().as_str(),
+                "projecttitle" | "title" | "fullname" | "author"
+            );
+            diagnostics.push(CompileDiagnostic {
+                code: if metadata_missing { "VAR002" } else { "VAR001" }.into(),
+                category: "compile-variable".into(),
+                severity: DiagnosticSeverity::Warning,
+                effective_level: None,
+                message: if metadata_missing {
+                    format!("compile variable {token} could not be resolved because its metadata value is empty")
+                } else {
+                    format!("Scrivener compile variable {token} is not supported")
+                },
+                remediation_hint: Some(if metadata_missing {
+                    "Set the corresponding project or publication metadata, or replace the variable with literal text".into()
+                } else {
+                    "Replace this variable with literal text or select a supported compile layout".into()
+                }),
+                source_entity_id: Some(source_entity_id.to_owned()),
+                source_range: Some(SourceRange { start, end: close_end }),
+                generated_file: None,
+                generated_line: None,
+                suppressed_by: None,
+                suppressed: false,
+            });
+            output.push_str(&source[start..close_end]);
+        }
+        cursor = close_end;
+    }
+    output.push_str(&source[cursor..]);
+    (output, diagnostics)
+}
+
+fn resolve_compile_variables(
+    ir: &mut CompileIr,
+    metadata: &CompileMetadata,
+) -> Vec<CompileDiagnostic> {
+    let publication_title = metadata.title.as_deref().unwrap_or(&ir.title);
+    let author = metadata.author.as_deref().or(ir.author.as_deref());
+    let mut diagnostics = Vec::new();
+    let mut sequence_number = 0u64;
+    for group in &mut ir.groups {
+        let (resolved_title, found) = resolve_variables_in_source(
+            &group.title,
+            &group.id,
+            publication_title,
+            author,
+            &mut sequence_number,
+        );
+        group.title = resolved_title;
+        diagnostics.extend(found);
+    }
+    for unit in &mut ir.units {
+        let (resolved_title, found) = resolve_variables_in_source(
+            &unit.title,
+            &unit.id,
+            publication_title,
+            author,
+            &mut sequence_number,
+        );
+        unit.title = resolved_title;
+        diagnostics.extend(found);
+        for segment in &mut unit.segments {
+            let original_hash = segment.document.source_sha256.clone();
+            let (source, found) = resolve_variables_in_source(
+                &segment.document.source,
+                &segment.source_entity_id,
+                publication_title,
+                author,
+                &mut sequence_number,
+            );
+            if source != segment.document.source {
+                segment.document = SemanticDocument::parse(source);
+                segment.document.source_sha256 = original_hash;
+            }
+            diagnostics.extend(found);
+        }
+    }
+    diagnostics
 }
 
 fn segment_valid(segment: &CompileSegment) -> bool {
@@ -1768,6 +1963,11 @@ fn first_placeholder_range(source: &str) -> Option<SourceRange> {
 /// Deterministic, non-mutating checks useful before publication or export.
 pub fn publication_diagnostics(ir: &CompileIr) -> Vec<CompileDiagnostic> {
     let mut diagnostics = Vec::new();
+    let mut checked_ir = ir.clone();
+    diagnostics.extend(resolve_compile_variables(
+        &mut checked_ir,
+        &CompileMetadata::default(),
+    ));
     if ir.title.trim().is_empty() {
         diagnostics.push(CompileDiagnostic {
             code: "PUB001".into(),
@@ -2014,6 +2214,10 @@ impl PandocRenderer {
             return Err("refusing to render invalid Compile IR".into());
         }
         design.validate()?;
+        let mut resolved_ir = ir.clone();
+        let mut compile_variable_diagnostics =
+            resolve_compile_variables(&mut resolved_ir, metadata);
+        let ir = &resolved_ir;
         let template_path = if let Some(template) = &design.template {
             if !matches!(format, CompileFormat::Latex | CompileFormat::Pdf) {
                 return Err("custom book templates are supported only for LaTeX and PDF".into());
@@ -2199,13 +2403,14 @@ impl PandocRenderer {
             }
             std::fs::read(&output_path).map_err(|e| format!("read rendered output: {e}"))?
         };
+        compile_variable_diagnostics.extend(renderer_diagnostics);
         Ok(CompileArtifact {
             format,
             media_type: format.media_type(),
             bytes,
             source_map,
             auxiliary_files,
-            diagnostics: renderer_diagnostics,
+            diagnostics: compile_variable_diagnostics,
         })
     }
 
@@ -3066,6 +3271,90 @@ output = "exports/old.md"
             segments: Vec::new(),
         });
         assert!(!ir.validate());
+    }
+
+    #[test]
+    fn scrivener_compile_variables_resolve_without_changing_canonical_sources() {
+        let source = "Title: <$PROJECTTITLE\\>\n\nBy <$fullname\\>\n\n<$n> and <$n>";
+        let mut ir = CompileIr::new("Working title");
+        ir.author = Some("Ada Lovelace".into());
+        ir.push(CompileUnit {
+            id: "scene-1".into(),
+            parent_id: None,
+            kind: ContentUnitKind::Scene,
+            title: "Title page".into(),
+            language_code: None,
+            segments: vec![CompileSegment::new("scene-1", source)],
+        });
+        let original = ir.units[0].segments[0].document.source.clone();
+        let artifact = PandocRenderer::default()
+            .render_with_profile_and_metadata(
+                &ir,
+                CompileFormat::Markdown,
+                None,
+                &BookDesign::default().profile(),
+                &CompileMetadata {
+                    title: Some("Published title".into()),
+                    author: None,
+                    cover_image: None,
+                },
+            )
+            .unwrap();
+        let output = String::from_utf8(artifact.bytes).unwrap();
+        assert!(output.contains("PUBLISHED TITLE"), "{output}");
+        assert!(output.contains("Ada Lovelace"), "{output}");
+        assert!(output.contains("1 and 2"), "{output}");
+        assert!(!output.contains("<$"), "{output}");
+        assert_eq!(ir.units[0].segments[0].document.source, original);
+        assert_eq!(artifact.source_map[0].source.end, source.len());
+        assert_eq!(
+            artifact.source_map[0].source_sha256,
+            format!("{:x}", Sha256::digest(source.as_bytes()))
+        );
+        assert!(artifact.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn unresolved_scrivener_compile_variables_have_source_diagnostics() {
+        let source = "Écrit par <$fullname\\> (<$customField\\>)";
+        let mut ir = CompileIr::new("A title");
+        ir.push(CompileUnit {
+            id: "page-1".into(),
+            parent_id: None,
+            kind: ContentUnitKind::FrontMatter,
+            title: "Title page".into(),
+            language_code: None,
+            segments: vec![CompileSegment::new("page-1", source)],
+        });
+        let artifact = PandocRenderer::default()
+            .render_with_profile_and_metadata(
+                &ir,
+                CompileFormat::Markdown,
+                None,
+                &BookDesign::default().profile(),
+                &CompileMetadata::default(),
+            )
+            .unwrap();
+        let mut diagnostics = artifact.diagnostics.iter().collect::<Vec<_>>();
+        diagnostics.sort_by(|left, right| left.code.cmp(&right.code));
+        assert_eq!(
+            diagnostics
+                .iter()
+                .map(|item| item.code.as_str())
+                .collect::<Vec<_>>(),
+            ["VAR001", "VAR002"]
+        );
+        let checked = publication_diagnostics(&ir);
+        assert!(checked.iter().any(|item| item.code == "VAR001"));
+        assert!(checked.iter().any(|item| item.code == "VAR002"));
+        for diagnostic in diagnostics {
+            let range = diagnostic.source_range.unwrap();
+            assert_eq!(diagnostic.source_entity_id.as_deref(), Some("page-1"));
+            assert!(source.is_char_boundary(range.start));
+            assert!(source.is_char_boundary(range.end));
+            assert!(range.end <= source.len());
+        }
+        assert_eq!(ir.units[0].segments[0].document.source, source);
     }
 
     #[test]
