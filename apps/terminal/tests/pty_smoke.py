@@ -256,6 +256,34 @@ def main():
         rows = terminal_snapshot(output, 24, 80)
         return len(rows) > 1 and rows[1].startswith(f"┌{title}")
 
+    def move_outline_selection_until(predicate, direction, attempts=180):
+        """Navigate by rendered row labels, not fixture-specific row offsets."""
+        key = b"\x1b[A" if direction == "up" else b"\x1b[B"
+        for _ in range(attempts):
+            rows = terminal_snapshot(output, 24, 80)
+            selected = next(
+                (row for row in rows if row.strip("│ ").startswith("▸")),
+                "",
+            )
+            if predicate(selected):
+                return True
+            os.write(master, key)
+            read_for(0.12)
+        return False
+
+    def move_outline_selection_to_manuscript_root(attempts=180):
+        for _ in range(attempts):
+            rows = terminal_snapshot(output, 24, 80)
+            selected = next(
+                (row for row in rows if row.strip("│ ").startswith("▸")),
+                "",
+            )
+            if "Manuscript" in selected:
+                return True
+            os.write(master, b"\x1b[A")
+            read_for(0.12)
+        return False
+
     def show_scene_cards_presentation():
         """Select the card presentation from the unified Outline's View menu."""
         menu_start = len(output)
@@ -330,11 +358,19 @@ def main():
                 raise AssertionError("File > Import Scrivener did not open the file browser")
             os.write(master, b"\t\r")  # select .scriv folder; Enter imports directly into staging
             if expected_titles:
-                imported_outline_ready = wait_for_screen_fragments(
-                    tuple(title.encode("utf-8") for title in expected_titles),
-                    menu_start,
-                    timeout=120.0,
-                )
+                deadline = time.monotonic() + 120.0
+                imported_outline_ready = False
+                while time.monotonic() < deadline:
+                    rows = terminal_snapshot(output, 24, 80)
+                    visible = "".join("".join(rows).split())
+                    if (
+                        len(rows) > 1
+                        and rows[1].startswith("┌Outline")
+                        and all(title.replace(" ", "") in visible for title in expected_titles)
+                    ):
+                        imported_outline_ready = True
+                        break
+                    read_for(0.1)
             else:
                 deadline = time.monotonic() + 120.0
                 imported_outline_ready = False
@@ -358,15 +394,99 @@ def main():
                     "the imported project did not focus its first scene in the outline; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
                 )
-            os.write(master, b"\r")  # open the first imported scene
-            editor_markers = (
-                (expected_text.encode("utf-8"),) if expected_text else (b"Editor",)
-            )
-            if not wait_for_screen_fragments(editor_markers, timeout=5.0):
-                raise AssertionError(
-                    "imported manuscript did not open in the editor; screen: "
-                    + repr(terminal_snapshot(output, 24, 80))
+            direct_prose_workflow = os.environ.get("WIDE_PTY_TEST_DIRECT_PROSE") == "1"
+            if direct_prose_workflow:
+                # Exercise chapter-owned prose while the imported project is
+                # still temporary. The reported conflict occurred before the
+                # first explicit Save/promotion, so testing only a permanent
+                # project would miss the affected lifecycle path.
+                # Real projects may have nested sections and many rows before
+                # direct prose, so locate the visible body row by its normal
+                # outliner label instead of assuming it is one Up key away.
+                if not move_outline_selection_to_manuscript_root():
+                    raise AssertionError("could not navigate to the top of the imported outline")
+                body_row_marker = os.environ.get(
+                    "WIDE_PTY_DIRECT_PROSE_ROW_MARKER", "chapter_body"
                 )
+                if not move_outline_selection_until(
+                    lambda row: body_row_marker in row,
+                    "down",
+                ):
+                    raise AssertionError(
+                        f"outline did not expose selected {body_row_marker!r} content; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                selected_direct_row = next(
+                    (
+                        row
+                        for row in terminal_snapshot(output, 24, 80)
+                        if row.strip("│ ").startswith("▸")
+                    ),
+                    "<no selected row>",
+                )
+                output_before_direct_edit = len(output)
+                os.write(master, b"\r")
+                direct_prose_markers = [b"direct prose"]
+                source_prose_marker = os.environ.get(
+                    "WIDE_PTY_DIRECT_PROSE_MARKER",
+                    "Chapter prose survives direct editing",
+                )
+                if source_prose_marker:
+                    direct_prose_markers.append(source_prose_marker.encode("utf-8"))
+                if not wait_for_screen_fragments(
+                    tuple(direct_prose_markers),
+                    output_before_direct_edit,
+                    timeout=5.0,
+                ):
+                    raise AssertionError(
+                        f"temporary chapter prose did not open from {selected_direct_row!r}; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                os.write(master, b"Edited ")
+                if not wait_for_screen_fragments(
+                    (b"Autosaved",), output_before_direct_edit, timeout=8.0
+                ):
+                    raise AssertionError(
+                        "temporary chapter prose did not autosave; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                if b"Autosave could not save" in output[output_before_direct_edit:]:
+                    raise AssertionError("temporary chapter prose autosave reported a conflict")
+                navigation_start = len(output)
+                os.write(master, b"\x1b")  # return to outline
+                if not wait_for_screen_fragments((b"Outline",), navigation_start, timeout=3.0):
+                    raise AssertionError("Escape did not return from temporary chapter prose")
+                if not move_outline_selection_until(
+                    lambda row: "[ ]" in row or "[x]" in row,
+                    "down",
+                ):
+                    raise AssertionError(
+                        "outline did not expose a scene after direct-prose editing; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                os.write(master, b"\r")
+                scene_open_markers = (
+                    (expected_text.encode("utf-8"),) if expected_text else (b"Editor",)
+                )
+                if not wait_for_screen_fragments(
+                    scene_open_markers,
+                    output_before_direct_edit,
+                    timeout=5.0,
+                ):
+                    raise AssertionError(
+                        "scene row or text changed after temporary prose autosave; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+            else:
+                os.write(master, b"\r")  # open the first imported scene
+                editor_markers = (
+                    (expected_text.encode("utf-8"),) if expected_text else (b"Editor",)
+                )
+                if not wait_for_screen_fragments(editor_markers, timeout=5.0):
+                    raise AssertionError(
+                        "imported manuscript did not open in the editor; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
             os.write(master, b"Additional UAT sentence.")
             os.write(master, b"\x13")  # Ctrl+S
             if not wait_for_screen_fragments((b"Save Project As", b"Folder contents"), timeout=5.0):
@@ -394,76 +514,52 @@ def main():
                     "editor did not return to the imported outline; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
                 )
-            if os.environ.get("WIDE_PTY_TEST_DIRECT_PROSE") == "1":
-                # Chapter-owned prose and scene prose are independent
-                # documents. Revisit both in one session, allow direct-prose
-                # autosave, and ensure switching documents neither creates a
-                # false conflict nor drops scene rows from the outline.
+            if direct_prose_workflow:
+                # After first Save, revisit both persisted documents and
+                # verify the staged autosave survived promotion.
+                if not move_outline_selection_to_manuscript_root():
+                    raise AssertionError("could not navigate to the top of the saved outline")
+                if not move_outline_selection_until(
+                    lambda row: body_row_marker in row,
+                    "down",
+                ):
+                    raise AssertionError("saved outline lost its direct-prose row")
                 output_before_direct_edit = len(output)
-                os.write(master, b"\x1b[A")  # scene -> preceding chapter prose row
                 os.write(master, b"\r")
+                saved_prose_marker = os.environ.get(
+                    "WIDE_PTY_DIRECT_PROSE_SAVED_MARKER",
+                    "Edited Chapter prose survives direct editing",
+                )
                 if not wait_for_screen_fragments(
-                    (b"direct prose", b"Chapter prose survives direct editing"),
+                    (saved_prose_marker.encode("utf-8"),),
                     output_before_direct_edit,
                     timeout=5.0,
                 ):
                     raise AssertionError(
-                        "chapter-level prose did not open from its outliner row; screen: "
+                        "staged chapter-prose autosave did not survive first Save; screen: "
                         + repr(terminal_snapshot(output, 24, 80))
                     )
-                os.write(master, b"Edited ")
-                if not wait_for_screen_fragments(
-                    (b"Autosaved",), output_before_direct_edit, timeout=8.0
-                ):
-                    raise AssertionError(
-                        "direct chapter prose did not autosave cleanly; screen: "
-                        + repr(terminal_snapshot(output, 24, 80))
-                    )
-                if b"Autosave could not save" in output[output_before_direct_edit:]:
-                    raise AssertionError("direct chapter prose autosave reported a conflict")
                 navigation_start = len(output)
                 os.write(master, b"\x1b")  # return to outliner
                 if not wait_for_screen_fragments((b"Outline",), navigation_start, timeout=3.0):
-                    raise AssertionError("Escape did not return from direct prose to the outline")
-                os.write(master, b"\x1b[B")  # chapter prose -> scene row
+                    raise AssertionError("Escape did not return from reopened chapter prose")
+                if not move_outline_selection_until(
+                    lambda row: "[ ]" in row or "[x]" in row,
+                    "down",
+                ):
+                    raise AssertionError("saved outline lost its scene row")
                 os.write(master, b"\r")
+                saved_scene_markers = [b"Additional UAT sentence."]
+                saved_scene_markers.append(
+                    expected_text.encode("utf-8") if expected_text else b"Editor"
+                )
                 if not wait_for_screen_fragments(
-                    (b"The patient blacksmith", b"Additional UAT sentence."),
+                    tuple(saved_scene_markers),
                     output_before_direct_edit,
                     timeout=5.0,
                 ):
                     raise AssertionError(
                         "scene row disappeared or scene text changed after direct-prose autosave; screen: "
-                        + repr(terminal_snapshot(output, 24, 80))
-                    )
-                navigation_start = len(output)
-                os.write(master, b"\x1b")
-                if not wait_for_screen_fragments((b"Outline",), navigation_start, timeout=3.0):
-                    raise AssertionError("Escape did not return from the scene to the outline")
-                os.write(master, b"\x1b[A")
-                os.write(master, b"\r")
-                if not wait_for_screen_fragments(
-                    (b"Edited Chapter prose survives direct editing",),
-                    output_before_direct_edit,
-                    timeout=5.0,
-                ):
-                    raise AssertionError(
-                        "reopening direct chapter prose did not show the autosaved edit; screen: "
-                        + repr(terminal_snapshot(output, 24, 80))
-                    )
-                navigation_start = len(output)
-                os.write(master, b"\x1b")
-                if not wait_for_screen_fragments((b"Outline",), navigation_start, timeout=3.0):
-                    raise AssertionError("Escape did not leave reopened chapter prose")
-                os.write(master, b"\x1b[B")
-                os.write(master, b"\r")
-                if not wait_for_screen_fragments(
-                    (b"The patient blacksmith", b"Additional UAT sentence."),
-                    output_before_direct_edit,
-                    timeout=5.0,
-                ):
-                    raise AssertionError(
-                        "repeated scene navigation lost the imported scene; screen: "
                         + repr(terminal_snapshot(output, 24, 80))
                     )
             menu_start = len(output)

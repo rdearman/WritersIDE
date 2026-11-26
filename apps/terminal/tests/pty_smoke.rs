@@ -282,6 +282,10 @@ fn protected_arrowmaking_project_imports_through_the_production_pty_without_sour
         .env("WIDE_PTY_IMPORT_TITLES", "")
         .env("WIDE_PTY_IMPORT_TEXT", "")
         .env("WIDE_PTY_COMPILE_PROFILE", "1")
+        .env("WIDE_PTY_TEST_DIRECT_PROSE", "1")
+        .env("WIDE_PTY_DIRECT_PROSE_MARKER", "")
+        .env("WIDE_PTY_DIRECT_PROSE_SAVED_MARKER", "Edited ")
+        .env("WIDE_PTY_DIRECT_PROSE_ROW_MARKER", "chapter_body")
         .output()
         .expect("run protected Scrivener project through Linux PTY");
     assert!(
@@ -307,6 +311,20 @@ fn protected_arrowmaking_project_imports_through_the_production_pty_without_sour
     assert!(
         !reopened.list_structural_nodes().unwrap().is_empty(),
         "imported project should retain its binder hierarchy"
+    );
+    let proposed = story_import::ScrivenerImportPlan::proposed(&inventory);
+    let expected_scenes = proposed
+        .decisions
+        .iter()
+        .filter(|decision| {
+            decision.destination_kind == story_import::ScrivenerDestinationKind::Scene
+                && decision.include_in_import
+        })
+        .count();
+    assert_eq!(
+        reopened.list_scenes(false).unwrap().len(),
+        expected_scenes,
+        "all automatically mapped scenes must remain visible after direct-prose editing and reopen"
     );
     let actual = story_import::inspect_scrivener_project(&source)
         .unwrap()

@@ -26,7 +26,8 @@ then edits, saves, compiles and reopens the imported project. The isolated
 protected ArrowMaking corpus PTY also passed, with fixture checksum manifests
 verified before and after.
 
-Verification on commit `1c41b9e`:
+Runtime build commit `1c41b9e`; the expanded regression suite was run on the
+current working tree (test-only changes after the frozen build):
 
 - `cargo fmt --all -- --check` — passed.
 - `cargo clippy --offline --workspace --all-targets -- -D warnings` — passed.
@@ -38,10 +39,17 @@ Verification on commit `1c41b9e`:
   remained valid.
 - Alpha UAT 32 checksums and 80x24 launcher rendering — passed.
 
-Human acceptance remains pending. The reported false external-change conflict
-and missing eleven scene rows from #38 have not reproduced; their root cause
-is not established, and conflict detection remains enabled. Issues #37, #38,
-#44, #46, #52, #53, #54 and #55 remain open for the requested human checks.
+Human acceptance remains pending. A stronger Scrivener PTY regression now
+edits and autosaves a chapter-body document while the import is still
+temporary, navigates to a scene, promotes the project, reopens both documents,
+and compares the persistent scene count with the automatic import plan. The
+synthetic and protected ArrowMaking workflows passed; private source checksums
+were valid before and after. The reported false external-change conflict and
+missing eleven scene rows from #38 still have not reproduced, and their root
+cause is not established. This exercises a representative body row, not the
+reported Introduction-specific interaction. Conflict detection remains
+enabled. Issues #37, #38, #44, #46, #52, #53, #54 and #55 remain open for
+further reproduction and human checks.
 Next actionable development is the already-planned integration of Scrivener
 per-format layouts and inclusion into persistent WIDE compile profiles, then
 the remaining approved v1.0 backlog.
