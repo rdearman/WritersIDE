@@ -151,6 +151,16 @@ the exact edition compiled from the current Scrivener project. The harness
 does not execute files found in the corpus. Any conversion is staged beneath
 ignored `generated/`; reports remain local beneath ignored `reports/`.
 
+The local EPUB comparator records paragraph-level changes, exact changed
+character sequences, Unicode codepoints/names, document paths and structural
+details. Historical EPUB XHTML that fails XML parsing is analysed through a
+tolerant HTML tree recovery pass; the original parse error remains in the
+report, and recovered values are evidence rather than a claim that the source
+publication is standards-compliant. The recovery pass is covered by synthetic
+malformed list nesting and mailto-attribute tests. It does not alter source or
+reference files. See the exact-commit example report
+`reports/e4ac09e-exact-diff/` for local content-bearing output.
+
 For a manually mapped candidate, use the production import CLI with a reviewed
 mapping JSON, then validate, reopen, compile and compare its publication. Do
 not invent a generic mapping merely to make an unfinished or ambiguous project
