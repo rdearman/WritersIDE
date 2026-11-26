@@ -602,6 +602,7 @@ struct SeriesReferenceRow {
 struct ScrivenerImportWizard {
     series_root: PathBuf,
     folder_name: String,
+    destination_selected: bool,
     book_title: String,
     target: ScrivenerImportTarget,
     inventory: story_import::ScrivenerProjectInventory,
@@ -668,6 +669,7 @@ enum FileBrowserPurpose {
     ImportScrivenerSource,
     ImportScrivenerCurrent,
     ImportScrivenerSeries,
+    ImportScrivenerDestination,
     Compile(story_document::CompileFormat),
 }
 
@@ -1906,7 +1908,7 @@ fn command_registry() -> Vec<CommandSpec> {
         CommandSpec {
             id: "file.import-scrivener",
             label: "Import Scrivener as New Project…",
-            description: "Choose a Scrivener project, review its binder mapping, and import it as a standalone novel",
+            description: "Choose a Scrivener project and import its binder hierarchy as a new book",
             category: "File",
             default_shortcuts: &[],
             mnemonic: Some('i'),
@@ -9152,6 +9154,10 @@ impl AppState {
                 .map(PathBuf::from)
                 .filter(|path| path.is_dir())
                 .unwrap_or(fallback),
+            FileBrowserPurpose::ImportScrivenerDestination => std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_dir())
+                .unwrap_or(fallback),
         };
         let name = match purpose {
             FileBrowserPurpose::NewProject => "My Novel".to_owned(),
@@ -9167,6 +9173,11 @@ impl AppState {
             | FileBrowserPurpose::ImportScrivenerSource
             | FileBrowserPurpose::ImportScrivenerCurrent
             | FileBrowserPurpose::ImportScrivenerSeries => String::new(),
+            FileBrowserPurpose::ImportScrivenerDestination => self
+                .scrivener_import
+                .as_ref()
+                .map(|wizard| wizard.folder_name.clone())
+                .unwrap_or_default(),
             FileBrowserPurpose::Compile(format) => {
                 let title = self
                     .app
@@ -9214,6 +9225,9 @@ impl AppState {
             "Directory tree focused · Tab: Folder contents · Enter opens folders/previews manifests · F5 inspects/imports · Esc cancels".into()
         } else if purpose == FileBrowserPurpose::OpenTextFile {
             "Choose a text file · F5 opens a read-only reference · Esc cancels".into()
+        } else if purpose == FileBrowserPurpose::ImportScrivenerDestination {
+            "Choose a writable parent · edit project folder name · F4 selects this destination"
+                .into()
         } else if purpose == FileBrowserPurpose::ImportDocument {
             "Choose a text, Markdown, or Org file · F5 previews import options".into()
         } else {
@@ -9538,6 +9552,34 @@ impl AppState {
                     browser.name = format!("{stem}.{}", next.extension());
                     browser.purpose = FileBrowserPurpose::Compile(next);
                     browser.overwrite_confirmed = false;
+                }
+            }
+            KeyCode::F(4) if browser.purpose == FileBrowserPurpose::ImportScrivenerDestination => {
+                let folder_name = browser.name.trim().to_owned();
+                let wizard = self
+                    .scrivener_import
+                    .as_mut()
+                    .ok_or("Scrivener import preview is no longer available")?;
+                match validate_scrivener_destination(
+                    &wizard.inventory,
+                    &browser.current_dir,
+                    &folder_name,
+                ) {
+                    Ok((parent, destination)) => {
+                        wizard.series_root = parent;
+                        wizard.folder_name = folder_name;
+                        wizard.destination_selected = true;
+                        self.message = format!(
+                            "Destination selected: {} · Enter imports · Esc returns to the outline",
+                            destination.display()
+                        );
+                        close = true;
+                    }
+                    Err(error) => {
+                        self.message = error;
+                        self.file_browser = Some(browser);
+                        return Ok(());
+                    }
                 }
             }
             KeyCode::F(4)
@@ -9890,6 +9932,34 @@ impl AppState {
                             Err(error) => {
                                 self.message =
                                     format!("Could not prepare Scrivener import: {error}");
+                                self.file_browser = Some(browser);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    FileBrowserPurpose::ImportScrivenerDestination => {
+                        let folder_name = browser.name.trim().to_owned();
+                        let wizard = self
+                            .scrivener_import
+                            .as_mut()
+                            .ok_or("Scrivener import preview is no longer available")?;
+                        match validate_scrivener_destination(
+                            &wizard.inventory,
+                            &browser.current_dir,
+                            &folder_name,
+                        ) {
+                            Ok((parent, destination)) => {
+                                wizard.series_root = parent;
+                                wizard.folder_name = folder_name;
+                                wizard.destination_selected = true;
+                                self.message = format!(
+                                    "Destination selected: {} · Enter imports · Esc returns to the outline",
+                                    destination.display()
+                                );
+                                close = true;
+                            }
+                            Err(error) => {
+                                self.message = error;
                                 self.file_browser = Some(browser);
                                 return Ok(());
                             }
@@ -10367,6 +10437,7 @@ impl AppState {
         self.scrivener_import = Some(ScrivenerImportWizard {
             series_root,
             folder_name,
+            destination_selected: true,
             book_title,
             target: ScrivenerImportTarget::Series,
             inventory,
@@ -10386,21 +10457,13 @@ impl AppState {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let inventory = story_import::inspect_scrivener_project(&source)?;
         let folder_name = format!("{} (Writer's IDE)", safe_filename(&inventory.title));
-        let source_path = PathBuf::from(&inventory.source_path);
-        let source_container = if source_path.is_file() {
-            source_path.parent().and_then(Path::parent)
-        } else {
-            source_path.parent()
-        };
-        let series_root = source_container
-            .ok_or("Scrivener source has no parent directory")?
-            .to_owned();
-        let destination = series_root.join(&folder_name);
-        if destination.exists() {
-            return Err(format!("destination already exists: {}", destination.display()).into());
-        }
+        let series_root = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|path| path.is_dir())
+            .unwrap_or(std::env::current_dir()?);
         let plan = story_import::ScrivenerImportPlan::proposed(&inventory);
         let item_count = inventory.items.len();
+        let preview = plan.preview(&inventory)?;
         let book_title = inventory
             .project_title()
             .unwrap_or(&inventory.title)
@@ -10408,6 +10471,7 @@ impl AppState {
         self.scrivener_import = Some(ScrivenerImportWizard {
             series_root,
             folder_name,
+            destination_selected: false,
             book_title,
             target: ScrivenerImportTarget::Standalone,
             inventory,
@@ -10417,7 +10481,10 @@ impl AppState {
         self.selected = 0;
         self.workspace = Workspace::Series;
         self.message = format!(
-            "Standalone Scrivener preview: {item_count} binder items · destination beside source · ←/→ map · Space include/skip · Ctrl-Enter import · Esc cancel"
+            "Import preview: {item_count} binder items · {} manuscript · {} private research · {} review notes · Enter choose destination · Esc cancel",
+            preview.manuscript_items,
+            preview.research_items,
+            preview.unsupported.len()
         );
         Ok(())
     }
@@ -10436,6 +10503,7 @@ impl AppState {
         self.scrivener_import = Some(ScrivenerImportWizard {
             series_root: self.app.project_root().to_owned(),
             folder_name: String::new(),
+            destination_selected: true,
             book_title: project_title,
             target: ScrivenerImportTarget::CurrentProject,
             inventory,
@@ -10555,7 +10623,13 @@ impl AppState {
             .scrivener_import
             .as_ref()
             .ok_or("no Scrivener import preview is open")?;
-        wizard.plan.validate_for_import(&wizard.inventory)?;
+        if wizard.target == ScrivenerImportTarget::Standalone && !wizard.destination_selected {
+            return Err("choose a writable destination folder before importing".into());
+        }
+        wizard
+            .plan
+            .validate_for_import(&wizard.inventory)
+            .map_err(|error| scrivener_mapping_error(&wizard.inventory, error.to_string()))?;
         let preview = wizard.plan.preview(&wizard.inventory)?;
         if !preview.unresolved_source_ids.is_empty() {
             return Err(format!(
@@ -10563,6 +10637,14 @@ impl AppState {
                 preview.unresolved_source_ids.len()
             )
             .into());
+        }
+        if wizard.target == ScrivenerImportTarget::Standalone {
+            validate_scrivener_destination(
+                &wizard.inventory,
+                &wizard.series_root,
+                &wizard.folder_name,
+            )
+            .map_err(|error| error.to_owned())?;
         }
         let series_root = wizard.series_root.clone();
         let target = wizard.target;
@@ -10656,7 +10738,15 @@ impl AppState {
             } else {
                 format!("Imported {title} as a new Writer's IDE project")
             },
-        )
+        )?;
+        self.workspace = Workspace::Outline;
+        self.selected = 0;
+        self.refresh()?;
+        self.selected = outline_rows(self)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Scene(_)))
+            .unwrap_or(0);
+        Ok(())
     }
     fn create_series_book(
         &mut self,
@@ -24451,7 +24541,9 @@ fn workspace_action_hint(state: &AppState) -> String {
 }
 
 fn detail_panel_title(state: &AppState) -> &'static str {
-    if state.workspace == Workspace::Dashboard && state.scenes.is_empty() {
+    if state.scrivener_import.is_some() {
+        "Import Details"
+    } else if state.workspace == Workspace::Dashboard && state.scenes.is_empty() {
         "Welcome"
     } else if state.workspace == Workspace::Outline {
         "Selected outline item"
@@ -24466,6 +24558,135 @@ fn detail_panel_title(state: &AppState) -> &'static str {
             _ => state.workspace.title(),
         }
     }
+}
+
+fn scrivener_import_detail(
+    wizard: &ScrivenerImportWizard,
+    selected: usize,
+    message: &str,
+) -> String {
+    let preview = wizard.plan.preview(&wizard.inventory).ok();
+    let destination = if wizard.destination_selected {
+        wizard
+            .series_root
+            .join(&wizard.folder_name)
+            .display()
+            .to_string()
+    } else {
+        "Choose a writable destination before importing".to_owned()
+    };
+    let status = if message.starts_with("Import could not be completed")
+        || message.starts_with("Destination")
+        || message.starts_with("Choose a writable")
+    {
+        format!("\n\nStatus: {message}")
+    } else {
+        String::new()
+    };
+    let selected_item = wizard.inventory.items.get(selected);
+    let mut text = format!(
+        "Scrivener project: {}\nDestination: {}\n\n{} binder items · {} manuscript entries · {} research items · {} excluded{}",
+        wizard.inventory.title,
+        destination,
+        wizard.inventory.items.len(),
+        preview.as_ref().map_or(0, |value| value.manuscript_items),
+        preview.as_ref().map_or(0, |value| value.research_items),
+        preview.as_ref().map_or(0, |value| value.skipped_items),
+        status,
+    );
+    if let Some(item) = selected_item {
+        let path = scrivener_binder_path(&wizard.inventory.items, item);
+        let mapping = wizard
+            .plan
+            .decisions
+            .iter()
+            .find(|decision| decision.source_document_id == item.source_document_id)
+            .map(|decision| scrivener_destination_label(decision.destination_kind))
+            .unwrap_or_else(|| "Needs review".to_owned());
+        text.push_str(&format!(
+            "\n\nSelected: {path}\nImported as: {mapping}\nText available: {} characters",
+            item.content_markdown
+                .as_ref()
+                .map_or(0, |value| value.chars().count())
+        ));
+        let warnings = item
+            .unsupported
+            .iter()
+            .filter(|warning| {
+                !warning.contains("Scrivener RTF font, colour, layout and embedded-object fidelity")
+            })
+            .take(3)
+            .collect::<Vec<_>>();
+        let warnings_truncated = warnings.len() == 3 && item.unsupported.len() > 3;
+        if !warnings.is_empty() {
+            text.push_str("\n\nReview notes:");
+            for warning in warnings {
+                text.push_str(&format!("\n• {warning}"));
+            }
+            if warnings_truncated {
+                text.push_str(&format!(
+                    "\n• and {} more; see Import Diagnostics",
+                    item.unsupported.len() - 3
+                ));
+            }
+        }
+    }
+    text.push_str("\n\nThe automatic mapping preserves the binder hierarchy. Import warnings are available after import; use Advanced Mapping only when you want to change the suggested roles.");
+    text
+}
+
+fn scrivener_destination_label(kind: story_import::ScrivenerDestinationKind) -> String {
+    use story_import::ScrivenerDestinationKind as Kind;
+    match kind {
+        Kind::Unmapped => "Needs review".into(),
+        Kind::Section => "Section heading".into(),
+        Kind::Chapter => "Chapter".into(),
+        Kind::Scene => "Scene".into(),
+        Kind::FrontMatter => "Front matter".into(),
+        Kind::BackMatter => "Back matter".into(),
+        Kind::Research => "Private research".into(),
+        Kind::Skip => "Excluded from this import".into(),
+    }
+}
+
+fn scrivener_binder_path(
+    items: &[story_import::ScrivenerBinderItem],
+    item: &story_import::ScrivenerBinderItem,
+) -> String {
+    let mut parts = vec![if item.title.trim().is_empty() {
+        "(untitled)".to_owned()
+    } else {
+        item.title.clone()
+    }];
+    let mut parent_id = item.parent_source_id.as_deref();
+    while let Some(id) = parent_id {
+        let Some(parent) = items
+            .iter()
+            .find(|candidate| candidate.source_document_id == id)
+        else {
+            break;
+        };
+        parts.push(parent.title.clone());
+        parent_id = parent.parent_source_id.as_deref();
+    }
+    parts.reverse();
+    parts.join(" / ")
+}
+
+fn scrivener_mapping_error(
+    inventory: &story_import::ScrivenerProjectInventory,
+    error: String,
+) -> String {
+    let mut explanation = error;
+    for item in &inventory.items {
+        explanation = explanation.replace(
+            &item.source_document_id,
+            &scrivener_binder_path(&inventory.items, item),
+        );
+    }
+    format!(
+        "Some imported items need a compatible parent mapping. Review the named binder paths in Import Details. {explanation}"
+    )
 }
 
 fn scene_card_rows(
@@ -25786,14 +26007,15 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         };
         let mut state = ListState::default()
             .with_selected(Some(list_selection.min(items.len().saturating_sub(1))));
+        let list_title = if s.scrivener_import.is_some() {
+            "Scrivener Import · Review"
+        } else {
+            s.workspace.title()
+        };
         let list = List::new(items)
             .highlight_symbol("▸ ")
             .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-            .block(
-                Block::default()
-                    .title(s.workspace.title())
-                    .borders(Borders::ALL),
-            );
+            .block(Block::default().title(list_title).borders(Borders::ALL));
         f.render_stateful_widget(list, body[0], &mut state);
         if s.workspace == Workspace::Revisions
             && let Some(snapshot_id) = s.revision_diff
@@ -25953,7 +26175,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 .block(board_block);
             f.render_widget(canvas, body[1]);
         } else {
-            let detail = if s.workspace == Workspace::Dashboard && s.scenes.is_empty() {
+            let detail = if let Some(wizard) = s.scrivener_import.as_ref() {
+                scrivener_import_detail(wizard, s.selected, &s.message)
+            } else if s.workspace == Workspace::Dashboard && s.scenes.is_empty() {
                 "Welcome to Writer's IDE\n\nSelect Start Writing to create a chapter and first scene, then start drafting. Select Open or Import to continue an existing manuscript. Offline Help is available with ? .".into()
             } else if s.workspace == Workspace::Outline {
                 let row = workspace_items(s)
@@ -26196,6 +26420,15 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         format!(" · {}", s.message)
                     }
                 )
+            } else if let Some(wizard) = s.scrivener_import.as_ref() {
+                if wizard.target == ScrivenerImportTarget::Standalone
+                    && !wizard.destination_selected
+                {
+                    " Enter Choose Destination · ←/→ Advanced Mapping · Esc Cancel".to_owned()
+                } else {
+                    " Enter Import · ←/→ Advanced Mapping · Space Include/Exclude · Esc Cancel"
+                        .to_owned()
+                }
             } else if s.workspace == Workspace::Cards {
                 format!(
                     " {} · {}",
@@ -26319,7 +26552,17 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 workspace_action_hint(s)
             };
             let menu_hint = display_shortcut_label(effective_shortcut_label(s, "menu.main", "F10"));
-            let actions = if let Some(tutorial) = tutorial_footer_status(s) {
+            let actions = if let Some(wizard) = s.scrivener_import.as_ref() {
+                if wizard.target == ScrivenerImportTarget::Standalone
+                    && !wizard.destination_selected
+                {
+                    "↑↓ Select · Enter Choose Destination · Esc Cancel · ←/→ Advanced Mapping"
+                        .to_owned()
+                } else {
+                    "Enter Import · Esc Cancel · ←/→ Advanced Mapping · Space Include/Exclude"
+                        .to_owned()
+                }
+            } else if let Some(tutorial) = tutorial_footer_status(s) {
                 format!(
                     " Save {} · Esc: Outline · {tutorial}",
                     effective_shortcut_label(s, "file.save", "Ctrl+S")
@@ -28795,6 +29038,56 @@ fn file_browser_leaf_name_is_safe(name: &str) -> bool {
             .all(|component| matches!(component, std::path::Component::Normal(_)))
 }
 
+fn validate_scrivener_destination(
+    inventory: &story_import::ScrivenerProjectInventory,
+    parent: &Path,
+    folder_name: &str,
+) -> Result<(PathBuf, PathBuf), String> {
+    if !file_browser_leaf_name_is_safe(folder_name) {
+        return Err("Enter a valid project folder name without path separators".into());
+    }
+    let parent = fs::canonicalize(parent)
+        .map_err(|error| format!("The selected destination folder cannot be opened: {error}"))?;
+    if !parent.is_dir() {
+        return Err("The selected destination must be an existing folder".into());
+    }
+    let source = PathBuf::from(&inventory.source_path);
+    let source_root = if source
+        .extension()
+        .is_some_and(|extension| extension == "scrivx")
+    {
+        source
+            .parent()
+            .ok_or_else(|| "The Scrivener manifest has no project folder".to_owned())?
+            .to_owned()
+    } else {
+        source
+    };
+    let source_root = fs::canonicalize(&source_root).map_err(|error| {
+        format!("The selected Scrivener source is no longer available: {error}")
+    })?;
+    if parent.starts_with(&source_root) {
+        return Err(
+            "Choose a destination outside the Scrivener project; the original source is protected"
+                .into(),
+        );
+    }
+    let destination = parent.join(folder_name);
+    if destination.exists() {
+        return Err(format!(
+            "A file or folder already exists at {}. Choose another name or destination.",
+            destination.display()
+        ));
+    }
+    tempfile::NamedTempFile::new_in(&parent).map_err(|error| {
+        format!(
+            "WIDE cannot write to {}: {error}. Choose another destination folder.",
+            parent.display()
+        )
+    })?;
+    Ok((parent, destination))
+}
+
 fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let Some(browser) = s.file_browser.as_ref() else {
         return;
@@ -28829,6 +29122,9 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         }
         FileBrowserPurpose::ImportScrivenerSeries => {
             "Import Scrivener into Series · choose a .scriv folder or .scrivx manifest"
+        }
+        FileBrowserPurpose::ImportScrivenerDestination => {
+            "Import Scrivener · choose a writable project destination"
         }
         FileBrowserPurpose::Compile(format) => match format {
             story_document::CompileFormat::Docx => "Compile · DOCX",
@@ -28917,7 +29213,9 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         &mut ListState::default()
             .with_selected((!browser.entries.is_empty()).then_some(browser.selected)),
     );
-    let selected_path = if browser.purpose == FileBrowserPurpose::NewProject {
+    let selected_path = if browser.purpose == FileBrowserPurpose::NewProject
+        || browser.purpose == FileBrowserPurpose::ImportScrivenerDestination
+    {
         browser.current_dir.join(&browser.folder_name)
     } else if matches!(
         browser.purpose,
@@ -29034,6 +29332,11 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         (
             "Enter Preview manifest / browse folder · F5 Inspect/Import · F7 New Folder · Esc Cancel",
             "Tab/Shift+Tab: tree → contents → name · Home: Home · /: Root · Backspace: Parent",
+        )
+    } else if browser.purpose == FileBrowserPurpose::ImportScrivenerDestination {
+        (
+            "F4 Select Destination · F7 New Folder · Esc Back to Import Preview",
+            "Tab/Shift+Tab: tree → contents → folder name · Enter opens folders · Backspace: Parent",
         )
     } else if browser.purpose == FileBrowserPurpose::NewProject {
         (
@@ -30140,18 +30443,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 .items
                 .iter()
                 .map(|item| {
-                    let parent = item
-                        .parent_source_id
-                        .as_deref()
-                        .and_then(|id| {
-                            wizard
-                                .inventory
-                                .items
-                                .iter()
-                                .find(|candidate| candidate.source_document_id == id)
-                        })
-                        .map(|item| format!("{} / ", item.title))
-                        .unwrap_or_default();
+                    let path = scrivener_binder_path(&wizard.inventory.items, item);
                     let decision =
                         wizard.plan.decisions.iter().find(|decision| {
                             decision.source_document_id == item.source_document_id
@@ -30175,23 +30467,13 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                         }
                     });
                     format!(
-                        "{}{} · {} · {} · {} chars · {}",
-                        parent,
-                        if item.title.is_empty() {
-                            "(untitled binder item)"
-                        } else {
-                            &item.title
-                        },
+                        "{} · {} · {} · {} characters",
+                        path,
                         item.type_code.as_deref().unwrap_or("unknown type"),
                         mapping,
                         item.content_markdown
                             .as_ref()
-                            .map_or(0, |text| text.chars().count()),
-                        if item.unsupported.is_empty() {
-                            "no item-level warnings".to_owned()
-                        } else {
-                            format!("{} fidelity warning(s)", item.unsupported.len())
-                        }
+                            .map_or(0, |text| text.chars().count())
                     )
                 })
                 .collect();
@@ -33799,6 +34081,19 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                         .into();
                 return Ok(false);
             }
+            KeyCode::Enter
+                if s.scrivener_import.as_ref().is_some_and(|wizard| {
+                    wizard.target == ScrivenerImportTarget::Standalone
+                        && !wizard.destination_selected
+                }) =>
+            {
+                if let Err(error) =
+                    s.start_file_browser(FileBrowserPurpose::ImportScrivenerDestination)
+                {
+                    s.message = format!("Could not choose an import destination: {error}");
+                }
+                return Ok(false);
+            }
             KeyCode::Left => {
                 if let Err(error) = s.cycle_scrivener_mapping(-1) {
                     s.message = error.to_string();
@@ -33820,6 +34115,12 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             KeyCode::Enter if k.modifiers.contains(KeyModifiers::CONTROL) => {
                 if let Err(error) = s.commit_scrivener_import() {
                     s.message = error.to_string();
+                }
+                return Ok(false);
+            }
+            KeyCode::Enter if s.scrivener_import.is_some() => {
+                if let Err(error) = s.commit_scrivener_import() {
+                    s.message = format!("Import could not be completed: {error}");
                 }
                 return Ok(false);
             }
@@ -36118,59 +36419,40 @@ mod tests {
             .start_scrivener_import_standalone(source.clone())
             .unwrap();
         assert!(state.selected_series_root.is_none());
-        assert!(state.message.contains("Standalone Scrivener preview"));
-
-        use story_import::ScrivenerDestinationKind as Kind;
-        let mappings = state
-            .scrivener_import
-            .as_ref()
-            .unwrap()
-            .inventory
-            .items
-            .iter()
-            .map(|item| {
-                (
-                    item.source_document_id.clone(),
-                    item.type_code.clone(),
-                    item.area.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (source_id, type_code, area) in mappings {
-            let decision = state
-                .scrivener_import
-                .as_mut()
-                .unwrap()
-                .plan
-                .decisions
-                .iter_mut()
-                .find(|decision| decision.source_document_id == source_id)
-                .unwrap();
-            match type_code.as_deref() {
-                Some("DraftFolder") => decision.destination_kind = Kind::Unmapped,
-                Some("Text") if area == "manuscript" => decision.destination_kind = Kind::Scene,
-                Some("ResearchFolder") => decision.destination_kind = Kind::Research,
-                _ => {
-                    decision.destination_kind = Kind::Skip;
-                    decision.include_in_import = false;
-                }
-            }
-        }
-        let draft = state
-            .scrivener_import
-            .as_ref()
-            .unwrap()
-            .inventory
-            .items
-            .iter()
-            .position(|item| item.type_code.as_deref() == Some("DraftFolder"))
-            .unwrap();
-        state.scrivener_import.as_mut().unwrap().plan.decisions[draft].destination_kind =
-            Kind::Chapter;
+        assert!(state.message.contains("Import preview"));
+        let wizard = state.scrivener_import.as_ref().unwrap();
+        wizard
+            .plan
+            .validate_for_import(&wizard.inventory)
+            .expect("automatic mapping should preserve and validate the full binder");
+        let (parent, destination) = validate_scrivener_destination(
+            &wizard.inventory,
+            root.path(),
+            "Windows Regression (Writer's IDE)",
+        )
+        .unwrap();
+        assert_eq!(
+            destination,
+            root.path().join("Windows Regression (Writer's IDE)")
+        );
+        let wizard = state.scrivener_import.as_mut().unwrap();
+        wizard.series_root = parent;
+        wizard.folder_name = "Windows Regression (Writer's IDE)".into();
+        wizard.destination_selected = true;
         state.commit_scrivener_import().unwrap();
 
         assert_eq!(state.app.get_project().unwrap().title, "Windows Regression");
-        assert_eq!(state.app.list_scenes(false).unwrap().len(), 1);
+        let prose_units = state.app.list_content_units(false).unwrap();
+        assert_eq!(prose_units.len(), 1);
+        let imported_text = state
+            .app
+            .load_content_unit_text(prose_units[0].id)
+            .unwrap()
+            .0;
+        assert!(
+            imported_text.contains("quiet, generic scene"),
+            "{imported_text:?}"
+        );
         assert_eq!(
             story_import::inspect_scrivener_project(&source)
                 .unwrap()
@@ -36204,6 +36486,30 @@ mod tests {
                 .message
                 .contains("Enter opens folders/previews manifests")
         );
+    }
+
+    #[test]
+    fn scrivener_destination_validation_rejects_source_subtree_and_collisions() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("Protected.scriv");
+        fs::create_dir_all(source.join("Files/Data")).unwrap();
+        fs::write(
+            source.join("Protected.scrivx"),
+            r#"<ScrivenerProject Version="3.0"><Binder>
+              <BinderItem UUID="draft" Type="DraftFolder"><Title>Manuscript</Title><Children/></BinderItem>
+            </Binder></ScrivenerProject>"#,
+        )
+        .unwrap();
+        let inventory = story_import::inspect_scrivener_project(&source).unwrap();
+        assert!(
+            validate_scrivener_destination(&inventory, &source.join("Files"), "Imported").is_err()
+        );
+        assert!(validate_scrivener_destination(&inventory, root.path(), "").is_err());
+        fs::create_dir(root.path().join("Collision")).unwrap();
+        assert!(validate_scrivener_destination(&inventory, root.path(), "Collision").is_err());
+        story_import::ScrivenerImportPlan::proposed(&inventory)
+            .validate_for_import(&inventory)
+            .unwrap();
     }
 
     #[test]
@@ -36245,7 +36551,7 @@ mod tests {
         let preview = state.scrivener_import.as_ref().unwrap();
         assert_eq!(preview.target, ScrivenerImportTarget::Standalone);
         assert!(!preview.inventory.items.is_empty());
-        assert!(state.message.contains("Standalone Scrivener preview"));
+        assert!(state.message.contains("Import preview"));
     }
 
     #[test]

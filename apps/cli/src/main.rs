@@ -635,6 +635,21 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut app = WriterApp::open_project(path)?;
             println!("{}", app.create_assembly(&title)?);
         }
+        "scrivener-profiles" => {
+            let path = args.next().ok_or("missing project path")?;
+            let app = WriterApp::open_project(path)?;
+            for profile in app.list_scrivener_edition_profiles()? {
+                println!(
+                    "{}\t{}\t{} warning(s)",
+                    profile.source_format_id,
+                    profile.assembly_id,
+                    profile.warnings.len()
+                );
+                for warning in profile.warnings {
+                    eprintln!("  warning: {warning}");
+                }
+            }
+        }
         "assembly-list" => {
             let path = args.next().ok_or("missing project path")?;
             let app = WriterApp::open_project(path)?;
@@ -2427,6 +2442,38 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             };
             compile_edition_with_overwrite(&project, &recipe, overwrite)?;
         }
+        "scrivener-profile-compile" => {
+            let project = PathBuf::from(args.next().ok_or("missing project path")?);
+            let source_format = args.next().ok_or("missing Scrivener source format ID")?;
+            let output_format = args.next().ok_or("missing WIDE output format")?;
+            let output = args.next().ok_or("missing project-relative output path")?;
+            let overwrite = match args.next().as_deref() {
+                None => false,
+                Some("--overwrite") => true,
+                Some(_) => return Err("expected optional --overwrite".into()),
+            };
+            let format = story_document::CompileFormat::parse(&output_format)
+                .ok_or("unknown output format")?;
+            let app = WriterApp::open_project(&project)?;
+            let matches = app
+                .list_scrivener_edition_profiles()?
+                .into_iter()
+                .filter(|profile| profile.source_format_id == source_format)
+                .collect::<Vec<_>>();
+            let profile = match matches.as_slice() {
+                [profile] => profile,
+                [] => return Err(format!("no imported Scrivener profile '{source_format}'").into()),
+                _ => return Err(format!("multiple imported profiles use source format ID '{source_format}'; select or remove an import before compiling").into()),
+            };
+            for warning in &profile.warnings {
+                eprintln!("warning: {warning}");
+            }
+            for path in
+                app.compile_scrivener_edition_profile(profile, format, &output, overwrite)?
+            {
+                println!("Compiled {}", path.display());
+            }
+        }
         "spellcheck" | "spellcheck-hunspell" => {
             let project = PathBuf::from(args.next().ok_or("missing project path")?);
             let language = args.next().ok_or("missing spelling language tag")?;
@@ -3647,6 +3694,9 @@ fn usage() {
     );
     eprintln!("writers-ide import-manuscript <source-file> <new-project-directory> [title]");
     eprintln!("writers-ide browse <project> [loopback-port]");
+    eprintln!(
+        "writers-ide scrivener-profiles <project>\nwriters-ide scrivener-profile-compile <project> <source-format-id> <output-format> <project-relative-output> [--overwrite]"
+    );
     eprintln!(
         "writers-ide compile-edition <project> <recipe.toml> [--overwrite]\nwriters-ide watch-edition <project> <recipe.toml> [poll-ms]\nwriters-ide spellcheck <project> <language-tag> [project-relative-wordlist] [executable]
 writers-ide spellcheck-hunspell <project> <language-tag> [project-relative-wordlist] [executable]"

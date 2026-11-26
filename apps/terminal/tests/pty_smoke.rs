@@ -67,6 +67,162 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("isolated-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let source = home.join("0 Import.scriv");
+    let files = source.join("Files/Data");
+    std::fs::create_dir_all(files.join("scene-id")).unwrap();
+    std::fs::create_dir_all(files.join("research-id")).unwrap();
+    std::fs::write(
+        source.join("0 Import.scrivx"),
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+        <ScrivenerProject Version="2.0"><Binder>
+          <BinderItem UUID="draft-id" Type="DraftFolder"><Title>Manuscript</Title><Children>
+            <BinderItem UUID="part-id" Type="Folder"><Title>Part One</Title><Children>
+              <BinderItem UUID="chapter-id" Type="Folder"><Title>Chapter One</Title><Children>
+                <BinderItem UUID="scene-id" Type="Text"><Title>Opening Scene</Title><Children/></BinderItem>
+              </Children></BinderItem>
+            </Children></BinderItem>
+          </Children></BinderItem>
+          <BinderItem UUID="research-folder-id" Type="ResearchFolder"><Title>Research</Title><Children>
+            <BinderItem UUID="research-id" Type="Text"><Title>Private Note</Title><Children/></BinderItem>
+          </Children></BinderItem>
+        </Binder></ScrivenerProject>"#,
+    )
+    .unwrap();
+    std::fs::write(
+        files.join("scene-id/content.rtf"),
+        r"{\rtf1\ansi The patient blacksmith studied the arrowhead.}",
+    )
+    .unwrap();
+    std::fs::write(
+        files.join("research-id/content.rtf"),
+        r"{\rtf1\ansi PRIVATE RESEARCH MUST NOT BE PUBLISHED.}",
+    )
+    .unwrap();
+
+    let initial = root.path().join("Initial Project");
+    WriterApp::create_project(&initial, "Initial Project").unwrap();
+    let source_before = story_import::inspect_scrivener_project(&source).unwrap();
+    assert!(
+        source_before.items.iter().any(|item| {
+            item.source_document_id == "scene-id"
+                && item
+                    .content_markdown
+                    .as_deref()
+                    .is_some_and(|text| text.contains("The patient blacksmith"))
+        }),
+        "the synthetic source fixture must contain readable manuscript text: {:?}",
+        source_before.items
+    );
+    let source_fingerprint = source_before.source_fingerprint;
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Scrivener PTY workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&initial)
+        .arg(&home)
+        .arg("scrivener-import")
+        .output()
+        .expect("run Scrivener import through Linux PTY");
+    assert!(
+        result.status.success(),
+        "Scrivener author workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let inventory = story_import::inspect_scrivener_project(&source).unwrap();
+    assert_eq!(inventory.source_fingerprint, source_fingerprint);
+    let destination = home.join(format!("{} (Writer's IDE)", inventory.title));
+    let reopened = WriterApp::open_project(&destination).unwrap();
+    let nodes = reopened.list_structural_nodes().unwrap();
+    for expected in ["Part One", "Chapter One"] {
+        assert!(
+            nodes.iter().any(|node| node.title == expected),
+            "missing {expected}"
+        );
+    }
+    let scenes = reopened.list_scenes(false).unwrap();
+    assert_eq!(scenes.len(), 1);
+    let prose = reopened.load_scene_text(scenes[0].scene.id).unwrap().0;
+    assert!(prose.contains("The patient blacksmith"));
+    assert!(prose.contains("Additional UAT sentence."));
+    let artifact = destination.join(format!("{}.docx", inventory.title));
+    assert!(
+        artifact.is_file(),
+        "the visible compile workflow did not create {artifact:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires WIDE_PRIVATE_ARROWMAKING_PROJECT to point at the protected local corpus"]
+fn protected_arrowmaking_project_imports_through_the_production_pty_without_source_changes() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let source: std::path::PathBuf = std::env::var_os("WIDE_PRIVATE_ARROWMAKING_PROJECT")
+        .expect("set WIDE_PRIVATE_ARROWMAKING_PROJECT to the protected .scriv project")
+        .into();
+    let inventory = story_import::inspect_scrivener_project(&source).unwrap();
+    let fingerprint = inventory.source_fingerprint.clone();
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("isolated-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let selected_source = home.join("0 Import.scriv");
+    std::os::unix::fs::symlink(&source, &selected_source).unwrap();
+    let initial = root.path().join("Initial Project");
+    WriterApp::create_project(&initial, "Initial Project").unwrap();
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping private Scrivener PTY workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&initial)
+        .arg(&home)
+        .arg("scrivener-import")
+        .env("WIDE_PTY_IMPORT_TITLES", "")
+        .env("WIDE_PTY_IMPORT_TEXT", "")
+        .output()
+        .expect("run protected Scrivener project through Linux PTY");
+    assert!(
+        result.status.success(),
+        "protected Scrivener PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let destination = home.join("0 Import (Writer's IDE)");
+    let reopened = WriterApp::open_project(&destination).unwrap();
+    assert!(
+        !reopened.list_structural_nodes().unwrap().is_empty(),
+        "imported project should retain its binder hierarchy"
+    );
+    let actual = story_import::inspect_scrivener_project(&source)
+        .unwrap()
+        .source_fingerprint;
+    assert_eq!(
+        actual, fingerprint,
+        "the protected source must remain unchanged"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn first_run_tutorial_navigation_and_resume_work_through_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

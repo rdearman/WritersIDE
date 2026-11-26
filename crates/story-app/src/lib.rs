@@ -89,6 +89,22 @@ pub struct ScrivenerCompilePresentation {
     pub warnings: Vec<String>,
 }
 
+/// Project-local bridge between a Scrivener compile format and a WIDE
+/// assembly. The source format does not imply a WIDE output format; authors
+/// choose EPUB, DOCX, PDF, or another renderer when compiling the profile.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScrivenerEditionProfile {
+    pub version: u16,
+    pub source_format_id: String,
+    pub assembly_id: String,
+    pub presentation: story_document::CompilePresentation,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+type ScrivenerPublicationEntities =
+    std::collections::BTreeMap<String, Vec<(Option<SceneId>, Option<ContentUnitId>)>>;
+
 pub fn scrivener_compile_presentation(
     inventory: &story_import::ScrivenerProjectInventory,
     plan: &story_import::ScrivenerImportPlan,
@@ -124,7 +140,6 @@ pub fn scrivener_compile_presentation(
     let mut title_policies =
         std::collections::BTreeMap::<Destination, std::collections::BTreeSet<bool>>::new();
     let mut separators = std::collections::BTreeSet::new();
-    let mut body_exclusions = Vec::new();
 
     for item in &inventory.items {
         let Some(section_type_id) = item.section_type_id.as_deref() else {
@@ -157,14 +172,6 @@ pub fn scrivener_compile_presentation(
         }
         if layout.text_prefix.is_some() || layout.text_suffix.is_some() {
             warnings.push(format!("Scrivener layout '{layout_id}' has body prefix/suffix content that requires a richer Compile IR mapping"));
-        }
-        if layout.include_text == Some(false)
-            && matches!(
-                destination,
-                Destination::Section | Destination::Chapter | Destination::Scene
-            )
-        {
-            body_exclusions.push(item.source_document_id.clone());
         }
         if matches!(destination, Destination::Scene)
             && let (Some(kind), Some(text)) = (
@@ -202,27 +209,6 @@ pub fn scrivener_compile_presentation(
         }
     } else if separators.len() > 1 {
         warnings.push(format!("Scrivener format '{format_id}' uses multiple scene separators; WIDE left the single separator setting unchanged"));
-    }
-    if !body_exclusions.is_empty() {
-        body_exclusions.sort();
-        body_exclusions.dedup();
-        warnings.push(format!("{} source document(s) use layouts with body text disabled; per-document layout body suppression is not yet represented by CompilePresentation", body_exclusions.len()));
-    }
-    for (label, id, enabled) in [
-        (
-            "front matter",
-            format.default_front_matter_id.as_deref(),
-            format.add_default_front_matter,
-        ),
-        (
-            "back matter",
-            format.default_back_matter_id.as_deref(),
-            format.add_default_back_matter,
-        ),
-    ] {
-        if id.is_some() || enabled.is_some() {
-            warnings.push(format!("Scrivener {label} selection is retained in import provenance but is not yet translated into the WIDE edition assembly"));
-        }
     }
     presentation.validate().map_err(AppError::Domain)?;
     warnings.sort();
@@ -4715,6 +4701,10 @@ impl WriterApp {
         let mut front_matter_position = 0u32;
         let mut back_matter_position = 0u32;
         let mut imported_scenes = Vec::new();
+        // Keep source-to-destination identities while importing. Compile
+        // profiles are assembled from these stable entities after the full
+        // binder has been mapped; they never infer identity from titles.
+        let mut publication_entities = ScrivenerPublicationEntities::new();
         let mut unsupported = preview.unsupported.clone();
 
         for item in &inventory.items {
@@ -4766,6 +4756,10 @@ impl WriterApp {
                         if item.include_in_compile == Some(false) {
                             self.set_content_unit_included(unit, false)?;
                         }
+                        publication_entities
+                            .entry(item.source_document_id.clone())
+                            .or_default()
+                            .push((None, Some(unit)));
                         destinations.push(("content_unit", unit.to_string(), "content_markdown"));
                     }
                 }
@@ -4805,6 +4799,10 @@ impl WriterApp {
                         if item.include_in_compile == Some(false) {
                             self.set_content_unit_included(unit, false)?;
                         }
+                        publication_entities
+                            .entry(item.source_document_id.clone())
+                            .or_default()
+                            .push((None, Some(unit)));
                         destinations.push(("content_unit", unit.to_string(), "content_markdown"));
                     }
                     destinations.push(("structural_node", node.to_string(), "chapter"));
@@ -4861,6 +4859,10 @@ impl WriterApp {
                         destinations.push(("reading", reading.to_string(), "notes"));
                     }
                     imported_scenes.push(scene);
+                    publication_entities
+                        .entry(item.source_document_id.clone())
+                        .or_default()
+                        .push((Some(scene), None));
                     destinations.push(("scene", scene.to_string(), "scene"));
                 }
                 Target::FrontMatter | Target::BackMatter => {
@@ -4886,6 +4888,10 @@ impl WriterApp {
                         // editions. Keep it in the project but exclude it
                         // from ordinary compilation until selected explicitly.
                         self.set_content_unit_included(unit, false)?;
+                        publication_entities
+                            .entry(item.source_document_id.clone())
+                            .or_default()
+                            .push((None, Some(unit)));
                         destinations.push(("content_unit", unit.to_string(), kind.as_str()));
                     }
                 }
@@ -4946,6 +4952,8 @@ impl WriterApp {
             unsupported.extend(item.unsupported.iter().cloned());
         }
 
+        self.create_scrivener_edition_profiles(inventory, plan, run, &publication_entities)?;
+
         // Keep imports deterministic and preserve binder order separately from
         // fictional chronology.
         unsupported.sort();
@@ -4969,6 +4977,205 @@ impl WriterApp {
             &unsupported.join("; "),
         )?;
         Ok((run, imported_scenes))
+    }
+
+    fn create_scrivener_edition_profiles(
+        &mut self,
+        inventory: &story_import::ScrivenerProjectInventory,
+        plan: &story_import::ScrivenerImportPlan,
+        run: ImportRunId,
+        publication_entities: &ScrivenerPublicationEntities,
+    ) -> Result<()> {
+        use story_import::ScrivenerDestinationKind as Destination;
+
+        let Some(settings) = inventory.compile_settings.as_ref() else {
+            return Ok(());
+        };
+        let decisions = plan
+            .decisions
+            .iter()
+            .map(|decision| (decision.source_document_id.as_str(), decision))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let root = self.project_root().to_path_buf();
+        let profile_dir = root.join(".writers-ide/scrivener-profiles");
+
+        for (format_index, format) in settings.formats.iter().enumerate() {
+            let proposed =
+                scrivener_compile_presentation(inventory, plan, &format.source_format_id)?;
+            let assembly =
+                self.create_assembly(&format!("Scrivener · {}", format.source_format_id))?;
+            let mut assembly_position = 0u32;
+            let mut profile_warnings = proposed.warnings;
+
+            for item in &inventory.items {
+                let Some(decision) = decisions.get(item.source_document_id.as_str()) else {
+                    continue;
+                };
+                let Some(entities) = publication_entities.get(&item.source_document_id) else {
+                    continue;
+                };
+                let publication_kind = matches!(
+                    decision.destination_kind,
+                    Destination::Section
+                        | Destination::Chapter
+                        | Destination::Scene
+                        | Destination::FrontMatter
+                        | Destination::BackMatter
+                );
+                let mut included = decision.include_in_import
+                    && publication_kind
+                    && (!matches!(
+                        decision.destination_kind,
+                        Destination::FrontMatter | Destination::BackMatter
+                    ) || item.include_in_compile != Some(false));
+
+                match decision.destination_kind {
+                    Destination::FrontMatter => {
+                        included = decision.include_in_import
+                            && format.add_default_front_matter == Some(true)
+                            && format.default_front_matter_id.as_deref()
+                                == Some(item.source_document_id.as_str());
+                    }
+                    Destination::BackMatter => {
+                        included = decision.include_in_import
+                            && format.add_default_back_matter == Some(true)
+                            && format.default_back_matter_id.as_deref()
+                                == Some(item.source_document_id.as_str());
+                    }
+                    Destination::Scene | Destination::Chapter | Destination::Section => {
+                        if let Some(section_type) = item.section_type_id.as_deref() {
+                            if let Some(layout_id) = format.section_layouts.get(section_type) {
+                                if let Some(layout) = format.layouts.get(layout_id) {
+                                    included &= layout.include_text != Some(false);
+                                } else {
+                                    profile_warnings.push(format!(
+                                        "Scrivener layout '{layout_id}' is missing for source section type '{section_type}'"
+                                    ));
+                                }
+                            } else {
+                                profile_warnings.push(format!(
+                                    "Scrivener source section type '{section_type}' has no layout mapping in format '{}'",
+                                    format.source_format_id
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+
+                for (scene, content) in entities {
+                    if let Some(scene) = scene {
+                        let assembly_item =
+                            self.add_assembly_scene(assembly, *scene, assembly_position)?;
+                        if !included {
+                            self.set_assembly_item_included(assembly_item, false)?;
+                        }
+                        assembly_position = assembly_position.checked_add(1).ok_or_else(|| {
+                            AppError::Domain("Scrivener edition ordering overflow".into())
+                        })?;
+                    }
+                    if let Some(content) = content {
+                        let assembly_item =
+                            self.add_assembly_content_unit(assembly, *content, assembly_position)?;
+                        if !included {
+                            self.set_assembly_item_included(assembly_item, false)?;
+                        }
+                        assembly_position = assembly_position.checked_add(1).ok_or_else(|| {
+                            AppError::Domain("Scrivener edition ordering overflow".into())
+                        })?;
+                    }
+                }
+            }
+
+            profile_warnings.sort();
+            profile_warnings.dedup();
+            let profile = ScrivenerEditionProfile {
+                version: 1,
+                source_format_id: format.source_format_id.clone(),
+                assembly_id: assembly.to_string(),
+                presentation: proposed.presentation,
+                warnings: profile_warnings,
+            };
+            let filename = format!("{run}-{format_index}.json");
+            let destination = profile_dir.join(filename);
+            let serialized = serde_json::to_vec_pretty(&profile)
+                .map_err(|error| AppError::Domain(error.to_string()))?;
+            write_project_file_atomically(&destination, &serialized)?;
+        }
+        Ok(())
+    }
+
+    /// Return imported Scrivener profiles in stable source order.
+    pub fn list_scrivener_edition_profiles(&self) -> Result<Vec<ScrivenerEditionProfile>> {
+        let directory = self.project_root().join(".writers-ide/scrivener-profiles");
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(AppError::Io(error)),
+        };
+        let mut paths = entries
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+            .into_iter()
+            .map(|path| {
+                let bytes = fs::read(path)?;
+                let profile: ScrivenerEditionProfile =
+                    serde_json::from_slice(&bytes).map_err(|error| {
+                        AppError::Domain(format!("invalid Scrivener edition profile: {error}"))
+                    })?;
+                if profile.version != 1
+                    || profile.source_format_id.trim().is_empty()
+                    || uuid::Uuid::parse_str(&profile.assembly_id).is_err()
+                {
+                    return Err(AppError::Domain(
+                        "invalid Scrivener edition profile identity".into(),
+                    ));
+                }
+                profile.presentation.validate().map_err(AppError::Domain)?;
+                Ok(profile)
+            })
+            .collect()
+    }
+
+    /// Compile a saved Scrivener profile using an explicitly selected WIDE
+    /// output format and project-relative destination.
+    pub fn compile_scrivener_edition_profile(
+        &self,
+        profile: &ScrivenerEditionProfile,
+        format: story_document::CompileFormat,
+        output: &str,
+        overwrite: bool,
+    ) -> Result<Vec<PathBuf>> {
+        if profile.version != 1 || uuid::Uuid::parse_str(&profile.assembly_id).is_err() {
+            return Err(AppError::Domain("invalid Scrivener edition profile".into()));
+        }
+        let recipe = story_document::EditionRecipe {
+            version: 1,
+            name: format!("Scrivener · {}", profile.source_format_id),
+            format,
+            assembly_id: Some(profile.assembly_id.clone()),
+            output: output.to_owned(),
+            metadata_title: None,
+            metadata_author: None,
+            cover_image: None,
+            design: story_document::BookDesign::default(),
+            expand_transclusions: false,
+            spellcheck: false,
+            language: None,
+            dictionary: None,
+            spelling_engine: story_document::SpellcheckEngine::default(),
+            diagnostics: story_document::DiagnosticPolicy::default(),
+            presentation: profile.presentation.clone(),
+        };
+        recipe.validate().map_err(AppError::Domain)?;
+        let artifact = self.compile_edition_artifact_recording_failure(&recipe)?;
+        self.publish_compile_artifact(self.project_root().join(output), &artifact, overwrite)
     }
 
     fn materialize_scrivener_assets(
@@ -8660,6 +8867,11 @@ unexpected_prose = "must not be silently discarded"
             .destination_kind = story_import::ScrivenerDestinationKind::Chapter;
         plan.decisions
             .iter_mut()
+            .find(|decision| decision.source_document_id == "scene-1")
+            .unwrap()
+            .destination_kind = story_import::ScrivenerDestinationKind::Scene;
+        plan.decisions
+            .iter_mut()
             .find(|decision| decision.source_document_id == "section-1")
             .unwrap()
             .destination_kind = story_import::ScrivenerDestinationKind::Section;
@@ -8874,8 +9086,8 @@ unexpected_prose = "must not be silently discarded"
             source.join("Matter.scrivx"),
             r#"<ScrivenerProject Version="2.0"><Binder>
               <BinderItem UUID="draft" Type="DraftFolder"><Title>Draft</Title><Children>
-                <BinderItem UUID="front-id" Type="Text"><Title>Opening Matter</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
-                <BinderItem UUID="back-id" Type="Text"><Title>Retailer Back Matter</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
+                <BinderItem UUID="front-id" Type="Text"><Title>Opening Matter</Title><IncludeInCompile>No</IncludeInCompile><Children/></BinderItem>
+                <BinderItem UUID="back-id" Type="Text"><Title>Retailer Back Matter</Title><IncludeInCompile>No</IncludeInCompile><Children/></BinderItem>
               </Children></BinderItem>
             </Binder></ScrivenerProject>"#,
         )
@@ -8884,6 +9096,7 @@ unexpected_prose = "must not be silently discarded"
             source.join("Settings/compile.xml"),
             r#"<CompileSettings><ProjectSettings><Content Scope="Included"/></ProjectSettings><FormatSettings>
               <Format ID="ebook"><FrontAndBackMatter><DefaultFrontMatter Add="Yes">front-id</DefaultFrontMatter><DefaultBackMatter Add="Yes">back-id</DefaultBackMatter></FrontAndBackMatter></Format>
+              <Format ID="kobo"><FrontAndBackMatter><DefaultFrontMatter Add="No">front-id</DefaultFrontMatter><DefaultBackMatter Add="Yes">back-id</DefaultBackMatter></FrontAndBackMatter></Format>
             </FormatSettings></CompileSettings>"#,
         )
         .unwrap();
@@ -8928,6 +9141,29 @@ unexpected_prose = "must not be silently discarded"
             story_import::ScrivenerImportMode::Editable,
         )
         .unwrap();
+        let profiles = app.list_scrivener_edition_profiles().unwrap();
+        let profile = profiles
+            .iter()
+            .find(|profile| profile.source_format_id == "ebook")
+            .unwrap();
+        let assembly = story_core::AssemblyId(uuid::Uuid::parse_str(&profile.assembly_id).unwrap());
+        let profile_ir = app.compile_assembly_ir(assembly).unwrap();
+        let profile_text = profile_ir.render_markdown().0;
+        assert!(profile_text.contains("FRONTMATTERPRIVATETEST"));
+        assert!(profile_text.contains("BACKMATTERPRIVATETEST"));
+        let kobo_profile = profiles
+            .iter()
+            .find(|profile| profile.source_format_id == "kobo")
+            .unwrap();
+        let kobo_assembly =
+            story_core::AssemblyId(uuid::Uuid::parse_str(&kobo_profile.assembly_id).unwrap());
+        let kobo_text = app
+            .compile_assembly_ir(kobo_assembly)
+            .unwrap()
+            .render_markdown()
+            .0;
+        assert!(!kobo_text.contains("FRONTMATTERPRIVATETEST"));
+        assert!(kobo_text.contains("BACKMATTERPRIVATETEST"));
         let units = app.list_content_units(false).unwrap();
         assert_eq!(units.len(), 2);
         for (title, expected) in [
@@ -8948,6 +9184,21 @@ unexpected_prose = "must not be silently discarded"
         let compiled = String::from_utf8(compiled.bytes).unwrap();
         assert!(!compiled.contains("FRONTMATTERPRIVATETEST"));
         assert!(!compiled.contains("BACKMATTERPRIVATETEST"));
+        let output = app
+            .compile_scrivener_edition_profile(
+                profile,
+                story_document::CompileFormat::Markdown,
+                "exports/retailer-edition.md",
+                false,
+            )
+            .unwrap();
+        let published_path = output
+            .iter()
+            .find(|path| path.extension().is_some_and(|extension| extension == "md"))
+            .unwrap();
+        let published = fs::read_to_string(published_path).unwrap();
+        assert!(published.contains("FRONTMATTERPRIVATETEST"));
+        assert!(published.contains("BACKMATTERPRIVATETEST"));
     }
 
     #[test]

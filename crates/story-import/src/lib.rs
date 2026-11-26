@@ -529,9 +529,10 @@ pub struct ScrivenerEmbeddedAsset {
     pub bytes: Vec<u8>,
 }
 
-/// Explicit destination choice shown in a Scrivener import preview. `Unmapped`
-/// is intentional: folder names and binder roles are not sufficient evidence
-/// to invent chapter/scene boundaries.
+/// A destination role for a Scrivener binder item. The proposed import plan
+/// preserves ordinary manuscript folders as sections or chapters where their
+/// parent/child shape establishes a safe outline role; `Unmapped` remains
+/// available for genuinely conflicting source metadata that needs review.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum ScrivenerDestinationKind {
     Unmapped,
@@ -574,6 +575,15 @@ pub struct ScrivenerImportPlan {
     pub decisions: Vec<ScrivenerMappingDecision>,
 }
 
+fn scrivener_item_is_folder(item: &ScrivenerBinderItem) -> bool {
+    item.type_code.as_deref().is_some_and(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "folder" | "draftfolder" | "researchfolder" | "trashfolder" | "group"
+        )
+    })
+}
+
 impl ScrivenerImportPlan {
     pub fn proposed(inventory: &ScrivenerProjectInventory) -> Self {
         let mut matter_roles = BTreeMap::<&str, ScrivenerDestinationKind>::new();
@@ -613,28 +623,140 @@ impl ScrivenerImportPlan {
                 }
             }
         }
+        // A format-selected matter document can live inside an otherwise
+        // private/unknown binder container (including a text document with
+        // children). Keep each ancestor in the hierarchy as an organisational
+        // section so the explicit selection is valid. Text on a promoted
+        // section is retained as SectionBody; unselected siblings keep their
+        // private Research role.
+        let mut matter_container_ids = BTreeSet::new();
+        for source_id in matter_roles.keys() {
+            let mut parent_id = inventory
+                .items
+                .iter()
+                .find(|item| item.source_document_id == *source_id)
+                .and_then(|item| item.parent_source_id.as_deref());
+            while let Some(id) = parent_id {
+                let Some(parent) = inventory
+                    .items
+                    .iter()
+                    .find(|item| item.source_document_id == id)
+                else {
+                    break;
+                };
+                if parent.area == "trash" {
+                    break;
+                }
+                if !matter_roles.contains_key(parent.source_document_id.as_str()) {
+                    matter_container_ids.insert(parent.source_document_id.as_str());
+                }
+                parent_id = parent.parent_source_id.as_deref();
+            }
+        }
+        let item_by_id = inventory
+            .items
+            .iter()
+            .map(|item| (item.source_document_id.as_str(), item))
+            .collect::<BTreeMap<_, _>>();
+        let default_kind = |item: &ScrivenerBinderItem| {
+            if let Some(kind) = matter_roles.get(item.source_document_id.as_str()) {
+                return *kind;
+            }
+            if matter_container_ids.contains(item.source_document_id.as_str()) {
+                return ScrivenerDestinationKind::Section;
+            }
+            match item.area.as_str() {
+                "research" | "unknown" => return ScrivenerDestinationKind::Research,
+                "trash" => return ScrivenerDestinationKind::Skip,
+                _ => {}
+            }
+            if scrivener_item_is_folder(item) {
+                if item
+                    .type_code
+                    .as_deref()
+                    .is_some_and(|value| value.eq_ignore_ascii_case("DraftFolder"))
+                {
+                    return ScrivenerDestinationKind::Section;
+                }
+                let children = inventory
+                    .items
+                    .iter()
+                    .filter(|child| {
+                        child.parent_source_id.as_deref() == Some(&item.source_document_id)
+                    })
+                    .collect::<Vec<_>>();
+                let has_child_folder = children.iter().any(|child| scrivener_item_is_folder(child));
+                let has_child_document = !children.is_empty() && !has_child_folder;
+                return if has_child_document {
+                    ScrivenerDestinationKind::Chapter
+                } else {
+                    // Folders are preserved as organisational sections when
+                    // their exact publishing role is not known. A folder that
+                    // directly groups text documents is a useful chapter
+                    // boundary; empty and nested containers remain sections.
+                    ScrivenerDestinationKind::Section
+                };
+            }
+            let parent_kind = item
+                .parent_source_id
+                .as_deref()
+                .and_then(|parent| item_by_id.get(parent).copied())
+                .map(|parent| {
+                    if parent.area == "research" || parent.area == "unknown" {
+                        ScrivenerDestinationKind::Research
+                    } else if parent.area == "trash" {
+                        ScrivenerDestinationKind::Skip
+                    } else if scrivener_item_is_folder(parent) {
+                        let children = inventory
+                            .items
+                            .iter()
+                            .filter(|child| {
+                                child.parent_source_id.as_deref()
+                                    == Some(&parent.source_document_id)
+                            })
+                            .collect::<Vec<_>>();
+                        let has_child_folder =
+                            children.iter().any(|child| scrivener_item_is_folder(child));
+                        if parent
+                            .type_code
+                            .as_deref()
+                            .is_some_and(|value| value.eq_ignore_ascii_case("DraftFolder"))
+                            || !children.is_empty() && has_child_folder
+                        {
+                            ScrivenerDestinationKind::Section
+                        } else if !children.is_empty() {
+                            ScrivenerDestinationKind::Chapter
+                        } else {
+                            ScrivenerDestinationKind::Section
+                        }
+                    } else if parent.area == "manuscript" {
+                        // Nested text documents form a parent document with
+                        // scene children; preserve that hierarchy where the
+                        // source binder expresses it.
+                        ScrivenerDestinationKind::Chapter
+                    } else {
+                        ScrivenerDestinationKind::Research
+                    }
+                });
+            match parent_kind {
+                Some(ScrivenerDestinationKind::Chapter) => ScrivenerDestinationKind::Scene,
+                Some(ScrivenerDestinationKind::Section) | None => ScrivenerDestinationKind::Chapter,
+                Some(ScrivenerDestinationKind::Research) => ScrivenerDestinationKind::Research,
+                Some(ScrivenerDestinationKind::Skip) => ScrivenerDestinationKind::Skip,
+                Some(ScrivenerDestinationKind::FrontMatter)
+                | Some(ScrivenerDestinationKind::BackMatter) => matter_roles
+                    .get(item.source_document_id.as_str())
+                    .copied()
+                    .unwrap_or(ScrivenerDestinationKind::Research),
+                Some(ScrivenerDestinationKind::Scene)
+                | Some(ScrivenerDestinationKind::Unmapped) => ScrivenerDestinationKind::Research,
+            }
+        };
         let decisions = inventory
             .items
             .iter()
             .map(|item| {
-                let destination_kind = matter_roles
-                    .get(item.source_document_id.as_str())
-                    .copied()
-                    .unwrap_or_else(|| match item.area.as_str() {
-                        "research" | "unknown" => ScrivenerDestinationKind::Research,
-                        "trash" => ScrivenerDestinationKind::Skip,
-                        // Binder folder roles vary by project; make the author
-                        // choose section vs chapter in the preview.
-                        _ if item.type_code.as_deref().is_some_and(|value| {
-                            value.eq_ignore_ascii_case("folder")
-                                || value.eq_ignore_ascii_case("draft")
-                        }) =>
-                        {
-                            ScrivenerDestinationKind::Unmapped
-                        }
-                        _ if item.content_markdown.is_some() => ScrivenerDestinationKind::Scene,
-                        _ => ScrivenerDestinationKind::Unmapped,
-                    });
+                let destination_kind = default_kind(item);
                 ScrivenerMappingDecision {
                     source_document_id: item.source_document_id.clone(),
                     destination_kind,
@@ -666,7 +788,7 @@ impl ScrivenerImportPlan {
                     decision.source_document_id.clone(),
                 ));
             }
-            let Some(item) = inventory
+            let Some(_item) = inventory
                 .items
                 .iter()
                 .find(|item| item.source_document_id == decision.source_document_id)
@@ -690,15 +812,11 @@ impl ScrivenerImportPlan {
                 ScrivenerDestinationKind::Section | ScrivenerDestinationKind::Chapter => {
                     preview.manuscript_items += 1;
                 }
-                ScrivenerDestinationKind::Scene => {
-                    preview.manuscript_items += 1;
-                    if item.content_markdown.is_none() {
-                        preview.unsupported.push(format!(
-                            "{} is mapped to a scene but has no readable prose file",
-                            item.source_document_id
-                        ));
-                    }
-                }
+                // Empty Scrivener text documents are legitimate outline
+                // placeholders. Preserve them as editable empty manuscript
+                // entries; an actual unreadable file is recorded separately
+                // in the item's unsupported diagnostics.
+                ScrivenerDestinationKind::Scene => preview.manuscript_items += 1,
                 ScrivenerDestinationKind::FrontMatter | ScrivenerDestinationKind::BackMatter => {
                     preview.manuscript_items += 1
                 }
@@ -4721,23 +4839,28 @@ This is an addition to the old file.}"#;
                 .any(|warning| warning.contains("does not establish Scrivener application version"))
         );
 
-        let mut plan = ScrivenerImportPlan::proposed(&inventory);
+        let plan = ScrivenerImportPlan::proposed(&inventory);
         let preview = plan.preview(&inventory).unwrap();
         assert_eq!(preview.total_items, 3);
         assert_eq!(preview.research_items, 1);
-        assert!(
-            preview
-                .unresolved_source_ids
-                .contains(&"chapter-uuid".into())
+        assert!(preview.unresolved_source_ids.is_empty());
+        assert_eq!(
+            plan.decisions
+                .iter()
+                .find(|decision| decision.source_document_id == "chapter-uuid")
+                .unwrap()
+                .destination_kind,
+            ScrivenerDestinationKind::Section
+        );
+        assert_eq!(
+            plan.decisions
+                .iter()
+                .find(|decision| decision.source_document_id == "scene-uuid")
+                .unwrap()
+                .destination_kind,
+            ScrivenerDestinationKind::Chapter
         );
         assert!(!preview.unresolved_source_ids.contains(&"scene-uuid".into()));
-        plan.decisions
-            .iter_mut()
-            .find(|decision| decision.source_document_id == "chapter-uuid")
-            .unwrap()
-            .destination_kind = ScrivenerDestinationKind::Chapter;
-        let preview = plan.preview(&inventory).unwrap();
-        assert!(preview.unresolved_source_ids.is_empty());
         plan.validate_for_import(&inventory).unwrap();
     }
 
@@ -4912,9 +5035,32 @@ This is an addition to the old file.}"#;
                     fields: BTreeMap::new(),
                     unsupported: Vec::new(),
                 },
-                make_item("front", Some("draft")),
-                make_item("back", Some("draft")),
-                make_item("alternate", Some("draft")),
+                {
+                    let mut item = make_item("matter-folder", None);
+                    item.position = 1;
+                    item.type_code = Some("Folder".into());
+                    item
+                },
+                {
+                    let mut item = make_item("front", Some("matter-folder"));
+                    item.position = 0;
+                    item
+                },
+                {
+                    let mut item = make_item("back", Some("matter-folder"));
+                    item.position = 1;
+                    item
+                },
+                {
+                    let mut item = make_item("private-sibling", Some("matter-folder"));
+                    item.position = 2;
+                    item
+                },
+                {
+                    let mut item = make_item("alternate", None);
+                    item.position = 2;
+                    item
+                },
             ],
             warnings: Vec::new(),
             unsupported: Vec::new(),
@@ -4932,6 +5078,11 @@ This is an addition to the old file.}"#;
             .collect::<BTreeMap<_, _>>();
         assert_eq!(mapping["front"], ScrivenerDestinationKind::FrontMatter);
         assert_eq!(mapping["back"], ScrivenerDestinationKind::BackMatter);
+        assert_eq!(mapping["matter-folder"], ScrivenerDestinationKind::Section);
+        assert_eq!(
+            mapping["private-sibling"],
+            ScrivenerDestinationKind::Research
+        );
         assert_eq!(mapping["alternate"], ScrivenerDestinationKind::Research);
         let mut plan = plan;
         plan.decisions

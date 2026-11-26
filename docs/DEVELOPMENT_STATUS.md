@@ -1090,3 +1090,70 @@ configure a named recipe. Per-Scrivener format profiles, front/back matter
 selection and a guided terminal configuration editor remain outstanding. This
 is partial #7/#53/#68/#73 work, not a claim that Scrivener publication mapping
 is complete. The human publication fidelity gate remains failed/pending review.
+
+## Scrivener format assemblies — implementation in progress, 26 November 2026
+
+Imported Scrivener compile formats now create separate WIDE manuscript
+assemblies. Each profile retains the source-format identifier, translates
+heading and scene-separator presentation rules, selects the configured default
+front/back matter, and applies Scrivener's recoverable binder inclusion and
+layout body-suppression settings without changing canonical inclusion. Profile
+configuration is stored project-locally under
+`.writers-ide/scrivener-profiles/`; each assembly remains editable through
+WIDE's existing assembly operations. The CLI can list profiles and compile a
+selected profile after the author explicitly chooses a WIDE output format and
+project-relative destination. A Scrivener format ID is never guessed to mean
+EPUB, DOCX, PDF or another WIDE renderer.
+
+Synthetic application coverage verifies distinct retailer-style front/back
+matter selection, private matter remains absent from ordinary compilation,
+the selected assembly compiles through the standard publication pipeline, and
+the result is saved to the selected destination. Remaining work includes
+exposing profile selection and output choice in the terminal publishing
+workflow, mapping all source layout constructs that WIDE cannot yet represent,
+and exercising the profiles against real Scrivener projects whose compile
+settings contain usable section-layout mappings. The three controlled golden
+projects and expanded private corpus must be rerun before this integration is
+ready for publication UAT.
+
+## Standalone Scrivener import UAT repair — verified in automation, 26 November 2026
+
+The ordinary File → Import Scrivener as New Project workflow now proposes a
+validated automatic mapping for supported binder structures, keeps ambiguous
+planning content private, preserves empty outline placeholders, and treats
+format-selected front/back matter ancestry as organisational sections so that
+valid selections do not fail parent-kind validation. The author can choose an
+explicit destination through the shared directory browser; the destination
+path is shown, and source-subtree, symlink-alias, non-writable and existing
+destination cases are rejected before creating a project. On success the
+terminal opens the imported project in the unified Outline with an imported
+scene selected. Import errors are translated to binder paths for the primary
+message, with technical detail available separately.
+
+Regression evidence on this revision: the synthetic PTY workflow completes
+source selection → automatic mapping → explicit destination → import → edit
+and save → compile DOCX → exit/reopen and content verification. The protected
+`ArrowMaking.scriv` corpus project also completes the production terminal
+workflow; its source fingerprint is identical before and after. Root-level
+fixture SHA256SUMS verification passed before and after. These results verify
+automation only; #53/#44 still require author UAT. The import PTY harness was
+adjusted to accept the actual indented outline row marker, and an outdated
+terminal assertion/XML fixture was corrected.
+
+Verification on the same code revision: `cargo fmt --all -- --check`,
+`git diff --check`, workspace Clippy with `-D warnings`, and the offline
+workspace suite passed (including the loopback-only Ollama test with the
+author-authorised socket permission). Focused protected-project command:
+
+```sh
+WIDE_PRIVATE_ARROWMAKING_PROJECT="$PWD/fixtures/back-catalogue/scrivener/ArrowMaking.scriv" \
+  cargo test --offline -p writers-ide-terminal --test pty_smoke \
+  protected_arrowmaking_project_imports_through_the_production_pty_without_source_changes \
+  -- --ignored --nocapture
+```
+
+The source remains the authority; a successful import does not establish
+publication fidelity. Scrivener per-format layout and inclusion settings have
+also been translated into WIDE named assemblies and are available to the CLI,
+but selection/output destination still need to be integrated into the
+terminal Publish workflow and verified against the expanded private corpus.

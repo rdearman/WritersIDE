@@ -133,6 +133,7 @@ def main():
     chapter_creation = modes == ["chapter-creation"]
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
+    scrivener_import = modes == ["scrivener-import"]
     insert_edit_actions = modes == ["insert-edit-actions"]
     outline_enter = modes == ["outline-enter"]
     special_character = modes == ["special-character"]
@@ -305,6 +306,142 @@ def main():
 
     try:
         read_for(1.0)
+        if scrivener_import:
+            expected_titles = os.environ.get(
+                "WIDE_PTY_IMPORT_TITLES", "Part One|Chapter One|Opening Scene"
+            ).split("|")
+            expected_titles = [title for title in expected_titles if title]
+            expected_text = os.environ.get(
+                "WIDE_PTY_IMPORT_TEXT", "The patient blacksmith"
+            )
+            os.write(master, b"\x1b")  # dismiss first-run help if present
+            read_for(0.2)
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10, File menu
+            read_for(0.2)
+            select_visible_menu_item("Import Scrivener as New Project")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Import Scrivener", b"Folder contents"), menu_start, timeout=5.0
+            ):
+                raise AssertionError("File > Import Scrivener did not open the file browser")
+            os.write(master, b"\t")  # focus project list
+            os.write(master, b"\x1b[15~")  # F5 inspect selected .scriv folder
+            if not wait_for_screen_fragments(
+                (b"Scrivener Import", b"Import Details"),
+                menu_start,
+                timeout=10.0,
+            ):
+                raise AssertionError(
+                    "Scrivener selection did not show the concise import preview; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            screen = "\n".join(terminal_snapshot(output, 24, 80))
+            if "Series Books" in screen or "draft-internal-id" in screen or "unmapped" in screen.lower():
+                raise AssertionError("import preview exposed the old series/mapping failure: " + screen)
+            if not wait_for_screen_fragments((b"Enter Choose Destination",), timeout=2.0):
+                raise AssertionError(
+                    "preview did not advertise the destination step; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"writable project destination", b"F4 Select Destination"),
+                menu_start,
+                timeout=5.0,
+            ):
+                raise AssertionError("destination browser was not shown after the preview")
+            os.write(master, b"\x1bOS")  # F4 selects the displayed parent folder
+            if not wait_for_screen_fragments((b"Destination:",), timeout=3.0):
+                raise AssertionError(
+                    "destination selection did not confirm the full path; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\r")  # Enter imports using the automatic mapping
+            if expected_titles:
+                imported_outline_ready = wait_for_screen_fragments(
+                    tuple(title.encode("utf-8") for title in expected_titles),
+                    menu_start,
+                    timeout=120.0,
+                )
+            else:
+                deadline = time.monotonic() + 120.0
+                imported_outline_ready = False
+                while time.monotonic() < deadline:
+                    rows = terminal_snapshot(output, 24, 80)
+                    if len(rows) > 1 and rows[1].startswith("┌Outline") and any(
+                        re.search(r"▸\s+\[ \] .+", row) for row in rows
+                    ):
+                        imported_outline_ready = True
+                        break
+                    read_for(0.1)
+            if not imported_outline_ready:
+                raise AssertionError(
+                    "import did not open the preserved manuscript outline; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            if expected_titles and not wait_for_screen_fragments(
+                ("▸ [ ] Opening Scene".encode("utf-8"),), timeout=2.0
+            ):
+                raise AssertionError(
+                    "the imported project did not focus its first scene in the outline; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\r")  # open the first imported scene
+            editor_markers = (
+                (expected_text.encode("utf-8"),) if expected_text else (b"Editor",)
+            )
+            if not wait_for_screen_fragments(editor_markers, timeout=5.0):
+                raise AssertionError(
+                    "imported manuscript did not open in the editor; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"Additional UAT sentence.")
+            os.write(master, b"\x13")  # Ctrl+S
+            if not wait_for_screen_fragments((b"Saved", b"Additional UAT sentence"), timeout=5.0):
+                raise AssertionError(
+                    "edited imported prose did not show save feedback; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x1b")  # return to the manuscript outline
+            if not wait_for_screen_fragments(
+                (b"Outline", b"Selected outline item"), timeout=5.0
+            ):
+                raise AssertionError(
+                    "editor did not return to the imported outline; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            selected_publish = False
+            for _ in range(10):
+                if wait_for_screen_fragments((b"Compile / Export",), menu_start, timeout=0.2):
+                    selected_publish = True
+                    break
+                os.write(master, b"\x1b[C")
+                read_for(0.05)
+            if not selected_publish:
+                raise AssertionError("Publish menu did not expose Compile / Export")
+            select_visible_menu_item("Compile / Export")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Selected path:", b".docx", b"F5 Compile"), timeout=5.0):
+                raise AssertionError("imported project did not reach the publication file browser")
+            os.write(master, b"\x1b[15~")
+            if not wait_for_screen_fragments((b"Compiled",), timeout=15.0):
+                raise AssertionError("imported manuscript did not compile successfully")
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 8.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after importing and compiling")
+            print("PTY Scrivener workflow passed: menu → source browser → automatic mapping → destination → edit/save → compile → exit.")
+            return
+
         if review_menu:
             os.write(master, b"\x1b")  # dismiss the visible first-run welcome
             read_for(0.25)
