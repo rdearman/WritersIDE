@@ -15,16 +15,21 @@ discarded or guessed. A synthetic application test verifies chapter and scene
 heading suppression, a custom scene separator, unchanged source titles, and
 warnings for an unmapped section type.
 
-This is a translation seam, not completion of Scrivener profile integration:
-the selected mapping is not yet persisted as a named WIDE edition recipe,
-format-level body inclusion and front/back matter are not yet applied to the
-shared Compile IR, and the terminal/CLI does not yet expose a profile creation
-workflow. Issues #7, #53, #68 and #73 remain open. The application crate's 59
-unit tests passed, including the full `story-app` test suite. Workspace
-formatting and Clippy with warnings denied passed. A full workspace test
-attempt did not complete in this execution; do not record it as passed. The
-current source tree also contains unrelated user-owned changes in `.gitignore`,
-`README_TMP.md`, `UAT/` and `tools/__pycache__/`; do not stage those paths.
+The translation is now exposed in `inspect-scrivener`, the import-plan preview
+and the final Scrivener import report, so authors and testers can inspect a
+proposal for every source format. This is still not completion of Scrivener
+profile integration: proposals are not persisted as named WIDE edition
+recipes, format-level body inclusion and front/back matter are not yet applied
+to the shared Compile IR, and the terminal does not yet offer a profile
+creation workflow. Issues #7, #53, #68 and #73 remain open.
+
+Verification after the CLI exposure: `cargo fmt --all -- --check`, workspace
+Clippy with warnings denied, and `cargo test --offline --workspace --
+--test-threads=1` passed. The full run included 338 terminal unit tests, 3
+author-workflow integration tests, 25 Linux PTY tests, all crate and CLI tests,
+and all doc tests. The current source tree also contains unrelated user-owned
+changes in `.gitignore`, `README_TMP.md`, `UAT/` and `tools/__pycache__`; do not
+stage those paths.
 
 This is the handover note for ongoing implementation. GitHub issues remain the
 authoritative source for approved requirements and human UAT findings.

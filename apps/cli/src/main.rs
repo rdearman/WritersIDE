@@ -61,6 +61,35 @@ fn parse_scrivener_import_options(
     })
 }
 
+fn scrivener_compile_presentation_proposals(
+    inventory: &story_import::ScrivenerProjectInventory,
+    plan: &story_import::ScrivenerImportPlan,
+) -> Vec<serde_json::Value> {
+    inventory
+        .compile_settings
+        .as_ref()
+        .into_iter()
+        .flat_map(|settings| settings.formats.iter())
+        .map(|format| {
+            match story_app::scrivener_compile_presentation(
+                inventory,
+                plan,
+                &format.source_format_id,
+            ) {
+                Ok(proposal) => serde_json::json!({
+                    "source_format_id": format.source_format_id,
+                    "presentation": proposal.presentation,
+                    "warnings": proposal.warnings,
+                }),
+                Err(error) => serde_json::json!({
+                    "source_format_id": format.source_format_id,
+                    "error": error.to_string(),
+                }),
+            }
+        })
+        .collect()
+}
+
 fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = env::args().skip(1);
     let Some(cmd) = args.next() else {
@@ -2475,6 +2504,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     "inventory": inventory,
                     "proposed_plan": plan,
                     "preview": preview,
+                    "compile_presentation_proposals": scrivener_compile_presentation_proposals(&inventory, &plan),
                     "compatibility": "experimental; tested against a small licensed Scrivener for Mac 3.1.4 fixture and a local Scrivener for Windows 3.1.1.0 project; broad product/version/platform coverage is unverified"
                 }))?
             );
@@ -2508,6 +2538,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         "inventory": inventory,
                         "plan": plan,
                         "preview": preview,
+                        "compile_presentation_proposals": scrivener_compile_presentation_proposals(&inventory, &plan),
                         "action": "review the plan, set each selected binder item's destination_kind, save it as JSON, and rerun import-scrivener",
                         "compatibility": "experimental; tested against a small licensed Scrivener for Mac 3.1.4 fixture and a local Scrivener for Windows 3.1.1.0 project; broad product/version/platform coverage is unverified"
                     }))?
@@ -2538,6 +2569,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 let report = serde_json::json!({
                     "inventory": inventory,
                     "plan": plan,
+                    "compile_presentation_proposals": scrivener_compile_presentation_proposals(&inventory, &plan),
                     "import_run": app.get_import_run_summary(run)?,
                     "imported_scene_ids": scenes,
                     "reference_mode": format!("{mode:?}").to_ascii_lowercase()
