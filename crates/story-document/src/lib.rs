@@ -1136,39 +1136,41 @@ impl CompileIr {
                     &unit.id,
                 );
             }
-            for (index, segment) in unit.segments.iter().enumerate() {
-                if index > 0 {
-                    output.push_str("\n\n---\n\n");
+            if !self.presentation.suppress_body_unit_ids.contains(&unit.id) {
+                for (index, segment) in unit.segments.iter().enumerate() {
+                    if index > 0 {
+                        output.push_str("\n\n---\n\n");
+                    }
+                    let start = output.len();
+                    if include_language_markup {
+                        let inherited_language = unit
+                            .language_code
+                            .as_deref()
+                            .or(self.language_code.as_deref());
+                        append_language_spans(
+                            &mut output,
+                            &segment.document.source,
+                            &segment.language_spans,
+                            inherited_language,
+                        );
+                    } else {
+                        output.push_str(&segment.document.source);
+                    }
+                    source_map.push(CompileSourceMapEntry {
+                        output: SourceRange {
+                            start,
+                            end: output.len(),
+                        },
+                        source_entity_id: segment.source_entity_id.clone(),
+                        source_sha256: segment.document.source_sha256.clone(),
+                        source: SourceRange {
+                            start: 0,
+                            end: segment
+                                .source_length
+                                .unwrap_or(segment.document.source.len()),
+                        },
+                    });
                 }
-                let start = output.len();
-                if include_language_markup {
-                    let inherited_language = unit
-                        .language_code
-                        .as_deref()
-                        .or(self.language_code.as_deref());
-                    append_language_spans(
-                        &mut output,
-                        &segment.document.source,
-                        &segment.language_spans,
-                        inherited_language,
-                    );
-                } else {
-                    output.push_str(&segment.document.source);
-                }
-                source_map.push(CompileSourceMapEntry {
-                    output: SourceRange {
-                        start,
-                        end: output.len(),
-                    },
-                    source_entity_id: segment.source_entity_id.clone(),
-                    source_sha256: segment.document.source_sha256.clone(),
-                    source: SourceRange {
-                        start: 0,
-                        end: segment
-                            .source_length
-                            .unwrap_or(segment.document.source.len()),
-                    },
-                });
             }
             output.push_str("\n\n");
             if language_wrapper.is_some() {
@@ -1196,6 +1198,11 @@ pub struct CompilePresentation {
     /// Optional single-line separator inserted between consecutive scenes
     /// when their scene titles are suppressed.
     pub scene_separator: Option<String>,
+    /// Compile-unit identifiers whose headings may remain visible while their
+    /// manuscript body is suppressed by a source publication layout.
+    /// This is presentation-only; the canonical document remains untouched.
+    #[serde(default)]
+    pub suppress_body_unit_ids: std::collections::BTreeSet<String>,
 }
 
 impl Default for CompilePresentation {
@@ -1208,6 +1215,7 @@ impl Default for CompilePresentation {
             include_matter_titles: true,
             chapter_title_template: None,
             scene_separator: None,
+            suppress_body_unit_ids: std::collections::BTreeSet::new(),
         }
     }
 }
@@ -1232,6 +1240,13 @@ impl CompilePresentation {
             return Err(
                 "scene separator must be a non-empty, single-line value up to 80 bytes".into(),
             );
+        }
+        if self
+            .suppress_body_unit_ids
+            .iter()
+            .any(|id| id.trim().is_empty())
+        {
+            return Err("suppressed body unit identifiers cannot be empty".into());
         }
         Ok(())
     }

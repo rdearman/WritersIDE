@@ -5067,6 +5067,7 @@ impl WriterApp {
                 self.create_assembly(&format!("Scrivener · {}", format.source_format_id))?;
             let mut assembly_position = 0u32;
             let mut profile_warnings = proposed.warnings;
+            let mut presentation = proposed.presentation;
 
             for item in &inventory.items {
                 let Some(decision) = decisions.get(item.source_document_id.as_str()) else {
@@ -5083,12 +5084,10 @@ impl WriterApp {
                         | Destination::FrontMatter
                         | Destination::BackMatter
                 );
-                let mut included = decision.include_in_import
-                    && publication_kind
-                    && (!matches!(
-                        decision.destination_kind,
-                        Destination::FrontMatter | Destination::BackMatter
-                    ) || item.include_in_compile != Some(false));
+                let source_included = item.include_in_compile != Some(false);
+                let mut included =
+                    decision.include_in_import && publication_kind && source_included;
+                let mut suppress_body = false;
 
                 match decision.destination_kind {
                     Destination::FrontMatter => {
@@ -5107,7 +5106,7 @@ impl WriterApp {
                         if let Some(section_type) = item.section_type_id.as_deref() {
                             if let Some(layout_id) = format.section_layouts.get(section_type) {
                                 if let Some(layout) = format.layouts.get(layout_id) {
-                                    included &= layout.include_text != Some(false);
+                                    suppress_body = layout.include_text == Some(false);
                                 } else {
                                     profile_warnings.push(format!(
                                         "Scrivener layout '{layout_id}' is missing for source section type '{section_type}'"
@@ -5130,6 +5129,10 @@ impl WriterApp {
                             self.add_assembly_scene(assembly, *scene, assembly_position)?;
                         if !included {
                             self.set_assembly_item_included(assembly_item, false)?;
+                        } else if suppress_body {
+                            presentation
+                                .suppress_body_unit_ids
+                                .insert(assembly_item.to_string());
                         }
                         assembly_position = assembly_position.checked_add(1).ok_or_else(|| {
                             AppError::Domain("Scrivener edition ordering overflow".into())
@@ -5140,6 +5143,10 @@ impl WriterApp {
                             self.add_assembly_content_unit(assembly, *content, assembly_position)?;
                         if !included {
                             self.set_assembly_item_included(assembly_item, false)?;
+                        } else if suppress_body {
+                            presentation
+                                .suppress_body_unit_ids
+                                .insert(assembly_item.to_string());
                         }
                         assembly_position = assembly_position.checked_add(1).ok_or_else(|| {
                             AppError::Domain("Scrivener edition ordering overflow".into())
@@ -5155,7 +5162,7 @@ impl WriterApp {
                 source_format_id: format.source_format_id.clone(),
                 display_name: scrivener_format_display_name(&format.source_format_id, format_index),
                 assembly_id: assembly.to_string(),
-                presentation: proposed.presentation,
+                presentation,
                 warnings: profile_warnings,
             };
             let filename = format!("{run}-{format_index}.json");
@@ -9270,6 +9277,174 @@ unexpected_prose = "must not be silently discarded"
                 .unwrap()
                 .contains("FRONTMATTERPRIVATETEST")
         );
+    }
+
+    #[test]
+    fn scrivener_profile_applies_source_exclusions_and_suppresses_only_layout_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("Profile Layout.scriv");
+        for id in ["shown-scene", "excluded-scene"] {
+            fs::create_dir_all(source.join("Files/Data").join(id)).unwrap();
+        }
+        fs::create_dir_all(source.join("Settings/Compile Formats")).unwrap();
+        fs::write(
+            source.join("Profile Layout.scrivx"),
+            r#"<ScrivenerProject Version="2.0"><Binder>
+              <BinderItem UUID="draft" Type="DraftFolder"><Title>Draft</Title><Children>
+                <BinderItem UUID="shown-scene" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><SectionType>scene-layout-type</SectionType><Children/></BinderItem>
+                <BinderItem UUID="excluded-scene" Type="Text"><Title>Removed Scene</Title><IncludeInCompile>No</IncludeInCompile><SectionType>scene-layout-type</SectionType><Children/></BinderItem>
+              </Children></BinderItem>
+            </Binder></ScrivenerProject>"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("Settings/compile.xml"),
+            r#"<CompileSettings><FormatSettings><Format ID="ebook"><SectionLayouts>
+              <Type ID="scene-layout-type">scene-layout</Type>
+            </SectionLayouts></Format></FormatSettings></CompileSettings>"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("Settings/Compile Formats/ebook.scrformat"),
+            r#"<CompileFormat ID="ebook"><Layouts><Layout ID="scene-layout" Name="Heading only"><Include Titles="Yes" Text="No"/></Layout></Layouts></CompileFormat>"#,
+        )
+        .unwrap();
+        fs::write(
+            source.join("Files/Data/shown-scene/content.rtf"),
+            r"{\rtf1\ansi PROFILEBODYMUSTBEHIDDEN}",
+        )
+        .unwrap();
+        fs::write(
+            source.join("Files/Data/excluded-scene/content.rtf"),
+            r"{\rtf1\ansi SOURCEEXCLUDEDPROSE}",
+        )
+        .unwrap();
+
+        let inventory = story_import::inspect_scrivener_project(&source).unwrap();
+        assert_eq!(
+            inventory
+                .items
+                .iter()
+                .find(|item| item.source_document_id == "shown-scene")
+                .unwrap()
+                .section_type_id
+                .as_deref(),
+            Some("scene-layout-type")
+        );
+        assert_eq!(
+            inventory.compile_settings.as_ref().unwrap().formats[0]
+                .section_layouts
+                .get("scene-layout-type")
+                .map(String::as_str),
+            Some("scene-layout")
+        );
+        assert_eq!(
+            inventory.compile_settings.as_ref().unwrap().formats[0]
+                .layouts
+                .get("scene-layout")
+                .and_then(|layout| layout.include_text),
+            Some(false)
+        );
+        let mut plan = story_import::ScrivenerImportPlan::proposed(&inventory);
+        for (id, kind) in [
+            ("draft", story_import::ScrivenerDestinationKind::Chapter),
+            ("shown-scene", story_import::ScrivenerDestinationKind::Scene),
+            (
+                "excluded-scene",
+                story_import::ScrivenerDestinationKind::Scene,
+            ),
+        ] {
+            plan.decisions
+                .iter_mut()
+                .find(|decision| decision.source_document_id == id)
+                .unwrap()
+                .destination_kind = kind;
+        }
+        let mut app =
+            WriterApp::create_project(dir.path().join("Imported"), "Profile test").unwrap();
+        app.import_scrivener_inventory(
+            &inventory,
+            &plan,
+            story_import::ScrivenerImportMode::Editable,
+        )
+        .unwrap();
+
+        let scenes = app.list_scenes(false).unwrap();
+        let shown = scenes
+            .iter()
+            .find(|scene| scene.scene.title == "Opening")
+            .unwrap()
+            .scene
+            .id;
+        let excluded = scenes
+            .iter()
+            .find(|scene| scene.scene.title == "Removed Scene")
+            .unwrap()
+            .scene
+            .id;
+        assert!(app.scene_is_included(shown).unwrap());
+        assert!(!app.scene_is_included(excluded).unwrap());
+        assert!(
+            app.load_scene_text(shown)
+                .unwrap()
+                .0
+                .contains("PROFILEBODYMUSTBEHIDDEN")
+        );
+        assert!(
+            app.load_scene_text(excluded)
+                .unwrap()
+                .0
+                .contains("SOURCEEXCLUDEDPROSE")
+        );
+
+        let profile = app
+            .list_scrivener_edition_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.source_format_id == "ebook")
+            .unwrap();
+        let ir = app
+            .compile_assembly_ir(story_core::AssemblyId(
+                uuid::Uuid::parse_str(&profile.assembly_id).unwrap(),
+            ))
+            .unwrap();
+        let mut ir = ir;
+        ir.presentation = profile.presentation.clone();
+        assert_eq!(
+            ir.units.len(),
+            1,
+            "source-excluded document stays out of the assembly"
+        );
+        assert!(ir.presentation.include_scene_titles);
+        assert_eq!(ir.presentation.suppress_body_unit_ids.len(), 1);
+        let (compiled, source_map) = ir.render_markdown();
+        assert!(
+            compiled.contains("Opening"),
+            "configured heading remains visible"
+        );
+        assert!(!compiled.contains("PROFILEBODYMUSTBEHIDDEN"));
+        assert!(!compiled.contains("SOURCEEXCLUDEDPROSE"));
+        assert!(
+            source_map.is_empty(),
+            "suppressed prose has no output source range"
+        );
+        let artifact = app
+            .compile_scrivener_edition_profile_artifact(
+                &profile,
+                story_document::CompileFormat::Markdown,
+            )
+            .unwrap();
+        let artifact_text = String::from_utf8(artifact.bytes).unwrap();
+        assert!(artifact_text.contains("Opening"));
+        assert!(!artifact_text.contains("PROFILEBODYMUSTBEHIDDEN"));
+        assert!(!artifact_text.contains("SOURCEEXCLUDEDPROSE"));
+
+        let ordinary = app
+            .compile_artifact(story_document::CompileFormat::Markdown, false)
+            .unwrap();
+        let ordinary = String::from_utf8(ordinary.bytes).unwrap();
+        assert!(ordinary.contains("PROFILEBODYMUSTBEHIDDEN"));
+        assert!(!ordinary.contains("SOURCEEXCLUDEDPROSE"));
     }
 
     #[test]

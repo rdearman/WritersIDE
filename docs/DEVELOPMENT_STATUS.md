@@ -2,6 +2,54 @@
 
 Updated: 2026-11-26
 
+## Current checkpoint — Alpha UAT 30 and imported Scrivener profile fidelity, 26 November 2026
+
+### Alpha UAT 30
+
+Frozen Linux x86_64 release build from commit
+`db7fec355569d6a76cc96057f820ba3f71fdf3a4` is available at
+`test-builds/alpha-uat-30-db7fec3/`. Launch with
+`cd test-builds/alpha-uat-30-db7fec3 && ./run.sh`. Its HOME, preferences,
+projects and synthetic Scrivener fixtures are isolated in the bundle. The
+checklist `test-builds/alpha-uat-30-db7fec3/UAT-CHECKLIST.md` focuses on staged
+project creation/import, editing and compiling before Save, first Save/Save As,
+unsaved close choices, crash recovery and Scrivener Trash/Project Notes/folder
+classification. `SHA256SUMS` was generated and verified. No private manuscript
+fixtures or generated publications are in the bundle. Human UAT is pending.
+The isolated release executable was launched and exited through an 80×24 PTY
+smoke check. The disposable projects were restored to their pristine template
+state afterwards, and the bundle checksums were regenerated and verified.
+
+### Imported Scrivener profile implementation in progress
+
+The shared Compile IR now applies source `IncludeInCompile=No` to ordinary
+manuscript entries in imported format assemblies. Scrivener layout
+`Include Text=No` now suppresses only the corresponding Compile IR body while
+preserving the configured title and the canonical editable text. The policy is
+saved in the imported profile's `CompilePresentation`, keyed by stable assembly
+unit IDs. Older serialized presentations default to no suppressed bodies.
+Implementation details are in [Engineering Design v2.45
+addendum](engineering-design-v2.45-addendum.md).
+
+The new synthetic import-to-profile regression passes, including profile
+artifact generation and confirmation that the ordinary project still contains
+the editable source prose. `cargo fmt --all -- --check`, `git diff --check`,
+workspace Clippy with `-D warnings`, and the full offline workspace suite
+passed: 346 terminal unit tests, 3 author-workflow tests, 28 Linux PTYs (one
+private-corpus PTY ignored), all other unit/integration tests, and doc tests.
+The full run required the previously authorised loopback permission for the
+local Ollama test.
+
+A fresh production import/reopen/EPUB run of controlled book-03 is recorded
+locally as `reports/profile-binding-20261126/`; source checksums were verified
+before and after, 68/68 manuscript bodies and 12/12 research bodies matched
+after import, and the generated EPUB passed EPUBCheck 4.2.6 with zero errors
+and warnings. This run remains provisional. Compiling both imported profiles
+exposed unresolved layout mappings for two Scrivener section types; the output
+still includes internal Manuscript and Title Page headings. The report and
+generated outputs contain private manuscript material and remain ignored and
+local. This is concrete remaining #7/#53 work, not a fidelity pass.
+
 ## Current checkpoint — persistent working projects and deferred Save As, 26 November 2026
 
 Design details: [Engineering Design v2.44 addendum](engineering-design-v2.44-addendum.md).
