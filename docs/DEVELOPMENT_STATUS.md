@@ -2,6 +2,50 @@
 
 Updated: 2026-11-26
 
+## Current checkpoint — Alpha UAT 32 and direct Scrivener import, 26 November 2026
+
+Frozen Linux x86_64 release build from commit `1c41b9e` is available at
+`test-builds/alpha-uat-32-1c41b9e/`. Launch it with:
+
+```sh
+cd /home/rick/Development/Active/WritersIDE/test-builds/alpha-uat-32-1c41b9e
+./run.sh
+```
+
+The build has isolated preferences and HOME data, synthetic fiction and
+non-fiction samples, and a sanitised Scrivener fixture. Its acceptance
+checklist is `UAT-CHECKLIST.md`; the frozen files verify against `SHA256SUMS`.
+The launcher rendered a recognisable WIDE screen in an 80x24 PTY. The bundle
+does not contain private manuscript fixtures.
+
+In the normal Scrivener import browser, pressing Enter on a selected `.scriv`
+project now starts automatic import to staging immediately and opens the
+normal outline/editor workspace; no intermediate mapping confirmation is
+required. F5 remains available. The production PTY test exercises this path,
+then edits, saves, compiles and reopens the imported project. The isolated
+protected ArrowMaking corpus PTY also passed, with fixture checksum manifests
+verified before and after.
+
+Verification on commit `1c41b9e`:
+
+- `cargo fmt --all -- --check` — passed.
+- `cargo clippy --offline --workspace --all-targets -- -D warnings` — passed.
+- `cargo test --offline --workspace` — passed: 351 terminal unit tests, 3
+  author-workflow tests, 29 active production PTY tests, and all other
+  workspace and doc tests; one PTY is intentionally ignored without private
+  corpus input.
+- Protected ArrowMaking import via production PTY — passed; source checksums
+  remained valid.
+- Alpha UAT 32 checksums and 80x24 launcher rendering — passed.
+
+Human acceptance remains pending. The reported false external-change conflict
+and missing eleven scene rows from #38 have not reproduced; their root cause
+is not established, and conflict detection remains enabled. Issues #37, #38,
+#44, #46, #52, #53, #54 and #55 remain open for the requested human checks.
+Next actionable development is the already-planned integration of Scrivener
+per-format layouts and inclusion into persistent WIDE compile profiles, then
+the remaining approved v1.0 backlog.
+
 ## Current checkpoint — Alpha UAT 30 and imported Scrivener profile fidelity, 26 November 2026
 
 ### Alpha UAT 30
@@ -1359,9 +1403,11 @@ Verification on the lifecycle candidate:
   imported via PTY into isolated staging storage and its source fingerprint
   remained unchanged.
 
-The real user-managed Alpha UAT 30 directory was not modified. Alpha UAT 31 is
-being prepared from the verified commit; its build manifest records the
-commit, executable hashes and isolated disposable project data. Scrivener's
-per-format presentation and inclusion controls remain outstanding after this
-lifecycle checkpoint and resume as the next publication task after the bundle
-is made available.
+The real user-managed Alpha UAT 30 directory was not modified. Frozen Alpha
+UAT 31 is available at `test-builds/alpha-uat-31-84b3b05/`, built from
+`84b3b0562cca3c63ff9e7d81f9066a89e52c672b`. Its launcher PTY smoke passed,
+the 41-entry `SHA256SUMS` manifest verifies, and the acceptance checklist is
+`test-builds/alpha-uat-31-84b3b05/UAT-CHECKLIST.md`. Preferences and project
+data are isolated within the bundle. Scrivener's per-format presentation and
+inclusion controls remain outstanding and resume as the next publication
+task; author UAT for the lifecycle changes remains open.
