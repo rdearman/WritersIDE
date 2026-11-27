@@ -59,6 +59,78 @@ fn named_snapshot_compare_and_selective_restore_work_through_the_production_pty(
 
 #[cfg(target_os = "linux")]
 #[test]
+fn whole_project_backup_is_available_from_the_file_menu_and_restores_after_reopen() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+    use story_document::CompileFormat;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Backup Workflow Project");
+    let home = root.path().join("isolated-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut app = WriterApp::create_project(&project, "Backup Workflow").unwrap();
+    let chapter = app.create_chapter(None, "The Long Road", 0).unwrap();
+    let scene = app.create_scene(chapter, "A Safe Camp", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "The camp held through the storm.")
+        .unwrap();
+    std::fs::create_dir_all(project.join("attachments")).unwrap();
+    std::fs::write(
+        project.join("attachments/cover-note.txt"),
+        b"asset survives",
+    )
+    .unwrap();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(&home)
+        .arg("backup-archive")
+        .output()
+        .expect("run whole-project backup through the Linux PTY");
+    assert!(
+        result.status.success(),
+        "project backup PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let archive = std::fs::read_dir(&home)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "zip"))
+        .expect("File menu backup created an archive in the selected location");
+    let restored_path = root.path().join("Restored Backup Project");
+    WriterApp::restore_project_archive(&archive, &restored_path).unwrap();
+    let restored = WriterApp::open_project(&restored_path).unwrap();
+    restored.validate_project().unwrap();
+    assert_eq!(
+        restored.load_scene_text(scene).unwrap().0,
+        "The camp held through the storm."
+    );
+    assert_eq!(
+        std::fs::read(restored_path.join("attachments/cover-note.txt")).unwrap(),
+        b"asset survives"
+    );
+    assert_eq!(
+        std::fs::read(project.join("attachments/cover-note.txt")).unwrap(),
+        b"asset survives",
+        "creating a backup must not alter the source project"
+    );
+    assert!(
+        restored
+            .compile_artifact(CompileFormat::Markdown, false)
+            .is_ok()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

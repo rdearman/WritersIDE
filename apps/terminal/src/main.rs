@@ -674,6 +674,7 @@ struct SeriesActionForm {
 enum FileBrowserPurpose {
     NewProject,
     SaveProjectAs,
+    BackupProjectArchive,
     OpenProject,
     OpenTextFile,
     InsertFile,
@@ -999,6 +1000,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "series.restore-selected-book",
         "file.save",
         "file.save-as",
+        "file.backup-archive",
         "file.quit",
     ],
     &[
@@ -1717,6 +1719,7 @@ enum CommandAction {
     ImportScrivenerCurrent,
     Save,
     SaveProjectAs,
+    BackupProjectArchive,
     RequestQuit,
     Help,
     ShowWelcome,
@@ -2079,6 +2082,21 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 7,
             advanced: false,
             action: CommandAction::SaveProjectAs,
+        },
+        CommandSpec {
+            id: "file.backup-archive",
+            label: "Back Up Project…",
+            description: "Create a checksummed whole-project backup archive without changing this project",
+            category: "File",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["backup project", "backup now"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Projects & Files",
+            menu_priority: 8,
+            advanced: false,
+            action: CommandAction::BackupProjectArchive,
         },
         CommandSpec {
             id: "file.quit",
@@ -9859,6 +9877,10 @@ impl AppState {
                 .map(PathBuf::from)
                 .filter(|path| path.is_dir())
                 .unwrap_or(fallback),
+            FileBrowserPurpose::BackupProjectArchive => std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|path| path.is_dir())
+                .unwrap_or(fallback),
             FileBrowserPurpose::OpenProject
             | FileBrowserPurpose::OpenTextFile
             | FileBrowserPurpose::InsertFile
@@ -9884,6 +9906,11 @@ impl AppState {
                 .get_project()
                 .map(|project| safe_filename(&project.title))
                 .unwrap_or_else(|_| "My Book".to_owned()),
+            FileBrowserPurpose::BackupProjectArchive => self
+                .app
+                .get_project()
+                .map(|project| format!("{}-backup.wide.zip", safe_filename(&project.title)))
+                .unwrap_or_else(|_| "My-Book-backup.wide.zip".to_owned()),
             FileBrowserPurpose::OpenProject
             | FileBrowserPurpose::OpenTextFile
             | FileBrowserPurpose::InsertFile
@@ -9940,6 +9967,8 @@ impl AppState {
             "Temporary workspace is stored privately by WIDE · enter a title and choose Fiction or Non-fiction · Save later to choose a permanent location".into()
         } else if purpose == FileBrowserPurpose::SaveProjectAs {
             "Choose a parent folder and new project folder name · existing projects are never overwritten".into()
+        } else if purpose == FileBrowserPurpose::BackupProjectArchive {
+            "Choose a separate destination for a checksummed whole-project archive · existing files are never overwritten".into()
         } else if matches!(
             purpose,
             FileBrowserPurpose::ImportScrivenerSource
@@ -10942,6 +10971,31 @@ impl AppState {
                             Err(error) => {
                                 self.message = format!(
                                     "Project copy failed; the current project remains open: {error}"
+                                );
+                                self.file_browser = Some(browser);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    FileBrowserPurpose::BackupProjectArchive => {
+                        self.save()?;
+                        if self.dirty {
+                            self.message =
+                                "Backup not created: save the manuscript successfully first".into();
+                            self.file_browser = Some(browser);
+                            return Ok(());
+                        }
+                        match self.app.backup_project_archive(&destination) {
+                            Ok(()) => {
+                                self.message = format!(
+                                    "Project backup archive created at {}",
+                                    destination.display()
+                                );
+                                close = true;
+                            }
+                            Err(error) => {
+                                self.message = format!(
+                                    "Project backup was not created: {error}. Choose another destination or cancel."
                                 );
                                 self.file_browser = Some(browser);
                                 return Ok(());
@@ -17098,6 +17152,14 @@ impl AppState {
                     && !self.message.starts_with("Save conflict/error:")
                 {
                     self.message = format!("Project was not saved as: {error}");
+                }
+            }
+            CommandAction::BackupProjectArchive => {
+                if let Err(error) =
+                    self.start_file_browser(FileBrowserPurpose::BackupProjectArchive)
+                {
+                    self.message =
+                        format!("Could not open the backup destination browser: {error}");
                 }
             }
             CommandAction::RequestQuit => self.request_quit(),
@@ -30623,6 +30685,7 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             "New Project · choose book type and title; WIDE manages temporary storage"
         }
         FileBrowserPurpose::SaveProjectAs => "Save Project As · create an independent project copy",
+        FileBrowserPurpose::BackupProjectArchive => "Back Up Project · choose archive destination",
         FileBrowserPurpose::OpenProject => "Open Project · choose a Writer's IDE project folder",
         FileBrowserPurpose::OpenTextFile => "Open Text File · read-only reference",
         FileBrowserPurpose::InsertFile => "Insert File · choose UTF-8 text to insert",
@@ -30876,6 +30939,11 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         (
             "F4 Select Folder · F5 Save Project Copy · F7 New Folder · Esc Cancel",
             "Tab/Shift+Tab: panes and project name · Parent = current folder",
+        )
+    } else if browser.purpose == FileBrowserPurpose::BackupProjectArchive {
+        (
+            "F5 Create Backup Archive · F7 New Folder · Esc Cancel",
+            "Choose a new archive filename in a separate folder; existing files are not replaced",
         )
     } else {
         (
@@ -48294,6 +48362,7 @@ mod tests {
                 "series.restore-selected-book",
                 "file.save",
                 "file.save-as",
+                "file.backup-archive",
                 "file.quit",
             ]
         );

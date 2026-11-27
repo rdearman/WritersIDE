@@ -136,6 +136,7 @@ def main():
     removal_dialogs = modes == ["removal-dialogs"]
     chapter_creation = modes == ["chapter-creation"]
     revision_snapshot = modes == ["revision-snapshot"]
+    backup_archive = modes == ["backup-archive"]
     authoring_audit = modes == ["authoring-audit"]
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
@@ -169,7 +170,7 @@ def main():
     section_removal_rehome = modes == ["section-removal-rehome"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
-    if create_fiction or create_nonfiction or recent_projects:
+    if create_fiction or create_nonfiction or recent_projects or backup_archive:
         # Keep this workflow focused on project lifecycle rather than allowing
         # first-run onboarding to consume editing keys.
         onboarding = os.path.join(isolated_home, "config", "writers-ide")
@@ -378,6 +379,35 @@ def main():
 
     try:
         read_for(1.0)
+        if backup_archive:
+            start = len(output)
+            os.write(master, b"\x1b[21~")  # File menu
+            select_visible_menu_item("Back Up Project")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Back Up Project", b"Choose a separate destination"), start, timeout=3.0
+            ):
+                raise AssertionError("Back Up Project did not open the destination browser")
+            os.write(master, b"\x1b[15~")  # F5: create backup archive
+            if not wait_for_screen_fragments(
+                (b"Project backup archive created at",), start, timeout=8.0
+            ):
+                raise AssertionError(
+                    "whole-project backup did not report verified success; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 8.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after project backup")
+            print("PTY whole-project backup passed: File > Back Up Project creates a verified archive.")
+            return
+
         if revision_snapshot:
             os.write(master, b"\x1b")  # dismiss first-run help if present
             if not wait_for_screen_fragments((b"The original passage stays.",), timeout=3.0):

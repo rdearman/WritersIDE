@@ -1,5 +1,23 @@
 # Writer's IDE Development Status
 
+## Manual whole-project backup workflow — 27 November 2026
+
+The existing consistent project archive service is now exposed as File → Back
+Up Project and through Search All Commands. The shared file browser starts in
+the user's home folder with a sensible `.wide.zip` filename. Creating the
+archive first saves pending manuscript text, then uses the existing SQLite
+online-backup, project-tree copy, SHA-256 manifest, same-filesystem staging and
+atomic publication path. Existing archive files are never
+overwritten; failures leave the browser open with an actionable message.
+
+A production PTY regression exercised the visible File menu, created the
+archive, restored it into a separate directory, reopened and validated the
+project, checked manuscript text and attachment bytes, and confirmed the
+source attachment was unchanged. This covers the manual-backup foundation in
+#70, not its entire contract. Rolling schedules, preference controls,
+retention, backup destination policy, close/exit prompts, failure retry and
+SSH/SIGHUP recovery remain outstanding. Human UAT remains required.
+
 ## Revision snapshot author workflow — 27 November 2026
 
 The existing snapshot service is now covered through the production terminal
