@@ -2362,3 +2362,38 @@ Human checks in `test-builds/alpha-uat-38-0a50253/UAT-CHECKLIST.md` remain
 outstanding, especially resizing and manuscript/reference rendering. Issue
 #56 remains open: span coalescing is a verified implementation improvement,
 but the screenshot's exact rendering cause has not been reproduced.
+
+## Alpha UAT 37 keyboard, outline and editor corrections — 27 November 2026
+
+The latest uncommitted authoring repair batch addresses the Alpha UAT 37
+regressions covered by the current interaction notes and terminal tests. Fiction
+and non-fiction now enter the same unified Outline presentation; chapter rows
+show total words including direct prose and descendant content; Outline refresh
+retains the selected structural identity; and direct chapter prose opens from
+the chapter instead of exposing its storage-only content row. Structural
+creation, reordering, promotion/demotion, rename and removal remain available
+from the Outline workflow, with named key shortcuts correctly parsed by the
+shared command dispatcher. The file browser now hides dotfiles by default and
+provides visible direct-path and hidden-file controls. A long-document PTY test
+checks cursor visibility, insertion while scrolled, terminal resize and saved
+content.
+
+The production test run found no failures after aligning older PTY expectations
+with the approved Outline interactions. Verification passed on this working
+tree: `cargo fmt --all -- --check`,
+`cargo clippy --offline --workspace --all-targets -- -D warnings`, and
+`cargo test --offline --workspace`. Results include 362 terminal unit tests,
+3 end-to-end author-workflow tests, and 40 production PTY tests passed; one
+protected private-corpus PTY was ignored because its opt-in fixture variable was
+not set. The Ollama loopback test passed with the author's previously approved
+socket permission. The workspace test run completed successfully. GitHub was
+unavailable from this session while attempting to read current issue comments,
+so issue status has not been updated from stale data.
+
+This is automated evidence only. Alpha UAT 38 remains the latest frozen human
+test build at commit `0a50253800a0276ce8744bde45198a0306598bca`; no UAT 39
+bundle has yet been made from this working tree. The author should retest
+U37-01 through U37-19 using the next frozen candidate. The exact human outcomes
+for each numbered finding remain to be entered after UAT, and #77/#44 remain
+open for human acceptance. Keep the current changes uncommitted until the
+corresponding verified commit and UAT bundle are produced.

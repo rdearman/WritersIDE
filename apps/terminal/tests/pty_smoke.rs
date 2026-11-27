@@ -237,6 +237,52 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn editor_cursor_scrolls_a_long_document_and_tracks_terminal_resizes_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Long Manuscript");
+    let mut app = WriterApp::create_project(&project, "Long Manuscript").unwrap();
+    let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+    let scene = app.create_scene(chapter, "A Long Passage", 0).unwrap();
+    let text = (0..64)
+        .map(|line| format!("LINE-{line:02} carries the manuscript prose."))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), &text).unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY long-editor viewport test: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("editor-viewport")
+        .output()
+        .expect("run the long-document terminal viewport workflow");
+    assert!(
+        result.status.success(),
+        "long-document viewport PTY failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    let saved = reopened.load_scene_text(scene).unwrap().0;
+    assert!(saved.contains("VISIBLE-INSERTIONLINE-40 carries the manuscript prose."));
+    assert!(saved.contains("LINE-63 carries the manuscript prose."));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn save_as_preserves_populated_project_trees_through_the_production_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;
@@ -1834,9 +1880,7 @@ fn empty_chapters_created_from_the_scene_outliner_persist_in_a_real_pty() {
         .filter(|node| node.kind == "chapter")
         .map(|node| node.title)
         .collect::<Vec<_>>();
-    // New chapters are inserted at the selected chapter boundary, so the
-    // second chapter is placed immediately before the still-selected Alpha.
-    assert_eq!(chapters, ["Beta", "Alpha"]);
+    assert_eq!(chapters, ["Alpha", "Beta"]);
 }
 
 #[cfg(target_os = "linux")]

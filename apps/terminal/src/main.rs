@@ -124,11 +124,11 @@ impl Workspace {
     }
 }
 
-fn default_authoring_workspace(book_type: story_core::BookType) -> Workspace {
-    match book_type {
-        story_core::BookType::Fiction => Workspace::Cards,
-        story_core::BookType::Nonfiction | story_core::BookType::Custom => Workspace::Outline,
-    }
+fn default_authoring_workspace(_book_type: story_core::BookType) -> Workspace {
+    // Fiction and non-fiction share the same authoritative hierarchy. Scene
+    // Cards remain available as an alternate presentation, not a book-type
+    // specific workspace.
+    Workspace::Outline
 }
 const PRIMARY_DESTINATIONS: [Workspace; 3] =
     [Workspace::Editor, Workspace::Outline, Workspace::Reading];
@@ -269,6 +269,8 @@ struct AppState {
     history_index: usize,
     location_history: Vec<EditorBookmark>,
     width: usize,
+    editor_viewport_width: usize,
+    editor_viewport_height: usize,
     editor_focus_mode: bool,
     horizontal_split_ratio: u16,
     vertical_split_ratio: u16,
@@ -704,6 +706,9 @@ struct FileBrowserState {
     org_import_mode: story_import::OrgImportMode,
     text_import_preview: Option<story_import::TextDocumentPreview>,
     preview_scroll: usize,
+    show_hidden: bool,
+    path_editing: bool,
+    path_input: String,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -1120,7 +1125,6 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "structure.section",
         "structure.chapter",
         "scene.create",
-        "scene.subchapter",
         "document.new-content-unit",
         "document.write-selected-chapter",
         "scene.toggle-inclusion",
@@ -1129,10 +1133,10 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "scene.field",
         "scene.status",
         "scene.move",
-        "scene.move-earlier",
-        "scene.move-later",
         "outline.move-up",
         "outline.move-down",
+        "outline.promote",
+        "outline.demote",
         "document.remove-content-unit",
         "document.removed-content-units",
         "document.restore-content-unit",
@@ -1765,6 +1769,8 @@ enum CommandAction {
     RenameSelectedStructuralNode,
     MoveOutlineUp,
     MoveOutlineDown,
+    PromoteOutlineItem,
+    DemoteOutlineItem,
     MoveSceneEarlier,
     MoveSceneLater,
     ArchiveSelectedScene,
@@ -2477,7 +2483,7 @@ fn command_registry() -> Vec<CommandSpec> {
             "scene.create",
             "New Scene",
             "Create a scene without choosing a chapter; assign its manuscript position later",
-            "Insert",
+            "Outline",
             "scene",
             false,
         ),
@@ -3111,7 +3117,7 @@ fn command_registry() -> Vec<CommandSpec> {
             id: "structure.section",
             label: "New Section",
             description: "Create a section in the manuscript outline",
-            category: "Insert",
+            category: "Outline",
             default_shortcuts: &[],
             mnemonic: None,
             palette_aliases: &["new section"],
@@ -3126,7 +3132,7 @@ fn command_registry() -> Vec<CommandSpec> {
             id: "structure.chapter",
             label: "New Chapter",
             description: "Create a chapter at the selected outline location",
-            category: "Insert",
+            category: "Outline",
             default_shortcuts: &[],
             mnemonic: None,
             palette_aliases: &["new chapter"],
@@ -3180,6 +3186,36 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::MoveOutlineDown,
             task_group: "",
             menu_priority: 17,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "outline.promote",
+            label: "Promote Selected Item",
+            description: "Move a section or chapter one level towards the manuscript root",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &[],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::PromoteOutlineItem,
+            task_group: "",
+            menu_priority: 18,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "outline.demote",
+            label: "Demote Selected Item",
+            description: "Nest a section or chapter under the preceding section",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &[],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::DemoteOutlineItem,
+            task_group: "",
+            menu_priority: 19,
             advanced: false,
         },
         CommandSpec {
@@ -3304,8 +3340,8 @@ fn command_registry() -> Vec<CommandSpec> {
         },
         CommandSpec {
             id: "document.rename-heading",
-            label: "Rename Selected Section or Chapter…",
-            description: "Change the selected section or chapter heading",
+            label: "Rename Selected Outline Item…",
+            description: "Change the title of the selected section, chapter, scene or prose document",
             category: "Edit",
             default_shortcuts: &[],
             mnemonic: None,
@@ -7046,10 +7082,29 @@ fn parse_shortcut(value: &str) -> Result<KeyEvent, Box<dyn std::error::Error>> {
         .strip_prefix('F')
         .or_else(|| key.strip_prefix('f'))
         .filter(|number| !number.is_empty());
+    let named_code = match key.to_ascii_lowercase().as_str() {
+        "insert" | "ins" => Some(KeyCode::Insert),
+        "delete" | "del" => Some(KeyCode::Delete),
+        "up" => Some(KeyCode::Up),
+        "down" => Some(KeyCode::Down),
+        "left" => Some(KeyCode::Left),
+        "right" => Some(KeyCode::Right),
+        "home" => Some(KeyCode::Home),
+        "end" => Some(KeyCode::End),
+        "pageup" | "pgup" => Some(KeyCode::PageUp),
+        "pagedown" | "pgdn" => Some(KeyCode::PageDown),
+        "tab" => Some(KeyCode::Tab),
+        "backtab" => Some(KeyCode::BackTab),
+        "enter" | "return" => Some(KeyCode::Enter),
+        "esc" | "escape" => Some(KeyCode::Esc),
+        _ => None,
+    };
     if modifiers.is_empty() && function_number.is_none() {
         return Err("command shortcuts must include Ctrl, Alt, or Shift".into());
     }
-    let code = if let Some(number) = function_number {
+    let code = if let Some(code) = named_code {
+        code
+    } else if let Some(number) = function_number {
         let number: u8 = number.parse()?;
         if !(1..=14).contains(&number) {
             return Err("function shortcut must be F1–F14".into());
@@ -7167,6 +7222,22 @@ fn effective_command_shortcuts(state: &AppState, command: CommandSpec) -> Vec<St
         .collect::<Vec<_>>();
     if !configured.is_empty() {
         return configured;
+    }
+    if state.workspace == Workspace::Outline {
+        let outline_default = match command.id {
+            "scene.create" => Some("Insert"),
+            "structure.chapter" => Some("Shift+Insert"),
+            "structure.section" => Some("Ctrl+Shift+Insert"),
+            "outline.move-up" => Some("Shift+Up"),
+            "outline.move-down" => Some("Shift+Down"),
+            "outline.promote" => Some("Shift+Left"),
+            "outline.demote" => Some("Shift+Right"),
+            "document.rename-heading" => Some("Ctrl+R"),
+            _ => None,
+        };
+        if let Some(shortcut) = outline_default {
+            return vec![shortcut.to_owned()];
+        }
     }
     if let CommandAction::Workspace(workspace) = command.action {
         return state
@@ -7938,6 +8009,8 @@ impl AppState {
             history_index: 0,
             location_history: Vec::new(),
             width: 80,
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
             editor_focus_mode: true,
             horizontal_split_ratio: default_split_ratio(),
             vertical_split_ratio: default_split_ratio(),
@@ -9410,6 +9483,12 @@ impl AppState {
         Ok(())
     }
     fn refresh(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let selected_outline_row = (self.workspace == Workspace::Outline)
+            .then(|| outline_rows(self).get(self.selected).cloned())
+            .flatten();
+        let selected_card = (self.workspace == Workspace::Cards)
+            .then(|| selected_scene_for_workspace(self))
+            .flatten();
         let removed_scenes = self.workspace == Workspace::Cards && self.removed_scenes_list;
         self.scenes = self
             .app
@@ -9418,7 +9497,16 @@ impl AppState {
             .filter(|record| record.scene.archived == removed_scenes)
             .map(|r| (r.scene.id, r.scene.title, r.scene.status, r.actual_words))
             .collect();
-        if !self.scenes.is_empty() {
+        if self.workspace == Workspace::Outline {
+            let rows = outline_rows(self);
+            self.selected = selected_outline_row
+                .and_then(|selected| rows.iter().position(|row| *row == selected))
+                .unwrap_or_else(|| self.selected.min(rows.len().saturating_sub(1)));
+        } else if self.workspace == Workspace::Cards {
+            self.selected = selected_card
+                .and_then(|scene| scene_card_ids(self).iter().position(|id| *id == scene))
+                .unwrap_or_else(|| self.selected.min(self.scenes.len().saturating_sub(1)));
+        } else if !self.scenes.is_empty() {
             self.selected = self.selected.min(self.scenes.len() - 1);
         }
         if let Some((chapter, _)) = self.selected_card_chapter
@@ -9946,6 +10034,7 @@ impl AppState {
         } else {
             String::new()
         };
+        let path_input = current_dir.display().to_string();
         self.menu = None;
         self.command_palette = None;
         self.file_browser = Some(FileBrowserState {
@@ -9969,6 +10058,9 @@ impl AppState {
             org_import_mode: story_import::OrgImportMode::SingleDocument,
             text_import_preview: None,
             preview_scroll: 0,
+            show_hidden: false,
+            path_editing: false,
+            path_input,
         });
         self.message = if purpose == FileBrowserPurpose::NewProject {
             "Temporary workspace is stored privately by WIDE · enter a title and choose Fiction or Non-fiction · Save later to choose a permanent location".into()
@@ -10111,6 +10203,59 @@ impl AppState {
         let Some(mut browser) = self.file_browser.take() else {
             return Ok(());
         };
+        if browser.path_editing {
+            match key.code {
+                KeyCode::Esc => {
+                    browser.path_editing = false;
+                    self.message = "Path entry cancelled".into();
+                }
+                KeyCode::Enter => {
+                    let entered = browser.path_input.trim();
+                    let path = if entered == "~" {
+                        std::env::var_os("HOME")
+                            .map(PathBuf::from)
+                            .unwrap_or_default()
+                    } else if let Some(rest) = entered.strip_prefix("~/") {
+                        std::env::var_os("HOME")
+                            .map(PathBuf::from)
+                            .unwrap_or_default()
+                            .join(rest)
+                    } else {
+                        PathBuf::from(entered)
+                    };
+                    if browser.purpose == FileBrowserPurpose::OpenProject
+                        && path.join("project.toml").is_file()
+                    {
+                        self.request_open_project(path)?;
+                        return Ok(());
+                    }
+                    match set_file_browser_directory(&mut browser, path.clone()) {
+                        Ok(()) => {
+                            browser.path_editing = false;
+                            browser.overwrite_confirmed = false;
+                            self.message = format!("Showing {}", browser.current_dir.display());
+                        }
+                        Err(error) => {
+                            self.message = format!("Could not open {}: {error}", path.display());
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    browser.path_input.pop();
+                }
+                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    browser.path_input.clear();
+                }
+                KeyCode::Char(character)
+                    if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+                {
+                    browser.path_input.push(character);
+                }
+                _ => {}
+            }
+            self.file_browser = Some(browser);
+            return Ok(());
+        }
         // New Project exposes its book type and actions as focusable controls.
         // Enter on those controls follows the same paths as the optional F-key
         // shortcuts, so creation never depends on an undocumented chord.
@@ -10253,6 +10398,29 @@ impl AppState {
         }
         let mut close = false;
         match key.code {
+            KeyCode::F(3) => {
+                browser.path_editing = true;
+                browser.path_input = browser.current_dir.display().to_string();
+                self.message = "Enter an absolute path or use ~ for your home folder · Enter opens · Esc cancels".into();
+            }
+            KeyCode::F(6) => {
+                let selected = browser
+                    .entries
+                    .get(browser.selected)
+                    .map(|(name, _)| name.clone());
+                browser.show_hidden = !browser.show_hidden;
+                browser.entries =
+                    file_browser_entries_with_hidden(&browser.current_dir, browser.show_hidden)?;
+                browser.selected = selected
+                    .and_then(|name| browser.entries.iter().position(|(entry, _)| *entry == name))
+                    .unwrap_or(0);
+                self.message = if browser.show_hidden {
+                    "Hidden files shown"
+                } else {
+                    "Hidden files hidden"
+                }
+                .into();
+            }
             KeyCode::Esc => {
                 close = true;
                 if browser.purpose == FileBrowserPurpose::SaveProjectAs
@@ -10925,12 +11093,7 @@ impl AppState {
                             "Created {name} in WIDE's temporary workspace · edit now, then Save to choose a permanent location"
                         );
                         self.switch_to_project(destination, created_message)?;
-                        self.switch(match book_type {
-                            story_core::BookType::Fiction => Workspace::Cards,
-                            story_core::BookType::Nonfiction | story_core::BookType::Custom => {
-                                Workspace::Outline
-                            }
-                        });
+                        self.switch(default_authoring_workspace(book_type));
                         close = true;
                     }
                     FileBrowserPurpose::SaveProjectAs => {
@@ -14454,6 +14617,24 @@ impl AppState {
         // when the author returns to the outliner.
         self.collapsed_outline_nodes
             .retain(|collapsed| *collapsed != node_id && !descendants.contains(collapsed));
+        if nodes
+            .iter()
+            .any(|node| node.id == node_id && node.kind == "chapter")
+            && let Some(body) = self
+                .app
+                .list_content_units(false)?
+                .into_iter()
+                .find(|unit| {
+                    unit.kind == story_core::ContentUnitKind::ChapterBody
+                        && unit.parent_id == Some(node_id)
+                })
+        {
+            self.selected = outline_rows(self)
+                .iter()
+                .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == node_id))
+                .unwrap_or(self.selected);
+            return self.open_content_unit(body.id);
+        }
         let rows = outline_rows(self);
         let node_row = rows.iter().position(|row| {
             matches!(row, OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } if *id == node_id)
@@ -14704,6 +14885,86 @@ impl AppState {
         };
         Ok(())
     }
+    fn outline_entry_can_move(&self, move_down: bool) -> bool {
+        match outline_rows(self).get(self.selected) {
+            Some(OutlineRow::Scene(_)) => true,
+            Some(OutlineRow::Section { .. } | OutlineRow::Chapter { .. }) => {
+                self.outline_move_destination(move_down).is_some()
+            }
+            _ => false,
+        }
+    }
+    fn move_selected_outline_entry(
+        &mut self,
+        move_down: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match outline_rows(self).get(self.selected) {
+            Some(OutlineRow::Scene(_)) => self.move_scene_card(if move_down { 1 } else { -1 }),
+            Some(OutlineRow::Section { .. } | OutlineRow::Chapter { .. }) => {
+                self.move_selected_outline_item(move_down)
+            }
+            _ => {
+                self.message = "Select a scene, chapter or section to move it".into();
+                Ok(())
+            }
+        }
+    }
+    fn move_selected_outline_depth(
+        &mut self,
+        demote: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. }) =
+            outline_rows(self).get(self.selected).cloned()
+        else {
+            self.message = "Select a chapter or section to change its outline level".into();
+            return Ok(());
+        };
+        let nodes = self.app.list_structural_nodes()?;
+        let Some(node) = nodes.iter().find(|node| node.id == id) else {
+            self.message = "Selected outline item no longer exists · no change made".into();
+            return Ok(());
+        };
+        let parent = if demote {
+            let mut sections = nodes
+                .iter()
+                .filter(|sibling| sibling.parent_id == node.parent_id && sibling.kind == "section")
+                .collect::<Vec<_>>();
+            sections.sort_by_key(|section| section.position);
+            sections
+                .into_iter()
+                .take_while(|section| section.id != id)
+                .last()
+                .map(|section| section.id)
+        } else {
+            node.parent_id.and_then(|parent| {
+                nodes
+                    .iter()
+                    .find(|candidate| candidate.id == parent)
+                    .and_then(|candidate| candidate.parent_id)
+            })
+        };
+        let Some(parent) = parent else {
+            self.message = if demote {
+                "No preceding section can contain this item · no change made".into()
+            } else {
+                "This item is already at the top outline level · no change made".into()
+            };
+            return Ok(());
+        };
+        let position = self.app.next_structural_node_position(Some(parent))?;
+        self.app.move_structural_node(id, Some(parent), position)?;
+        self.refresh()?;
+        self.selected = outline_rows(self)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Section { id: row_id, .. } | OutlineRow::Chapter { id: row_id, .. } if *row_id == id))
+            .unwrap_or(0);
+        self.message = if demote {
+            "Outline item nested under the preceding section".into()
+        } else {
+            "Outline item promoted one level".into()
+        };
+        Ok(())
+    }
     fn open_content_unit(
         &mut self,
         id: story_core::ContentUnitId,
@@ -14728,7 +14989,8 @@ impl AppState {
         self.redo_stack.clear();
         self.editor_selection = None;
         self.dirty = false;
-        self.workspace = Workspace::Editor;
+        self.scroll = 0;
+        self.switch(Workspace::Editor);
         self.message = format!("{} · direct prose", self.app.get_content_unit(id)?.title);
         Ok(())
     }
@@ -14857,6 +15119,9 @@ impl AppState {
                 Err(error) => self.message = format!("Save conflict/error: {error}"),
             }
         }
+        if !self.dirty {
+            self.refresh()?;
+        }
         Ok(())
     }
     fn persist_challenge_draft(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -14903,8 +15168,14 @@ impl AppState {
                         | OutlineRow::ContentUnit(_)
                 )
             ) || card_chapter.is_some();
+            let chapter_body_parent = (previous == Workspace::Editor && w == Workspace::Outline)
+                .then_some(self.editing_content_unit)
+                .flatten()
+                .and_then(|unit| self.app.get_content_unit(unit).ok())
+                .filter(|unit| unit.kind == story_core::ContentUnitKind::ChapterBody)
+                .and_then(|unit| unit.parent_id);
             let current_scene = selected_scene_for_workspace(self).or_else(|| {
-                (!selected_container)
+                (!selected_container && chapter_body_parent.is_none())
                     .then(|| self.editing_scene.or_else(|| self.active_scene()))
                     .flatten()
             });
@@ -14940,7 +15211,14 @@ impl AppState {
                 }
             } else if w == Workspace::Outline {
                 let rows = outline_rows(self);
-                if let Some(scene) = current_scene {
+                if let Some(chapter) = chapter_body_parent {
+                    self.selected = rows
+                        .iter()
+                        .position(
+                            |row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter),
+                        )
+                        .unwrap_or(self.selected.min(rows.len().saturating_sub(1)));
+                } else if let Some(scene) = current_scene {
                     self.selected = rows
                         .iter()
                         .position(|row| *row == OutlineRow::Scene(scene))
@@ -15075,6 +15353,194 @@ impl AppState {
             })
             .unwrap_or_else(|| self.selected.min(rows.len().saturating_sub(1)));
         self.save_session()?;
+        Ok(())
+    }
+    fn move_outline_horizontal(&mut self, expand: bool) -> Result<(), Box<dyn std::error::Error>> {
+        let rows = outline_rows(self);
+        let Some(row) = rows.get(self.selected).cloned() else {
+            return Ok(());
+        };
+        let structural = matches!(row, OutlineRow::Section { .. } | OutlineRow::Chapter { .. });
+        let current_node = match row {
+            OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } => Some(id),
+            OutlineRow::Scene(id) => self.app.get_scene(id)?.chapter_id,
+            OutlineRow::ContentUnit(id) => self.app.get_content_unit(id)?.parent_id,
+        };
+        if expand {
+            if let Some(id) = current_node.filter(|_| structural)
+                && self.collapsed_outline_nodes.remove(&id)
+            {
+                self.message = "Outline group expanded".into();
+            } else {
+                let parent = current_node.filter(|_| structural);
+                let direct_child = rows.iter().enumerate().skip(self.selected + 1).find_map(
+                    |(index, candidate)| {
+                        let child_parent = match candidate {
+                            OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } => {
+                                self.app
+                                    .list_structural_nodes()
+                                    .ok()?
+                                    .into_iter()
+                                    .find(|node| node.id == *id)?
+                                    .parent_id
+                            }
+                            OutlineRow::Scene(id) => self.app.get_scene(*id).ok()?.chapter_id,
+                            OutlineRow::ContentUnit(id) => {
+                                self.app.get_content_unit(*id).ok()?.parent_id
+                            }
+                        };
+                        (parent.is_some() && child_parent == parent).then_some(index)
+                    },
+                );
+                if let Some(index) = direct_child {
+                    self.selected = index;
+                    self.message = "Moved to first child".into();
+                } else {
+                    self.message = "No child item to open".into();
+                }
+            }
+        } else if structural
+            && current_node.is_some_and(|id| !self.collapsed_outline_nodes.contains(&id))
+        {
+            let id = current_node.unwrap();
+            self.collapsed_outline_nodes.insert(id);
+            self.message = "Outline group collapsed".into();
+        } else {
+            let parent = match row {
+                OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } => self
+                    .app
+                    .list_structural_nodes()?
+                    .into_iter()
+                    .find(|node| node.id == id)
+                    .and_then(|node| node.parent_id),
+                OutlineRow::Scene(id) => self.app.get_scene(id)?.chapter_id,
+                OutlineRow::ContentUnit(id) => self.app.get_content_unit(id)?.parent_id,
+            };
+            if let Some(parent) = parent
+                && let Some(index) = outline_rows(self).iter().position(|candidate| matches!(candidate,
+                    OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } if *id == parent
+                ))
+            {
+                self.selected = index;
+                self.message = "Moved to parent".into();
+            } else {
+                self.message = "Already at the manuscript root".into();
+            }
+        }
+        self.save_session()?;
+        Ok(())
+    }
+    fn toggle_outline_inclusion(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(row) = outline_rows(self).get(self.selected).cloned() else {
+            self.message = "Select manuscript content to change publication inclusion".into();
+            return Ok(());
+        };
+        match row {
+            OutlineRow::Scene(scene) => {
+                let included = self.app.scene_is_included(scene)?;
+                self.app.set_scene_included(scene, !included)?;
+                let title = self.app.get_scene(scene)?.scene.title;
+                self.refresh()?;
+                self.selected = outline_rows(self)
+                    .iter()
+                    .position(|row| *row == OutlineRow::Scene(scene))
+                    .unwrap_or(self.selected);
+                self.message = if included {
+                    format!("Moved ‘{title}’ to Excluded · its text is retained")
+                } else {
+                    format!("Moved ‘{title}’ to Included")
+                };
+            }
+            OutlineRow::ContentUnit(unit) => self.toggle_content_unit_inclusion(unit)?,
+            OutlineRow::Chapter { id, .. } | OutlineRow::Section { id, .. } => {
+                let nodes = self.app.list_structural_nodes()?;
+                let mut descendants = BTreeSet::from([id]);
+                loop {
+                    let before = descendants.len();
+                    for node in &nodes {
+                        if node
+                            .parent_id
+                            .is_some_and(|parent| descendants.contains(&parent))
+                        {
+                            descendants.insert(node.id);
+                        }
+                    }
+                    if before == descendants.len() {
+                        break;
+                    }
+                }
+                let units = self
+                    .app
+                    .list_content_units(false)?
+                    .into_iter()
+                    .filter(|unit| {
+                        unit.parent_id
+                            .is_some_and(|parent| descendants.contains(&parent))
+                    })
+                    .collect::<Vec<_>>();
+                let scenes = self
+                    .app
+                    .list_scenes(false)?
+                    .into_iter()
+                    .filter(|scene| {
+                        scene
+                            .chapter_id
+                            .is_some_and(|parent| descendants.contains(&parent))
+                    })
+                    .collect::<Vec<_>>();
+                if units.is_empty() && scenes.is_empty() {
+                    self.message = "This outline item has no manuscript content to include".into();
+                    return Ok(());
+                }
+                let mut states = Vec::new();
+                for unit in &units {
+                    states.push(self.app.content_unit_is_included(unit.id)?);
+                }
+                for scene in &scenes {
+                    states.push(self.app.scene_is_included(scene.scene.id)?);
+                }
+                let include = !states.iter().all(|included| *included);
+                let sole_unit_title =
+                    (units.len() == 1 && scenes.is_empty()).then(|| units[0].title.clone());
+                for unit in &units {
+                    self.app.set_content_unit_included(unit.id, include)?;
+                }
+                for scene in &scenes {
+                    self.app.set_scene_included(scene.scene.id, include)?;
+                }
+                self.refresh()?;
+                self.message = match (include, sole_unit_title) {
+                    (false, Some(title)) => {
+                        format!("Moved ‘{title}’ to Excluded · its prose and metadata are retained")
+                    }
+                    (true, _) => {
+                        "Included selected outline branch and its manuscript content".into()
+                    }
+                    (false, _) => {
+                        "Excluded selected outline branch; all content is retained".into()
+                    }
+                };
+            }
+        }
+        Ok(())
+    }
+    fn toggle_content_unit_inclusion(
+        &mut self,
+        unit: story_core::ContentUnitId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let included = self.app.content_unit_is_included(unit)?;
+        self.app.set_content_unit_included(unit, !included)?;
+        let title = self.app.get_content_unit(unit)?.title;
+        self.refresh()?;
+        self.selected = outline_rows(self)
+            .iter()
+            .position(|row| *row == OutlineRow::ContentUnit(unit))
+            .unwrap_or(self.selected);
+        self.message = if included {
+            format!("Moved ‘{title}’ to Excluded · its prose is retained")
+        } else {
+            format!("Moved ‘{title}’ to Included")
+        };
         Ok(())
     }
     fn toggle_menu(&mut self) {
@@ -15628,11 +16094,11 @@ impl AppState {
                             spec.takes_arguments = false;
                         }
                         "outline.move-up" => {
-                            spec.label = "Move Scene Up";
+                            spec.label = "Move Selected Item Earlier";
                             spec.takes_arguments = false;
                         }
                         "outline.move-down" => {
-                            spec.label = "Move Scene Down";
+                            spec.label = "Move Selected Item Later";
                             spec.takes_arguments = false;
                         }
                         "scene.toggle-inclusion" => {
@@ -15892,6 +16358,17 @@ impl AppState {
                 None
             };
         }
+        if spec.id == "document.rename-heading" {
+            return if self.workspace != Workspace::Outline {
+                Some("Open Outline and select a document first")
+            } else if self.removed_content_units_list || self.removed_scenes_list {
+                Some("Restore the selected item before renaming it")
+            } else if outline_rows(self).get(self.selected).is_none() {
+                Some("Select an outline item to rename")
+            } else {
+                None
+            };
+        }
         if spec.id == "scene.restore" {
             return if self.workspace != Workspace::Cards || !self.removed_scenes_list {
                 Some("Show Removed Scenes first")
@@ -16016,16 +16493,14 @@ impl AppState {
                 Some("Open the manuscript outline to use structural actions")
             }
             CommandAction::MoveOutlineUp
-                if self.workspace == Workspace::Outline
-                    && self.outline_move_destination(false).is_none() =>
+                if self.workspace == Workspace::Outline && !self.outline_entry_can_move(false) =>
             {
-                Some("Select a chapter or section with a sibling above")
+                Some("There is no earlier item of this type")
             }
             CommandAction::MoveOutlineDown
-                if self.workspace == Workspace::Outline
-                    && self.outline_move_destination(true).is_none() =>
+                if self.workspace == Workspace::Outline && !self.outline_entry_can_move(true) =>
             {
-                Some("Select a chapter or section with a sibling below")
+                Some("There is no later item of this type")
             }
             CommandAction::MoveSceneEarlier | CommandAction::MoveSceneLater
                 if !is_manuscript_outliner(self.workspace)
@@ -16750,25 +17225,38 @@ impl AppState {
             "Rename selected scene · Ctrl+A clears title · Enter saves · Esc cancels".into();
     }
 
-    fn start_structural_node_rename(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let node = match outline_rows(self).get(self.selected) {
-            Some(OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. }) => *id,
-            _ => {
-                self.message = "Select a section or chapter in Outline before renaming it".into();
-                return Ok(());
+    fn start_selected_outline_rename(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        match outline_rows(self).get(self.selected).cloned() {
+            Some(OutlineRow::Scene(id)) => {
+                self.select_scene_in_current_outliner(id);
+                self.start_scene_rename();
             }
-        };
-        let title = self
-            .app
-            .list_structural_nodes()?
-            .into_iter()
-            .find(|candidate| candidate.id == node)
-            .map(|node| node.title)
-            .ok_or("selected heading no longer exists")?;
-        self.mode = Some('J');
-        self.prompt = title;
-        self.message =
-            "Rename selected heading · Ctrl+A clears title · Enter saves · Esc cancels".into();
+            Some(OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. }) => {
+                let title = self
+                    .app
+                    .list_structural_nodes()?
+                    .into_iter()
+                    .find(|candidate| candidate.id == id)
+                    .map(|node| node.title)
+                    .ok_or("selected outline item no longer exists")?;
+                self.mode = Some('J');
+                self.prompt = title;
+                self.message = "Rename selected outline item · Enter saves · Esc cancels".into();
+            }
+            Some(OutlineRow::ContentUnit(id)) => {
+                let title = self
+                    .app
+                    .list_content_units(false)?
+                    .into_iter()
+                    .find(|unit| unit.id == id)
+                    .map(|unit| unit.title)
+                    .ok_or("selected document no longer exists")?;
+                self.mode = Some('U');
+                self.prompt = title;
+                self.message = "Rename selected document · Enter saves · Esc cancels".into();
+            }
+            None => self.message = "Select an outline item to rename".into(),
+        }
         Ok(())
     }
 
@@ -17123,9 +17611,11 @@ impl AppState {
                 };
                 self.create_empty_chapter_at_selection(title)?;
             }
-            CommandAction::RenameSelectedStructuralNode => self.start_structural_node_rename()?,
-            CommandAction::MoveOutlineUp => self.move_selected_outline_item(false)?,
-            CommandAction::MoveOutlineDown => self.move_selected_outline_item(true)?,
+            CommandAction::RenameSelectedStructuralNode => self.start_selected_outline_rename()?,
+            CommandAction::MoveOutlineUp => self.move_selected_outline_entry(false)?,
+            CommandAction::MoveOutlineDown => self.move_selected_outline_entry(true)?,
+            CommandAction::PromoteOutlineItem => self.move_selected_outline_depth(false)?,
+            CommandAction::DemoteOutlineItem => self.move_selected_outline_depth(true)?,
             CommandAction::MoveSceneEarlier => self.move_scene_card(-1)?,
             CommandAction::MoveSceneLater => self.move_scene_card(1)?,
             CommandAction::ArchiveSelectedScene => self.begin_scene_removal(false)?,
@@ -17534,6 +18024,27 @@ impl AppState {
             if let Err(error) = result {
                 self.message = format!("Heading was not renamed: {error}");
             }
+            return Ok(());
+        }
+        if mode == Some('U') {
+            if cmd.trim().is_empty() {
+                self.message =
+                    "Document title unchanged · enter a title or press Esc to cancel".into();
+                return Ok(());
+            }
+            let Some(OutlineRow::ContentUnit(id)) = outline_rows(self).get(self.selected).cloned()
+            else {
+                self.message =
+                    "Selected document is no longer available · nothing was renamed".into();
+                return Ok(());
+            };
+            self.app.rename_content_unit(id, cmd.trim())?;
+            self.refresh()?;
+            self.selected = outline_rows(self)
+                .iter()
+                .position(|row| *row == OutlineRow::ContentUnit(id))
+                .unwrap_or(0);
+            self.message = format!("Renamed document to ‘{}’", cmd.trim());
             return Ok(());
         }
         if matches!(mode, Some('T' | 'Y')) {
@@ -24964,6 +25475,29 @@ impl AppState {
                 text[start..end].split('\n').count()
             })
     }
+    fn ensure_editor_cursor_visible(&mut self) {
+        if self.reference_focused || self.workspace != Workspace::Editor || self.editor.is_empty() {
+            return;
+        }
+        let width = self.editor_viewport_width.max(1);
+        let visible_height = self.editor_viewport_height.max(1);
+        let cursor_row = self.cursor.0.min(self.editor.len().saturating_sub(1));
+        let mut display_row = 0usize;
+        for line in self.editor.iter().take(cursor_row) {
+            let cells = 2usize.saturating_add(UnicodeWidthStr::width(line.as_str()));
+            display_row = display_row.saturating_add(cells.div_ceil(width).max(1));
+        }
+        let line = &self.editor[cursor_row];
+        let prefix: String = line.graphemes(true).take(self.cursor.1).collect();
+        let cursor_cells = 2usize.saturating_add(UnicodeWidthStr::width(prefix.as_str()));
+        display_row = display_row.saturating_add(cursor_cells / width);
+
+        if display_row < self.scroll {
+            self.scroll = display_row;
+        } else if display_row >= self.scroll.saturating_add(visible_height) {
+            self.scroll = display_row.saturating_add(1).saturating_sub(visible_height);
+        }
+    }
     fn delete_selection(&mut self) -> bool {
         let Some(((start_row, start_col), (end_row, end_col))) = self.selection_bounds() else {
             return false;
@@ -25492,6 +26026,9 @@ fn open_default_manuscript_if_unrestored(
 
 fn handle_interactive_key(state: &mut AppState, key: KeyEvent) -> bool {
     let result = handle(state, key);
+    if !matches!(key.code, KeyCode::PageUp | KeyCode::PageDown) {
+        state.ensure_editor_cursor_visible();
+    }
     handle_interactive_result(state, result)
 }
 
@@ -25804,6 +26341,7 @@ fn run(
                     } else {
                         s.push_undo();
                         s.paste_text(&text);
+                        s.ensure_editor_cursor_visible();
                         autosave_deadline = Some(Instant::now() + Duration::from_secs(2));
                     }
                     if s.active_challenge.as_ref().is_some_and(|challenge| {
@@ -26066,12 +26604,7 @@ fn workspace_action_hint(state: &AppState) -> String {
         }
         Workspace::Outline if state.removed_content_units_list => "Removed Prose Documents · ↑/↓ select · Outline > Restore Selected Prose Document · Outline > Show Removed Prose Documents returns".into(),
         Workspace::Outline => {
-            let inclusion = effective_shortcut_label(state, "scene.toggle-inclusion", "Space");
-            if inclusion == "Space" {
-                "↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude scene/prose · Insert creates content · Edit > Remove/Move".into()
-            } else {
-                format!("↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude scene/prose · {inclusion}: Include/Exclude · Insert creates content · Edit > Remove/Move")
-            }
+            format!("↑↓ select · Enter open · Ins scene · ⇧Ins chapter · Ctrl⇧Ins section · ⇧↑↓ move · ⇧←→ nest · Ctrl+R rename · {} include · Del remove", effective_shortcut_label(state, "scene.toggle-inclusion", "Space"))
         }
         Workspace::Editor => "Esc: Outline".into(),
         _ => "Tab: next primary view · Shift+Tab: previous".into(),
@@ -26874,6 +27407,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         ])
         .split(area);
     s.width = area.width as usize;
+    let previous_editor_viewport = (s.editor_viewport_width, s.editor_viewport_height);
     let head = Paragraph::new(menu_bar_line(s, area.width as usize));
     f.render_widget(head, rows[0]);
     let body = if pane_direction(s.width) == Direction::Vertical {
@@ -26893,6 +27427,49 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             ])
             .split(rows[1])
     };
+    if s.workspace == Workspace::Editor {
+        let mut editor_area = if s.editor_focus_mode {
+            rows[1]
+        } else {
+            body[1]
+        };
+        if let Some(layout) = s.pane_layout.clone() {
+            if let Some(rect) = layout
+                .rectangles(
+                    pane_layout::PaneRect {
+                        x: editor_area.x,
+                        y: editor_area.y,
+                        width: editor_area.width,
+                        height: editor_area.height,
+                    },
+                    18,
+                    6,
+                )
+                .into_iter()
+                .find_map(|(id, rect)| (id == 1).then_some(rect))
+            {
+                editor_area = Rect::new(rect.x, rect.y, rect.width, rect.height);
+            }
+        } else if !s.editor_focus_mode
+            && !s.reference_panes.is_empty()
+            && !s.reference_panes_hidden
+            && !should_collapse_to_single_pane(editor_area)
+        {
+            let panes = Layout::default()
+                .direction(s.reference_layout.direction(s.width))
+                .constraints([
+                    Constraint::Percentage(s.horizontal_split_ratio),
+                    Constraint::Percentage(100 - s.horizontal_split_ratio),
+                ])
+                .split(editor_area);
+            editor_area = panes[usize::from(s.reference_swapped)];
+        }
+        s.editor_viewport_width = editor_area.width.saturating_sub(2).max(1) as usize;
+        s.editor_viewport_height = editor_area.height.saturating_sub(2).max(1) as usize;
+        if previous_editor_viewport != (s.editor_viewport_width, s.editor_viewport_height) {
+            s.ensure_editor_cursor_visible();
+        }
+    }
     s.pane_bounds = pane_layout::PaneRect {
         x: rows[1].x,
         y: rows[1].y,
@@ -27142,12 +27719,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     )
                 })
             });
-            let mut line_start_byte = view_start as u64
-                + view_lines
-                    .iter()
-                    .take(s.scroll)
-                    .map(|line| line.len() as u64 + 1)
-                    .sum::<u64>();
+            let mut line_start_byte = view_start as u64;
             let projected_graphemes = projection.as_ref().map(|projection| {
                 projection
                     .graphemes
@@ -27158,7 +27730,6 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             let content = view_lines
                 .iter()
                 .enumerate()
-                .skip(s.scroll)
                 .map(|(row, line)| {
                     let prefix = if !s.reference_focused && row == view_cursor.0 {
                         "> "
@@ -27298,27 +27869,30 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             !s.reference_panes.is_empty() && !s.reference_panes_hidden && !s.editor_focus_mode;
         let compact_single_pane =
             has_reference_panes && should_collapse_to_single_pane(editor_and_reference);
-        let editor = Paragraph::new(content).wrap(Wrap { trim: false }).block(
-            Block::default()
-                .title(if compact_single_pane && !s.reference_focused {
-                    format!("{editor_title} · compact · Ctrl-Tab for references")
-                } else if s.reference_focused {
-                    format!("{editor_title} · reference focused")
-                } else {
-                    editor_title
-                })
-                .borders(Borders::ALL)
-                .border_style(
-                    if s.pane_layout
-                        .as_ref()
-                        .is_some_and(|layout| layout.focused() == 1)
-                    {
-                        Style::default().fg(Color::Cyan)
+        let editor = Paragraph::new(content)
+            .scroll((s.scroll.min(u16::MAX as usize) as u16, 0))
+            .wrap(Wrap { trim: false })
+            .block(
+                Block::default()
+                    .title(if compact_single_pane && !s.reference_focused {
+                        format!("{editor_title} · compact · Ctrl-Tab for references")
+                    } else if s.reference_focused {
+                        format!("{editor_title} · reference focused")
                     } else {
-                        Style::default()
-                    },
-                ),
-        );
+                        editor_title
+                    })
+                    .borders(Borders::ALL)
+                    .border_style(
+                        if s.pane_layout
+                            .as_ref()
+                            .is_some_and(|layout| layout.focused() == 1)
+                        {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default()
+                        },
+                    ),
+            );
         if let Some(layout) = s.pane_layout.clone() {
             draw_manual_pane_layout(f, s, rows[1], layout, editor);
         } else if has_reference_panes && compact_single_pane && s.reference_focused {
@@ -30647,10 +31221,20 @@ fn draw_series_form_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
 }
 
 fn file_browser_entries(path: &Path) -> io::Result<Vec<(String, bool)>> {
+    file_browser_entries_with_hidden(path, false)
+}
+
+fn file_browser_entries_with_hidden(
+    path: &Path,
+    show_hidden: bool,
+) -> io::Result<Vec<(String, bool)>> {
     let mut entries = fs::read_dir(path)?
         .filter_map(Result::ok)
         .filter_map(|entry| {
             let name = entry.file_name().to_string_lossy().into_owned();
+            if !show_hidden && name.starts_with('.') {
+                return None;
+            }
             // Follow directory symlinks so they remain navigable in the
             // browser; broken links and unreadable entries are omitted.
             let metadata = fs::metadata(entry.path()).ok()?;
@@ -30667,8 +31251,9 @@ fn file_browser_entries(path: &Path) -> io::Result<Vec<(String, bool)>> {
 }
 
 fn set_file_browser_directory(browser: &mut FileBrowserState, path: PathBuf) -> io::Result<()> {
-    let entries = file_browser_entries(&path)?;
+    let entries = file_browser_entries_with_hidden(&path, browser.show_hidden)?;
     browser.current_dir = path;
+    browser.path_input = browser.current_dir.display().to_string();
     browser.entries = entries;
     browser.selected = 0;
     browser.tree_selected = file_browser_ancestors(&browser.current_dir)
@@ -30933,7 +31518,12 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         browser.current_dir.join(&browser.name)
     };
     f.render_widget(
-        Paragraph::new(if browser.purpose == FileBrowserPurpose::NewProject {
+        Paragraph::new(if browser.path_editing {
+            format!(
+                "Directory: {}▏ · Enter opens this folder · Esc cancels",
+                browser.path_input
+            )
+        } else if browser.purpose == FileBrowserPurpose::NewProject {
             format!(
                 "WIDE-managed temporary storage: {} · permanent location chosen when you Save",
                 selected_path.display()
@@ -31063,13 +31653,20 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             "Parent = current folder · Tab/Shift+Tab: panes and project name",
         )
     };
+    let navigation = format!(
+        "{navigation} · F3 Path · F6 Hidden {}",
+        if browser.show_hidden { "on" } else { "off" }
+    );
     f.render_widget(
         Paragraph::new(vec![
             Line::from(truncate_display_cells(
                 primary_action,
                 chunks[7].width as usize,
             )),
-            Line::from(truncate_display_cells(navigation, chunks[7].width as usize)),
+            Line::from(truncate_display_cells(
+                &navigation,
+                chunks[7].width as usize,
+            )),
         ]),
         chunks[7],
     );
@@ -32144,15 +32741,6 @@ fn outline_rows(s: &AppState) -> Vec<OutlineRow> {
         }
         if node.kind == "chapter" {
             rows.extend(
-                content_units
-                    .iter()
-                    .filter(|unit| {
-                        unit.kind == story_core::ContentUnitKind::ChapterBody
-                            && unit.parent_id == Some(node.id)
-                    })
-                    .map(|unit| OutlineRow::ContentUnit(unit.id)),
-            );
-            rows.extend(
                 scenes
                     .iter()
                     .filter(|scene| scene.chapter_id == Some(node.id))
@@ -32392,27 +32980,77 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             .into_iter()
             .map(|row| match row {
                 OutlineRow::Section {
-                    title, collapsed, ..
-                } => format!("{} {}", if collapsed { "▸" } else { "▾" }, title),
+                    id,
+                    title,
+                    collapsed,
+                } => {
+                    let excluded = s
+                        .app
+                        .list_content_units(false)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|unit| {
+                            unit.kind == story_core::ContentUnitKind::SectionBody
+                                && unit.parent_id == Some(id)
+                                && !s.app.content_unit_is_included(unit.id).unwrap_or(true)
+                        });
+                    format!(
+                        "{} {}{}",
+                        if collapsed { "▸" } else { "▾" },
+                        title,
+                        if excluded { " [excluded]" } else { "" }
+                    )
+                }
                 OutlineRow::Chapter {
+                    id,
                     title,
                     scene_count,
                     collapsed,
-                    ..
-                } => format!(
-                    "  {} {} · {} scene(s)",
-                    if collapsed { "▸" } else { "▾" },
-                    title,
-                    scene_count
-                ),
+                } => {
+                    let mut words = s
+                        .scenes
+                        .iter()
+                        .filter(|(scene, ..)| {
+                            s.app
+                                .get_scene(*scene)
+                                .is_ok_and(|record| record.chapter_id == Some(id))
+                        })
+                        .map(|scene| u64::from(scene.3))
+                        .sum::<u64>();
+                    words += s
+                        .app
+                        .list_content_units(false)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|unit| {
+                            unit.kind == story_core::ContentUnitKind::ChapterBody
+                                && unit.parent_id == Some(id)
+                        })
+                        .map(|unit| u64::from(unit.actual_words))
+                        .sum::<u64>();
+                    let excluded = s
+                        .app
+                        .list_content_units(false)
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|unit| {
+                            unit.kind == story_core::ContentUnitKind::ChapterBody
+                                && unit.parent_id == Some(id)
+                                && !s.app.content_unit_is_included(unit.id).unwrap_or(true)
+                        });
+                    format!(
+                        "  {} {}{} · {} scene(s) · {words} words",
+                        if collapsed { "▸" } else { "▾" },
+                        title,
+                        if excluded { " [excluded]" } else { "" },
+                        scene_count
+                    )
+                }
                 OutlineRow::Scene(id) => s.scenes.iter().find(|scene| scene.0 == id).map_or_else(
                     || format!("  <missing scene {id}>"),
                     |scene| {
-                        let inclusion = if s.app.scene_is_included(id).unwrap_or(true) {
-                            "Included"
-                        } else {
-                            "Excluded"
-                        };
+                        let excluded = !s.app.scene_is_included(id).unwrap_or(true);
+                        let exclusion = if excluded { " [excluded]" } else { "" };
                         let placement = s
                             .app
                             .get_scene(id)
@@ -32421,7 +33059,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                             .map(|_| " · Unplaced")
                             .unwrap_or_default();
                         format!(
-                            "  [{inclusion}] {}{}   {}   {} words{placement}",
+                            "  {}{}{exclusion}   {}   {} words{placement}",
                             if s.selected_scenes.contains(&id) {
                                 "[x] "
                             } else {
@@ -32437,14 +33075,10 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                     |_| format!("  <missing content unit {id}>"),
                     |unit| {
                         format!(
-                            "  {} · {}{} · {} · {} words",
-                            if unit.included {
-                                "Included"
-                            } else {
-                                "Excluded"
-                            },
+                            "  {}{}{} · {} · {} words",
                             if unit.archived { "Removed · " } else { "" },
                             unit.title,
+                            if unit.included { "" } else { " [excluded]" },
                             unit.kind.as_str(),
                             unit.actual_words
                         )
@@ -36387,7 +37021,8 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                         .position(|candidate| *candidate == scene)
                         .unwrap_or(s.selected);
                 } else {
-                    s.message = "This chapter is empty in the selected collection · Insert creates a scene here".into();
+                    s.message =
+                        "This chapter has no scenes · Outline > New Scene adds one here".into();
                 }
                 return Ok(false);
             }
@@ -36420,7 +37055,8 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                         .position(|candidate| *candidate == scene)
                         .unwrap_or(s.selected);
                 } else {
-                    s.message = "This chapter is empty in the selected collection · Insert creates a scene here".into();
+                    s.message =
+                        "This chapter has no scenes · Outline > New Scene adds one here".into();
                 }
                 return Ok(false);
             }
@@ -36520,55 +37156,21 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.message = format!("Diff for {}", snapshot.label);
             }
         }
+        KeyCode::Left if s.workspace == Workspace::Outline && k.modifiers.is_empty() => {
+            s.move_outline_horizontal(false)?;
+        }
+        KeyCode::Right if s.workspace == Workspace::Outline && k.modifiers.is_empty() => {
+            s.move_outline_horizontal(true)?;
+        }
         KeyCode::Char(' ') if s.workspace == Workspace::Outline && k.modifiers.is_empty() => {
-            match outline_rows(s).get(s.selected).cloned() {
-                Some(OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. }) => {
-                    s.toggle_outline_node(id)?;
-                }
-                Some(OutlineRow::Scene(id)) => {
-                    if effective_shortcut_label(s, "scene.toggle-inclusion", "Space") != "Space" {
-                        let shortcut =
-                            effective_shortcut_label(s, "scene.toggle-inclusion", "Space");
-                        s.message = format!("Use {shortcut} to change scene inclusion");
-                        return Ok(false);
-                    }
-                    let included = s.app.scene_is_included(id)?;
-                    s.app.set_scene_included(id, !included)?;
-                    s.refresh()?;
-                    s.selected = outline_rows(s)
-                        .iter()
-                        .position(|row| *row == OutlineRow::Scene(id))
-                        .unwrap_or(s.selected);
-                    let title = s.app.get_scene(id)?.scene.title;
-                    s.message = if included {
-                        format!("Moved “{title}” to Excluded · its text and metadata are retained")
-                    } else {
-                        format!(
-                            "Moved “{title}” to Included · it will appear in Compile when placed"
-                        )
-                    };
-                }
-                Some(OutlineRow::ContentUnit(id)) => {
-                    let included = s.app.content_unit_is_included(id)?;
-                    s.app.set_content_unit_included(id, !included)?;
-                    s.refresh()?;
-                    s.selected = outline_rows(s)
-                        .iter()
-                        .position(|row| *row == OutlineRow::ContentUnit(id))
-                        .unwrap_or(s.selected);
-                    let title = s.app.get_content_unit(id)?.title;
-                    s.message = if included {
-                        format!("Moved “{title}” to Excluded · its prose and metadata are retained")
-                    } else {
-                        format!("Moved “{title}” to Included · it will appear in Compile")
-                    };
-                }
-                None => {
-                    s.message =
-                        "Select a heading, chapter text or scene to change its outline state"
-                            .into();
-                }
+            if effective_shortcut_label(s, "scene.toggle-inclusion", "Space") != "Space" {
+                s.message = format!(
+                    "Use {} to change manuscript inclusion",
+                    effective_shortcut_label(s, "scene.toggle-inclusion", "Space")
+                );
+                return Ok(false);
             }
+            s.toggle_outline_inclusion()?;
         }
         KeyCode::Char(' ')
             if s.workspace == Workspace::Outline && k.modifiers == KeyModifiers::CONTROL =>
@@ -36689,7 +37291,7 @@ mod tests {
         assert_eq!(detail_panel_title(&state), "Selected outline item");
         assert_eq!(
             workspace_action_hint(&state),
-            "↑/↓ select · Enter open manuscript · Space expand/collapse or include/exclude scene/prose · Insert creates content · Edit > Remove/Move"
+            "↑↓ select · Enter open · Ins scene · ⇧Ins chapter · Ctrl⇧Ins section · ⇧↑↓ move · ⇧←→ nest · Ctrl+R rename · Space include · Del remove"
         );
 
         state.workspace = Workspace::StoryBible;
@@ -36703,6 +37305,55 @@ mod tests {
 
         state.workspace = Workspace::Editor;
         assert_eq!(workspace_action_hint(&state), "Esc: Outline");
+    }
+
+    #[test]
+    fn fiction_nonfiction_and_custom_books_share_the_same_default_outline() {
+        for book_type in [
+            story_core::BookType::Fiction,
+            story_core::BookType::Nonfiction,
+            story_core::BookType::Custom,
+        ] {
+            assert_eq!(default_authoring_workspace(book_type), Workspace::Outline);
+        }
+    }
+
+    #[test]
+    fn outline_shortcuts_and_structural_menu_follow_the_approved_context_bindings() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = AppState::new(
+            WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap(),
+            default_bindings(),
+        );
+        state.workspace = Workspace::Outline;
+        for (id, expected) in [
+            ("scene.create", "Insert"),
+            ("structure.chapter", "Shift+Insert"),
+            ("structure.section", "Ctrl+Shift+Insert"),
+            ("outline.move-up", "Shift+Up"),
+            ("outline.move-down", "Shift+Down"),
+            ("outline.promote", "Shift+Left"),
+            ("outline.demote", "Shift+Right"),
+            ("document.rename-heading", "Ctrl+R"),
+        ] {
+            let command = command_by_id(id).unwrap();
+            assert!(effective_command_shortcuts(&state, command).contains(&expected.to_owned()));
+        }
+        assert_eq!(
+            menu_category(&command_by_id("structure.chapter").unwrap()),
+            "Outline"
+        );
+        assert_eq!(
+            menu_category(&command_by_id("scene.create").unwrap()),
+            "Outline"
+        );
+        state.open_menu_category(OUTLINE_MENU_INDEX);
+        let entries = state.menu_commands();
+        let ids = entries.iter().map(|entry| entry.id).collect::<Vec<_>>();
+        assert!(ids.contains(&"structure.chapter"));
+        assert!(ids.contains(&"outline.move-up"));
+        assert!(!ids.contains(&"scene.subchapter"));
+        assert!(!ids.contains(&"scene.move-earlier"));
     }
 
     #[test]
@@ -36751,8 +37402,8 @@ mod tests {
             "Write Selected Scene",
             "Rename Selected Scene",
             "Edit Scene Synopsis",
-            "Move Scene Up",
-            "Move Scene Down",
+            "Move Selected Item Earlier",
+            "Move Selected Item Later",
             "Move Scene to Chapter…",
             "Include / Exclude Scene",
         ] {
@@ -36770,7 +37421,7 @@ mod tests {
         assert!(
             workspace_action_hint(&state)
                 .to_lowercase()
-                .contains("space expand/collapse or include/exclude"),
+                .contains("space include"),
             "{}",
             workspace_action_hint(&state)
         );
@@ -36850,7 +37501,7 @@ mod tests {
             KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
             "scene.toggle-inclusion".into(),
         ));
-        assert!(workspace_action_hint(&state).contains("I: Include/Exclude"));
+        assert!(workspace_action_hint(&state).contains("I include"));
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
@@ -36919,7 +37570,7 @@ mod tests {
         state.workspace = Workspace::Outline;
         state.selected = outline_rows(&state)
             .iter()
-            .position(|row| *row == OutlineRow::ContentUnit(prose))
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
             .unwrap();
 
         handle(
@@ -36941,7 +37592,7 @@ mod tests {
         assert!(
             workspace_items(&state)
                 .iter()
-                .any(|row| row.contains("Excluded"))
+                .any(|row| row.contains("[excluded]"))
         );
     }
 
@@ -37462,7 +38113,7 @@ mod tests {
             state.app.get_project().unwrap().book_type,
             story_core::BookType::Fiction
         );
-        assert_eq!(state.workspace, Workspace::Cards);
+        assert_eq!(state.workspace, Workspace::Outline);
     }
 
     #[test]
@@ -37638,7 +38289,7 @@ mod tests {
         state.workspace = Workspace::Outline;
         state.selected = outline_rows(&state)
             .iter()
-            .position(|row| *row == OutlineRow::ContentUnit(unit))
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
             .unwrap();
         state.open_selected().unwrap();
         assert_eq!(state.workspace, Workspace::Editor);
@@ -37714,9 +38365,8 @@ mod tests {
         assert_eq!(state.workspace, Workspace::Editor);
         assert_eq!(state.editing_content_unit, Some(body));
         state.switch(Workspace::Outline);
-        assert_eq!(
-            outline_rows(&state).get(state.selected),
-            Some(&OutlineRow::ContentUnit(body))
+        assert!(
+            matches!(outline_rows(&state).get(state.selected), Some(OutlineRow::Chapter { id, .. }) if *id == chapter)
         );
     }
 
@@ -39330,6 +39980,18 @@ mod tests {
         assert!(parse_shortcut("A").is_err());
         assert_eq!(parse_shortcut("F10").unwrap().code, KeyCode::F(10));
         assert_eq!(parse_shortcut("Ctrl+Alt+F10").unwrap().code, KeyCode::F(10));
+        assert_eq!(
+            parse_shortcut("Shift+Insert").unwrap().code,
+            KeyCode::Insert
+        );
+        assert_eq!(
+            parse_shortcut("Shift+Down").unwrap(),
+            KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT)
+        );
+        assert_eq!(
+            parse_shortcut("Ctrl+Shift+Left").unwrap(),
+            KeyEvent::new(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        );
         let root = tempfile::tempdir().unwrap();
         let project = WriterApp::create_project(root.path().join("Keys"), "Keys").unwrap();
         let config = project.project_root().join(".writers-ide/keybindings.toml");
@@ -42858,6 +43520,8 @@ mod tests {
                 width: 80,
                 height: 18,
             },
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
         };
         handle(
             &mut state,
@@ -43787,11 +44451,7 @@ mod tests {
             .iter()
             .position(|row| row.contains("Chapter One"))
             .unwrap();
-        handle(
-            &mut state,
-            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
-        )
-        .unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
         let collapsed = workspace_items(&state);
         assert_eq!(collapsed.len(), 3);
         assert!(collapsed.iter().all(|row| !row.contains("Opening")));
@@ -43819,7 +44479,7 @@ mod tests {
         );
         handle(
             &mut reopened,
-            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
         )
         .unwrap();
         assert_eq!(workspace_items(&reopened).len(), 4);
@@ -46820,6 +47480,8 @@ mod tests {
                 width: 80,
                 height: 18,
             },
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
         };
         assert_eq!(state.selected_text().as_deref(), Some("pha\nbe"));
         handle(
@@ -46986,6 +47648,8 @@ mod tests {
                 width: 80,
                 height: 18,
             },
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
         };
         handle(
             &mut state,
@@ -47260,6 +47924,8 @@ mod tests {
                 width: 80,
                 height: 18,
             },
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
         };
         handle(
             &mut state,
@@ -47430,6 +48096,8 @@ mod tests {
                 width: 80,
                 height: 18,
             },
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -47750,6 +48418,8 @@ mod tests {
                 width: 80,
                 height: 18,
             },
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
         };
         assert!(
             !handle(
@@ -47920,6 +48590,8 @@ mod tests {
                 width: 80,
                 height: 18,
             },
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
         };
         state.open_selected().unwrap();
         state.insert('A');
@@ -49760,6 +50432,8 @@ mod tests {
                 width: 80,
                 height: 18,
             },
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
         };
         handle(
             &mut state,
@@ -50147,6 +50821,8 @@ mod tests {
                 width: 80,
                 height: 18,
             },
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
         };
         state.mode = Some(':');
         state.prompt = "reading-links".into();
@@ -50720,18 +51396,6 @@ mod tests {
         state.refresh().unwrap();
         state.selected = outline_rows(&state)
             .iter()
-            .position(|row| *row == OutlineRow::ContentUnit(prose))
-            .unwrap();
-        handle(
-            &mut state,
-            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
-        )
-        .unwrap();
-        assert!(state.pending_content_unit_removal.is_some());
-        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
-
-        state.selected = outline_rows(&state)
-            .iter()
             .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
             .unwrap();
         handle(
@@ -50740,6 +51404,18 @@ mod tests {
         )
         .unwrap();
         assert!(state.pending_structural_node_removal.is_some());
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert!(!state.app.get_content_unit(prose).unwrap().archived);
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| *row == OutlineRow::Scene(scene))
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.pending_scene_removal.is_some());
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
 
         state.selected = outline_rows(&state)
@@ -51144,16 +51820,16 @@ mod tests {
     }
 
     #[test]
-    fn prose_document_removal_and_restoration_preserve_chapter_text_and_compile_state() {
+    fn visible_section_prose_removal_and_restoration_preserve_content_and_compile_state() {
         let directory = tempfile::tempdir().unwrap();
         let project = directory.path().join("Book");
         let mut app = WriterApp::create_project(&project, "Book").unwrap();
-        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let section = app.create_section("Part One", 0).unwrap();
         let unit = app
             .create_content_unit(
-                story_core::ContentUnitKind::ChapterBody,
-                "Chapter One",
-                Some(chapter),
+                story_core::ContentUnitKind::SectionBody,
+                "Part One prose",
+                Some(section),
                 0,
                 None,
             )
@@ -51235,7 +51911,7 @@ mod tests {
         assert!(!state.removed_content_units_list);
         let restored = state.app.get_content_unit(unit).unwrap();
         assert!(!restored.archived);
-        assert_eq!(restored.parent_id, Some(chapter));
+        assert_eq!(restored.parent_id, Some(section));
         assert_eq!(
             state.app.load_content_unit_text(unit).unwrap().0,
             "The chapter's prose remains intact."
@@ -51781,6 +52457,8 @@ mod tests {
                 width: 80,
                 height: 18,
             },
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
         };
         state.mode = Some(':');
         state.prompt = format!("query {}", query.id);
@@ -51962,6 +52640,8 @@ mod tests {
                 width: 80,
                 height: 18,
             },
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
         };
         let hit = |kind: &str, id: String, title: &str| story_storage::ProjectSearchHit {
             entity_kind: kind.into(),
@@ -52195,6 +52875,8 @@ mod tests {
                 width: 80,
                 height: 18,
             },
+            editor_viewport_width: 78,
+            editor_viewport_height: 18,
         };
         let execute = |state: &mut AppState, command: String| {
             state.mode = Some(':');
@@ -54300,7 +54982,7 @@ mod tests {
             story_core::BookType::Fiction
         );
         assert_eq!(state.app.get_project().unwrap().title, "New Novel");
-        assert_eq!(state.workspace, Workspace::Cards);
+        assert_eq!(state.workspace, Workspace::Outline);
         assert!(state.app.list_scenes(false).unwrap().is_empty());
     }
 
@@ -54386,7 +55068,7 @@ mod tests {
             .unwrap();
         assert!(state.app.project_root().starts_with(staged_projects_root()));
         assert_eq!(state.app.get_project().unwrap().title, "Unchosen");
-        assert_eq!(state.workspace, Workspace::Cards);
+        assert_eq!(state.workspace, Workspace::Outline);
     }
 
     #[test]
@@ -54487,6 +55169,56 @@ mod tests {
 
         let entries = file_browser_entries(directory.path()).unwrap();
         assert!(entries.contains(&("linked-folder".into(), true)));
+    }
+
+    #[test]
+    fn file_browser_hides_dotfiles_by_default_and_supports_direct_path_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("Library");
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join(".private"), "private").unwrap();
+        fs::write(target.join("Visible.txt"), "visible").unwrap();
+        let entries = file_browser_entries(&target).unwrap();
+        assert!(entries.iter().any(|(name, _)| name == "Visible.txt"));
+        assert!(!entries.iter().any(|(name, _)| name == ".private"));
+        assert!(
+            file_browser_entries_with_hidden(&target, true)
+                .unwrap()
+                .iter()
+                .any(|(name, _)| name == ".private")
+        );
+
+        let project = WriterApp::create_project(root.path().join("Project"), "Project").unwrap();
+        let mut state = AppState::new(project, default_bindings());
+        state
+            .start_file_browser(FileBrowserPurpose::OpenProject)
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        set_file_browser_directory(browser, root.path().to_owned()).unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))
+            .unwrap();
+        for character in target.display().to_string().chars() {
+            state
+                .handle_file_browser_key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    KeyModifiers::NONE,
+                ))
+                .unwrap();
+        }
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert_eq!(state.file_browser.as_ref().unwrap().current_dir, target);
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE))
+            .unwrap();
+        let browser = state.file_browser.as_ref().unwrap();
+        assert!(browser.show_hidden);
+        assert!(browser.entries.iter().any(|(name, _)| name == ".private"));
     }
 
     #[test]
@@ -55571,13 +56303,10 @@ mod tests {
         state.workspace = Workspace::Outline;
         state.refresh().unwrap();
         let rows = workspace_items(&state);
+        assert!(rows.iter().any(|row| row.contains("Included Scene")));
         assert!(
             rows.iter()
-                .any(|row| row.contains("[Included]") && row.contains("Included Scene"))
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.contains("[Excluded]") && row.contains("Excluded Scene"))
+                .any(|row| row.contains("[excluded]") && row.contains("Excluded Scene"))
         );
         assert!(
             rows.iter()
@@ -55597,7 +56326,6 @@ mod tests {
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
         let chapter = app.create_chapter(None, "Chapter Four", 0).unwrap();
         let first = app.create_scene(chapter, "First Scene", 0).unwrap();
-        let second = app.create_scene(chapter, "Second Scene", 1).unwrap();
         let prose = app
             .create_content_unit(
                 story_core::ContentUnitKind::ChapterBody,
@@ -55610,18 +56338,17 @@ mod tests {
         let mut state = AppState::new(app, default_bindings());
         state.workspace = Workspace::Outline;
         state.refresh().unwrap();
+        assert!(!outline_rows(&state).contains(&OutlineRow::ContentUnit(prose)));
         state.selected = outline_rows(&state)
             .iter()
-            .position(|row| *row == OutlineRow::Scene(second))
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
             .unwrap();
-        state.open_content_unit(prose).unwrap();
+        state.open_selected().unwrap();
         assert!(state.selected_scene().contains("Chapter Four prose"));
-        assert!(!state.selected_scene().contains("Second Scene"));
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert_eq!(state.workspace, Workspace::Outline);
-        assert_eq!(
-            outline_rows(&state)[state.selected],
-            OutlineRow::ContentUnit(prose)
+        assert!(
+            matches!(outline_rows(&state)[state.selected], OutlineRow::Chapter { id, .. } if id == chapter)
         );
         state.open_scene(first).unwrap();
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
