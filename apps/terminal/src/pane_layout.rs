@@ -4,11 +4,20 @@
 //! the application state. This lets a pane be split without copying prose.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Orientation {
     Vertical,
     Horizontal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Direction {
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +45,10 @@ pub struct PaneLayout {
     root: PaneNode,
     focused: u64,
     next_id: u64,
+    /// Numbered pane slots remain unchanged for the lifetime of each pane.
+    /// Older saved layouts have no map and are assigned numbers on first use.
+    #[serde(default)]
+    numbers: BTreeMap<u64, u8>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -45,6 +58,7 @@ pub enum LayoutError {
     CannotCloseOnlyPane,
     NoParentSplit,
     PaneIdExhausted,
+    PaneLimitReached,
 }
 
 impl std::fmt::Display for LayoutError {
@@ -55,6 +69,7 @@ impl std::fmt::Display for LayoutError {
             Self::CannotCloseOnlyPane => "there is only one window open",
             Self::NoParentSplit => "the focused window has no divider to resize",
             Self::PaneIdExhausted => "no more window identifiers are available",
+            Self::PaneLimitReached => "WIDE supports up to four visible windows",
         };
         f.write_str(message)
     }
@@ -68,6 +83,7 @@ impl Default for PaneLayout {
             root: PaneNode::Leaf(1),
             focused: 1,
             next_id: 2,
+            numbers: BTreeMap::from([(1, 1)]),
         }
     }
 }
@@ -87,6 +103,43 @@ impl PaneLayout {
 
     pub fn panes(&self) -> Vec<u64> {
         leaves(&self.root)
+    }
+
+    pub fn number(&self, id: u64) -> Option<u8> {
+        self.numbers.get(&id).copied().or_else(|| {
+            self.panes()
+                .iter()
+                .position(|pane| *pane == id)
+                .map(|index| index as u8 + 1)
+        })
+    }
+
+    pub fn focus_number(&mut self, number: u8) -> Result<(), LayoutError> {
+        self.normalize_numbers();
+        let id = self
+            .panes()
+            .into_iter()
+            .find(|id| self.numbers.get(id) == Some(&number))
+            .ok_or(LayoutError::UnknownPane)?;
+        self.focus(id)
+    }
+
+    fn normalize_numbers(&mut self) {
+        let mut used = std::collections::BTreeSet::new();
+        let mut normalized = BTreeMap::new();
+        for id in self.panes() {
+            let number = self
+                .numbers
+                .get(&id)
+                .copied()
+                .filter(|number| (1..=4).contains(number) && !used.contains(number))
+                .or_else(|| (1..=4).find(|number| !used.contains(number)));
+            if let Some(number) = number {
+                used.insert(number);
+                normalized.insert(id, number);
+            }
+        }
+        self.numbers = normalized;
     }
 
     pub fn focus(&mut self, id: u64) -> Result<(), LayoutError> {
@@ -111,6 +164,66 @@ impl PaneLayout {
         self.focused = panes[next];
     }
 
+    /// Focus the nearest visible pane in a screen direction. Distance along
+    /// the requested axis is primary; perpendicular distance breaks ties.
+    pub fn focus_direction(
+        &mut self,
+        direction: Direction,
+        bounds: PaneRect,
+        min_width: u16,
+        min_height: u16,
+    ) -> bool {
+        let rectangles = self.rectangles(bounds, min_width, min_height);
+        let Some((_, current)) = rectangles.iter().find(|(id, _)| *id == self.focused) else {
+            return false;
+        };
+        let center = |rect: PaneRect| {
+            (
+                u32::from(rect.x) * 2 + u32::from(rect.width),
+                u32::from(rect.y) * 2 + u32::from(rect.height),
+            )
+        };
+        let (cx, cy) = center(*current);
+        let candidate = rectangles
+            .iter()
+            .filter(|(id, _)| *id != self.focused)
+            .filter_map(|(id, rect)| {
+                let (x, y) = center(*rect);
+                let (primary, perpendicular, aligned) = match direction {
+                    Direction::Up if y < cy => (
+                        cy - y,
+                        x.abs_diff(cx),
+                        intervals_overlap(current.x, current.width, rect.x, rect.width),
+                    ),
+                    Direction::Down if y > cy => (
+                        y - cy,
+                        x.abs_diff(cx),
+                        intervals_overlap(current.x, current.width, rect.x, rect.width),
+                    ),
+                    Direction::Left if x < cx => (
+                        cx - x,
+                        y.abs_diff(cy),
+                        intervals_overlap(current.y, current.height, rect.y, rect.height),
+                    ),
+                    Direction::Right if x > cx => (
+                        x - cx,
+                        y.abs_diff(cy),
+                        intervals_overlap(current.y, current.height, rect.y, rect.height),
+                    ),
+                    _ => return None,
+                };
+                Some(((u8::from(!aligned), primary, perpendicular), *id))
+            })
+            .min_by_key(|(distance, _)| *distance)
+            .map(|(_, id)| id);
+        if let Some(id) = candidate {
+            self.focused = id;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Split the focused leaf, retaining its identity as the first child.
     /// The new second child receives focus. Existing sibling geometry is
     /// unchanged because only this leaf is replaced.
@@ -122,9 +235,16 @@ impl PaneLayout {
         min_width: u16,
         min_height: u16,
     ) -> Result<u64, LayoutError> {
+        if self.pane_count() >= 4 {
+            return Err(LayoutError::PaneLimitReached);
+        }
         if !can_split(bounds, orientation, ratio, min_width, min_height) {
             return Err(LayoutError::InsufficientSpace);
         }
+        self.normalize_numbers();
+        let number = (1..=4)
+            .find(|number| !self.numbers.values().any(|existing| existing == number))
+            .ok_or(LayoutError::PaneLimitReached)?;
         let new_id = self.next_id;
         let next_id = new_id.checked_add(1).ok_or(LayoutError::PaneIdExhausted)?;
         let replacement = PaneNode::Split {
@@ -138,6 +258,7 @@ impl PaneLayout {
         }
         self.next_id = next_id;
         self.focused = new_id;
+        self.numbers.insert(new_id, number);
         Ok(new_id)
     }
 
@@ -156,10 +277,12 @@ impl PaneLayout {
         if contains(&self.root, id) {
             return Err(LayoutError::UnknownPane);
         }
-        let new_id = self.split(orientation, ratio, bounds, min_width, min_height)?;
-        if !replace_leaf(&mut self.root, new_id, PaneNode::Leaf(id)) {
+        let old_new_id = self.split(orientation, ratio, bounds, min_width, min_height)?;
+        if !replace_leaf(&mut self.root, old_new_id, PaneNode::Leaf(id)) {
             return Err(LayoutError::UnknownPane);
         }
+        let number = self.numbers.remove(&old_new_id).unwrap_or(1);
+        self.numbers.insert(id, number);
         self.focused = id;
         Ok(())
     }
@@ -172,7 +295,9 @@ impl PaneLayout {
         if !contains(&self.root, id) {
             return Err(LayoutError::UnknownPane);
         }
+        self.normalize_numbers();
         self.root = remove_leaf(self.root.clone(), id).ok_or(LayoutError::UnknownPane)?;
+        self.numbers.remove(&id);
         if self.focused == id {
             self.focused = first_leaf(&self.root).ok_or(LayoutError::UnknownPane)?;
         }
@@ -182,6 +307,7 @@ impl PaneLayout {
     /// Keep the focused leaf and discard all other layout nodes.
     pub fn only_focused(&mut self) {
         self.root = PaneNode::Leaf(self.focused);
+        self.numbers.retain(|id, _| *id == self.focused);
     }
 
     /// Set the divider ratio on the split immediately containing `id`.
@@ -246,6 +372,7 @@ impl PaneLayout {
     /// must be unique. This lets saved layouts reconnect to currently open
     /// views by their stable source keys rather than stale runtime pane IDs.
     pub fn remap_panes(&mut self, mapping: &[(u64, u64)]) -> Result<(), LayoutError> {
+        self.normalize_numbers();
         let existing = self.panes();
         let mut destinations = std::collections::BTreeSet::new();
         if mapping.len() != existing.len()
@@ -273,6 +400,10 @@ impl PaneLayout {
         }
         visit(&mut self.root, &remap);
         remap(&mut self.focused);
+        self.numbers = mapping
+            .iter()
+            .filter_map(|(from, to)| self.numbers.get(from).copied().map(|n| (*to, n)))
+            .collect();
         self.next_id = destinations
             .iter()
             .copied()
@@ -281,6 +412,11 @@ impl PaneLayout {
             .ok_or(LayoutError::PaneIdExhausted)?;
         Ok(())
     }
+}
+
+fn intervals_overlap(start_a: u16, length_a: u16, start_b: u16, length_b: u16) -> bool {
+    u32::from(start_a) < u32::from(start_b) + u32::from(length_b)
+        && u32::from(start_b) < u32::from(start_a) + u32::from(length_a)
 }
 
 fn valid_node(node: &PaneNode) -> bool {
@@ -591,6 +727,79 @@ mod tests {
         layout.focus_next(true);
         assert_eq!(layout.focused(), b);
         assert_eq!(layout.focus(999), Err(LayoutError::UnknownPane));
+    }
+
+    #[test]
+    fn directional_focus_uses_visible_pane_geometry_and_stays_when_no_target_exists() {
+        let mut layout = PaneLayout::default();
+        let left = layout.focused();
+        let right = layout
+            .split(Orientation::Vertical, 5_000, WIDE, 20, 8)
+            .unwrap();
+        assert_eq!(layout.focused(), right);
+        assert!(layout.focus_direction(Direction::Left, WIDE, 20, 8));
+        assert_eq!(layout.focused(), left);
+        assert!(!layout.focus_direction(Direction::Left, WIDE, 20, 8));
+        assert_eq!(layout.focused(), left);
+        assert!(layout.focus_direction(Direction::Right, WIDE, 20, 8));
+        assert_eq!(layout.focused(), right);
+    }
+
+    #[test]
+    fn directional_focus_selects_geometrically_nearest_pane_in_recursive_layout() {
+        let mut layout = PaneLayout::default();
+        let left = layout.focused();
+        let right = layout
+            .split(Orientation::Vertical, 5_000, WIDE, 20, 8)
+            .unwrap();
+        let right_bottom = layout
+            .split(
+                Orientation::Horizontal,
+                5_000,
+                layout.rectangles(WIDE, 20, 8)[1].1,
+                20,
+                8,
+            )
+            .unwrap();
+        assert!(layout.focus_direction(Direction::Up, WIDE, 20, 8));
+        assert_eq!(layout.focused(), right);
+        assert!(layout.focus_direction(Direction::Left, WIDE, 20, 8));
+        assert_eq!(layout.focused(), left);
+        assert!(layout.focus_direction(Direction::Down, WIDE, 20, 8));
+        assert_eq!(layout.focused(), right_bottom);
+    }
+
+    #[test]
+    fn numbered_pane_slots_remain_stable_when_neighbour_closes_and_limit_is_four() {
+        let mut layout = PaneLayout::default();
+        let first = layout.focused();
+        let second = layout
+            .split(Orientation::Vertical, 5_000, WIDE, 20, 8)
+            .unwrap();
+        let third = layout
+            .split(Orientation::Horizontal, 5_000, WIDE, 20, 8)
+            .unwrap();
+        assert_eq!(layout.number(first), Some(1));
+        assert_eq!(layout.number(second), Some(2));
+        assert_eq!(layout.number(third), Some(3));
+
+        layout.close(second).unwrap();
+        let fourth = layout
+            .split(Orientation::Vertical, 5_000, WIDE, 20, 8)
+            .unwrap();
+        assert_eq!(layout.number(first), Some(1));
+        assert_eq!(layout.number(third), Some(3));
+        assert_eq!(layout.number(fourth), Some(2));
+        layout.focus_number(3).unwrap();
+        assert_eq!(layout.focused(), third);
+        layout
+            .split(Orientation::Horizontal, 5_000, WIDE, 20, 8)
+            .unwrap();
+        assert_eq!(layout.pane_count(), 4);
+        assert_eq!(
+            layout.split(Orientation::Horizontal, 5_000, WIDE, 20, 8),
+            Err(LayoutError::PaneLimitReached)
+        );
     }
 
     #[test]

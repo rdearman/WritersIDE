@@ -2515,3 +2515,122 @@ production PTY suite then passed serially (43 passed, 1 protected-corpus test
 ignored because its private path was not configured). The full workspace run
 had 364 terminal unit tests, 3 author workflows, and all other crate and
 integration tests pass. Human acceptance remains open.
+
+### Alpha UAT 41 — spelling navigation candidate — 27 November 2026
+
+Frozen Linux x86_64 release build from pushed commit `87156d5` is available at
+`test-builds/alpha-uat-41-87156d5/`. Launch it from the repository root with:
+
+```sh
+cd test-builds/alpha-uat-41-87156d5
+./run.sh "The Glassmaker's Compass"
+```
+
+The bundle has isolated preferences and disposable synthetic projects. Its
+checklist covers U37-01 through U37-19, including the new occurrence-level
+Spell Check navigation. The release PTY smoke opened the bundled Glassmaker
+sample at 80×24, verified the rendered title and prose, and exited cleanly via
+Ctrl+Q. `SHA256SUMS` verifies both release executables, launcher, manifest and
+checklist; all four sample project databases pass SQLite `integrity_check`.
+One attempted test reused an assertion for a different sample manuscript and
+was invalid; the replacement sample-specific PTY smoke passed. The complete
+workspace suite had one load-sensitive PTY timeout under parallel load; that
+workflow passed in isolation, the PTY timeout was increased, and the complete
+PTY suite passed serially (43 passed, 1 protected-corpus test ignored). The
+workspace suite was not rerun after that test-only timeout change. Human UAT is
+pending. Alpha UAT 39 was removed; Alpha UAT 40 and 41 are the two retained
+numbered builds.
+
+### Alpha UAT 40 follow-up — new authoring priorities
+
+The author’s consolidated UAT 40 report confirms that vertical editing,
+word-count totals, layout persistence, pane switching, scene renaming, direct
+chapter prose, date/time and special-character insertion, Spell Check and
+offline thesaurus improved. Preserve these results. New top priorities are a
+global directional pane controller, dependable internal copy/paste across
+SSH panes, generic outliner operations, read-only external text viewing,
+formatting-mark/tab display correctness, interactive proofing and configurable
+document statuses. Human acceptance remains open. The immediate next task is
+to route the approved Alt+Arrow, F6/Shift+F6 and View-menu pane navigation
+through one global command path, with regression coverage for focus and
+independent pane state. This direct Alt+Arrow default was superseded by the
+author's later Ctrl+Backslash prefix proposal below.
+
+### Window prefix compatibility and notation — active implementation
+
+The author subsequently proposed a GNU Screen-style prefix, replacing direct
+Alt+Arrow pane navigation as the default. WIDE now uses Ctrl+Backslash followed
+by a separate key: directional arrows, stable pane numbers 1–4, Tab/Shift+Tab,
+H/V split, X close, M maximise/restore, P saved layout, ? help, or Esc cancel.
+The same actions remain available from the View menu and F6/Shift+F6. Direct
+Alt+Arrow commands remain user-bindable but have no default assignment. A
+user-defined binding for the prefix event takes precedence over the default.
+
+**Terminal byte detail:** the conventional terminal encoding of Control+Backslash
+is ASCII 0x1C (FS). In raw mode, Crossterm's Unix input parser decodes this as
+`Ctrl+4`; conventional Ctrl+4 uses the same byte and cannot be distinguished.
+WIDE accepts `Ctrl+4` as a configuration alias and displays the canonical
+`Ctrl+\` spelling. A person who needs Ctrl+4 for another command must rebind
+the window prefix. `Ctrl+\` is the simultaneous two-key chord; a comma denotes
+the following independent key (for example, `Ctrl+\, 1`). A literal plus is
+never part of the prefix. Ctrl+/ remains a separate simultaneous chord.
+
+| Environment | Evidence and result |
+|---|---|
+| Linux PTY, Crossterm raw mode | **Tested:** injected byte 0x1C activates the prefix and the next independent arrow/number key moves focus; Esc cancels, invalid keys (including a literal `+`) are consumed without editing, and shutdown restores ISIG and VQUIT. |
+| GNU Screen and tmux | **Screen tested; workflow currently fails at Escape cancellation.** The real WIDE PTY sequence through GNU Screen delivers 0x1C and the following independent arrow and number keys, including 0x31 selecting pane 1. In that nested run a standalone Escape did not reach WIDE, leaving the prefix active. The same Escape cancellation passes on a bare Linux PTY and in a standalone Crossterm Screen probe. The cause is unresolved; do not claim complete Screen compatibility. The combined regression currently stops at Screen, so tmux was not reached in that run and remains unverified. GNU Screen defaults to C-a and tmux to C-b; defaults alone do not establish behavior under custom host bindings. |
+| Terminator | **Not interactively tested:** its documented defaults use Ctrl+Shift+O/E for splits; those chords are no longer WIDE's defaults. The current session has no usable X display for this terminal GUI. |
+| GNOME Terminal, Konsole, XTerm, Windows Terminal, PuTTY, macOS Terminal, iTerm2, native Linux/BSD consoles | **Not interactively tested.** Konsole and the macOS/Windows environments are unavailable here; the presence of a command or protocol documentation is not an interaction test. Windows Terminal permits configurable keybindings, so a host mapping can still consume keys. |
+| SSH and keyboard layouts | **Not interactively tested:** no SSH PTY or physical UK/US/international keyboard is attached. The PTY regression checks bytes received by WIDE, not which physical key a remote client emits. |
+
+The initial production PTY workflow has passed for the bare Linux PTY. It
+creates two editor panes, verifies independent scrolling, sends raw 0x1C and
+separate arrows/numbers (with an explicit assertion for the independent bytes
+0x1C then 0x31 selecting pane 1), tests help/cancel/invalid/literal-plus
+sequences, maximise/restore, F6/menu fallback and close/split, then verifies
+manuscript text and terminal mode after exit. A separate startup test verifies
+0x1C alone visibly activates the prefix after raw mode is active without
+raising SIGQUIT. Unit tests cover `Ctrl+\\`/`Ctrl+4` parsing, TOML keymap
+round-trip, canonical shortcut formatting, menu label, user-binding
+precedence, `Ctrl+Shift+O` simultaneous modifiers and comma-separated sequence
+notation. Formatting and Clippy passed. The full workspace run passed the
+library, application, storage, CLI and 371 terminal unit tests, plus the three
+author workflow tests. Its production PTY suite had 44 passed, one ignored
+(private protected fixture not configured), and one failure: the nested Screen
+Escape case described above. The bare Linux prefix, exact 0x1C/0x31 focus and
+startup signal tests pass. GitHub updates and a new UAT build remain
+outstanding. The author has not human-accepted these changes.
+
+## Application-wide keyboard consistency checkpoint — 27 November 2026
+
+Implemented the approved keyboard interaction standard across the shared command
+router, window-management prefix, authoring dialogues and editing keymap profiles.
+The `Ctrl+\\` prefix is centrally decoded and cancellable, with arrows, numbered
+pane focus, next/previous pane, split, close, maximise, layout selection and help
+commands. The production PTY sends ASCII `0x1C` and then a separate ASCII `0x31`
+and verifies the visible result `Focused pane 1`; it sends no literal plus key.
+The same prefix route is exercised from non-modal workspaces and on startup,
+including verification that terminal signal and VQUIT settings are restored.
+
+Global Save now remains available from the outliner: temporary projects open the
+first-save destination browser, while permanent projects acknowledge their
+transactionally saved structural changes. Standard global shortcuts take
+precedence over WordStar editor defaults. No-function-key PTY coverage exercises
+editing, save, find, menu, return to outline, quit and persistence using ordinary
+keys. Dialogue/file-browser controls expose Enter, Esc, Tab/Shift+Tab, arrows
+and Space paths; function-key bindings remain optional alternatives.
+
+Verification at this checkpoint: `cargo fmt --all -- --check` and
+`cargo clippy --workspace --all-targets --offline -- -D warnings` passed.
+Focused tests passed for global Save from the outline, prefix activation in all
+non-modal workspaces, prefix layout selection, raw Ctrl+/ terminal decoding,
+keybinding precedence, project keybinding persistence, file-browser import
+controls, no-function-key authoring PTY, and Screen/tmux PTY prefix workflow.
+The first complete workspace run passed all suites through `story-pipeline`,
+storage, CLI, and reached the terminal's 377 unit tests; it then reported six
+stale UI expectation assertions after the keyboard-label and dialogue updates.
+Those expectations have been corrected and the affected tests passed in focused
+runs. The complete workspace suite and all terminal PTY tests must be rerun
+before this checkpoint is considered fully verified or packaged as Alpha UAT.
+Human UAT remains required; no compatibility claim is made for terminals that
+have not been exercised.

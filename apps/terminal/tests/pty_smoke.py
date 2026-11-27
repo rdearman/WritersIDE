@@ -10,12 +10,13 @@ import select
 import signal
 import struct
 import sys
+import termios
 import time
 import unicodedata
 
 
 ANSI_CONTROL = re.compile(
-    rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))"
+    rb"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\)|\([A-Za-z0-9]|\)[A-Za-z0-9])"
 )
 CSI = re.compile(r"\x1b\[([0-?]*)([ -/]*)?([@-~])")
 
@@ -24,11 +25,16 @@ def terminal_snapshot(data, rows, columns):
     """Apply the cursor/clear controls Ratatui uses and return visible rows."""
     cells = [[" "] * columns for _ in range(rows)]
     row = column = 0
+    alternate_charset = False
     text = data.decode("utf-8", errors="replace")
     index = 0
     while index < len(text):
         character = text[index]
         if character == "\x1b":
+            if index + 2 < len(text) and text[index + 1] in "()":
+                alternate_charset = text[index + 2] == "0"
+                index += 3
+                continue
             if text.startswith("\x1b]", index):
                 end = text.find("\x07", index + 2)
                 string_end = text.find("\x1b\\", index + 2)
@@ -82,6 +88,20 @@ def terminal_snapshot(data, rows, columns):
         elif character == "\b":
             column = max(0, column - 1)
         elif character >= " " and character != "\x7f" and row < rows and column < columns:
+            if alternate_charset:
+                character = {
+                    "l": "┌",
+                    "m": "└",
+                    "k": "┐",
+                    "j": "┘",
+                    "q": "─",
+                    "x": "│",
+                    "t": "├",
+                    "u": "┤",
+                    "w": "┬",
+                    "v": "┴",
+                    "n": "┼",
+                }.get(character, character)
             width = (
                 0
                 if unicodedata.combining(character)
@@ -129,6 +149,7 @@ def main():
     create_nonfiction = modes == ["create-nonfiction"]
     continue_fiction = modes == ["continue-fiction"]
     tutorial_navigation = modes == ["tutorial-navigation"]
+    no_function_authoring = modes == ["no-function-authoring"]
     scene_rename = modes == ["scene-rename"]
     heading_rename = modes == ["heading-rename"]
     previous_position = modes == ["previous-position"]
@@ -148,7 +169,17 @@ def main():
     outline_enter = modes == ["outline-enter"]
     special_character = modes == ["special-character"]
     named_layouts = modes == ["named-layouts"]
-    split_navigation = modes == ["split-navigation"]
+    split_navigation = modes in (
+        ["split-navigation"],
+        ["split-navigation-tmux"],
+        ["split-navigation-screen"],
+    )
+    pty_wrapper = (
+        "tmux" if modes == ["split-navigation-tmux"]
+        else "screen" if modes == ["split-navigation-screen"]
+        else None
+    )
+    prefix_startup = modes == ["prefix-startup"]
     edit_menu = modes == ["edit-menu"]
     date_time_insertion = modes == ["date-time-insertion"]
     date_time_unavailable = modes == ["date-time-unavailable"]
@@ -175,7 +206,15 @@ def main():
     section_removal_rehome = modes == ["section-removal-rehome"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
-    if create_fiction or create_nonfiction or recent_projects or backup_archive or review_proofread:
+    if (
+        create_fiction
+        or create_nonfiction
+        or recent_projects
+        or backup_archive
+        or review_proofread
+        or pty_wrapper is not None
+        or no_function_authoring
+    ):
         # Keep this workflow focused on project lifecycle rather than allowing
         # first-run onboarding to consume editing keys.
         onboarding = os.path.join(isolated_home, "config", "writers-ide")
@@ -203,10 +242,23 @@ def main():
                 "XDG_CONFIG_HOME": os.path.join(isolated_home, "config"),
                 "XDG_DATA_HOME": os.path.join(isolated_home, "data"),
                 "TMPDIR": os.path.join(isolated_home, "tmp"),
+                "TMUX_TMPDIR": os.path.join(isolated_home, "tmp"),
+                "SCREENDIR": os.path.join(isolated_home, "screen"),
             }
         )
-        arguments = [binary] if project == "-" else [binary, project]
-        os.execve(binary, arguments, environment)
+        os.makedirs(environment["SCREENDIR"], exist_ok=True)
+        os.chmod(environment["SCREENDIR"], 0o700)
+        application = [binary] if project == "-" else [binary, project]
+        if pty_wrapper == "tmux":
+            arguments = [
+                "tmux", "-L", "wide-prefix-pty", "-f", "/dev/null",
+                "new-session", "-s", "wide-prefix-pty", *application,
+            ]
+        elif pty_wrapper == "screen":
+            arguments = ["screen", "-c", "/dev/null", *application]
+        else:
+            arguments = application
+        os.execvpe(arguments[0], arguments, environment)
 
     set_size(master, 24, 80)
     output = bytearray()
@@ -254,6 +306,17 @@ def main():
         visible = ANSI_CONTROL.sub(b"", output[start:])
         return all(marker in visible for marker in markers)
 
+    def wait_for_normalized_fragments(markers, start=0, timeout=5.0):
+        """Match rendered status text despite terminal style and blank-cell runs."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            visible = b"".join(ANSI_CONTROL.sub(b"", output[start:]).split())
+            if all(b"".join(marker.split()) in visible for marker in markers):
+                return True
+            read_for(0.1)
+        visible = b"".join(ANSI_CONTROL.sub(b"", output[start:]).split())
+        return all(b"".join(marker.split()) in visible for marker in markers)
+
     def wait_for_screen_fragments(markers, start=0, timeout=5.0):
         """Check the reconstructed current screen rather than concatenated redraw bytes."""
         deadline = time.monotonic() + timeout
@@ -281,14 +344,20 @@ def main():
         return marker.decode("utf-8").replace(" ", "") not in visible
 
     def wait_for_workspace_title(title, timeout=5.0):
+        def matches_title(rows):
+            if len(rows) <= 1:
+                return False
+            heading = rows[1].lstrip("┌").strip()
+            return heading.startswith(title) or re.match(r"Pane [1-4] · " + re.escape(title), heading) is not None
+
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             rows = terminal_snapshot(output, 24, 80)
-            if len(rows) > 1 and rows[1].startswith(f"┌{title}"):
+            if matches_title(rows):
                 return True
             read_for(0.1)
         rows = terminal_snapshot(output, 24, 80)
-        return len(rows) > 1 and rows[1].startswith(f"┌{title}")
+        return matches_title(rows)
 
     def move_outline_selection_until(predicate, direction, attempts=180):
         """Navigate by rendered row labels, not fixture-specific row offsets."""
@@ -336,7 +405,7 @@ def main():
     def show_outline_tree_presentation():
         """Open the unified Outline through the visible View menu."""
         rows = terminal_snapshot(output, 24, 80)
-        if len(rows) > 1 and rows[1].startswith("┌Editor"):
+        if len(rows) > 1 and (rows[1].startswith("┌Editor") or "· Editor —" in rows[1]):
             os.write(master, b"\x1b")  # use the editor's advertised return route first
             if not wait_for_screen_fragments((b"Included", b"Excluded"), timeout=3.0) and not wait_for_workspace_title("Outline"):
                 raise AssertionError(
@@ -386,7 +455,7 @@ def main():
 
     def open_outline_menu():
         start = len(output)
-        os.write(master, b"\x1b[21~")  # F10
+        os.write(master, b"\x1b[21~")  # F10 remains covered as a compatibility path.
         read_for(0.2)
         for _ in range(12):
             if wait_for_screen_fragments(("Outline · actions".encode("utf-8"),), start, timeout=0.1):
@@ -417,7 +486,7 @@ def main():
     def open_help_menu(already_open=False):
         """Find Help from the current menu root instead of assuming its index."""
         if not already_open:
-            os.write(master, b"\x1b[21~")  # F10
+            os.write(master, b"\x1f")  # Ctrl+/ standard menu route.
             read_for(0.2)
         for _ in range(10):
             rows = terminal_snapshot(output, 24, 80)
@@ -431,12 +500,106 @@ def main():
         )
 
     try:
+        if prefix_startup:
+            # Wait only until RawModeGuard has changed the PTY's line
+            # discipline, then queue 0x1C before waiting for the application
+            # screen. This exercises project-open startup without racing the
+            # process's exec-to-main interval, when terminal input still
+            # belongs to the parent shell.
+            raw_deadline = time.monotonic() + 3.0
+            raw_enabled = False
+            while time.monotonic() < raw_deadline:
+                if not termios.tcgetattr(master)[3] & termios.ISIG:
+                    raw_enabled = True
+                    break
+                read_for(0.01)
+            if not raw_enabled:
+                raise AssertionError("application did not enter raw mode during startup")
+            os.write(master, b"\x1c")
         read_for(1.0)
+        if prefix_startup:
+            if not wait_for_screen_fragments((b"Window prefix",), timeout=5.0):
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                if finished_pid == child_pid and os.WIFSIGNALED(status):
+                    raise AssertionError("startup Ctrl+Backslash terminated the process with a signal")
+                raise AssertionError(
+                    "startup byte 0x1C was not queued as the window prefix; current screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x1b")
+            if not wait_for_screen_fragments((b"Window command cancelled",), timeout=3.0):
+                raise AssertionError("startup prefix did not accept Escape cancellation")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit after the startup prefix check")
+            print("PTY startup-prefix workflow passed: early ASCII 0x1C queued safely, prefix cancelled, and terminal restored.")
+            return
+        if no_function_authoring:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")
+            if not wait_for_workspace_title("Editor", timeout=0.25):
+                if not wait_for_workspace_title("Outline", timeout=5.0):
+                    raise AssertionError("neither Outline nor Editor opened for the no-function-key workflow; screen: " + repr(terminal_snapshot(output, 24, 80)))
+                os.write(master, b"\r")  # Enter opens the selected manuscript item.
+            if not wait_for_workspace_title("Editor", timeout=5.0):
+                    raise AssertionError("Enter did not open the selected manuscript in the editor")
+            os.write(master, b"\r")
+            read_for(0.1)
+            os.write(master, b"The author-facing keyboard path works.")
+            read_for(0.35)
+            os.write(master, b"\x13")  # Ctrl+S saves after all prose input is delivered.
+            if not wait_for_screen_fragments((b"author-facing",), timeout=3.0):
+                raise AssertionError("editor did not accept the author text; screen: " + repr(terminal_snapshot(output, 24, 80)))
+            if not wait_for_screen_fragments((b"SAVED",), timeout=4.0):
+                raise AssertionError("Ctrl+S did not report that the manuscript was saved; screen: " + repr(terminal_snapshot(output, 24, 80)))
+            find_start = len(output)
+            os.write(master, b"\x06")  # Ctrl+F opens Find.
+            if not wait_for_screen_fragments((b"Enter: Find",), find_start, timeout=3.0):
+                raise AssertionError("Ctrl+F did not open Find")
+            os.write(master, b"author-facing")
+            os.write(master, b"\r")
+            close_find_start = len(output)
+            os.write(master, b"\x1b")
+            if not wait_for_screen_fragments((b"Find panel closed",), close_find_start, timeout=3.0):
+                raise AssertionError("Esc did not close Find before returning to Outline")
+            read_for(0.25)
+            os.write(master, b"\x1b")  # Escape returns to Outline from the editor.
+            if not wait_for_screen_fragments((b"Returned to Outline",), timeout=3.0):
+                raise AssertionError("Editor did not acknowledge Escape navigation; screen: " + repr(terminal_snapshot(output, 24, 80)))
+            if not wait_for_workspace_title("Outline", timeout=3.0):
+                raise AssertionError("Esc did not return from the editor to Outline; screen: " + repr(terminal_snapshot(output, 24, 80)))
+            menu_start = len(output)
+            os.write(master, b"\x1f")  # Ctrl+/ control byte; Crossterm presents Ctrl+7.
+            if not wait_for_screen_fragments((b"File", b"Quit"), menu_start, timeout=3.0):
+                raise AssertionError("Ctrl+/ did not open the File menu from Outline; screen: " + repr(terminal_snapshot(output, 24, 80)))
+            os.write(master, b"\x1b")
+            if not wait_for_screen_fragments((b"Menu closed",), menu_start, timeout=3.0):
+                raise AssertionError("Esc did not cancel the menu and restore Outline")
+            os.write(master, b"\x11")  # Ctrl+Q quits without a function key.
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("Ctrl+Q did not exit from Outline cleanly; screen: " + repr(terminal_snapshot(output, 24, 80)))
+            print("PTY no-function-key author workflow passed: Enter opens, Ctrl+S saves, Ctrl+F finds, Esc closes Find and returns to Outline, Ctrl+Q exits.")
+            return
         if editor_viewport:
             if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
                 os.write(master, b"\x1b")
             if not wait_for_workspace_title("Editor", timeout=5.0):
-                raise AssertionError("long manuscript did not open in the Editor")
+                raise AssertionError(
+                    "long manuscript did not open in the Editor; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
             if not wait_for_screen_fragments((b"LINE-00",), timeout=3.0):
                 raise AssertionError("first long-document line was not initially visible")
             for _ in range(40):
@@ -489,7 +652,7 @@ def main():
                 (b"Back Up Project", b"Choose a separate destination"), start, timeout=3.0
             ):
                 raise AssertionError("Back Up Project did not open the destination browser")
-            os.write(master, b"\x1b[15~")  # F5: create backup archive
+            os.write(master, b"\r")  # The archive filename/action control is focused on entry.
             if not wait_for_screen_fragments(
                 (b"Project backup archive created at",), start, timeout=8.0
             ):
@@ -653,15 +816,15 @@ def main():
             select_visible_menu_item("Save Project As")
             os.write(master, b"\r")
             if not wait_for_screen_fragments(
-                (b"Save Project As", b"F5 Save Project Copy"), menu_start, timeout=5.0
+                (b"Save Project As", b"Enter Save Project Copy"), menu_start, timeout=5.0
             ):
                 raise AssertionError("File > Save Project As did not open its folder browser")
-            os.write(master, b"\x1b[15~")  # F5: prepare the copy
+            os.write(master, b"\r")  # The project-name/action control is focused on entry.
             if not wait_for_screen_fragments(
-                (b"Create an independent project copy", b"F5"), timeout=5.0
+                (b"Create an independent project copy",), timeout=5.0
             ):
                 raise AssertionError("Save As did not show its destination confirmation")
-            os.write(master, b"\x1b[15~")  # F5: confirm the independent copy
+            os.write(master, b"\r")  # Enter confirms the independent copy.
             if not wait_for_screen_fragments((b"Saved project at",), timeout=10.0):
                 raise AssertionError(
                     "Save As did not report the copied project; screen: "
@@ -705,7 +868,9 @@ def main():
             while time.monotonic() < deadline:
                 rows = terminal_snapshot(output, 24, 80)
                 visible = "".join("".join(rows).split())
-                imported_in_outline = len(rows) > 1 and rows[1].startswith("┌Outline")
+                imported_in_outline = len(rows) > 1 and (
+                    rows[1].startswith("┌Outline") or "· Outline" in rows[1]
+                )
                 if imported_in_outline or ("Included" in visible and "Excluded" in visible):
                     imported_workspace_ready = True
                     break
@@ -829,13 +994,13 @@ def main():
                     "first explicit Save did not open the permanent-location browser; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
                 )
-            os.write(master, b"\x1b[15~")  # F5: use the proposed permanent project path
-            if not wait_for_screen_fragments((b"F5 Confirm Save Copy",), timeout=3.0):
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Create an independent project copy",), timeout=3.0):
                 raise AssertionError(
                     "Save As did not show its no-overwrite confirmation; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
                 )
-            os.write(master, b"\x1b[15~")
+            os.write(master, b"\r")
             if not wait_for_screen_fragments((b"Saved project at",), timeout=10.0):
                 raise AssertionError(
                     "edited import was not promoted to a permanent project; screen: "
@@ -946,9 +1111,9 @@ def main():
                     raise AssertionError("Publish menu did not expose Compile / Export")
                 select_visible_menu_item("Compile / Export")
                 os.write(master, b"\r")
-            if not wait_for_screen_fragments((b"Selected path:", b".docx", b"F5 Compile"), timeout=5.0):
+            if not wait_for_screen_fragments((b"Selected path:", b".docx", b"Enter Compile"), timeout=5.0):
                 raise AssertionError("imported project did not reach the publication file browser")
-            os.write(master, b"\x1b[15~")
+            os.write(master, b"\r")
             if not wait_for_screen_fragments((b"Compiled",), timeout=15.0):
                 raise AssertionError("imported manuscript did not compile successfully")
             os.write(master, b"\x11")  # Ctrl+Q
@@ -1130,7 +1295,7 @@ def main():
             # New Project, Open Project, Recent Projects, Import, Guided Tour.
             os.write(master, b"\x1b[B" * 4 + b"\r")
             if not wait_for_screen_fragments(
-                (b"Tutorial", b"1/6", b"Press F10 to open the menu"), timeout=10.0
+                (b"Tutorial", b"1/6", b"Press Ctrl+/ to open the menu"), timeout=10.0
             ):
                 raise AssertionError("Guided Tour did not open its first actionable lesson")
 
@@ -1139,14 +1304,14 @@ def main():
             os.write(master, b"\x1b[17~")
             read_for(0.2)
             if not wait_for_screen_fragments(
-                (b"Tutorial", b"1/6", b"0/9 verified", b"Press F10 to open the menu"),
+                (b"Tutorial", b"1/6", b"0/9 verified", b"Press Ctrl+/ to open the menu"),
                 timeout=3.0,
             ):
                 raise AssertionError("F6 took focus away from the active tutorial lesson")
 
-            # Complete the visible route: F10 → Navigate → Outline → scene.
+            # Complete the visible route without a function key: Ctrl+/ → Navigate → Outline → scene.
             menu_start = len(output)
-            os.write(master, b"\x1b[21~")
+            os.write(master, b"\x1f")
             read_for(0.2)
             os.write(master, b"\x1b[C" * 3)
             selected_outline = False
@@ -1211,10 +1376,10 @@ def main():
                 )
             if not any("Resume: Help > Resume Tutorial" in row for row in rows):
                 raise AssertionError("paused tutorial footer did not show its Help resume route")
-            os.write(master, b"\x1b[21~")
+            os.write(master, b"\x1f")
             if not wait_for_screen_fragments((b"New Project", b"Quit"), timeout=3.0):
                 raise AssertionError(
-                    "F10 did not open the File menu while the tutorial was active; screen: "
+                    "Ctrl+/ did not open the File menu while the tutorial was active; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
                 )
             open_help_menu(already_open=True)
@@ -1468,7 +1633,7 @@ def main():
             select_visible_menu_item("Insert File…")
             os.write(master, b"\r")
             if not wait_for_fragments(
-                (b"Selectedpath:", b"F5Confirm"),
+                (b"Selectedpath:", b"EnterConfirm"),
                 file_start,
                 timeout=3.0,
             ):
@@ -1476,7 +1641,7 @@ def main():
                     "Insert > Insert File did not open the shared browser; visible tail: "
                     + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
                 )
-            os.write(master, b"\t" + b"\x1b[B" * 3 + b"\x1b[15~")
+            os.write(master, b"\t" + b"\x1b[B" * 3 + b"\r\r")
             if not wait_for_fragments(
                 (b"Inserted", b"imported.txt"),
                 file_start,
@@ -1628,18 +1793,64 @@ def main():
             if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
                 os.write(master, b"\x1b")  # dismiss the first-run welcome panel
             if not wait_for_screen_fragments((b"PANE-LINE-00",), timeout=5.0):
-                raise AssertionError("the opening document was not visible before splitting")
+                raise AssertionError(
+                    "the opening document was not visible before splitting; current screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+
+            if pty_wrapper is not None:
+                # Keep the multiplexer probe focused on the raw prefix path;
+                # F10 and Escape may be intercepted by the host layer.
+                os.write(master, b"\x1c")
+                if not wait_for_normalized_fragments((b"Window prefix",), timeout=3.0):
+                    raise AssertionError(f"{pty_wrapper} did not forward ASCII 0x1C")
+                os.write(master, b"v")
+                if not wait_for_normalized_fragments(
+                    (b"Split side by side",), timeout=3.0
+                ):
+                    raise AssertionError(f"{pty_wrapper} did not forward the separate V command")
+                os.write(master, b"\x1c")
+                if not wait_for_normalized_fragments((b"Window prefix",), timeout=3.0):
+                    raise AssertionError(f"{pty_wrapper} did not reactivate ASCII 0x1C")
+                os.write(master, b"\x31")
+                if not wait_for_normalized_fragments(
+                    (b"Focused pane 1",), timeout=3.0
+                ):
+                    raise AssertionError(
+                        f"{pty_wrapper} did not execute the separate ASCII 0x31 pane selection"
+                    )
+                os.write(master, b"\x11")  # Ctrl+Q
+                quit_deadline = time.monotonic() + 5.0
+                finished_pid = 0
+                status = 0
+                while finished_pid == 0 and time.monotonic() < quit_deadline:
+                    read_for(0.1)
+                    finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                    raise AssertionError(f"WIDE did not exit cleanly under {pty_wrapper}")
+                print(
+                    f"PTY prefix workflow passed through {pty_wrapper}: separate 0x1C + V split, then 0x1C + 0x31 focused pane 1."
+                )
+                return
 
             split_start = len(output)
             os.write(master, b"\x1b[21~")  # F10
             read_for(0.2)
             os.write(master, b"\x1b[C" * 4)  # View
+            if not wait_for_screen_fragments(
+                (b"Window Commands", b"Ctrl+\\"), split_start, timeout=2.0
+            ):
+                raise AssertionError(
+                    "View menu did not show the window command and canonical Ctrl+Backslash label"
+                )
             select_visible_menu_item("Split Side by Side")
             os.write(master, b"\r")
             if not wait_for_screen_fragments((b"Split side by side",), split_start, timeout=3.0):
                 raise AssertionError(
-                    "View > Split Side by Side did not open a second window; screen: "
+                    "Window split did not open a second pane; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
+                    + "\nraw visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1200:]))
                 )
 
             # The split opens with the second view focused. Scroll it beyond
@@ -1656,13 +1867,32 @@ def main():
                 )
 
             focus_start = len(output)
-            os.write(master, b"\x1b[21~")  # F10
-            read_for(0.2)
-            os.write(master, b"\x1b[C" * 4)  # View
-            select_visible_menu_item("Next Window")
-            os.write(master, b"\r")
-            if not wait_for_screen_fragments((b"Focused next window",), focus_start, timeout=3.0):
-                raise AssertionError("View > Next Window did not transfer pane focus")
+            def send_window_prefix():
+                start = len(output)
+                os.write(master, b"\x1c")  # ASCII FS: Ctrl+Backslash (Crossterm decodes Ctrl+4)
+                if not wait_for_screen_fragments((b"Window prefix",), start, timeout=3.0):
+                    finished, status = os.waitpid(child_pid, os.WNOHANG)
+                    if finished == child_pid and os.WIFSIGNALED(status):
+                        raise AssertionError(
+                            "Ctrl+Backslash raised a signal instead of reaching Crossterm"
+                        )
+                    raise AssertionError(
+                        "ASCII 0x1C did not activate the window-management prefix; current screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                        + "\nrecent output: "
+                        + repr(ANSI_CONTROL.sub(b"", output[-1600:]))
+                    )
+                finished, status = os.waitpid(child_pid, os.WNOHANG)
+                if finished == child_pid and os.WIFSIGNALED(status):
+                    raise AssertionError(
+                        "raw terminal mode did not suppress SIGQUIT for Ctrl+Backslash"
+                    )
+                return start
+
+            send_window_prefix()  # prefix-only input is observably active before the next key
+            os.write(master, b"\x1b[D")  # separate event: Left focuses the adjacent pane
+            if not wait_for_screen_fragments((b"Focused pane to the left",), focus_start, timeout=3.0):
+                raise AssertionError("Ctrl+Backslash, Left did not focus the left pane")
             os.write(master, b"\x1b[6~")  # Page Down in the first/editor window
             read_for(0.3)
             rows = terminal_snapshot(output, 24, 80)
@@ -1673,6 +1903,124 @@ def main():
                     + repr(rows)
                 )
 
+            focus_start = send_window_prefix()
+            os.write(master, b"\x1b[C")  # separate event: Right
+            if not wait_for_screen_fragments((b"Focused pane to the right",), focus_start, timeout=3.0):
+                raise AssertionError("Ctrl+Backslash, Right did not focus the right pane")
+
+            focus_start = send_window_prefix()
+            os.write(master, b"\t")
+            if not wait_for_screen_fragments((b"Focused next window",), focus_start, timeout=3.0):
+                raise AssertionError("Ctrl+Backslash, Tab did not focus the next pane")
+            focus_start = send_window_prefix()
+            os.write(master, b"\x1b[Z")  # terminal Shift+Tab / BackTab
+            if not wait_for_screen_fragments((b"Focused previous window",), focus_start, timeout=3.0):
+                raise AssertionError("Ctrl+Backslash, Shift+Tab did not focus the previous pane")
+
+            operation_start = send_window_prefix()
+            os.write(master, b"h")
+            if not wait_for_screen_fragments((b"Split top and bottom",), operation_start, timeout=3.0):
+                raise AssertionError("Ctrl+Backslash, H did not create a horizontal split")
+            focus_start = send_window_prefix()
+            os.write(master, b"\x1b[A")
+            if not wait_for_screen_fragments((b"Focused pane above",), focus_start, timeout=3.0):
+                raise AssertionError("Ctrl+Backslash, Up did not focus the pane above")
+            focus_start = send_window_prefix()
+            os.write(master, b"\x1b[B")
+            if not wait_for_screen_fragments((b"Focused pane below",), focus_start, timeout=3.0):
+                raise AssertionError("Ctrl+Backslash, Down did not focus the pane below")
+
+            layout_start = send_window_prefix()
+            os.write(master, b"p")
+            if not wait_for_screen_fragments((b"No saved workspace layouts",), layout_start, timeout=3.0):
+                raise AssertionError("Ctrl+Backslash, P did not open the author-facing layout selector")
+            if b"window-layout-load" in output[layout_start:]:
+                raise AssertionError("workspace layout selection exposed internal command syntax")
+
+            # These are separate physical terminal writes, not a textual
+            # shortcut expression: ASCII 0x1C arms the prefix, then ASCII
+            # 0x31 selects pane 1. No plus key is sent or consumed.
+            focus_start = send_window_prefix()
+            os.write(master, b"\x31")
+            if not wait_for_screen_fragments(
+                (b"Focused pane 1",), focus_start, timeout=3.0
+            ):
+                raise AssertionError("raw bytes 0x1C then 0x31 did not focus pane 1")
+
+            for number in (b"2", b"3"):
+                focus_start = send_window_prefix()
+                os.write(master, number)
+                if not wait_for_screen_fragments(
+                    (b"Focused pane " + number,), focus_start, timeout=3.0
+                ):
+                    raise AssertionError(f"prefix followed by {number!r} did not focus its numbered pane")
+            if not wait_for_screen_fragments((b"Pane 1", b"Pane 2"), focus_start, timeout=1.0):
+                raise AssertionError("visible pane headers did not show stable pane numbers")
+
+            cancel_start = len(output)
+            cancel_start = send_window_prefix()
+            read_for(0.15)  # allow Screen to forward the prefix before the independent Escape key
+            os.write(master, b"\x1b")
+            if not wait_for_screen_fragments((b"Window command cancelled",), cancel_start, timeout=3.0):
+                raise AssertionError(
+                    "Esc did not cancel the pending window prefix; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+
+            invalid_start = len(output)
+            invalid_start = send_window_prefix()
+            os.write(master, b"z")
+            if not wait_for_screen_fragments((b"not recognised",), invalid_start, timeout=3.0):
+                raise AssertionError("an unsupported prefix sequence was not safely consumed")
+
+            plus_start = len(output)
+            plus_start = send_window_prefix()
+            os.write(master, b"+")  # Plus is a separate invalid key, never prefix syntax.
+            if not wait_for_screen_fragments((b"not recognised",), plus_start, timeout=3.0):
+                raise AssertionError("a literal plus was incorrectly required by the prefix sequence")
+
+            operation_start = len(output)
+            operation_start = send_window_prefix()
+            os.write(master, b"m")
+            if not wait_for_screen_fragments((b"maximized",), operation_start, timeout=3.0):
+                raise AssertionError("prefix followed by M did not maximise the focused pane")
+            send_window_prefix()
+            os.write(master, b"m")
+            if not wait_for_screen_fragments((b"layout restored",), operation_start, timeout=3.0):
+                raise AssertionError("prefix followed by M did not restore the pane layout")
+            focus_start = len(output)
+            os.write(master, b"\x1b[17~")  # F6: next pane
+            if not wait_for_screen_fragments((b"Focused next window",), focus_start, timeout=3.0):
+                raise AssertionError("F6 did not move focus to the next pane")
+            focus_start = len(output)
+            os.write(master, b"\x1b[17;2~")  # Shift+F6: previous pane
+            if not wait_for_screen_fragments((b"Focused previous window",), focus_start, timeout=3.0):
+                raise AssertionError("Shift+F6 did not move focus to the previous pane")
+
+            focus_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10: menu fallback
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 4)  # View
+            select_visible_menu_item("Next Window")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Focused next window",), focus_start, timeout=3.0):
+                raise AssertionError("View > Next Window did not transfer pane focus")
+
+            operation_start = len(output)
+            operation_start = send_window_prefix()
+            os.write(master, b"x")
+            if not wait_for_screen_fragments((b"Window closed",), operation_start, timeout=3.0):
+                raise AssertionError("prefix followed by X did not close the focused pane")
+            operation_start = send_window_prefix()
+            os.write(master, b"v")
+            if not wait_for_screen_fragments((b"Split side by side",), operation_start, timeout=3.0):
+                raise AssertionError("prefix followed by V did not split the focused pane")
+
+            help_start = send_window_prefix()
+            os.write(master, b"?")
+            if not wait_for_screen_fragments((b"Window Management", b"Ctrl+"), help_start, timeout=3.0):
+                raise AssertionError("prefix followed by ? did not open window-management help")
+
             os.write(master, b"\x11")  # Ctrl+Q
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0
@@ -1682,7 +2030,12 @@ def main():
                 finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after split-pane navigation")
-            print("PTY split navigation passed: the View menu creates and focuses windows with independent scroll positions.")
+            restored = termios.tcgetattr(master)
+            if not restored[3] & termios.ISIG:
+                raise AssertionError("application shutdown did not restore terminal signal handling")
+            if restored[6][termios.VQUIT] != b"\x1c":
+                raise AssertionError("application shutdown did not restore the terminal VQUIT byte")
+            print("PTY window-prefix workflow passed: raw-mode ASCII 0x1C, directions, pane numbers, help/cancel, split/close/maximise, F6/menu fallback, independent scrolling, and termios restoration.")
             return
 
         if edit_menu:
@@ -2107,7 +2460,7 @@ def main():
             os.write(master, b"\x1b[C" * 6 + b"\x1b[B\r")  # Publish > Compile / Export
             browser_start = len(output)
             if not wait_for_fragments(
-                (b"Selectedpath:", b".docx", b"F5Compile"),
+                (b"Selectedpath:", b".docx", b"EnterCompile"),
                 browser_start,
                 timeout=4.0,
             ):
@@ -2120,7 +2473,7 @@ def main():
             set_size(master, 24, 80)
             read_for(0.3)
             compile_start = len(output)
-            os.write(master, b"\x1b[15~")  # F5: compile to the suggested DOCX path
+            os.write(master, b"\r")  # The output name/action control is focused on entry.
             if not wait_for_fragments(
                 (b"Compiled", b"Publish", b"Project.docx"),
                 compile_start,
@@ -2152,10 +2505,7 @@ def main():
             ):
                 os.write(master, b"\r")  # New Project is selected on the start screen
             elif wait_for_screen_fragments((b"No scenes yet",), timeout=0.5):
-                os.write(master, b"\x1b[21~")  # F10, File menu
-                read_for(0.2)
-                select_visible_menu_item("New Project")
-                os.write(master, b"\r")
+                os.write(master, b"\x0e")  # Ctrl+N, independent of function-key support.
             else:
                 raise AssertionError(
                     "blank project did not expose New Project on its start screen or File menu; screen: "
@@ -2178,9 +2528,19 @@ def main():
             # Select Non-fiction when requested, then create directly into
             # managed temporary storage without a location picker.
             if create_nonfiction:
-                os.write(master, b"\t\x1b[C\t\r")
+                os.write(master, b"\t")
+                read_for(0.12)
+                os.write(master, b"\x1b[C")
+                read_for(0.12)
+                os.write(master, b"\t")
+                read_for(0.12)
+                os.write(master, b"\r")
             else:
-                os.write(master, b"\t\t\r")
+                os.write(master, b"\t")
+                read_for(0.12)
+                os.write(master, b"\t")
+                read_for(0.12)
+                os.write(master, b"\r")
             expected_project_markers = (
                 (b"Created", b"Outline")
                 if create_nonfiction
@@ -2225,10 +2585,13 @@ def main():
                 os.write(master, b"\x13")
                 if not wait_for(b"Save Project As", edit_start):
                     raise AssertionError("first non-fiction Save did not request a permanent location")
-                os.write(master, b"\x1b[15~")
-                if not wait_for_screen_fragments((b"Confirm Save Copy",), timeout=3.0):
-                    raise AssertionError("non-fiction Save As did not ask before creating its destination")
-                os.write(master, b"\x1b[15~")
+                os.write(master, b"\r")
+                if not wait_for_screen_fragments((b"Create an independent project copy",), timeout=3.0):
+                    raise AssertionError(
+                        "non-fiction Save As did not ask before creating its destination; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                os.write(master, b"\r")
                 if not wait_for_screen_fragments((b"Saved project at",), timeout=3.0):
                     raise AssertionError("non-fiction project was not promoted to permanent storage")
                 os.write(master, b"\x11")
@@ -2264,13 +2627,13 @@ def main():
             os.write(master, b"\x13")  # Ctrl+S
             if not wait_for(b"Save Project As", save_request_offset):
                 raise AssertionError("first Ctrl+S did not open the permanent-location browser")
-            os.write(master, b"\x1b[15~")
-            if not wait_for_screen_fragments((b"Confirm Save Copy",), timeout=3.0):
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Create an independent project copy",), timeout=3.0):
                 raise AssertionError(
                     "Save As did not request collision-safe confirmation; visible tail: "
                     + repr(ANSI_CONTROL.sub(b"", output[-2200:]))
                 )
-            os.write(master, b"\x1b[15~")
+            os.write(master, b"\r")
             if not wait_for_screen_fragments((b"Saved project at",), timeout=3.0):
                 raise AssertionError(
                     "temporary project did not promote to the chosen location; screen: "

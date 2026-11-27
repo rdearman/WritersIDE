@@ -360,6 +360,8 @@ struct AppState {
     reference_panes: Vec<ReferencePane>,
     active_reference: usize,
     reference_focused: bool,
+    window_prefix_active: bool,
+    window_layout_picker: Option<WindowLayoutPickerState>,
     reference_layout: ReferenceLayout,
     reference_panes_hidden: bool,
     reference_swapped: bool,
@@ -583,6 +585,12 @@ struct NamedWindowPane {
     pane_id: u64,
     source_key: String,
     source_occurrence: usize,
+}
+
+#[derive(Clone, Debug)]
+struct WindowLayoutPickerState {
+    names: Vec<String>,
+    selected: usize,
 }
 
 impl Default for NamedWindowLayoutsFile {
@@ -896,7 +904,7 @@ fn tutorial_panel_at(
         );
         lines.push(format!("{completed}/{} verified · {task}", required.len()));
     }
-    lines.push("F4 Back · F5 Retry · F7 Skip · F8 Exit · Esc Pause".into());
+    lines.push("Alt+P Previous · Alt+R Retry · Alt+S Skip · Alt+Q Exit · Esc Pause".into());
     lines.push("Help > Resume Tutorial returns to this step".into());
     HelpPanel {
         title: format!("Tutorial · {title} · {}/{}", step + 1, lessons.len()),
@@ -907,7 +915,7 @@ fn tutorial_panel_at(
 
 fn tutorial_navigation_task_label(action: &str) -> &'static str {
     match action {
-        "menu" => "Press F10 to open the menu",
+        "menu" => "Press Ctrl+/ to open the menu",
         "navigate-menu" => "Press → until Navigate is highlighted",
         "outline-select" => "Press ↓ until Outline is highlighted",
         "outline" => "Press Enter to open Outline",
@@ -933,13 +941,13 @@ fn tutorial_required_actions(
         ("reference-open", "Open View > Open Outline Reference"),
         (
             "reference-focus",
-            "Move focus to the reference pane with Ctrl+Tab",
+            r"Move focus with Ctrl+\ then an arrow or pane number; F6 / Shift+F6 also cycles",
         ),
     ];
     const SEARCH: [(&str, &str); 1] = [("search", "Search for a word in the sample manuscript")];
     const COMPILE: [(&str, &str); 1] = [(
         "compile",
-        "Compile an EPUB from Publish > Compile, then choose EPUB with F2",
+        "Compile an EPUB from Publish > Compile, then choose EPUB with Alt+F",
     )];
     match (track, step) {
         (_, 0) => &TUTORIAL_NAVIGATION_ACTIONS,
@@ -1088,12 +1096,17 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "view.reference-outline",
         "view.reference-timeline",
         "view.reference-diagnostics",
+        "window.prefix",
         "window.split-side-by-side",
         "window.split-top-bottom",
         "window.grow",
         "window.shrink",
         "window.next",
         "window.previous",
+        "window.focus-up",
+        "window.focus-down",
+        "window.focus-left",
+        "window.focus-right",
         "window.move-reference-earlier",
         "window.move-reference-later",
         "window.close",
@@ -1278,11 +1291,32 @@ struct RevisionHunk {
 #[serde(deny_unknown_fields)]
 struct KeymapFile {
     #[serde(default)]
+    profile: Option<EditorKeymapProfile>,
+    #[serde(default)]
     bindings: BTreeMap<String, String>,
     #[serde(default)]
     commands: BTreeMap<String, String>,
     #[serde(default)]
     contexts: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum EditorKeymapProfile {
+    #[default]
+    Standard,
+    WordStar,
+    Custom,
+}
+
+impl EditorKeymapProfile {
+    fn next(self) -> Self {
+        match self {
+            Self::Standard => Self::WordStar,
+            Self::WordStar => Self::Custom,
+            Self::Custom => Self::Standard,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1781,7 +1815,9 @@ enum CommandAction {
     ToggleSceneInclusion,
     WindowSplit(pane_layout::Orientation),
     WindowResize(bool),
+    WindowPrefix,
     WindowFocusNext(bool),
+    WindowFocusDirection(pane_layout::Direction),
     WindowClose,
     WindowOnly,
     WriteSelectedChapter,
@@ -1924,7 +1960,7 @@ fn command_registry() -> Vec<CommandSpec> {
             label: "Main Menu",
             description: "Open the hierarchical command menu",
             category: "Menu",
-            default_shortcuts: &["Ctrl+/", "F10"],
+            default_shortcuts: &["Ctrl+/", "Alt+M", "F10"],
             mnemonic: Some('m'),
             palette_aliases: &[],
             palette_prefix: None,
@@ -3758,7 +3794,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command(
             "settings.keybinding-context-set",
             "Bind Context Key Sequence",
-            "Bind one to four chords in editor, navigation, dialog, or menu context",
+            "Bind one to four simultaneous-key chords in editor, navigation, dialogue, or menu context; list sequential chords with commas",
             "Tools",
             "keybinding-context-set",
             true,
@@ -3774,7 +3810,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command(
             "settings.keybinding-user-context-set",
             "Bind User Context Key Sequence",
-            "Bind a context sequence in the user keymap, overridden by project sequences",
+            "Bind a user context sequence; commas separate sequential chords and project sequences take precedence",
             "Tools",
             "keybinding-user-context-set",
             true,
@@ -4275,6 +4311,13 @@ fn command_registry() -> Vec<CommandSpec> {
             true,
         ),
         window_command(
+            "window.prefix",
+            "Window Commands…",
+            "Arm the window command prefix, then press a direction, pane number, or command key",
+            CommandAction::WindowPrefix,
+            0,
+        ),
+        window_command(
             "window.switch-view",
             "Switch View…",
             "Search open and available manuscript and reference views",
@@ -4322,6 +4365,34 @@ fn command_registry() -> Vec<CommandSpec> {
             "Focus the previous visible window",
             CommandAction::WindowFocusNext(true),
             6,
+        ),
+        window_command(
+            "window.focus-up",
+            "Focus Pane Above",
+            "Move keyboard focus to the nearest visible pane above",
+            CommandAction::WindowFocusDirection(pane_layout::Direction::Up),
+            7,
+        ),
+        window_command(
+            "window.focus-down",
+            "Focus Pane Below",
+            "Move keyboard focus to the nearest visible pane below",
+            CommandAction::WindowFocusDirection(pane_layout::Direction::Down),
+            8,
+        ),
+        window_command(
+            "window.focus-left",
+            "Focus Pane to the Left",
+            "Move keyboard focus to the nearest visible pane to the left",
+            CommandAction::WindowFocusDirection(pane_layout::Direction::Left),
+            9,
+        ),
+        window_command(
+            "window.focus-right",
+            "Focus Pane to the Right",
+            "Move keyboard focus to the nearest visible pane to the right",
+            CommandAction::WindowFocusDirection(pane_layout::Direction::Right),
+            10,
         ),
         legacy_command(
             "window.move-reference-earlier",
@@ -4916,6 +4987,8 @@ fn command_registry() -> Vec<CommandSpec> {
     ]);
     for command in &mut commands {
         command.default_shortcuts = match command.id {
+            "file.close-project" => &["Ctrl+W"],
+            "edit.delete-word" => &["Ctrl+Backspace"],
             "edit.undo" => &["Ctrl+Z"],
             "edit.redo" => &["Ctrl+Y", "Ctrl+Shift+Z"],
             "edit.cut-selection" => &["Ctrl+X"],
@@ -5055,12 +5128,17 @@ fn legacy_command(
     alias: &'static str,
     takes_arguments: bool,
 ) -> CommandSpec {
+    let default_shortcuts = if alias == "window-maximize" {
+        &["F12"][..]
+    } else {
+        &[]
+    };
     CommandSpec {
         id,
         label,
         description,
         category,
-        default_shortcuts: &[],
+        default_shortcuts,
         mnemonic: None,
         palette_aliases: &[],
         palette_prefix: Some(alias),
@@ -5079,12 +5157,18 @@ fn window_command(
     action: CommandAction,
     menu_priority: u8,
 ) -> CommandSpec {
+    let default_shortcuts: &'static [&'static str] = match id {
+        "window.prefix" => &[r"Ctrl+\"],
+        "window.next" => &["F6"],
+        "window.previous" => &["Shift+F6"],
+        _ => &[],
+    };
     CommandSpec {
         id,
         label,
         description,
         category: "View",
-        default_shortcuts: &[],
+        default_shortcuts,
         mnemonic: None,
         palette_aliases: &[],
         palette_prefix: None,
@@ -5112,10 +5196,7 @@ fn command_for_effective_shortcut(state: &AppState, key: KeyEvent) -> Option<Com
             && command.id == "edit.copy-selection"
             && key.code == KeyCode::Char('c')
             && key.modifiers == KeyModifiers::CONTROL)
-            && !matches!(
-                command.action,
-                CommandAction::Workspace(_) | CommandAction::Save
-            )
+            && !matches!(command.action, CommandAction::Workspace(_))
             && effective_command_shortcuts(state, *command)
                 .iter()
                 .any(|shortcut| {
@@ -5140,12 +5221,18 @@ fn workspace_command_for_shortcut(state: &AppState, key: KeyEvent) -> Option<Com
 }
 
 fn registered_global_command_for_key(state: &AppState, key: KeyEvent) -> Option<CommandSpec> {
+    let tutorial_modal_open = state
+        .help_panel
+        .as_ref()
+        .is_some_and(|panel| panel.title.starts_with("Tutorial ·"));
     if let Some((_, command_id)) = state
         .command_bindings
         .iter()
         .find(|(event, _)| same_keycode(event.code, key.code) && event.modifiers == key.modifiers)
+        && let Some(command) = command_by_id(command_id)
+        && (!tutorial_modal_open || !is_global_pane_command(command))
     {
-        return command_by_id(command_id);
+        return Some(command);
     }
     let context = active_keybinding_context(state);
     let context_bindings = state
@@ -5162,7 +5249,21 @@ fn registered_global_command_for_key(state: &AppState, key: KeyEvent) -> Option<
         return context_bindings
             .iter()
             .find(|binding| binding.sequence.len() == 1)
-            .and_then(|binding| command_by_id(&binding.command_id));
+            .and_then(|binding| command_by_id(&binding.command_id))
+            .filter(|command| !tutorial_modal_open || !is_global_pane_command(*command));
+    }
+    // Traditional terminals encode Ctrl+/ as ASCII 0x1F. Crossterm decodes
+    // that control byte as Ctrl+7, so recognise it as the menu chord unless
+    // an explicit user binding already claimed Ctrl+_.
+    if key.code == KeyCode::Char('7')
+        && key.modifiers == KeyModifiers::CONTROL
+        && let Some(menu) = command_for_effective_shortcut(
+            state,
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+        )
+        && menu.id == "menu.main"
+    {
+        return Some(menu);
     }
     let modal_is_open = state.mode.is_some()
         || state.command_palette.is_some()
@@ -5175,10 +5276,25 @@ fn registered_global_command_for_key(state: &AppState, key: KeyEvent) -> Option<
         || state.snippet_preview.is_some()
         || state.snippet_chooser.is_some()
         || state.special_character_picker.is_some();
+    let modal_is_open = modal_is_open || tutorial_modal_open;
     if let Some(help) = command_for_effective_shortcut(state, key)
         .filter(|command| command.action == CommandAction::Help)
     {
         return Some(help);
+    }
+    if !modal_is_open
+        && let Some(save) = command_for_effective_shortcut(state, key)
+        && save.action == CommandAction::Save
+    {
+        return Some(save);
+    }
+    if !modal_is_open
+        && let Some(command) = command_for_effective_shortcut(state, key)
+        && (command.action == CommandAction::WindowPrefix
+            || command.action == CommandAction::Save
+            || (state.workspace == Workspace::Editor && is_global_pane_command(command)))
+    {
+        return Some(command);
     }
     if !modal_is_open
         && !(state.workspace == Workspace::Editor
@@ -5187,7 +5303,52 @@ fn registered_global_command_for_key(state: &AppState, key: KeyEvent) -> Option<
     {
         return Some(command);
     }
-    command_for_effective_shortcut(state, key).filter(|command| is_early_command(command.action))
+    command_for_effective_shortcut(state, key).filter(|command| {
+        is_early_command(command.action)
+            || (!modal_is_open
+                && (matches!(
+                    command.action,
+                    CommandAction::WindowPrefix | CommandAction::Save
+                ) || (state.workspace == Workspace::Editor
+                    && is_global_pane_command(*command))))
+    })
+}
+
+fn normalize_standard_terminal_key(state: &AppState, key: KeyEvent) -> KeyEvent {
+    let decoded_ctrl_slash = KeyEvent::new(KeyCode::Char('7'), KeyModifiers::CONTROL);
+    if !same_keycode(key.code, decoded_ctrl_slash.code)
+        || key.modifiers != decoded_ctrl_slash.modifiers
+    {
+        return key;
+    }
+    let explicitly_bound =
+        state.command_bindings.iter().any(|(event, _)| {
+            same_keycode(event.code, key.code) && event.modifiers == key.modifiers
+        }) || state.context_command_bindings.iter().any(|binding| {
+            binding.sequence.first().is_some_and(|event| {
+                same_keycode(event.code, key.code) && event.modifiers == key.modifiers
+            })
+        });
+    if explicitly_bound {
+        key
+    } else {
+        // The 0x1F control byte is the conventional encoding of Ctrl+/; WIDE
+        // normalises Crossterm's Ctrl+7 representation before any view handler.
+        KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL)
+    }
+}
+
+fn is_global_pane_command(command: CommandSpec) -> bool {
+    matches!(
+        command.action,
+        CommandAction::WindowSplit(_)
+            | CommandAction::WindowPrefix
+            | CommandAction::WindowResize(_)
+            | CommandAction::WindowFocusNext(_)
+            | CommandAction::WindowFocusDirection(_)
+            | CommandAction::WindowClose
+            | CommandAction::WindowOnly
+    ) || command.id == "window.maximize"
 }
 
 fn dispatch_key_command(
@@ -5231,13 +5392,13 @@ fn workspace_default_shortcuts(workspace: Workspace) -> &'static [&'static str] 
         Workspace::Cards => &["F3"],
         Workspace::Editor => &["F4"],
         Workspace::PlotGrid => &["F5"],
-        Workspace::Characters => &["F6"],
+        Workspace::Characters => &[],
         Workspace::StoryBible => &["F7"],
         Workspace::Timeline => &["F8"],
         Workspace::Analytics => &["F9"],
         Workspace::Research => &[],
         Workspace::Issues => &["F11"],
-        Workspace::Search => &["F12"],
+        Workspace::Search => &[],
         Workspace::Reading => &["F13"],
         Workspace::Revisions => &["F14"],
         Workspace::PlanningBoards | Workspace::Assemblies | Workspace::Series => &[],
@@ -7104,6 +7265,7 @@ fn parse_shortcut(value: &str) -> Result<KeyEvent, Box<dyn std::error::Error>> {
         .or_else(|| key.strip_prefix('f'))
         .filter(|number| !number.is_empty());
     let named_code = match key.to_ascii_lowercase().as_str() {
+        "plus" => Some(KeyCode::Char('+')),
         "insert" | "ins" => Some(KeyCode::Insert),
         "delete" | "del" => Some(KeyCode::Delete),
         "up" => Some(KeyCode::Up),
@@ -7123,7 +7285,12 @@ fn parse_shortcut(value: &str) -> Result<KeyEvent, Box<dyn std::error::Error>> {
     if modifiers.is_empty() && function_number.is_none() {
         return Err("command shortcuts must include Ctrl, Alt, or Shift".into());
     }
-    let code = if let Some(code) = named_code {
+    let code = if key == "\\" && modifiers == KeyModifiers::CONTROL {
+        // Legacy terminal protocols encode Ctrl+Backslash as ASCII FS (0x1C).
+        // Crossterm decodes that byte as Ctrl+4 because both chords have the
+        // same representation without an enhanced keyboard protocol.
+        KeyCode::Char('4')
+    } else if let Some(code) = named_code {
         code
     } else if let Some(number) = function_number {
         let number: u8 = number.parse()?;
@@ -7147,8 +7314,29 @@ fn parse_shortcut(value: &str) -> Result<KeyEvent, Box<dyn std::error::Error>> {
 const KEY_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(900);
 
 fn parse_key_sequence(value: &str) -> Result<Vec<KeyEvent>, Box<dyn std::error::Error>> {
-    let sequence = value
-        .split_whitespace()
+    let mut chords = Vec::new();
+    let mut current = String::new();
+    let mut previous = None;
+    for character in value.chars() {
+        // A comma after '+' names the comma key (for example Ctrl+,); other
+        // commas separate sequential chords, as in Ctrl+\\, 1.
+        if (character == ',' && previous != Some('+')) || character.is_whitespace() {
+            let chord = current.trim();
+            if !chord.is_empty() {
+                chords.push(chord.to_owned());
+            }
+            current.clear();
+        } else {
+            current.push(character);
+        }
+        previous = Some(character);
+    }
+    let chord = current.trim();
+    if !chord.is_empty() {
+        chords.push(chord.to_owned());
+    }
+    let sequence = chords
+        .iter()
         .enumerate()
         .map(|(index, chord)| {
             if index == 0 {
@@ -7216,6 +7404,11 @@ fn same_keycode(left: KeyCode, right: KeyCode) -> bool {
 }
 
 fn format_key_event(event: KeyEvent) -> String {
+    if event.code == KeyCode::Char('4') && event.modifiers == KeyModifiers::CONTROL {
+        // Canonical name for terminal byte 0x1C; Ctrl+4 is indistinguishable
+        // on the baseline protocol and is accepted as an alias by the parser.
+        return r"Ctrl+\".into();
+    }
     let mut parts = Vec::new();
     if event.modifiers.contains(KeyModifiers::CONTROL) {
         parts.push("Ctrl".to_owned());
@@ -7227,11 +7420,20 @@ fn format_key_event(event: KeyEvent) -> String {
         parts.push("Shift".to_owned());
     }
     parts.push(match event.code {
+        KeyCode::Char('+') => "Plus".to_owned(),
         KeyCode::Char(ch) => ch.to_ascii_uppercase().to_string(),
         KeyCode::F(number) => format!("F{number}"),
         other => format!("{other:?}"),
     });
     parts.join("+")
+}
+
+fn format_key_sequence(sequence: &[KeyEvent]) -> String {
+    sequence
+        .iter()
+        .map(|event| format_key_event(*event))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn effective_command_shortcuts(state: &AppState, command: CommandSpec) -> Vec<String> {
@@ -7280,7 +7482,7 @@ fn effective_command_shortcuts(state: &AppState, command: CommandSpec) -> Vec<St
                     .iter()
                     .map(|event| format_key_event(*event))
                     .collect::<Vec<_>>()
-                    .join(" ")
+                    .join(", ")
             })
             .collect::<Vec<_>>();
     }
@@ -7296,7 +7498,7 @@ fn effective_command_shortcuts(state: &AppState, command: CommandSpec) -> Vec<St
                     .iter()
                     .map(|event| format_key_event(*event))
                     .collect::<Vec<_>>()
-                    .join(" ")
+                    .join(", ")
             })
             .collect::<Vec<_>>();
         for shortcut in command.default_shortcuts {
@@ -7592,6 +7794,7 @@ fn read_keymap(project: &Path) -> Result<KeymapFile, Box<dyn std::error::Error>>
     match fs::read_to_string(path) {
         Ok(text) => Ok(toml::from_str(&text)?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(KeymapFile {
+            profile: None,
             bindings: BTreeMap::new(),
             commands: BTreeMap::new(),
             contexts: BTreeMap::new(),
@@ -7604,11 +7807,21 @@ fn read_user_keymap() -> Result<KeymapFile, Box<dyn std::error::Error>> {
     match read_keymap_file(&user_keymap_path())? {
         Some(config) => Ok(config),
         None => Ok(KeymapFile {
+            profile: None,
             bindings: BTreeMap::new(),
             commands: BTreeMap::new(),
             contexts: BTreeMap::new(),
         }),
     }
+}
+
+fn effective_editor_keymap_profile(project: &Path) -> EditorKeymapProfile {
+    [read_user_keymap().ok(), read_keymap(project).ok()]
+        .into_iter()
+        .flatten()
+        .filter_map(|config| config.profile)
+        .next_back()
+        .unwrap_or_default()
 }
 impl AppState {
     fn queue_background_grammar_check(
@@ -8180,6 +8393,8 @@ impl AppState {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -8277,6 +8492,21 @@ impl AppState {
             .into_iter()
             .map(|layout| layout.name)
             .collect())
+    }
+
+    fn open_window_layout_picker(&mut self) {
+        match self.named_window_layout_names() {
+            Ok(names) if names.is_empty() => {
+                self.message = "No saved workspace layouts · View → Save Layout creates one".into();
+            }
+            Ok(names) => {
+                self.window_layout_picker = Some(WindowLayoutPickerState { names, selected: 0 });
+                self.message = "Choose a saved workspace layout · Enter loads · Esc cancels".into();
+            }
+            Err(error) => {
+                self.message = format!("Saved workspace layouts could not be listed: {error}");
+            }
+        }
     }
 
     fn load_named_window_layout(
@@ -10013,7 +10243,7 @@ impl AppState {
             KeyCode::Down if !picker.paths.is_empty() => {
                 picker.selected = (picker.selected + 1) % picker.paths.len();
             }
-            KeyCode::Enter if !picker.paths.is_empty() => {
+            KeyCode::Enter | KeyCode::Char(' ') if !picker.paths.is_empty() => {
                 let path = picker.paths[picker.selected].clone();
                 if !path.join("project.toml").is_file() {
                     self.message = format!(
@@ -10115,7 +10345,17 @@ impl AppState {
             entries,
             selected: 0,
             tree_selected,
-            focus: if purpose == FileBrowserPurpose::NewProject {
+            focus: if matches!(
+                purpose,
+                FileBrowserPurpose::NewProject
+                    | FileBrowserPurpose::SaveProjectAs
+                    | FileBrowserPurpose::BackupProjectArchive
+                    | FileBrowserPurpose::ImportScrivenerDestination
+                    | FileBrowserPurpose::Compile(_)
+            ) {
+                // These dialogs open with a usable name/action already
+                // selected. The user can press Enter immediately or Tab
+                // into the tree and contents to change the destination.
                 2
             } else {
                 0
@@ -10146,18 +10386,19 @@ impl AppState {
                 | FileBrowserPurpose::ImportScrivenerCurrent
                 | FileBrowserPurpose::ImportScrivenerSeries
         ) {
-            "Directory tree focused · Tab: Folder contents · Enter opens folders/previews manifests · F5 inspects/imports · Esc cancels".into()
+            "Directory tree focused · Tab moves to folder contents · Enter opens a folder or imports a Scrivener project · Esc cancels".into()
         } else if purpose == FileBrowserPurpose::OpenTextFile {
-            "Choose a text file · F5 opens a read-only reference · Esc cancels".into()
+            "Choose a text file · Enter opens a read-only reference · Esc cancels".into()
         } else if purpose == FileBrowserPurpose::ImportScrivenerDestination {
-            "Choose a writable parent · edit project folder name · F4 selects this destination"
+            "Choose a writable parent · Tab to the folder name · Enter selects this destination"
                 .into()
         } else if purpose == FileBrowserPurpose::ImportDocument {
-            "Choose a text, Markdown, or Org file · F5 previews import options".into()
+            "Choose a text, Markdown, or Org file · Enter previews import options".into()
         } else if purpose == FileBrowserPurpose::OpenProject {
             "Choose a Writer's IDE project · Enter opens a project or browses a folder · Esc cancels".into()
         } else {
-            "Choose a folder or filename · F5 confirms · F7 creates folder · Esc cancels".into()
+            "Choose a folder or filename · Enter confirms · Alt+N creates a folder · Esc cancels"
+                .into()
         };
         Ok(())
     }
@@ -10329,9 +10570,18 @@ impl AppState {
             return Ok(());
         }
         // New Project exposes its book type and actions as focusable controls.
-        // Enter on those controls follows the same paths as the optional F-key
-        // shortcuts, so creation never depends on an undocumented chord.
-        let key = if browser.purpose == FileBrowserPurpose::NewProject && key.code == KeyCode::Enter
+        // Enter activates the focused action; Space toggles the book-type choice.
+        let key = if (matches!(browser.purpose, FileBrowserPurpose::Compile(_))
+            && key.code == KeyCode::Char('f')
+            && key.modifiers == KeyModifiers::ALT)
+            || (browser.purpose == FileBrowserPurpose::NewProject
+                && browser.focus == 4
+                && matches!(key.code, KeyCode::Left | KeyCode::Right))
+        {
+            KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)
+        } else if browser.purpose == FileBrowserPurpose::NewProject
+            && (key.code == KeyCode::Enter
+                || (key.code == KeyCode::Char(' ') && matches!(browser.focus, 4..=6)))
         {
             match browser.focus {
                 2 => {
@@ -10341,9 +10591,23 @@ impl AppState {
                     self.file_browser = Some(browser);
                     return Ok(());
                 }
-                4 => KeyEvent::new(KeyCode::F(2), key.modifiers),
-                5 => KeyEvent::new(KeyCode::F(5), key.modifiers),
-                6 => KeyEvent::new(KeyCode::Esc, key.modifiers),
+                4 if key.code == KeyCode::Enter => {
+                    browser.focus = 5;
+                    let selected_type = match browser.new_project_book_type {
+                        Some(story_core::BookType::Nonfiction) => "Non-fiction",
+                        _ => "Fiction",
+                    };
+                    self.message = format!(
+                        "{selected_type} selected · Enter creates the project · Space changes book type"
+                    );
+                    self.file_browser = Some(browser);
+                    return Ok(());
+                }
+                4 if key.code == KeyCode::Char(' ') => {
+                    KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)
+                }
+                5 => KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE),
+                6 => KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
                 _ => key,
             }
         } else {
@@ -10364,7 +10628,10 @@ impl AppState {
                 KeyCode::PageDown => {
                     browser.preview_scroll = browser.preview_scroll.saturating_add(10)
                 }
-                KeyCode::F(2) if preview.format == story_import::TextDocumentFormat::Org => {
+                KeyCode::F(2) | KeyCode::Char('o')
+                    if preview.format == story_import::TextDocumentFormat::Org
+                        && (key.code == KeyCode::F(2) || key.modifiers == KeyModifiers::ALT) =>
+                {
                     browser.org_import_mode = match browser.org_import_mode {
                         story_import::OrgImportMode::SingleDocument => {
                             story_import::OrgImportMode::HeadingHierarchy
@@ -10470,12 +10737,16 @@ impl AppState {
         }
         let mut close = false;
         match key.code {
-            KeyCode::F(3) => {
+            KeyCode::F(3) | KeyCode::Char('p')
+                if key.code == KeyCode::F(3) || key.modifiers == KeyModifiers::ALT =>
+            {
                 browser.path_editing = true;
                 browser.path_input = browser.current_dir.display().to_string();
                 self.message = "Enter an absolute path or use ~ for your home folder · Enter opens · Esc cancels".into();
             }
-            KeyCode::F(6) => {
+            KeyCode::F(6) | KeyCode::Char('h')
+                if key.code == KeyCode::F(6) || key.modifiers == KeyModifiers::ALT =>
+            {
                 let selected = browser
                     .entries
                     .get(browser.selected)
@@ -10604,7 +10875,7 @@ impl AppState {
                     browser.new_project_book_type = Some(selected_type);
                     browser.overwrite_confirmed = false;
                     self.message = format!(
-                        "Book type: {} · press F2 to change",
+                        "Book type: {} · press Space or ←/→ to change",
                         match browser.new_project_book_type {
                             Some(story_core::BookType::Fiction) => "Fiction",
                             Some(story_core::BookType::Nonfiction) => "Non-fiction",
@@ -10638,7 +10909,10 @@ impl AppState {
                     browser.overwrite_confirmed = false;
                 }
             }
-            KeyCode::F(4) if browser.purpose == FileBrowserPurpose::ImportScrivenerDestination => {
+            KeyCode::F(4) | KeyCode::Enter
+                if browser.purpose == FileBrowserPurpose::ImportScrivenerDestination
+                    && (key.code == KeyCode::F(4) || browser.focus == 2) =>
+            {
                 let folder_name = browser.name.trim().to_owned();
                 let wizard = self
                     .scrivener_import
@@ -10816,7 +11090,7 @@ impl AppState {
                             | FileBrowserPurpose::ImportScrivenerSeries
                     ) {
                         if !name.ends_with(".scrivx") {
-                            self.message = "Select a Scrivener project or .scrivx manifest and press Enter or F5 to import into temporary workspace".into();
+                            self.message = "Select a Scrivener project or .scrivx manifest and press Enter to import into temporary workspace".into();
                             self.file_browser = Some(browser);
                             return Ok(());
                         } else {
@@ -10842,10 +11116,13 @@ impl AppState {
                     "Open Project only opens existing WIDE projects; select a project folder"
                         .into();
             }
-            KeyCode::F(7) if browser.purpose != FileBrowserPurpose::NewProject => {
+            KeyCode::F(7) | KeyCode::Char('n')
+                if browser.purpose != FileBrowserPurpose::NewProject
+                    && (key.code == KeyCode::F(7) || key.modifiers == KeyModifiers::ALT) =>
+            {
                 let folder = browser.name.trim();
                 if !file_browser_leaf_name_is_safe(folder) {
-                    self.message = "Enter a valid folder name before pressing F7".into();
+                    self.message = "Enter a valid folder name, then use Alt+N to create it".into();
                 } else {
                     let path = browser.current_dir.join(folder);
                     match fs::create_dir(&path) {
@@ -10866,7 +11143,7 @@ impl AppState {
                     }
                 }
             }
-            KeyCode::F(5) => {
+            KeyCode::F(5) | KeyCode::Enter if browser.focus == 2 || key.code == KeyCode::F(5) => {
                 let name = browser.name.trim();
                 if (browser.purpose == FileBrowserPurpose::NewProject && name.is_empty())
                     || (browser.purpose != FileBrowserPurpose::NewProject
@@ -10908,7 +11185,7 @@ impl AppState {
                             listed_project.or(tree_project)
                         };
                         let Some(project_path) = project_path else {
-                            self.message = "Select a Writer's IDE project folder and press Enter or F5. Ordinary folders open for browsing.".into();
+                            self.message = "Select a Writer's IDE project folder and press Enter. Ordinary folders open for browsing.".into();
                             self.file_browser = Some(browser);
                             return Ok(());
                         };
@@ -10932,7 +11209,7 @@ impl AppState {
                                     (!is_dir).then(|| browser.current_dir.join(item))
                                 })
                         else {
-                            self.message = "Select a text file, then press F5".into();
+                            self.message = "Select a text file, then press Enter to open it".into();
                             self.file_browser = Some(browser);
                             return Ok(());
                         };
@@ -10954,7 +11231,8 @@ impl AppState {
                                     (!is_dir).then(|| browser.current_dir.join(item))
                                 })
                         else {
-                            self.message = "Select a text file, then press F5".into();
+                            self.message =
+                                "Select a text file, then press Enter to insert it".into();
                             self.file_browser = Some(browser);
                             return Ok(());
                         };
@@ -10989,7 +11267,7 @@ impl AppState {
                                 })
                         else {
                             self.message =
-                                "Select a text, Markdown, or Org file, then press F5".into();
+                                "Select a text, Markdown, or Org file, then press Enter to preview import".into();
                             self.file_browser = Some(browser);
                             return Ok(());
                         };
@@ -11002,7 +11280,7 @@ impl AppState {
                                     .map(|unit| unit.body_markdown.split_whitespace().count())
                                     .sum::<usize>();
                                 self.message = format!(
-                                    "Import preview: {} unit(s), about {words} words, {} item(s) need review · F5 imports · F2 changes Org mode · Esc returns",
+                                    "Import preview: {} unit(s), about {words} words, {} item(s) need review · Enter imports · Esc returns",
                                     preview.units.len(),
                                     preview.unsupported.len()
                                 );
@@ -11027,7 +11305,7 @@ impl AppState {
                             });
                         let Some(source) = source else {
                             self.message =
-                                "Select a .scriv project folder or .scrivx manifest, then press F5"
+                                "Select a .scriv project folder or .scrivx manifest, then press Enter"
                                     .into();
                             self.file_browser = Some(browser);
                             return Ok(());
@@ -11055,7 +11333,7 @@ impl AppState {
                             });
                         let Some(source) = source else {
                             self.message =
-                                "Select a .scriv project folder or .scrivx manifest, then press F5"
+                                "Select a .scriv project folder or .scrivx manifest, then press Enter"
                                     .into();
                             self.file_browser = Some(browser);
                             return Ok(());
@@ -11083,7 +11361,7 @@ impl AppState {
                             });
                         let Some(source) = source else {
                             self.message =
-                                "Select a .scriv project folder or .scrivx manifest, then press F5"
+                                "Select a .scriv project folder or .scrivx manifest, then press Enter"
                                     .into();
                             self.file_browser = Some(browser);
                             return Ok(());
@@ -11143,7 +11421,8 @@ impl AppState {
                             return Ok(());
                         }
                         let Some(book_type) = browser.new_project_book_type else {
-                            self.message = "Choose Fiction or Non-fiction first · press F2".into();
+                            self.message =
+                                "Choose Fiction or Non-fiction first · use Space or ←/→".into();
                             self.file_browser = Some(browser);
                             return Ok(());
                         };
@@ -11177,7 +11456,7 @@ impl AppState {
                         if !browser.overwrite_confirmed {
                             browser.overwrite_confirmed = true;
                             self.message = format!(
-                                "Create an independent project copy at {}? Press F5 again to confirm",
+                                "Create an independent project copy at {}? Press Enter again to confirm",
                                 destination.display()
                             );
                             self.file_browser = Some(browser);
@@ -11248,7 +11527,7 @@ impl AppState {
                         if destination.exists() && !browser.overwrite_confirmed {
                             browser.overwrite_confirmed = true;
                             self.message =
-                                "Output exists. Press F5 again to replace it, or edit the filename"
+                                "Output exists. Press Enter again to replace it, or edit the filename"
                                     .into();
                             self.file_browser = Some(browser);
                             return Ok(());
@@ -12662,7 +12941,7 @@ impl AppState {
             self.replace_preview_match = 0;
             self.scroll = 0;
             self.message = format!(
-                "Review changes: {total} replacement(s) in {target_count} scene(s) · F5 applies · Esc returns to Find and Replace"
+                "Review changes: {total} replacement(s) in {target_count} scene(s) · Enter applies · Esc returns to Find and Replace"
             );
         }
         Ok(())
@@ -12940,6 +13219,44 @@ impl AppState {
             self.reference_focused = true;
         }
     }
+    fn ensure_manual_pane_layout(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.pane_layout.is_some() {
+            return Ok(());
+        }
+        let mut layout = pane_layout::PaneLayout::default();
+        let mut assignments = Vec::with_capacity(self.reference_panes.len());
+        for pane in &self.reference_panes {
+            let rect = layout
+                .rectangles(self.pane_bounds, 18, 6)
+                .into_iter()
+                .find(|(id, _)| *id == layout.focused())
+                .map(|(_, rect)| rect)
+                .unwrap_or(self.pane_bounds);
+            let id = layout.split(pane_layout::Orientation::Vertical, 5_000, rect, 18, 6)?;
+            assignments.push((pane.source_key.clone(), id));
+        }
+        for (source_key, id) in assignments {
+            if let Some(pane) = self
+                .reference_panes
+                .iter_mut()
+                .find(|pane| pane.source_key == source_key && pane.layout_id.is_none())
+            {
+                pane.layout_id = Some(id);
+            }
+        }
+        if self.reference_focused
+            && let Some(id) = self
+                .reference_panes
+                .get(self.active_reference)
+                .and_then(|pane| pane.layout_id)
+        {
+            layout.focus(id)?;
+        } else {
+            layout.focus(1)?;
+        }
+        self.pane_layout = Some(layout);
+        Ok(())
+    }
     fn split_focused_window(
         &mut self,
         orientation: pane_layout::Orientation,
@@ -12953,27 +13270,8 @@ impl AppState {
         {
             return Err("open a manuscript document before splitting the writing view".into());
         }
+        self.ensure_manual_pane_layout()?;
         let mut layout = self.pane_layout.clone().unwrap_or_default();
-        if self.pane_layout.is_none() && !self.reference_panes.is_empty() {
-            for pane in &mut self.reference_panes {
-                let rect = layout
-                    .rectangles(self.pane_bounds, 18, 6)
-                    .into_iter()
-                    .find(|(id, _)| *id == layout.focused())
-                    .map(|(_, rect)| rect)
-                    .unwrap_or(self.pane_bounds);
-                let id = layout.split(pane_layout::Orientation::Vertical, 5_000, rect, 18, 6)?;
-                pane.layout_id = Some(id);
-            }
-            if self.reference_focused
-                && let Some(id) = self
-                    .reference_panes
-                    .get(self.active_reference)
-                    .and_then(|pane| pane.layout_id)
-            {
-                layout.focus(id)?;
-            }
-        }
         let focused = layout.focused();
         let bounds = layout
             .rectangles(self.pane_bounds, 18, 6)
@@ -13057,6 +13355,63 @@ impl AppState {
                 "Focused next reference window".into()
             };
         }
+        Ok(())
+    }
+    fn focus_window_direction(
+        &mut self,
+        direction: pane_layout::Direction,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.pane_layout.is_none() && !self.reference_panes.is_empty() {
+            self.ensure_manual_pane_layout()?;
+        }
+        let Some(layout) = self.pane_layout.as_mut() else {
+            self.message = "Open a second pane before moving focus directionally".into();
+            return Ok(());
+        };
+        let moved = layout.focus_direction(direction, self.pane_bounds, 18, 6);
+        let focused = layout.focused();
+        self.focus_manual_pane(focused);
+        self.message = if moved {
+            match direction {
+                pane_layout::Direction::Up => "Focused pane above",
+                pane_layout::Direction::Down => "Focused pane below",
+                pane_layout::Direction::Left => "Focused pane to the left",
+                pane_layout::Direction::Right => "Focused pane to the right",
+            }
+            .into()
+        } else {
+            match direction {
+                pane_layout::Direction::Up => "No pane above the focused pane",
+                pane_layout::Direction::Down => "No pane below the focused pane",
+                pane_layout::Direction::Left => "No pane to the left of the focused pane",
+                pane_layout::Direction::Right => "No pane to the right of the focused pane",
+            }
+            .into()
+        };
+        self.save_session()?;
+        Ok(())
+    }
+    fn focus_window_number(&mut self, number: u8) -> Result<(), Box<dyn std::error::Error>> {
+        if number == 1 && self.pane_layout.is_none() {
+            self.focus_main_editor();
+            self.message = "Focused pane 1 · manuscript".into();
+            return Ok(());
+        }
+        if self.pane_layout.is_none() && !self.reference_panes.is_empty() {
+            self.ensure_manual_pane_layout()?;
+        }
+        let Some(layout) = self.pane_layout.as_mut() else {
+            self.message = "Only pane 1 is open".into();
+            return Ok(());
+        };
+        if layout.focus_number(number).is_err() {
+            self.message = format!("Pane {number} is not open");
+            return Ok(());
+        }
+        let focused = layout.focused();
+        self.focus_manual_pane(focused);
+        self.message = format!("Focused pane {number}");
+        self.save_session()?;
         Ok(())
     }
     fn resize_focused_window(&mut self, grow: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -13579,7 +13934,7 @@ impl AppState {
             text,
         );
         self.reference_focused = true;
-        self.message = "External file is read-only · mark a passage with v, then Ctrl+C copies it to the terminal clipboard where supported and Writer's IDE clipboard · Ctrl+Tab returns to the manuscript".into();
+        self.message = r"External file is read-only · mark a passage with v, then Ctrl+C copies to the WIDE clipboard (system clipboard where supported) · Ctrl+\ then an arrow or F6 returns focus to the manuscript".into();
         Ok(())
     }
     fn open_compile_results_reference(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -16321,6 +16676,10 @@ impl AppState {
                 "window.grow" | "window.shrink" => editor && multiple_windows,
                 "window.next"
                 | "window.previous"
+                | "window.focus-up"
+                | "window.focus-down"
+                | "window.focus-left"
+                | "window.focus-right"
                 | "window.move-reference-earlier"
                 | "window.move-reference-later" => {
                     editor
@@ -16636,13 +16995,6 @@ impl AppState {
             CommandAction::NewProject if self.active_challenge.is_some() => {
                 Some("Finish or quit the writing challenge before creating a project")
             }
-            CommandAction::Save
-                if self.editing_scene.is_none()
-                    && self.editing_content_unit.is_none()
-                    && self.assembly_draft.is_none() =>
-            {
-                Some("Open a scene or assembly draft first")
-            }
             CommandAction::WriteSelectedChapter
                 if self.workspace != Workspace::Outline
                     || !matches!(
@@ -16880,7 +17232,7 @@ impl AppState {
                     .iter()
                     .map(|event| format_key_event(*event))
                     .collect::<Vec<_>>()
-                    .join(" ");
+                    .join(", ");
                 if sequence.is_empty() {
                     manager.capture_command_id = Some(command_id);
                     self.message = "Capture at least one modified chord before Enter".into();
@@ -16939,7 +17291,7 @@ impl AppState {
                             .iter()
                             .map(|event| format_key_event(*event))
                             .collect::<Vec<_>>()
-                            .join(" ");
+                            .join(", ");
                         self.message =
                             format!("Captured {sequence}; press another chord or Enter to finish")
                     }
@@ -17026,6 +17378,24 @@ impl AppState {
             KeyCode::Char('u') if key.modifiers.is_empty() => {
                 manager.user_scope = !manager.user_scope
             }
+            KeyCode::Char('p') if key.modifiers.is_empty() => {
+                let mut config = if manager.user_scope {
+                    read_user_keymap()?
+                } else {
+                    read_keymap(self.app.project_root())?
+                };
+                let profile = config
+                    .profile
+                    .unwrap_or_else(|| effective_editor_keymap_profile(self.app.project_root()))
+                    .next();
+                config.profile = Some(profile);
+                if manager.user_scope {
+                    save_user_keymap(&config)?;
+                } else {
+                    save_keymap(self.app.project_root(), &config)?;
+                }
+                self.message = format!("Manuscript keymap profile set to {profile:?}");
+            }
             KeyCode::Char('/') if key.modifiers.is_empty() => manager.filtering = true,
             KeyCode::Char('b') if key.modifiers.is_empty() => {
                 if let Some(command) = keybinding_manager_commands(&manager).get(manager.selected) {
@@ -17107,7 +17477,7 @@ impl AppState {
                     menu.selected = (menu.selected + 1) % count;
                 }
             }
-            KeyCode::Enter => {
+            KeyCode::Enter | KeyCode::Char(' ') => {
                 let entries = self.menu_visible_entries();
                 if let Some(spec) = entries.get(menu.selected).copied() {
                     if let Some(reason) = self.command_disabled_reason(spec) {
@@ -17836,8 +18206,17 @@ impl AppState {
             CommandAction::FindPreviousMatch => self.navigate_search_match(false)?,
             CommandAction::ToggleSceneInclusion => self.toggle_scene_card_inclusion()?,
             CommandAction::WindowSplit(orientation) => self.split_focused_window(orientation)?,
+            CommandAction::WindowPrefix => {
+                self.window_prefix_active = true;
+                self.menu = None;
+                self.command_palette = None;
+                self.message = r"Window prefix · arrows focus · 1–4 select · h/v split · x close · m maximise · p layouts · ? help · Esc cancels".into();
+            }
             CommandAction::WindowResize(grow) => self.resize_focused_window(grow)?,
             CommandAction::WindowFocusNext(reverse) => self.focus_window_next(reverse)?,
+            CommandAction::WindowFocusDirection(direction) => {
+                self.focus_window_direction(direction)?
+            }
             CommandAction::WindowClose => self.close_focused_window()?,
             CommandAction::WindowOnly => self.keep_only_focused_window()?,
             CommandAction::WriteSelectedChapter => self.write_selected_chapter()?,
@@ -17894,8 +18273,15 @@ impl AppState {
                     {
                         self.message = format!("Choose a project location to save: {error}");
                     }
-                } else {
+                } else if self.editing_scene.is_some()
+                    || self.editing_content_unit.is_some()
+                    || self.assembly_draft.is_some()
+                    || self.active_challenge.is_some()
+                {
                     self.save()?;
+                } else {
+                    self.save_session()?;
+                    self.message = "Project changes are saved".into();
                 }
             }
             CommandAction::SaveProjectAs => {
@@ -18464,7 +18850,8 @@ impl AppState {
             self.series_removed_books_view = false;
             self.selected = 0;
             self.switch(Workspace::Series);
-            self.message = "Series Books · Enter opens a book · F10 Menu → Series for create/import/reference actions".into();
+            self.message =
+                "Series Books · Enter opens a book · Ctrl+/ opens File and Series actions".into();
             return Ok(());
         }
         if cmd == "series-remove-selected-book" {
@@ -18625,7 +19012,7 @@ impl AppState {
             });
             self.mode = None;
             self.prompt.clear();
-            self.message = "Keybinding Manager · Tab changes context · b captures · u removes · r resets selected".into();
+            self.message = "Keybinding Manager · Tab changes context · p profile · b binds · u scope · r removes · Shift+R resets".into();
             return Ok(());
         }
         if cmd == "keybinding-list" {
@@ -26352,7 +26739,26 @@ fn thesaurus_data_path_from(
     None
 }
 
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> io::Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Enter raw mode before project recovery/opening. ASCII 0x1C is the
+    // configured VQUIT byte in cooked mode; cfmakeraw clears ISIG so it is
+    // buffered as input rather than terminating WIDE while a project opens.
+    let _raw_mode = RawModeGuard::enable()?;
     let incomplete_cleanup_failures = cleanup_incomplete_staged_projects();
     let discard_cleanup_failures = cleanup_staged_project_discards();
     let (completed_promotions, promotion_conflicts) = reconcile_staged_promotions();
@@ -26547,7 +26953,8 @@ fn run(
         }
         t.draw(|f| draw(f, s))?;
         if event::poll(Duration::from_millis(200))? {
-            match event::read()? {
+            let terminal_event = event::read()?;
+            match terminal_event {
                 Event::Key(k) => {
                     let previous_render_context = render_context_key(s);
                     let should_quit = handle_interactive_key(s, k);
@@ -27346,6 +27753,13 @@ fn tutorial_next_action(state: &AppState) -> Option<&'static str> {
     tutorial_next_action_for_progress(&progress)
 }
 
+fn tutorial_lesson_complete(state: &AppState) -> bool {
+    onboarding::load(&state.tutorial_preferences_path)
+        .ok()
+        .and_then(|preferences| preferences.active_tutorial)
+        .is_some_and(|progress| tutorial_next_action_for_progress(&progress).is_none())
+}
+
 fn tutorial_next_action_for_progress(
     progress: &onboarding::TutorialProgress,
 ) -> Option<&'static str> {
@@ -27374,9 +27788,11 @@ fn tutorial_expected_action_hint(state: &AppState) -> String {
         Some("resume") => "Press Esc to pause, then choose Help > Resume Tutorial".into(),
         Some("cards") => "Choose View > Show Scene Cards".into(),
         Some("reference-open") => "Open View > Open Outline Reference".into(),
-        Some("reference-focus") => "Press Ctrl+Tab to focus the reference pane".into(),
+        Some("reference-focus") => {
+            r"Press Ctrl+\, then an arrow to move between panes; F6 / Shift+F6 also cycles".into()
+        }
         Some("search") => "Search for a word in the sample manuscript".into(),
-        Some("compile") => "Open Publish > Compile, choose EPUB with F2 and save it".into(),
+        Some("compile") => "Open Publish > Compile, choose EPUB with Alt+F and save it".into(),
         _ => "Continue the current tutorial lesson".into(),
     }
 }
@@ -27618,10 +28034,11 @@ fn draw_manual_pane_layout(
             })
             .collect::<Vec<_>>();
         let focused = pane_id == layout.focused();
+        let number = layout.number(pane_id).unwrap_or(0);
         let title = if focused {
-            format!("{} · focused", pane.title)
+            format!("Pane {number} · {} · focused", pane.title)
         } else {
-            pane.title.clone()
+            format!("Pane {number} · {}", pane.title)
         };
         let block = Block::default()
             .title(truncate_display_cells(
@@ -27755,7 +28172,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         })
                         .collect::<Vec<_>>(),
                     format!(
-                        "Review Changes · scene {}/{} · F3 next match · F6 include/exclude",
+                        "Review Changes · scene {}/{} · Alt+N next match · Alt+I include/exclude",
                         s.replace_preview_target + 1,
                         targets.len()
                     ),
@@ -27769,7 +28186,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         .map(ListItem::new)
                         .collect::<Vec<_>>(),
                     format!(
-                        "Find Results · {}/{} · F3 next · Shift+F3 previous",
+                        "Find Results · {}/{} · Alt+N next · Alt+Shift+N previous",
                         s.search_location_index + 1,
                         s.search_result_rows.len()
                     ),
@@ -27821,7 +28238,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             (
                 vec![
                     Line::from("No manuscript document is open."),
-                    Line::from("Use F10 Menu → Insert → Create Chapter, or choose File → Import."),
+                    Line::from("Use the Outline menu to create chapters, or choose File → Import."),
                 ],
                 "Start Writing".into(),
             )
@@ -27871,7 +28288,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     .copied()
                     .unwrap_or(false);
                 let preview = format!(
-                    "Scene: {}\nMatch {}/{} · {} · F6 include/exclude match · F8 include/exclude scene\n\n--- Original ---\n{}\n\n--- Proposed changes ---\n{}",
+                    "Scene: {}\nMatch {}/{} · {} · Alt+I include/exclude match · Alt+P include/exclude scene\n\n--- Original ---\n{}\n\n--- Proposed changes ---\n{}",
                     target.title,
                     s.replace_preview_match + 1,
                     target.replacements,
@@ -28156,6 +28573,11 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             !s.reference_panes.is_empty() && !s.reference_panes_hidden && !s.editor_focus_mode;
         let compact_single_pane =
             has_reference_panes && should_collapse_to_single_pane(editor_and_reference);
+        let editor_title = if let Some(layout) = s.pane_layout.as_ref() {
+            format!("Pane {} · {editor_title}", layout.number(1).unwrap_or(1))
+        } else {
+            format!("Pane 1 · {editor_title}")
+        };
         let editor = Paragraph::new(content)
             .scroll((s.scroll.min(u16::MAX as usize) as u16, 0))
             .wrap(Wrap { trim: false })
@@ -28702,18 +29124,18 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         );
         let help = if panel.replacing && s.pending_replace.is_some() {
             [
-                "F3: Next/Skip · F6: Include/exclude match · F8: Include/exclude scene",
-                "F5: Apply Replace All · Esc: Back to fields",
+                "Alt+N: Next/Skip · Alt+I: Include/exclude match · Alt+P: Include/exclude scene",
+                "Enter: Apply Replace All · Esc: Back to fields",
             ]
         } else if panel.replacing {
             [
-                "Tab/Shift+Tab: fields · Enter: Preview all · F3: Next/Skip · F4: Scope",
-                "F9: Replace This · F2: Mode · F6: Case · F7: Whole · F8: Accents · Esc: Close",
+                "Tab/Shift+Tab: fields · Enter: Preview all · Alt+N: Next/Skip · Alt+S: Scope",
+                "Alt+R: Replace This · Alt+T: Mode · Alt+C: Case · Alt+W: Whole word · Alt+A: Accents · Esc: Close",
             ]
         } else {
             [
-                "Enter: Find · F3/Shift+F3: Next/Previous · F4: Scope · Ctrl+H: Replace",
-                "F2: Mode · F6: Case · F7: Whole word · F8: Accents · Esc: Close",
+                "Enter: Find · Alt+N: Next · Alt+S: Scope · Ctrl+H: Replace",
+                "Alt+T: Mode · Alt+C: Case · Alt+W: Whole word · Alt+A: Accents · Esc: Close",
             ]
         };
         let options = format!(
@@ -28817,14 +29239,16 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 {
                     "↑/↓ finding · a apply · i ignore · Esc manuscript".into()
                 } else if !s.reference_panes.is_empty() && !s.reference_panes_hidden {
-                    "Ctrl+Tab panes".into()
+                    r"Ctrl+\ then arrow · F6 panes".into()
                 } else {
                     "Esc outline".into()
                 }
             } else {
                 workspace_action_hint(s)
             };
-            let status = if let Some(tutorial) = tutorial_footer_status(s) {
+            let status = if s.window_prefix_active {
+                r" Window prefix · ↑↓←→ focus · 1–4 pane · Tab/Shift+Tab · H/V split · X close · M maximise · P layouts · ? help · Esc cancel".to_owned()
+            } else if let Some(tutorial) = tutorial_footer_status(s) {
                 format!(
                     " Active:{focus} · {} · Save {} · {tutorial}",
                     if s.dirty {
@@ -28873,7 +29297,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             };
             if let Some(tutorial) = tutorial_footer_status(s) {
                 format!(
-                    " {tutorial} · F10 Menu · {} · {}{}",
+                    " {tutorial} · Ctrl+/ Menu · {} · {}{}",
                     workspace_action_hint(s),
                     if s.dirty {
                         "unsaved"
@@ -29005,7 +29429,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 ),
                 top[1],
             );
-            let pane_hint: String = if s.workspace == Workspace::Editor {
+            let pane_hint: String = if s.window_prefix_active {
+                r"Prefix: ↑↓←→ focus · 1–4 pane · Tab/Shift+Tab · H/V split · X close · M maximise · P layouts · ? help · Esc cancels".into()
+            } else if s.workspace == Workspace::Editor {
                 if s.reference_focused
                     && s.active_reference_pane()
                         .is_some_and(|pane| pane.spelling.is_some())
@@ -29017,7 +29443,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 {
                     "↑/↓ finding · a apply · i ignore · Esc manuscript".into()
                 } else if !s.reference_panes.is_empty() && !s.reference_panes_hidden {
-                    "Ctrl+Tab: Reference · Esc: Outline".into()
+                    r"Ctrl+\ then arrow / F6: panes · Esc: Outline".into()
                 } else {
                     "Esc: Outline".into()
                 }
@@ -29113,6 +29539,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.recent_project_picker.is_some() {
         draw_recent_project_picker_overlay(f, s);
     }
+    if s.window_layout_picker.is_some() {
+        draw_window_layout_picker_overlay(f, s);
+    }
     if s.pending_reading_removal.is_some() {
         draw_reading_removal_overlay(f, s);
     }
@@ -29172,7 +29601,7 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
             "Help: {} opens or closes this panel; Esc returns to the previous focus",
             effective_shortcut_label(state, "help.context", "Help menu / command palette")
         ),
-        "Writing: Ctrl+Tab switches to an open reference pane; Esc returns to the manuscript".to_owned(),
+        r"Writing: Ctrl+\ then an arrow moves between panes; 1–4 selects one; F6 / Shift+F6 cycles; Esc returns to Outline".to_owned(),
         "Navigation: outside manuscript editing, Tab cycles Manuscript → Outline → Reference and Shift+Tab goes back. In the editor, Tab inserts indentation; Esc returns to Outline.".to_owned(),
         format!(
             "Save: {} · current buffer is {}",
@@ -29185,7 +29614,7 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
         ),
     ];
     if state.file_browser.is_some() {
-        lines.push("File browser: Tab/Shift+Tab changes panes and filename; Enter opens a folder; Backspace goes to the parent; Home opens your home folder; / opens filesystem root; F2 changes compile format; F5 confirms; F7 creates a folder; Esc cancels.".into());
+        lines.push("File browser: Tab/Shift+Tab moves between controls; Enter opens or confirms; Alt+F changes compile format; Alt+N creates a folder; Backspace goes to the parent; Home opens your home folder; / opens filesystem root; Esc cancels.".into());
     }
     if state.special_character_picker.is_some() {
         lines.push(
@@ -29233,7 +29662,9 @@ fn context_help_panel(state: &AppState) -> HelpPanel {
             "Command Palette: type to search actions and descriptions · ↑/↓ select · Enter run · Tab prepare arguments · Esc close".to_owned(),
         );
     }
-    lines.push("Scroll: ↑/↓ or Page Up/Page Down · F10 opens menu".to_owned());
+    lines.push(
+        "Scroll: ↑/↓ or Page Up/Page Down · Ctrl+/ opens the menu (F10 also works)".to_owned(),
+    );
     HelpPanel {
         title: format!("Help · {context}"),
         lines,
@@ -31047,6 +31478,47 @@ fn draw_recent_project_picker_overlay(f: &mut ratatui::Frame<'_>, state: &AppSta
     );
 }
 
+fn draw_window_layout_picker_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
+    let Some(picker) = state.window_layout_picker.as_ref() else {
+        return;
+    };
+    let area = f.area();
+    if area.width < 4 || area.height < 3 {
+        return;
+    }
+    let width = area.width.saturating_sub(4).clamp(1, 72);
+    let height = (picker.names.len() as u16)
+        .saturating_add(4)
+        .min(area.height.saturating_sub(2));
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 3,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Workspace Layouts · ↑/↓ choose · Enter or Space load · Esc cancel ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let items = picker
+        .names
+        .iter()
+        .map(|name| ListItem::new(name.as_str()))
+        .collect::<Vec<_>>();
+    f.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White)),
+        inner,
+        &mut ListState::default().with_selected(Some(
+            picker.selected.min(picker.names.len().saturating_sub(1)),
+        )),
+    );
+}
+
 fn draw_reading_removal_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     let Some(dialog) = &s.pending_reading_removal else {
         return;
@@ -31953,7 +32425,7 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         };
         f.render_widget(
             Paragraph::new(format!(
-                "Book type: {}{book_type}{} · F2 Change",
+                "Book type: {}{book_type}{} · ←/→ or Space changes",
                 if browser.focus == 4 { "[ " } else { "" },
                 if browser.focus == 4 { " ]" } else { "" }
             ))
@@ -31985,26 +32457,26 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     );
     let (primary_action, navigation) = if browser.overwrite_confirmed {
         let action = if browser.purpose == FileBrowserPurpose::NewProject {
-            "F5 Confirm Create · Esc Cancel"
+            "Enter Create · Esc Cancel"
         } else if browser.purpose == FileBrowserPurpose::SaveProjectAs {
-            "F5 Confirm Save Copy · Esc Cancel"
+            "Enter Save Copy · Esc Cancel"
         } else {
-            "F5 Confirm Overwrite · Esc Cancel"
+            "Enter Replace · Esc Cancel"
         };
         (action, "Review the selected destination before confirming")
     } else if matches!(browser.purpose, FileBrowserPurpose::Compile(_)) {
         (
-            "F5 Compile · F2 Format · F7 New Folder · Enter Browse · Esc Cancel",
+            "Enter Compile · Alt+F Format · Alt+N New Folder · Esc Cancel",
             "Tab/Shift+Tab: panes and filename · Home: Home · /: Root · Backspace: Parent",
         )
     } else if browser.purpose == FileBrowserPurpose::OpenProject {
         (
-            "Enter Open project / browse folder · F5 Open selected project · Esc Cancel",
+            "Enter Open project / browse folder · Esc Cancel",
             "Tab/Shift+Tab: tree and projects · Home: Home · /: Root · Backspace: Parent",
         )
     } else if browser.purpose == FileBrowserPurpose::OpenTextFile {
         (
-            "F5 Open Read-only Reference · Enter Browse · Esc Cancel",
+            "Enter Open Read-only Reference or browse folder · Esc Cancel",
             "Tab/Shift+Tab: panes · Home: Home · /: Root · Backspace: Parent",
         )
     } else if matches!(
@@ -32014,12 +32486,12 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             | FileBrowserPurpose::ImportScrivenerSeries
     ) {
         (
-            "Enter Preview manifest / browse folder · F5 Inspect/Import · F7 New Folder · Esc Cancel",
+            "Enter imports selected project or browses folders · Alt+N New Folder · Esc Cancel",
             "Tab/Shift+Tab: tree → contents → name · Home: Home · /: Root · Backspace: Parent",
         )
     } else if browser.purpose == FileBrowserPurpose::ImportScrivenerDestination {
         (
-            "F4 Select Destination · F7 New Folder · Esc Back to Import Preview",
+            "Enter selects destination · Alt+N New Folder · Esc Back to Import Preview",
             "Tab/Shift+Tab: tree → contents → folder name · Enter opens folders · Backspace: Parent",
         )
     } else if browser.purpose == FileBrowserPurpose::NewProject {
@@ -32029,17 +32501,17 @@ fn draw_file_browser_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         )
     } else if browser.purpose == FileBrowserPurpose::SaveProjectAs {
         (
-            "F4 Select Folder · F5 Save Project Copy · F7 New Folder · Esc Cancel",
+            "Enter Save Project Copy · Alt+N New Folder · Esc Cancel",
             "Tab/Shift+Tab: panes and project name · Parent = current folder",
         )
     } else if browser.purpose == FileBrowserPurpose::BackupProjectArchive {
         (
-            "F5 Create Backup Archive · F7 New Folder · Esc Cancel",
+            "Enter Create Backup Archive · Alt+N New Folder · Esc Cancel",
             "Choose a new archive filename in a separate folder; existing files are not replaced",
         )
     } else {
         (
-            "F4 Select Folder · F5 Confirm · F7 New Folder · Esc Cancel",
+            "Enter Confirm · Alt+N New Folder · Esc Cancel",
             "Parent = current folder · Tab/Shift+Tab: panes and project name",
         )
     };
@@ -32213,7 +32685,7 @@ fn draw_text_import_preview(
         ),
     ];
     if preview.format == story_import::TextDocumentFormat::Org {
-        lines.push(format!("Org import mode: {mode} · F2 changes mode"));
+        lines.push(format!("Org import mode: {mode} · Alt+O changes mode"));
     }
     lines.push("Proposed content".into());
     for unit in &preview.units {
@@ -32263,7 +32735,7 @@ fn draw_text_import_preview(
         chunks[0],
     );
     frame.render_widget(
-        Paragraph::new("F5/Enter Import · ↑/↓ scroll · F2 Org mode · Esc back to files")
+        Paragraph::new("Enter Import · ↑/↓ scroll · Alt+O Org mode · Esc back to files")
             .wrap(Wrap { trim: true })
             .style(Style::default().fg(Color::Yellow)),
         chunks[1],
@@ -32290,9 +32762,10 @@ fn draw_keybinding_manager_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
     } else {
         "Project"
     };
+    let profile = effective_editor_keymap_profile(s.app.project_root());
     let block = Block::default()
         .title(format!(
-            " Keybinding Manager · {scope} · {context} · / filter · Esc close "
+            " Keybinding Manager · {scope} · {context} · {profile:?} · / filter · Esc close "
         ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
@@ -32313,14 +32786,7 @@ fn draw_keybinding_manager_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
                         .filter(|binding| {
                             binding.context == context && binding.command_id == command.id
                         })
-                        .map(|binding| {
-                            binding
-                                .sequence
-                                .iter()
-                                .map(|key| format_key_event(*key))
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        })
+                        .map(|binding| format_key_sequence(&binding.sequence))
                         .collect::<Vec<_>>()
                         .join(", ")
                 };
@@ -32335,7 +32801,7 @@ fn draw_keybinding_manager_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
             .block(Block::default().title(if manager.filtering {
                 format!("Filter: {}_", manager.filter)
             } else {
-                "Commands · b bind · u scope · r remove · Shift-R reset scope · Tab context".into()
+                "Commands · b bind · u scope · p profile · r remove · Shift-R reset scope · Tab context".into()
             })),
         inner,
         &mut ListState::default().with_selected(
@@ -33311,7 +33777,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
         let current_project = s.app.get_project().ok().map(|project| project.id);
         return match s.series_books() {
             Ok(books) if books.is_empty() => vec![
-                "No books in this series · use F10 Menu → Series → Import Scrivener Book or New Book"
+                "No books in this series · use Ctrl+/ → Series → Import Scrivener Book or New Book"
                     .into(),
             ],
             Ok(books) => books
@@ -33326,7 +33792,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                 })
                 .collect(),
             Err(_) => vec![
-                "No series selected · use F10 Menu → Series → Select Series or Create Series".into(),
+                "No series selected · use Ctrl+/ → Series → Select Series or Create Series".into(),
             ],
         };
     }
@@ -34907,7 +35373,9 @@ fn handle_find_panel_key(
         }
         return Ok(());
     }
-    if key.code == KeyCode::F(4) {
+    if key.code == KeyCode::F(4)
+        || (key.code == KeyCode::Char('s') && key.modifiers == KeyModifiers::ALT)
+    {
         let invalidate_preview = s.pending_replace.is_some();
         let mut scopes = vec!["current".to_owned()];
         scopes.push("open".into());
@@ -34948,7 +35416,9 @@ fn handle_find_panel_key(
         }
         return Ok(());
     }
-    if key.code == KeyCode::F(3) {
+    if key.code == KeyCode::F(3)
+        || (key.code == KeyCode::Char('n') && key.modifiers == KeyModifiers::ALT)
+    {
         if s.pending_replace.is_some() {
             s.step_replace_preview_match(!key.modifiers.contains(KeyModifiers::SHIFT));
         } else {
@@ -34956,15 +35426,22 @@ fn handle_find_panel_key(
         }
         return Ok(());
     }
-    if key.code == KeyCode::F(6) && s.pending_replace.is_some() {
+    if (key.code == KeyCode::F(6)
+        || (key.code == KeyCode::Char('i') && key.modifiers == KeyModifiers::ALT))
+        && s.pending_replace.is_some()
+    {
         s.toggle_replace_preview_match();
         return Ok(());
     }
-    if key.code == KeyCode::F(8) && s.pending_replace.is_some() {
+    if (key.code == KeyCode::F(8)
+        || (key.code == KeyCode::Char('p') && key.modifiers == KeyModifiers::ALT))
+        && s.pending_replace.is_some()
+    {
         s.toggle_replace_preview_file();
         return Ok(());
     }
-    if key.code == KeyCode::F(9)
+    if (key.code == KeyCode::F(9)
+        || (key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::ALT))
         && s.find_panel.as_ref().is_some_and(|panel| panel.replacing)
         && s.pending_replace.is_none()
     {
@@ -34981,7 +35458,9 @@ fn handle_find_panel_key(
         }
         return Ok(());
     }
-    if key.code == KeyCode::F(5) && s.find_panel.as_ref().is_some_and(|panel| panel.replacing) {
+    if (key.code == KeyCode::F(5) || (key.code == KeyCode::Enter && s.pending_replace.is_some()))
+        && s.find_panel.as_ref().is_some_and(|panel| panel.replacing)
+    {
         match s.execute_legacy_palette_command("replace-apply") {
             Ok(()) if s.pending_replace.is_none() => {
                 let result = s.message.clone();
@@ -35022,7 +35501,9 @@ fn handle_find_panel_key(
     }
     let panel = s.find_panel.as_mut().ok_or("find panel is closed")?;
     match key.code {
-        KeyCode::F(2) => {
+        KeyCode::F(2) | KeyCode::Char('t')
+            if key.code == KeyCode::F(2) || key.modifiers == KeyModifiers::ALT =>
+        {
             panel.mode = match panel.mode {
                 story_core::FindMode::Normal => story_core::FindMode::Wildcard,
                 story_core::FindMode::Wildcard => story_core::FindMode::Regex,
@@ -35030,9 +35511,21 @@ fn handle_find_panel_key(
                 story_core::FindMode::Extended => story_core::FindMode::Normal,
             };
         }
-        KeyCode::F(6) => panel.case_sensitive = !panel.case_sensitive,
-        KeyCode::F(7) => panel.whole_word = !panel.whole_word,
-        KeyCode::F(8) => panel.accent_sensitive = !panel.accent_sensitive,
+        KeyCode::F(6) | KeyCode::Char('c')
+            if key.code == KeyCode::F(6) || key.modifiers == KeyModifiers::ALT =>
+        {
+            panel.case_sensitive = !panel.case_sensitive
+        }
+        KeyCode::F(7) | KeyCode::Char('w')
+            if key.code == KeyCode::F(7) || key.modifiers == KeyModifiers::ALT =>
+        {
+            panel.whole_word = !panel.whole_word
+        }
+        KeyCode::F(8) | KeyCode::Char('a')
+            if key.code == KeyCode::F(8) || key.modifiers == KeyModifiers::ALT =>
+        {
+            panel.accent_sensitive = !panel.accent_sensitive
+        }
         KeyCode::Tab | KeyCode::BackTab => {
             let forward = key.code == KeyCode::Tab;
             panel.field = if panel.replacing {
@@ -35356,7 +35849,141 @@ fn handle_command_palette_key(
     Ok(())
 }
 
+fn handle_window_prefix_key(
+    state: &mut AppState,
+    key: KeyEvent,
+) -> Result<(), Box<dyn std::error::Error>> {
+    state.window_prefix_active = false;
+    if key.code == KeyCode::Esc && key.modifiers.is_empty() {
+        state.message = "Window command cancelled · no pane or manuscript changes".into();
+        return Ok(());
+    }
+
+    let action_result = match key.code {
+        KeyCode::Up if key.modifiers.is_empty() => {
+            state.focus_window_direction(pane_layout::Direction::Up)
+        }
+        KeyCode::Down if key.modifiers.is_empty() => {
+            state.focus_window_direction(pane_layout::Direction::Down)
+        }
+        KeyCode::Left if key.modifiers.is_empty() => {
+            state.focus_window_direction(pane_layout::Direction::Left)
+        }
+        KeyCode::Right if key.modifiers.is_empty() => {
+            state.focus_window_direction(pane_layout::Direction::Right)
+        }
+        KeyCode::Char(number @ '1'..='4') if key.modifiers.is_empty() => {
+            state.focus_window_number(number as u8 - b'0')
+        }
+        KeyCode::Tab | KeyCode::BackTab
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            state.focus_window_next(
+                key.code == KeyCode::BackTab || key.modifiers == KeyModifiers::SHIFT,
+            )
+        }
+        KeyCode::Char(character)
+            if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
+        {
+            match character.to_ascii_lowercase() {
+                'h' => state.split_focused_window(pane_layout::Orientation::Horizontal),
+                'v' => state.split_focused_window(pane_layout::Orientation::Vertical),
+                'x' => state.close_focused_window(),
+                'm' => state.dispatch_registered_command_id("window.maximize"),
+                'p' => {
+                    state.open_window_layout_picker();
+                    Ok(())
+                }
+                '?' => {
+                    state.help_panel = Some(HelpPanel {
+                        title: "Window Management".into(),
+                        lines: vec![
+                            r"Prefix: Ctrl+\ (Control and Backslash together; terminal byte 0x1C)".into(),
+                            r"After the prefix: Up/Down/Left/Right focuses the nearest pane".into(),
+                            "1–4 focuses the pane with that stable number".into(),
+                            "Tab / Shift+Tab focuses the next / previous pane".into(),
+                            "H / V splits horizontally / vertically".into(),
+                            "X closes the focused pane · M maximises/restores it".into(),
+                            "P selects a saved workspace layout · Esc cancels the prefix".into(),
+                            "Alternatives: View menu, F6 and Shift+F6; numbers are shown in pane titles".into(),
+                            "On conventional terminals Ctrl+\\ arrives as Ctrl+4; those two physical chords share byte 0x1C".into(),
+                        ],
+                        scroll: 0,
+                    });
+                    state.message = "Window shortcuts · Esc closes this help".into();
+                    Ok(())
+                }
+                _ => Err("unsupported window command".into()),
+            }
+        }
+        _ => Err("unsupported window command".into()),
+    };
+    if let Err(error) = action_result {
+        state.message = if error.to_string() == "unsupported window command" {
+            "Window command not recognised · no action taken".into()
+        } else {
+            format!("Window command could not be completed: {error}")
+        };
+    }
+    Ok(())
+}
+
 fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Error>> {
+    let k = normalize_standard_terminal_key(s, k);
+    if s.window_prefix_active {
+        handle_window_prefix_key(s, k)?;
+        return Ok(false);
+    }
+    if let Some(picker) = s.window_layout_picker.as_mut() {
+        match k.code {
+            KeyCode::Esc => {
+                s.window_layout_picker = None;
+                s.message =
+                    "Workspace layout selection cancelled · current arrangement unchanged".into();
+            }
+            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
+            KeyCode::Down => {
+                picker.selected = (picker.selected + 1).min(picker.names.len().saturating_sub(1));
+            }
+            KeyCode::Enter => {
+                let name = picker.names.get(picker.selected).cloned();
+                s.window_layout_picker = None;
+                if let Some(name) = name {
+                    match s.load_named_window_layout(&name) {
+                        Ok(()) => s.message = format!("Loaded workspace layout ‘{name}’"),
+                        Err(error) => {
+                            s.message = format!("Workspace layout was not changed: {error}")
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(' ') => {
+                let name = picker.names.get(picker.selected).cloned();
+                s.window_layout_picker = None;
+                if let Some(name) = name {
+                    match s.load_named_window_layout(&name) {
+                        Ok(()) => s.message = format!("Loaded workspace layout ‘{name}’"),
+                        Err(error) => {
+                            s.message = format!("Workspace layout was not changed: {error}")
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    let k = if k.code == KeyCode::Char(' ')
+        && (s.pending_series_book_removal.is_some()
+            || s.pending_structural_node_removal.is_some()
+            || s.pending_content_unit_removal.is_some()
+            || s.pending_scene_removal.is_some()
+            || s.pending_reading_removal.is_some())
+    {
+        KeyEvent::new(KeyCode::Enter, k.modifiers)
+    } else {
+        k
+    };
     if let Some(book) = s.pending_series_book_removal.clone() {
         match k.code {
             KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
@@ -35551,14 +36178,13 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         .help_panel
         .as_ref()
         .is_some_and(|panel| panel.title.starts_with("Tutorial ·"));
-    if tutorial_has_focus && k.code == KeyCode::F(6) {
-        s.message =
-            "The tutorial uses Enter to continue · F6 remains assigned to your workspace".into();
-        return Ok(false);
-    }
     if tutorial_has_focus && s.file_browser.is_none() && s.find_panel.is_none() {
         match k.code {
             KeyCode::F(4) => {
+                s.advance_tutorial(-1)?;
+                return Ok(false);
+            }
+            KeyCode::Char('p') if k.modifiers == KeyModifiers::ALT => {
                 s.advance_tutorial(-1)?;
                 return Ok(false);
             }
@@ -35566,7 +36192,15 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.retry_tutorial_step()?;
                 return Ok(false);
             }
+            KeyCode::Char('r') if k.modifiers == KeyModifiers::ALT => {
+                s.retry_tutorial_step()?;
+                return Ok(false);
+            }
             KeyCode::F(7) => {
+                s.advance_tutorial(2)?;
+                return Ok(false);
+            }
+            KeyCode::Char('s') if k.modifiers == KeyModifiers::ALT => {
                 s.advance_tutorial(2)?;
                 return Ok(false);
             }
@@ -35574,8 +36208,25 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 s.exit_tutorial()?;
                 return Ok(false);
             }
+            KeyCode::Char('q') if k.modifiers == KeyModifiers::ALT => {
+                s.exit_tutorial()?;
+                return Ok(false);
+            }
             _ => {}
         }
+    }
+    let tutorial_non_function_control =
+        matches!(k.code, KeyCode::Char('p' | 'r' | 's' | 'q')) && k.modifiers == KeyModifiers::ALT;
+    if tutorial_has_focus
+        && tutorial_lesson_complete(s)
+        && !matches!(
+            k.code,
+            KeyCode::Enter | KeyCode::Esc | KeyCode::F(4 | 5 | 7 | 8)
+        )
+        && !tutorial_non_function_control
+    {
+        s.message = "Lesson complete · press Enter to continue".into();
+        return Ok(false);
     }
     if tutorial_has_focus && k.code == KeyCode::Enter {
         if tutorial_next_action(s).is_none() {
@@ -35589,6 +36240,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     } else if tutorial_has_focus
         && k.code != KeyCode::Esc
         && !matches!(k.code, KeyCode::F(4 | 5 | 7 | 8))
+        && !tutorial_non_function_control
         && !tutorial_key_is_expected(s, k)
     {
         s.message = format!("Next: {}", tutorial_expected_action_hint(s));
@@ -35613,6 +36265,25 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             s.file_browser = previous_browser;
             s.message = format!("File browser error: {error}");
         }
+        return Ok(false);
+    }
+    if s.workspace == Workspace::Editor
+        && s.menu.is_none()
+        && s.find_panel.is_none()
+        && s.mode.is_none()
+        && s.keybinding_manager.is_none()
+        && s.help_panel.is_none()
+        && effective_editor_keymap_profile(s.app.project_root()) == EditorKeymapProfile::WordStar
+        // Application-wide commands (notably Ctrl+S Save) take precedence
+        // over editor-profile defaults. Profiles may customise manuscript
+        // editing, but cannot shadow the shared application command layer.
+        && registered_global_command_for_key(s, k).is_none()
+        && !s
+            .command_bindings
+            .iter()
+            .any(|(event, _)| same_keycode(event.code, k.code) && event.modifiers == k.modifiers)
+        && handle_wordstar_editor_key(s, k)?
+    {
         return Ok(false);
     }
     if let Some(command) = registered_global_command_for_key(s, k) {
@@ -35749,7 +36420,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                                 format!("{title} - {}.docx", safe_filename(&profile.display_name));
                         }
                         s.message = format!(
-                            "Compile with {} · F2 changes output format · choose a destination",
+                            "Compile with {} · Alt+F changes output format · choose a destination",
                             profile.display_name
                         );
                     } else {
@@ -35763,9 +36434,6 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         if panel_title.is_some_and(|title| title.starts_with("Tutorial ·")) {
             match k.code {
-                KeyCode::F(6) => {
-                    s.message = "The tutorial uses Enter to continue · F6 remains assigned to your workspace".into();
-                }
                 KeyCode::Char('q' | 'Q') if s.workspace != Workspace::Editor => {
                     s.exit_tutorial()?;
                     return Ok(false);
@@ -37193,6 +37861,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     .filter(|workspace| *workspace != Workspace::Dashboard)
                     .unwrap_or(Workspace::Outline);
                 s.switch(previous);
+                s.message = format!("Returned to {}", previous.title());
                 if previous == Workspace::Outline
                     && let Some(scene) = scene
                 {
@@ -37670,6 +38339,106 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         KeyCode::Enter => s.open_selected()?,
         _ => {}
+    }
+    Ok(false)
+}
+
+fn handle_wordstar_editor_key(
+    state: &mut AppState,
+    key: KeyEvent,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let control = KeyModifiers::CONTROL;
+    if state
+        .pending_command_sequence
+        .as_ref()
+        .is_some_and(|pending| pending.context == "wordstar")
+    {
+        let pending = state.pending_command_sequence.take().unwrap();
+        if pending.started.elapsed() < KEY_SEQUENCE_TIMEOUT && key.code == KeyCode::Esc {
+            state.message = "WordStar command cancelled".into();
+            return Ok(true);
+        }
+        if pending.started.elapsed() < KEY_SEQUENCE_TIMEOUT {
+            match (pending.sequence.first().map(|event| event.code), key.code) {
+                (Some(KeyCode::Char('q')), KeyCode::Char('s')) if key.modifiers == control => {
+                    state.move_editor_cursors(CursorMotion::Home, false);
+                    return Ok(true);
+                }
+                (Some(KeyCode::Char('q')), KeyCode::Char('d')) if key.modifiers == control => {
+                    state.move_editor_cursors(CursorMotion::End, false);
+                    return Ok(true);
+                }
+                (Some(KeyCode::Char('q')), KeyCode::Char('r')) if key.modifiers == control => {
+                    state.move_cursor(0, 0, false);
+                    return Ok(true);
+                }
+                (Some(KeyCode::Char('q')), KeyCode::Char('c')) if key.modifiers == control => {
+                    let row = state.editor.len().saturating_sub(1);
+                    let column = state.editor.get(row).map_or(0, |line| grapheme_count(line));
+                    state.move_cursor(row, column, false);
+                    return Ok(true);
+                }
+                (Some(KeyCode::Char('k')), KeyCode::Char('b')) if key.modifiers == control => {
+                    state.editor_selection = Some(state.cursor);
+                    state.message = "WordStar block start marked".into();
+                    return Ok(true);
+                }
+                (Some(KeyCode::Char('k')), KeyCode::Char('k')) if key.modifiers == control => {
+                    if state.editor_selection.is_none() {
+                        state.editor_selection = Some(state.cursor);
+                    }
+                    state.message = "WordStar block end marked".into();
+                    return Ok(true);
+                }
+                (Some(KeyCode::Char('k')), KeyCode::Char('c')) if key.modifiers == control => {
+                    state.copy_selected_text()?;
+                    state.message = "WordStar block copied to WIDE's internal clipboard".into();
+                    return Ok(true);
+                }
+                (Some(KeyCode::Char('k')), KeyCode::Char('y')) if key.modifiers == control => {
+                    state.delete_selected_text();
+                    return Ok(true);
+                }
+                _ => {
+                    state.message = "WordStar sequence not recognised · no action taken".into();
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    if key.modifiers == control {
+        match key.code {
+            KeyCode::Char('e') => state.move_editor_cursors(CursorMotion::Up, false),
+            // These chords are reserved by the application-wide standard:
+            // Ctrl+S saves and Ctrl+X cuts. Keep the familiar arrow keys for
+            // left/down movement rather than letting a profile steal them.
+            KeyCode::Char('s' | 'x') => return Ok(false),
+            KeyCode::Char('d') => state.move_editor_cursors(CursorMotion::Right, false),
+            KeyCode::Char('r') => {
+                state.scroll = state
+                    .scroll
+                    .saturating_sub(state.editor_viewport_height.max(1));
+            }
+            KeyCode::Char('c') => {
+                state.scroll = state
+                    .scroll
+                    .saturating_add(state.editor_viewport_height.max(1));
+            }
+            KeyCode::Char('q' | 'k') => {
+                state.pending_command_sequence = Some(PendingCommandSequence {
+                    context: "wordstar".into(),
+                    sequence: vec![key],
+                    started: Instant::now(),
+                });
+                state.message = if key.code == KeyCode::Char('q') {
+                    r"WordStar prefix Ctrl+Q · use Ctrl+Q then S/D for line ends or R/C for document ends · Esc cancels".into()
+                } else {
+                    r"WordStar prefix Ctrl+K · use Ctrl+K then B/K to mark a block, C to copy, or Y to delete · Esc cancels".into()
+                };
+            }
+            _ => return Ok(false),
+        }
+        return Ok(true);
     }
     Ok(false)
 }
@@ -39674,7 +40443,7 @@ mod tests {
         assert!(
             state
                 .message
-                .contains("Enter opens folders/previews manifests")
+                .contains("Enter opens a folder or imports a Scrivener project")
         );
     }
 
@@ -40344,7 +41113,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             effective_command_shortcuts(&state, command_by_id("menu.main").unwrap()),
-            vec!["F10"]
+            vec!["Alt+M", "F10"]
         );
         handle(
             &mut state,
@@ -40450,7 +41219,7 @@ mod tests {
         let registry = command_registry();
         assert_eq!(
             command_by_id("menu.main").unwrap().default_shortcuts,
-            &["Ctrl+/", "F10"]
+            &["Ctrl+/", "Alt+M", "F10"]
         );
         assert_eq!(
             format_key_event(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL)),
@@ -43543,7 +44312,7 @@ mod tests {
         state.function_bindings.push((10, Workspace::Analytics));
         assert_eq!(
             effective_command_shortcuts(&state, command_by_id("menu.main").unwrap()),
-            vec!["Ctrl+/"]
+            vec!["Ctrl+/", "Alt+M"]
         );
         handle(
             &mut state,
@@ -43559,12 +44328,12 @@ mod tests {
         state.workspace = Workspace::Editor;
         state.context_command_bindings = vec![ContextCommandBinding {
             context: "editor".into(),
-            sequence: parse_key_sequence("Ctrl+/ F").unwrap(),
+            sequence: parse_key_sequence("Ctrl+/, F").unwrap(),
             command_id: "menu.main".into(),
         }];
         assert_eq!(
             effective_command_shortcuts(&state, command_by_id("menu.main").unwrap()),
-            vec!["Ctrl+/ F"]
+            vec!["Ctrl+/, F", "Alt+M"]
         );
         handle(
             &mut state,
@@ -43639,8 +44408,7 @@ mod tests {
 
         let panel = context_help_panel(&state);
         assert!(panel.lines.iter().any(|line| {
-            line.contains("Ctrl+Tab switches to an open reference pane")
-                && line.contains("Esc returns to the manuscript")
+            line.contains(r"Ctrl+\ then an arrow") && line.contains("F6 / Shift+F6 cycles")
         }));
         assert!(panel.lines.iter().any(|line| {
             line.contains("Tab inserts indentation") && line.contains("Esc leaves for Outline")
@@ -43650,6 +44418,378 @@ mod tests {
                 .lines
                 .iter()
                 .any(|line| line.contains("Ctrl+G switches"))
+        );
+    }
+
+    #[test]
+    fn approved_global_pane_shortcuts_follow_recursive_layout_and_restore_each_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Draft", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.pane_bounds = pane_layout::PaneRect {
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 50,
+        };
+        state.cursor = (0, 1);
+        state
+            .split_focused_window(pane_layout::Orientation::Vertical)
+            .unwrap();
+        let right_pane = state.reference_panes[0].layout_id.unwrap();
+        assert_eq!(state.pane_layout.as_ref().unwrap().number(1), Some(1));
+        assert_eq!(
+            state.pane_layout.as_ref().unwrap().number(right_pane),
+            Some(2)
+        );
+
+        state.cursor = (0, 5);
+        // Crossterm's conventional terminal decoder reports ASCII FS (0x1C)
+        // as Ctrl+4. The shortcut parser accepts Ctrl+\\ as the same event.
+        let decoded_ctrl_backslash = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL);
+        handle(&mut state, decoded_ctrl_backslash).unwrap();
+        assert!(state.window_prefix_active);
+        handle(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        assert!(!state.reference_focused);
+        assert_eq!(state.pane_layout.as_ref().unwrap().focused(), 1);
+        assert_eq!(state.cursor, (0, 1));
+        assert_eq!(state.reference_panes[0].cursor, (0, 5));
+
+        state.cursor = (0, 2);
+        handle(&mut state, decoded_ctrl_backslash).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Right, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.reference_focused);
+        assert_eq!(state.pane_layout.as_ref().unwrap().focused(), right_pane);
+        assert_eq!(state.cursor, (0, 5));
+        assert_eq!(state.reference_panes[0].cursor, (0, 2));
+
+        handle(&mut state, KeyEvent::new(KeyCode::F(6), KeyModifiers::NONE)).unwrap();
+        assert!(!state.reference_focused);
+        assert_eq!(state.pane_layout.as_ref().unwrap().focused(), 1);
+        assert_eq!(state.cursor, (0, 2));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::F(6), KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        assert!(state.reference_focused);
+        assert_eq!(state.pane_layout.as_ref().unwrap().focused(), right_pane);
+        assert_eq!(state.cursor, (0, 5));
+
+        for (id, expected) in [("window.next", "F6"), ("window.previous", "Shift+F6")] {
+            assert!(
+                effective_command_shortcuts(&state, command_by_id(id).unwrap())
+                    .iter()
+                    .any(|shortcut| shortcut == expected),
+                "{id} should advertise {expected}"
+            );
+        }
+        assert_eq!(
+            effective_command_shortcuts(&state, command_by_id("window.prefix").unwrap()),
+            vec![r"Ctrl+\"]
+        );
+        for id in [
+            "window.focus-up",
+            "window.focus-down",
+            "window.focus-left",
+            "window.focus-right",
+            "window.split-side-by-side",
+            "window.split-top-bottom",
+            "window.close",
+        ] {
+            assert!(effective_command_shortcuts(&state, command_by_id(id).unwrap()).is_empty());
+        }
+        assert!(workspace_default_shortcuts(Workspace::Characters).is_empty());
+        assert!(workspace_default_shortcuts(Workspace::Search).is_empty());
+    }
+
+    #[test]
+    fn window_prefix_activates_from_every_nonmodal_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let prefix = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL);
+        for workspace in Workspace::ALL {
+            state.workspace = workspace;
+            handle(&mut state, prefix).unwrap();
+            assert!(
+                state.window_prefix_active,
+                "prefix was not active in {workspace:?}"
+            );
+            handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+            assert!(!state.window_prefix_active);
+            assert!(state.message.contains("cancelled"));
+        }
+    }
+
+    #[test]
+    fn window_prefix_p_opens_a_selectable_layout_dialog_and_enter_loads_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Draft", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.pane_bounds = pane_layout::PaneRect {
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 50,
+        };
+        state.save_named_window_layout("Writing").unwrap();
+        state
+            .split_focused_window(pane_layout::Orientation::Vertical)
+            .unwrap();
+        assert_eq!(state.pane_layout.as_ref().unwrap().pane_count(), 2);
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.window_layout_picker.as_ref().unwrap().names,
+            ["Writing"]
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.window_layout_picker.is_none());
+        assert_eq!(state.pane_layout.as_ref().unwrap().pane_count(), 1);
+        assert!(state.message.contains("Loaded workspace layout"));
+    }
+
+    #[test]
+    fn global_close_project_shortcut_uses_the_registered_command_without_function_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        assert_eq!(
+            effective_command_shortcuts(&state, command_by_id("file.close-project").unwrap()),
+            ["Ctrl+W"]
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.workspace, Workspace::Dashboard);
+        assert!(state.message.contains("closed") || state.message.contains("start"));
+    }
+
+    #[test]
+    fn global_save_shortcut_works_from_the_outline_and_focuses_the_save_action() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.temporary_project = true;
+        assert_eq!(
+            registered_global_command_for_key(
+                &state,
+                KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL)
+            )
+            .map(|command| command.id),
+            Some("file.save")
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        let browser = state
+            .file_browser
+            .as_ref()
+            .expect("Save opens its destination browser");
+        assert_eq!(browser.purpose, FileBrowserPurpose::SaveProjectAs);
+        assert_eq!(
+            browser.focus, 2,
+            "Enter should act on the advertised save control"
+        );
+    }
+
+    #[test]
+    fn keybinding_manager_selects_and_persists_wordstar_profile_with_editor_navigation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["one two".into(), "three".into()];
+        state.cursor = (0, 2);
+        state
+            .execute_legacy_palette_command("keybinding-manager")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            effective_editor_keymap_profile(state.app.project_root()),
+            EditorKeymapProfile::WordStar
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(
+            state.cursor,
+            (0, 2),
+            "global Ctrl+S must not be shadowed by WordStar"
+        );
+        assert!(state.message.contains("saved") || state.message.contains("Save"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.cursor.0, 0, "WordStar Ctrl+E moves up");
+        state.cursor = (0, 3);
+        state.editor_selection = Some((0, 0));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert_eq!(state.editor[0], " two", "global Ctrl+X cuts selected text");
+        assert_eq!(state.clipboard, "one");
+    }
+
+    #[test]
+    fn ctrl_backslash_prefix_is_keymap_configurable_and_does_not_override_user_bindings() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Draft", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.editor = vec!["Existing draft text".into()];
+
+        let prefix = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL);
+        assert_eq!(parse_shortcut(r"Ctrl+\").unwrap(), prefix);
+        assert_eq!(parse_shortcut("Ctrl+4").unwrap(), prefix);
+        assert_eq!(format_key_event(prefix), r"Ctrl+\");
+        assert_eq!(
+            parse_shortcut("Ctrl+/").unwrap(),
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL)
+        );
+        assert!(parse_shortcut("Ctrl++").is_err());
+
+        state.command_bindings = vec![(prefix, "edit.select-all".into())];
+        handle(&mut state, prefix).unwrap();
+        assert!(!state.window_prefix_active);
+        assert_eq!(state.editor.join("\n"), "Existing draft text");
+        assert_eq!(
+            state.message,
+            "Selected all text in the current manuscript document"
+        );
+        assert_eq!(
+            state.selected_text().as_deref(),
+            Some("Existing draft text")
+        );
+
+        state.command_bindings.clear();
+        state.command_bindings = vec![(parse_shortcut("Ctrl+F").unwrap(), "window.prefix".into())];
+        assert_eq!(
+            effective_command_shortcuts(&state, command_by_id("window.prefix").unwrap()),
+            vec!["Ctrl+F"]
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+        )
+        .unwrap();
+        assert!(state.window_prefix_active);
+    }
+
+    #[test]
+    fn ctrl_backslash_notation_round_trips_through_toml_and_menu_shortcut_formatting() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let config = app.project_root().join(".writers-ide/keybindings.toml");
+        fs::write(
+            &config,
+            r#"[commands]
+"Ctrl+\\" = "window.prefix"
+"#,
+        )
+        .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.command_bindings = load_command_bindings(state.app.project_root()).unwrap();
+        let prefix = KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL);
+        assert!(
+            state
+                .command_bindings
+                .contains(&(prefix, "window.prefix".into()))
+        );
+        assert_eq!(
+            effective_command_shortcuts(&state, command_by_id("window.prefix").unwrap()),
+            vec![r"Ctrl+\"]
+        );
+        assert_eq!(
+            command_by_id("window.prefix").unwrap().label,
+            "Window Commands…"
+        );
+
+        state
+            .execute_legacy_palette_command(r"keybinding-set Ctrl+\ window.prefix")
+            .unwrap();
+        state.command_bindings = load_command_bindings(state.app.project_root()).unwrap();
+        assert!(
+            state
+                .command_bindings
+                .contains(&(prefix, "window.prefix".into()))
+        );
+        assert_eq!(
+            effective_command_shortcuts(&state, command_by_id("window.prefix").unwrap()),
+            vec![r"Ctrl+\"]
+        );
+    }
+
+    #[test]
+    fn prefix_sequence_notation_uses_comma_for_sequential_keys_and_plus_only_for_modifiers() {
+        let prefix_then_one = parse_key_sequence(r"Ctrl+\, 1").unwrap();
+        assert_eq!(prefix_then_one.len(), 2);
+        assert_eq!(
+            prefix_then_one[0],
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL)
+        );
+        assert_eq!(
+            prefix_then_one[1],
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE)
+        );
+        assert_eq!(format_key_sequence(&prefix_then_one), r"Ctrl+\, 1");
+        let simultaneous = parse_shortcut("Ctrl+Shift+O").unwrap();
+        assert_eq!(
+            simultaneous.modifiers,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT
+        );
+        assert_eq!(format_key_event(simultaneous), "Ctrl+Shift+O");
+        assert_eq!(
+            format_key_event(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::SHIFT)),
+            "Shift+Plus"
+        );
+        assert_eq!(
+            parse_shortcut("Shift+Plus").unwrap().code,
+            KeyCode::Char('+')
         );
     }
 
@@ -43668,6 +44808,22 @@ mod tests {
         )
         .unwrap();
         assert!(state.help_panel.is_none());
+        assert!(state.menu.is_some());
+    }
+
+    #[test]
+    fn conventional_ctrl_slash_terminal_byte_opens_menu_from_its_decoded_ctrl_seven_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        let decoded_control_slash = KeyEvent::new(KeyCode::Char('7'), KeyModifiers::CONTROL);
+        assert_eq!(
+            registered_global_command_for_key(&state, decoded_control_slash)
+                .map(|command| command.id),
+            Some("menu.main")
+        );
+        handle(&mut state, decoded_control_slash).unwrap();
         assert!(state.menu.is_some());
     }
 
@@ -43921,6 +45077,8 @@ mod tests {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -46460,10 +47618,8 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Wildcards (*, ?)") || rendered.contains("Wildcards"));
         assert!(rendered.contains("Tab/Shift+Tab: fields"));
-        assert!(rendered.contains("F9: Replace This"));
-        assert!(
-            rendered.contains("F5: Apply Replace All") || rendered.contains("Enter: Preview all")
-        );
+        assert!(rendered.contains("Alt+R: Replace This"));
+        assert!(rendered.contains("Enter: Preview all"));
     }
 
     #[test]
@@ -47881,6 +49037,8 @@ mod tests {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -48049,6 +49207,8 @@ mod tests {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -48325,6 +49485,8 @@ mod tests {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -48497,6 +49659,8 @@ mod tests {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -48819,6 +49983,8 @@ mod tests {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -48991,6 +50157,8 @@ mod tests {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -49244,8 +50412,14 @@ mod tests {
         assert!(screen.contains("Save failed") || screen.contains("not saved"));
         assert!(screen.contains("UNSAVED"));
         assert!(screen.contains("Save Ctrl+S"));
-        assert!(screen.contains("Menu Ctrl+/ or F10"));
-        assert!(screen.contains("Help Help menu"));
+        assert!(
+            screen.contains("Menu") && screen.contains("Ctrl+/"),
+            "{screen:?}"
+        );
+        assert!(
+            screen.contains("? Help") || screen.contains("Help"),
+            "{screen:?}"
+        );
         assert!(screen.contains("Quit Without Saving") || screen.contains("Quit Without Sav"));
     }
 
@@ -49697,6 +50871,7 @@ mod tests {
                             | "view.reference-outline"
                             | "view.reference-timeline"
                             | "view.reference-diagnostics"
+                            | "window.prefix"
                             | "window.switch-view"
                             | "window.split-side-by-side"
                             | "window.split-top-bottom"
@@ -50226,7 +51401,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(
-            narrow.contains("hold Ctrl, press / or F10 Menu"),
+            narrow.contains("hold Ctrl, press / or Alt+M or F10 Menu"),
             "{narrow:?}"
         );
 
@@ -50833,6 +52008,8 @@ mod tests {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -51222,6 +52399,8 @@ mod tests {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -52858,6 +54037,8 @@ mod tests {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -53041,6 +54222,8 @@ mod tests {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -53276,6 +54459,8 @@ mod tests {
             extra_cursors: Vec::new(),
             active_challenge: None,
             menu: None,
+            window_prefix_active: false,
+            window_layout_picker: None,
             reference_panes: Vec::new(),
             active_reference: 0,
             reference_focused: false,
@@ -53799,7 +54984,7 @@ mod tests {
             panel
                 .lines
                 .iter()
-                .any(|line| line.contains("Press F10 to open the menu"))
+                .any(|line| line.contains("Press Ctrl+/ to open the menu"))
         );
         assert!(
             !panel
@@ -53817,13 +55002,13 @@ mod tests {
             panel
                 .lines
                 .iter()
-                .any(|line| line.contains("0/9 verified · Press F10 to open the menu"))
+                .any(|line| line.contains("0/9 verified · Press Ctrl+/ to open the menu"))
         );
         assert!(panel.lines.iter().any(|line| {
-            line.contains("F4 Back")
-                && line.contains("F5 Retry")
-                && line.contains("F7 Skip")
-                && line.contains("F8 Exit")
+            line.contains("Alt+P Previous")
+                && line.contains("Alt+R Retry")
+                && line.contains("Alt+S Skip")
+                && line.contains("Alt+Q Exit")
         }));
 
         let initial_workspace = state.workspace;
@@ -53850,7 +55035,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(screen.contains("0/9 verified · Press F10 to open the menu"));
+        assert!(screen.contains("0/9 verified · Press Ctrl+/ to open the menu"));
         assert!(screen.contains("Dashboard"), "workspace remains visible");
 
         let mut preferences = onboarding::load(&preferences_path).unwrap();
@@ -54349,7 +55534,11 @@ mod tests {
         assert_eq!(progress.step, 0);
         assert_eq!(state.workspace, workspace_before_f6);
         assert!(state.help_panel.is_some());
-        assert!(state.message.contains("uses Enter to continue"));
+        assert!(
+            state.message.contains("press Enter to continue"),
+            "the completed tutorial modal should explain how to continue, got {:?}",
+            state.message
+        );
 
         for (width, height) in [(80, 24), (236, 60)] {
             let mut terminal =
@@ -55990,7 +57179,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("Import Document · Preview"));
-        assert!(screen.contains("F5/Enter Import"));
+        assert!(screen.contains("Enter Import"));
 
         state
             .handle_file_browser_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))

@@ -3,9 +3,11 @@
 #   $XDG_CONFIG_HOME/writers-ide/keybindings.toml
 # or to a project's .writers-ide/keybindings.toml
 #
-# These are overrides, not editor profiles. The built-in Writer's IDE defaults
-# remain active for bindings you do not replace. Project bindings take
-# precedence over user bindings for the same key/context.
+# Set this to "standard", "word-star", or "custom". Standard is the default;
+# WordStar supplies non-conflicting cursor and block-editing conventions;
+# global shortcuts such as Ctrl+S Save and Ctrl+X Cut keep precedence. Custom
+# keeps Standard behaviour and applies these user/project overrides.
+profile = "standard"
 
 [bindings]
 # Function-key workspace navigation; unspecified workspace keys keep defaults.
@@ -24,12 +26,12 @@ F4 = "Reading"
 "Ctrl+Alt+P" = "command.palette-open"
 
 [contexts.editor]
-# Multi-stroke sequences are available in a specific interaction context.
-"Ctrl+X Ctrl+S" = "file.save"
+# Commas separate sequential chords; plus signs combine simultaneous keys.
+"Ctrl+X, Ctrl+S" = "file.save"
 
 [contexts.navigation]
-"Ctrl+X Ctrl+F" = "file.open-project"
+"Ctrl+X, Ctrl+F" = "file.open-project"
 
 [contexts.menu]
 # The same key may be used in distinct contexts when sequences do not conflict.
-"Ctrl+X Ctrl+H" = "help.context"
+"Ctrl+X, Ctrl+H" = "help.context"
