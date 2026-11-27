@@ -17185,7 +17185,7 @@ impl AppState {
                     self.save_conflict_context()
                 );
             }
-            CommandAction::RestoreRevisionHunk => self.restore_selected_revision_hunk()?,
+            CommandAction::RestoreRevisionHunk => self.request_revision_hunk_restore()?,
             CommandAction::Process {
                 expand_transclusions,
             } => {
@@ -25344,7 +25344,38 @@ impl AppState {
         Ok(())
     }
 
-    fn restore_selected_revision_hunk(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn request_revision_hunk_restore(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err("save the current manuscript buffer before restoring a revision".into());
+        }
+        let scene = self.revision_scene.ok_or("open a snapshot diff first")?;
+        let snapshot = self.revision_diff.ok_or("open a snapshot diff first")?;
+        let diff = self.app.diff_snapshot(scene, snapshot)?;
+        let hunks = revision_hunks(&diff);
+        if self.revision_hunk >= hunks.len() {
+            return Err("the selected snapshot has no changed hunk".into());
+        }
+        let snapshot_label = self
+            .app
+            .list_snapshots(scene)?
+            .into_iter()
+            .find(|entry| entry.id == snapshot)
+            .map(|entry| entry.label)
+            .unwrap_or_else(|| "selected snapshot".into());
+        self.mode = Some('V');
+        self.prompt = format!(
+            "Restore hunk {}/{} from ‘{}’? Enter/y confirms · Esc cancels",
+            self.revision_hunk + 1,
+            hunks.len(),
+            snapshot_label
+        );
+        self.message =
+            "Only the highlighted hunk will be replaced; current text is preserved in a new snapshot"
+                .into();
+        Ok(())
+    }
+
+    fn confirm_revision_hunk_restore(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if self.dirty {
             return Err("save the current manuscript buffer before restoring a revision".into());
         }
@@ -25365,6 +25396,8 @@ impl AppState {
             self.cursor = (0, 0);
             self.editor_selection = None;
         }
+        self.mode = None;
+        self.prompt.clear();
         self.revision_diff = None;
         self.revision_hunk = 0;
         self.refresh()?;
@@ -35061,6 +35094,24 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT =>
                 {
                     s.prompt.push(character);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        if s.mode == Some('V') {
+            match k.code {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                    if let Err(error) = s.confirm_revision_hunk_restore() {
+                        s.message = format!(
+                            "Revision was not restored; your current manuscript remains unchanged: {error}"
+                        );
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                    s.mode = None;
+                    s.prompt.clear();
+                    s.message = "Revision restore cancelled; manuscript unchanged".into();
                 }
                 _ => {}
             }
@@ -49617,6 +49668,30 @@ mod tests {
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, Some('V'));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "first\nnew\nlast\n",
+            "requesting restoration must not mutate the manuscript"
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.mode, None);
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "first\nnew\nlast\n",
+            "cancelling restoration must leave current text intact"
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.mode, Some('V'));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         )
         .unwrap();
         assert_eq!(

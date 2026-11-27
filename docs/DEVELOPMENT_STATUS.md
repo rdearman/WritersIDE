@@ -1,5 +1,29 @@
 # Writer's IDE Development Status
 
+## Confirm revision-hunk restoration before applying — 27 November 2026
+
+Revision history previously restored a highlighted hunk immediately when the
+author pressed `r`. It now opens a focused confirmation naming the snapshot and
+hunk; Enter or `y` applies only that hunk, while Escape or `n` cancels and
+leaves the current diff/text unchanged. Confirmation re-reads the selected
+snapshot diff and current document hash before writing. The existing restore
+service still creates a safety snapshot of the pre-restore text. Unit coverage
+verifies both cancellation and confirmation, and the production Linux PTY
+journey performs cancel-then-confirm, exits and reopens to verify the restored
+text and safety snapshot.
+
+Focused unit tests and the production Linux PTY test pass. Verification on
+27 November 2026: `cargo fmt --all -- --check`,
+`cargo clippy --offline --workspace --all-targets -- -D warnings`, and
+`cargo test --offline --workspace -- --test-threads=1` all passed. The test
+run included 38 PTY tests; one protected private-corpus test was intentionally
+ignored because its local fixture path was not configured. An initial test run
+exposed a collision with the existing chapter-title input mode; revision
+confirmation now uses a distinct mode, and the full suite passes after that
+correction. This resolves the explicit confirmation gap in #69 but does not
+complete whole-document restoration, snapshot rename/retention policy, or
+human UAT.
+
 ## Scrivener inherited section-type profile suppression — 27 November 2026
 
 Compile profiles previously applied a Scrivener layout's `Include Text=No`

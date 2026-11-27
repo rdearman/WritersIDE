@@ -451,6 +451,15 @@ def main():
                     + repr(terminal_snapshot(output, 24, 80))
                 )
             os.write(master, b"r")
+            if not wait_for_screen_fragments((b"Enter/y confirms",), timeout=4.0):
+                raise AssertionError("revision restore did not ask for explicit confirmation")
+            os.write(master, b"\x1b")  # cancel without changing current manuscript
+            if not wait_for_screen_fragments((b"Revision restore cancelled",), timeout=4.0):
+                raise AssertionError("cancelling revision restoration gave no feedback")
+            os.write(master, b"r")
+            if not wait_for_screen_fragments((b"Enter/y confirms",), timeout=4.0):
+                raise AssertionError("revision restore confirmation could not be reopened")
+            os.write(master, b"\r")  # confirm hunk restoration
             if not wait_for_screen_fragments((b"Selected revision hunk restored",), timeout=4.0):
                 raise AssertionError("restoring the selected revision hunk gave no success feedback")
 
