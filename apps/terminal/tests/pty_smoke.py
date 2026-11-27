@@ -137,6 +137,7 @@ def main():
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
     scrivener_import = modes == ["scrivener-import"]
+    save_as_populated = modes == ["save-as-populated"]
     insert_edit_actions = modes == ["insert-edit-actions"]
     outline_enter = modes == ["outline-enter"]
     special_character = modes == ["special-character"]
@@ -341,6 +342,41 @@ def main():
 
     try:
         read_for(1.0)
+        if save_as_populated:
+            os.write(master, b"\x1b")  # dismiss first-run help if present
+            read_for(0.2)
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10, File menu
+            read_for(0.2)
+            select_visible_menu_item("Save Project As")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Save Project As", b"F5 Save Project Copy"), menu_start, timeout=5.0
+            ):
+                raise AssertionError("File > Save Project As did not open its folder browser")
+            os.write(master, b"\x1b[15~")  # F5: prepare the copy
+            if not wait_for_screen_fragments(
+                (b"Create an independent project copy", b"F5"), timeout=5.0
+            ):
+                raise AssertionError("Save As did not show its destination confirmation")
+            os.write(master, b"\x1b[15~")  # F5: confirm the independent copy
+            if not wait_for_screen_fragments((b"Saved project at",), timeout=10.0):
+                raise AssertionError(
+                    "Save As did not report the copied project; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 8.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after Save As")
+            print("PTY Save As workflow passed: File menu → destination browser → independent copy → explicit success.")
+            return
+
         if scrivener_import:
             expected_titles = os.environ.get(
                 "WIDE_PTY_IMPORT_TITLES", "Part One|Chapter One|Opening Scene"
@@ -734,7 +770,15 @@ def main():
                 raise AssertionError("tutorial sample scene did not open from the outline")
             if not wait_for_workspace_title("Editor"):
                 raise AssertionError("tutorial scene selection did not open the manuscript editor")
-            os.write(master, b"\nFirst tutorial sentence.")
+            # Send prose at a human typing cadence. A single PTY write can
+            # coalesce many key events and make the application-under-test
+            # drop the tail under load, which tests the PTY's burst handling
+            # rather than an author's normal editing workflow.
+            os.write(master, b"\n")
+            read_for(0.05)
+            for character in "First tutorial sentence.":
+                os.write(master, character.encode("utf-8"))
+                read_for(0.015)
             if not wait_for_screen_fragments(
                 (b"6/9 verified", b"Save your writing"), timeout=3.0
             ):

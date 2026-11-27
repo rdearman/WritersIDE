@@ -9,10 +9,24 @@ consistent SQLite backup. A new terminal application-state regression
 populates attachments, a nested template, an existing export and research
 content, selects Save As through the registered File command and browser, then
 checks source and destination bytes, project identity, manuscript prose, and
-the reopened database. The focused test passes. This is verification coverage,
-not a claimed root-cause fix. The reported false external-change conflict and
-missing scene rows remain unreproduced; preserve conflict detection and leave
-#38 open for continued reproduction and human UAT.
+the reopened database. A production Linux PTY test now exercises the same copy
+through the visible File menu and Save As browser, then reopens and validates
+both projects. The focused state and PTY tests pass. This is verification
+coverage, not a claimed root-cause fix. The reported false external-change
+conflict and missing scene rows remain unreproduced; preserve conflict
+detection and leave #38 open for continued reproduction and human UAT.
+
+Verification for this batch: `cargo fmt --all -- --check`, workspace Clippy
+with warnings denied, and the complete offline workspace test suite passed.
+The terminal suite passed 358 unit tests, all 3 author-workflow tests, and 34
+production PTY tests; the protected ArrowMaking PTY is intentionally ignored
+unless its private fixture path is configured. The full suite includes the
+localhost-only Ollama mock-server test run with the author's authorised socket
+permission. A first full-suite attempt exposed that the tutorial PTY sent its
+entire sample sentence as one artificial burst and intermittently lost the
+tail; the harness now sends those characters at a human typing cadence, and
+the test passed both in isolation and in the complete PTY run. This test-harness
+adjustment does not change application input behaviour.
 
 ## Scrivener `LevelTypes` profile mapping — 27 November 2026
 

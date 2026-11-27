@@ -67,6 +67,84 @@ fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn save_as_preserves_populated_project_trees_through_the_production_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("Source Project");
+    let home = root.path().join("isolated-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let mut app = WriterApp::create_project(&source, "Save As Copy").unwrap();
+    let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+    let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(
+        scene,
+        Some(&hash),
+        "The original manuscript remains present.",
+    )
+    .unwrap();
+    let project_id = app.get_project().unwrap().id;
+    let fixtures = [
+        (
+            "attachments/reference.bin",
+            b"attachment contents".as_slice(),
+        ),
+        (
+            "templates/story-bible/custom.toml",
+            b"template contents".as_slice(),
+        ),
+        ("exports/previous.epub", b"previous export".as_slice()),
+        ("research/notes/source.md", b"research contents".as_slice()),
+    ];
+    for (relative, bytes) in fixtures {
+        let path = source.join(relative);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(&harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&source)
+        .arg(&home)
+        .arg("save-as-populated")
+        .output()
+        .expect("run Save As through the Linux PTY");
+    assert!(
+        result.status.success(),
+        "Save As PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let destination = home.join("Save As Copy");
+    let copied = WriterApp::open_project(&destination).expect("open copied project");
+    copied.validate_project().unwrap();
+    assert_eq!(copied.get_project().unwrap().id, project_id);
+    assert_eq!(
+        copied.load_scene_text(scene).unwrap().0,
+        "The original manuscript remains present."
+    );
+    for (relative, bytes) in fixtures {
+        assert_eq!(std::fs::read(destination.join(relative)).unwrap(), bytes);
+        assert_eq!(std::fs::read(source.join(relative)).unwrap(), bytes);
+    }
+    let original = WriterApp::open_project(&source).unwrap();
+    original.validate_project().unwrap();
+    assert_eq!(original.get_project().unwrap().id, project_id);
+    assert_eq!(
+        original.load_scene_text(scene).unwrap().0,
+        "The original manuscript remains present."
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;
