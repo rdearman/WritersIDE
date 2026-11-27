@@ -2472,3 +2472,24 @@ first full run had one transient scene-rename PTY with an empty screen; it
 passed immediately in isolation and passed in the final full run. The document
 export test that failed in the preceding run also passed in isolation and in
 the final full run. This evidence is automated; human UAT remains open.
+
+### Alpha UAT 40 — proofreading scope and responsiveness — 27 November 2026
+
+Frozen Linux x86_64 release build from commit `d8fa071` is available at
+`test-builds/alpha-uat-40-d8fa071/`. Launch from the repository root:
+
+```sh
+cd test-builds/alpha-uat-40-d8fa071
+./run.sh "The Glassmaker's Compass"
+```
+
+The bundle uses isolated preferences and disposable synthetic projects; it
+contains no private manuscript material. Its checklist covers U37-01–U37-19
+and adds an explicit two-document Spell Check scope exercise. Checksums passed,
+four sample project databases passed SQLite integrity checks, and the release
+binary completed a PTY Review-menu launch and exit smoke test. Verification at
+the frozen source commit passed formatting, workspace Clippy with warnings
+denied, and the full workspace suite (363 terminal unit tests, 3 author-workflow
+tests, 43 PTY workflows; 1 protected-corpus PTY skipped because its local path
+was not configured). Human UAT remains pending. Alpha UAT 38 was removed to
+retain only Alpha UAT 39 and Alpha UAT 40.
