@@ -1566,8 +1566,12 @@ fn spell_check_from_review_defaults_to_the_open_document_and_preserves_prose() {
     let first = app.create_scene(chapter, "Arrival", 0).unwrap();
     let second = app.create_scene(chapter, "Aftermath", 1).unwrap();
     let (_, hash) = app.load_scene_text(first).unwrap();
-    app.save_scene_text(first, Some(&hash), "Baad word.")
-        .unwrap();
+    let long_text = (1..=40)
+        .map(|line| format!("A correctly spelled line {line}."))
+        .chain(std::iter::once("Baad word.".to_owned()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.save_scene_text(first, Some(&hash), &long_text).unwrap();
     let (_, hash) = app.load_scene_text(second).unwrap();
     app.save_scene_text(second, Some(&hash), "Wrng word.")
         .unwrap();
@@ -1598,7 +1602,7 @@ fn spell_check_from_review_defaults_to_the_open_document_and_preserves_prose() {
         String::from_utf8_lossy(&result.stderr)
     );
     let reopened = WriterApp::open_project(&project).unwrap();
-    assert_eq!(reopened.load_scene_text(first).unwrap().0, "Baad word.");
+    assert_eq!(reopened.load_scene_text(first).unwrap().0, long_text);
     assert_eq!(reopened.load_scene_text(second).unwrap().0, "Wrng word.");
 }
 

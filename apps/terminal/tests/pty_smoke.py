@@ -1003,7 +1003,7 @@ def main():
                     raise AssertionError("application did not exit cleanly after offline thesaurus test")
                 print("PTY Review workflow passed: offline thesaurus opened from its menu and showed local results.")
                 return
-            if not wait_for_screen_fragments((b"Scope: current document", b"manuscript is unchanged"), menu_start, timeout=5.0):
+            if not wait_for_screen_fragments((b"Spell Check", b"Arrival", b"No spelling candidates found"), menu_start, timeout=5.0):
                 raise AssertionError("Review > Spell Check did not show current-document results")
             os.write(master, b"\x11")
             quit_deadline = time.monotonic() + 5.0
@@ -1035,13 +1035,26 @@ def main():
             read_for(0.2)
             select_visible_menu_item("Spell Check")
             os.write(master, b"\r")
-            if not wait_for_screen_fragments((b"Spell Check", b"Arrival", b"Baad", b"current document"), menu_start, timeout=5.0):
-                raise AssertionError("Spell Check did not show results for the open document")
+            if not wait_for_screen_fragments((b"Spell Check", b"Arrival", b"en-GB", b"Baad", b"line 41, column 1"), menu_start, timeout=5.0):
+                raise AssertionError(
+                    "Spell Check did not show results for the open document; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
             screen = "\n".join(terminal_snapshot(output, 24, 80))
             if "Wrng" in screen:
                 raise AssertionError("Spell Check included a different scene instead of the current document")
-            if "manuscript unchanged" not in screen:
-                raise AssertionError("Spell Check did not report that manuscript prose was unchanged")
+            os.write(master, b"\r")  # navigate from the report to the source occurrence
+            if not wait_for_screen_fragments((b"Selected spelling occurrence", b"line 41, column 1"), menu_start, timeout=3.0):
+                raise AssertionError("Spell Check did not navigate to and select the misspelling in the manuscript")
+            screen = "\n".join(terminal_snapshot(output, 24, 80))
+            if "Spell Check" in screen and "Active:reference" in screen:
+                raise AssertionError("the spelling report kept focus instead of returning to the manuscript selection")
+            if "Baad word." not in screen:
+                raise AssertionError("spelling navigation did not scroll the misspelling into the editor viewport")
+            if "! Baad word." not in screen:
+                raise AssertionError(
+                    "the editor did not mark the misspelling's line in context: " + repr(screen)
+                )
             os.write(master, b"\x11")
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0
@@ -2319,7 +2332,7 @@ def main():
                 raise AssertionError("reopened scene content was not visible for continued writing")
             os.write(master, b"\x1b[1;5F Continued.")  # Ctrl+End, then append at document end
             edit_start = len(output)
-            if not wait_for_screen_fragments((b"Autosaved",), edit_start, timeout=5.0):
+            if not wait_for_screen_fragments((b"Autosaved",), edit_start, timeout=15.0):
                 raise AssertionError("continued writing was not autosaved after reopening")
             os.write(master, b"\x13")  # Ctrl+S: save the promoted project
             if not wait_for_screen_fragments((b"Saved",), edit_start, timeout=5.0):

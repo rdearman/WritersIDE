@@ -2493,3 +2493,25 @@ denied, and the full workspace suite (363 terminal unit tests, 3 author-workflow
 tests, 43 PTY workflows; 1 protected-corpus PTY skipped because its local path
 was not configured). Human UAT remains pending. Alpha UAT 38 was removed to
 retain only Alpha UAT 39 and Alpha UAT 40.
+
+### U37-11 spelling-result navigation — implementation in progress
+
+Review → Spell Check now lists each occurrence with a one-based line and
+grapheme-column location. Enter returns to the source document, scrolls a
+misspelling below the viewport into view, selects its exact source range, and
+marks the affected line with `!` while preserving the surrounding prose.
+Navigation refuses stale source text. A production PTY regression now checks a
+misspelling on line 41, verifies it is visible and marked in context, and
+reopens the project to confirm both documents are unchanged. A unit test covers
+repeated Unicode words, combining-mark columns and UTF-8 source ranges. This
+advances U37-11; interactive suggestion/replace/ignore and dictionary controls
+remain outstanding under #33.
+
+Verification passed formatting, warnings-denied workspace Clippy, the new
+Unicode occurrence unit test, and the full offline workspace tests apart from
+one load-sensitive fiction reopen PTY timeout. That workflow passed when run
+alone; its autosave wait was raised from five to fifteen seconds. The complete
+production PTY suite then passed serially (43 passed, 1 protected-corpus test
+ignored because its private path was not configured). The full workspace run
+had 364 terminal unit tests, 3 author workflows, and all other crate and
+integration tests pass. Human acceptance remains open.

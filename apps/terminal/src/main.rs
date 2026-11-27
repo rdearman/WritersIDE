@@ -541,6 +541,25 @@ struct ReferencePane {
     cursor: (usize, usize),
     selection_anchor: Option<usize>,
     proofreading: Option<ProofreadingReview>,
+    spelling: Option<SpellCheckReview>,
+}
+
+#[derive(Clone, Debug)]
+struct SpellCheckReview {
+    scene_id: Option<SceneId>,
+    content_unit_id: Option<story_core::ContentUnitId>,
+    source_text: String,
+    occurrences: Vec<SpellCheckOccurrence>,
+    selected: usize,
+    jumped_to_source: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SpellCheckOccurrence {
+    word: String,
+    byte_range: std::ops::Range<usize>,
+    line: usize,
+    column: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -9409,6 +9428,7 @@ impl AppState {
                         .unwrap_or((0, 0)),
                     selection_anchor: None,
                     proofreading: None,
+                    spelling: None,
                 });
             } else {
                 stale_reference = true;
@@ -12990,6 +13010,7 @@ impl AppState {
                 cursor: self.cursor,
                 selection_anchor: None,
                 proofreading: None,
+                spelling: None,
             }
         } else {
             let pane = self
@@ -13114,6 +13135,95 @@ impl AppState {
             .selected
             .min(pane.content.lines().count().saturating_sub(1));
         true
+    }
+    fn select_spelling_occurrence(&mut self, forward: bool) -> bool {
+        let Some(pane) = self.active_reference_pane_mut() else {
+            return false;
+        };
+        let Some(review) = &mut pane.spelling else {
+            return false;
+        };
+        if review.occurrences.is_empty() {
+            return true;
+        }
+        review.jumped_to_source = false;
+        review.selected = if forward {
+            (review.selected + 1) % review.occurrences.len()
+        } else {
+            (review.selected + review.occurrences.len() - 1) % review.occurrences.len()
+        };
+        pane.scroll = review.selected;
+        true
+    }
+    fn jump_to_selected_spelling_occurrence(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(pane) = self.active_reference_pane() else {
+            return Ok(());
+        };
+        let Some(review) = &pane.spelling else {
+            return Ok(());
+        };
+        let Some(occurrence) = review.occurrences.get(review.selected).cloned() else {
+            self.message = "No spelling occurrence is selected".into();
+            return Ok(());
+        };
+        let source_text = review.source_text.clone();
+        let scene_id = review.scene_id;
+        let content_unit_id = review.content_unit_id;
+        if self.dirty
+            && ((scene_id.is_some() && self.editing_scene != scene_id)
+                || (content_unit_id.is_some() && self.editing_content_unit != content_unit_id))
+        {
+            self.message =
+                "Save the current document before navigating to the spelling result".into();
+            return Ok(());
+        }
+        if let Some(scene) = scene_id {
+            if self.editing_scene != Some(scene) {
+                self.open_scene(scene)?;
+            }
+        } else if let Some(content) = content_unit_id
+            && self.editing_content_unit != Some(content)
+        {
+            self.open_content_unit(content)?;
+        }
+        let text = self.editor.join("\n");
+        if text != source_text {
+            self.message =
+                "Spelling result is stale · run Spell Check again for the current text".into();
+            return Ok(());
+        }
+        let Some(start) = editor_position_from_byte(&text, occurrence.byte_range.start) else {
+            self.message = "Spelling result no longer points to a valid text position".into();
+            return Ok(());
+        };
+        let Some(end) = editor_position_from_byte(&text, occurrence.byte_range.end) else {
+            self.message = "Spelling result no longer points to a valid text boundary".into();
+            return Ok(());
+        };
+        self.reference_focused = false;
+        self.switch(Workspace::Editor);
+        self.editor_selection = Some(end);
+        self.cursor = start;
+        if let Some(review) = self
+            .active_reference_pane_mut()
+            .and_then(|pane| pane.spelling.as_mut())
+        {
+            review.jumped_to_source = true;
+        }
+        self.ensure_editor_cursor_visible();
+        let selection_matches = self.selected_text().as_deref() == Some(occurrence.word.as_str());
+        self.message = format!(
+            "Selected spelling occurrence '{}' at line {}, column {} · {} · manuscript unchanged",
+            occurrence.word,
+            occurrence.line,
+            occurrence.column,
+            if selection_matches {
+                "selection active"
+            } else {
+                "selection unavailable"
+            }
+        );
+        Ok(())
     }
     fn refresh_proofreading_pane(&mut self) {
         let Some(pane) = self.active_reference_pane_mut() else {
@@ -13374,6 +13484,7 @@ impl AppState {
                     cursor: if shared_scene { self.cursor } else { (0, 0) },
                     selection_anchor: None,
                     proofreading: None,
+                    spelling: None,
                 };
                 self.active_reference = index;
                 self.sync_focused_window(focused);
@@ -13410,6 +13521,7 @@ impl AppState {
                 cursor,
                 selection_anchor: None,
                 proofreading: None,
+                spelling: None,
             };
             self.active_reference = index;
         } else {
@@ -13425,6 +13537,7 @@ impl AppState {
                 cursor: if shared_scene { self.cursor } else { (0, 0) },
                 selection_anchor: None,
                 proofreading: None,
+                spelling: None,
             });
             self.active_reference = self.reference_panes.len() - 1;
         }
@@ -17036,7 +17149,7 @@ impl AppState {
                     }
                     if spec.id == "analysis.spellcheck" {
                         self.menu = None;
-                        let (title, language) = if let Some(scene) =
+                        let (title, language, scene_id, content_unit_id) = if let Some(scene) =
                             self.editing_scene.or_else(|| self.active_scene())
                         {
                             let project = self.app.get_project()?;
@@ -17044,12 +17157,16 @@ impl AppState {
                             (
                                 scene.title.clone(),
                                 scene.effective_language_code(&project).to_owned(),
+                                Some(scene.id),
+                                None,
                             )
                         } else if let Some(content_unit) = self.editing_content_unit {
                             let project = self.app.get_project()?;
                             (
                                 self.app.get_content_unit(content_unit)?.title,
                                 project.language_code.clone(),
+                                None,
+                                Some(content_unit),
                             )
                         } else {
                             return Err(
@@ -17072,38 +17189,34 @@ impl AppState {
                             .as_ref()
                             .map(|finding| finding.candidates.len())
                             .unwrap_or_default();
-                        let mut body = format!(
-                            "Spell Check · {title}\nLanguage: {language}\nScope: current document\n\n"
-                        );
-                        if findings.is_none() {
-                            body.push_str(
-                                "No spelling candidates found. The manuscript is unchanged.\n",
-                            );
-                        } else {
-                            if let Some(finding) = findings {
-                                body.push_str(&format!(
-                                    "{}\n",
-                                    finding
-                                        .candidates
-                                        .iter()
-                                        .map(|(word, count)| format!(
-                                            "{word} · {count} occurrence(s)"
-                                        ))
-                                        .collect::<Vec<_>>()
-                                        .join(", ")
-                                ));
-                            }
-                            body.push_str("\nReview candidates against the manuscript; spelling suggestions do not change prose.\n");
-                        }
+                        let occurrences = findings
+                            .as_ref()
+                            .map(|finding| spelling_occurrences(&text, &finding.candidates))
+                            .unwrap_or_default();
+                        let body = spelling_review_text(&occurrences);
                         self.open_reference_buffer(
                             "spellcheck:current".into(),
                             None,
-                            format!("Spell Check · {title}"),
+                            format!("Spell Check · {title} · {language}"),
                             body,
                         );
+                        if let Some(pane) = self.active_reference_pane_mut() {
+                            pane.spelling = Some(SpellCheckReview {
+                                scene_id,
+                                content_unit_id,
+                                source_text: text,
+                                occurrences,
+                                selected: 0,
+                                jumped_to_source: false,
+                            });
+                        }
                         self.reference_focused = true;
                         self.message = format!(
-                            "Spell Check complete · {title} · {candidate_count} candidate word(s) · manuscript unchanged"
+                            "Spell Check complete · {title} · {candidate_count} candidate word(s) · {} occurrence(s) · manuscript unchanged",
+                            self.active_reference_pane()
+                                .and_then(|pane| pane.spelling.as_ref())
+                                .map(|review| review.occurrences.len())
+                                .unwrap_or_default()
                         );
                         self.record_recent_command(spec.id);
                         return Ok(());
@@ -27863,6 +27976,25 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 })
             });
             let mut line_start_byte = view_start as u64;
+            let spelling_highlight = (!s.reference_focused)
+                .then(|| s.active_reference_pane())
+                .flatten()
+                .and_then(|pane| pane.spelling.as_ref())
+                .filter(|review| {
+                    review.jumped_to_source
+                        && review.scene_id == s.editing_scene
+                        && review.content_unit_id == s.editing_content_unit
+                        && review.source_text == full_text
+                })
+                .and_then(|review| review.occurrences.get(review.selected))
+                .map(|occurrence| {
+                    (
+                        occurrence.line.saturating_sub(1),
+                        occurrence.column.saturating_sub(1),
+                        occurrence.column.saturating_sub(1)
+                            + occurrence.word.graphemes(true).count(),
+                    )
+                });
             let projected_graphemes = projection.as_ref().map(|projection| {
                 projection
                     .graphemes
@@ -27874,7 +28006,11 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 .iter()
                 .enumerate()
                 .map(|(row, line)| {
-                    let prefix = if !s.reference_focused && row == view_cursor.0 {
+                    let spelling_line = spelling_highlight
+                        .is_some_and(|(highlight_row, _, _)| highlight_row == row);
+                    let prefix = if !s.reference_focused && spelling_line {
+                        "! "
+                    } else if !s.reference_focused && row == view_cursor.0 {
                         "> "
                     } else {
                         "  "
@@ -27888,7 +28024,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         } else {
                             ch
                         };
-                        let selected = selection.is_some_and(|((sr, sc), (er, ec))| {
+                        let coordinate_selection = selection.is_some_and(|((sr, sc), (er, ec))| {
                             (row > sr || (row == sr && col >= sc))
                                 && (row < er || (row == er && col < ec))
                         });
@@ -27896,6 +28032,11 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                             .as_ref()
                             .and_then(|items| items.get(&(byte_offset as usize)))
                             .map(|item| item.source);
+                        let spelling_selection =
+                            spelling_highlight.is_some_and(|(line, start, end)| {
+                                row == line && col >= start && col < end
+                            });
+                        let selected = coordinate_selection || spelling_selection;
                         let decorated = source_range.is_some_and(|source| {
                             editor_grapheme_is_mentioned(
                                 source.start as u64,
@@ -27904,7 +28045,10 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                             )
                         });
                         let mut style = if selected {
-                            Style::default().fg(Color::White).bg(Color::Blue)
+                            Style::default()
+                                .fg(Color::White)
+                                .bg(Color::Blue)
+                                .add_modifier(Modifier::REVERSED)
                         } else if decorated {
                             Style::default()
                                 .fg(Color::Cyan)
@@ -28073,6 +28217,12 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                                     && row >= reference.scroll
                                     && row < reference.scroll.saturating_add(1)
                             })
+                            || (s.reference_focused
+                                && reference.spelling.as_ref().is_some_and(|review| {
+                                    review.selected == row
+                                        && row >= reference.scroll
+                                        && row < reference.scroll.saturating_add(1)
+                                }))
                         {
                             Line::styled(line, Style::default().fg(Color::Black).bg(Color::Yellow))
                         } else {
@@ -28095,7 +28245,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         },
                         if is_shared_scene {
                             "shared"
-                        } else if reference.proofreading.is_some() {
+                        } else if reference.proofreading.is_some() || reference.spelling.is_some() {
                             "review"
                         } else {
                             "read-only"
@@ -28169,6 +28319,12 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                                         && row >= reference.scroll
                                         && row < reference.scroll.saturating_add(1)
                                 })
+                                || (s.reference_focused
+                                    && reference.spelling.as_ref().is_some_and(|review| {
+                                        review.selected == row
+                                            && row >= reference.scroll
+                                            && row < reference.scroll.saturating_add(1)
+                                    }))
                             {
                                 Line::styled(
                                     line,
@@ -28194,7 +28350,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                             },
                             if is_shared_scene {
                                 "shared"
-                            } else if reference.proofreading.is_some() {
+                            } else if reference.proofreading.is_some()
+                                || reference.spelling.is_some()
+                            {
                                 "review"
                             } else {
                                 "read-only"
@@ -28650,6 +28808,11 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             let pane_hint: String = if s.workspace == Workspace::Editor {
                 if s.reference_focused
                     && s.active_reference_pane()
+                        .is_some_and(|pane| pane.spelling.is_some())
+                {
+                    "↑/↓ occurrence · Enter jump · Esc manuscript".into()
+                } else if s.reference_focused
+                    && s.active_reference_pane()
                         .is_some_and(|pane| pane.proofreading.is_some())
                 {
                     "↑/↓ finding · a apply · i ignore · Esc manuscript".into()
@@ -28845,6 +29008,11 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             let pane_hint: String = if s.workspace == Workspace::Editor {
                 if s.reference_focused
                     && s.active_reference_pane()
+                        .is_some_and(|pane| pane.spelling.is_some())
+                {
+                    "↑/↓ occurrence · Enter jump · Esc manuscript".into()
+                } else if s.reference_focused
+                    && s.active_reference_pane()
                         .is_some_and(|pane| pane.proofreading.is_some())
                 {
                     "↑/↓ finding · a apply · i ignore · Esc manuscript".into()
@@ -28858,6 +29026,14 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             };
             let menu_hint = display_shortcut_label(effective_shortcut_label(s, "menu.main", "F10"));
             let actions = if s.reference_focused
+                && let Some(pane) = s.active_reference_pane()
+                && let Some(review) = pane.spelling.as_ref()
+            {
+                format!(
+                    "Spell Check · {} occurrence(s) · Enter jump · Esc manuscript",
+                    review.occurrences.len()
+                )
+            } else if s.reference_focused
                 && let Some(pane) = s.active_reference_pane()
                 && let Some(review) = pane.proofreading.as_ref()
             {
@@ -29574,6 +29750,49 @@ fn spellcheck_text_with_engine(
         title: title.to_owned(),
         candidates,
     }))
+}
+
+fn spelling_occurrences(
+    text: &str,
+    candidates: &BTreeMap<String, u32>,
+) -> Vec<SpellCheckOccurrence> {
+    let mut occurrences = text
+        .split_word_bound_indices()
+        .filter_map(|(start, word)| {
+            let has_letter_or_digit = word.chars().any(char::is_alphanumeric);
+            let normalized = word.to_lowercase();
+            if !has_letter_or_digit || !candidates.contains_key(&normalized) {
+                return None;
+            }
+            let line = text[..start].bytes().filter(|byte| *byte == b'\n').count();
+            let line_start = text[..start].rfind('\n').map_or(0, |index| index + 1);
+            let column = text[line_start..start].graphemes(true).count();
+            Some(SpellCheckOccurrence {
+                word: word.to_owned(),
+                byte_range: start..start + word.len(),
+                line: line + 1,
+                column: column + 1,
+            })
+        })
+        .collect::<Vec<_>>();
+    occurrences.sort_by_key(|occurrence| occurrence.byte_range.start);
+    occurrences
+}
+
+fn spelling_review_text(occurrences: &[SpellCheckOccurrence]) -> String {
+    if occurrences.is_empty() {
+        return "No spelling candidates found. The manuscript is unchanged.".into();
+    }
+    occurrences
+        .iter()
+        .map(|occurrence| {
+            format!(
+                "{} · line {}, column {}",
+                occurrence.word, occurrence.line, occurrence.column
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn planning_board_bounds(items: &[story_storage::PlanningBoardItemRecord]) -> ([f64; 2], [f64; 2]) {
@@ -36481,6 +36700,31 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         s.focus_main_editor();
         s.message = "Manuscript editor focused".into();
         return Ok(false);
+    }
+    if s.workspace == Workspace::Editor
+        && s.reference_focused
+        && s.active_reference_pane()
+            .is_some_and(|pane| pane.spelling.is_some())
+    {
+        match k.code {
+            KeyCode::Up | KeyCode::Down => {
+                s.select_spelling_occurrence(k.code == KeyCode::Down);
+                let selected = s
+                    .active_reference_pane()
+                    .and_then(|pane| pane.spelling.as_ref())
+                    .map(|review| review.selected + 1)
+                    .unwrap_or(0);
+                s.message = format!(
+                    "Spelling occurrence {selected} selected · Enter goes to text · Esc manuscript"
+                );
+                return Ok(false);
+            }
+            KeyCode::Enter => {
+                s.jump_to_selected_spelling_occurrence()?;
+                return Ok(false);
+            }
+            _ => {}
+        }
     }
     if s.workspace == Workspace::Editor
         && s.reference_focused
@@ -57235,6 +57479,7 @@ mod tests {
             cursor: (2, 4),
             selection_anchor: None,
             proofreading: None,
+            spelling: None,
         });
         layout.focus(reference_id).unwrap();
         state.reference_focused = true;
@@ -57306,6 +57551,7 @@ mod tests {
             cursor: (0, 0),
             selection_anchor: None,
             proofreading: None,
+            spelling: None,
         });
         state.pane_layout = Some(saved);
         state.save_named_window_layout("Research").unwrap();
@@ -57315,5 +57561,28 @@ mod tests {
         state.reference_panes.clear();
         assert!(state.load_named_window_layout("Research").is_err());
         assert_eq!(state.pane_layout, before);
+    }
+
+    #[test]
+    fn spelling_occurrences_map_each_unicode_match_to_grapheme_columns() {
+        let source = "e\u{301} café café.\nWrong.";
+        let candidates = BTreeMap::from([("café".to_owned(), 2), ("wrong".to_owned(), 1)]);
+
+        let occurrences = spelling_occurrences(source, &candidates);
+
+        assert_eq!(occurrences.len(), 3);
+        assert_eq!(
+            occurrences
+                .iter()
+                .map(|occurrence| (occurrence.word.as_str(), occurrence.line, occurrence.column))
+                .collect::<Vec<_>>(),
+            [("café", 1, 3), ("café", 1, 8), ("Wrong", 2, 1)]
+        );
+        for occurrence in &occurrences {
+            assert_eq!(
+                source.get(occurrence.byte_range.clone()),
+                Some(occurrence.word.as_str())
+            );
+        }
     }
 }
