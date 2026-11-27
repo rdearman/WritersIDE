@@ -136,6 +136,7 @@ def main():
     removal_dialogs = modes == ["removal-dialogs"]
     chapter_creation = modes == ["chapter-creation"]
     revision_snapshot = modes == ["revision-snapshot"]
+    revision_document = modes == ["revision-document"]
     backup_archive = modes == ["backup-archive"]
     authoring_audit = modes == ["authoring-audit"]
     reference_removal = modes == ["reference-removal"]
@@ -408,7 +409,7 @@ def main():
             print("PTY whole-project backup passed: File > Back Up Project creates a verified archive.")
             return
 
-        if revision_snapshot:
+        if revision_snapshot or revision_document:
             os.write(master, b"\x1b")  # dismiss first-run help if present
             if not wait_for_screen_fragments((b"The original passage stays.",), timeout=3.0):
                 raise AssertionError("the test manuscript did not open in the writing workspace")
@@ -450,6 +451,30 @@ def main():
                     "opening the saved revision did not show a readable text diff; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
                 )
+            if revision_document:
+                os.write(master, b"R")
+                if not wait_for_screen_fragments((b"Replace the entire document", b"Before revision test"), timeout=4.0):
+                    raise AssertionError("whole-document restore did not show its confirmation")
+                os.write(master, b"\x1b")
+                if not wait_for_screen_fragments((b"Document restore cancelled",), timeout=4.0):
+                    raise AssertionError("cancelling whole-document restore gave no feedback")
+                os.write(master, b"R")
+                if not wait_for_screen_fragments((b"Replace the entire document",), timeout=4.0):
+                    raise AssertionError("whole-document restore confirmation could not be reopened")
+                os.write(master, b"\r")
+                if not wait_for_screen_fragments((b"Entire document restored",), timeout=4.0):
+                    raise AssertionError("whole-document restore gave no success feedback")
+                os.write(master, b"\x11")  # Ctrl+Q
+                quit_deadline = time.monotonic() + 8.0
+                finished_pid = 0
+                status = 0
+                while finished_pid == 0 and time.monotonic() < quit_deadline:
+                    read_for(0.1)
+                    finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+                if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                    raise AssertionError("the whole-document restore workflow did not exit cleanly")
+                print("PTY whole-document restore passed: named snapshot, preview, cancel, confirm and safety snapshot.")
+                return
             os.write(master, b"r")
             if not wait_for_screen_fragments((b"Enter/y confirms",), timeout=4.0):
                 raise AssertionError("revision restore did not ask for explicit confirmation")

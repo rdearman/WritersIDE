@@ -16,13 +16,13 @@ Focused unit tests and the production Linux PTY test pass. Verification on
 27 November 2026: `cargo fmt --all -- --check`,
 `cargo clippy --offline --workspace --all-targets -- -D warnings`, and
 `cargo test --offline --workspace -- --test-threads=1` all passed. The test
-run included 38 PTY tests; one protected private-corpus test was intentionally
+run included 39 PTY tests; one protected private-corpus test was intentionally
 ignored because its local fixture path was not configured. An initial test run
 exposed a collision with the existing chapter-title input mode; revision
 confirmation now uses a distinct mode, and the full suite passes after that
-correction. This resolves the explicit confirmation gap in #69 but does not
-complete whole-document restoration, snapshot rename/retention policy, or
-human UAT.
+correction. Both selective and whole-document restoration now have explicit
+confirmation and safety snapshots. Snapshot rename/retention policy and human
+UAT remain outstanding.
 
 The Revisions diff also exposes `R` to restore the entire document from the
 selected snapshot. It previews the current and snapshot character counts,
@@ -31,10 +31,11 @@ existing optimistic hash check and journalled restore service preserve the
 current text in a safety snapshot. A unit regression covers preview,
 cancellation, full restoration and safety snapshot creation. Follow-up
 verification on 27 November 2026 passed workspace formatting, warnings-denied
-workspace Clippy, and the full offline workspace test suite, including 38 PTY
+workspace Clippy, and the full offline workspace test suite, including 39 PTY
 tests (one protected private-corpus test was intentionally ignored because its
-local fixture path was not configured). Whole-document restore has not yet
-had a separate PTY scenario or human UAT.
+local fixture path was not configured). A separate production PTY test now
+covers whole-document preview, cancellation, confirmation, clean exit/reopen,
+restored prose and the pre-restore safety snapshot. Human UAT remains open.
 
 ## Scrivener inherited section-type profile suppression — 27 November 2026
 
