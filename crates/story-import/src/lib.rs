@@ -418,6 +418,11 @@ pub struct ScrivenerProjectInventory {
     /// Source-defined section type names keyed by stable Scrivener type ID.
     #[serde(default)]
     pub section_types: BTreeMap<String, String>,
+    /// Scrivener's default section type by binder item category (`folders`,
+    /// `containers`, or `files`). Explicit per-item SectionType metadata takes
+    /// precedence over these defaults when resolving a compile layout.
+    #[serde(default)]
+    pub level_types: BTreeMap<String, String>,
     /// Project-defined status labels keyed by their source IDs. Binder items
     /// may store only the numeric ID, so retain this lookup to translate
     /// source statuses without losing their original field values.
@@ -429,6 +434,25 @@ pub struct ScrivenerProjectInventory {
 }
 
 impl ScrivenerProjectInventory {
+    /// Resolve the source section type used for compilation. Scrivener stores
+    /// explicit overrides on individual binder items, while its LevelTypes
+    /// table supplies defaults by binder category.
+    pub fn effective_section_type_id<'a>(
+        &'a self,
+        item: &'a ScrivenerBinderItem,
+    ) -> Option<&'a str> {
+        if let Some(explicit) = item.section_type_id.as_deref() {
+            return Some(explicit);
+        }
+        let category = match item.type_code.as_deref()?.to_ascii_lowercase().as_str() {
+            "folder" | "draftfolder" | "researchfolder" | "trashfolder" => "folders",
+            "container" | "group" => "containers",
+            "text" | "file" | "document" => "files",
+            _ => return None,
+        };
+        self.level_types.get(category).map(String::as_str)
+    }
+
     /// Return a non-empty source metadata value by case-insensitive field name.
     pub fn metadata_value(&self, names: &[&str]) -> Option<&str> {
         self.project_metadata
@@ -1763,6 +1787,7 @@ pub fn inspect_scrivener_project(
         project_metadata: BTreeMap::new(),
         compile_settings: None,
         section_types: scrivener_section_type_names(&root),
+        level_types: scrivener_level_types(&root),
         status_labels: scrivener_status_labels(&root),
         items: Vec::new(),
         warnings: Vec::new(),
@@ -2147,6 +2172,26 @@ fn scrivener_section_type_names(root: &ScrivenerXmlNode) -> BTreeMap<String, Str
             let id = node.attributes.get("ID")?;
             let name = node.text.trim();
             (!name.is_empty()).then(|| (id.clone(), name.to_owned()))
+        })
+        .collect()
+}
+
+fn scrivener_level_types(root: &ScrivenerXmlNode) -> BTreeMap<String, String> {
+    let Some(level_types) = find_scrivener_node(root, "LevelTypes") else {
+        return BTreeMap::new();
+    };
+    level_types
+        .children
+        .iter()
+        .filter_map(|category| {
+            let type_id = category
+                .children
+                .iter()
+                .find(|child| child.name.eq_ignore_ascii_case("Type"))?
+                .text
+                .trim()
+                .to_owned();
+            (!type_id.is_empty()).then(|| (category.name.to_ascii_lowercase(), type_id))
         })
         .collect()
 }
@@ -4925,7 +4970,10 @@ This is an addition to the old file.}"#;
                 <Children><BinderItem UUID="child" Type="Text"><Title>Chapter prose</Title>
                   <MetaData><IncludeInCompile>Yes</IncludeInCompile><SectionType>type-chapter</SectionType></MetaData>
                   <Children/></BinderItem></Children></BinderItem>
-            </Binder><SectionTypes><TypeDefinitions>
+            </Binder><LevelTypes><Folders><Type>type-folder</Type></Folders>
+              <Containers><Type>type-chapter</Type></Containers>
+              <Files><Type>type-chapter</Type></Files></LevelTypes>
+            <SectionTypes><TypeDefinitions>
               <Type ID="type-folder">Internal heading role</Type>
               <Type ID="type-chapter">Numbered chapter role</Type>
             </TypeDefinitions></SectionTypes></ScrivenerProject>"#,
@@ -4973,6 +5021,19 @@ This is an addition to the old file.}"#;
         assert_eq!(
             inventory.section_types.get("type-chapter").unwrap(),
             "Numbered chapter role"
+        );
+        assert_eq!(inventory.level_types.get("folders").unwrap(), "type-folder");
+        assert_eq!(inventory.level_types.get("files").unwrap(), "type-chapter");
+        let mut defaulted_child = inventory.items[1].clone();
+        defaulted_child.section_type_id = None;
+        assert_eq!(
+            inventory.effective_section_type_id(&defaulted_child),
+            Some("type-chapter")
+        );
+        defaulted_child.section_type_id = Some("explicit-override".into());
+        assert_eq!(
+            inventory.effective_section_type_id(&defaulted_child),
+            Some("explicit-override")
         );
         assert_eq!(
             inventory.project_metadata.get("ProjectTitle").unwrap(),
@@ -5065,6 +5126,7 @@ This is an addition to the old file.}"#;
                 ..ScrivenerCompileSettings::default()
             }),
             section_types: BTreeMap::new(),
+            level_types: BTreeMap::new(),
             status_labels: BTreeMap::new(),
             items: vec![
                 ScrivenerBinderItem {
@@ -5204,6 +5266,7 @@ This is an addition to the old file.}"#;
                 ..ScrivenerCompileSettings::default()
             }),
             section_types: BTreeMap::new(),
+            level_types: BTreeMap::new(),
             status_labels: BTreeMap::new(),
             items: vec![
                 make_item("trash-root", None, "Trash", "TrashFolder", "trash"),
@@ -5277,6 +5340,7 @@ This is an addition to the old file.}"#;
             project_metadata: BTreeMap::new(),
             compile_settings: None,
             section_types: BTreeMap::new(),
+            level_types: BTreeMap::new(),
             status_labels: BTreeMap::new(),
             items: vec![
                 ScrivenerBinderItem {

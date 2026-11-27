@@ -647,3 +647,28 @@ source items with unresolved layouts; private research and unselected material
 do not contribute. Source-body preservation remains 70/70 manuscript and 10/10
 research, and EPUBCheck remains clean. See `DEVELOPMENT_STATUS.md` for the
 verification details and the exact remaining limitation.
+
+## Scrivener binder-level layout defaults — 27 November 2026
+
+Scrivener `.scrivx` manifests can assign default section types by binder
+category (`Folders`, `Containers`, and `Files`) under `LevelTypes`; an
+individual item's `SectionType` is an override. WIDE's importer now retains
+these defaults and the shared compile-profile translator resolves an explicit
+item override first, then the matching binder-category default. Layout
+references resolve by exact source layout ID or by a unique exact layout name.
+Ambiguous names remain a warning. This retains source semantics without
+inferring layout meaning from binder titles.
+
+The targeted controlled Book 03 run is
+`reports/level-types-book03-20261127-02/`; its generated EPUB is
+`generated/level-types-book03-20261127-02/book-03.epub`. The production import,
+save/reopen and compile path preserved 70/70 manuscript bodies and 10/10
+research bodies, with zero missing or changed destinations. The source
+fingerprint and fixture checksum manifest were unchanged, and EPUBCheck 4.2.6
+reported zero generated EPUB errors or warnings. The run remains provisional:
+the default profile still has three selected section types without assignments
+and eight assigned layout references whose built-in layout definitions are
+not available in the project; the alternate profile has thirteen selected
+types without assignments. WIDE reports these gaps rather than guessing. This
+run tested the local implementation before its commit; an exact-commit rerun
+will be recorded in `DEVELOPMENT_STATUS.md`.

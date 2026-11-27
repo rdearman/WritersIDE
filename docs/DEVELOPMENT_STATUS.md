@@ -1,5 +1,33 @@
 # Writer's IDE Development Status
 
+## Scrivener `LevelTypes` profile mapping — 27 November 2026
+
+The importer now retains Scrivener binder-category section defaults from
+`.scrivx` `LevelTypes`. The shared compile-profile mapping gives an explicit
+document `SectionType` precedence, then resolves the `Folders`, `Containers`,
+or `Files` default from the binder type. Per-format layout references resolve
+by exact source layout ID or one unique exact layout name. Ambiguous names are
+reported; missing definitions are not guessed from document titles.
+
+Focused importer and app tests pass. Formatting, workspace Clippy with warnings
+denied, and the full offline workspace test suite pass (one protected private
+ArrowMaking PTY is intentionally ignored unless its local path is configured).
+The relevant Book 03 production regression is
+`reports/level-types-book03-20261127-02/`; its EPUB is
+`generated/level-types-book03-20261127-02/book-03.epub`. It preserved 70/70
+manuscript and 10/10 research bodies through import/reopen, did not modify the
+source, and passed EPUBCheck 4.2.6 with zero errors/warnings. Fixture checksums
+passed before and after. Its source tree was dirty during this run; repeat the
+regression on the committed revision before using it as exact-commit evidence.
+Profile fidelity remains provisional: the default profile has three selected
+types with no layout assignment and eight assignments whose built-in layout
+definitions are absent; the alternate profile has thirteen unassigned selected
+types. Do not invent mappings. Issues #7/#53 remain open for further profile
+recovery and human publication acceptance.
+
+The latest author-proposed interaction model remains under review and is not
+approved. Do not undertake interface restructuring from that proposal.
+
 ## Dependency, licence and coverage-tool audit — 27 November 2026
 
 The independent Rust tooling is available on this machine: cargo-audit 0.23.0,

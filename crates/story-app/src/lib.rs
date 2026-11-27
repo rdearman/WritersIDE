@@ -329,7 +329,7 @@ pub fn scrivener_compile_presentation(
         if !selected_matter {
             continue;
         }
-        let Some(section_type_id) = item.section_type_id.as_deref() else {
+        let Some(section_type_id) = inventory.effective_section_type_id(item) else {
             continue;
         };
         let section_type_name = inventory
@@ -344,12 +344,22 @@ pub fn scrivener_compile_presentation(
             ));
             continue;
         };
-        let Some(layout) = format.layouts.get(layout_id) else {
-            warnings.push(format!(
-                "layout '{layout_id}' for '{}' (Scrivener section type '{section_type_name}') is not available in format '{format_id}'",
-                item.title
-            ));
-            continue;
+        let layout = match scrivener_layout_by_reference(format, layout_id) {
+            Ok(Some(layout)) => layout,
+            Ok(None) => {
+                warnings.push(format!(
+                    "layout '{layout_id}' for '{}' (Scrivener section type '{section_type_name}') is not available in format '{format_id}'",
+                    item.title
+                ));
+                continue;
+            }
+            Err(()) => {
+                warnings.push(format!(
+                    "layout reference '{layout_id}' for '{}' (Scrivener section type '{section_type_name}') is ambiguous in format '{format_id}'",
+                    item.title
+                ));
+                continue;
+            }
         };
         if matches!(
             destination,
@@ -444,6 +454,26 @@ pub fn scrivener_compile_presentation(
         presentation,
         warnings,
     })
+}
+
+fn scrivener_layout_by_reference<'a>(
+    format: &'a story_import::ScrivenerCompileFormatSettings,
+    reference: &str,
+) -> std::result::Result<Option<&'a story_import::ScrivenerCompileLayout>, ()> {
+    if let Some(layout) = format.layouts.get(reference) {
+        return Ok(Some(layout));
+    }
+    let mut matches = format
+        .layouts
+        .values()
+        .filter(|layout| layout.name.as_deref() == Some(reference));
+    let Some(layout) = matches.next() else {
+        return Ok(None);
+    };
+    if matches.next().is_some() {
+        return Err(());
+    }
+    Ok(Some(layout))
 }
 
 /// Translate the simple Scrivener title-prefix pattern used for sequential
@@ -6854,6 +6884,7 @@ mod tests {
             project_metadata: std::collections::BTreeMap::new(),
             compile_settings: None,
             section_types: std::collections::BTreeMap::new(),
+            level_types: std::collections::BTreeMap::new(),
             status_labels: std::collections::BTreeMap::from([("1".into(), "First Draft".into())]),
             items: Vec::new(),
             warnings: Vec::new(),
@@ -6864,7 +6895,7 @@ mod tests {
             parent_source_id: Some("chapter".into()),
             position: 0,
             title: "Imported scene".into(),
-            type_code: Some("Text".into()),
+            type_code: None,
             area: "manuscript".into(),
             include_in_compile: Some(true),
             section_type_id: None,
@@ -6939,6 +6970,7 @@ mod tests {
             ]),
             compile_settings: None,
             section_types: std::collections::BTreeMap::new(),
+            level_types: std::collections::BTreeMap::new(),
             status_labels: std::collections::BTreeMap::new(),
             items: Vec::new(),
             warnings: Vec::new(),
@@ -10657,7 +10689,7 @@ unexpected_prose = "must not be silently discarded"
             parent_source_id: None,
             position: 0,
             title: format!("Internal {id}"),
-            type_code: None,
+            type_code: Some("Text".into()),
             area: "draft".into(),
             include_in_compile: Some(true),
             section_type_id: Some(type_id.into()),
@@ -10702,7 +10734,7 @@ unexpected_prose = "must not be silently discarded"
         private_research.area = "research".into();
         let mut excluded_chapter = item("excluded-chapter", "unmapped-type");
         excluded_chapter.include_in_compile = Some(false);
-        let inventory = ScrivenerProjectInventory {
+        let mut inventory = ScrivenerProjectInventory {
             source_path: "source.scriv".into(),
             source_fingerprint: "fingerprint".into(),
             title: "Book".into(),
@@ -10718,6 +10750,7 @@ unexpected_prose = "must not be silently discarded"
                 ("scene-type".into(), "Scene Break".into()),
                 ("unmapped-type".into(), "Appendix Note".into()),
             ]),
+            level_types: BTreeMap::from([("files".into(), "scene-type".into())]),
             status_labels: BTreeMap::new(),
             items: vec![
                 item("chapter", "chapter-type"),
@@ -10756,6 +10789,11 @@ unexpected_prose = "must not be silently discarded"
                 },
             ],
         };
+        inventory.items[1].section_type_id = None;
+        assert_eq!(
+            inventory.effective_section_type_id(&inventory.items[1]),
+            Some("scene-type")
+        );
         let mapped = scrivener_compile_presentation(&inventory, &plan, "ebook").unwrap();
         assert!(!mapped.presentation.include_chapter_titles);
         assert!(!mapped.presentation.include_scene_titles);
@@ -10794,5 +10832,22 @@ unexpected_prose = "must not be silently discarded"
             warning.contains("title prefix/suffix") || warning.contains("chapter title prefixes")
         }));
         assert_eq!(numbered.items[0].title, "Internal chapter");
+
+        let mut named_layout = inventory.clone();
+        let format = &mut named_layout.compile_settings.as_mut().unwrap().formats[0];
+        format
+            .section_layouts
+            .insert("chapter-type".into(), "Numbered chapter".into());
+        let mut layout = format.layouts.remove("hide-chapter").unwrap();
+        layout.source_layout_id = "opaque-source-id".into();
+        layout.name = Some("Numbered chapter".into());
+        layout.include_titles = Some(true);
+        layout.title_prefix = Some("Chapter <$t>\n".into());
+        format.layouts.insert("opaque-source-id".into(), layout);
+        let mapped = scrivener_compile_presentation(&named_layout, &plan, "ebook").unwrap();
+        assert_eq!(
+            mapped.presentation.chapter_title_template.as_deref(),
+            Some("Chapter {number}")
+        );
     }
 }
