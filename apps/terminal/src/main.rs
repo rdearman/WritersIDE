@@ -26531,9 +26531,7 @@ fn push_coalesced_editor_span(spans: &mut Vec<Span<'static>>, text: &str, style:
     if let Some(last) = spans.last_mut()
         && last.style == style
     {
-        let mut combined = last.content.clone().into_owned();
-        combined.push_str(text);
-        *last = Span::styled(combined, style);
+        last.content.to_mut().push_str(text);
         return;
     }
 
