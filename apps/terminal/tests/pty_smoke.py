@@ -2549,7 +2549,12 @@ def main():
             raise AssertionError("Navigate > Reference did not open the Reference Library")
         os.write(master, b"\r")  # open the selected imported reference
         if not wait_for_screen_fragments((b"Reference only stays clear.",), timeout=3.0):
-            raise AssertionError("the imported reference prose was not rendered contiguously")
+            raise AssertionError(
+                "the imported reference prose was not rendered contiguously; screen: "
+                + repr(terminal_snapshot(output, 24, 80))
+                + "; output tail: "
+                + repr(ANSI_CONTROL.sub(b"", output[-1600:]))
+            )
         assert_visible_sentence(output, 24, 80, "Reference only stays clear.", "Reference Library")
         if any("Maqrara opened the old bok" in row for row in terminal_snapshot(output, 24, 80)):
             raise AssertionError("manuscript prose leaked into the Reference Library")

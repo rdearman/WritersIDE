@@ -2277,3 +2277,37 @@ uppercase N mnemonics, Ctrl+N while the File menu is focused, and Ctrl+N from
 the manuscript workspace must all open the same New Project dialogue; each
 cancel path preserves the active manuscript. The expanded PTY journey passed.
 The author's terminal/SSH key-delivery UAT remains outstanding.
+
+### Frozen author test build — Alpha UAT 37, 27 November 2026
+
+Alpha UAT 37 is frozen at source commit `322a044735937e793c4708a6d9413c687f189031` in
+`test-builds/alpha-uat-37-322a044/`. Launch with:
+
+```sh
+cd test-builds/alpha-uat-37-322a044
+./run.sh "Authoring Audit Project"
+```
+
+The bundle uses isolated preferences and four disposable synthetic projects;
+private manuscripts and publications are excluded. `UAT-CHECKLIST.md` covers
+the Outline menu, structure changes, inclusion/recovery, New Project keyboard
+dispatch, editing, persistence, non-fiction and publishing. The release binary
+passed production PTY journeys for fiction creation/write/autosave/first Save
+and the menu-driven authoring audit. All four bundled project databases passed
+SQLite integrity checks and bundle `SHA256SUMS` verified. Executable SHA-256:
+
+```text
+91b509fea3e2ca2c3dad3b404d575310a8195e7068664ca6f07cc56f72ab3143  bin/writers-ide-terminal
+befdae533576d1d9616de3c86b1476f76ec8250d6739cd0329b87b337b444d67  bin/writers-ide
+```
+
+Workspace formatting and warnings-denied Clippy passed. Workspace unit and
+service integration suites passed; after repairing two stale PTY assertions,
+the production PTY suite passed 39 tests and ignored one private-corpus test
+because its local fixture path was not configured. The expanded #58 shortcut
+PTY journey passed for lowercase/uppercase N and Ctrl+N both inside and outside
+the File menu. Human UAT remains required for #44, #54, #55, #58 and #76. Alpha
+UAT 36 is retained as the only older Alpha bundle; Alpha UAT 37 brings the total
+to two. Continue the v1.0 backlog after this checkpoint; the next priority is
+the outstanding P0 rendering and key-delivery defects, then the remaining #77
+interaction requirements.
