@@ -576,6 +576,47 @@ fn date_time_insertion_without_an_active_document_is_rejected_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn find_replace_fields_show_focus_caret_and_remain_editable_before_search_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Find Replace PTY");
+    let mut app = WriterApp::create_project(&project, "Find Replace PTY").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "The red fox waits.")
+        .unwrap();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(&harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("find-replace-focus")
+        .output()
+        .expect("run Find and Replace focus workflow through the production Linux PTY");
+    assert!(
+        result.status.success(),
+        "Find and Replace focus PTY failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "The red fox waits.",
+        "editing the search fields without running a replacement must not alter the manuscript"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn view_menu_switches_between_unified_outline_presentations_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

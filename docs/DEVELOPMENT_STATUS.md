@@ -1874,3 +1874,21 @@ Next actionable priorities remain: complete the author-facing Scrivener
 publication-profile path and its real-corpus mapping, then continue the open
 v1.0 defects and workflow verification. The proposed UX design remains pending
 author review; no broad interaction redesign is authorised by these tests.
+
+### Find and Replace field focus and caret — 27 November 2026
+
+Find and Replace now displays a visible `▏` insertion marker in the focused
+Find, Replace, or editable scope field. Left/Right, Home/End, insertion, and
+Backspace operate at Unicode grapheme boundaries. Focus remains visibly
+highlighted independently of the caret. A production PTY opens the panel via
+Edit, types replacement text before running a search, moves to Find with Tab,
+and closes with Escape; project content remains unchanged. A unit regression
+places the caret within an accented grapheme sequence and verifies mid-field
+editing and empty-field caret display.
+
+Verification: focused editor test and production PTY passed; the complete
+offline workspace suite passed (757 passed, 1 ignored protected ArrowMaking
+test); workspace Clippy with warnings denied, `cargo fmt --all -- --check`, and
+`git diff --check` passed. The PTY exercises the standard 80×24 terminal. The
+broader Find/Replace workflow and other terminal sizes still require author
+UAT; issue #43 remains open for that acceptance.

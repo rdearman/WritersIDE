@@ -1475,9 +1475,46 @@ struct FindPanel {
     scope: String,
     pattern: String,
     replacement: String,
+    pattern_cursor: usize,
+    replacement_cursor: usize,
+    scope_cursor: usize,
     field: FindPanelField,
     history_position: Option<usize>,
     history_draft: Option<String>,
+}
+
+fn find_field_byte_offset(value: &str, grapheme_index: usize) -> usize {
+    value
+        .grapheme_indices(true)
+        .nth(grapheme_index)
+        .map(|(offset, _)| offset)
+        .unwrap_or(value.len())
+}
+
+fn find_field_insert(value: &mut String, cursor: &mut usize, character: char) {
+    let byte_offset = find_field_byte_offset(value, *cursor);
+    value.insert(byte_offset, character);
+    *cursor = value[..byte_offset + character.len_utf8()]
+        .graphemes(true)
+        .count();
+}
+
+fn find_field_backspace(value: &mut String, cursor: &mut usize) {
+    if *cursor == 0 {
+        return;
+    }
+    let start = find_field_byte_offset(value, cursor.saturating_sub(1));
+    let end = find_field_byte_offset(value, *cursor);
+    value.replace_range(start..end, "");
+    *cursor -= 1;
+}
+
+fn render_find_field(value: &str, cursor: usize, focused: bool) -> String {
+    if !focused {
+        return value.to_owned();
+    }
+    let byte_offset = find_field_byte_offset(value, cursor);
+    format!("{}▏{}", &value[..byte_offset], &value[byte_offset..])
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -12007,6 +12044,9 @@ impl AppState {
             scope: scope.to_owned(),
             pattern: query.to_owned(),
             replacement: String::new(),
+            pattern_cursor: query.graphemes(true).count(),
+            replacement_cursor: 0,
+            scope_cursor: scope.graphemes(true).count(),
             field: FindPanelField::Pattern,
             history_position: None,
             history_draft: None,
@@ -17885,11 +17925,13 @@ impl AppState {
                 && let Some(panel) = &mut self.find_panel
             {
                 panel.scope = "open".into();
+                panel.scope_cursor = panel.scope.graphemes(true).count();
             }
             if cmd == "find-project"
                 && let Some(panel) = &mut self.find_panel
             {
                 panel.scope = "all".into();
+                panel.scope_cursor = panel.scope.graphemes(true).count();
             }
             return Ok(());
         }
@@ -23053,6 +23095,9 @@ impl AppState {
                 scope: "all".into(),
                 pattern: query.into(),
                 replacement: String::new(),
+                pattern_cursor: query.graphemes(true).count(),
+                replacement_cursor: 0,
+                scope_cursor: 3,
                 field: FindPanelField::Pattern,
                 history_position: None,
                 history_draft: None,
@@ -27550,11 +27595,25 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             story_core::FindMode::Wildcard => "Wildcards (*, ?)",
             story_core::FindMode::Regex => "Regex",
         };
+        let pattern_text = render_find_field(
+            &panel.pattern,
+            panel.pattern_cursor,
+            panel.field == FindPanelField::Pattern,
+        );
         let replace_text = if panel.replacing {
-            panel.replacement.as_str()
+            render_find_field(
+                &panel.replacement,
+                panel.replacement_cursor,
+                panel.field == FindPanelField::Replacement,
+            )
         } else {
-            "Ctrl+H to show this field"
+            "Ctrl+H to show this field".to_owned()
         };
+        let scope_text = render_find_field(
+            &panel.scope,
+            panel.scope_cursor,
+            panel.field == FindPanelField::Scope,
+        );
         let help = if panel.replacing && s.pending_replace.is_some() {
             [
                 "F3: Next/Skip · F6: Include/exclude match · F8: Include/exclude scene",
@@ -27594,7 +27653,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
         let lines = vec![
             Line::from(vec![
                 Span::styled(" Find: ", Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(&panel.pattern, focused(FindPanelField::Pattern)),
+                Span::styled(pattern_text, focused(FindPanelField::Pattern)),
                 Span::raw("    "),
                 Span::styled(
                     "Replace with: ",
@@ -27602,9 +27661,18 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 ),
                 Span::styled(replace_text, focused(FindPanelField::Replacement)),
             ]),
-            Line::from(format!(
-                " Search in: {scope} · {mode} · {match_count} match(es)"
-            )),
+            Line::from(vec![
+                Span::raw(" Search in: "),
+                Span::styled(
+                    if panel.field == FindPanelField::Scope {
+                        scope_text
+                    } else {
+                        scope
+                    },
+                    focused(FindPanelField::Scope),
+                ),
+                Span::raw(format!(" · {mode} · {match_count} match(es)")),
+            ]),
             Line::from(format!(" {options}")),
             Line::from(format!(" {}", help[0])),
             Line::from(format!(" {}", help[1])),
@@ -33534,12 +33602,17 @@ fn open_find_panel(s: &mut AppState, replacing: bool) {
         };
     } else {
         let session = load_find_panel_session(s.app.project_root());
+        let pattern_cursor = session.pattern.graphemes(true).count();
+        let replacement_cursor = session.replacement.graphemes(true).count();
         s.find_panel = Some(FindPanel {
             replacing,
             mode: story_core::FindMode::Normal,
             scope: "current".into(),
             pattern: session.pattern,
             replacement: session.replacement,
+            pattern_cursor,
+            replacement_cursor,
+            scope_cursor: "current".graphemes(true).count(),
             case_sensitive: session.case_sensitive,
             whole_word: session.whole_word,
             accent_sensitive: session.accent_sensitive,
@@ -33621,6 +33694,7 @@ fn handle_find_panel_key(
                 .position(|scope| scope == &panel.scope)
                 .unwrap_or(scopes.len() - 1);
             panel.scope = scopes[(index + 1) % scopes.len()].clone();
+            panel.scope_cursor = panel.scope.graphemes(true).count();
         }
         if invalidate_preview {
             s.pending_replace = None;
@@ -33741,24 +33815,67 @@ fn handle_find_panel_key(
                 }
             };
         }
-        KeyCode::Backspace => match panel.field {
+        KeyCode::Left => match panel.field {
             FindPanelField::Pattern => {
-                panel.pattern.pop();
+                panel.pattern_cursor = panel.pattern_cursor.saturating_sub(1)
             }
             FindPanelField::Replacement => {
-                panel.replacement.pop();
+                panel.replacement_cursor = panel.replacement_cursor.saturating_sub(1)
+            }
+            FindPanelField::Scope => panel.scope_cursor = panel.scope_cursor.saturating_sub(1),
+        },
+        KeyCode::Right => match panel.field {
+            FindPanelField::Pattern => {
+                panel.pattern_cursor =
+                    (panel.pattern_cursor + 1).min(panel.pattern.graphemes(true).count())
+            }
+            FindPanelField::Replacement => {
+                panel.replacement_cursor =
+                    (panel.replacement_cursor + 1).min(panel.replacement.graphemes(true).count())
             }
             FindPanelField::Scope => {
-                panel.scope.pop();
+                panel.scope_cursor =
+                    (panel.scope_cursor + 1).min(panel.scope.graphemes(true).count())
+            }
+        },
+        KeyCode::Home => match panel.field {
+            FindPanelField::Pattern => panel.pattern_cursor = 0,
+            FindPanelField::Replacement => panel.replacement_cursor = 0,
+            FindPanelField::Scope => panel.scope_cursor = 0,
+        },
+        KeyCode::End => match panel.field {
+            FindPanelField::Pattern => panel.pattern_cursor = panel.pattern.graphemes(true).count(),
+            FindPanelField::Replacement => {
+                panel.replacement_cursor = panel.replacement.graphemes(true).count()
+            }
+            FindPanelField::Scope => panel.scope_cursor = panel.scope.graphemes(true).count(),
+        },
+        KeyCode::Backspace => match panel.field {
+            FindPanelField::Pattern => {
+                find_field_backspace(&mut panel.pattern, &mut panel.pattern_cursor);
+            }
+            FindPanelField::Replacement => {
+                find_field_backspace(&mut panel.replacement, &mut panel.replacement_cursor);
+            }
+            FindPanelField::Scope => {
+                find_field_backspace(&mut panel.scope, &mut panel.scope_cursor);
             }
         },
         KeyCode::Char(character)
             if key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT =>
         {
             match panel.field {
-                FindPanelField::Pattern => panel.pattern.push(character),
-                FindPanelField::Replacement => panel.replacement.push(character),
-                FindPanelField::Scope => panel.scope.push(character),
+                FindPanelField::Pattern => {
+                    find_field_insert(&mut panel.pattern, &mut panel.pattern_cursor, character)
+                }
+                FindPanelField::Replacement => find_field_insert(
+                    &mut panel.replacement,
+                    &mut panel.replacement_cursor,
+                    character,
+                ),
+                FindPanelField::Scope => {
+                    find_field_insert(&mut panel.scope, &mut panel.scope_cursor, character)
+                }
             }
         }
         _ => {}
@@ -33833,6 +33950,7 @@ fn step_find_query_history(
             .take()
             .unwrap_or_else(|| session.pattern.clone()),
     };
+    panel.pattern_cursor = panel.pattern.graphemes(true).count();
     if s.pending_replace.take().is_some() {
         s.message = "Replacement preview cancelled because the query changed".into();
     }
@@ -44998,6 +45116,63 @@ mod tests {
     }
 
     #[test]
+    fn find_replace_shows_a_visible_caret_and_moves_it_by_unicode_grapheme() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "First", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        open_find_panel(&mut state, true);
+        {
+            let panel = state.find_panel.as_mut().unwrap();
+            panel.pattern = "café".into();
+            panel.pattern_cursor = 3;
+            panel.field = FindPanelField::Pattern;
+        }
+
+        let render = |state: &mut AppState| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, state)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        assert!(render(&mut state).contains("Find: caf▏é"));
+
+        handle(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('X'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.find_panel.as_ref().unwrap().pattern, "caXfé");
+        assert_eq!(state.find_panel.as_ref().unwrap().pattern_cursor, 3);
+        assert!(render(&mut state).contains("caX▏fé"));
+
+        handle(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)).unwrap();
+        assert!(render(&mut state).contains("Replace with: ▏"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::Left, KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.find_panel.as_ref().unwrap().replacement, "xé");
+        assert!(render(&mut state).contains("Replace with: x▏é"));
+    }
+
+    #[test]
     fn terminal_find_and_replace_use_each_scenes_locale() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -45818,6 +45993,9 @@ mod tests {
             scope: "open".into(),
             pattern: "unsaved".into(),
             replacement: String::new(),
+            pattern_cursor: 7,
+            replacement_cursor: 0,
+            scope_cursor: 4,
             case_sensitive: true,
             whole_word: false,
             accent_sensitive: false,
@@ -45862,6 +46040,9 @@ mod tests {
             scope: "open".into(),
             pattern: "unsaved".into(),
             replacement: String::new(),
+            pattern_cursor: 7,
+            replacement_cursor: 0,
+            scope_cursor: 4,
             case_sensitive: true,
             whole_word: false,
             accent_sensitive: false,
@@ -46176,6 +46357,9 @@ mod tests {
             scope: "current".into(),
             pattern: "cat".into(),
             replacement: "fox".into(),
+            pattern_cursor: 3,
+            replacement_cursor: 3,
+            scope_cursor: 7,
             field: FindPanelField::Pattern,
             history_position: None,
             history_draft: None,

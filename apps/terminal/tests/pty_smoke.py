@@ -144,6 +144,7 @@ def main():
     edit_menu = modes == ["edit-menu"]
     date_time_insertion = modes == ["date-time-insertion"]
     date_time_unavailable = modes == ["date-time-unavailable"]
+    find_replace_focus = modes == ["find-replace-focus"]
     review_thesaurus = modes == ["review-thesaurus"]
     review_menu = modes in (["review-menu"], ["review-thesaurus"])
     removed_scenes = modes == ["removed-scenes"]
@@ -1365,6 +1366,47 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit after the unavailable insertion test")
             print("PTY date/time precondition passed: no document means a clear unavailable response and no mutation.")
+            return
+
+        if find_replace_focus:
+            search_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10 opens the menu bar.
+            read_for(0.2)
+            os.write(master, b"\x1b[C")  # Edit menu.
+            select_visible_menu_item("Find and Replace")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Find: ", b"Replace with:", b"Find: \xe2\x96\x8f"),
+                search_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "Find and Replace did not show the focused Find caret; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\t")  # replacement is editable before any search runs
+            if not wait_for_screen_fragments((b"Replace with: \xe2\x96\x8f",), search_start, timeout=3.0):
+                raise AssertionError("the empty replacement field did not show its insertion caret")
+            os.write(master, b"fox")
+            if not wait_for_screen_fragments((b"Replace with: fox\xe2\x96\x8f",), search_start, timeout=3.0):
+                raise AssertionError("typing before a search did not update the replacement field")
+            os.write(master, b"\tcat")  # move to Find, then enter the search term
+            if not wait_for_screen_fragments((b"Find: cat\xe2\x96\x8f",), search_start, timeout=3.0):
+                raise AssertionError("Tab did not focus Find and place its caret after typed text")
+            os.write(master, b"\x1b")  # close without searching or modifying the manuscript
+            if not wait_for_screen_fragments((b"The red fox waits.",), search_start, timeout=3.0):
+                raise AssertionError("closing Find and Replace did not restore the manuscript")
+            read_for(0.2)
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit after the Find and Replace focus test")
+            print("PTY Find and Replace focus passed: empty fields show a caret, replacement-first entry works, and Esc preserves prose.")
             return
 
         if chapter_creation:
