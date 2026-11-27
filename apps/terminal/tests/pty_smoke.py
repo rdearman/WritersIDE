@@ -2,6 +2,7 @@
 """Exercise the built terminal application through a real Linux PTY."""
 
 import fcntl
+import json
 import os
 import pty
 import re
@@ -138,6 +139,7 @@ def main():
     compile_docx = modes == ["compile-docx"]
     scrivener_import = modes == ["scrivener-import"]
     save_as_populated = modes == ["save-as-populated"]
+    recent_projects = modes == ["recent-projects"]
     insert_edit_actions = modes == ["insert-edit-actions"]
     outline_enter = modes == ["outline-enter"]
     special_character = modes == ["special-character"]
@@ -165,7 +167,7 @@ def main():
     section_removal_rehome = modes == ["section-removal-rehome"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
-    if create_fiction or create_nonfiction:
+    if create_fiction or create_nonfiction or recent_projects:
         # Keep this workflow focused on project lifecycle rather than allowing
         # first-run onboarding to consume editing keys.
         onboarding = os.path.join(isolated_home, "config", "writers-ide")
@@ -175,6 +177,14 @@ def main():
                 '{"version":1,"welcome_seen":true,"tutorial_dismissed":true,'
                 '"tutorial_completed":false,"active_tutorial":null}'
             )
+    if recent_projects:
+        recent_path = os.environ.get("WIDE_PTY_RECENT_PROJECT")
+        if not recent_path:
+            raise AssertionError("recent-projects PTY requires a target project path")
+        recent_file = os.path.join(isolated_home, "config", "writers-ide", "recent-projects.json")
+        os.makedirs(os.path.dirname(recent_file), exist_ok=True)
+        with open(recent_file, "w", encoding="utf-8") as recent_store:
+            json.dump({"version": 1, "paths": [recent_path]}, recent_store)
     child_pid, master = pty.fork()
     if child_pid == 0:
         environment = os.environ.copy()
@@ -305,11 +315,35 @@ def main():
             raise AssertionError("Scene Cards presentation did not render its Included and Excluded collections")
 
     def show_outline_tree_presentation():
-        """Open the unified hierarchical Outline with its advertised F2 shortcut."""
+        """Open the unified Outline through the visible View menu."""
+        rows = terminal_snapshot(output, 24, 80)
+        if len(rows) > 1 and rows[1].startswith("┌Editor"):
+            os.write(master, b"\x1b")  # use the editor's advertised return route first
+            if not wait_for_screen_fragments((b"Included", b"Excluded"), timeout=3.0) and not wait_for_workspace_title("Outline"):
+                raise AssertionError(
+                    "Esc did not return from the editor to its manuscript outliner; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+        if wait_for_workspace_title("Outline", timeout=0.1):
+            return
         menu_start = len(output)
-        os.write(master, b"\x1bOQ")  # F2: Outline
+        os.write(master, b"\x1b[21~")  # F10
+        read_for(0.2)
+        os.write(master, b"\x1b[C" * 4)  # View
+        if wait_for_screen_fragments((b"Show Outline Tree",), menu_start, timeout=2.0):
+            select_visible_menu_item("Show Outline Tree")
+            os.write(master, b"\r")
+        elif wait_for_screen_fragments((b"Show Scene Cards",), menu_start, timeout=2.0):
+            # The menu offers the other presentation when Outline is already
+            # active; dismiss it without changing the current view.
+            os.write(master, b"\x1b")
+        else:
+            raise AssertionError("View menu did not identify the Outline presentation")
         if not wait_for_workspace_title("Outline", timeout=3.0):
-            raise AssertionError("F2 did not open the unified hierarchical manuscript outline")
+            raise AssertionError(
+                "View > Show Outline Tree did not open the manuscript outline; screen: "
+                + repr(terminal_snapshot(output, 24, 80))
+            )
 
     def select_visible_menu_item(label):
         for _ in range(64):
@@ -342,6 +376,46 @@ def main():
 
     try:
         read_for(1.0)
+        if recent_projects:
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10, File menu
+            read_for(0.2)
+            select_visible_menu_item("Recent Projects")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Recent Projects", b"Enter open"), menu_start, timeout=5.0
+            ):
+                raise AssertionError("File > Recent Projects did not open its project picker")
+            # Startup adds the current project at index zero; the seeded
+            # destination is therefore the second visible project.
+            os.write(master, b"\x1b[B\r")
+            if not wait_for_screen_fragments(
+                (b"Target Project", b"Included", b"The Target Scene"), timeout=5.0
+            ):
+                raise AssertionError(
+                    "Recent Projects did not open the selected book; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\r")
+            if not wait_for_workspace_title("Editor", timeout=5.0) or not wait_for_screen_fragments(
+                (b"Text from the selected recent book.",), timeout=5.0
+            ):
+                raise AssertionError(
+                    "the opened recent book did not navigate to its manuscript; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 8.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after opening a recent project")
+            print("PTY Recent Projects workflow passed: File menu → select recent book → open its outline.")
+            return
+
         if save_as_populated:
             os.write(master, b"\x1b")  # dismiss first-run help if present
             read_for(0.2)
@@ -397,34 +471,31 @@ def main():
             ):
                 raise AssertionError("File > Import Scrivener did not open the file browser")
             os.write(master, b"\t\r")  # select .scriv folder; Enter imports directly into staging
-            if expected_titles:
-                deadline = time.monotonic() + 120.0
-                imported_outline_ready = False
-                while time.monotonic() < deadline:
-                    rows = terminal_snapshot(output, 24, 80)
-                    visible = "".join("".join(rows).split())
-                    if (
-                        len(rows) > 1
-                        and rows[1].startswith("┌Outline")
-                        and all(title.replace(" ", "") in visible for title in expected_titles)
-                    ):
-                        imported_outline_ready = True
-                        break
-                    read_for(0.1)
-            else:
-                deadline = time.monotonic() + 120.0
-                imported_outline_ready = False
-                while time.monotonic() < deadline:
-                    rows = terminal_snapshot(output, 24, 80)
-                    if len(rows) > 1 and rows[1].startswith("┌Outline") and any(
-                        re.search(r"▸\s+\[ \] .+", row) for row in rows
-                    ):
-                        imported_outline_ready = True
-                        break
-                    read_for(0.1)
-            if not imported_outline_ready:
+            deadline = time.monotonic() + 120.0
+            imported_workspace_ready = False
+            imported_in_outline = False
+            while time.monotonic() < deadline:
+                rows = terminal_snapshot(output, 24, 80)
+                visible = "".join("".join(rows).split())
+                imported_in_outline = len(rows) > 1 and rows[1].startswith("┌Outline")
+                if imported_in_outline or ("Included" in visible and "Excluded" in visible):
+                    imported_workspace_ready = True
+                    break
+                read_for(0.1)
+            if not imported_workspace_ready:
                 raise AssertionError(
-                    "import did not open the preserved manuscript outline; screen: "
+                    "import did not open the preserved manuscript workspace; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            # Import may briefly render its structural outline before the
+            # normal fiction card workspace settles. Use the visible View
+            # menu to ensure this workflow proceeds in the hierarchy.
+            show_outline_tree_presentation()
+            if expected_titles and not wait_for_screen_fragments(
+                tuple(title.encode("utf-8") for title in expected_titles), timeout=3.0
+            ):
+                raise AssertionError(
+                    "the imported hierarchy did not preserve its expected titles; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
                 )
             if expected_titles and not wait_for_screen_fragments(
@@ -870,9 +941,12 @@ def main():
                 raise AssertionError("the selected scene did not open in the manuscript editor")
             if not wait_for_workspace_title("Editor"):
                 raise AssertionError("the scene did not open in the manuscript editor")
-            os.write(master, b"\x1b")  # Scene actions are available in the manuscript Outline
+            os.write(master, b"\x1b")  # return to the originating manuscript outline
+            if not wait_for_screen_fragments((b"Included", b"Excluded"), timeout=3.0):
+                raise AssertionError("Esc did not restore the originating Scene Cards view")
+            show_outline_tree_presentation()
             if not wait_for_workspace_title("Outline"):
-                raise AssertionError("Esc did not return to the selected scene in the Outline")
+                raise AssertionError("the View menu did not open the hierarchical Outline")
             os.write(master, b"\x1b[21~")  # F10
             read_for(0.2)
             menu_start = len(output)
@@ -917,8 +991,11 @@ def main():
             if not wait_for_screen_fragments((b"Original scene body",), timeout=10.0):
                 raise AssertionError("the selected scene did not open in the manuscript editor")
             os.write(master, b"\x1b")
+            if not wait_for_screen_fragments((b"Included", b"Excluded"), timeout=3.0):
+                raise AssertionError("Esc did not restore the originating Scene Cards view")
+            show_outline_tree_presentation()
             if not wait_for_workspace_title("Outline"):
-                raise AssertionError("Esc did not return to the manuscript Outline")
+                raise AssertionError("the View menu did not open the manuscript Outline")
             os.write(master, b"\x1b[A")  # select the chapter heading above the scene
             read_for(0.3)
             os.write(master, b"\x1b[21~")  # F10

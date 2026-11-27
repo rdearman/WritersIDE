@@ -145,6 +145,61 @@ fn save_as_preserves_populated_project_trees_through_the_production_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn recent_projects_opens_the_selected_book_from_the_production_menu_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let current_path = root.path().join("Current Project");
+    let target_path = root.path().join("Target Project");
+    let current = WriterApp::create_project(&current_path, "Current Book").unwrap();
+    let mut target = WriterApp::create_project(&target_path, "The Different Book").unwrap();
+    let chapter = target
+        .create_chapter(None, "The Target Chapter", 0)
+        .unwrap();
+    let scene = target.create_scene(chapter, "The Target Scene", 0).unwrap();
+    let (_, hash) = target.load_scene_text(scene).unwrap();
+    target
+        .save_scene_text(scene, Some(&hash), "Text from the selected recent book.")
+        .unwrap();
+    let target_id = target.get_project().unwrap().id;
+    drop(target);
+    drop(current);
+
+    let home = root.path().join("isolated-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(&harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&current_path)
+        .arg(&home)
+        .arg("recent-projects")
+        .env(
+            "WIDE_PTY_RECENT_PROJECT",
+            target_path.canonicalize().unwrap(),
+        )
+        .output()
+        .expect("run Recent Projects through the Linux PTY");
+    assert!(
+        result.status.success(),
+        "Recent Projects PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&target_path).unwrap();
+    reopened.validate_project().unwrap();
+    assert_eq!(reopened.get_project().unwrap().id, target_id);
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "Text from the selected recent book."
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

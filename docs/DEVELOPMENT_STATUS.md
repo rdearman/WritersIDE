@@ -28,6 +28,28 @@ tail; the harness now sends those characters at a human typing cadence, and
 the test passed both in isolation and in the complete PTY run. This test-harness
 adjustment does not change application input behaviour.
 
+## Recent project author workflow — 27 November 2026
+
+The command audit found that `File > Recent Projects` had service/state tests
+but no production terminal journey. A new PTY test seeds an isolated recent
+project list, opens a different project through the visible menu, confirms its
+fiction outliner is active, opens a scene, and checks its saved prose and
+identity after exit/reopen. This exposed that projects without a saved session
+were landing on Dashboard. The application now selects the established fiction
+Scene Cards or non-fiction Outline as the default on startup/project switch,
+then restores any saved per-project workspace over that fallback. The
+production Recent Projects PTY passes. Editor-to-outliner navigation now tracks
+the latest Scene Cards or Outline presentation, including across first Save
+promotion, so Esc returns to the view the author was using. PTY coverage
+verifies scene/chapter renaming, Scrivener import through edit, autosave,
+promotion, reopen and compile, and the fiction create/save/reopen/continue
+journey. Final verification passed: `cargo fmt --all -- --check`, workspace
+Clippy with warnings denied, and `cargo test --offline --workspace
+-- --test-threads=1`. The run passed 358 terminal unit tests, 35 production PTY
+tests (one private fixture PTY intentionally ignored), 3 full author workflows
+and all other workspace tests. The Ollama test's local loopback socket ran with
+the user's previously authorised permission. Human UAT remains necessary.
+
 ## Scrivener `LevelTypes` profile mapping — 27 November 2026
 
 The importer now retains Scrivener binder-category section defaults from

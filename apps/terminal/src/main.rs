@@ -123,6 +123,13 @@ impl Workspace {
         }
     }
 }
+
+fn default_authoring_workspace(book_type: story_core::BookType) -> Workspace {
+    match book_type {
+        story_core::BookType::Fiction => Workspace::Cards,
+        story_core::BookType::Nonfiction | story_core::BookType::Custom => Workspace::Outline,
+    }
+}
 const PRIMARY_DESTINATIONS: [Workspace; 3] =
     [Workspace::Editor, Workspace::Outline, Workspace::Reading];
 
@@ -11400,7 +11407,15 @@ impl AppState {
         notice: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let recent_projects_path = self.recent_projects_path.clone();
+        let same_project = self.app.get_project()?.id == app.get_project()?.id;
+        let manuscript_return_view = same_project
+            .then(|| self.history.get(self.history_index).copied())
+            .flatten()
+            .filter(|workspace| is_manuscript_outliner(*workspace));
         let mut next = Self::new(app, function_bindings);
+        next.workspace = manuscript_return_view.unwrap_or(default_authoring_workspace(
+            next.app.get_project()?.book_type,
+        ));
         next.temporary_project = is_staged_project(&path);
         next.recent_projects_path = recent_projects_path.clone();
         next.command_bindings = command_bindings;
@@ -14832,7 +14847,19 @@ impl AppState {
                     .then(|| self.editing_scene.or_else(|| self.active_scene()))
                     .flatten()
             });
-            if !(is_manuscript_outliner(previous) && is_manuscript_outliner(w)) {
+            if is_manuscript_outliner(previous) && is_manuscript_outliner(w) {
+                // Scene Cards and the hierarchical Outline are two views of
+                // one manuscript outliner. Keep the editor's return target
+                // aligned with the presentation the author most recently
+                // used, rather than leaving a stale sibling view in history.
+                if self.history.is_empty() {
+                    self.history.push(w);
+                    self.history_index = 0;
+                } else if self.history_index < self.history.len() {
+                    self.history[self.history_index] = w;
+                    self.history.truncate(self.history_index + 1);
+                }
+            } else {
                 if self.history_index + 1 < self.history.len() {
                     self.history.truncate(self.history_index + 1);
                 }
@@ -15120,6 +15147,11 @@ impl AppState {
             self.switch_to_open_project(demo_path, demo, "Tutorial sample opened".into());
         self.recent_projects_path = recent_projects_path;
         switched?;
+        // The first tutorial lesson explicitly teaches navigation from the
+        // dashboard; project-type defaults apply to normal project opening,
+        // while the lesson must begin in its documented practice context.
+        self.workspace = Workspace::Dashboard;
+        self.selected = 0;
         self.tutorial_preferences_path = preferences_path.clone();
         self.refresh_tutorial_progress_label();
         self.help_panel = Some(tutorial_panel_at(track, 0, &self.tutorial_preferences_path));
@@ -25396,6 +25428,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = WriterApp::open_project(&project_path)?;
     app.recover_interrupted_writing_challenges()?;
     let mut state = AppState::new(app, function_bindings);
+    state.workspace = default_authoring_workspace(state.app.get_project()?.book_type);
     state.temporary_project = startup_scratch.is_some() || is_staged_project(&project_path);
     let recent_projects_path = user_recent_projects_path();
     state.recent_projects_path = Some(recent_projects_path.clone());
