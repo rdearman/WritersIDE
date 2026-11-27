@@ -142,6 +142,8 @@ def main():
     special_character = modes == ["special-character"]
     named_layouts = modes == ["named-layouts"]
     edit_menu = modes == ["edit-menu"]
+    date_time_insertion = modes == ["date-time-insertion"]
+    date_time_unavailable = modes == ["date-time-unavailable"]
     review_thesaurus = modes == ["review-thesaurus"]
     review_menu = modes in (["review-menu"], ["review-thesaurus"])
     removed_scenes = modes == ["removed-scenes"]
@@ -1302,6 +1304,69 @@ def main():
             print("PTY Edit-menu workflow passed: selection, duplication, paragraph joining, Undo, save and reopen dispatch in writing mode.")
             return
 
+        if date_time_insertion:
+            insertion_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10 opens the menu bar.
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 2)  # Insert menu.
+            select_visible_menu_item("Insert Date and Time")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Inserted date and time", b"The clock struck noon."),
+                insertion_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "Insert > Date and Time did not both report success and render inserted text; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x13")  # Ctrl+S
+            if not wait_for_screen_fragments((b"[SAVED]",), insertion_start, timeout=3.0):
+                raise AssertionError("date/time insertion did not save through the editor")
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("the application did not exit cleanly after date/time insertion")
+            print("PTY date/time workflow passed: Insert menu action changed the active scene and saved successfully.")
+            return
+
+        if date_time_unavailable:
+            insertion_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10 opens the menu bar.
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 2)  # Insert menu.
+            select_visible_menu_item("Insert Date and Time")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Insert Date and Time unavailable", b"Open a manuscript document first"),
+                insertion_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "date/time insertion without a document did not explain why it was unavailable; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            if b"Inserted date and time" in ANSI_CONTROL.sub(b"", output[insertion_start:]):
+                raise AssertionError("WIDE claimed to insert date/time without an active document")
+            os.write(master, b"\x1b")  # close menu without changing the project
+            read_for(0.2)
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit after the unavailable insertion test")
+            print("PTY date/time precondition passed: no document means a clear unavailable response and no mutation.")
+            return
+
         if chapter_creation:
             os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
             read_for(0.3)
@@ -1731,6 +1796,7 @@ def main():
             not section_removal_delete
             and not section_removal_rehome
             and not chapter_removal
+            and not date_time_unavailable
             and b"Arrival" not in output
         ):
             raise AssertionError(

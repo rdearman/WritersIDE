@@ -7,6 +7,7 @@ This is a command-by-command inventory built from the terminal command registry 
 - The production PTY now verifies New Section, New Chapter, New Scene, inclusion toggling, manuscript editing and saving, searchable story-link creation, and changing a project from Fiction to Non-fiction. It asserts the visible transitions and persisted results.
 - Section and chapter actions had previously routed through a legacy command parser that did not recognise the author-facing labels. They now dispatch through typed actions and show title prompts.
 - Date/time insertion now requires an active editable document and reports unavailability instead of claiming insertion succeeded without a target.
+- A production Linux PTY now selects Insert > Insert Date and Time, verifies that the active scene changes, saves, exits, and reopens to verify persistence. A separate no-document PTY verifies the action reports why it is unavailable, does not claim success, and exits cleanly.
 - The unified outline now renders inclusion state independently from multi-selection state and labels unplaced scenes. Scene Cards remains available.
 - The editor breadcrumb and Escape return use the active content-unit identity, avoiding a stale scene title or returning to a different outline row.
 - Story-link endpoint selection now searches and selects existing entities rather than asking authors to type identifiers. The resulting relation names its endpoints.
@@ -120,7 +121,7 @@ Unique command/audit entries: **384**; statically declared registry entries: **3
 | `edit.duplicate-selection` | Edit | — | Duplicate Selection or Paragraph: Duplicate selected text or the paragraph containing the cursor | Menu/registry command | Registered; not individually exercised by the #76 PTY batch |
 | `edit.indent` | Edit | — | Indent Paragraph: Indent the selected paragraphs or the current paragraph | Menu/registry command | Registered; not individually exercised by the #76 PTY batch |
 | `edit.insert-date` | Insert | — | Insert Date: Insert today's date using the project date format | Menu/registry command | Registered; not individually exercised by the #76 PTY batch |
-| `edit.insert-date-time` | Insert | — | Insert Date and Time: Insert the current date and time using project formats | Menu/registry command | Registered; not individually exercised by the #76 PTY batch |
+| `edit.insert-date-time` | Insert | — | Insert Date and Time: Insert the current date and time using project formats | Menu/registry command | Production PTY verified active-document insertion/save/reopen and no-document rejection; other date/time variants remain covered by unit tests |
 | `edit.insert-file` | Insert | — | Insert File…: Insert UTF-8 text from a selected file at the manuscript cursor | Menu/registry command | Registered; not individually exercised by the #76 PTY batch |
 | `edit.insert-special-character` | Insert | — | Special Character…: Search and insert a Unicode character or enter its code point | Menu/registry command | Registered; not individually exercised by the #76 PTY batch |
 | `edit.insert-time` | Insert | — | Insert Time: Insert the current local time using the project time format | Menu/registry command | Registered; not individually exercised by the #76 PTY batch |

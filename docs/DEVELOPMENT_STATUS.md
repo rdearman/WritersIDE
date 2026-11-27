@@ -1848,3 +1848,29 @@ not verified because the creation-only PTY helper assumes an initial empty
 scene view. Checklist: `test-builds/alpha-uat-34-1073cf3/UAT-CHECKLIST.md`.
 Human verification remains pending. Launch with `./run.sh` from the bundle
 directory; preferences and disposable project data are bundle-local.
+
+### Issue #76 PTY verification — date/time insertion — 27 November 2026
+
+The command audit now distinguishes menu registration from production workflow
+evidence for Insert Date and Time. Two Linux PTY tests exercise the actual
+terminal: with an active scene, the menu action inserts text, reports success,
+and the saved text survives reopen; with an empty project, the action explains
+that a manuscript document must be opened, does not report success, and exits
+without creating a scene or mutating manuscript content. Other date and time
+variants remain covered by application unit tests; they are not claimed as
+individually PTY-verified.
+
+Verification on the implementation revision: the complete offline workspace
+suite passed (755 passed, 1 ignored protected ArrowMaking fixture test), all 32
+runnable production PTY tests passed, workspace Clippy with warnings denied,
+`cargo fmt --all -- --check`, and `git diff --check` passed. The PTY script
+failed twice while being developed because it first expected an off-screen menu
+entry to be visible without scrolling, then sent Escape and quit without
+allowing the terminal event loop to process the first key; both test-harness
+assumptions were corrected. No production behavior was changed in this batch.
+Human workflow acceptance for #76 and related UI issues remains open.
+
+Next actionable priorities remain: complete the author-facing Scrivener
+publication-profile path and its real-corpus mapping, then continue the open
+v1.0 defects and workflow verification. The proposed UX design remains pending
+author review; no broad interaction redesign is authorised by these tests.

@@ -500,6 +500,82 @@ fn outline_heading_rename_from_the_edit_menu_is_persistent_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn date_time_insertion_dispatches_from_the_production_menu_and_persists_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Date Time PTY");
+    let mut app = WriterApp::create_project(&project, "Date Time PTY").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "The clock struck noon.")
+        .unwrap();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(&harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("date-time-insertion")
+        .output()
+        .expect("run date/time insertion through the production Linux PTY");
+    assert!(
+        result.status.success(),
+        "date/time insertion PTY failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    let text = reopened.load_scene_text(scene).unwrap().0;
+    assert!(text.contains("The clock struck noon."));
+    assert_ne!(
+        text, "The clock struck noon.",
+        "menu action must insert text"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn date_time_insertion_without_an_active_document_is_rejected_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Empty Project");
+    WriterApp::create_project(&project, "Empty Project").unwrap();
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(&harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("date-time-unavailable")
+        .output()
+        .expect("run unavailable date/time action through the production Linux PTY");
+    assert!(
+        result.status.success(),
+        "unavailable date/time PTY failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        WriterApp::open_project(&project)
+            .unwrap()
+            .list_scenes(false)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn view_menu_switches_between_unified_outline_presentations_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;
