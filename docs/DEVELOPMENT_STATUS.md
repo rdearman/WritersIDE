@@ -24,6 +24,18 @@ correction. This resolves the explicit confirmation gap in #69 but does not
 complete whole-document restoration, snapshot rename/retention policy, or
 human UAT.
 
+The Revisions diff also exposes `R` to restore the entire document from the
+selected snapshot. It previews the current and snapshot character counts,
+requires Enter/`y` confirmation, and supports Escape/`n` cancellation. The
+existing optimistic hash check and journalled restore service preserve the
+current text in a safety snapshot. A unit regression covers preview,
+cancellation, full restoration and safety snapshot creation. Follow-up
+verification on 27 November 2026 passed workspace formatting, warnings-denied
+workspace Clippy, and the full offline workspace test suite, including 38 PTY
+tests (one protected private-corpus test was intentionally ignored because its
+local fixture path was not configured). Whole-document restore has not yet
+had a separate PTY scenario or human UAT.
+
 ## Scrivener inherited section-type profile suppression — 27 November 2026
 
 Compile profiles previously applied a Scrivener layout's `Include Text=No`

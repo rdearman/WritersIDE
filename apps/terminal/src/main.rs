@@ -1727,6 +1727,7 @@ enum CommandAction {
     RestartTutorial,
     ResolveSaveConflict,
     RestoreRevisionHunk,
+    RestoreRevisionDocument,
     Process { expand_transclusions: bool },
     ProcessSelected { expand_transclusions: bool },
     LegacyPalette,
@@ -2219,6 +2220,21 @@ fn command_registry() -> Vec<CommandSpec> {
             menu_priority: 100,
             advanced: true,
             action: CommandAction::RestoreRevisionHunk,
+        },
+        CommandSpec {
+            id: "revision.restore-document",
+            label: "Restore Entire Document from Snapshot",
+            description: "Replace this document with the selected snapshot after confirmation",
+            category: "Review",
+            default_shortcuts: &[],
+            mnemonic: Some('d'),
+            palette_aliases: &["restore-document-snapshot"],
+            palette_prefix: None,
+            takes_arguments: false,
+            task_group: "Revisions & Recovery",
+            menu_priority: 101,
+            advanced: true,
+            action: CommandAction::RestoreRevisionDocument,
         },
         CommandSpec {
             id: "compile.run",
@@ -16048,6 +16064,12 @@ impl AppState {
             CommandAction::RestoreRevisionHunk if self.dirty => {
                 Some("Save the manuscript buffer first")
             }
+            CommandAction::RestoreRevisionDocument if self.revision_diff.is_none() => {
+                Some("Open a revision diff first")
+            }
+            CommandAction::RestoreRevisionDocument if self.dirty => {
+                Some("Save the manuscript buffer first")
+            }
             _ if matches!(
                 spec.id,
                 "series.add-current" | "series.new-book" | "series.references"
@@ -17186,6 +17208,7 @@ impl AppState {
                 );
             }
             CommandAction::RestoreRevisionHunk => self.request_revision_hunk_restore()?,
+            CommandAction::RestoreRevisionDocument => self.request_revision_document_restore()?,
             CommandAction::Process {
                 expand_transclusions,
             } => {
@@ -25404,6 +25427,58 @@ impl AppState {
         self.message = "Selected revision hunk restored; previous text was snapshotted".into();
         Ok(())
     }
+
+    fn request_revision_document_restore(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err("save the current manuscript buffer before restoring a revision".into());
+        }
+        let scene = self.revision_scene.ok_or("open a snapshot diff first")?;
+        let snapshot = self.revision_diff.ok_or("open a snapshot diff first")?;
+        let record = self
+            .app
+            .list_snapshots(scene)?
+            .into_iter()
+            .find(|entry| entry.id == snapshot)
+            .ok_or("the selected snapshot is no longer available")?;
+        let (_, current) = self.app.load_scene_text(scene)?;
+        let (_, snapshot_text) = self.app.load_snapshot(snapshot)?;
+        self.mode = Some('W');
+        self.prompt = format!(
+            "Replace the entire document with ‘{}’? Enter/y confirms · Esc cancels",
+            record.label
+        );
+        self.message = format!(
+            "This replaces {} current characters with {} snapshot characters; current text will be saved as a new snapshot",
+            current.chars().count(),
+            snapshot_text.chars().count()
+        );
+        Ok(())
+    }
+
+    fn confirm_revision_document_restore(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.dirty {
+            return Err("save the current manuscript buffer before restoring a revision".into());
+        }
+        let scene = self.revision_scene.ok_or("open a snapshot diff first")?;
+        let snapshot = self.revision_diff.ok_or("open a snapshot diff first")?;
+        let (_, expected_hash) = self.app.load_scene_text(scene)?;
+        self.app.restore_snapshot(scene, snapshot, &expected_hash)?;
+        if self.editing_scene == Some(scene) {
+            let (text, saved_hash) = self.app.load_scene_text(scene)?;
+            self.editor = text.split('\n').map(str::to_owned).collect();
+            self.saved_hash = saved_hash;
+            self.cursor = (0, 0);
+            self.editor_selection = None;
+        }
+        self.mode = None;
+        self.prompt.clear();
+        self.revision_diff = None;
+        self.revision_hunk = 0;
+        self.refresh()?;
+        self.message =
+            "Entire document restored from snapshot; previous text was snapshotted".into();
+        Ok(())
+    }
 }
 
 fn open_default_manuscript_if_unrestored(
@@ -27554,7 +27629,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     format!("{snapshot_label} · no changes · Esc close")
                 } else {
                     format!(
-                        "{snapshot_label} · hunk {}/{} · [ ] select · r restore · Esc close",
+                        "{snapshot_label} · hunk {}/{} · [ ] select · r restore hunk · R restore document · Esc close",
                         selected_hunk + 1,
                         hunks.len()
                     )
@@ -35117,6 +35192,24 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
             return Ok(false);
         }
+        if s.mode == Some('W') {
+            match k.code {
+                KeyCode::Enter | KeyCode::Char('y' | 'Y') => {
+                    if let Err(error) = s.confirm_revision_document_restore() {
+                        s.message = format!(
+                            "Document was not restored; your current manuscript remains unchanged: {error}"
+                        );
+                    }
+                }
+                KeyCode::Esc | KeyCode::Char('n' | 'N') => {
+                    s.mode = None;
+                    s.prompt.clear();
+                    s.message = "Document restore cancelled; manuscript unchanged".into();
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
         if s.mode == Some('R') {
             match k.code {
                 KeyCode::Esc => {
@@ -36386,6 +36479,13 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         KeyCode::Char('r') if s.workspace == Workspace::Revisions && s.revision_diff.is_some() => {
             if let Some(command) = command_by_id("revision.restore-hunk")
+                && let Err(error) = s.dispatch_registered(command.action)
+            {
+                s.message = error.to_string();
+            }
+        }
+        KeyCode::Char('R') if s.workspace == Workspace::Revisions && s.revision_diff.is_some() => {
+            if let Some(command) = command_by_id("revision.restore-document")
                 && let Err(error) = s.dispatch_registered(command.action)
             {
                 s.message = error.to_string();
@@ -49711,6 +49811,64 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|snapshot| snapshot.id == other_snapshot)
+        );
+
+        let whole_document_snapshot = state
+            .app
+            .create_snapshot(scene, "Complete version")
+            .unwrap();
+        let (_, current_hash) = state.app.load_scene_text(scene).unwrap();
+        state
+            .app
+            .save_scene_text(
+                scene,
+                Some(&current_hash),
+                "replacement text\nwith two lines",
+            )
+            .unwrap();
+        state.revision_scene = Some(scene);
+        state.revision_diff = Some(whole_document_snapshot);
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        assert_eq!(state.mode, Some('W'));
+        assert!(state.prompt.contains("Complete version"));
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "replacement text\nwith two lines",
+            "requesting whole-document restoration must not mutate the manuscript"
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.mode, None);
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "replacement text\nwith two lines",
+            "cancelling whole-document restoration must leave current text intact"
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('R'), KeyModifiers::SHIFT),
+        )
+        .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "first\nold\nlast\n"
+        );
+        assert!(state.message.contains("Entire document restored"));
+        assert!(
+            state
+                .app
+                .list_snapshots(scene)
+                .unwrap()
+                .iter()
+                .any(|snapshot| snapshot.label == "Before restore: Complete version")
         );
     }
 
