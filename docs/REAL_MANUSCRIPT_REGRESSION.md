@@ -34,6 +34,13 @@ not be considered proof that all Scrivener layout and inclusion settings have
 been preserved. Resolve the remaining source assignment gaps before claiming
 source-to-publication fidelity.
 
+Scrivener also stores a format-level text separator in a `.scrformat` under
+`SeparatorSettings/TextSeparators/Between`. WIDE retains that setting and uses
+it as a fallback for consecutive scenes when the selected scene layouts provide
+no separator. A separator specified by a scene layout takes precedence.
+Unsupported or incomplete settings are reported; separators are not inferred
+from binder titles and do not override chapter boundaries.
+
 User clarification: additional back matter, corrected websites/email links and
 newsletter information may exist in the Scrivener projects but not in the
 historical EPUBs. Some binder items may have been deliberately excluded from

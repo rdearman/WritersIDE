@@ -1,5 +1,37 @@
 # Writer's IDE Development Status
 
+## Scrivener format-level scene separator — 27 November 2026
+
+Scrivener `.scrformat` files can define the separator between consecutive text
+documents at format level (`SeparatorSettings/TextSeparators/Between`). WIDE
+now imports this value as typed format metadata and applies it to the compile
+presentation only when selected scene layouts provide no scene separator.
+An explicit layout separator retains precedence; an incomplete or unsupported
+setting produces a warning. This remains subject to the source-format mapping
+limits recorded in `REAL_MANUSCRIPT_REGRESSION.md` and human publication UAT.
+
+Synthetic regression coverage verifies the XML import, the format-level
+fallback, the layout-level precedence and separator rendering between two
+scenes within one chapter. The full offline workspace suite passed against the
+implementation committed as
+`4e8f471b91f068d5976a48f2eab984a71aba0099`: 358 terminal unit tests, three
+author-workflow tests, 35 PTY tests, all workspace library, CLI, integration
+and doc tests; one protected private-corpus PTY was intentionally ignored.
+Workspace formatting and warnings-denied Clippy passed.
+
+The exact-commit production three-book regression is
+`reports/format-separator-4e8f471-20261127/`; generated EPUBs are
+`generated/format-separator-4e8f471-20261127/book-01.epub`,
+`generated/format-separator-4e8f471-20261127/book-02.epub`, and
+`generated/format-separator-4e8f471-20261127/book-03.epub`. Fixture checksums
+passed before and after. Source fingerprints remained unchanged, all 149 included
+manuscript/research bodies (41+4, 38+4, 70+10) survived persistence and
+reopening exactly, and excluded Trash bodies remained excluded. EPUBCheck
+4.2.6 reported zero errors and warnings for all generated EPUBs. The run remains
+provisional: all three imports are classified incomplete, and the recorded
+source/reference publication discrepancies remain material. This regression
+does not establish human publication fidelity.
+
 ## Scrivener statistics metadata and three-book regression — 27 November 2026
 
 The Scrivener profile investigation corrected an earlier interpretation of
