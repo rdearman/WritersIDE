@@ -53803,6 +53803,75 @@ mod tests {
     }
 
     #[test]
+    fn save_as_preserves_populated_project_assets_templates_exports_and_database_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("Source Project");
+        let mut app = WriterApp::create_project(&source, "Source Project").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Original manuscript text.")
+            .unwrap();
+        let project_id = app.get_project().unwrap().id;
+        for (relative, bytes) in [
+            ("attachments/reference.bin", b"asset bytes".as_slice()),
+            (
+                "templates/story-bible/custom.toml",
+                b"template bytes".as_slice(),
+            ),
+            ("exports/previous.epub", b"publication bytes".as_slice()),
+            ("research/notes/source.md", b"research bytes".as_slice()),
+        ] {
+            let path = source.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, bytes).unwrap();
+        }
+
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state
+            .dispatch_registered_command_id("file.save-as")
+            .unwrap();
+        let browser = state.file_browser.as_mut().unwrap();
+        browser.current_dir = directory.path().to_owned();
+        browser.entries = file_browser_entries(directory.path()).unwrap();
+        browser.name = "Saved Copy".into();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+        state
+            .handle_file_browser_key(KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE))
+            .unwrap();
+
+        let destination = directory.path().join("Saved Copy");
+        assert_eq!(state.app.project_root(), destination);
+        assert_eq!(state.app.get_project().unwrap().id, project_id);
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            "Original manuscript text."
+        );
+        for (relative, bytes) in [
+            ("attachments/reference.bin", b"asset bytes".as_slice()),
+            (
+                "templates/story-bible/custom.toml",
+                b"template bytes".as_slice(),
+            ),
+            ("exports/previous.epub", b"publication bytes".as_slice()),
+            ("research/notes/source.md", b"research bytes".as_slice()),
+        ] {
+            assert_eq!(fs::read(destination.join(relative)).unwrap(), bytes);
+            assert_eq!(fs::read(source.join(relative)).unwrap(), bytes);
+        }
+        let reopened = WriterApp::open_project(&destination).unwrap();
+        reopened.validate_project().unwrap();
+        assert_eq!(reopened.get_project().unwrap().id, project_id);
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "Original manuscript text."
+        );
+    }
+
+    #[test]
     fn temporary_project_quit_requires_a_permanent_save_or_explicit_discard() {
         let directory = tempfile::tempdir().unwrap();
         let project =

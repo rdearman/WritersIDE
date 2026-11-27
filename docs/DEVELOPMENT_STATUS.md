@@ -1,5 +1,19 @@
 # Writer's IDE Development Status
 
+## #38 project-copy completeness regression — 27 November 2026
+
+The reported UAT symptom that Save As omitted `attachments/`, `templates/`, or
+`exports/` was not reproduced in the current implementation. Save As uses the
+project archive/restore path, which includes those managed trees and a
+consistent SQLite backup. A new terminal application-state regression
+populates attachments, a nested template, an existing export and research
+content, selects Save As through the registered File command and browser, then
+checks source and destination bytes, project identity, manuscript prose, and
+the reopened database. The focused test passes. This is verification coverage,
+not a claimed root-cause fix. The reported false external-change conflict and
+missing scene rows remain unreproduced; preserve conflict detection and leave
+#38 open for continued reproduction and human UAT.
+
 ## Scrivener `LevelTypes` profile mapping — 27 November 2026
 
 The importer now retains Scrivener binder-category section defaults from
