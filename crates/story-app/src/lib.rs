@@ -219,6 +219,49 @@ fn scrivener_profile_recipe(
     Ok(recipe)
 }
 
+fn scrivener_profile_warning_diagnostics(
+    profile: &ScrivenerEditionProfile,
+) -> Vec<story_document::CompileDiagnostic> {
+    profile
+        .warnings
+        .iter()
+        .map(|warning| {
+            let message = warning.replace(&profile.source_format_id, &profile.display_name);
+            let message = message
+                .split_whitespace()
+                .map(|word| {
+                    let identifier = word
+                        .trim_matches(|character: char| {
+                            !character.is_ascii_alphanumeric() && character != '-'
+                        });
+                    if uuid::Uuid::parse_str(identifier).is_ok() {
+                        word.replace(identifier, "source identifier")
+                    } else {
+                        word.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            story_document::CompileDiagnostic {
+                code: "SCR001".into(),
+                category: "imported-layout".into(),
+                severity: story_document::DiagnosticSeverity::Warning,
+                effective_level: None,
+                message: format!("Imported layout '{}': {message}", profile.display_name),
+                remediation_hint: Some(
+                    "Review the source-format layout and publication selections in the import report before relying on this output.".into(),
+                ),
+                source_entity_id: None,
+                source_range: None,
+                generated_file: None,
+                generated_line: None,
+                suppressed_by: None,
+                suppressed: false,
+            }
+        })
+        .collect()
+}
+
 pub fn scrivener_compile_presentation(
     inventory: &story_import::ScrivenerProjectInventory,
     plan: &story_import::ScrivenerImportPlan,
@@ -5409,8 +5452,7 @@ impl WriterApp {
         output: &str,
         overwrite: bool,
     ) -> Result<Vec<PathBuf>> {
-        let recipe = scrivener_profile_recipe(profile, format, output)?;
-        let artifact = self.compile_edition_artifact_recording_failure(&recipe)?;
+        let artifact = self.compile_scrivener_edition_profile_artifact(profile, format)?;
         // `publish_compile_artifact` interprets relative destinations against
         // the canonical project root. Pre-joining the possibly relative root
         // here would cause that path to be joined a second time.
@@ -5427,7 +5469,11 @@ impl WriterApp {
     ) -> Result<story_document::CompileArtifact> {
         let output = format!("exports/scrivener-edition.{}", format.extension());
         let recipe = scrivener_profile_recipe(profile, format, &output)?;
-        self.compile_edition_artifact_recording_failure(&recipe)
+        let mut artifact = self.compile_edition_artifact_recording_failure(&recipe)?;
+        artifact
+            .diagnostics
+            .extend(scrivener_profile_warning_diagnostics(profile));
+        Ok(artifact)
     }
 
     fn materialize_scrivener_assets(
@@ -9708,6 +9754,35 @@ unexpected_prose = "must not be silently discarded"
                 .0
                 .contains("The blacksmith opens the forge.")
         );
+
+        let mut profile_with_gap = profile.clone();
+        let source_layout_id = uuid::Uuid::new_v4().to_string();
+        profile_with_gap.warnings.push(format!(
+            "selected source item using layout '{source_layout_id}' has no assignment in format '{}'",
+            profile_with_gap.source_format_id,
+        ));
+        app.compile_scrivener_edition_profile(
+            &profile_with_gap,
+            story_document::CompileFormat::Markdown,
+            "exports/warnings.md",
+            false,
+        )
+        .unwrap();
+        let compile_result = app.list_compile_results().unwrap().remove(0);
+        assert!(
+            compile_result
+                .warnings
+                .iter()
+                .any(|warning| { warning.contains("SCR001") && warning.contains("Ebook") })
+        );
+        assert!(compile_result.diagnostics.iter().any(|diagnostic| {
+            diagnostic.code == "SCR001"
+                && diagnostic.severity == story_document::DiagnosticSeverity::Warning
+                && diagnostic.message.contains("Imported layout 'Ebook'")
+                && !diagnostic.message.contains(&profile.source_format_id)
+                && !diagnostic.message.contains(&source_layout_id)
+                && diagnostic.message.contains("source identifier")
+        }));
     }
 
     #[test]

@@ -1686,6 +1686,28 @@ settings contain usable section-layout mappings. The three controlled golden
 projects and expanded private corpus must be rerun before this integration is
 ready for publication UAT.
 
+### Imported Scrivener layout warnings in compile diagnostics — 27 November 2026
+
+Warnings retained on an imported Scrivener edition profile now flow into the
+shared compile artifact and recorded compile result as `SCR001` warnings. The
+diagnostic names the profile in author-facing terms, explains that its source
+format selections need review, and avoids exposing UUID-like layout identifiers
+in the primary message. Profile compilation and ordinary compile-result
+recording now use the same artifact path, so warnings are not lost between
+preview and publication. The original source-layout IDs remain available in
+the import report for detailed investigation; missing or uncertain layout
+assignments remain warnings and are not guessed.
+
+The synthetic regression test verifies warning propagation to a Markdown
+compile result and checks that UUIDs are redacted from its diagnostic text.
+Verification on this revision: the focused profile test, full offline workspace
+tests (753 passed, 1 ignored; the ignored protected-project test requires the
+private ArrowMaking fixture variable), workspace Clippy with warnings denied,
+`cargo fmt --all -- --check`, and `git diff --check` passed. This diagnostics
+change does not alter the Scrivener importer or renderer, so the private real
+manuscript publication harness was not rerun for it. Publication-profile
+fidelity remains incomplete and awaits further automated and human verification.
+
 ## Standalone Scrivener import UAT repair — verified in automation, 26 November 2026
 
 The ordinary File → Import Scrivener as New Project workflow now proposes a
