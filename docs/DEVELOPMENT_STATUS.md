@@ -2311,3 +2311,23 @@ UAT 36 is retained as the only older Alpha bundle; Alpha UAT 37 brings the total
 to two. Continue the v1.0 backlog after this checkpoint; the next priority is
 the outstanding P0 rendering and key-delivery defects, then the remaining #77
 interaction requirements.
+
+### Editor render-span regression repair — 27 November 2026
+
+Inspection of the live editor renderer found that, despite the earlier rendering
+addendum describing coalesced style runs, the implementation still emitted one
+Ratatui span per grapheme. Adjacent graphemes with identical styles are now
+combined, while cursor, selection, semantic formatting, mention decoration and
+formatting-mark style boundaries remain separate. A focused unit test verifies
+both coalescing and those style boundaries. The production full-screen PTY test
+passed its manuscript/reference transition and resize checks at 80×24 and
+201×60. Formatting and warnings-denied workspace Clippy passed. The complete
+offline workspace suite passed: 359 terminal unit tests, 3 author-workflow
+tests, 39 PTY tests (one protected private-corpus test skipped because its
+opt-in path was unset), and all other workspace unit, integration, CLI and doc
+tests. The first focused PTY attempt captured only an Escape byte before the app
+rendered; its immediate rerun passed, and the full PTY suite also passed. This
+repair removes an implementation mismatch and reduces per-character terminal
+render spans; it does not prove the exact cause of the author's scattered-glyph
+screenshot. Issue #56 remains open for human verification. No Alpha bundle was
+created; the repository retains Alpha UAT 36 and 37 only.

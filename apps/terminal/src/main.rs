@@ -26523,6 +26523,23 @@ fn tutorial_footer_status(state: &AppState) -> Option<String> {
     Some(format!("{label} · Resume: Help > Resume Tutorial"))
 }
 
+fn push_coalesced_editor_span(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
+    if text.is_empty() {
+        return;
+    }
+
+    if let Some(last) = spans.last_mut()
+        && last.style == style
+    {
+        let mut combined = last.content.clone().into_owned();
+        combined.push_str(text);
+        *last = Span::styled(combined, style);
+        return;
+    }
+
+    spans.push(Span::styled(text.to_owned(), style));
+}
+
 fn tutorial_key_matches_command(state: &AppState, command_id: &str, key: KeyEvent) -> bool {
     command_by_id(command_id).is_some_and(|command| {
         effective_command_shortcuts(state, command)
@@ -27150,7 +27167,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     } else {
                         "  "
                     };
-                    let mut spans = vec![Span::raw(prefix)];
+                    let mut spans = Vec::new();
+                    push_coalesced_editor_span(&mut spans, prefix, Style::default());
                     let mut byte_offset = line_start_byte;
                     for (col, ch) in line.graphemes(true).enumerate() {
                         let shown = if s.editor_preferences.show_formatting_marks && ch == "\t" {
@@ -27211,26 +27229,31 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         if !s.reference_focused && row == view_cursor.0 && col == view_cursor.1 {
                             style = style.add_modifier(Modifier::REVERSED);
                         }
-                        spans.push(Span::styled(shown.to_owned(), style));
+                        push_coalesced_editor_span(&mut spans, shown, style);
                         byte_offset += ch.len() as u64;
                     }
                     if !s.reference_focused
                         && row == view_cursor.0
                         && view_cursor.1 >= grapheme_count(line)
                     {
-                        spans.push(Span::styled(
+                        push_coalesced_editor_span(
+                            &mut spans,
                             " ",
                             Style::default()
                                 .fg(Color::Black)
                                 .bg(Color::White)
                                 .add_modifier(Modifier::REVERSED),
-                        ));
+                        );
                     }
                     if s.editor_preferences.show_formatting_marks
                         && let Some(marker) =
                             formatting_line_marker(line, view_lines.get(row + 1).copied())
                     {
-                        spans.push(Span::styled(marker, Style::default().fg(Color::DarkGray)));
+                        push_coalesced_editor_span(
+                            &mut spans,
+                            marker,
+                            Style::default().fg(Color::DarkGray),
+                        );
                     }
                     line_start_byte = byte_offset + 1;
                     Line::from(spans)
@@ -55978,6 +56001,26 @@ mod tests {
                 .unwrap()
                 .show_formatting_marks
         );
+    }
+
+    #[test]
+    fn editor_coalesces_adjacent_graphemes_without_crossing_style_boundaries() {
+        let normal = Style::default();
+        let cursor = normal.add_modifier(Modifier::REVERSED);
+        let mut spans = Vec::new();
+
+        push_coalesced_editor_span(&mut spans, "  ", normal);
+        push_coalesced_editor_span(&mut spans, "The ", normal);
+        push_coalesced_editor_span(&mut spans, "é", cursor);
+        push_coalesced_editor_span(&mut spans, "lan", normal);
+
+        assert_eq!(spans.len(), 3);
+        assert_eq!(spans[0].content, "  The ");
+        assert_eq!(spans[0].style, normal);
+        assert_eq!(spans[1].content, "é");
+        assert_eq!(spans[1].style, cursor);
+        assert_eq!(spans[2].content, "lan");
+        assert_eq!(spans[2].style, normal);
     }
 
     #[test]
