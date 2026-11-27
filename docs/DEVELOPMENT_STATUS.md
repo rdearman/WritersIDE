@@ -1,5 +1,25 @@
 # Writer's IDE Development Status
 
+## Scrivener inherited section-type profile suppression — 27 November 2026
+
+Compile profiles previously applied a Scrivener layout's `Include Text=No`
+only when a binder item had an explicit `SectionType`. Scrivener also assigns
+section types by binder category through `LevelTypes`; the presentation
+translator already honoured those defaults, but profile assembly did not.
+Profile creation now uses the same effective section-type resolver, preserving
+explicit per-item overrides while applying inherited per-format body
+suppression. The synthetic import-to-profile test now omits per-item section
+types and verifies the inherited mapping, source exclusion, retained heading
+and private canonical body.
+
+Verification passed on the current change: `cargo fmt --all -- --check`,
+warnings-denied workspace Clippy, and the complete offline workspace suite
+(including 358 terminal unit tests, 3 author workflows, and 38 PTY tests; one
+protected-corpus PTY intentionally ignored). The Ollama loopback mock ran with
+the author's prior socket permission. A fresh real Book 03 import/reopen/
+profile compile and EPUBCheck run is pending; source layout gaps remain
+unresolved and no publication-fidelity or human-acceptance claim is made.
+
 ## Manual whole-project backup workflow — 27 November 2026
 
 The existing consistent project archive service is now exposed as File → Back

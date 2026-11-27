@@ -5374,7 +5374,7 @@ impl WriterApp {
 
                 if included
                     && publication_kind
-                    && let Some(section_type) = item.section_type_id.as_deref()
+                    && let Some(section_type) = inventory.effective_section_type_id(item)
                 {
                     let section_type_name = inventory
                         .section_types
@@ -9860,10 +9860,10 @@ unexpected_prose = "must not be silently discarded"
             source.join("Profile Layout.scrivx"),
             r#"<ScrivenerProject Version="2.0"><Binder>
               <BinderItem UUID="draft" Type="DraftFolder"><Title>Draft</Title><Children>
-                <BinderItem UUID="shown-scene" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><SectionType>scene-layout-type</SectionType><Children/></BinderItem>
-                <BinderItem UUID="excluded-scene" Type="Text"><Title>Removed Scene</Title><IncludeInCompile>No</IncludeInCompile><SectionType>scene-layout-type</SectionType><Children/></BinderItem>
+                <BinderItem UUID="shown-scene" Type="Text"><Title>Opening</Title><IncludeInCompile>Yes</IncludeInCompile><Children/></BinderItem>
+                <BinderItem UUID="excluded-scene" Type="Text"><Title>Removed Scene</Title><IncludeInCompile>No</IncludeInCompile><Children/></BinderItem>
               </Children></BinderItem>
-            </Binder></ScrivenerProject>"#,
+            </Binder><LevelTypes><Files><Type>scene-layout-type</Type></Files></LevelTypes></ScrivenerProject>"#,
         )
         .unwrap();
         fs::write(
@@ -9898,6 +9898,16 @@ unexpected_prose = "must not be silently discarded"
                 .unwrap()
                 .section_type_id
                 .as_deref(),
+            None
+        );
+        assert_eq!(
+            inventory.effective_section_type_id(
+                inventory
+                    .items
+                    .iter()
+                    .find(|item| item.source_document_id == "shown-scene")
+                    .unwrap()
+            ),
             Some("scene-layout-type")
         );
         assert_eq!(

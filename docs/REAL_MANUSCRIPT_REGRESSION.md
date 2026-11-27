@@ -688,3 +688,15 @@ exact-commit rerun is `reports/level-types-book03-ab42c04-20261127/`, tested at
 `ab42c04760397d7be109125e5eab9481e6d02a5a`. Its harness marks the working tree
 dirty because the author's untracked `README_TMP.md` and `UAT/` are present;
 `git status` showed no modified tracked files.
+
+## 27 November 2026 — inherited section types apply per-format body suppression
+
+The WIDE profile builder now uses the same effective section-type resolver as
+the presentation translator. This matters when a Scrivener item inherits its
+layout type through `LevelTypes` instead of carrying an explicit
+`SectionType`: a selected layout with `Include Text=No` must suppress that
+item's body in Compile IR while retaining its editable canonical content and
+any configured heading. The synthetic production-import regression covers
+this inherited-type path and source exclusion. A fresh controlled Book 03 run
+is required before making any real-manuscript conclusion; current source
+section-layout assignments remain incomplete and must not be guessed.
