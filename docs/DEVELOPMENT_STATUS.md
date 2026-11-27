@@ -5,7 +5,8 @@
 The independent Rust tooling is available on this machine: cargo-audit 0.23.0,
 cargo-deny 0.22.1, cargo-machete 0.10.1, and cargo-llvm-cov 0.9.2. `cargo
 machete --with-metadata --skip-target-dir` passed and found no unused
-dependencies.
+dependencies. The feature hardening and audit refresh are committed and pushed
+as `7ad9ab81244d3a2f1272539b28f559919fce2f52`.
 
 `cargo audit` ran against a locally fetched RustSec database (1,568 advisories)
 and reported 24 advisory instances across 645 locked package records after
