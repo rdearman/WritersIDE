@@ -1553,6 +1553,57 @@ fn review_menu_exposes_spellcheck_and_grammar_actions_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn spell_check_from_review_defaults_to_the_open_document_and_preserves_prose() {
+    let _guard = lock_pty_test();
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Spell Check Scope Project");
+    let mut app = WriterApp::create_project(&project, "Spell Check Scope Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let first = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let second = app.create_scene(chapter, "Aftermath", 1).unwrap();
+    let (_, hash) = app.load_scene_text(first).unwrap();
+    app.save_scene_text(first, Some(&hash), "Baad word.")
+        .unwrap();
+    let (_, hash) = app.load_scene_text(second).unwrap();
+    app.save_scene_text(second, Some(&hash), "Wrng word.")
+        .unwrap();
+    drop(app);
+
+    let mock_aspell = root.path().join("aspell-mock");
+    std::fs::write(
+        &mock_aspell,
+        "#!/bin/sh\ntext=$(cat)\ncase \"$text\" in *Baad*) echo Baad;; esac\ncase \"$text\" in *Wrng*) echo Wrng;; esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&mock_aspell, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("spellcheck-current")
+        .env("WIDE_ASPELL", &mock_aspell)
+        .output()
+        .expect("run current-document Spell Check through the production Linux PTY");
+    assert!(
+        result.status.success(),
+        "current-document Spell Check PTY failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(reopened.load_scene_text(first).unwrap().0, "Baad word.");
+    assert_eq!(reopened.load_scene_text(second).unwrap().0, "Wrng word.");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn grammar_review_can_correct_and_reopen_a_scene_through_the_production_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

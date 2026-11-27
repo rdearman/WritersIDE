@@ -155,6 +155,7 @@ def main():
     find_replace_focus = modes == ["find-replace-focus"]
     review_thesaurus = modes == ["review-thesaurus"]
     review_menu = modes in (["review-menu"], ["review-thesaurus"])
+    review_spellcheck_current = modes == ["spellcheck-current"]
     review_proofread = modes == ["review-proofread"]
     removed_scenes = modes == ["removed-scenes"]
     outline_view = modes == ["outline-view"]
@@ -970,17 +971,17 @@ def main():
             read_for(0.2)
             found_review = False
             for _ in range(10):
-                if wait_for_screen_fragments((b"Spellcheck Manuscript",), menu_start, timeout=0.15):
+                if wait_for_screen_fragments((b"Spell Check",), menu_start, timeout=0.15):
                     found_review = True
                     break
                 os.write(master, b"\x1b[C")
                 read_for(0.1)
             if not found_review:
-                raise AssertionError("Review menu did not expose Spellcheck Manuscript")
+                raise AssertionError("Review menu did not expose Spell Check")
             # Menu viewports show a subset of a long command group at once.
             # Walk the selectable entries just as a keyboard user would; do
             # not require every command to fit in the initial viewport.
-            select_visible_menu_item("Thesaurus" if review_thesaurus else "Spellcheck Manuscript")
+            select_visible_menu_item("Thesaurus" if review_thesaurus else "Spell Check")
             os.write(master, b"\r")
             if review_thesaurus:
                 if not wait_for_screen_fragments((b"thesaurus ",), menu_start, timeout=2.0):
@@ -1002,10 +1003,8 @@ def main():
                     raise AssertionError("application did not exit cleanly after offline thesaurus test")
                 print("PTY Review workflow passed: offline thesaurus opened from its menu and showed local results.")
                 return
-            if not wait_for_screen_fragments((b"spellcheck",), menu_start, timeout=2.0):
-                raise AssertionError("Review > Spellcheck did not open its command prompt")
-            os.write(master, b"\x1b")
-            read_for(0.2)
+            if not wait_for_screen_fragments((b"Scope: current document", b"manuscript is unchanged"), menu_start, timeout=5.0):
+                raise AssertionError("Review > Spell Check did not show current-document results")
             os.write(master, b"\x11")
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0
@@ -1016,6 +1015,43 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after Review menu test")
             print("PTY Review workflow passed: spellcheck and grammar actions are visible and keyboard-selectable.")
+            return
+
+        if review_spellcheck_current:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")
+            if wait_for_workspace_title("Outline", timeout=3.0):
+                if not move_outline_selection_until(lambda row: "Arrival" in row, "down"):
+                    raise AssertionError("the Arrival scene was not selectable")
+                os.write(master, b"\r")
+            elif not wait_for_workspace_title("Editor", timeout=0.5):
+                raise AssertionError("project did not open in an authoring workspace")
+            if not wait_for_workspace_title("Editor", timeout=3.0):
+                raise AssertionError("the Arrival document did not open")
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 5)  # Review menu root
+            read_for(0.2)
+            select_visible_menu_item("Spell Check")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Spell Check", b"Arrival", b"Baad", b"current document"), menu_start, timeout=5.0):
+                raise AssertionError("Spell Check did not show results for the open document")
+            screen = "\n".join(terminal_snapshot(output, 24, 80))
+            if "Wrng" in screen:
+                raise AssertionError("Spell Check included a different scene instead of the current document")
+            if "manuscript unchanged" not in screen:
+                raise AssertionError("Spell Check did not report that manuscript prose was unchanged")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after current-document Spell Check")
+            print("PTY Spell Check passed: Review checks only the open document and leaves its prose unchanged.")
             return
 
         if review_proofread:

@@ -2451,6 +2451,24 @@ return keys. The full verification run passed: formatting, workspace Clippy
 with warnings denied, workspace tests (including 363 terminal unit tests, 3
 author workflows and 42 production PTY workflows; 1 private-corpus test was
 ignored because its path was not configured). The new proofreading PTY test
-verified correction, saving and reopening. GitHub REST issue retrieval for #33
-failed with a network connection error; no issue status was inferred from
-stale comments. Human UAT is still required for the review interaction.
+verified correction, saving and reopening. Human UAT is still required for the
+review interaction.
+
+### Current-document spelling review — 27 November 2026
+
+Review → Spell Check now uses the open scene or direct-prose document, inherits
+its language, and displays candidates in a focused results pane instead of
+scanning unrelated manuscript documents and placing a long summary in the
+status line. The operation leaves prose unchanged. A production PTY test uses
+two scenes with distinct misspellings to verify the current-document scope and
+reopens the project to verify persistence. The current implementation lists
+candidate words and counts; interactive misspelling navigation and replacement
+remain outstanding under #33 and U37-11.
+
+Verification passed: formatting, warnings-denied workspace Clippy, and the
+full offline workspace suite (363 terminal unit tests, 3 author-workflow tests,
+43 production PTY tests passed; 1 opt-in protected-corpus PTY ignored). The
+first full run had one transient scene-rename PTY with an empty screen; it
+passed immediately in isolation and passed in the final full run. The document
+export test that failed in the preceding run also passed in isolation and in
+the final full run. This evidence is automated; human UAT remains open.

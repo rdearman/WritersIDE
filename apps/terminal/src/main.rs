@@ -3835,7 +3835,7 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command("analysis.coverage-check", "Check Coverage Rules", "Evaluate saved coverage requirements without changing story data", "Plot", "coverage-check", false),
         legacy_command("analysis.coverage-list", "List Coverage Rules", "List project-local coverage requirements", "Plot", "coverage-list", false),
         legacy_command("analysis.coverage-remove", "Remove Coverage Rule", "Remove a coverage requirement by ID", "Plot", "coverage-remove", true),
-        legacy_command("analysis.spellcheck", "Spellcheck Manuscript", "Run local Aspell without changing prose", "Review", "spellcheck", true),
+        legacy_command("analysis.spellcheck", "Spell Check", "Check the current manuscript document with a local dictionary", "Review", "spellcheck", true),
         legacy_command("analysis.thesaurus", "Thesaurus", "Look up synonyms in an installed offline thesaurus", "Review", "thesaurus", true),
         legacy_command("proofread.grammar-check", "Grammar Check", "Check the current scene or manuscript using the offline grammar engine", "Review", "grammar-check", false),
         legacy_command("proofread.grammar-settings", "Grammar Settings", "Enable or disable proofreading categories, change severity, or exclude terms", "Review", "grammar-settings", false),
@@ -17034,6 +17034,80 @@ impl AppState {
                         self.record_recent_command(spec.id);
                         return Ok(());
                     }
+                    if spec.id == "analysis.spellcheck" {
+                        self.menu = None;
+                        let (title, language) = if let Some(scene) =
+                            self.editing_scene.or_else(|| self.active_scene())
+                        {
+                            let project = self.app.get_project()?;
+                            let scene = self.app.get_scene(scene)?.scene;
+                            (
+                                scene.title.clone(),
+                                scene.effective_language_code(&project).to_owned(),
+                            )
+                        } else if let Some(content_unit) = self.editing_content_unit {
+                            let project = self.app.get_project()?;
+                            (
+                                self.app.get_content_unit(content_unit)?.title,
+                                project.language_code.clone(),
+                            )
+                        } else {
+                            return Err(
+                                "open a manuscript document before running Spell Check".into()
+                            );
+                        };
+                        let text = self.editor.join("\n");
+                        let aspell = std::env::var_os("WIDE_ASPELL")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(|| "aspell".into());
+                        let findings = spellcheck_text_with_engine(
+                            &text,
+                            &title,
+                            &language,
+                            &std::collections::BTreeSet::new(),
+                            aspell.to_string_lossy().as_ref(),
+                            story_document::SpellcheckEngine::Aspell,
+                        )?;
+                        let candidate_count = findings
+                            .as_ref()
+                            .map(|finding| finding.candidates.len())
+                            .unwrap_or_default();
+                        let mut body = format!(
+                            "Spell Check · {title}\nLanguage: {language}\nScope: current document\n\n"
+                        );
+                        if findings.is_none() {
+                            body.push_str(
+                                "No spelling candidates found. The manuscript is unchanged.\n",
+                            );
+                        } else {
+                            if let Some(finding) = findings {
+                                body.push_str(&format!(
+                                    "{}\n",
+                                    finding
+                                        .candidates
+                                        .iter()
+                                        .map(|(word, count)| format!(
+                                            "{word} · {count} occurrence(s)"
+                                        ))
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                ));
+                            }
+                            body.push_str("\nReview candidates against the manuscript; spelling suggestions do not change prose.\n");
+                        }
+                        self.open_reference_buffer(
+                            "spellcheck:current".into(),
+                            None,
+                            format!("Spell Check · {title}"),
+                            body,
+                        );
+                        self.reference_focused = true;
+                        self.message = format!(
+                            "Spell Check complete · {title} · {candidate_count} candidate word(s) · manuscript unchanged"
+                        );
+                        self.record_recent_command(spec.id);
+                        return Ok(());
+                    }
                     if spec.takes_arguments {
                         if spec.category == "Series"
                             || matches!(spec.id, "link.create" | "link.delete")
@@ -29428,6 +29502,7 @@ fn spellcheck_terminal_project_with_engine(
         std::collections::BTreeSet::new()
     };
     let input = app.processing_input()?;
+    let allowed = &allowed;
     let prose = input
         .scenes
         .into_iter()
@@ -29440,50 +29515,65 @@ fn spellcheck_terminal_project_with_engine(
         );
     let mut findings = Vec::new();
     for (kind, title, text) in prose {
-        let mut child = Command::new(executable)
-            .args(engine.command_arguments(language))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        use std::io::Write;
-        child
-            .stdin
-            .take()
-            .ok_or("Aspell stdin unavailable")?
-            .write_all(text.as_bytes())?;
-        let output = child.wait_with_output()?;
-        if !output.status.success() {
-            return Err(format!(
-                "{} failed for {kind} {title}: {}",
-                match engine {
-                    story_document::SpellcheckEngine::Aspell => "Aspell",
-                    story_document::SpellcheckEngine::Hunspell => "Hunspell",
-                },
-                String::from_utf8_lossy(&output.stderr)
-            )
-            .into());
-        }
-        let mut candidates = BTreeMap::new();
-        for word in String::from_utf8(output.stdout)?
-            .lines()
-            .map(str::trim)
-            .filter(|word| !word.is_empty())
+        if let Some(finding) =
+            spellcheck_text_with_engine(&text, &title, language, allowed, executable, engine)?
         {
-            let normalized = word.to_lowercase();
-            if !allowed.contains(&normalized) {
-                *candidates.entry(normalized).or_insert(0) += 1;
-            }
-        }
-        if !candidates.is_empty() {
-            findings.push(TerminalSpellingFinding {
-                entity_kind: kind,
-                title,
-                candidates,
-            });
+            let mut finding = finding;
+            finding.entity_kind = kind;
+            findings.push(finding);
         }
     }
     Ok(findings)
+}
+
+fn spellcheck_text_with_engine(
+    text: &str,
+    title: &str,
+    language: &str,
+    allowed: &std::collections::BTreeSet<String>,
+    executable: &str,
+    engine: story_document::SpellcheckEngine,
+) -> Result<Option<TerminalSpellingFinding>, Box<dyn std::error::Error>> {
+    let mut child = Command::new(executable)
+        .args(engine.command_arguments(language))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .ok_or("spell checker stdin unavailable")?
+        .write_all(text.as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "{} failed for {title}: {}",
+            match engine {
+                story_document::SpellcheckEngine::Aspell => "Aspell",
+                story_document::SpellcheckEngine::Hunspell => "Hunspell",
+            },
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let mut candidates = BTreeMap::new();
+    for word in String::from_utf8(output.stdout)?
+        .lines()
+        .map(str::trim)
+        .filter(|word| !word.is_empty())
+    {
+        let normalized = word.to_lowercase();
+        if !allowed.contains(&normalized) {
+            *candidates.entry(normalized).or_insert(0) += 1;
+        }
+    }
+    Ok((!candidates.is_empty()).then(|| TerminalSpellingFinding {
+        entity_kind: "document".to_owned(),
+        title: title.to_owned(),
+        candidates,
+    }))
 }
 
 fn planning_board_bounds(items: &[story_storage::PlanningBoardItemRecord]) -> ([f64; 2], [f64; 2]) {
