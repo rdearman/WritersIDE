@@ -2397,3 +2397,26 @@ U37-01 through U37-19 using the next frozen candidate. The exact human outcomes
 for each numbered finding remain to be entered after UAT, and #77/#44 remain
 open for human acceptance. Keep the current changes uncommitted until the
 corresponding verified commit and UAT bundle are produced.
+
+### Alpha UAT 39 — Alpha UAT 37 authoring fixes — 27 November 2026
+
+Frozen Linux x86_64 release build from commit
+`88c8ea546b87879825aae38495011fbc9ff31656` is available at
+`test-builds/alpha-uat-39-88c8ea5/`. From the repository root, launch with:
+
+```sh
+cd test-builds/alpha-uat-39-88c8ea5
+./run.sh "The Glassmaker's Compass"
+```
+
+`UAT-CHECKLIST.md` has concise checks U37-01 through U37-19 covering the
+unified outline, structural operations, inclusion and recovery, counts,
+editor viewport, panes, persistence, file browser and proofreading. The bundle
+contains isolated preferences and four synthetic disposable projects copied
+from UAT 38; it contains no private regression manuscripts. `SHA256SUMS`
+verifies both executables, launch script, manifest and checklist. The release
+launcher was opened in a PTY, the menu was displayed and the application exited
+cleanly. All four bundled SQLite databases passed `PRAGMA integrity_check`.
+Automated implementation verification is recorded above; human acceptance is
+pending. Alpha UAT 37 was removed so Alpha UAT 38 and Alpha UAT 39 are the only
+two retained numbered Alpha bundles.
