@@ -2269,3 +2269,11 @@ passed. Workspace unit and service integration tests passed; the final full
 terminal PTY run passed 39 tests, with one protected private-corpus test ignored
 because its opt-in path was not configured. This change is automatically
 verified and remains awaiting human acceptance under #54/#77.
+
+### New Project mnemonic dispatch regression coverage — 27 November 2026
+
+Extended the production authoring PTY journey for #58: File-menu lowercase and
+uppercase N mnemonics, Ctrl+N while the File menu is focused, and Ctrl+N from
+the manuscript workspace must all open the same New Project dialogue; each
+cancel path preserves the active manuscript. The expanded PTY journey passed.
+The author's terminal/SSH key-delivery UAT remains outstanding.

@@ -2509,6 +2509,27 @@ def main():
         read_for(0.3)
         assert_sample_prose_visible(output, 24, 80, "screen after cancelling New Project")
 
+        os.write(master, b"\x1b[21~")  # F10 opens File again
+        read_for(0.2)
+        os.write(master, b"N")  # uppercase mnemonic must resolve identically
+        if not wait_for_screen_fragments((b"Title", b"Create"), timeout=3.0):
+            raise AssertionError(
+                "File > N did not open the New Project dialogue; screen: "
+                + repr(terminal_snapshot(output, 24, 80))
+            )
+        os.write(master, b"\x1b")  # cancel without creating a project
+        read_for(0.3)
+        assert_sample_prose_visible(output, 24, 80, "screen after cancelling uppercase New Project")
+
+        os.write(master, b"\x1b[21~")  # F10 opens File
+        read_for(0.2)
+        os.write(master, b"\x0e")  # Ctrl+N while the menu has focus
+        if not wait_for_screen_fragments((b"Title", b"Create"), timeout=3.0):
+            raise AssertionError("Ctrl+N from the open File menu did not start New Project")
+        os.write(master, b"\x1b")  # cancel without creating a project
+        read_for(0.3)
+        assert_sample_prose_visible(output, 24, 80, "screen after cancelling menu Ctrl+N")
+
         os.write(master, b"\x0e")  # Ctrl+N
         if not wait_for_screen_fragments((b"Title", b"Create"), timeout=3.0):
             raise AssertionError("Ctrl+N did not open the New Project dialogue")
