@@ -23,12 +23,13 @@ layout definitions. That is a source configuration gap, not evidence that the
 custom layout names should be guessed. The resulting presentation remains
 provisional pending source settings clarification and human review.
 
-The production three-book run is
-`reports/scrivener-stat-layout-0600ca7-20261127/`; EPUBs for local review are:
+The production three-book run at commit
+`798abe95a9403a0805174a7fe62475872d322ec4` is
+`reports/scrivener-stat-layout-798abe9-20261127/`; EPUBs for local review are:
 
-- `generated/scrivener-stat-layout-0600ca7-20261127/book-01.epub`
-- `generated/scrivener-stat-layout-0600ca7-20261127/book-02.epub`
-- `generated/scrivener-stat-layout-0600ca7-20261127/book-03.epub`
+- `generated/scrivener-stat-layout-798abe9-20261127/book-01.epub`
+- `generated/scrivener-stat-layout-798abe9-20261127/book-02.epub`
+- `generated/scrivener-stat-layout-798abe9-20261127/book-03.epub`
 
 All source fingerprints were unchanged. Exact import/reopen body preservation
 was 41/41 manuscript and 4/4 research for Book 01; 38/38 manuscript and 4/4
@@ -38,7 +39,8 @@ body destinations were missing or changed, and EPUBCheck 4.2.6 reported zero
 errors and warnings for all three generated EPUBs. Import status remains
 incomplete for all three, and these metrics do not establish publication
 fidelity: semantic comparison discrepancies remain and the reports remain
-provisional. Fixture SHA-256 verification passed before and after the run.
+provisional. Fixture SHA-256 verification passed before and after the exact-
+commit run.
 
 The first full workspace run found a flaky production PTY authoring test: its
 sentence was sent as one burst, and the terminal dropped the final characters
