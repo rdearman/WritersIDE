@@ -148,6 +148,7 @@ def main():
     outline_enter = modes == ["outline-enter"]
     special_character = modes == ["special-character"]
     named_layouts = modes == ["named-layouts"]
+    split_navigation = modes == ["split-navigation"]
     edit_menu = modes == ["edit-menu"]
     date_time_insertion = modes == ["date-time-insertion"]
     date_time_unavailable = modes == ["date-time-unavailable"]
@@ -1512,6 +1513,67 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after layout workflow")
             print("PTY window-layout workflow passed: View menu saves and reloads a named project layout.")
+            return
+
+        if split_navigation:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")  # dismiss the first-run welcome panel
+            if not wait_for_screen_fragments((b"PANE-LINE-00",), timeout=5.0):
+                raise AssertionError("the opening document was not visible before splitting")
+
+            split_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 4)  # View
+            select_visible_menu_item("Split Side by Side")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Split side by side",), split_start, timeout=3.0):
+                raise AssertionError(
+                    "View > Split Side by Side did not open a second window; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+
+            # The split opens with the second view focused. Scroll it beyond
+            # the first pane's viewport and verify both independent positions
+            # are visible together on the reconstructed terminal screen.
+            os.write(master, b"\x1b[6~" * 3)  # Page Down in the focused second view
+            read_for(0.3)
+            rows = terminal_snapshot(output, 24, 80)
+            screen = "\n".join(rows)
+            if "PANE-LINE-00" not in screen or "PANE-LINE-30" not in screen:
+                raise AssertionError(
+                    "scrolling the second window did not preserve independent viewports; screen: "
+                    + repr(rows)
+                )
+
+            focus_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 4)  # View
+            select_visible_menu_item("Next Window")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Focused next window",), focus_start, timeout=3.0):
+                raise AssertionError("View > Next Window did not transfer pane focus")
+            os.write(master, b"\x1b[6~")  # Page Down in the first/editor window
+            read_for(0.3)
+            rows = terminal_snapshot(output, 24, 80)
+            screen = "\n".join(rows)
+            if "PANE-LINE-10" not in screen or "PANE-LINE-30" not in screen:
+                raise AssertionError(
+                    "scrolling the first window changed the second window or did not move independently; screen: "
+                    + repr(rows)
+                )
+
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after split-pane navigation")
+            print("PTY split navigation passed: the View menu creates and focuses windows with independent scroll positions.")
             return
 
         if edit_menu:

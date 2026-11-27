@@ -1427,6 +1427,50 @@ fn named_window_layouts_save_and_load_through_the_real_view_menu() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn split_panes_keep_independent_scroll_positions_through_the_real_view_menu() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Split Navigation Project");
+    let mut app = WriterApp::create_project(&project, "Split Navigation Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Harbour", 0).unwrap();
+    let text = (0..64)
+        .map(|line| format!("PANE-LINE-{line:02}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), &text).unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY split-navigation workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("split-navigation")
+        .output()
+        .expect("run the Linux PTY split-pane navigation workflow");
+    assert!(
+        result.status.success(),
+        "PTY split-pane navigation workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(reopened.load_scene_text(scene).unwrap().0, text);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn edit_menu_is_visible_and_selection_commands_dispatch_from_writing_mode_in_a_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

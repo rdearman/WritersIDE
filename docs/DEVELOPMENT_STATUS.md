@@ -2420,3 +2420,22 @@ cleanly. All four bundled SQLite databases passed `PRAGMA integrity_check`.
 Automated implementation verification is recorded above; human acceptance is
 pending. Alpha UAT 37 was removed so Alpha UAT 38 and Alpha UAT 39 are the only
 two retained numbered Alpha bundles.
+
+## Production PTY coverage for independent split-pane navigation — 27 November 2026
+
+Added a terminal-level author workflow for #25/#77: open the View menu, split
+the active manuscript window side by side, scroll the new pane, switch focus
+through View → Next Window, then scroll the original editor pane. The test
+reconstructs the rendered 80×24 terminal and verifies each pane retains its
+separate visible position; reopening confirms the manuscript bytes were not
+changed. The focused PTY passed. Follow-up verification passed `cargo fmt --all
+-- --check`, workspace Clippy with warnings denied, and the full offline
+workspace test suite: 362 terminal unit tests, 3 author-workflow tests, 41
+production PTY tests and all other workspace/integration/doc tests passed; one
+protected ArrowMaking PTY was intentionally ignored because its local fixture
+path was not configured. This demonstrates independent scrolling and focus in
+the tested split layout. It does not establish complete pane navigation parity
+or human usability; those remain open for UAT. Next actionable authoring item:
+make the existing spelling/proofreading review scope and correction journey
+usable through normal Review actions, then refresh the GitHub issue comments
+when the API is available.
