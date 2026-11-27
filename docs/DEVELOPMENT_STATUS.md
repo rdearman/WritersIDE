@@ -18,6 +18,19 @@ close #38 on this evidence. Existing empty-project idle-startup PTY coverage
 also confirms no conflict appears without a selected document. Human
 reproduction and the missing-scenes root cause remain outstanding.
 
+## Protected ArrowMaking Scrivener import through the TUI — 27 November 2026
+
+The previously ignored production PTY test was explicitly run with
+`WIDE_PRIVATE_ARROWMAKING_PROJECT=fixtures/back-catalogue/scrivener/ArrowMaking.scriv`
+and Rust's `--ignored` selector. It passed through the file browser, normal
+automatic import path, outline, direct prose edit/autosave, permanent Save,
+reopen, profile compile and source-fingerprint check. The imported structure
+and automatically proposed scene count remained available after reopening.
+Fixture SHA-256 validation passed before and after the run. The private source
+was not modified and remains excluded from Git. This is automated workflow
+evidence, not author acceptance; import progress feedback and publication
+fidelity gaps remain open.
+
 ## Scrivener format-level scene separator — 27 November 2026
 
 Scrivener `.scrformat` files can define the separator between consecutive text
