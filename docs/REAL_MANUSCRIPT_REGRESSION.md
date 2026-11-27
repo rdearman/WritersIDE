@@ -669,6 +669,8 @@ reported zero generated EPUB errors or warnings. The run remains provisional:
 the default profile still has three selected section types without assignments
 and eight assigned layout references whose built-in layout definitions are
 not available in the project; the alternate profile has thirteen selected
-types without assignments. WIDE reports these gaps rather than guessing. This
-run tested the local implementation before its commit; an exact-commit rerun
-will be recorded in `DEVELOPMENT_STATUS.md`.
+types without assignments. WIDE reports these gaps rather than guessing. The
+exact-commit rerun is `reports/level-types-book03-ab42c04-20261127/`, tested at
+`ab42c04760397d7be109125e5eab9481e6d02a5a`. Its harness marks the working tree
+dirty because the author's untracked `README_TMP.md` and `UAT/` are present;
+`git status` showed no modified tracked files.

@@ -12,13 +12,16 @@ reported; missing definitions are not guessed from document titles.
 Focused importer and app tests pass. Formatting, workspace Clippy with warnings
 denied, and the full offline workspace test suite pass (one protected private
 ArrowMaking PTY is intentionally ignored unless its local path is configured).
-The relevant Book 03 production regression is
-`reports/level-types-book03-20261127-02/`; its EPUB is
-`generated/level-types-book03-20261127-02/book-03.epub`. It preserved 70/70
-manuscript and 10/10 research bodies through import/reopen, did not modify the
-source, and passed EPUBCheck 4.2.6 with zero errors/warnings. Fixture checksums
-passed before and after. Its source tree was dirty during this run; repeat the
-regression on the committed revision before using it as exact-commit evidence.
+The exact-commit Book 03 production regression is
+`reports/level-types-book03-ab42c04-20261127/`; its EPUB is
+`generated/level-types-book03-ab42c04-20261127/book-03.epub`. Commit
+`ab42c04760397d7be109125e5eab9481e6d02a5a` preserved 70/70 manuscript and
+10/10 research bodies through import/reopen, did not modify the source, and
+passed EPUBCheck 4.2.6 with zero errors/warnings. Fixture checksums passed
+before and after. The regression harness marks the worktree dirty because the
+author's untracked `README_TMP.md` and `UAT/` are present; `git status` showed no
+modified tracked files. The earlier working-tree run
+`reports/level-types-book03-20261127-02/` remains local and provisional.
 Profile fidelity remains provisional: the default profile has three selected
 types with no layout assignment and eight assignments whose built-in layout
 definitions are absent; the alternate profile has thirteen unassigned selected
