@@ -176,6 +176,31 @@ fn structural_kind_label(kind: story_core::NodeKind) -> &'static str {
         story_core::NodeKind::Group => "Group",
     }
 }
+
+fn bulk_node_location(
+    state: &AppState,
+    _kind: story_core::NodeKind,
+) -> Result<(Option<story_core::NodeId>, u32), Box<dyn std::error::Error>> {
+    let nodes = state.app.list_structural_nodes()?;
+    let selected_node = match outline_rows(state).get(state.selected) {
+        Some(OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. }) => Some(*id),
+        Some(OutlineRow::ContentUnit(id)) => state.app.get_content_unit(*id)?.parent_id,
+        Some(OutlineRow::Scene(id)) => state.app.get_scene(*id)?.chapter_id,
+        None => None,
+    }
+    .and_then(|id| nodes.iter().find(|node| node.id == id));
+    let sibling_count = |parent: Option<story_core::NodeId>| {
+        nodes.iter().filter(|node| node.parent_id == parent).count() as u32
+    };
+    match selected_node {
+        Some(node) if node.kind == "section" => {
+            let children = sibling_count(Some(node.id));
+            Ok((Some(node.id), children))
+        }
+        Some(node) => Ok((node.parent_id, node.position.saturating_add(1))),
+        None => Ok((None, sibling_count(None))),
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OutlineRow {
     Section {
@@ -259,6 +284,17 @@ struct StructuralConversionDialog {
     selected: usize,
 }
 
+#[derive(Clone, Debug)]
+struct BulkNodeInsertDialog {
+    kind: story_core::NodeKind,
+    parent: Option<story_core::NodeId>,
+    position: u32,
+    count: String,
+    first_number: String,
+    pattern: String,
+    focus: usize,
+}
+
 struct AppState {
     app: WriterApp,
     temporary_project: bool,
@@ -319,6 +355,7 @@ struct AppState {
     pending_content_unit_removal: Option<ContentUnitRemovalDialog>,
     pending_structural_node_removal: Option<StructuralNodeRemovalDialog>,
     structural_conversion: Option<StructuralConversionDialog>,
+    bulk_node_insert: Option<BulkNodeInsertDialog>,
     function_bindings: Vec<(u8, Workspace)>,
     command_bindings: CommandBindings,
     context_command_bindings: Vec<ContextCommandBinding>,
@@ -468,6 +505,7 @@ struct RenderContextKey {
     snippet_chooser: bool,
     snippet_preview: bool,
     structural_conversion: bool,
+    bulk_node_insert: bool,
     reference_focused: bool,
     editor_focus_mode: bool,
     references_hidden: bool,
@@ -491,6 +529,7 @@ fn render_context_key(state: &AppState) -> RenderContextKey {
         snippet_chooser: state.snippet_chooser.is_some(),
         snippet_preview: state.snippet_preview.is_some(),
         structural_conversion: state.structural_conversion.is_some(),
+        bulk_node_insert: state.bulk_node_insert.is_some(),
         reference_focused: state.reference_focused,
         editor_focus_mode: state.editor_focus_mode,
         references_hidden: state.reference_panes_hidden,
@@ -1196,6 +1235,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "document.restore-content-unit",
         "document.rename-heading",
         "document.convert-heading",
+        "document.insert-multiple",
         "document.remove-empty-node",
         "document.removed-nodes",
         "document.restore-node",
@@ -1861,6 +1901,7 @@ enum CommandAction {
     ShowRemovedStructuralNodes,
     RestoreSelectedStructuralNode,
     ConvertSelectedStructuralNode,
+    InsertMultipleStructuralNodes,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3445,6 +3486,21 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::ConvertSelectedStructuralNode,
             task_group: "Outline",
             menu_priority: 21,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "document.insert-multiple",
+            label: "Insert Multiple Items…",
+            description: "Add a numbered run of chapters or sections in outline order",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["bulk insert", "insert multiple chapters", "insert multiple sections"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::InsertMultipleStructuralNodes,
+            task_group: "Outline",
+            menu_priority: 22,
             advanced: false,
         },
         CommandSpec {
@@ -5313,7 +5369,8 @@ fn registered_global_command_for_key(state: &AppState, key: KeyEvent) -> Option<
         || state.snippet_preview.is_some()
         || state.snippet_chooser.is_some()
         || state.special_character_picker.is_some();
-    let modal_is_open = modal_is_open || state.structural_conversion.is_some();
+    let modal_is_open =
+        modal_is_open || state.structural_conversion.is_some() || state.bulk_node_insert.is_some();
     let modal_is_open = modal_is_open || tutorial_modal_open;
     if let Some(help) = command_for_effective_shortcut(state, key)
         .filter(|command| command.action == CommandAction::Help)
@@ -8425,6 +8482,7 @@ impl AppState {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -14927,6 +14985,90 @@ impl AppState {
         Ok(())
     }
 
+    fn open_bulk_node_insert(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.workspace != Workspace::Outline {
+            self.message = "Open Outline to insert multiple items".into();
+            return Ok(());
+        }
+        let kind = story_core::NodeKind::Chapter;
+        let (parent, position) = bulk_node_location(self, kind)?;
+        self.bulk_node_insert = Some(BulkNodeInsertDialog {
+            kind,
+            parent,
+            position,
+            count: "5".into(),
+            first_number: "1".into(),
+            pattern: "Chapter {n}".into(),
+            focus: 0,
+        });
+        Ok(())
+    }
+
+    fn finish_bulk_node_insert(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(dialog) = self.bulk_node_insert.clone() else {
+            return Ok(());
+        };
+        let count = dialog
+            .count
+            .parse::<usize>()
+            .ok()
+            .filter(|count| (1..=100).contains(count));
+        let Some(count) = count else {
+            self.message = "Choose a quantity from 1 to 100 · outline unchanged".into();
+            return Ok(());
+        };
+        let first_number = match dialog.first_number.parse::<u32>() {
+            Ok(number) => number,
+            Err(_) => {
+                self.message = "Starting number must be a whole number · outline unchanged".into();
+                return Ok(());
+            }
+        };
+        let mut titles = Vec::with_capacity(count);
+        for offset in 0..count {
+            let number = match first_number.checked_add(offset as u32) {
+                Some(number) => number,
+                None => {
+                    self.message =
+                        "The requested numbering exceeds the supported range · outline unchanged"
+                            .into();
+                    return Ok(());
+                }
+            };
+            let title = if dialog.pattern.contains("{n}") {
+                dialog.pattern.replace("{n}", &number.to_string())
+            } else {
+                format!("{} {number}", dialog.pattern.trim())
+            };
+            titles.push(title);
+        }
+        match self.app.create_structural_nodes_batch(
+            dialog.parent,
+            dialog.kind,
+            &titles,
+            dialog.position,
+        ) {
+            Ok(ids) => {
+                self.bulk_node_insert = None;
+                self.refresh()?;
+                self.selected = outline_rows(self)
+                    .iter()
+                    .position(|row| matches!(row,
+                        OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } if *id == ids[0]))
+                    .unwrap_or(0);
+                self.message = format!(
+                    "Inserted {} {} items · first item selected",
+                    ids.len(),
+                    structural_kind_label(dialog.kind).to_ascii_lowercase()
+                );
+            }
+            Err(error) => {
+                self.message = format!("Items were not inserted · outline unchanged: {error}");
+            }
+        }
+        Ok(())
+    }
+
     fn begin_content_unit_removal(
         &mut self,
         restoring: bool,
@@ -17024,6 +17166,15 @@ impl AppState {
                 None
             };
         }
+        if spec.id == "document.insert-multiple" {
+            return if self.workspace != Workspace::Outline {
+                Some("Open Outline first")
+            } else if self.removed_structural_nodes_list || self.removed_content_units_list {
+                Some("Return to the active Outline first")
+            } else {
+                None
+            };
+        }
         if spec.id == "scene.restore" {
             return if self.workspace != Workspace::Cards || !self.removed_scenes_list {
                 Some("Show Removed Scenes first")
@@ -18381,6 +18532,7 @@ impl AppState {
             CommandAction::ConvertSelectedStructuralNode => {
                 self.open_structural_conversion_dialog()?
             }
+            CommandAction::InsertMultipleStructuralNodes => self.open_bulk_node_insert()?,
             CommandAction::MoveOutlineUp => self.move_selected_outline_entry(false)?,
             CommandAction::MoveOutlineDown => self.move_selected_outline_entry(true)?,
             CommandAction::PromoteOutlineItem => self.move_selected_outline_depth(false)?,
@@ -29670,6 +29822,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.structural_conversion.is_some() {
         draw_structural_conversion_overlay(f, s);
     }
+    if s.bulk_node_insert.is_some() {
+        draw_bulk_node_insert_overlay(f, s);
+    }
     if s.command_palette.is_some() {
         draw_command_palette_overlay(f, s);
     }
@@ -29765,6 +29920,64 @@ fn draw_structural_conversion_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) 
             "↑/↓ choose · Enter convert · Esc cancel · incompatible contents are retained",
         ),
         chunks[2],
+    );
+}
+
+fn draw_bulk_node_insert_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(dialog) = &s.bulk_node_insert else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).min(72);
+    let height = area.height.saturating_sub(4).min(13);
+    if width < 32 || height < 9 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Insert Multiple Outline Items ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    let labels = [
+        format!("Item type: {}", structural_kind_label(dialog.kind)),
+        format!("Quantity: {}", dialog.count),
+        format!("Name pattern: {}", dialog.pattern),
+        format!("Starting number: {}", dialog.first_number),
+    ];
+    for (index, label) in labels.iter().enumerate() {
+        let style = if dialog.focus == index {
+            Style::default().fg(Color::White).bg(Color::Blue)
+        } else {
+            Style::default()
+        };
+        f.render_widget(Paragraph::new(label.as_str()).style(style), chunks[index]);
+    }
+    f.render_widget(
+        Paragraph::new("Use {n} in the pattern; without it, the number is appended."),
+        chunks[4],
+    );
+    f.render_widget(
+        Paragraph::new("Tab fields · ↑/↓ or Space changes type · Enter inserts · Esc cancels"),
+        chunks[5],
     );
 }
 
@@ -36140,6 +36353,73 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         handle_window_prefix_key(s, k)?;
         return Ok(false);
     }
+    if s.bulk_node_insert.is_some() {
+        match k.code {
+            KeyCode::Esc => {
+                s.bulk_node_insert = None;
+                s.message = "Multiple insertion cancelled · outline unchanged".into();
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                if let Some(dialog) = s.bulk_node_insert.as_mut() {
+                    dialog.focus = if k.code == KeyCode::BackTab
+                        || k.modifiers.contains(KeyModifiers::SHIFT)
+                    {
+                        (dialog.focus + 3) % 4
+                    } else {
+                        (dialog.focus + 1) % 4
+                    };
+                }
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::Char(' ')
+                if s.bulk_node_insert
+                    .as_ref()
+                    .is_some_and(|dialog| dialog.focus == 0) =>
+            {
+                let next_kind =
+                    if s.bulk_node_insert.as_ref().unwrap().kind == story_core::NodeKind::Chapter {
+                        story_core::NodeKind::Section
+                    } else {
+                        story_core::NodeKind::Chapter
+                    };
+                let (parent, position) = bulk_node_location(s, next_kind)?;
+                if let Some(dialog) = s.bulk_node_insert.as_mut() {
+                    dialog.kind = next_kind;
+                    dialog.parent = parent;
+                    dialog.position = position;
+                    dialog.pattern = format!("{} {{n}}", structural_kind_label(next_kind));
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(dialog) = s.bulk_node_insert.as_mut() {
+                    match dialog.focus {
+                        1 => {
+                            dialog.count.pop();
+                        }
+                        2 => {
+                            dialog.pattern.pop();
+                        }
+                        3 => {
+                            dialog.first_number.pop();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            KeyCode::Enter => s.finish_bulk_node_insert()?,
+            KeyCode::Char(character) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(dialog) = s.bulk_node_insert.as_mut() {
+                    match dialog.focus {
+                        1 if character.is_ascii_digit() => dialog.count.push(character),
+                        2 => dialog.pattern.push(character),
+                        3 if character.is_ascii_digit() => dialog.first_number.push(character),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
     if let Some(picker) = s.window_layout_picker.as_mut() {
         match k.code {
             KeyCode::Esc => {
@@ -39859,6 +40139,110 @@ mod tests {
         );
         assert!(state.structural_conversion.is_some());
         assert!(state.message.contains("no changes made"));
+    }
+
+    #[test]
+    fn outline_bulk_insert_creates_sequential_chapters_and_rejects_invalid_count() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let section = app.create_section("Part One", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Section { id, .. } if *id == section))
+            .unwrap();
+        state
+            .dispatch_registered_command_id("document.insert-multiple")
+            .unwrap();
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let visible = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(visible.contains("Insert Multiple Outline Items"));
+        assert!(visible.contains("Quantity: 5"));
+        assert!(visible.contains("Name pattern: Chapter {n}"));
+        assert!(visible.contains("Enter inserts"));
+        let dialog = state.bulk_node_insert.as_mut().unwrap();
+        dialog.count = "3".into();
+        dialog.first_number = "4".into();
+        dialog.pattern = "Chapter {n}".into();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        let chapters = state
+            .app
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|node| node.parent_id == Some(section))
+            .collect::<Vec<_>>();
+        assert_eq!(chapters.len(), 3);
+        assert_eq!(
+            chapters
+                .iter()
+                .map(|node| node.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Chapter 4", "Chapter 5", "Chapter 6"]
+        );
+        assert!(matches!(
+            outline_rows(&state).get(state.selected),
+            Some(OutlineRow::Chapter { id, .. }) if *id == chapters[0].id
+        ));
+
+        state.open_bulk_node_insert().unwrap();
+        state.bulk_node_insert.as_mut().unwrap().count = "101".into();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.bulk_node_insert.is_some());
+        assert_eq!(
+            state.app.list_structural_nodes().unwrap().len(),
+            4,
+            "invalid quantities must not partially insert items"
+        );
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapters[0].id))
+            .unwrap();
+        state.open_bulk_node_insert().unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        let dialog = state.bulk_node_insert.as_mut().unwrap();
+        assert_eq!(dialog.kind, story_core::NodeKind::Section);
+        dialog.count = "2".into();
+        dialog.first_number = "7".into();
+        dialog.pattern = "Interlude {n}".into();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let nested_sections = state
+            .app
+            .list_structural_nodes()
+            .unwrap()
+            .into_iter()
+            .filter(|node| node.parent_id == Some(section) && node.kind == "section")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            nested_sections
+                .iter()
+                .map(|node| node.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Interlude 7", "Interlude 8"]
+        );
     }
 
     #[test]
@@ -45378,6 +45762,7 @@ mod tests {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -49339,6 +49724,7 @@ mod tests {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -49510,6 +49896,7 @@ mod tests {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -49789,6 +50176,7 @@ mod tests {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -49964,6 +50352,7 @@ mod tests {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -50289,6 +50678,7 @@ mod tests {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -50464,6 +50854,7 @@ mod tests {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -52316,6 +52707,7 @@ mod tests {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -52708,6 +53100,7 @@ mod tests {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -54347,6 +54740,7 @@ mod tests {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -54533,6 +54927,7 @@ mod tests {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -54771,6 +55166,7 @@ mod tests {
             snippet_chooser: None,
             special_character_picker: None,
             structural_conversion: None,
+            bulk_node_insert: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,

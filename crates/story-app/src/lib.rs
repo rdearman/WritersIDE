@@ -1776,6 +1776,17 @@ impl WriterApp {
             .store
             .create_node(parent, NodeKind::Chapter, title, position)?)
     }
+    pub fn create_structural_nodes_batch(
+        &mut self,
+        parent: Option<NodeId>,
+        kind: NodeKind,
+        titles: &[String],
+        position: u32,
+    ) -> Result<Vec<NodeId>> {
+        Ok(self
+            .store
+            .create_nodes_batch(parent, kind, titles, position)?)
+    }
     pub fn move_structural_node(
         &mut self,
         node: NodeId,

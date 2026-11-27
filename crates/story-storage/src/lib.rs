@@ -2444,6 +2444,117 @@ impl ProjectStore {
         self.conn.execute("INSERT INTO structural_node(id,parent_id,kind,title,position,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?6)",params![id.to_string(),parent.map(|x|x.to_string()),kind.as_str(),title,i64::from(position),now])?;
         Ok(id)
     }
+    /// Insert a contiguous batch of structural siblings atomically. Existing
+    /// siblings are shifted out of the unique-index range before positions are
+    /// compacted, so SQLite's immediate uniqueness checks cannot observe a
+    /// transient collision.
+    pub fn create_nodes_batch(
+        &mut self,
+        parent: Option<NodeId>,
+        kind: NodeKind,
+        titles: &[String],
+        position: u32,
+    ) -> Result<Vec<NodeId>> {
+        if titles.is_empty() {
+            return Err(StorageError::Invalid(
+                "enter at least one outline item title".into(),
+            ));
+        }
+        for title in titles {
+            if title.trim().is_empty() {
+                return Err(StorageError::Invalid(
+                    "outline item titles cannot be empty".into(),
+                ));
+            }
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(parent_id) = parent {
+            let parent_kind: Option<String> = tx
+                .query_row(
+                    "SELECT kind FROM structural_node WHERE id=?1 AND archived=0",
+                    [parent_id.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match parent_kind.as_deref() {
+                None => return Err(StorageError::NotFound(parent_id.to_string())),
+                Some("chapter") => {
+                    return Err(StorageError::Invalid(
+                        "a chapter cannot contain structural documents".into(),
+                    ));
+                }
+                Some("section" | "group") => {}
+                Some(other) => {
+                    return Err(StorageError::Invalid(format!(
+                        "unsupported parent document kind {other}"
+                    )));
+                }
+            }
+        }
+        let mut statement = tx.prepare(
+            "SELECT id,position FROM structural_node WHERE archived=0 AND ((parent_id=?1) OR (parent_id IS NULL AND ?1 IS NULL)) ORDER BY position,id",
+        )?;
+        let siblings = statement
+            .query_map([parent.map(|id| id.to_string())], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(statement);
+        if position as usize > siblings.len() {
+            return Err(StorageError::Invalid(
+                "outline insertion position is beyond the sibling list".into(),
+            ));
+        }
+        let maximum = siblings.iter().map(|(_, p)| *p).max().unwrap_or(0);
+        let offset = maximum
+            .checked_add(siblings.len() as i64)
+            .and_then(|n| n.checked_add(titles.len() as i64))
+            .and_then(|n| n.checked_add(100))
+            .ok_or_else(|| StorageError::Invalid("outline position space exhausted".into()))?;
+        for (id, old_position) in &siblings {
+            tx.execute(
+                "UPDATE structural_node SET position=?2 WHERE id=?1",
+                params![
+                    id,
+                    old_position
+                        .checked_add(offset)
+                        .ok_or_else(|| StorageError::Invalid(
+                            "outline position space exhausted".into()
+                        ))?
+                ],
+            )?;
+        }
+        let ids = titles.iter().map(|_| NodeId::new()).collect::<Vec<_>>();
+        for (index, (id, title)) in ids.iter().zip(titles).enumerate() {
+            let temporary_position = maximum
+                .checked_add(offset)
+                .and_then(|n| n.checked_add(index as i64 + 1))
+                .ok_or_else(|| StorageError::Invalid("outline position space exhausted".into()))?;
+            let now = now();
+            tx.execute(
+                "INSERT INTO structural_node(id,parent_id,kind,title,position,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?6,?6)",
+                params![id.to_string(), parent.map(|value| value.to_string()), kind.as_str(), title.trim(), temporary_position, now],
+            )?;
+        }
+        let mut ordered = siblings
+            .iter()
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        ordered.splice(
+            position as usize..position as usize,
+            ids.iter().map(ToString::to_string),
+        );
+        for (index, id) in ordered.iter().enumerate() {
+            tx.execute(
+                "UPDATE structural_node SET position=?2 WHERE id=?1",
+                params![id, index as i64],
+            )?;
+        }
+        tx.commit()?;
+        Ok(ids)
+    }
     pub fn list_structural_nodes(&self) -> Result<Vec<StructuralNodeSummary>> {
         let mut stmt = self.conn.prepare("SELECT id,parent_id,kind,title,position FROM structural_node WHERE archived=0 ORDER BY parent_id,position,id")?;
         let rows = stmt.query_map([], |row| {
@@ -12977,6 +13088,55 @@ mod tests {
         assert_eq!(reopened_nodes.len(), 2);
         assert!(reopened_nodes.iter().any(|node| node.id == section));
         assert!(reopened_nodes.iter().any(|node| node.id == child));
+    }
+
+    #[test]
+    fn structural_batch_insertion_is_ordered_atomic_and_persistent() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let first = store
+            .create_node(None, NodeKind::Chapter, "Chapter 1", 0)
+            .unwrap();
+        let second = store
+            .create_nodes_batch(
+                None,
+                NodeKind::Chapter,
+                &["Chapter 2".into(), "Chapter 3".into()],
+                1,
+            )
+            .unwrap();
+        let nodes = store.list_structural_nodes().unwrap();
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| node.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Chapter 1", "Chapter 2", "Chapter 3"]
+        );
+        assert_eq!(nodes[0].id, first);
+        assert_eq!(nodes[1].id, second[0]);
+        assert_eq!(nodes[2].id, second[1]);
+
+        let before = nodes;
+        assert!(
+            store
+                .create_nodes_batch(None, NodeKind::Section, &["".into()], 1)
+                .is_err()
+        );
+        assert!(
+            store
+                .create_nodes_batch(Some(first), NodeKind::Section, &["Invalid".into()], 0)
+                .is_err()
+        );
+        assert_eq!(store.list_structural_nodes().unwrap().len(), before.len());
+
+        drop(store);
+        let reopened = ProjectStore::open(&project).unwrap();
+        let reopened_nodes = reopened.list_structural_nodes().unwrap();
+        assert_eq!(reopened_nodes.len(), 3);
+        assert_eq!(reopened_nodes[1].id, second[0]);
+        assert_eq!(reopened_nodes[2].position, 2);
     }
 
     #[test]
