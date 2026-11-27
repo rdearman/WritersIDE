@@ -416,6 +416,65 @@ fn recent_projects_opens_the_selected_book_from_the_production_menu_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn internal_clipboard_crosses_manuscript_documents_and_external_text_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Clipboard Workflow Project");
+    let home = root.path().join("isolated-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let external = home.join("A-reference.txt");
+    let external_text = "REFERENCE-LINE-ONE\nREFERENCE-LINE-TWO";
+    std::fs::write(&external, external_text).unwrap();
+
+    let mut app = WriterApp::create_project(&project, "Clipboard Workflow").unwrap();
+    let chapter = app.create_chapter(None, "The Harbour", 0).unwrap();
+    let source = app.create_scene(chapter, "Source Passage", 0).unwrap();
+    let target = app.create_scene(chapter, "Destination Passage", 1).unwrap();
+    let (_, source_hash) = app.load_scene_text(source).unwrap();
+    app.save_scene_text(source, Some(&source_hash), "MANUSCRIPT-CLIPBOARD-PASSAGE")
+        .unwrap();
+    let (_, target_hash) = app.load_scene_text(target).unwrap();
+    app.save_scene_text(target, Some(&target_hash), "DESTINATION-START")
+        .unwrap();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(&home)
+        .arg("cross-document-clipboard")
+        .output()
+        .expect("run cross-document clipboard workflow in the production Linux PTY");
+    assert!(
+        result.status.success(),
+        "clipboard PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(source).unwrap().0,
+        "MANUSCRIPT-CLIPBOARD-PASSAGE"
+    );
+    assert_eq!(
+        reopened.load_scene_text(target).unwrap().0,
+        "DESTINATION-STARTMANUSCRIPT-CLIPBOARD-PASSAGEREFERENCE-LINE-ONE\nREFERENCE-LINE-TWO"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&external).unwrap(),
+        external_text,
+        "copying from an external reference must never modify the source"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn scrivener_import_to_edit_reopen_and_compile_works_through_the_production_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

@@ -160,6 +160,7 @@ def main():
     revision_document = modes == ["revision-document"]
     backup_archive = modes == ["backup-archive"]
     authoring_audit = modes == ["authoring-audit"]
+    cross_document_clipboard = modes == ["cross-document-clipboard"]
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
     scrivener_import = modes == ["scrivener-import"]
@@ -214,6 +215,7 @@ def main():
         or review_proofread
         or pty_wrapper is not None
         or no_function_authoring
+        or cross_document_clipboard
     ):
         # Keep this workflow focused on project lifecycle rather than allowing
         # first-run onboarding to consume editing keys.
@@ -1606,6 +1608,101 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after Outline navigation")
             print("PTY Outline workflow passed: Enter opens a section descendant and restores the selected hierarchy.")
+            return
+
+        if cross_document_clipboard:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")
+            show_outline_tree_presentation()
+            if not move_outline_selection_until(lambda row: "Source Passage" in row, "down"):
+                raise AssertionError("clipboard source document was not selectable in the outline")
+            os.write(master, b"\r")
+            if not wait_for_workspace_title("Editor") or not wait_for_screen_fragments(
+                (b"MANUSCRIPT-CLIPBOARD-PASSAGE",), timeout=3.0
+            ):
+                raise AssertionError("source manuscript document did not open")
+            os.write(master, b"\x01\x03")  # Ctrl+A, Ctrl+C: copy the current document
+            if not wait_for_screen_fragments((b"Selection copied to the local clipboard",), timeout=3.0):
+                raise AssertionError("copy did not report success or use WIDE's internal clipboard")
+            os.write(master, b"\x1b")
+            if not wait_for_workspace_title("Outline", timeout=3.0):
+                raise AssertionError("Esc did not return to the outliner after copying")
+            if not move_outline_selection_until(lambda row: "Destination Passage" in row, "down"):
+                raise AssertionError("clipboard destination document was not selectable")
+            os.write(master, b"\r")
+            if not wait_for_workspace_title("Editor") or not wait_for_screen_fragments(
+                (b"DESTINATION-START",), timeout=3.0
+            ):
+                raise AssertionError("destination manuscript document did not open")
+            os.write(master, b"\x1b[1;5F\x16")  # Ctrl+End, Ctrl+V
+            if not wait_for_screen_fragments((b"MANUSCRIPT-CLIPBOARD-PASSAGE",), timeout=3.0):
+                raise AssertionError("internal clipboard did not paste into the second manuscript document")
+            os.write(master, b"\x13")
+            if not wait_for_screen_fragments((b"SAVED",), timeout=5.0):
+                raise AssertionError("cross-document paste was not saved")
+
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10 opens File from the editor
+            read_for(0.2)
+            for _ in range(10):
+                current = "".join("".join(terminal_snapshot(output, 24, 80)).split())
+                if "OpenTextFile" in current:
+                    break
+                os.write(master, b"\x1b[C")
+                read_for(0.1)
+            else:
+                raise AssertionError(
+                    "File menu did not expose Open Text File from the editor; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                    + "; tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1200:]))
+                )
+            select_visible_menu_item("Open Text File…")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Choose a text file", b"A-reference.txt"), menu_start, timeout=3.0):
+                raise AssertionError("Open Text File did not show the external reference in its browser")
+            # Start on the directory tree. Tab focuses the contents pane;
+            # directories sort before files, so config, screen and tmp precede
+            # A-reference.txt in this isolated HOME.
+            os.write(master, b"\t" + b"\x1b[B" * 3)
+            read_for(0.3)
+            rows = terminal_snapshot(output, 24, 80)
+            if not any("A-reference.txt" in row and "▸" in row for row in rows):
+                raise AssertionError("external reference file was not selected in the focused contents pane: " + repr(rows))
+            os.write(master, b"\r")
+            read_for(0.2)  # Enter places the selected filename in the dialogue field.
+            os.write(master, b"\r")  # A second Enter opens the read-only reference.
+            if not wait_for_screen_fragments((b"REFERENCE-LINE-ONE", b"REFERENCE-LINE-TWO"), timeout=5.0):
+                raise AssertionError(
+                    "external reference text did not open in its read-only pane; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                    + "; tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
+            os.write(master, b"v\x1b[B\x03")  # mark both lines, then copy them
+            if not wait_for_screen_fragments((b"Copied to Writer's IDE clipboard",), timeout=3.0):
+                raise AssertionError("external reference selection was not copied internally")
+            os.write(master, b"\x1c\t\x1b[1;5F\x16")  # prefix + Tab focuses manuscript; end, paste
+            if not wait_for_screen_fragments((b"REFERENCE-LINE-ONE", b"REFERENCE-LINE-TWO"), timeout=3.0):
+                raise AssertionError(
+                    "external text did not paste into the manuscript pane; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                    + "; tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1600:]))
+                )
+            os.write(master, b"\x13")
+            if not wait_for_screen_fragments((b"SAVED",), timeout=5.0):
+                raise AssertionError("external reference paste was not saved")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("clipboard workflow did not exit cleanly after saving")
+            print("PTY clipboard workflow passed: copied across documents and from a read-only external file into the manuscript; saved and exited.")
             return
 
         if insert_edit_actions:

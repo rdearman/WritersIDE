@@ -2655,3 +2655,17 @@ statuses, remaining command-syntax prompts, and interactive spelling and
 selected-text thesaurus workflows. Skip work already fully implemented and
 verified. Publication-profile fidelity, new import formats, reusable templates
 and nonessential features are deferred until after the allowance reset.
+
+### Post-UAT-42 clipboard workflow correction — 27 November 2026
+
+The production PTY now exercises copying from one manuscript document into a
+second, then selecting text from an external read-only file and pasting it into
+the manuscript. It exposed that Ctrl+Backslash + Tab cycled reference buffers
+without restoring manuscript focus when no explicit pane layout existed.
+`focus_window_next` now promotes open reference buffers to the shared pane
+layout before cycling. The focused production PTY passed, including save/reopen
+verification and proof that the external file remains unchanged. Two prefix
+unit tests, the reference-window menu test, terminal Clippy with warnings
+denied, and formatting passed. The full workspace suite has not yet been rerun
+for this post-UAT-42 change. The existing UAT 42 remains frozen at its declared
+source commit; this correction is in the next development checkpoint.

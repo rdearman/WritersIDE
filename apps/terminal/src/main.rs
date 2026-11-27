@@ -13336,6 +13336,12 @@ impl AppState {
         Ok(())
     }
     fn focus_window_next(&mut self, reverse: bool) -> Result<(), Box<dyn std::error::Error>> {
+        // Reference panes are also application panes. Promote the legacy
+        // reference-only collection to the shared layout before cycling so
+        // next/previous always traverses the manuscript editor as well.
+        if self.pane_layout.is_none() && !self.reference_panes.is_empty() {
+            self.ensure_manual_pane_layout()?;
+        }
         if let Some(layout) = self.pane_layout.as_mut() {
             layout.focus_next(reverse);
             let focused = layout.focused();
@@ -13345,15 +13351,8 @@ impl AppState {
                 self.message = "Focused next window".into();
             }
             self.save_session()?;
-        } else if self.reference_panes.is_empty() {
-            self.message = "No other window is open".into();
         } else {
-            self.cycle_reference(!reverse);
-            self.message = if reverse {
-                "Focused previous reference window".into()
-            } else {
-                "Focused next reference window".into()
-            };
+            self.message = "No other window is open".into();
         }
         Ok(())
     }
