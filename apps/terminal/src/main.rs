@@ -168,6 +168,14 @@ fn destination_title(workspace: Workspace) -> &'static str {
         _ => workspace.title(),
     }
 }
+
+fn structural_kind_label(kind: story_core::NodeKind) -> &'static str {
+    match kind {
+        story_core::NodeKind::Section => "Section",
+        story_core::NodeKind::Chapter => "Chapter",
+        story_core::NodeKind::Group => "Group",
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum OutlineRow {
     Section {
@@ -242,6 +250,15 @@ struct StructuralNodeRemovalDialog {
     choice: usize,
 }
 
+#[derive(Clone, Debug)]
+struct StructuralConversionDialog {
+    id: story_core::NodeId,
+    title: String,
+    current: story_core::NodeKind,
+    choices: Vec<story_core::NodeKind>,
+    selected: usize,
+}
+
 struct AppState {
     app: WriterApp,
     temporary_project: bool,
@@ -301,6 +318,7 @@ struct AppState {
     removed_structural_nodes_list: bool,
     pending_content_unit_removal: Option<ContentUnitRemovalDialog>,
     pending_structural_node_removal: Option<StructuralNodeRemovalDialog>,
+    structural_conversion: Option<StructuralConversionDialog>,
     function_bindings: Vec<(u8, Workspace)>,
     command_bindings: CommandBindings,
     context_command_bindings: Vec<ContextCommandBinding>,
@@ -449,6 +467,7 @@ struct RenderContextKey {
     replace_preview: bool,
     snippet_chooser: bool,
     snippet_preview: bool,
+    structural_conversion: bool,
     reference_focused: bool,
     editor_focus_mode: bool,
     references_hidden: bool,
@@ -471,6 +490,7 @@ fn render_context_key(state: &AppState) -> RenderContextKey {
         replace_preview: state.multi_replace_preview.is_some(),
         snippet_chooser: state.snippet_chooser.is_some(),
         snippet_preview: state.snippet_preview.is_some(),
+        structural_conversion: state.structural_conversion.is_some(),
         reference_focused: state.reference_focused,
         editor_focus_mode: state.editor_focus_mode,
         references_hidden: state.reference_panes_hidden,
@@ -1175,6 +1195,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "document.removed-content-units",
         "document.restore-content-unit",
         "document.rename-heading",
+        "document.convert-heading",
         "document.remove-empty-node",
         "document.removed-nodes",
         "document.restore-node",
@@ -1839,6 +1860,7 @@ enum CommandAction {
     ArchiveSelectedStructuralNode,
     ShowRemovedStructuralNodes,
     RestoreSelectedStructuralNode,
+    ConvertSelectedStructuralNode,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3408,6 +3430,21 @@ fn command_registry() -> Vec<CommandSpec> {
             action: CommandAction::RenameSelectedStructuralNode,
             task_group: "Outline",
             menu_priority: 20,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "document.convert-heading",
+            label: "Convert Selected Section or Chapter…",
+            description: "Change a structural item's type when its contents are compatible",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["convert outline item", "convert section", "convert chapter"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ConvertSelectedStructuralNode,
+            task_group: "Outline",
+            menu_priority: 21,
             advanced: false,
         },
         CommandSpec {
@@ -5276,6 +5313,7 @@ fn registered_global_command_for_key(state: &AppState, key: KeyEvent) -> Option<
         || state.snippet_preview.is_some()
         || state.snippet_chooser.is_some()
         || state.special_character_picker.is_some();
+    let modal_is_open = modal_is_open || state.structural_conversion.is_some();
     let modal_is_open = modal_is_open || tutorial_modal_open;
     if let Some(help) = command_for_effective_shortcut(state, key)
         .filter(|command| command.action == CommandAction::Help)
@@ -8386,6 +8424,7 @@ impl AppState {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -14809,6 +14848,85 @@ impl AppState {
         };
         Ok(())
     }
+    fn open_structural_conversion_dialog(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(row @ (OutlineRow::Section { .. } | OutlineRow::Chapter { .. })) =
+            outline_rows(self).get(self.selected).cloned()
+        else {
+            self.message = "Select a section or chapter in Outline first".into();
+            return Ok(());
+        };
+        let id = match row {
+            OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } => id,
+            _ => unreachable!(),
+        };
+        let Some(node) = self
+            .app
+            .list_structural_nodes()?
+            .into_iter()
+            .find(|node| node.id == id)
+        else {
+            self.message = "The selected outline item is no longer available".into();
+            return Ok(());
+        };
+        let current = match node.kind.as_str() {
+            "section" => story_core::NodeKind::Section,
+            "chapter" => story_core::NodeKind::Chapter,
+            "group" => story_core::NodeKind::Group,
+            _ => {
+                self.message = "This outline item cannot be converted".into();
+                return Ok(());
+            }
+        };
+        let choices = [story_core::NodeKind::Section, story_core::NodeKind::Chapter]
+            .into_iter()
+            .filter(|kind| *kind != current)
+            .collect();
+        self.structural_conversion = Some(StructuralConversionDialog {
+            id,
+            title: node.title,
+            current,
+            choices,
+            selected: 0,
+        });
+        Ok(())
+    }
+
+    fn finish_structural_conversion(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(dialog) = self.structural_conversion.clone() else {
+            return Ok(());
+        };
+        let Some(target) = dialog.choices.get(dialog.selected).copied() else {
+            self.structural_conversion = None;
+            self.message = "No compatible document conversion is available".into();
+            return Ok(());
+        };
+        match self.app.convert_structural_node(dialog.id, target) {
+            Ok(()) => {
+                self.structural_conversion = None;
+                self.refresh()?;
+                self.selected = outline_rows(self)
+                    .iter()
+                    .position(|row| matches!(row,
+                        OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. } if *id == dialog.id))
+                    .unwrap_or(0);
+                self.message = format!(
+                    "Converted ‘{}’ from {} to {} · identity and position preserved",
+                    dialog.title,
+                    structural_kind_label(dialog.current),
+                    structural_kind_label(target)
+                );
+            }
+            Err(error) => {
+                self.message = format!(
+                    "Cannot convert ‘{}’ to {} yet: {error} · no changes made",
+                    dialog.title,
+                    structural_kind_label(target)
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn begin_content_unit_removal(
         &mut self,
         restoring: bool,
@@ -16892,6 +17010,20 @@ impl AppState {
                 None
             };
         }
+        if spec.id == "document.convert-heading" {
+            return if self.workspace != Workspace::Outline {
+                Some("Open Outline first")
+            } else if self.removed_structural_nodes_list || self.removed_content_units_list {
+                Some("Return to the active Outline first")
+            } else if !matches!(
+                outline_rows(self).get(self.selected),
+                Some(OutlineRow::Section { .. } | OutlineRow::Chapter { .. })
+            ) {
+                Some("Select a section or chapter first")
+            } else {
+                None
+            };
+        }
         if spec.id == "scene.restore" {
             return if self.workspace != Workspace::Cards || !self.removed_scenes_list {
                 Some("Show Removed Scenes first")
@@ -18246,6 +18378,9 @@ impl AppState {
                 self.create_empty_chapter_at_selection(title)?;
             }
             CommandAction::RenameSelectedStructuralNode => self.start_selected_outline_rename()?,
+            CommandAction::ConvertSelectedStructuralNode => {
+                self.open_structural_conversion_dialog()?
+            }
             CommandAction::MoveOutlineUp => self.move_selected_outline_entry(false)?,
             CommandAction::MoveOutlineDown => self.move_selected_outline_entry(true)?,
             CommandAction::PromoteOutlineItem => self.move_selected_outline_depth(false)?,
@@ -29532,6 +29667,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.special_character_picker.is_some() {
         draw_special_character_picker_overlay(f, s);
     }
+    if s.structural_conversion.is_some() {
+        draw_structural_conversion_overlay(f, s);
+    }
     if s.command_palette.is_some() {
         draw_command_palette_overlay(f, s);
     }
@@ -29559,6 +29697,75 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.help_panel.is_some() {
         draw_help_overlay(f, s);
     }
+}
+
+fn draw_structural_conversion_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(dialog) = &s.structural_conversion else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).min(68);
+    let height = area.height.saturating_sub(4).min(13);
+    if width < 28 || height < 7 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Convert Outline Item ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let options = dialog
+        .choices
+        .iter()
+        .map(|kind| {
+            ListItem::new(format!(
+                "{} {}",
+                structural_kind_label(*kind),
+                if *kind == story_core::NodeKind::Chapter {
+                    "· contains scenes and prose"
+                } else {
+                    "· organisational container"
+                }
+            ))
+        })
+        .collect::<Vec<_>>();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+    f.render_widget(
+        Paragraph::new(format!(
+            "{} · currently {}",
+            dialog.title,
+            structural_kind_label(dialog.current)
+        )),
+        chunks[0],
+    );
+    f.render_stateful_widget(
+        List::new(options)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White)),
+        chunks[1],
+        &mut ListState::default().with_selected(Some(dialog.selected)),
+    );
+    f.render_widget(
+        Paragraph::new(
+            "↑/↓ choose · Enter convert · Esc cancel · incompatible contents are retained",
+        ),
+        chunks[2],
+    );
 }
 
 fn context_help_panel(state: &AppState) -> HelpPanel {
@@ -35972,6 +36179,28 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         }
         return Ok(false);
     }
+    if s.structural_conversion.is_some() {
+        match k.code {
+            KeyCode::Esc => {
+                s.structural_conversion = None;
+                s.message = "Conversion cancelled · outline unchanged".into();
+            }
+            KeyCode::Up | KeyCode::Down => {
+                if let Some(dialog) = s.structural_conversion.as_mut()
+                    && !dialog.choices.is_empty()
+                {
+                    dialog.selected = if k.code == KeyCode::Up {
+                        (dialog.selected + dialog.choices.len() - 1) % dialog.choices.len()
+                    } else {
+                        (dialog.selected + 1) % dialog.choices.len()
+                    };
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => s.finish_structural_conversion()?,
+            _ => {}
+        }
+        return Ok(false);
+    }
     let k = if k.code == KeyCode::Char(' ')
         && (s.pending_series_book_removal.is_some()
             || s.pending_structural_node_removal.is_some()
@@ -39551,6 +39780,85 @@ mod tests {
         assert!(
             matches!(outline_rows(&state).get(state.selected), Some(OutlineRow::Chapter { id, .. }) if *id == chapter)
         );
+    }
+
+    #[test]
+    fn outline_conversion_dialog_converts_compatible_node_and_preserves_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let section = app.create_section("Part One", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Section { id, .. } if *id == section))
+            .unwrap();
+
+        state.open_menu_category(OUTLINE_MENU_INDEX);
+        let convert = state
+            .menu_visible_entries()
+            .iter()
+            .position(|spec| spec.id == "document.convert-heading")
+            .expect("conversion is available from the Edit menu");
+        state.menu.as_mut().unwrap().selected = convert;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.structural_conversion.is_some());
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        let node = state.app.list_structural_nodes().unwrap().remove(0);
+        assert_eq!(node.id, section);
+        assert_eq!(node.kind, "chapter");
+        assert_eq!(node.title, "Part One");
+        assert!(state.structural_conversion.is_none());
+        assert!(state.message.contains("identity and position preserved"));
+    }
+
+    #[test]
+    fn outline_conversion_rejects_incompatible_children_without_changing_outline() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let section = app.create_section("Part One", 0).unwrap();
+        let child = app.create_section("Nested", 1).unwrap();
+        app.move_structural_node(child, Some(section), 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Section { id, .. } if *id == section))
+            .unwrap();
+
+        state
+            .dispatch_registered_command_id("document.convert-heading")
+            .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        let nodes = state.app.list_structural_nodes().unwrap();
+        assert_eq!(
+            nodes.iter().find(|node| node.id == section).unwrap().kind,
+            "section"
+        );
+        assert_eq!(
+            nodes
+                .iter()
+                .find(|node| node.id == child)
+                .unwrap()
+                .parent_id,
+            Some(section)
+        );
+        assert!(state.structural_conversion.is_some());
+        assert!(state.message.contains("no changes made"));
     }
 
     #[test]
@@ -45069,6 +45377,7 @@ mod tests {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -49029,6 +49338,7 @@ mod tests {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -49199,6 +49509,7 @@ mod tests {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -49477,6 +49788,7 @@ mod tests {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -49651,6 +49963,7 @@ mod tests {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -49975,6 +50288,7 @@ mod tests {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -50149,6 +50463,7 @@ mod tests {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -52000,6 +52315,7 @@ mod tests {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -52391,6 +52707,7 @@ mod tests {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -54029,6 +54346,7 @@ mod tests {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -54214,6 +54532,7 @@ mod tests {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -54451,6 +54770,7 @@ mod tests {
             snippet_preview: None,
             snippet_chooser: None,
             special_character_picker: None,
+            structural_conversion: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,

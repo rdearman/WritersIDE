@@ -68,6 +68,8 @@ const MIGRATION_50: &str =
     include_str!("../migrations/0050_structural_removal_content_placement.sql");
 const MIGRATION_51: &str = include_str!("../migrations/0051_multiple_section_bodies.sql");
 const MIGRATION_52: &str = include_str!("../migrations/0052_content_unit_inclusion.sql");
+const MIGRATION_53: &str =
+    include_str!("../migrations/0053_structural_kind_conversion_constraints.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -1491,6 +1493,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_50}\nINSERT INTO schema_migrations(version,applied_at) VALUES(50,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_51}\nINSERT INTO schema_migrations(version,applied_at) VALUES(51,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_52}\nINSERT INTO schema_migrations(version,applied_at) VALUES(52,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_53}\nINSERT INTO schema_migrations(version,applied_at) VALUES(53,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1539,7 +1542,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 52 {
+        if version > 53 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1748,6 +1751,10 @@ impl ProjectStore {
         }
         if current_version == 51 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_52}\nINSERT INTO schema_migrations(version,applied_at) VALUES(52,'{}');\nCOMMIT;", now()))?;
+            current_version = 52;
+        }
+        if current_version == 52 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_53}\nINSERT INTO schema_migrations(version,applied_at) VALUES(53,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -2485,6 +2492,83 @@ impl ProjectStore {
         if changed == 0 {
             return Err(StorageError::NotFound(id.to_string()));
         }
+        Ok(())
+    }
+    /// Change a structural node's semantic kind without replacing its stable
+    /// identity, title, parent, sibling position, or attached metadata.
+    /// Conversions that would strand child documents, chapter scenes, or
+    /// direct prose are rejected with an actionable explanation.
+    pub fn convert_structural_node(&mut self, id: NodeId, target: NodeKind) -> Result<()> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let (source, archived): (String, bool) = tx
+            .query_row(
+                "SELECT kind,archived FROM structural_node WHERE id=?1",
+                [id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|_| StorageError::NotFound(id.to_string()))?;
+        if archived {
+            return Err(StorageError::Invalid(
+                "restore the outline item before changing its type".into(),
+            ));
+        }
+        if source == target.as_str() {
+            return Ok(());
+        }
+
+        let has_children: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM structural_node WHERE parent_id=?1)",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        if target == NodeKind::Chapter && has_children {
+            return Err(StorageError::Invalid(
+                "this item has child documents; move or promote them before converting it to a chapter".into(),
+            ));
+        }
+
+        let has_scenes: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scene_placement WHERE chapter_id=?1)",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        if source == NodeKind::Chapter.as_str() && target != NodeKind::Chapter && has_scenes {
+            return Err(StorageError::Invalid(
+                "this chapter contains scenes; move them to another chapter or Unplaced before converting it".into(),
+            ));
+        }
+
+        let has_chapter_prose: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM content_unit WHERE parent_node_id=?1 AND kind='chapter_body')",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        if source == NodeKind::Chapter.as_str() && target != NodeKind::Chapter && has_chapter_prose
+        {
+            return Err(StorageError::Invalid(
+                "this chapter has direct prose; move or remove that prose document before converting it".into(),
+            ));
+        }
+
+        let has_section_prose: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM content_unit WHERE parent_node_id=?1 AND kind='section_body')",
+            [id.to_string()],
+            |row| row.get(0),
+        )?;
+        if source == NodeKind::Section.as_str() && target != NodeKind::Section && has_section_prose
+        {
+            return Err(StorageError::Invalid(
+                "this section has direct prose; move or remove that prose document before converting it".into(),
+            ));
+        }
+
+        tx.execute(
+            "UPDATE structural_node SET kind=?2,updated_at=?3 WHERE id=?1 AND archived=0",
+            params![id.to_string(), target.as_str(), now()],
+        )?;
+        tx.commit()?;
         Ok(())
     }
     pub fn move_node(
@@ -12063,7 +12147,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 52);
+        assert_eq!(version, 53);
     }
     #[test]
     fn event_character_and_location_relationships_are_typed_atomic_and_persistent() {
@@ -12122,7 +12206,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 52);
+        assert_eq!(schema_version, 53);
     }
     #[test]
     fn writing_challenges_are_validated_persisted_and_completed_once() {
@@ -12852,6 +12936,114 @@ mod tests {
                 [section.to_string()],
             )
             .unwrap_err();
+    }
+
+    #[test]
+    fn structural_kind_conversion_preserves_identity_order_and_children() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let section = store
+            .create_node(None, NodeKind::Section, "Part One", 0)
+            .unwrap();
+        let child = store
+            .create_node(Some(section), NodeKind::Group, "Nested Material", 0)
+            .unwrap();
+
+        store
+            .convert_structural_node(section, NodeKind::Group)
+            .unwrap();
+        store
+            .convert_structural_node(section, NodeKind::Section)
+            .unwrap();
+        store
+            .convert_structural_node(child, NodeKind::Chapter)
+            .unwrap();
+        let nodes = store.list_structural_nodes().unwrap();
+        let converted_parent = nodes.iter().find(|node| node.id == section).unwrap();
+        let converted_child = nodes.iter().find(|node| node.id == child).unwrap();
+        assert_eq!(converted_parent.kind, "section");
+        assert_eq!(converted_parent.title, "Part One");
+        assert_eq!(converted_parent.position, 0);
+        assert_eq!(converted_child.kind, "chapter");
+        assert_eq!(converted_child.parent_id, Some(section));
+        assert_eq!(converted_child.title, "Nested Material");
+        assert_eq!(converted_child.position, 0);
+
+        drop(store);
+        let reopened = ProjectStore::open(&project).unwrap();
+        reopened.validate().unwrap();
+        let reopened_nodes = reopened.list_structural_nodes().unwrap();
+        assert_eq!(reopened_nodes.len(), 2);
+        assert!(reopened_nodes.iter().any(|node| node.id == section));
+        assert!(reopened_nodes.iter().any(|node| node.id == child));
+    }
+
+    #[test]
+    fn structural_conversion_rejects_incompatible_contents_and_direct_sql_bypass() {
+        let directory = tempdir().unwrap();
+        let mut store = ProjectStore::create(directory.path().join("Book"), "Book").unwrap();
+        let section = store
+            .create_node(None, NodeKind::Section, "Part One", 0)
+            .unwrap();
+        let child = store
+            .create_node(Some(section), NodeKind::Group, "Nested", 0)
+            .unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter One", 1)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Opening").unwrap();
+
+        assert!(
+            store
+                .convert_structural_node(section, NodeKind::Chapter)
+                .unwrap_err()
+                .to_string()
+                .contains("child documents")
+        );
+        assert!(
+            store
+                .convert_structural_node(chapter, NodeKind::Section)
+                .unwrap_err()
+                .to_string()
+                .contains("contains scenes")
+        );
+        assert_eq!(store.get_scene(scene).unwrap().scene.title, "Opening");
+
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE structural_node SET kind='chapter' WHERE id=?1",
+                    [section.to_string()],
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .conn
+                .execute(
+                    "UPDATE structural_node SET kind='section' WHERE id=?1",
+                    [chapter.to_string()],
+                )
+                .is_err()
+        );
+        let nodes = store.list_structural_nodes().unwrap();
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.id == section && node.kind == "section")
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.id == child && node.parent_id == Some(section))
+        );
+        assert!(
+            nodes
+                .iter()
+                .any(|node| node.id == chapter && node.kind == "chapter")
+        );
     }
 
     #[test]
@@ -14002,7 +14194,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 52))
+            .map(|version| assert_eq!(version, 53))
             .unwrap();
     }
 
@@ -14411,7 +14603,7 @@ mod tests {
             .unwrap();
         drop(st);
         let conn = Connection::open(project.join("story.db")).unwrap();
-        conn.execute_batch("ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE content_unit_exclusion; DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code; DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
+        conn.execute_batch("DROP TRIGGER structural_node_kind_conversion_guard; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE content_unit_exclusion; DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code; DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
         conn.execute_batch("DROP TABLE diagnostic_suppression; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
@@ -14423,7 +14615,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 52);
+        assert_eq!(version, 53);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -14452,7 +14644,8 @@ mod tests {
 
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch(
-            "ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE content_unit_exclusion; DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code;
+            "DROP TRIGGER structural_node_kind_conversion_guard;
+             ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE content_unit_exclusion; DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code;
              DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object;
              DROP TRIGGER story_link_source_exists_insert;
              DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update;
@@ -16570,7 +16763,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 52);
+        assert_eq!(version, 53);
     }
 
     #[test]
@@ -17120,6 +17313,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 52);
+        assert_eq!(version, 53);
     }
 }

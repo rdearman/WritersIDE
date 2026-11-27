@@ -1856,6 +1856,9 @@ impl WriterApp {
     pub fn rename_structural_node(&mut self, id: NodeId, title: &str) -> Result<()> {
         Ok(self.store.rename_structural_node(id, title)?)
     }
+    pub fn convert_structural_node(&mut self, id: NodeId, kind: NodeKind) -> Result<()> {
+        Ok(self.store.convert_structural_node(id, kind)?)
+    }
     pub fn list_archived_structural_nodes(
         &self,
     ) -> Result<Vec<story_storage::StructuralNodeSummary>> {

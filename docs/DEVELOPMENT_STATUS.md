@@ -2669,3 +2669,22 @@ unit tests, the reference-window menu test, terminal Clippy with warnings
 denied, and formatting passed. The full workspace suite has not yet been rerun
 for this post-UAT-42 change. The existing UAT 42 remains frozen at its declared
 source commit; this correction is in the next development checkpoint.
+
+### Compatible outline conversion checkpoint — 27 November 2026
+
+Added a guarded schema migration and transactional conversion service for
+section, chapter and group node kinds. SQLite rejects conversions that would
+make child hierarchy, placed scenes or heading prose invalid. The Outline menu
+now offers **Convert Selected Section or Chapter…** with a keyboard-selectable
+dialogue. The current author-facing outliner supports section/chapter targets;
+Group remains unavailable there because the outliner does not render Group
+nodes. Failed conversions leave the dialogue open and the hierarchy unchanged.
+
+Verification: storage tests passed (98), app tests passed (64), terminal unit
+tests passed (379), author workflow tests passed (3), and the production PTY
+suite passed 46 tests with one optional protected private-fixture test ignored.
+The full PTY run's Screen/tmux test was denied temporary socket creation by the
+sandbox; rerunning that test with the previously authorised socket access passed.
+Formatting, targeted Clippy with warnings denied, and `git diff --check` passed.
+No new UAT build has been made; Alpha UAT 42 remains frozen at `dac9c35`.
+Conversion has automated verification but has not had human UAT.
