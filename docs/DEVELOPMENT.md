@@ -73,11 +73,21 @@ Availability is not the same as a successful audit. Run a tool at an appropriate
 checkpoint and record its result. Do not automatically upgrade dependencies or
 make any of these tools a mandatory runtime requirement.
 
-Latest local audit checkpoint (25 November 2026): `cargo audit` loaded 1,568
-RustSec advisories and reported 26 advisories plus 10 allowed warnings across
-the lockfile, including transitive SQLite, URL, ZIP and zstd dependencies. No
-dependency was automatically upgraded. The affected dependency paths and
-exposure need deliberate compatibility and security review before release.
+Latest local audit checkpoint (27 November 2026): `cargo audit` loaded 1,568
+RustSec advisories and reported 24 advisory instances across 645 locked
+dependency records after disabling unnecessary optional codecs on WIDE's direct
+`zip` 0.6.6 dependency. The production archive features needed here are Deflate
+and Store; AES, bzip2, zstd and time support are no longer enabled for that
+dependency. This removes the zstd decoder warnings from that path without
+changing package versions. `cargo audit` still reports advisories on ZIP
+versions 0.6.6, 7.4.0 and 8.6.0, plus transitive SQLite and URL advisories.
+These are advisory findings, not a count of confirmed exploitable call paths:
+WIDE's ZIP 0.6.6 call sites read entries and do not call archive extraction;
+the active zip 8.6.0 consumer is Harper's Weirpack reader. SQLite 0.35.0 is
+bundled through rusqlite and needs a deliberate compatibility decision before
+upgrading. No package version was automatically upgraded. The audit reports
+two unmaintained-crate notices (`bincode` and `paste`); these are not
+vulnerability findings.
 `cargo deny check` could not finish because locked platform-specific crate data
 was unavailable from the network-restricted Cargo registry. `cargo-machete`
 found two unused direct dependencies, which were removed; a repeat check passed.

@@ -12,4 +12,4 @@ epub = "1.2.4"
 
 [dev-dependencies]
 tempfile.workspace = true
-zip = "0.6.6"
+zip.workspace = true

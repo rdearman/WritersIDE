@@ -1,26 +1,50 @@
 # Writer's IDE Development Status
 
-## Dependency, licence and coverage-tool audit — 26 November 2026
+## Dependency, licence and coverage-tool audit — 27 November 2026
 
 The independent Rust tooling is available on this machine: cargo-audit 0.23.0,
 cargo-deny 0.22.1, cargo-machete 0.10.1, and cargo-llvm-cov 0.9.2. `cargo
 machete --with-metadata --skip-target-dir` passed and found no unused
 dependencies.
 
-Security and licence audit results are not yet conclusive. `cargo audit
---no-fetch --stale` could not run because the local advisory database is absent.
-`cargo deny check advisories ...` could not obtain its advisory database lock
-under the read-only Cargo home. `cargo deny check licenses bans sources` ran
-without a repository `deny.toml`, so its fallback policy rejected dependencies
-because no licences were explicitly allowed; this is not evidence that those
-licences are incompatible with WIDE. No license allowlist was invented.
+`cargo audit` ran against a locally fetched RustSec database (1,568 advisories)
+and reported 24 advisory instances across 645 locked package records after
+WIDE's direct `zip` 0.6.6 dependency was restricted to the Deflate feature. This
+removes unnecessary AES, bzip2, zstd and time codec support from that path and
+eliminates its zstd decoder warnings without changing package versions. Audit
+findings still cover ZIP versions 0.6.6, 7.4.0 and 8.6.0, bundled SQLite
+(`libsqlite3-sys` 0.35.0), and URL 2.5.8. They require reachability and
+compatibility review; the advisory count is not a count of confirmed exploitable
+WIDE paths. WIDE's ZIP 0.6.6 call sites read entries rather than invoking ZIP
+extraction. The bundled SQLite advisory is relevant when opening an untrusted
+project database and sibling WAL. The package upgrade needed to include patched
+SQLite was not made because the existing project constraint forbids automatic
+dependency upgrades. `bincode` and `paste` are reported as unmaintained, not as
+vulnerabilities.
+
+`cargo deny` still has no repository policy file; its default license policy is
+not a meaningful compatibility verdict, and locked platform-specific package
+metadata has previously been unavailable in this restricted registry. No
+license allowlist was invented.
 
 The workspace Cargo manifests declare `MIT`, but the repository has no tracked
 root `LICENSE` or `COPYING` file. This declaration is an unresolved release
 documentation/licensing consistency issue; do not present WIDE as MIT-licensed
 or make an open-source claim until the author resolves it. No dependency was
-upgraded, no runtime dependency was added, and cargo-llvm-cov was verified as
-installed but not run in this checkpoint.
+package version was upgraded and no runtime dependency was added. `cargo
+machete --with-metadata --skip-target-dir` passes. cargo-llvm-cov is installed;
+coverage was not measured in this checkpoint. The first workspace test attempt
+could not link because the workspace volume was full. Only the rebuildable
+`target/debug/incremental` cache was removed; the retry with incremental
+compilation disabled passed. `cargo fmt --all -- --check` and
+`cargo clippy --offline --workspace --all-targets -- -D warnings` passed. The
+full `CARGO_INCREMENTAL=0 CARGO_BUILD_JOBS=2 cargo test --offline --workspace
+-- --test-threads=1` run passed all 753 tests across the workspace, including 356
+terminal unit tests, 3 author workflows and 30 PTY tests; one protected private
+ArrowMaking PTY remains intentionally ignored without its private fixture
+environment variable. All doc tests passed. No runtime/network service was
+needed; the test requiring a temporary loopback listener ran with the separately
+authorised local-socket permission.
 
 ## Scrivener profile warning scope — 26 November 2026
 

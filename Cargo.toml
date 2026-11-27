@@ -19,7 +19,7 @@ tempfile = "3.23"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_28", "underline-color", "all-widgets", "macros", "layout-cache"] }
 crossterm = "0.28"
 serde_json = "1.0"
-zip = "0.6.6"
+zip = { version = "0.6.6", default-features = false, features = ["deflate"] }
 time = { version = "0.3.47", features = ["parsing", "local-offset"] }
 unicode-segmentation = "1.12"
 unicode-width = "0.2"
