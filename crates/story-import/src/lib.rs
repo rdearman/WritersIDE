@@ -502,6 +502,12 @@ pub struct ScrivenerCompileFormatSettings {
     pub exclude_front_matter_from_statistics: Option<bool>,
     #[serde(default)]
     pub exclude_back_matter_from_statistics: Option<bool>,
+    /// Format-level separator between consecutive text documents. Used only
+    /// when the selected section layouts define no scene-specific separator.
+    #[serde(default)]
+    pub text_between_separator_kind: Option<String>,
+    #[serde(default)]
+    pub text_between_separator: Option<String>,
     #[serde(default)]
     pub layouts: BTreeMap<String, ScrivenerCompileLayout>,
 }
@@ -2347,7 +2353,7 @@ fn scrivener_compile_settings(
         });
     };
     let source_layouts = parse_scrivener_format_layouts(settings_dir)?;
-    let source_statistics = parse_scrivener_format_statistics(settings_dir)?;
+    let source_options = parse_scrivener_format_options(settings_dir)?;
     let formats = format_settings
         .children
         .iter()
@@ -2361,11 +2367,13 @@ fn scrivener_compile_settings(
                 .get(&settings.source_format_id)
                 .cloned()
                 .unwrap_or_default();
-            if let Some((exclude_front, exclude_back)) =
-                source_statistics.get(&settings.source_format_id)
-            {
-                settings.exclude_front_matter_from_statistics = *exclude_front;
-                settings.exclude_back_matter_from_statistics = *exclude_back;
+            if let Some(options) = source_options.get(&settings.source_format_id) {
+                settings.exclude_front_matter_from_statistics =
+                    options.exclude_front_matter_from_statistics;
+                settings.exclude_back_matter_from_statistics =
+                    options.exclude_back_matter_from_statistics;
+                settings.text_between_separator_kind = options.text_between_separator_kind.clone();
+                settings.text_between_separator = options.text_between_separator.clone();
             }
             if let Some(layouts) = format
                 .children
@@ -2427,11 +2435,17 @@ fn scrivener_compile_settings(
     })
 }
 
-type ScrivenerFormatStatistics = BTreeMap<String, (Option<bool>, Option<bool>)>;
+#[derive(Clone, Debug, Default)]
+struct ScrivenerFormatOptions {
+    exclude_front_matter_from_statistics: Option<bool>,
+    exclude_back_matter_from_statistics: Option<bool>,
+    text_between_separator_kind: Option<String>,
+    text_between_separator: Option<String>,
+}
 
-fn parse_scrivener_format_statistics(
+fn parse_scrivener_format_options(
     settings_dir: &Path,
-) -> Result<ScrivenerFormatStatistics, ImportError> {
+) -> Result<BTreeMap<String, ScrivenerFormatOptions>, ImportError> {
     let Some(format_dir) = find_case_insensitive_child(settings_dir, "Compile Formats", true)?
     else {
         return Ok(BTreeMap::new());
@@ -2480,12 +2494,32 @@ fn parse_scrivener_format_statistics(
                     },
                 )
         };
+        let separators = format_node
+            .children
+            .iter()
+            .find(|node| node.name.eq_ignore_ascii_case("SeparatorSettings"))
+            .and_then(|node| {
+                node.children
+                    .iter()
+                    .find(|child| child.name.eq_ignore_ascii_case("TextSeparators"))
+            })
+            .and_then(|node| {
+                node.children
+                    .iter()
+                    .find(|child| child.name.eq_ignore_ascii_case("Between"))
+            });
         formats.insert(
             format_id,
-            (
-                parse_setting("ExcludeFrontMatter"),
-                parse_setting("ExcludeBackMatter"),
-            ),
+            ScrivenerFormatOptions {
+                exclude_front_matter_from_statistics: parse_setting("ExcludeFrontMatter"),
+                exclude_back_matter_from_statistics: parse_setting("ExcludeBackMatter"),
+                text_between_separator_kind: separators
+                    .and_then(|node| node.attributes.get("Type"))
+                    .cloned(),
+                text_between_separator: separators
+                    .map(|node| node.text.clone())
+                    .filter(|text| !text.is_empty()),
+            },
         );
     }
     Ok(formats)
@@ -5076,7 +5110,7 @@ This is an addition to the old file.}"#;
             r#"<CompileFormat ID="retailer"><Layouts><Layout ID="layout-chapter" Name="Chapter title">
               <Include Titles="No" Text="Yes"/><Titles><Prefix>Chapter &lt;$t&gt;</Prefix></Titles>
               <Separators><Between Type="Line">* * *</Between></Separators>
-            </Layout></Layouts><Statistics><ExcludeFrontMatter>Yes</ExcludeFrontMatter>
+            </Layout></Layouts><SeparatorSettings><TextSeparators><Between Type="Custom">~ ~ ~</Between></TextSeparators></SeparatorSettings><Statistics><ExcludeFrontMatter>Yes</ExcludeFrontMatter>
               <ExcludeBackMatter>No</ExcludeBackMatter></Statistics></CompileFormat>"#,
         )
         .unwrap();
@@ -5155,6 +5189,11 @@ This is an addition to the old file.}"#;
         assert_eq!(formats[1].add_default_back_matter, Some(false));
         assert_eq!(formats[1].exclude_front_matter_from_statistics, Some(true));
         assert_eq!(formats[1].exclude_back_matter_from_statistics, Some(false));
+        assert_eq!(
+            formats[1].text_between_separator_kind.as_deref(),
+            Some("Custom")
+        );
+        assert_eq!(formats[1].text_between_separator.as_deref(), Some("~ ~ ~"));
         let layout = formats[1].layouts.get("layout-chapter").unwrap();
         assert_eq!(layout.name.as_deref(), Some("Chapter title"));
         assert_eq!(layout.include_titles, Some(false));

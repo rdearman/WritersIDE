@@ -446,6 +446,25 @@ pub fn scrivener_compile_presentation(
         }
     } else if separators.len() > 1 {
         warnings.push(format!("Scrivener format '{format_id}' uses multiple scene separators; WIDE left the single separator setting unchanged"));
+    } else if let (Some(kind), Some(text)) = (
+        format.text_between_separator_kind.as_deref(),
+        format.text_between_separator.as_deref(),
+    ) {
+        if matches!(
+            kind.to_ascii_lowercase().as_str(),
+            "text" | "custom" | "separator"
+        ) && !text.trim().is_empty()
+        {
+            presentation.scene_separator = Some(text.to_owned());
+        } else if !matches!(kind.to_ascii_lowercase().as_str(), "none" | "") {
+            warnings.push(format!("Scrivener format '{format_id}' scene separator kind '{kind}' is not represented in WIDE's text-separator setting"));
+        }
+    } else if format.text_between_separator_kind.is_some()
+        || format.text_between_separator.is_some()
+    {
+        warnings.push(format!(
+            "Scrivener format '{format_id}' has an incomplete format-level scene separator setting"
+        ));
     }
     presentation.validate().map_err(AppError::Domain)?;
     warnings.sort();
@@ -9674,7 +9693,13 @@ unexpected_prose = "must not be silently discarded"
     fn scrivener_profile_renders_sequential_chapter_numbers_from_layout_prefix() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("Numbered Chapters.scriv");
-        for id in ["chapter-one", "scene-one", "chapter-two", "scene-two"] {
+        for id in [
+            "chapter-one",
+            "scene-one",
+            "chapter-two",
+            "scene-two",
+            "scene-three",
+        ] {
             fs::create_dir_all(source.join("Files/Data").join(id)).unwrap();
         }
         fs::create_dir_all(source.join("Settings/Compile Formats")).unwrap();
@@ -9687,6 +9712,7 @@ unexpected_prose = "must not be silently discarded"
                 </Children></BinderItem>
                 <BinderItem UUID="chapter-two" Type="Folder"><Title>...</Title><SectionType>chapter-type</SectionType><Children>
                   <BinderItem UUID="scene-two" Type="Text"><Title>Event 2</Title><SectionType>scene-type</SectionType><Children/></BinderItem>
+                  <BinderItem UUID="scene-three" Type="Text"><Title>Event 3</Title><SectionType>scene-type</SectionType><Children/></BinderItem>
                 </Children></BinderItem>
               </Children></BinderItem>
             </Binder></ScrivenerProject>"#,
@@ -9703,13 +9729,14 @@ unexpected_prose = "must not be silently discarded"
             source.join("Settings/Compile Formats/ebook.scrformat"),
             r#"<CompileFormat ID="ebook"><Layouts>
               <Layout ID="chapter-layout" Name="Numbered chapter"><Include Titles="Yes" Text="Yes"/><Titles><Prefix>Chapter &lt;$t&gt;</Prefix></Titles></Layout>
-              <Layout ID="scene-layout" Name="Scene boundary"><Include Titles="No" Text="Yes"/><Separators><Between Type="Custom">* * *</Between></Separators></Layout>
-            </Layouts></CompileFormat>"#,
+              <Layout ID="scene-layout" Name="Scene boundary"><Include Titles="No" Text="Yes"/></Layout>
+            </Layouts><SeparatorSettings><TextSeparators><Between Type="Custom">* * *</Between></TextSeparators></SeparatorSettings></CompileFormat>"#,
         )
         .unwrap();
         for (id, text) in [
             ("scene-one", "The blacksmith opens the forge."),
             ("scene-two", "The apprentice lifts the hammer."),
+            ("scene-three", "The bell rings above the forge."),
         ] {
             fs::write(
                 source.join("Files/Data").join(id).join("content.rtf"),
@@ -9732,6 +9759,7 @@ unexpected_prose = "must not be silently discarded"
             ),
             ("scene-one", story_import::ScrivenerDestinationKind::Scene),
             ("scene-two", story_import::ScrivenerDestinationKind::Scene),
+            ("scene-three", story_import::ScrivenerDestinationKind::Scene),
         ] {
             plan.decisions
                 .iter_mut()
@@ -9777,9 +9805,12 @@ unexpected_prose = "must not be silently discarded"
         assert!(!text.contains("## ..."));
         assert!(!text.contains("Event 1"));
         assert!(!text.contains("Event 2"));
+        assert!(!text.contains("Event 3"));
         assert!(!text.contains("<$t>"));
         assert!(text.contains("The blacksmith opens the forge."));
         assert!(text.contains("The apprentice lifts the hammer."));
+        assert!(text.contains("The bell rings above the forge."));
+        assert!(text.contains("* * *"));
         assert!(
             app.load_scene_text(app.list_scenes(false).unwrap()[0].scene.id)
                 .unwrap()
@@ -10706,6 +10737,8 @@ unexpected_prose = "must not be silently discarded"
                 ("chapter-type".into(), "hide-chapter".into()),
                 ("scene-type".into(), "hide-scene".into()),
             ]),
+            text_between_separator_kind: Some("Custom".into()),
+            text_between_separator: Some("- - -".into()),
             layouts: BTreeMap::from([
                 (
                     "hide-chapter".into(),
