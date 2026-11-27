@@ -697,6 +697,17 @@ layout type through `LevelTypes` instead of carrying an explicit
 `SectionType`: a selected layout with `Include Text=No` must suppress that
 item's body in Compile IR while retaining its editable canonical content and
 any configured heading. The synthetic production-import regression covers
-this inherited-type path and source exclusion. A fresh controlled Book 03 run
-is required before making any real-manuscript conclusion; current source
-section-layout assignments remain incomplete and must not be guessed.
+this inherited-type path and source exclusion. The fresh controlled Book 03
+run is `reports/level-types-inherited-872013c-20261127/`. It retained all
+70/70 manuscript and 10/10 research bodies after reopen, left the source
+fingerprint unchanged, and its ordinary generated EPUB passed EPUBCheck 4.2.6
+with zero errors or warnings. The imported `DEFAULT` profile was then compiled
+separately to
+`generated/level-types-inherited-872013c-20261127/book-03-project/exports/inherited-profile.epub`;
+that EPUB also passed EPUBCheck with zero errors or warnings, while the profile
+reported 14 missing or unavailable layout assignments. This validates that
+the profile compiles and remains standards-valid, not that its headings or
+selection match Scrivener. The report remains provisional, includes three
+unresolved variables and source/reference publication discrepancies, and does
+not justify guessing unavailable source layout definitions. Fixture checksums
+passed before and after the run.

@@ -16,9 +16,20 @@ Verification passed on the current change: `cargo fmt --all -- --check`,
 warnings-denied workspace Clippy, and the complete offline workspace suite
 (including 358 terminal unit tests, 3 author workflows, and 38 PTY tests; one
 protected-corpus PTY intentionally ignored). The Ollama loopback mock ran with
-the author's prior socket permission. A fresh real Book 03 import/reopen/
-profile compile and EPUBCheck run is pending; source layout gaps remain
-unresolved and no publication-fidelity or human-acceptance claim is made.
+the author's prior socket permission. The exact-commit Book 03 production run
+is `reports/level-types-inherited-872013c-20261127/`, with its imported
+project under `generated/level-types-inherited-872013c-20261127/book-03-project/`.
+It retained all 70/70 manuscript and 10/10 research bodies after reopen, left
+the protected source unchanged, and the standard generated EPUB passed
+EPUBCheck 4.2.6 with zero errors or warnings. The separately compiled
+Scrivener `DEFAULT` profile is
+`generated/level-types-inherited-872013c-20261127/book-03-project/exports/inherited-profile.epub`;
+it also passes EPUBCheck with zero errors or warnings, but reports 14 missing
+or unavailable layout assignments. Its content/heading presentation therefore
+remains provisional and is not evidence of source-layout fidelity. The full
+report records source/reference text discrepancies and 3 unresolved variables.
+Fixture SHA-256 validation passed before and after. No human acceptance is
+claimed.
 
 ## Manual whole-project backup workflow — 27 November 2026
 
