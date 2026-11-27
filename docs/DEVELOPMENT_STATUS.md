@@ -2578,13 +2578,13 @@ never part of the prefix. Ctrl+/ remains a separate simultaneous chord.
 | Environment | Evidence and result |
 |---|---|
 | Linux PTY, Crossterm raw mode | **Tested:** injected byte 0x1C activates the prefix and the next independent arrow/number key moves focus; Esc cancels, invalid keys (including a literal `+`) are consumed without editing, and shutdown restores ISIG and VQUIT. |
-| GNU Screen and tmux | **Screen tested; workflow currently fails at Escape cancellation.** The real WIDE PTY sequence through GNU Screen delivers 0x1C and the following independent arrow and number keys, including 0x31 selecting pane 1. In that nested run a standalone Escape did not reach WIDE, leaving the prefix active. The same Escape cancellation passes on a bare Linux PTY and in a standalone Crossterm Screen probe. The cause is unresolved; do not claim complete Screen compatibility. The combined regression currently stops at Screen, so tmux was not reached in that run and remains unverified. GNU Screen defaults to C-a and tmux to C-b; defaults alone do not establish behavior under custom host bindings. |
+| GNU Screen and tmux | **PTY integration passed:** the production prefix test traversed the installed GNU Screen and tmux layers, including Escape cancellation, directional and numbered focus, and clean teardown. This verifies the tested Linux PTY setup only; it does not establish compatibility with arbitrary host bindings or other terminal emulators. GNU Screen defaults to C-a and tmux to C-b; defaults alone do not establish behavior under custom host bindings. |
 | Terminator | **Not interactively tested:** its documented defaults use Ctrl+Shift+O/E for splits; those chords are no longer WIDE's defaults. The current session has no usable X display for this terminal GUI. |
 | GNOME Terminal, Konsole, XTerm, Windows Terminal, PuTTY, macOS Terminal, iTerm2, native Linux/BSD consoles | **Not interactively tested.** Konsole and the macOS/Windows environments are unavailable here; the presence of a command or protocol documentation is not an interaction test. Windows Terminal permits configurable keybindings, so a host mapping can still consume keys. |
 | SSH and keyboard layouts | **Not interactively tested:** no SSH PTY or physical UK/US/international keyboard is attached. The PTY regression checks bytes received by WIDE, not which physical key a remote client emits. |
 
-The initial production PTY workflow has passed for the bare Linux PTY. It
-creates two editor panes, verifies independent scrolling, sends raw 0x1C and
+The production PTY workflow has passed for the bare Linux PTY and the installed
+GNU Screen/tmux PTY layers. It creates two editor panes, verifies independent scrolling, sends raw 0x1C and
 separate arrows/numbers (with an explicit assertion for the independent bytes
 0x1C then 0x31 selecting pane 1), tests help/cancel/invalid/literal-plus
 sequences, maximise/restore, F6/menu fallback and close/split, then verifies
@@ -2593,13 +2593,11 @@ manuscript text and terminal mode after exit. A separate startup test verifies
 raising SIGQUIT. Unit tests cover `Ctrl+\\`/`Ctrl+4` parsing, TOML keymap
 round-trip, canonical shortcut formatting, menu label, user-binding
 precedence, `Ctrl+Shift+O` simultaneous modifiers and comma-separated sequence
-notation. Formatting and Clippy passed. The full workspace run passed the
-library, application, storage, CLI and 371 terminal unit tests, plus the three
-author workflow tests. Its production PTY suite had 44 passed, one ignored
-(private protected fixture not configured), and one failure: the nested Screen
-Escape case described above. The bare Linux prefix, exact 0x1C/0x31 focus and
-startup signal tests pass. GitHub updates and a new UAT build remain
-outstanding. The author has not human-accepted these changes.
+notation. Formatting and Clippy passed. The latest full workspace run passed
+all suites, including 377 terminal unit tests, three author-workflow tests, and
+46 production PTY tests; one optional private-corpus PTY test was ignored
+because its local path was not configured. The nested Screen/tmux prefix test
+passed on this run. The author has not human-accepted these changes.
 
 ## Application-wide keyboard consistency checkpoint — 27 November 2026
 
@@ -2626,11 +2624,34 @@ Focused tests passed for global Save from the outline, prefix activation in all
 non-modal workspaces, prefix layout selection, raw Ctrl+/ terminal decoding,
 keybinding precedence, project keybinding persistence, file-browser import
 controls, no-function-key authoring PTY, and Screen/tmux PTY prefix workflow.
-The first complete workspace run passed all suites through `story-pipeline`,
-storage, CLI, and reached the terminal's 377 unit tests; it then reported six
-stale UI expectation assertions after the keyboard-label and dialogue updates.
-Those expectations have been corrected and the affected tests passed in focused
-runs. The complete workspace suite and all terminal PTY tests must be rerun
-before this checkpoint is considered fully verified or packaged as Alpha UAT.
-Human UAT remains required; no compatibility claim is made for terminals that
-have not been exercised.
+`cargo test --workspace --offline` passed: 377 terminal unit tests, 3
+author-workflow tests, 46 production PTY tests passed and 1 optional private
+fixture PTY test was ignored. Human UAT remains required; other terminal
+emulators have not been interactively tested.
+
+### Frozen Alpha UAT 42 — 27 November 2026
+
+The Linux x86_64 release bundle is `test-builds/alpha-uat-42-dac9c35/`, frozen
+from product commit `dac9c3530ada24b5d8693a07626cdfcf558e9757`. Launch from the
+repository root:
+
+```sh
+cd test-builds/alpha-uat-42-dac9c35
+./run.sh "The Glassmaker's Compass"
+```
+
+Use `./run.sh "Chapter-Based Sample"` for the synthetic non-fiction sample.
+The bundle has isolated HOME/preferences, disposable projects, a concise
+`UAT-CHECKLIST.md` and `SHA256SUMS`; checksum verification passed. A release
+binary PTY smoke at 80×24 rendered the sample prose and exited cleanly using
+the visible Quit Without Saving action. No private manuscript content is
+included. Alpha UAT 41 and 42 are the two retained numbered Alpha builds.
+Human acceptance remains pending.
+
+Next implementation priorities from the latest author direction: verify and
+complete cross-document internal clipboard use (including external text), then
+compatible node conversion, bulk structural insertion, project-configurable
+statuses, remaining command-syntax prompts, and interactive spelling and
+selected-text thesaurus workflows. Skip work already fully implemented and
+verified. Publication-profile fidelity, new import formats, reusable templates
+and nonessential features are deferred until after the allowance reset.
