@@ -132,6 +132,7 @@ def main():
     scene_rename = modes == ["scene-rename"]
     heading_rename = modes == ["heading-rename"]
     previous_position = modes == ["previous-position"]
+    external_conflict = modes == ["external-conflict"]
     removal_dialogs = modes == ["removal-dialogs"]
     chapter_creation = modes == ["chapter-creation"]
     authoring_audit = modes == ["authoring-audit"]
@@ -2046,6 +2047,47 @@ def main():
             ):
                 raise AssertionError("application did not remain usable and quit cleanly")
             print("PTY navigation regression passed: empty Previous Position is nonfatal; menu and quit remain usable.")
+            return
+
+        if external_conflict:
+            manuscript_path = os.environ["WIDE_PTY_EXTERNAL_MANUSCRIPT"]
+            replacement = manuscript_path + ".external-tmp"
+            with open(replacement, "w", encoding="utf-8") as manuscript:
+                manuscript.write("External editor version remains on disk.")
+            os.replace(replacement, manuscript_path)
+            os.write(master, b"Local unsaved draft.")
+            conflict_start = len(output)
+            if not wait_for_screen_fragments(
+                (b"Autosave could not save", b"Local unsaved draft."),
+                conflict_start,
+                timeout=8.0,
+            ):
+                raise AssertionError(
+                    "external edit was not reported while preserving the in-memory draft; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x11")  # Ctrl+Q; conflict must not trap exit.
+            if not wait_for_screen_fragments(
+                (b"Quit Without Saving",), conflict_start, timeout=3.0
+            ):
+                raise AssertionError(
+                    "the conflicted editor did not offer an explicit quit-without-saving choice; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"d")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if (
+                finished_pid != child_pid
+                or not os.WIFEXITED(status)
+                or os.WEXITSTATUS(status) != 0
+            ):
+                raise AssertionError("discarding conflicted in-memory edits did not exit cleanly")
+            print("PTY conflict workflow passed: external disk version was preserved and unsaved edits could be discarded safely.")
             return
 
         if chapter_removal:

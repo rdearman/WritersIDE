@@ -709,6 +709,48 @@ fn date_time_insertion_without_an_active_document_is_rejected_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn external_save_conflict_preserves_disk_version_and_allows_discard_exit_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("External Conflict Project");
+    let mut app = WriterApp::create_project(&project, "External Conflict Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "Original saved version.")
+        .unwrap();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let manuscript_path = project.join("manuscript").join(format!("{scene}.md"));
+    let result = Command::new("python3")
+        .arg(&harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("external-conflict")
+        .env("WIDE_PTY_EXTERNAL_MANUSCRIPT", &manuscript_path)
+        .output()
+        .expect("run external-edit conflict through the production Linux PTY");
+    assert!(
+        result.status.success(),
+        "external conflict PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    assert_eq!(
+        std::fs::read_to_string(manuscript_path).unwrap(),
+        "External editor version remains on disk.",
+        "quitting without saving must never overwrite the externally edited file"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn find_replace_fields_show_focus_caret_and_remain_editable_before_search_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

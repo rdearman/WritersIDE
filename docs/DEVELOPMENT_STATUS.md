@@ -1,5 +1,23 @@
 # Writer's IDE Development Status
 
+## #38 expected external-edit conflict through the production PTY — 27 November 2026
+
+A new PTY regression launches the real terminal with a saved scene, atomically
+replaces that scene file from an external writer while WIDE is open, types a
+separate in-memory edit, and waits for autosave. WIDE reports the conflict,
+keeps the in-memory edit available, offers Quit Without Saving, exits cleanly
+when that explicit choice is selected, and leaves the externally written file
+byte-for-byte intact. On reopen, the unchanged metadata hash still causes
+conflict detection; the test intentionally verifies the file bytes rather than
+using a normal load that would suppress that integrity warning.
+
+This demonstrates the expected concurrent-edit safety path; it does **not**
+reproduce the author's earlier spontaneous conflict or explain the separately
+reported disappearance of 11 outline scenes. Do not disable conflict checks or
+close #38 on this evidence. Existing empty-project idle-startup PTY coverage
+also confirms no conflict appears without a selected document. Human
+reproduction and the missing-scenes root cause remain outstanding.
+
 ## Scrivener format-level scene separator — 27 November 2026
 
 Scrivener `.scrformat` files can define the separator between consecutive text
