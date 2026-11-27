@@ -1773,7 +1773,12 @@ def main():
                 raise AssertionError("Book Type did not open a visible choice dialogue")
             os.write(master, b"\x1b[B\r")  # Fiction -> Non-fiction
             if not wait_for_screen_fragments((b"Book type set to Non-fiction",), type_start, timeout=3.0):
-                raise AssertionError("Book Type did not confirm its selection")
+                raise AssertionError(
+                    "Book Type did not confirm its selection; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                    + "; output tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1600:]))
+                )
             os.write(master, b"\x11")
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0
@@ -1874,15 +1879,25 @@ def main():
 
         if create_fiction or create_nonfiction:
             read_for(0.5)
-            if not wait_for_screen_fragments((b"No scenes yet",), timeout=3.0):
-                raise AssertionError("welcome panel did not reveal the starting project")
             menu_start = len(output)
-            os.write(master, b"\x1b[21~")  # F10, File menu
-            read_for(0.2)
-            select_visible_menu_item("New Project")
-            os.write(master, b"\r")
+            if wait_for_screen_fragments(
+                (b"Start screen", b"New Project"), timeout=0.5
+            ):
+                os.write(master, b"\r")  # New Project is selected on the start screen
+            elif wait_for_screen_fragments((b"No scenes yet",), timeout=0.5):
+                os.write(master, b"\x1b[21~")  # F10, File menu
+                read_for(0.2)
+                select_visible_menu_item("New Project")
+                os.write(master, b"\r")
+            else:
+                raise AssertionError(
+                    "blank project did not expose New Project on its start screen or File menu; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                    + "; output tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1600:]))
+                )
             if not wait_for_screen_fragments((b"New Project", b"Fiction"), menu_start, timeout=3.0):
-                raise AssertionError("File > New Project did not open its title/type dialogue")
+                raise AssertionError("New Project did not open its title/type dialogue")
             browser_deadline = time.monotonic() + 5.0
             while (
                 (b"New Project" not in output or b"Fiction" not in output)
@@ -2004,7 +2019,12 @@ def main():
                 )
             os.write(master, b"\x1b[15~")
             if not wait_for_screen_fragments((b"Saved project at",), timeout=3.0):
-                raise AssertionError("temporary project did not promote to the chosen location")
+                raise AssertionError(
+                    "temporary project did not promote to the chosen location; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                    + "; output tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
             os.write(master, b"\x11")  # Ctrl+Q
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0

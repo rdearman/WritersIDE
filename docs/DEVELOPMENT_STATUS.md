@@ -2330,4 +2330,35 @@ rendered; its immediate rerun passed, and the full PTY suite also passed. This
 repair removes an implementation mismatch and reduces per-character terminal
 render spans; it does not prove the exact cause of the author's scattered-glyph
 screenshot. Issue #56 remains open for human verification. No Alpha bundle was
-created; the repository retains Alpha UAT 36 and 37 only.
+created at that checkpoint; Alpha UAT 36 was subsequently removed to keep the
+number of retained Alpha builds within the requested limit.
+
+### Alpha UAT 38 and production PTY harness correction — 27 November 2026
+
+Alpha UAT 38 is frozen at product commit `0a50253800a0276ce8744bde45198a0306598bca`
+in `test-builds/alpha-uat-38-0a50253/`. The bundle has isolated preferences and
+four disposable synthetic projects; private manuscripts and publications are
+not included. Its launch command is:
+
+```sh
+cd test-builds/alpha-uat-38-0a50253
+./run.sh
+```
+
+The fiction-creation PTY harness now accepts both supported entry states: the
+first-run Start screen and an already-open blank project's File menu. It emits
+the captured screen and output tail when project-type selection or first-save
+promotion fails, which makes future workflow failures diagnosable. Both the
+updated harness and the release binary completed the fiction creation, scene,
+write, save and exit journey. The full production PTY suite passed 39 tests;
+one opt-in private-corpus test was skipped because its local fixture path was
+not configured. Formatting, workspace Clippy and the full offline workspace
+suite passed at the frozen product revision. The PTY harness-only changes do
+not alter the runtime binary. Bundle checksums, shell syntax and all four
+sample-project SQLite integrity checks passed. Alpha UAT 37 is the only older
+numbered Alpha bundle retained, so there are two numbered Alpha builds total.
+
+Human checks in `test-builds/alpha-uat-38-0a50253/UAT-CHECKLIST.md` remain
+outstanding, especially resizing and manuscript/reference rendering. Issue
+#56 remains open: span coalescing is a verified implementation improvement,
+but the screenshot's exact rendering cause has not been reproduced.
