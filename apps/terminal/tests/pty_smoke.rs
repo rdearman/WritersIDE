@@ -1553,6 +1553,52 @@ fn review_menu_exposes_spellcheck_and_grammar_actions_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn grammar_review_can_correct_and_reopen_a_scene_through_the_production_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Proofreading Workflow Project");
+    let mut app = WriterApp::create_project(&project, "Proofreading Workflow Project").unwrap();
+    app.set_project_language("en-GB").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "They is ready.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY proofreading workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("review-proofread")
+        .output()
+        .expect("run the Linux PTY proofreading workflow");
+    assert!(
+        result.status.success(),
+        "PTY proofreading workflow failed\nstdout:\n{}\nstderr:\n{}\nscreen:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr),
+        std::fs::read_to_string(root.path().join("proofread-screen.txt")).unwrap_or_default()
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "They are ready."
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn offline_thesaurus_runs_from_the_review_menu_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

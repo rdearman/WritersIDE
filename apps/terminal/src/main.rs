@@ -394,17 +394,19 @@ struct GrammarBackgroundJob {
     source_hash: String,
     generation: u64,
     text: String,
+    language_overrides: Vec<(std::ops::Range<usize>, String)>,
     config: story_analysis::GrammarProofreadingConfig,
+    notes: Vec<String>,
 }
 
 struct GrammarBackgroundResult {
     scene_id: SceneId,
     scene_title: String,
     project_root: String,
-    language: String,
     source_hash: String,
     generation: u64,
-    result: Result<Vec<story_analysis::ProofreadingFinding>, String>,
+    result: Result<story_analysis::GrammarCheckReport, String>,
+    notes: Vec<String>,
 }
 
 fn next_grammar_job_generation(
@@ -7598,6 +7600,22 @@ impl AppState {
         if !settings.grammar.background_enabled {
             return Ok(());
         }
+        self.enqueue_grammar_check(scene_id, settings.grammar)
+    }
+
+    fn queue_manual_grammar_check(
+        &mut self,
+        scene_id: SceneId,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let settings = self.app.proofreading_config()?;
+        self.enqueue_grammar_check(scene_id, settings.grammar)
+    }
+
+    fn enqueue_grammar_check(
+        &mut self,
+        scene_id: SceneId,
+        config: story_analysis::GrammarProofreadingConfig,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let record = self.app.get_scene(scene_id)?;
         let project = self.app.get_project()?;
         let project_root = self
@@ -7607,6 +7625,29 @@ impl AppState {
             .to_string_lossy()
             .into_owned();
         let (text, source_hash) = self.app.load_scene_text(scene_id)?;
+        let tags = self.app.list_passage_language_tags(scene_id)?;
+        let stale_tags = tags
+            .iter()
+            .filter(|tag| tag.anchor.state != "current")
+            .count();
+        let language_overrides = tags
+            .iter()
+            .filter(|tag| tag.anchor.state == "current")
+            .map(|tag| {
+                let start = usize::try_from(tag.anchor.start_byte)
+                    .map_err(|_| io::Error::other("passage start offset overflow"))?;
+                let end = usize::try_from(tag.anchor.end_byte)
+                    .map_err(|_| io::Error::other("passage end offset overflow"))?;
+                Ok((start..end, tag.language_code.clone()))
+            })
+            .collect::<Result<Vec<_>, Box<dyn std::error::Error>>>()?;
+        let mut notes = Vec::new();
+        if stale_tags > 0 {
+            notes.push(format!(
+                "{}: skipped {stale_tags} passage language tag(s) that need re-anchoring",
+                record.scene.title
+            ));
+        }
         if self.grammar_worker.is_none() {
             let (job_tx, job_rx) = mpsc::channel::<GrammarBackgroundJob>();
             let (result_tx, result_rx) = mpsc::channel::<GrammarBackgroundResult>();
@@ -7622,9 +7663,10 @@ impl AppState {
                     ) {
                         continue;
                     }
-                    let result = story_analysis::grammar_check_with_config(
+                    let result = story_analysis::grammar_check_with_passage_languages_and_config(
                         &job.text,
                         &job.language,
+                        &job.language_overrides,
                         &job.config,
                     );
                     if !grammar_job_generation_is_current(
@@ -7639,10 +7681,10 @@ impl AppState {
                             scene_id: job.scene_id,
                             scene_title: job.scene_title,
                             project_root: job.project_root,
-                            language: job.language,
                             source_hash: job.source_hash,
                             generation: job.generation,
                             result,
+                            notes: job.notes,
                         })
                         .is_err()
                     {
@@ -7669,7 +7711,9 @@ impl AppState {
                     source_hash,
                     generation,
                     text,
-                    config: settings.grammar,
+                    language_overrides,
+                    config,
+                    notes,
                 })
                 .map_err(|error| format!("queue background grammar check: {error}"))?;
         }
@@ -7709,10 +7753,11 @@ impl AppState {
                 continue;
             }
             let mut actions = Vec::new();
-            let mut notes = Vec::new();
+            let mut notes = result.notes;
             match result.result {
-                Ok(findings) => {
-                    for finding in findings {
+                Ok(report) => {
+                    for localized in report.findings {
+                        let finding = localized.finding;
                         let expected_text = self
                             .app
                             .load_scene_text(result.scene_id)
@@ -7724,7 +7769,7 @@ impl AppState {
                         actions.push(ProofreadingAction {
                             scene_id: result.scene_id,
                             scene_title: result.scene_title.clone(),
-                            language: result.language.clone(),
+                            language: localized.language,
                             source_hash: result.source_hash.clone(),
                             byte_range: finding.byte_range,
                             expected_text,
@@ -7733,6 +7778,12 @@ impl AppState {
                             message: finding.message,
                             status: ProofreadingActionStatus::Pending,
                         });
+                    }
+                    for unsupported_language in report.unsupported_languages {
+                        notes.push(format!(
+                            "{} [{unsupported_language}]: offline grammar is unavailable; use local spelling tools",
+                            result.scene_title
+                        ));
                     }
                 }
                 Err(error) => notes.push(error),
@@ -7750,13 +7801,14 @@ impl AppState {
             };
             self.open_reference_buffer(
                 format!("grammar-background:{}", result.scene_id),
-                Some(result.scene_id),
+                None,
                 format!("Grammar · {}", result.scene_title),
                 body,
             );
             if let Some(pane) = self.active_reference_pane_mut() {
                 pane.proofreading = Some(review);
             }
+            self.reference_focused = true;
             self.message = if count == 0 {
                 format!(
                     "Background grammar check complete · {} · no findings",
@@ -16963,6 +17015,23 @@ impl AppState {
                     if spec.id == "scene.move" {
                         self.menu = None;
                         self.start_scene_move()?;
+                        return Ok(());
+                    }
+                    if spec.id == "proofread.grammar-check" {
+                        self.menu = None;
+                        if self.dirty {
+                            return Err("save the manuscript before running Grammar Check so suggestions match the saved source".into());
+                        }
+                        let scene = self
+                            .editing_scene
+                            .or_else(|| self.active_scene())
+                            .ok_or("select a scene first")?;
+                        self.queue_manual_grammar_check(scene)?;
+                        let title = self.app.get_scene(scene)?.scene.title;
+                        self.message = format!(
+                            "Grammar check started · {title} · results will appear in the reference pane"
+                        );
+                        self.record_recent_command(spec.id);
                         return Ok(());
                     }
                     if spec.takes_arguments {
@@ -27952,6 +28021,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         },
                         if is_shared_scene {
                             "shared"
+                        } else if reference.proofreading.is_some() {
+                            "review"
                         } else {
                             "read-only"
                         }
@@ -28049,6 +28120,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                             },
                             if is_shared_scene {
                                 "shared"
+                            } else if reference.proofreading.is_some() {
+                                "review"
                             } else {
                                 "read-only"
                             },
@@ -28710,7 +28783,15 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 workspace_action_hint(s)
             };
             let menu_hint = display_shortcut_label(effective_shortcut_label(s, "menu.main", "F10"));
-            let actions = if let Some(wizard) = s.scrivener_import.as_ref() {
+            let actions = if s.reference_focused
+                && let Some(pane) = s.active_reference_pane()
+                && let Some(review) = pane.proofreading.as_ref()
+            {
+                format!(
+                    "Grammar review · {} finding(s) · a apply · i ignore · Esc manuscript",
+                    review.findings.len()
+                )
+            } else if let Some(wizard) = s.scrivener_import.as_ref() {
                 let destination = if wizard.target == ScrivenerImportTarget::Standalone {
                     "temporary working project"
                 } else {
@@ -54181,6 +54262,36 @@ mod tests {
     }
 
     #[test]
+    fn review_menu_enter_dispatches_grammar_check_for_an_open_scene() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        app.set_project_language("en-GB").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "They is ready.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        let review_menu = MENU_CATEGORIES
+            .iter()
+            .position(|name| *name == "Review")
+            .unwrap();
+        state.open_menu_category(review_menu);
+        let selected = state
+            .menu_visible_entries()
+            .iter()
+            .position(|command| command.id == "proofread.grammar-check")
+            .unwrap();
+        state.menu.as_mut().unwrap().selected = selected;
+        state
+            .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        assert!(state.grammar_worker.is_some());
+        assert!(state.message.contains("Grammar check started"));
+    }
+
+    #[test]
     fn grammar_settings_are_visible_editable_and_persisted_per_project() {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -54289,10 +54400,13 @@ mod tests {
             scene_id: scene,
             scene_title: "Scene".into(),
             project_root: result_project_root,
-            language: "en-GB".into(),
             source_hash: source_hash.clone(),
             generation,
-            result: Ok(Vec::new()),
+            result: Ok(story_analysis::GrammarCheckReport {
+                findings: Vec::new(),
+                unsupported_languages: Vec::new(),
+            }),
+            notes: Vec::new(),
         };
         result_sender
             .send(make_result(project_root_text.clone(), stale_generation))

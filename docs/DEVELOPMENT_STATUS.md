@@ -2435,7 +2435,22 @@ production PTY tests and all other workspace/integration/doc tests passed; one
 protected ArrowMaking PTY was intentionally ignored because its local fixture
 path was not configured. This demonstrates independent scrolling and focus in
 the tested split layout. It does not establish complete pane navigation parity
-or human usability; those remain open for UAT. Next actionable authoring item:
-make the existing spelling/proofreading review scope and correction journey
-usable through normal Review actions, then refresh the GitHub issue comments
-when the API is available.
+or human usability; those remain open for UAT.
+
+## Review-menu proofreading workflow — 27 November 2026
+
+Added a production PTY workflow that opens a scene, runs Review → Grammar
+Check, accepts a suggested correction, saves, exits and verifies the corrected
+text after reopening. Exercising the workflow found that manual checks ran
+synchronously and could hold the terminal while the embedded grammar engine
+worked. Manual single-document checks now reuse the existing background worker,
+return immediately with progress feedback, preserve passage-language
+overrides, and show their results in a focused review pane. The pane is labelled
+as a review rather than read-only, and its footer exposes the apply, ignore and
+return keys. The full verification run passed: formatting, workspace Clippy
+with warnings denied, workspace tests (including 363 terminal unit tests, 3
+author workflows and 42 production PTY workflows; 1 private-corpus test was
+ignored because its path was not configured). The new proofreading PTY test
+verified correction, saving and reopening. GitHub REST issue retrieval for #33
+failed with a network connection error; no issue status was inferred from
+stale comments. Human UAT is still required for the review interaction.

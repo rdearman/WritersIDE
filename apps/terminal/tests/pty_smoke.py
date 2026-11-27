@@ -155,6 +155,7 @@ def main():
     find_replace_focus = modes == ["find-replace-focus"]
     review_thesaurus = modes == ["review-thesaurus"]
     review_menu = modes in (["review-menu"], ["review-thesaurus"])
+    review_proofread = modes == ["review-proofread"]
     removed_scenes = modes == ["removed-scenes"]
     outline_view = modes == ["outline-view"]
     editor_viewport = modes == ["editor-viewport"]
@@ -173,7 +174,7 @@ def main():
     section_removal_rehome = modes == ["section-removal-rehome"]
     os.makedirs(isolated_home, exist_ok=True)
     os.makedirs(os.path.join(isolated_home, "tmp"), exist_ok=True)
-    if create_fiction or create_nonfiction or recent_projects or backup_archive:
+    if create_fiction or create_nonfiction or recent_projects or backup_archive or review_proofread:
         # Keep this workflow focused on project lifecycle rather than allowing
         # first-run onboarding to consume editing keys.
         onboarding = os.path.join(isolated_home, "config", "writers-ide")
@@ -370,7 +371,11 @@ def main():
             if wait_for_screen_fragments((f"▸ {label}".encode("utf-8"),), timeout=0.12):
                 return
             os.write(master, b"\x1b[B")
-            read_for(0.04)
+            # The application polls terminal input every 200 ms. Read through
+            # at least one full poll/render cycle before deciding whether the
+            # selection moved; otherwise a stale highlighted row can cause the
+            # next Enter to activate its neighbour.
+            read_for(0.22)
         raise AssertionError(
             f"menu did not expose selectable item {label!r}; visible tail: "
             + repr(ANSI_CONTROL.sub(b"", output[-2200:]))
@@ -1011,6 +1016,61 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after Review menu test")
             print("PTY Review workflow passed: spellcheck and grammar actions are visible and keyboard-selectable.")
+            return
+
+        if review_proofread:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")  # dismiss first-run welcome
+            if not wait_for_workspace_title("Outline", timeout=3.0) and not wait_for_workspace_title("Editor", timeout=0.1):
+                raise AssertionError("project did not open in a manuscript workspace")
+            if wait_for_workspace_title("Outline", timeout=0.1):
+                if not move_outline_selection_until(lambda row: "Arrival" in row, "down"):
+                    raise AssertionError(
+                        "the Opening scene was not selectable in the outline; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                os.write(master, b"\r")  # open the selected scene
+            if not wait_for_workspace_title("Editor") or not wait_for_screen_fragments((b"They is ready",), timeout=3.0):
+                raise AssertionError("the selected scene did not open with its saved prose")
+
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 5)  # Review
+            select_visible_menu_item("Grammar Check")
+            read_for(0.2)  # let the menu selection redraw before dispatching Enter
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Grammar check started",), menu_start, timeout=2.0):
+                raise AssertionError("Review > Grammar Check did not return control with progress feedback")
+            if not wait_for_screen_fragments(
+                (b"Grammar review", b"Suggestion: are", b"a apply"),
+                menu_start,
+                timeout=60.0,
+            ):
+                screen = terminal_snapshot(output, 24, 80)
+                with open(os.path.join(isolated_home, "proofread-screen.txt"), "w", encoding="utf-8") as snapshot:
+                    snapshot.write("\n".join(screen))
+                key_rows = [row for row in screen if any(token in row for token in ("Offline", "Suggestion", "Apply", "Grammar", "They"))]
+                raise AssertionError(
+                    "Review > Grammar Check did not finish; relevant screen rows: "
+                    + repr(key_rows)
+                )
+            os.write(master, b"a")  # apply the selected suggestion
+            if not wait_for_screen_fragments((b"They are ready",), menu_start, timeout=3.0):
+                raise AssertionError("the accepted proofreading correction was not visible in the editor")
+            os.write(master, b"\x13")  # save corrected prose
+            if not wait_for_screen_fragments((b"SAVED",), menu_start, timeout=3.0):
+                raise AssertionError("the accepted proofreading correction did not report saved state")
+            os.write(master, b"\x11")  # quit after the explicit save
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after proofreading correction")
+            print("PTY proofreading passed: select a scene, run Review > Grammar Check, apply a suggestion, save and exit.")
             return
 
         if tutorial_navigation:
