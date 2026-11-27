@@ -970,7 +970,7 @@ struct RecentProjectPicker {
 }
 
 const MENU_CATEGORIES: [&str; 10] = [
-    "File", "Edit", "Insert", "Navigate", "View", "Review", "Publish", "Tools", "Help", "Scene",
+    "File", "Edit", "Insert", "Navigate", "View", "Review", "Publish", "Tools", "Help", "Outline",
 ];
 const MENU_CATEGORY_COMMAND_IDS: [&str; 10] = [
     "menu.file",
@@ -1032,27 +1032,9 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "edit.lowercase",
         "edit.title-case",
         "research.remove-reference",
-        "scene.rename",
-        "scene.status",
-        "scene.move",
-        "scene.toggle-inclusion",
         "comment.create",
-        "outline.move-up",
-        "outline.move-down",
-        "document.remove-content-unit",
-        "document.removed-content-units",
-        "document.restore-content-unit",
-        "document.rename-heading",
-        "document.remove-empty-node",
-        "document.removed-nodes",
-        "document.restore-node",
     ],
     &[
-        "structure.section",
-        "structure.chapter",
-        "scene.create",
-        "document.new-content-unit",
-        "document.write-selected-chapter",
         "edit.insert-date",
         "edit.insert-time",
         "edit.insert-date-time",
@@ -1135,17 +1117,29 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
     ],
     &["help.resume-tutorial", "help.context", "help.search"],
     &[
-        "scene.create",
+        "structure.section",
         "structure.chapter",
+        "scene.create",
+        "scene.subchapter",
+        "document.new-content-unit",
+        "document.write-selected-chapter",
+        "scene.toggle-inclusion",
         "scene.open",
         "scene.rename",
         "scene.field",
+        "scene.status",
+        "scene.move",
         "scene.move-earlier",
         "scene.move-later",
         "outline.move-up",
         "outline.move-down",
-        "scene.move",
-        "scene.toggle-inclusion",
+        "document.remove-content-unit",
+        "document.removed-content-units",
+        "document.restore-content-unit",
+        "document.rename-heading",
+        "document.remove-empty-node",
+        "document.removed-nodes",
+        "document.restore-node",
         "scene.remove",
         "scene.removed-list",
         "scene.restore",
@@ -1153,20 +1147,14 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
     ],
 ];
 
-const SCENE_MENU_INDEX: usize = 9;
+const OUTLINE_MENU_INDEX: usize = 9;
 
 fn menu_category_available(state: &AppState, index: usize) -> bool {
-    let fiction_outliner = is_manuscript_outliner(state.workspace)
-        && state
-            .app
-            .get_project()
-            .is_ok_and(|project| project.book_type == story_core::BookType::Fiction);
-    if fiction_outliner {
-        !(state.workspace == Workspace::Cards && index == 6)
-        // The compact card presentation leaves Publish to the command search.
-    } else {
-        index != SCENE_MENU_INDEX
+    if index == OUTLINE_MENU_INDEX {
+        return is_manuscript_outliner(state.workspace);
     }
+    // The compact card presentation leaves Publish to the command search.
+    !(state.workspace == Workspace::Cards && index == 6)
 }
 
 fn visible_menu_category_indices(state: &AppState) -> Vec<usize> {
@@ -1871,7 +1859,7 @@ fn command_registry() -> Vec<CommandSpec> {
                     "Publish" => "Open Publish Menu",
                     "Tools" => "Open Tools Menu",
                     "Help" => "Open Help Menu",
-                    "Scene" => "Open Scene Menu",
+                    "Outline" => "Open Outline Menu",
                     "View" => "Open View Menu",
                     _ => "Open Menu",
                 },
@@ -5372,21 +5360,24 @@ fn menu_category(spec: &CommandSpec) -> &'static str {
         || id.starts_with("edit.text-expansion")
     {
         "Tools"
-    } else if spec.category == "Insert"
-        || id == "scene.create"
+    } else if id == "scene.create"
+        || id == "scene.subchapter"
+        || (id.starts_with("scene.") && id != "scene.open")
         || id.starts_with("structure.")
         || id == "document.new-content-unit"
-        || id.starts_with("link.")
+        || id == "document.write-selected-chapter"
+        || id.starts_with("document.remove-")
+        || id.starts_with("document.removed-")
+        || id.starts_with("document.restore-")
+        || id == "document.rename-heading"
+        || matches!(id, "outline.move-up" | "outline.move-down")
     {
+        "Outline"
+    } else if spec.category == "Insert" || id.starts_with("link.") {
         "Insert"
     } else if matches!(
         id,
-        "search.find-panel"
-            | "search.replace-panel"
-            | "search.find-next"
-            | "search.find-previous"
-            | "outline.move-up"
-            | "outline.move-down"
+        "search.find-panel" | "search.replace-panel" | "search.find-next" | "search.find-previous"
     ) {
         "Edit"
     } else if spec.category == "View"
@@ -9765,7 +9756,7 @@ impl AppState {
             .filter(|node| node.kind == "chapter" && visible_chapters.contains(&node.id))
             .collect::<Vec<_>>();
         if chapters.is_empty() {
-            self.message = "No chapter boundaries yet · Insert > New Chapter creates one".into();
+            self.message = "No chapter boundaries yet · Outline > New Chapter creates one".into();
             return Ok(());
         }
         let selected_scene_chapter = selected_scene_for_workspace(self)
@@ -15593,14 +15584,9 @@ impl AppState {
     fn open_menu_category(&mut self, index: usize) {
         self.pending_command_sequence = None;
         let top = index.min(MENU_CATEGORIES.len().saturating_sub(1));
-        if top == SCENE_MENU_INDEX
-            && self
-                .app
-                .get_project()
-                .is_ok_and(|project| project.book_type != story_core::BookType::Fiction)
-        {
+        if top == OUTLINE_MENU_INDEX && !is_manuscript_outliner(self.workspace) {
             self.menu = None;
-            self.message = "Scene actions are available in fiction projects".into();
+            self.message = "Open the manuscript outline to use structural actions".into();
             return;
         }
         self.menu = Some(MenuState { top, selected: 0 });
@@ -15616,7 +15602,7 @@ impl AppState {
         let menu_index = menu.top.min(MENU_CATEGORIES.len() - 1);
         let top = MENU_CATEGORIES[menu_index];
         let commands = command_registry();
-        if menu_index == SCENE_MENU_INDEX {
+        if menu_index == OUTLINE_MENU_INDEX {
             return MENU_COMMON_COMMANDS[menu_index]
                 .iter()
                 .filter_map(|id| commands.iter().find(|spec| spec.id == *id).copied())
@@ -16025,12 +16011,9 @@ impl AppState {
                 Some("Select a chapter in Outline first")
             }
             CommandAction::OpenMenuCategory(index)
-                if index == SCENE_MENU_INDEX
-                    && self.app.get_project().is_ok_and(|project| {
-                        project.book_type != story_core::BookType::Fiction
-                    }) =>
+                if index == OUTLINE_MENU_INDEX && !is_manuscript_outliner(self.workspace) =>
             {
-                Some("Scene actions are available in fiction projects")
+                Some("Open the manuscript outline to use structural actions")
             }
             CommandAction::MoveOutlineUp
                 if self.workspace == Workspace::Outline
@@ -26073,15 +26056,15 @@ fn workspace_action_hint(state: &AppState) -> String {
     match state.workspace {
         Workspace::Cards => {
             if state.removed_scenes_list {
-                "Removed Scenes · ↑/↓ select · Scene > Restore Selected Scene · Esc returns to Outline".into()
+                "Removed Scenes · ↑/↓ select · Outline > Restore Selected Scene · Esc returns to Outline".into()
             } else {
                 format!(
-                    "{}: Include/Exclude · ↑↓ select · ←→ move/place · ⇧↑↓ chapter · ⇧←→ move chapter · ⇧Ins new chapter · Tab columns · Scene > Move Scene to Removed",
+                    "{}: Include/Exclude · ↑↓ select · ←→ move/place · ⇧↑↓ chapter · ⇧←→ move chapter · ⇧Ins new chapter · Tab columns · Outline > Move Scene to Removed",
                     effective_shortcut_label(state, "scene.toggle-inclusion", "Space")
                 )
             }
         }
-        Workspace::Outline if state.removed_content_units_list => "Removed Prose Documents · ↑/↓ select · Edit > Restore Selected Prose Document · Edit > Show Removed Prose Documents returns".into(),
+        Workspace::Outline if state.removed_content_units_list => "Removed Prose Documents · ↑/↓ select · Outline > Restore Selected Prose Document · Outline > Show Removed Prose Documents returns".into(),
         Workspace::Outline => {
             let inclusion = effective_shortcut_label(state, "scene.toggle-inclusion", "Space");
             if inclusion == "Space" {
@@ -26431,9 +26414,9 @@ fn draw_scene_card_collection(
         });
     let items = if rows.is_empty() {
         let empty_state = if title.starts_with("Removed Scenes") {
-            "No removed scenes · Esc or Scene > Return to Outline"
+            "No removed scenes · Esc or Outline > Return to Outline"
         } else {
-            "No scenes yet · Insert > New Scene"
+            "No scenes yet · Outline > New Scene"
         };
         vec![ListItem::new(empty_state)]
     } else {
@@ -26465,7 +26448,7 @@ fn draw_scene_cards_workspace(frame: &mut ratatui::Frame<'_>, state: &AppState, 
         draw_scene_card_collection(
             frame,
             area,
-            "Removed Scenes · Restore from Scene menu",
+            "Removed Scenes · Restore from Outline menu",
             &rows,
             selected_scene_for_workspace(state),
             None,
@@ -36714,18 +36697,18 @@ mod tests {
 
         let regular_menus = visible_menu_category_indices(&state);
         assert!(
-            regular_menus.contains(&SCENE_MENU_INDEX),
-            "Scene actions are available in the unified outline"
+            regular_menus.contains(&OUTLINE_MENU_INDEX),
+            "Outline actions are available in manuscript outliners"
         );
         assert!(
             regular_menus.contains(&6),
             "Publish remains in manuscript workspaces"
         );
 
-        state.open_menu_category(SCENE_MENU_INDEX);
+        state.open_menu_category(OUTLINE_MENU_INDEX);
         assert_eq!(state.workspace, Workspace::Outline);
         let outline_menus = visible_menu_category_indices(&state);
-        assert!(outline_menus.contains(&SCENE_MENU_INDEX));
+        assert!(outline_menus.contains(&OUTLINE_MENU_INDEX));
         assert!(
             outline_menus.contains(&6),
             "Publish remains available from the hierarchical outline"
@@ -36735,7 +36718,7 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(bar.contains("Scene"), "{bar}");
+        assert!(bar.contains("Outline"), "{bar}");
 
         state.selected = outline_rows(&state)
             .iter()
@@ -36793,7 +36776,7 @@ mod tests {
         assert!(!state.app.scene_is_included(second).unwrap());
         assert!(state.app.scene_is_included(first).unwrap());
 
-        state.open_menu_category(SCENE_MENU_INDEX);
+        state.open_menu_category(OUTLINE_MENU_INDEX);
         let entries = state.menu_visible_entries();
         state.menu.as_mut().unwrap().selected = entries
             .iter()
@@ -36826,7 +36809,7 @@ mod tests {
             "Renamed Second"
         );
 
-        state.open_menu_category(SCENE_MENU_INDEX);
+        state.open_menu_category(OUTLINE_MENU_INDEX);
         let entries = state.menu_visible_entries();
         state.menu.as_mut().unwrap().selected = entries
             .iter()
@@ -36860,7 +36843,7 @@ mod tests {
         .unwrap();
         assert!(state.app.scene_is_included(second).unwrap());
 
-        state.open_menu_category(SCENE_MENU_INDEX);
+        state.open_menu_category(OUTLINE_MENU_INDEX);
         let entries = state.menu_visible_entries();
         state.menu.as_mut().unwrap().selected = entries
             .iter()
@@ -36956,11 +36939,11 @@ mod tests {
             .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapter))
             .unwrap();
 
-        let edit = MENU_CATEGORIES
+        let outline = MENU_CATEGORIES
             .iter()
-            .position(|category| *category == "Edit")
+            .position(|category| *category == "Outline")
             .unwrap();
-        state.open_menu_category(edit);
+        state.open_menu_category(outline);
         let entries = state.menu_visible_entries();
         state.menu.as_mut().unwrap().selected = entries
             .iter()
@@ -37894,7 +37877,7 @@ mod tests {
     }
 
     #[test]
-    fn nonfiction_outline_reorders_chapters_through_visible_edit_menu_actions() {
+    fn nonfiction_outline_reorders_chapters_through_visible_outline_menu_actions() {
         let root = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project_with_type(
             root.path().join("Book"),
@@ -37925,12 +37908,12 @@ mod tests {
             .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == first))
             .unwrap();
 
-        let edit_menu = MENU_CATEGORIES
+        let outline_menu = MENU_CATEGORIES
             .iter()
-            .position(|category| *category == "Edit")
+            .position(|category| *category == "Outline")
             .unwrap();
         state.menu = Some(MenuState {
-            top: edit_menu,
+            top: outline_menu,
             selected: 0,
         });
         let visible = state
@@ -37940,10 +37923,15 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(visible.contains(&"outline.move-up"));
         assert!(visible.contains(&"outline.move-down"));
-        state.menu = None;
-        state
-            .dispatch_registered_command_id("outline.move-down")
+        state.menu.as_mut().unwrap().selected = visible
+            .iter()
+            .position(|command| *command == "outline.move-down")
             .unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
 
         let mut siblings = state
             .app
@@ -39691,12 +39679,13 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
         let mut state = AppState::new(app, default_bindings());
+        state.workspace = Workspace::Outline;
 
-        let insert = MENU_CATEGORIES
+        let outline = MENU_CATEGORIES
             .iter()
-            .position(|category| *category == "Insert")
+            .position(|category| *category == "Outline")
             .unwrap();
-        state.open_menu_category(insert);
+        state.open_menu_category(outline);
         let command = state
             .menu_visible_entries()
             .iter()
@@ -39730,7 +39719,7 @@ mod tests {
             .find(|scene| scene.scene.title == "A Room with a View")
             .expect("scene title should create an independent scene document");
         assert_eq!(created.chapter_id, None);
-        assert_eq!(state.workspace, Workspace::Cards);
+        assert_eq!(state.workspace, Workspace::Outline);
         assert!(state.message.contains("Included · unplaced"));
         let input = state.app.processing_input().unwrap();
         assert!(
@@ -39741,11 +39730,13 @@ mod tests {
         );
 
         let chapter = state.app.create_chapter(None, "Chapter One", 0).unwrap();
-        let edit = MENU_CATEGORIES
+        state.refresh().unwrap();
+        state.select_scene_in_current_outliner(created.scene.id);
+        let outline = MENU_CATEGORIES
             .iter()
-            .position(|category| *category == "Edit")
+            .position(|category| *category == "Outline")
             .unwrap();
-        state.open_menu_category(edit);
+        state.open_menu_category(outline);
         let command = state
             .menu_visible_entries()
             .iter()
@@ -39918,7 +39909,7 @@ mod tests {
         assert_eq!(state.workspace, Workspace::Outline);
         assert_eq!(selected_scene_for_workspace(&state), Some(turning));
 
-        state.open_menu_category(SCENE_MENU_INDEX);
+        state.open_menu_category(OUTLINE_MENU_INDEX);
         assert_eq!(state.workspace, Workspace::Outline);
         assert!(state.menu_visible_entries().iter().any(|command| {
             command.id == "scene.toggle-inclusion"
@@ -42924,9 +42915,19 @@ mod tests {
             .into_iter()
             .map(|command| command.id)
             .collect::<Vec<_>>();
+        assert!(!ids.contains(&"scene.create"));
+        assert!(!ids.contains(&"structure.chapter"));
+        assert!(ids.contains(&"edit.snippet-insert"));
+        state.menu = None;
+        state.workspace = Workspace::Outline;
+        state.open_menu_category(OUTLINE_MENU_INDEX);
+        let ids = state
+            .menu_commands()
+            .into_iter()
+            .map(|command| command.id)
+            .collect::<Vec<_>>();
         assert!(ids.contains(&"scene.create"));
         assert!(ids.contains(&"structure.chapter"));
-        assert!(ids.contains(&"edit.snippet-insert"));
         state.menu.as_mut().unwrap().selected =
             ids.iter().position(|id| *id == "scene.create").unwrap();
         handle(
@@ -45932,12 +45933,12 @@ mod tests {
         state.switch(Workspace::Cards);
 
         // Exercise the full menu and title-prompt route reported broken in UAT.
-        let insert_menu = MENU_CATEGORIES
+        let outline_menu = MENU_CATEGORIES
             .iter()
-            .position(|category| *category == "Insert")
+            .position(|category| *category == "Outline")
             .unwrap();
         state.menu = Some(MenuState {
-            top: insert_menu,
+            top: outline_menu,
             selected: 0,
         });
         state.menu.as_mut().unwrap().selected = state
@@ -48470,11 +48471,11 @@ mod tests {
             MENU_CATEGORIES,
             [
                 "File", "Edit", "Insert", "Navigate", "View", "Review", "Publish", "Tools", "Help",
-                "Scene",
+                "Outline",
             ]
         );
         for category in MENU_CATEGORIES {
-            if category == "Scene" {
+            if category == "Outline" {
                 assert!(command_by_id("menu.scene").is_some());
                 continue;
             }
@@ -48486,7 +48487,7 @@ mod tests {
         }
         assert_eq!(
             menu_category(&command_by_id("scene.create").unwrap()),
-            "Insert"
+            "Outline"
         );
         assert_eq!(
             menu_category(&command_by_id("help.context").unwrap()),
@@ -48548,7 +48549,7 @@ mod tests {
 
         for (top, category) in MENU_CATEGORIES.iter().enumerate() {
             for id in MENU_COMMON_COMMANDS[top] {
-                if top == SCENE_MENU_INDEX {
+                if top == OUTLINE_MENU_INDEX {
                     assert!(
                         command_by_id(id).is_some(),
                         "Scene action {id} is unregistered"
@@ -48560,7 +48561,7 @@ mod tests {
                     "{category} curated action {id} is unregistered or miscategorized"
                 );
             }
-            if top == SCENE_MENU_INDEX {
+            if top == OUTLINE_MENU_INDEX {
                 state.workspace = Workspace::Cards;
             }
             state.menu = Some(MenuState { top, selected: 0 });
@@ -48609,7 +48610,7 @@ mod tests {
                     expected.splice(maximize..maximize, ["window.grow", "window.shrink"]);
                 }
             }
-            if top != SCENE_MENU_INDEX && category != &"Tools" && category != &"Help" {
+            if top != OUTLINE_MENU_INDEX && category != &"Tools" && category != &"Help" {
                 expected.push("command.palette-open");
             }
             assert_eq!(
@@ -49090,10 +49091,10 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         for category in MENU_CATEGORIES {
-            if category == "Scene" {
+            if category == "Outline" {
                 assert!(
                     !wide.contains(category),
-                    "Scene is contextual to fiction cards"
+                    "Outline is contextual to manuscript outliners"
                 );
                 continue;
             }
@@ -49108,7 +49109,7 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(cards.contains("Scene"), "{cards}");
+        assert!(cards.contains("Outline"), "{cards}");
         assert!(!cards.contains("Publish"), "{cards}");
         state.workspace = Workspace::Dashboard;
         let narrow = menu_bar_line(&state, 40)
@@ -50192,7 +50193,7 @@ mod tests {
         state.workspace = Workspace::Cards;
         state.refresh().unwrap();
         state.selected = 0;
-        let scene_menu = SCENE_MENU_INDEX;
+        let scene_menu = OUTLINE_MENU_INDEX;
         let remove = command_by_id("scene.remove").unwrap();
         state.open_menu_category(scene_menu);
         state.menu.as_mut().unwrap().selected = state
@@ -50310,7 +50311,7 @@ mod tests {
         assert!(rendered.contains("Return to Outline"));
         assert!(!rendered.contains("Insert > New Scene"));
 
-        let scene_menu = SCENE_MENU_INDEX;
+        let scene_menu = OUTLINE_MENU_INDEX;
         state.open_menu_category(scene_menu);
         let return_command = state
             .menu_commands()
@@ -50351,7 +50352,7 @@ mod tests {
             })
             .unwrap();
 
-        state.open_menu_category(1);
+        state.open_menu_category(OUTLINE_MENU_INDEX);
         state.menu.as_mut().unwrap().selected = state
             .menu_commands()
             .iter()
@@ -50372,7 +50373,7 @@ mod tests {
             chapter
         );
 
-        state.open_menu_category(1);
+        state.open_menu_category(OUTLINE_MENU_INDEX);
         state.menu.as_mut().unwrap().selected = state
             .menu_commands()
             .iter()
@@ -50385,7 +50386,7 @@ mod tests {
         assert!(
             matches!(outline_rows(&state).first(), Some(OutlineRow::Chapter { id, title, .. }) if *id == chapter && title == "Empty Chapter")
         );
-        state.open_menu_category(1);
+        state.open_menu_category(OUTLINE_MENU_INDEX);
         state.menu.as_mut().unwrap().selected = state
             .menu_commands()
             .iter()
@@ -51147,7 +51148,7 @@ mod tests {
             .iter()
             .position(|row| *row == OutlineRow::ContentUnit(unit))
             .unwrap();
-        state.open_menu_category(1);
+        state.open_menu_category(OUTLINE_MENU_INDEX);
         state.menu.as_mut().unwrap().selected = state
             .menu_commands()
             .iter()
@@ -51160,7 +51161,7 @@ mod tests {
         handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
         assert_eq!(state.app.list_content_units(false).unwrap().len(), 1);
 
-        state.open_menu_category(1);
+        state.open_menu_category(OUTLINE_MENU_INDEX);
         state.menu.as_mut().unwrap().selected = state
             .menu_commands()
             .iter()
@@ -51184,7 +51185,7 @@ mod tests {
                 .contains("The chapter's prose remains intact.")
         );
 
-        state.open_menu_category(1);
+        state.open_menu_category(OUTLINE_MENU_INDEX);
         state.menu.as_mut().unwrap().selected = state
             .menu_commands()
             .iter()
@@ -51195,7 +51196,7 @@ mod tests {
             .unwrap();
         assert!(state.removed_content_units_list);
         assert_eq!(outline_rows(&state), vec![OutlineRow::ContentUnit(unit)]);
-        state.open_menu_category(1);
+        state.open_menu_category(OUTLINE_MENU_INDEX);
         state.menu.as_mut().unwrap().selected = state
             .menu_commands()
             .iter()

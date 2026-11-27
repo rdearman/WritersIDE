@@ -342,7 +342,10 @@ def main():
             # active; dismiss it without changing the current view.
             os.write(master, b"\x1b")
         else:
-            raise AssertionError("View menu did not identify the Outline presentation")
+            raise AssertionError(
+                "View menu did not identify the Outline presentation; screen: "
+                + repr(terminal_snapshot(output, 24, 80))
+            )
         if not wait_for_workspace_title("Outline", timeout=3.0):
             raise AssertionError(
                 "View > Show Outline Tree did not open the manuscript outline; screen: "
@@ -359,6 +362,20 @@ def main():
             f"menu did not expose selectable item {label!r}; visible tail: "
             + repr(ANSI_CONTROL.sub(b"", output[-2200:]))
             + "\ncurrent screen: "
+            + repr(terminal_snapshot(output, 24, 80))
+        )
+
+    def open_outline_menu():
+        start = len(output)
+        os.write(master, b"\x1b[21~")  # F10
+        read_for(0.2)
+        for _ in range(12):
+            if wait_for_screen_fragments(("Outline · actions".encode("utf-8"),), start, timeout=0.1):
+                return start
+            os.write(master, b"\x1b[C")
+            read_for(0.05)
+        raise AssertionError(
+            "Outline menu was not reachable from the manuscript outliner; screen: "
             + repr(terminal_snapshot(output, 24, 80))
         )
 
@@ -1071,19 +1088,10 @@ def main():
             show_outline_tree_presentation()
             if not wait_for_workspace_title("Outline"):
                 raise AssertionError("the View menu did not open the hierarchical Outline")
-            os.write(master, b"\x1b[21~")  # F10
-            read_for(0.2)
-            menu_start = len(output)
-            for _ in range(12):
-                if wait_for_screen_fragments(
-                    (b"Rename Selected Scene",), menu_start, timeout=0.1
-                ):
-                    break
-                os.write(master, b"\x1b[C")  # advance through the visible menu roots
-                read_for(0.05)
+            menu_start = open_outline_menu()
             if not wait_for_screen_fragments((b"Rename Selected Scene",), timeout=3.0):
                 raise AssertionError(
-                    "Scene menu did not expose Rename Selected Scene; screen: "
+                    "Outline menu did not expose Rename Selected Scene; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
                 )
             select_visible_menu_item("Rename Selected Scene")
@@ -1107,7 +1115,7 @@ def main():
                 finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit after the scene rename")
-            print("PTY scene rename passed: Scene menu opened a prefilled editable title and saved it.")
+            print("PTY scene rename passed: Outline menu opened a prefilled editable title and saved it.")
             return
         if heading_rename:
             if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
@@ -1122,23 +1130,25 @@ def main():
                 raise AssertionError("the View menu did not open the manuscript Outline")
             os.write(master, b"\x1b[A")  # select the chapter heading above the scene
             read_for(0.3)
-            os.write(master, b"\x1b[21~")  # F10
-            read_for(0.2)
-            os.write(master, b"\x1b[C")  # Edit
+            open_outline_menu()
             select_visible_menu_item("Rename Selected Section or Chapter")
             os.write(master, b"\r")
             if not wait_for_screen_fragments(
                 (b"Old Chapter", b"Ctrl+A clears title", b"Enter saves"), timeout=3.0
             ):
                 raise AssertionError("heading rename did not show its prefilled title field")
+            rename_start = len(output)
             os.write(
                 master,
                 b"\x01" + "Part One · The Returning Light\r".encode("utf-8"),
             )
             if not wait_for_screen_fragments(
-                ("Renamed heading to “Part One · The Returning Light”".encode("utf-8"),), timeout=3.0
+                (b"Part One", b"The Returning Light"), rename_start, timeout=3.0
             ):
-                raise AssertionError("renamed chapter was not saved; visible tail: " + repr(ANSI_CONTROL.sub(b"", output[-1800:])))
+                raise AssertionError(
+                    "renamed chapter was not visible in the outline; visible tail: "
+                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
+                )
             os.write(master, b"\x11")
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0
@@ -1148,7 +1158,7 @@ def main():
                 finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit after the heading rename")
-            print("PTY heading rename passed: Edit menu saved a prefilled section or chapter heading.")
+            print("PTY heading rename passed: Outline menu saved a prefilled section or chapter heading.")
             return
         if outline_view:
             os.write(master, b"\x1b")  # dismiss first-run welcome
@@ -1298,36 +1308,8 @@ def main():
             os.write(master, b"\x1b")  # dismiss the first-run welcome/tutorial panel
             read_for(0.25)
             show_scene_cards_presentation()
-            menu_start = len(output)
-            # F10, then move to the now-visible Scene menu.
-            os.write(master, b"\x1b[21~")
-            if not wait_for_screen_fragments(
-                (b"New Project", b"Open Project", b"Recent Projects"),
-                menu_start,
-                timeout=3.0,
-            ):
-                raise AssertionError("F10 did not reopen the File menu from Scene Cards")
-            # Publishing is context-hidden in the compact card presentation, so the visible
-            # sequence from File to Scene contains eight category steps.
-            for _ in range(12):
-                if wait_for_screen_fragments((b"Show Removed Scenes",), menu_start, timeout=0.1):
-                    break
-                os.write(master, b"\x1b[C")
-                read_for(0.04)
-            if not wait_for_screen_fragments((b"Show Removed Scenes",), menu_start, timeout=3.0):
-                raise AssertionError(
-                    "Scene menu did not expose Show Removed Scenes; visible tail: "
-                    + repr(ANSI_CONTROL.sub(b"", output[-1800:]))
-                )
-            selected_removed_command = False
-            for _ in range(20):
-                if wait_for_screen_fragments(("▸ Show Removed Scenes".encode(),), menu_start, timeout=0.2):
-                    selected_removed_command = True
-                    break
-                os.write(master, b"\x1b[B")
-                read_for(0.1)
-            if not selected_removed_command:
-                raise AssertionError("could not select Scene > Show Removed Scenes through the menu")
+            menu_start = open_outline_menu()
+            select_visible_menu_item("Show Removed Scenes")
             os.write(master, b"\r")
             if not wait_for_fragments((b"Noremovedscenes", b"ReturntoOutline"), menu_start, timeout=3.0):
                 raise AssertionError(
@@ -1350,7 +1332,7 @@ def main():
                 finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after returning from Removed Scenes")
-            print("PTY Removed Scenes workflow passed: Scene menu, empty-state guidance, Esc return and selection restoration.")
+            print("PTY Removed Scenes workflow passed: Outline menu, empty-state guidance, Esc return and selection restoration.")
             return
 
         if special_character:
@@ -1725,11 +1707,11 @@ def main():
             read_for(0.25)
             show_outline_tree_presentation()
 
-            def insert_command(label, text=None):
+            def outline_command(label, text=None):
                 start = len(output)
-                os.write(master, b"\x1b[21~" + b"\x1b[C" * 2)  # F10 > Insert
+                open_outline_menu()
                 if not wait_for_screen_fragments((label.encode("utf-8"),), start, timeout=3.0):
-                    raise AssertionError(f"Insert menu did not show {label!r}")
+                    raise AssertionError(f"Outline menu did not show {label!r}")
                 select_visible_menu_item(label)
                 os.write(master, b"\r")
                 if text is not None:
@@ -1740,9 +1722,9 @@ def main():
                     if not wait_for_screen_fragments((text.encode("utf-8"),), start, timeout=3.0):
                         raise AssertionError(f"{label} did not reveal the created item")
 
-            insert_command("New Section", "Part One")
-            insert_command("New Chapter", "Chapter One")
-            insert_command("New Scene", "Opening")
+            outline_command("New Section", "Part One")
+            outline_command("New Chapter", "Chapter One")
+            outline_command("New Scene", "Opening")
             if not wait_for_screen_fragments((b"[Included]", b"Opening"), timeout=3.0):
                 raise AssertionError("unified outline did not display the scene inclusion state")
             toggle_start = len(output)
@@ -1752,7 +1734,7 @@ def main():
             os.write(master, b" ")
             if not wait_for_screen_fragments((b"[Included]", b"Opening"), toggle_start, timeout=3.0):
                 raise AssertionError("Space did not visibly restore the scene to Included")
-            insert_command("New Scene", "Discovery")
+            outline_command("New Scene", "Discovery")
 
             os.write(master, b"\x1b[A")  # select Opening
             edit_start = len(output)

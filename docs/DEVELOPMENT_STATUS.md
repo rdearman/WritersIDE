@@ -2207,3 +2207,65 @@ test); workspace Clippy with warnings denied, `cargo fmt --all -- --check`, and
 `git diff --check` passed. The PTY exercises the standard 80×24 terminal. The
 broader Find/Replace workflow and other terminal sizes still require author
 UAT; issue #43 remains open for that acceptance.
+
+### Approved interaction contract — implementation checkpoint, 27 November 2026
+
+The author-approved `interaction-design-v1.0.md` is now authoritative. The
+previous proposal is retained for history and marked superseded. Current
+implementation gaps are recorded here to guide code changes without delaying
+authoring reliability on another large design document:
+
+| Requirement | Current status | Evidence / next implementation step |
+|---|---|---|
+| HIER-01, HIER-02 | Partial; schema conflict | `NodeKind` is Section/Chapter/Group, scenes have chapter-only placement, and prose is in separate content units. Plan a data-preserving adapter/migration before enabling arbitrary typed nesting or interleaved prose. |
+| HIER-03 | Partial | Existing transactional create/move/archive/restore operations cover current types; complete typed-tree operations and structural undo integration. |
+| OUT-01, OUT-02 | Partial | Outline and Cards are separate presentations over shared data; columns/presets and effective aggregate word counts need completion. |
+| OUT-03 | Partial | Inclusion and expansion are independently visible; complete mixed inclusion, unplaced, diagnostics, unsaved and ASCII indicators consistently. |
+| OUT-04 | Partial | Hoisting/filtering and presentation-only sorting require a unified-tree audit. |
+| OUT-05 | Partial | Cards share identities/order/inclusion with the outline but remain a distinct workspace; consolidate presentation state without losing the card layout. |
+| WS-01, WS-04 | Partial | Recursive split geometry exists; enforce the four-pane limit and test minimum sizes, collapse/restore on resize, swap and close-last-pane behavior. |
+| WS-02, WS-05 | Partial | Existing workspace/session persistence exists; add approved presets and verify multi-project isolation/restoration. |
+| WS-03 | Partial | Reference panes and pinned/following views exist; prove multiple editors share one buffer, undo and dirty state. |
+| KEY-01, KEY-02 | Partial | Registry and user bindings exist; audit proposed global keys, add Standard/WordStar/custom profiles and conflict-safe migrations. |
+| KEY-03 | Partial | Outline/card key actions exist; reconcile pane Tab behavior, selection, structural editing and visible effective bindings. |
+| KEY-04, KEY-05 | Partial | Shared registry/dispatcher exists; verify modal → prefix → global → view → application → printable precedence and terminal protocol fallbacks. |
+| MENU-01, MENU-02 | Partial | Menus are flat; persistent roots and context roots are not yet the approved set, and dynamic roots beyond Outline remain. |
+| MENU-03 | Implemented in part | This checkpoint moves section/chapter/scene/document structure creation, renaming, movement and inclusion into the Outline menu; Insert retains prose insertion. Remaining structural actions and other context roots need migration. |
+| MENU-04 | Partial | Command palette preserves advanced commands; complete command-to-route classification and contextual availability tests. |
+| ED-01, ED-04 | Partial | Markdown-backed rendered presentation, formatting marks and Unicode editing exist; semantic editing coverage, Reveal Codes, inline diagnostics and document language controls remain. |
+| ED-02, ED-03 | Partial | Individual and direct chapter prose editing, journalled autosave and revision restore exist; continuous multi-unit editing, stable cursor return and shared-buffer guarantees remain. |
+| PUB-01, PUB-02 | Partial | Named profiles, inclusion previews and Compile IR exist; complete profile overrides, front/back matter selection, variables and preview/output workflow remain. |
+| PUB-03 | Partial | Privacy boundaries and Scrivener mapping exist; real-corpus profile fidelity and unsupported-setting diagnostics remain. |
+| SHELL-01, SHELL-02 | Implemented with UAT open | Temporary project creation/import, autosave, promotion, recovery and direct project opening are automated; keep #44/#53 human acceptance open. |
+| SHELL-03, SHELL-04 | Partial | Identity/save indicators and progress/error feedback exist in key workflows; complete narrow-screen priority, long-operation progress and cancellation. |
+| ACC | Partial | Production PTYs cover core fiction, non-fiction, import, save/reopen, compile and restore paths; broaden the approved workflow matrix and keep human acceptance separate. |
+
+Dependency order under #77: (1) integrity and shared active-document/buffer
+identity; (2) command-dispatch precedence and project lifecycle regressions;
+(3) safe typed-hierarchy migration plus unified outliner over existing services;
+(4) dynamic flat context menus; (5) four-pane workspace and keyboard profiles;
+(6) semantic/continuous editing; (7) named publication profiles and compile
+presentation; (8) full PTY/regression and human UAT. A new menu checkpoint has
+begun with Outline ownership of structural actions; it is not a completed menu
+redesign.
+
+### Outline menu ownership regression repair — 27 November 2026
+
+Section, chapter, scene and direct-prose document creation are no longer listed
+under Insert. They are available through the context-sensitive Outline menu in
+both Outline and Scene Cards, for fiction and non-fiction workspaces. Structural
+rename, movement, inclusion and recoverable removal actions are exposed there;
+the ordinary Edit menu is reduced accordingly. Empty-state guidance now names
+the Outline menu. The non-fiction chapter reorder test and heading rename test
+use the Outline menu; an editor menu test verifies that structural creation is
+absent from Insert and reachable from Outline. Focused menu unit tests passed
+(49/49), and individual PTYs passed for scene rename, heading rename and the
+production menu authoring journey. The initial full test run exposed two stale
+PTY assumptions: the removed-scenes command was still sought under Scene, and
+the heading-rename script relied on a transient toast. Both now follow Outline;
+the rename test checks the visible changed heading and its Rust wrapper checks
+persisted state after reopen. Formatting and warnings-denied workspace Clippy
+passed. Workspace unit and service integration tests passed; the final full
+terminal PTY run passed 39 tests, with one protected private-corpus test ignored
+because its opt-in path was not configured. This change is automatically
+verified and remains awaiting human acceptance under #54/#77.

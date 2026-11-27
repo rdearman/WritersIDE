@@ -1,5 +1,9 @@
 # WIDE User Experience and Interaction Design Specification
 
+> **Superseded:** This unapproved proposal is retained as historical discussion only. The
+> author-approved normative interaction contract is [interaction-design-v1.0.md](interaction-design-v1.0.md),
+> tracked under GitHub issue #77. Where they differ, follow the approved specification.
+
 **Version:** 1.0 proposal
 **Status:** Draft for author review; not approved
 **Date:** 26 November 2026

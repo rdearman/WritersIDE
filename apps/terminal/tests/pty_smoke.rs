@@ -749,7 +749,7 @@ fn scene_rename_from_the_context_menu_is_editable_and_persistent_in_a_real_pty()
 
 #[cfg(target_os = "linux")]
 #[test]
-fn outline_heading_rename_from_the_edit_menu_is_persistent_in_a_real_pty() {
+fn outline_heading_rename_from_the_outline_menu_is_persistent_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
