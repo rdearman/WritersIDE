@@ -19,13 +19,20 @@ source binder and compile settings. Do not edit imported prose to match an old
 publication or silently dismiss mismatches as revision differences.
 
 The importer records binder `IncludeInCompile` flags. Inspection of the three
-current projects found the flag set to `Yes` on every inventoried binder item;
-the active Scrivener compile formats also set `ExcludeFrontMatter=Yes` and
-`ExcludeBackMatter=Yes`. The effect of those format-level switches and the
-source section-type/layout mapping is not yet represented or verified in
-WIDE's compilation decisions. Therefore the current generated publications
-must not be considered proof that all Scrivener inclusion settings have been
-preserved. Resolve this mapping before claiming source-to-publication fidelity.
+current projects found the flag set to `Yes` on every inventoried binder item.
+The `.scrformat` files also contain `Statistics/ExcludeFrontMatter` and
+`Statistics/ExcludeBackMatter`. These are word-count/statistics options, not
+publication membership switches; they must not be used to suppress selected
+front or back matter. The importer now preserves these values as typed
+statistics metadata, and a regression test verifies that setting them does not
+remove explicitly selected matter from a publication profile. Scrivener's
+compile overview separately selects front/back matter and assigns section
+types to layouts. Those assignments are stored in `compile.xml`; the selected
+formats in the current fixtures have incomplete or absent assignments, which
+WIDE reports rather than guessing. Therefore the generated publications must
+not be considered proof that all Scrivener layout and inclusion settings have
+been preserved. Resolve the remaining source assignment gaps before claiming
+source-to-publication fidelity.
 
 User clarification: additional back matter, corrected websites/email links and
 newsletter information may exist in the Scrivener projects but not in the

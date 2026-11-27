@@ -1,5 +1,56 @@
 # Writer's IDE Development Status
 
+## Scrivener statistics metadata and three-book regression — 27 November 2026
+
+The Scrivener profile investigation corrected an earlier interpretation of
+`ExcludeFrontMatter` and `ExcludeBackMatter`: in `.scrformat` these values are
+inside `Statistics`, where they control word/statistics totals. They are not
+publication inclusion flags. The importer now retains each optional boolean on
+its typed per-format settings. A regression confirms that selected front and
+back matter remains publishable even when both statistics exclusions are on.
+Compile inclusion continues to come from binder flags and the selected
+front/back matter folders in `compile.xml`.
+
+Authoritative Scrivener 3 documentation also confirms that section layouts are
+assigned to section types in the project compile overview. A format with no
+assignments can still compile, but its section-layout presentation is not
+applied. WIDE preserves explicit assignments and reports missing or
+unavailable ones; it does not copy assignments from another format or infer
+them from binder names. In the current Book 03 source, the selected custom
+format has no section-layout assignments, while the separate `DEFAULT`
+settings name built-in layouts that are not present in the project's custom
+layout definitions. That is a source configuration gap, not evidence that the
+custom layout names should be guessed. The resulting presentation remains
+provisional pending source settings clarification and human review.
+
+The production three-book run is
+`reports/scrivener-stat-layout-0600ca7-20261127/`; EPUBs for local review are:
+
+- `generated/scrivener-stat-layout-0600ca7-20261127/book-01.epub`
+- `generated/scrivener-stat-layout-0600ca7-20261127/book-02.epub`
+- `generated/scrivener-stat-layout-0600ca7-20261127/book-03.epub`
+
+All source fingerprints were unchanged. Exact import/reopen body preservation
+was 41/41 manuscript and 4/4 research for Book 01; 38/38 manuscript and 4/4
+research for Book 02; and 70/70 manuscript and 10/10 research for Book 03.
+Trash body records were intentionally excluded (3, 4 and 0 respectively), no
+body destinations were missing or changed, and EPUBCheck 4.2.6 reported zero
+errors and warnings for all three generated EPUBs. Import status remains
+incomplete for all three, and these metrics do not establish publication
+fidelity: semantic comparison discrepancies remain and the reports remain
+provisional. Fixture SHA-256 verification passed before and after the run.
+
+The first full workspace run found a flaky production PTY authoring test: its
+sentence was sent as one burst, and the terminal dropped the final characters
+under load. The test now emits that sentence at a human typing cadence. The
+formerly failing PTY passed in isolation and in the complete workspace run.
+`cargo fmt --all -- --check`, workspace Clippy with warnings denied, and the
+full offline workspace test suite passed; the terminal suite passed 358 unit
+tests, 3 author-workflow tests and 35 production PTY tests, with the protected
+ArrowMaking PTY intentionally ignored without its local fixture variable. The
+loopback-only Ollama test passed with the author's previously authorised local
+socket permission. This changes test input pacing only, not terminal behaviour.
+
 ## #38 project-copy completeness regression — 27 November 2026
 
 The reported UAT symptom that Save As omitted `attachments/`, `templates/`, or

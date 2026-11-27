@@ -9544,7 +9544,7 @@ unexpected_prose = "must not be silently discarded"
         .unwrap();
         fs::write(
             source.join("Settings/Compile Formats/ebook.scrformat"),
-            r#"<CompileFormat ID="ebook"><Layouts><Layout ID="ebook-matter-layout" Name="Matter heading only"><Include Titles="Yes" Text="No"/></Layout></Layouts></CompileFormat>"#,
+            r#"<CompileFormat ID="ebook"><Layouts><Layout ID="ebook-matter-layout" Name="Matter heading only"><Include Titles="Yes" Text="No"/></Layout></Layouts><Statistics><ExcludeFrontMatter>Yes</ExcludeFrontMatter><ExcludeBackMatter>Yes</ExcludeBackMatter></Statistics></CompileFormat>"#,
         )
         .unwrap();
         fs::write(

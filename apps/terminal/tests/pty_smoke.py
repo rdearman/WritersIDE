@@ -1619,7 +1619,11 @@ def main():
             if not wait_for_workspace_title("Editor", timeout=3.0):
                 raise AssertionError("Enter did not open the selected scene")
             read_for(0.15)
-            os.write(master, b"The map revealed a hidden pass.")
+            # Send text like a person rather than one burst: bulk PTY writes
+            # can coalesce terminal key events and drop the tail under load.
+            for character in "The map revealed a hidden pass.":
+                os.write(master, character.encode("utf-8"))
+                read_for(0.015)
             if not wait_for_screen_fragments((b"hidden pass",), edit_start, timeout=3.0):
                 raise AssertionError("manuscript typing was not visible; screen: " + repr(terminal_snapshot(output, 24, 80)) + "\noutput tail: " + repr(ANSI_CONTROL.sub(b"", output[-1600:])))
             os.write(master, b"\x13")  # Ctrl+S

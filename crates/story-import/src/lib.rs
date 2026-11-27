@@ -496,6 +496,12 @@ pub struct ScrivenerCompileFormatSettings {
     pub default_back_matter_id: Option<String>,
     #[serde(default)]
     pub add_default_back_matter: Option<bool>,
+    /// Scrivener's legacy format-level statistics options. These affect
+    /// statistics only; they do not determine whether matter is published.
+    #[serde(default)]
+    pub exclude_front_matter_from_statistics: Option<bool>,
+    #[serde(default)]
+    pub exclude_back_matter_from_statistics: Option<bool>,
     #[serde(default)]
     pub layouts: BTreeMap<String, ScrivenerCompileLayout>,
 }
@@ -2341,6 +2347,7 @@ fn scrivener_compile_settings(
         });
     };
     let source_layouts = parse_scrivener_format_layouts(settings_dir)?;
+    let source_statistics = parse_scrivener_format_statistics(settings_dir)?;
     let formats = format_settings
         .children
         .iter()
@@ -2354,6 +2361,12 @@ fn scrivener_compile_settings(
                 .get(&settings.source_format_id)
                 .cloned()
                 .unwrap_or_default();
+            if let Some((exclude_front, exclude_back)) =
+                source_statistics.get(&settings.source_format_id)
+            {
+                settings.exclude_front_matter_from_statistics = *exclude_front;
+                settings.exclude_back_matter_from_statistics = *exclude_back;
+            }
             if let Some(layouts) = format
                 .children
                 .iter()
@@ -2412,6 +2425,70 @@ fn scrivener_compile_settings(
         formats,
         available_layouts: source_layouts,
     })
+}
+
+type ScrivenerFormatStatistics = BTreeMap<String, (Option<bool>, Option<bool>)>;
+
+fn parse_scrivener_format_statistics(
+    settings_dir: &Path,
+) -> Result<ScrivenerFormatStatistics, ImportError> {
+    let Some(format_dir) = find_case_insensitive_child(settings_dir, "Compile Formats", true)?
+    else {
+        return Ok(BTreeMap::new());
+    };
+    let entries = fs::read_dir(&format_dir).map_err(|error| ImportError::Io(error.to_string()))?;
+    let mut formats = BTreeMap::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| ImportError::Io(error.to_string()))?;
+        let kind = entry
+            .file_type()
+            .map_err(|error| ImportError::Io(error.to_string()))?;
+        if !kind.is_file()
+            || !entry
+                .path()
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("scrformat"))
+        {
+            continue;
+        }
+        let source =
+            fs::read_to_string(entry.path()).map_err(|error| ImportError::Io(error.to_string()))?;
+        let root = parse_scrivener_xml(&source)?;
+        let Some(format_node) = find_scrivener_node(&root, "CompileFormat") else {
+            continue;
+        };
+        let Some(format_id) = format_node.attributes.get("ID").cloned() else {
+            continue;
+        };
+        let statistics = format_node
+            .children
+            .iter()
+            .find(|node| node.name.eq_ignore_ascii_case("Statistics"));
+        let parse_setting = |name: &str| {
+            statistics
+                .and_then(|node| {
+                    node.children
+                        .iter()
+                        .find(|child| child.name.eq_ignore_ascii_case(name))
+                })
+                .and_then(
+                    |node| match node.text.trim().to_ascii_lowercase().as_str() {
+                        "yes" | "true" | "1" => Some(true),
+                        "no" | "false" | "0" => Some(false),
+                        _ => None,
+                    },
+                )
+        };
+        formats.insert(
+            format_id,
+            (
+                parse_setting("ExcludeFrontMatter"),
+                parse_setting("ExcludeBackMatter"),
+            ),
+        );
+    }
+    Ok(formats)
 }
 
 fn scrivener_named_value(node: &ScrivenerXmlNode, name: &str) -> Option<String> {
@@ -4999,7 +5076,8 @@ This is an addition to the old file.}"#;
             r#"<CompileFormat ID="retailer"><Layouts><Layout ID="layout-chapter" Name="Chapter title">
               <Include Titles="No" Text="Yes"/><Titles><Prefix>Chapter &lt;$t&gt;</Prefix></Titles>
               <Separators><Between Type="Line">* * *</Between></Separators>
-            </Layout></Layouts></CompileFormat>"#,
+            </Layout></Layouts><Statistics><ExcludeFrontMatter>Yes</ExcludeFrontMatter>
+              <ExcludeBackMatter>No</ExcludeBackMatter></Statistics></CompileFormat>"#,
         )
         .unwrap();
 
@@ -5075,6 +5153,8 @@ This is an addition to the old file.}"#;
             Some("back-id")
         );
         assert_eq!(formats[1].add_default_back_matter, Some(false));
+        assert_eq!(formats[1].exclude_front_matter_from_statistics, Some(true));
+        assert_eq!(formats[1].exclude_back_matter_from_statistics, Some(false));
         let layout = formats[1].layouts.get("layout-chapter").unwrap();
         assert_eq!(layout.name.as_deref(), Some("Chapter title"));
         assert_eq!(layout.include_titles, Some(false));
