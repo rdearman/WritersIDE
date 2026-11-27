@@ -69,6 +69,15 @@ coverage, not a claimed root-cause fix. The reported false external-change
 conflict and missing scene rows remain unreproduced; preserve conflict
 detection and leave #38 open for continued reproduction and human UAT.
 
+Follow-up P0 startup check: a production Linux PTY now opens a genuinely empty
+project, dismisses first-run help, waits beyond the two-second autosave window,
+and verifies that no save-conflict/save-failed state appears and no unattached
+editor is opened. The test also checks that Insert Date and Time is unavailable
+without a document and exits normally. It passed. This rules out the reported
+spurious conflict for that idle empty-project path only; it does not reproduce
+the author's dirty-buffer conflict, establish its trigger, or explain the
+missing scene rows. Conflict detection remains enabled and #38 stays open.
+
 Verification for this batch: `cargo fmt --all -- --check`, workspace Clippy
 with warnings denied, and the complete offline workspace test suite passed.
 The terminal suite passed 358 unit tests, all 3 author-workflow tests, and 34

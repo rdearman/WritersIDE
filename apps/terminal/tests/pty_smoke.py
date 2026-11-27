@@ -1458,6 +1458,23 @@ def main():
             return
 
         if date_time_unavailable:
+            # A new empty project has no manuscript target. Let the normal
+            # delayed-autosave interval elapse and verify startup did not
+            # manufacture a dirty editor or an external-change conflict.
+            os.write(master, b"\x1b")  # dismiss first-run help, if present
+            read_for(0.2)
+            read_for(2.2)
+            initial_screen = terminal_snapshot(output, 24, 80)
+            if any("conflict" in row.lower() or "[save failed]" in row.lower() for row in initial_screen):
+                raise AssertionError(
+                    "an idle empty project displayed a spurious save conflict; screen: "
+                    + repr(initial_screen)
+                )
+            if any("Editor" in row and "No scene selected" in row for row in initial_screen):
+                raise AssertionError(
+                    "an empty project opened an unattached editor instead of its outline; screen: "
+                    + repr(initial_screen)
+                )
             insertion_start = len(output)
             os.write(master, b"\x1b[21~")  # F10 opens the menu bar.
             read_for(0.2)
