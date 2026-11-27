@@ -135,6 +135,7 @@ def main():
     external_conflict = modes == ["external-conflict"]
     removal_dialogs = modes == ["removal-dialogs"]
     chapter_creation = modes == ["chapter-creation"]
+    revision_snapshot = modes == ["revision-snapshot"]
     authoring_audit = modes == ["authoring-audit"]
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
@@ -377,6 +378,64 @@ def main():
 
     try:
         read_for(1.0)
+        if revision_snapshot:
+            os.write(master, b"\x1b")  # dismiss first-run help if present
+            if not wait_for_screen_fragments((b"The original passage stays.",), timeout=3.0):
+                raise AssertionError("the test manuscript did not open in the writing workspace")
+
+            snapshot_start = len(output)
+            os.write(master, b"\x10snapshot Before revision test\r")
+            if not wait_for_screen_fragments((b"Snapshot created:",), snapshot_start, timeout=4.0):
+                raise AssertionError(
+                    "the author-facing command palette did not confirm the named snapshot; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+
+            for character in "A later discovery.\n":
+                os.write(master, character.encode("utf-8"))
+                read_for(0.015)
+            os.write(master, b"\x13")  # Ctrl+S
+            if not wait_for_screen_fragments((b"[SAVED]",), snapshot_start, timeout=4.0):
+                raise AssertionError("the edited manuscript did not report a successful save")
+
+            revisions_start = len(output)
+            os.write(master, b"\x10Revisions\r")
+            if not wait_for_workspace_title("Revisions", timeout=4.0):
+                raise AssertionError(
+                    "the command palette did not open the revision workspace; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            if not wait_for_screen_fragments(
+                ("A Discovery  ·  Before revision test".encode("utf-8"),),
+                revisions_start,
+                timeout=4.0,
+            ):
+                raise AssertionError(
+                    "the named snapshot was not discoverable in revision history; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"hunk 1/", b"A later discovery."), revisions_start, timeout=4.0):
+                raise AssertionError(
+                    "opening the saved revision did not show a readable text diff; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"r")
+            if not wait_for_screen_fragments((b"Selected revision hunk restored",), timeout=4.0):
+                raise AssertionError("restoring the selected revision hunk gave no success feedback")
+
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 8.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("the revision workflow did not exit cleanly")
+            print("PTY revision workflow passed: named snapshot, saved edit, readable diff and selective restore.")
+            return
+
         if recent_projects:
             menu_start = len(output)
             os.write(master, b"\x1b[21~")  # F10, File menu

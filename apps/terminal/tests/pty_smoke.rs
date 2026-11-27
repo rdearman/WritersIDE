@@ -9,6 +9,56 @@ fn lock_pty_test() -> std::sync::MutexGuard<'static, ()> {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn named_snapshot_compare_and_selective_restore_work_through_the_production_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Revision Workflow Project");
+    let mut app = WriterApp::create_project(&project, "Revision Workflow").unwrap();
+    let chapter = app.create_chapter(None, "The Arrival", 0).unwrap();
+    let scene = app.create_scene(chapter, "A Discovery", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "The original passage stays.")
+        .unwrap();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("revision-snapshot")
+        .output()
+        .expect("run named snapshot, comparison and selective restore through the Linux PTY");
+    assert!(
+        result.status.success(),
+        "revision snapshot PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "The original passage stays."
+    );
+    let snapshots = reopened.list_snapshots(scene).unwrap();
+    assert!(
+        snapshots
+            .iter()
+            .any(|snapshot| snapshot.label == "Before revision test")
+    );
+    assert!(
+        snapshots.len() >= 2,
+        "restore must snapshot the pre-restore text"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn full_screen_terminal_opens_menu_resizes_and_exits_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

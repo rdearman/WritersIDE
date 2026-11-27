@@ -1,5 +1,28 @@
 # Writer's IDE Development Status
 
+## Revision snapshot author workflow — 27 November 2026
+
+The existing snapshot service is now covered through the production terminal
+interface as well as service and UI-state tests. The PTY journey creates a
+labelled scene snapshot from the command palette, edits and saves the prose,
+opens the Revisions workspace, reads the changed text in its diff, restores the
+selected hunk, and exits. Reopening verifies the original prose and confirms
+that the restored pre-change text was itself snapshotted. The revision list now
+shows the scene and author-provided label without placing a UUID and raw Unix
+timestamp ahead of the useful description; this keeps labels legible at 80
+columns.
+
+Focused production PTY verification passed. The full offline workspace suite
+passed, including 358 terminal unit tests, all three author workflows, 37
+production PTY tests (one protected-corpus test intentionally ignored), and
+all workspace library, CLI, integration, and documentation tests. The
+Ollama-only localhost mock test passed with the previously authorised socket
+permission. `cargo fmt --all -- --check` and workspace Clippy with warnings
+denied also passed. This does not complete #69: restore still executes immediately
+from the inspected diff without a separate confirmation step, and whole-document
+restore, rename/retention policy, and human UAT remain outstanding. No
+interaction-design proposals awaiting author approval were implemented.
+
 ## #38 expected external-edit conflict through the production PTY — 27 November 2026
 
 A new PTY regression launches the real terminal with a saved scene, atomically

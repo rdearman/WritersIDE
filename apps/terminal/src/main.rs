@@ -32529,10 +32529,12 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                     .find(|row| row.0 == scene)
                     .map(|row| row.1.as_str())
                     .unwrap_or("Unknown scene");
-                format!(
-                    "{}  {}  {}  ·  {}",
-                    title, snapshot.id, snapshot.created_at, snapshot.label
-                )
+                // Keep the author-facing history useful at ordinary terminal
+                // widths. Stable UUIDs and raw Unix timestamps belong in
+                // diagnostics, not ahead of the snapshot label where they can
+                // truncate the information the author needs to choose a
+                // revision.
+                format!("{}  ·  {}", title, snapshot.label)
             })
             .collect(),
         Workspace::Assemblies => s
