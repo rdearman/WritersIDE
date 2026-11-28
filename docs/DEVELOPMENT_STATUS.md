@@ -1,5 +1,22 @@
 # Writer's IDE Development Status
 
+## Previous Position boundary coverage — 28 November 2026
+
+Added a production Linux PTY journey for populated navigation history: search
+from one scene to another, return to the recorded scene, consume that history
+entry, then retry at the empty boundary while text is unsaved. The app reports
+the boundary without discarding the edit; saving and reopening confirms it
+persisted. Together with the existing empty-history menu test, both focused
+PTY tests pass.
+
+Verification passed: `cargo fmt --all -- --check`, warnings-denied workspace
+Clippy, and the complete offline workspace suite. Results: 386 terminal unit
+tests, 3 author workflows, 56 PTY tests passed, 1 protected private-corpus PTY
+ignored because its local fixture path was unset; all other workspace and doc
+tests passed. The default sandbox run could not bind the Ollama mock loopback
+socket; the full suite was rerun with the previously authorised socket access
+and passed. Human UAT remains pending for #62.
+
 ## Alpha UAT 46 candidate — 28 November 2026
 
 Frozen at `bfc28d0110cfd30f2ea5a1abf54520bd85710d16`. The isolated Linux

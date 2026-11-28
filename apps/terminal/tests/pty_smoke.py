@@ -153,6 +153,7 @@ def main():
     scene_rename = modes == ["scene-rename"]
     heading_rename = modes == ["heading-rename"]
     previous_position = modes == ["previous-position"]
+    previous_position_history = modes == ["previous-position-history"]
     external_conflict = modes == ["external-conflict"]
     removal_dialogs = modes == ["removal-dialogs"]
     chapter_creation = modes == ["chapter-creation"]
@@ -3215,6 +3216,43 @@ def main():
             ):
                 raise AssertionError("application did not remain usable and quit cleanly")
             print("PTY navigation regression passed: empty Previous Position is nonfatal; menu and quit remain usable.")
+            return
+
+        if previous_position_history:
+            if not wait_for_screen_fragments((b"Thomas waits beside the station clock.",), timeout=3.0):
+                raise AssertionError("the initial station scene did not open")
+            os.write(master, b"\x10grep lantern-marker\r")
+            if not wait_for_screen_fragments((b"A unique lantern-marker glows above the market.",), timeout=4.0):
+                raise AssertionError("search did not navigate to the second scene")
+            os.write(master, b"\x1b")  # Close Find while retaining the location history.
+            read_for(0.2)
+            os.write(master, b"\x10return-position\r")
+            if not wait_for_screen_fragments((b"Returned to the previous manuscript position",), timeout=3.0):
+                raise AssertionError("Previous Position did not return to the recorded scene; screen: " + repr(terminal_snapshot(output, 24, 80)) + " tail: " + repr(ANSI_CONTROL.sub(b"", output[-1600:])))
+            if not wait_for_screen_fragments((b"Thomas waits beside the station clock.",), timeout=2.0):
+                raise AssertionError("the previous scene was not restored visibly")
+
+            # The history entry is consumed once. A second attempt at the
+            # boundary must remain non-fatal and preserve an in-memory edit.
+            os.write(master, b"UNSAVED-PRESERVED")
+            os.write(master, b"\x10return-position\r")
+            if not wait_for_screen_fragments((b"No previous manuscript position",), timeout=3.0):
+                raise AssertionError("the history boundary did not report a nonfatal status")
+            if not wait_for_screen_fragments((b"UNSAVED-PRESERVED",), timeout=2.0):
+                raise AssertionError("failed boundary navigation discarded unsaved editor text")
+            os.write(master, b"\x13")  # Ctrl+S
+            if not wait_for_screen_fragments((b"[SAVED]",), timeout=3.0):
+                raise AssertionError("the manuscript did not remain saveable after boundary navigation")
+            os.write(master, b"\x11")  # Ctrl+Q
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after populated-history navigation")
+            print("PTY navigation regression passed: Previous Position returns through populated history once; empty boundary preserves edits and remains saveable.")
             return
 
         if external_conflict:

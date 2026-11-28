@@ -2350,6 +2350,62 @@ fn empty_previous_position_from_navigate_menu_keeps_the_terminal_running() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn previous_position_with_history_returns_once_and_preserves_unsaved_text_at_boundary() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Pty Project");
+    let mut app = WriterApp::create_project(&project, "Pty Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let first = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let second = app.create_scene(chapter, "The Market", 1).unwrap();
+    for (scene, text) in [
+        (first, "Thomas waits beside the station clock."),
+        (second, "A unique lantern-marker glows above the market."),
+    ] {
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), text).unwrap();
+    }
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY navigation regression: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("previous-position-history")
+        .output()
+        .expect("run the Linux PTY populated-history regression");
+    assert!(
+        result.status.success(),
+        "populated Previous Position PTY flow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert!(
+        reopened
+            .load_scene_text(first)
+            .unwrap()
+            .0
+            .contains("UNSAVED-PRESERVED")
+    );
+    assert_eq!(
+        reopened.load_scene_text(second).unwrap().0,
+        "A unique lantern-marker glows above the market."
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn outline_enter_opens_a_section_descendant_and_returns_to_the_same_scene() {
     let _guard = lock_pty_test();
     use std::process::Command;
