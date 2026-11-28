@@ -28138,6 +28138,7 @@ fn scene_card_rows(
         .into_iter()
         .collect::<BTreeSet<_>>();
     let mut nodes = s.app.list_structural_nodes().unwrap_or_default();
+    let status_definitions = s.app.list_manuscript_statuses().unwrap_or_default();
     let node_positions = nodes
         .iter()
         .map(|node| (node.id, (node.parent_id, node.position)))
@@ -28157,7 +28158,7 @@ fn scene_card_rows(
                 *id,
                 chapter,
                 title,
-                status.as_str().to_owned(),
+                manuscript_status_label(*status, &status_definitions),
                 *words,
                 record.scene.synopsis,
             ))
@@ -28235,6 +28236,21 @@ fn scene_card_rows(
         }
     }
     rows
+}
+
+fn manuscript_status_label(
+    status: SceneStatus,
+    definitions: &[story_core::ManuscriptStatusDefinition],
+) -> String {
+    definitions
+        .iter()
+        .find(|definition| definition.status == status)
+        .map(|definition| definition.label.clone())
+        .unwrap_or_else(|| match status {
+            SceneStatus::Imported => "Imported".into(),
+            SceneStatus::Archived => "Archived".into(),
+            _ => status.as_str(),
+        })
 }
 
 fn structural_node_order_path(
@@ -28745,6 +28761,7 @@ fn draw_manual_pane_layout(
 
 fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     let area = f.area();
+    let status_definitions = s.app.list_manuscript_statuses().unwrap_or_default();
     s.planning_board_area = None;
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -28880,7 +28897,10 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     s.scenes
                         .iter()
                         .map(|(_, title, status, words)| {
-                            ListItem::new(format!("{title}  [{}] {words}", status.as_str()))
+                            ListItem::new(format!(
+                                "{title}  [{}] {words}",
+                                manuscript_status_label(*status, &status_definitions)
+                            ))
                         })
                         .collect(),
                     "Scenes".into(),
@@ -29754,7 +29774,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             } else if let Some((_, title, status, words)) = s.scenes.get(s.selected) {
                 format!(
                     "Scene: {title}\nStatus: {}\nWords: {words}\n\nEnter opens the manuscript editor.",
-                    status.as_str()
+                    manuscript_status_label(*status, &status_definitions)
                 )
             } else {
                 s.workspace.title().to_owned()
@@ -34775,6 +34795,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
             ],
         };
     }
+    let status_definitions = s.app.list_manuscript_statuses().unwrap_or_default();
     match s.workspace {
         Workspace::Dashboard if s.scenes.is_empty() => vec![
             format!(
@@ -34901,7 +34922,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                                 "[ ] "
                             },
                             scene.1,
-                            scene.2.as_str(),
+                            manuscript_status_label(scene.2, &status_definitions),
                             scene.3
                         )
                     },
@@ -34941,7 +34962,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                         "Removed · {}\n{} · {} · {} words",
                         chapter,
                         row.scene.title,
-                        row.scene.status.as_str(),
+                        manuscript_status_label(row.scene.status, &status_definitions),
                         row.actual_words
                     ));
                 }
@@ -34950,7 +34971,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                     if included { "Included" } else { "Excluded" },
                     chapter,
                     row.scene.title,
-                    row.scene.status.as_str(),
+                    manuscript_status_label(row.scene.status, &status_definitions),
                     row.actual_words
                 ))
             })
@@ -34990,7 +35011,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                         } else {
                             "[ ]"
                         },
-                        status.as_str()
+                        manuscript_status_label(*status, &status_definitions)
                     )
                 })
                 .collect()
@@ -35006,7 +35027,7 @@ fn workspace_items(s: &AppState) -> Vec<String> {
                     } else {
                         "[ ]"
                     },
-                    status.as_str()
+                    manuscript_status_label(*status, &status_definitions)
                 )
             })
             .collect(),
@@ -52998,6 +53019,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(state.menu.map(|menu| menu.top), Some(2));
+    }
+
+    #[test]
+    fn custom_manuscript_statuses_render_their_project_labels() {
+        let definitions = [story_core::ManuscriptStatusDefinition {
+            status: SceneStatus::Custom(1),
+            label: "Third Draft".into(),
+            position: 0,
+            enabled: true,
+        }];
+        assert_eq!(
+            manuscript_status_label(SceneStatus::Custom(1), &definitions),
+            "Third Draft"
+        );
+        assert_eq!(
+            manuscript_status_label(SceneStatus::Archived, &definitions),
+            "Archived"
+        );
     }
 
     #[test]
