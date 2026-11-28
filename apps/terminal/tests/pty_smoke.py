@@ -2463,6 +2463,9 @@ def main():
                 raise AssertionError("status label could not be edited in the configuration dialogue")
             os.write(master, b"\r")  # finish label edit
             os.write(master, b" ")  # disable the selected status for future assignments
+            os.write(master, b"aThird Draft\r")
+            if not wait_for_screen_fragments((b"[x] Third Draft",), menu_start, timeout=2.0):
+                raise AssertionError("a project-local manuscript status could not be added")
             os.write(master, b"\r")  # save project-local status choices
             if not wait_for_screen_fragments((b"status choices saved to this project",), menu_start, timeout=3.0):
                 raise AssertionError("status configuration did not report a successful project save")
@@ -2475,7 +2478,7 @@ def main():
                 finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("the application did not exit cleanly after status configuration")
-            print("PTY manuscript status configuration passed: renamed, disabled and saved a project status.")
+            print("PTY manuscript status configuration passed: renamed, disabled, added and saved project statuses.")
             return
 
         if chapter_creation:

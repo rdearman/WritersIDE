@@ -71,6 +71,7 @@ const MIGRATION_52: &str = include_str!("../migrations/0052_content_unit_inclusi
 const MIGRATION_53: &str =
     include_str!("../migrations/0053_structural_kind_conversion_constraints.sql");
 const MIGRATION_54: &str = include_str!("../migrations/0054_project_scene_statuses.sql");
+const MIGRATION_55: &str = include_str!("../migrations/0055_custom_scene_statuses.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -1496,6 +1497,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_52}\nINSERT INTO schema_migrations(version,applied_at) VALUES(52,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_53}\nINSERT INTO schema_migrations(version,applied_at) VALUES(53,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_54}\nINSERT INTO schema_migrations(version,applied_at) VALUES(54,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_55}\nINSERT INTO schema_migrations(version,applied_at) VALUES(55,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1544,7 +1546,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 54 {
+        if version > 55 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1761,6 +1763,10 @@ impl ProjectStore {
         }
         if current_version == 53 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_54}\nINSERT INTO schema_migrations(version,applied_at) VALUES(54,'{}');\nCOMMIT;", now()))?;
+            current_version = 54;
+        }
+        if current_version == 54 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_55}\nINSERT INTO schema_migrations(version,applied_at) VALUES(55,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -3752,7 +3758,16 @@ impl ProjectStore {
         definitions: &[story_core::ManuscriptStatusDefinition],
     ) -> Result<()> {
         let current = self.list_manuscript_statuses()?;
-        if definitions.len() != current.len()
+        let current_codes = current
+            .iter()
+            .map(|definition| definition.status)
+            .collect::<std::collections::BTreeSet<_>>();
+        let definition_codes = definitions
+            .iter()
+            .map(|definition| definition.status)
+            .collect::<std::collections::BTreeSet<_>>();
+        if definitions.len() < current.len()
+            || !current_codes.is_subset(&definition_codes)
             || definitions.iter().any(|definition| {
                 definition.label.trim().is_empty()
                     || definition.label.chars().count() > 40
@@ -3760,16 +3775,9 @@ impl ProjectStore {
                         definition.status,
                         SceneStatus::Imported | SceneStatus::Archived
                     )
+                    || matches!(definition.status, SceneStatus::Custom(0))
             })
-            || definitions
-                .iter()
-                .map(|item| item.status.as_str())
-                .collect::<std::collections::BTreeSet<_>>()
-                .len()
-                != current.len()
-            || definitions
-                .iter()
-                .any(|item| !current.iter().any(|old| old.status == item.status))
+            || definition_codes.len() != definitions.len()
             || definitions.iter().filter(|item| item.enabled).count() == 0
             || definitions
                 .iter()
@@ -3786,7 +3794,7 @@ impl ProjectStore {
         tx.execute("UPDATE project_scene_status SET position=position+1000", [])?;
         for definition in definitions {
             tx.execute(
-                "UPDATE project_scene_status SET label=?2,position=?3,enabled=?4 WHERE status_code=?1",
+                "INSERT INTO project_scene_status(status_code,label,position,enabled) VALUES(?1,?2,?3,?4) ON CONFLICT(status_code) DO UPDATE SET label=excluded.label,position=excluded.position,enabled=excluded.enabled",
                 params![definition.status.as_str(), definition.label.trim(), definition.position, definition.enabled],
             )?;
         }
@@ -12124,6 +12132,7 @@ fn validate_sql_dump(sql: &str) -> Result<()> {
 }
 fn parse_status(s: &str) -> SceneStatus {
     match s {
+        "idea" => SceneStatus::Idea,
         "outlined" => SceneStatus::Outlined,
         "ready_to_draft" => SceneStatus::ReadyToDraft,
         "drafting" => SceneStatus::Drafting,
@@ -12132,7 +12141,12 @@ fn parse_status(s: &str) -> SceneStatus {
         "complete" => SceneStatus::Complete,
         "imported" => SceneStatus::Imported,
         "archived" => SceneStatus::Archived,
-        _ => SceneStatus::Idea,
+        _ => s
+            .strip_prefix("custom_")
+            .filter(|suffix| suffix.len() == 5 && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|suffix| suffix.parse::<u16>().ok())
+            .filter(|code| *code > 0)
+            .map_or(SceneStatus::Idea, SceneStatus::Custom),
     }
 }
 fn precision(s: TimePrecision) -> &'static str {
@@ -12473,8 +12487,40 @@ mod tests {
         }
         statuses[0].label = "Planned".into();
         statuses[1].enabled = false;
+        statuses.push(story_core::ManuscriptStatusDefinition {
+            status: SceneStatus::Custom(1),
+            label: "Third Draft".into(),
+            position: statuses.len() as u32,
+            enabled: true,
+        });
         store.update_manuscript_statuses(&statuses).unwrap();
         assert_eq!(store.list_manuscript_statuses().unwrap(), statuses);
+        assert!(store
+            .conn
+            .execute(
+                "UPDATE project_scene_status SET status_code='custom_00000' WHERE status_code='idea'",
+                [],
+            )
+            .is_err());
+        assert!(store
+            .conn
+            .execute(
+                "INSERT INTO project_scene_status(status_code,label,position,enabled) VALUES('custom_100000','Invalid',100,1)",
+                [],
+            )
+            .is_err());
+
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter One", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Opening").unwrap();
+        let mut record = store.get_scene(scene).unwrap();
+        record.scene.status = SceneStatus::Custom(1);
+        store.update_scene(&record.scene).unwrap();
+        assert_eq!(
+            store.get_scene(scene).unwrap().scene.status,
+            SceneStatus::Custom(1)
+        );
 
         let mut invalid = statuses.clone();
         invalid[0].status = invalid[1].status;
@@ -12488,6 +12534,10 @@ mod tests {
 
         let reopened = ProjectStore::open(&project).unwrap();
         assert_eq!(reopened.list_manuscript_statuses().unwrap(), statuses);
+        assert_eq!(
+            reopened.get_scene(scene).unwrap().scene.status,
+            SceneStatus::Custom(1)
+        );
     }
 
     #[test]
@@ -12586,7 +12636,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 54);
+        assert_eq!(version, 55);
     }
     #[test]
     fn event_character_and_location_relationships_are_typed_atomic_and_persistent() {
@@ -12645,7 +12695,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 54);
+        assert_eq!(schema_version, 55);
     }
     #[test]
     fn writing_challenges_are_validated_persisted_and_completed_once() {
@@ -14777,7 +14827,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 54))
+            .map(|version| assert_eq!(version, 55))
             .unwrap();
     }
 
@@ -15198,7 +15248,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 54);
+        assert_eq!(version, 55);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -17346,7 +17396,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 54);
+        assert_eq!(version, 55);
     }
 
     #[test]
@@ -17896,6 +17946,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 54);
+        assert_eq!(version, 55);
     }
 }

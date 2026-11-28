@@ -2713,17 +2713,17 @@ build has been generated; Alpha UAT 42 remains frozen at `dac9c35`.
 Schema migration 54 adds ordered status choices to each project with
 author-facing default labels. The Outline menu now provides a status picker for
 the selected scene. Tools > Manuscript Statuses lets authors rename,
-enable/disable and reorder the project's choices; existing scene status codes
+enable/disable, reorder and add custom choices to the project's statuses; existing scene status codes
 remain stable, including imported and archived states. At least one choice must
 remain enabled, and changes are saved transactionally.
 
-Verification passed for project-local status persistence and validation, the
-production PTY status-selection workflow (including reopen), the production
-PTY status-configuration workflow (rename/disable/reopen), formatting and
-targeted Clippy with warnings denied. Authors can rename the seven supported
-drafting stages to create a project-specific progression, but the current model
-does not create an unlimited number of distinct status stages. Human UAT
-remains pending; Alpha UAT 42 remains frozen.
+Migration 55 extends project status definitions with stable custom status IDs.
+The status settings workflow now supports adding named stages, and the status
+picker can assign them. Regression coverage verifies project persistence,
+scene assignment after reopen, and direct SQL rejection of malformed custom
+status codes. The storage suite passed (102 tests), the production status
+configuration PTY passed, and targeted Clippy with warnings denied passed.
+Human UAT remains pending; Alpha UAT 42 remains frozen.
 
 ### Author-facing argument prompt correction — 28 November 2026
 

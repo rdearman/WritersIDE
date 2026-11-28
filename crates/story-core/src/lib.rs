@@ -1762,7 +1762,7 @@ impl NodeKind {
         }
     }
 }
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum SceneStatus {
     Idea,
     Outlined,
@@ -1776,19 +1776,24 @@ pub enum SceneStatus {
     /// as a new idea while making no claim that the draft is complete.
     Imported,
     Archived,
+    /// Project-local author-defined status. The numeric identity is stable
+    /// across label edits and ordering changes; its visible label is stored in
+    /// the project's manuscript-status definitions.
+    Custom(u16),
 }
 impl SceneStatus {
-    pub fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> String {
         match self {
-            Self::Idea => "idea",
-            Self::Outlined => "outlined",
-            Self::ReadyToDraft => "ready_to_draft",
-            Self::Drafting => "drafting",
-            Self::DraftComplete => "draft_complete",
-            Self::Revising => "revising",
-            Self::Complete => "complete",
-            Self::Imported => "imported",
-            Self::Archived => "archived",
+            Self::Idea => "idea".into(),
+            Self::Outlined => "outlined".into(),
+            Self::ReadyToDraft => "ready_to_draft".into(),
+            Self::Drafting => "drafting".into(),
+            Self::DraftComplete => "draft_complete".into(),
+            Self::Revising => "revising".into(),
+            Self::Complete => "complete".into(),
+            Self::Imported => "imported".into(),
+            Self::Archived => "archived".into(),
+            Self::Custom(code) => format!("custom_{code:05}"),
         }
     }
 }

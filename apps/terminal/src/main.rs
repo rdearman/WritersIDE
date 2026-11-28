@@ -342,6 +342,8 @@ struct ManuscriptStatusSettings {
     definitions: Vec<story_core::ManuscriptStatusDefinition>,
     selected: usize,
     editing_label: bool,
+    adding_status: bool,
+    new_status_label: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15305,6 +15307,8 @@ impl AppState {
             definitions: self.app.list_manuscript_statuses()?,
             selected: 0,
             editing_label: false,
+            adding_status: false,
+            new_status_label: String::new(),
         });
         Ok(())
     }
@@ -30443,7 +30447,7 @@ fn draw_manuscript_status_settings_overlay(f: &mut ratatui::Frame<'_>, s: &AppSt
     };
     let area = f.area();
     let width = area.width.saturating_sub(4).min(68);
-    let height = (settings.definitions.len() as u16 + 5).min(area.height.saturating_sub(2));
+    let height = (settings.definitions.len() as u16 + 6).min(area.height.saturating_sub(2));
     if width < 34 || height < 7 {
         return;
     }
@@ -30482,9 +30486,14 @@ fn draw_manuscript_status_settings_overlay(f: &mut ratatui::Frame<'_>, s: &AppSt
             ))
         })
         .collect::<Vec<_>>();
-    lines.push(Line::from(
-        "↑/↓ select · Space enable · R rename · ←/→ reorder",
-    ));
+    lines.push(Line::from(if settings.adding_status {
+        format!(
+            "New status: {}▏ · Enter add · Esc cancel",
+            settings.new_status_label
+        )
+    } else {
+        "↑/↓ select · Space enable · R rename · A add · ←/→ reorder".into()
+    }));
     lines.push(Line::from("Enter save · Esc cancel"));
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -36240,7 +36249,13 @@ fn parse_terminal_status(value: &str) -> Result<SceneStatus, Box<dyn std::error:
         "complete" => SceneStatus::Complete,
         "imported" => SceneStatus::Imported,
         "archived" => SceneStatus::Archived,
-        _ => return Err(format!("unknown scene status: {value}").into()),
+        _ => value
+            .strip_prefix("custom_")
+            .filter(|suffix| suffix.len() == 5 && suffix.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|suffix| suffix.parse::<u16>().ok())
+            .filter(|code| *code > 0)
+            .map(SceneStatus::Custom)
+            .ok_or_else(|| format!("unknown scene status: {value}"))?,
     })
 }
 fn parse_participation_role(
@@ -36901,6 +36916,59 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         return Ok(false);
     }
     if let Some(settings) = s.manuscript_status_settings.as_mut() {
+        if settings.adding_status {
+            match k.code {
+                KeyCode::Esc => {
+                    settings.adding_status = false;
+                    settings.new_status_label.clear();
+                }
+                KeyCode::Enter => {
+                    let label = settings.new_status_label.trim().to_owned();
+                    if label.is_empty() {
+                        s.message = "Enter a status name, or Esc to cancel".into();
+                        return Ok(false);
+                    }
+                    let next_code = settings
+                        .definitions
+                        .iter()
+                        .filter_map(|definition| match definition.status {
+                            SceneStatus::Custom(code) => Some(code),
+                            _ => None,
+                        })
+                        .max()
+                        .unwrap_or(0)
+                        .checked_add(1);
+                    let Some(code) = next_code else {
+                        s.message = "No more custom status identifiers are available".into();
+                        return Ok(false);
+                    };
+                    let position = settings.definitions.len() as u32;
+                    settings
+                        .definitions
+                        .push(story_core::ManuscriptStatusDefinition {
+                            status: SceneStatus::Custom(code),
+                            label,
+                            position,
+                            enabled: true,
+                        });
+                    settings.selected = settings.definitions.len() - 1;
+                    settings.adding_status = false;
+                    settings.new_status_label.clear();
+                }
+                KeyCode::Backspace => {
+                    settings.new_status_label.pop();
+                }
+                KeyCode::Char(character)
+                    if !k.modifiers.contains(KeyModifiers::CONTROL)
+                        && !k.modifiers.contains(KeyModifiers::ALT)
+                        && settings.new_status_label.chars().count() < 40 =>
+                {
+                    settings.new_status_label.push(character);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
         if settings.editing_label {
             match k.code {
                 KeyCode::Esc => settings.editing_label = false,
@@ -36965,6 +37033,11 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
             KeyCode::Char('r') | KeyCode::Char('R') => {
                 settings.editing_label = true;
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                settings.adding_status = true;
+                settings.new_status_label.clear();
+                s.message = "New manuscript status · type a name · Enter adds · Esc cancels".into();
             }
             KeyCode::Enter => {
                 if let Err(error) = s.save_manuscript_status_settings() {
