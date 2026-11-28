@@ -2824,3 +2824,13 @@ workspace and exited cleanly. `sha256sum -c SHA256SUMS` passed for the binary,
 launcher, manifest, checklist and disposable sample projects. Alpha UAT 42
 remains frozen at `dac9c35`; Alpha UAT 41 was removed so only UAT 42 and UAT 43
 remain. Human acceptance remains pending.
+
+Workspace verification: formatting and workspace Clippy with warnings denied
+passed. The first offline workspace test run was blocked by the sandbox's
+loopback socket restriction; the Ollama test passed when retried with the
+authorised socket permission. In the elevated full-workspace rerun, all
+reported crate tests passed except one terminal project-creation PTY test that
+could not find its outline menu; the same PTY test passed immediately when run
+alone, and the complete terminal package suite had passed. Treat workspace
+tests as not yet clean in aggregate; investigate the intermittent PTY result
+before claiming a full workspace pass.
