@@ -2769,3 +2769,15 @@ results workflow remains available. A production PTY regression selects
 “colour”, looks up the local dictionary, applies “hue”, saves and verifies the
 reopened manuscript. Focused PTY and formatting passed; final Clippy check is
 pending.
+
+### 28 November terminal regression checkpoint
+
+After the spelling correction and selected-text thesaurus increments, the full
+terminal package suite passed: 381 unit tests, 3 author-workflow tests and 50
+production PTY tests passed; 1 private-corpus PTY test was skipped because its
+local fixture path was not configured. The nested Screen/tmux PTY gate first
+hit the sandbox socket restriction, then passed when retried with the
+previously authorised socket permission. `cargo fmt --all -- --check`,
+terminal Clippy with warnings denied and `git diff --check` passed. The frozen
+Alpha UAT 42 bundle at `test-builds/alpha-uat-42-dac9c35/` passed its SHA-256
+manifest verification; its source remains frozen at `dac9c35`.
