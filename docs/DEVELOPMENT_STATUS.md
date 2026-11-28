@@ -1,5 +1,28 @@
 # Writer's IDE Development Status
 
+## Alpha UAT 47 candidate — 28 November 2026
+
+Frozen from code commit `b746778` at
+`test-builds/alpha-uat-47-b746778/`. Launch from the repository root with:
+
+```sh
+cd test-builds/alpha-uat-47-b746778
+./run.sh "The Glassmaker's Compass"
+```
+
+Use `./run.sh "Chapter-Based Sample"` for the non-fiction project. The Linux
+x86_64 bundle includes fresh synthetic fiction/non-fiction projects, isolated
+preferences, launch script, manifest, concise Previous/Next navigation
+checklist and SHA-256 checksums. The release executable opened the fiction
+sample and exited cleanly through a PTY; checksums passed after the smoke
+launch. Full verification passed: formatting, workspace Clippy with warnings
+denied, and `cargo test --offline --workspace` (387 terminal unit tests, 3
+author workflows, 56 PTY tests; one protected private-corpus test intentionally
+ignored because its local path was not configured; all other workspace/doc
+tests passed). Human acceptance remains pending. Only Alpha UAT 46 and 47 are
+retained; Alpha 45 was removed to limit disk use. Checklist:
+`test-builds/alpha-uat-47-b746778/UAT-CHECKLIST.md`.
+
 ## Bidirectional manuscript position history — 28 November 2026
 
 Navigate now provides paired **Return to Previous Position** and **Return to
