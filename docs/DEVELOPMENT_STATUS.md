@@ -2834,3 +2834,9 @@ could not find its outline menu; the same PTY test passed immediately when run
 alone, and the complete terminal package suite had passed. Treat workspace
 tests as not yet clean in aggregate; investigate the intermittent PTY result
 before claiming a full workspace pass.
+
+The flaking project-creation PTY check was tightened to wait for the Outline
+workspace, title-dialogue dismissal and the new chapter's selected state
+instead of accepting stale prompt text. Its focused production PTY passed
+twice after that change. The complete workspace suite has not yet been rerun
+after the test-harness correction.

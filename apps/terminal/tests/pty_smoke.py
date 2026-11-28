@@ -2797,6 +2797,11 @@ def main():
                     "Enter on Create Project did not open the new fiction project; output tail: "
                     + repr(ANSI_CONTROL.sub(b"", output[-2400:]))
                 )
+            if not wait_for_workspace_title("Outline", timeout=3.0):
+                raise AssertionError(
+                    "new project creation feedback appeared without opening its outline; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
             exited_pid, exited_status = os.waitpid(child_pid, os.WNOHANG)
             if exited_pid == child_pid:
                 raise AssertionError(
@@ -2812,6 +2817,16 @@ def main():
             os.write(master, b"Opening Chapter\r")
             if not wait_for_screen_fragments((b"Opening Chapter",), timeout=3.0):
                 raise AssertionError("New Chapter was not shown in the outline")
+            if not wait_for_screen_absence(b"Enter creates", timeout=3.0):
+                raise AssertionError(
+                    "New Chapter still had its title prompt open after confirmation; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            if not wait_for_screen_absence(b"No outline row selected", timeout=3.0):
+                raise AssertionError(
+                    "the created chapter was not selected in the outline; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
             if create_nonfiction:
                 menu_start = open_outline_menu()
                 select_visible_menu_item("Write Selected Chapter")
