@@ -947,6 +947,7 @@ fn welcome_panel(has_progress: bool) -> HelpPanel {
     let mut lines = vec![
         "Choose a project action or start a tutorial. Tutorials use a disposable sample project."
             .into(),
+        "Resume Last Project · continue the most recently opened book".into(),
         "New Project · choose Fiction or Non-fiction, then a location".into(),
         "Open Project · continue an existing Writer's IDE project".into(),
         "Recent Projects · reopen a project used recently".into(),
@@ -954,6 +955,7 @@ fn welcome_panel(has_progress: bool) -> HelpPanel {
         "Guided Tour · overview of navigation, writing, references and publishing".into(),
         "Quick Start · create/open, write and save, then compile".into(),
         "Skip · continue directly to your project; Help remains available".into(),
+        "Don't show this again · automatically resume the last project at startup".into(),
     ];
     if has_progress {
         lines.push("Resume Tutorial · return to saved progress".into());
@@ -2366,7 +2368,7 @@ fn command_registry() -> Vec<CommandSpec> {
         CommandSpec {
             id: "help.show-welcome",
             label: "Show Welcome",
-            description: "Reopen first-run choices for the guided tutorial or quick start",
+            description: "Reopen the startup chooser and restore its next-launch preference",
             category: "Help",
             default_shortcuts: &[],
             mnemonic: Some('w'),
@@ -16950,17 +16952,47 @@ impl AppState {
         self.help_panel = Some(context_help_panel(self));
     }
     fn show_welcome(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let preferences = onboarding::load(&user_tutorial_preferences_path())?;
+        let path = self.tutorial_preferences_path.clone();
+        let mut preferences = onboarding::load(&path)?;
+        preferences.show_startup_chooser = Some(true);
+        onboarding::store(&path, &preferences)?;
         self.help_panel = Some(welcome_panel(preferences.active_tutorial.is_some()));
         Ok(())
     }
     fn mark_welcome_seen(&self, dismiss_tutorial: bool) -> Result<(), Box<dyn std::error::Error>> {
         let mut preferences = onboarding::load(&self.tutorial_preferences_path)?;
         preferences.welcome_seen = true;
+        preferences.show_startup_chooser.get_or_insert(true);
         if dismiss_tutorial {
             preferences.tutorial_dismissed = true;
         }
         onboarding::store(&self.tutorial_preferences_path, &preferences)?;
+        Ok(())
+    }
+    fn dismiss_startup_chooser_and_resume(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut preferences = onboarding::load(&self.tutorial_preferences_path)?;
+        preferences.welcome_seen = true;
+        preferences.show_startup_chooser = Some(false);
+        onboarding::store(&self.tutorial_preferences_path, &preferences)?;
+        self.help_panel = None;
+        let recent = self
+            .recent_projects_path
+            .as_deref()
+            .map(load_recent_projects)
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(path) = recent
+            .into_iter()
+            .find(|path| path.join("project.toml").is_file() && path.join("story.db").is_file())
+        {
+            self.switch_to_project(
+                path,
+                "Startup chooser disabled · resumed the last project".into(),
+            )?;
+        } else {
+            self.message = "Startup chooser disabled · create or open a project to begin".into();
+            self.dispatch_registered_command_id("file.new-project")?;
+        }
         Ok(())
     }
     fn restart_tutorial(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -27763,8 +27795,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (completed_promotions, promotion_conflicts) = reconcile_staged_promotions();
     let recoverable_stages = recoverable_staged_projects();
     let explicit_project = env::args().nth(1).map(Into::into);
+    let onboarding_path = user_tutorial_preferences_path();
+    let startup_preferences = onboarding::load(&onboarding_path).unwrap_or_default();
+    let recent_projects_path = user_recent_projects_path();
+    let recent_last_project = load_recent_projects(&recent_projects_path)
+        .unwrap_or_default()
+        .into_iter()
+        .find(|path| path.join("project.toml").is_file() && path.join("story.db").is_file());
+    let mut show_startup_chooser = explicit_project.is_none()
+        && startup_preferences.startup_chooser_enabled()
+        && completed_promotions.is_empty()
+        && recoverable_stages.is_empty();
+    if explicit_project.is_none()
+        && !startup_preferences.startup_chooser_enabled()
+        && recent_last_project.is_none()
+        && recoverable_stages.is_empty()
+        && completed_promotions.is_empty()
+    {
+        // Without an existing project there is nothing safe to auto-resume.
+        // Fall back to the project chooser instead of opening disposable work.
+        show_startup_chooser = true;
+    }
     let (project_path, startup_scratch) = if explicit_project.is_none() {
         if let Some(path) = completed_promotions.last() {
+            (path.clone(), None)
+        } else if recoverable_stages.is_empty()
+            && !show_startup_chooser
+            && let Some(path) = recent_last_project.as_ref()
+        {
             (path.clone(), None)
         } else {
             prepare_startup_project(None)?
@@ -27781,7 +27839,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = AppState::new(app, function_bindings);
     state.workspace = default_authoring_workspace(state.app.get_project()?.book_type);
     state.temporary_project = startup_scratch.is_some() || is_staged_project(&project_path);
-    let recent_projects_path = user_recent_projects_path();
     state.recent_projects_path = Some(recent_projects_path.clone());
     state.command_bindings = command_bindings;
     state.context_command_bindings = context_command_bindings;
@@ -27852,7 +27909,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     state.restore_session()?;
     state.refresh()?;
     open_default_manuscript_if_unrestored(&mut state, has_saved_session)?;
-    let onboarding_path = user_tutorial_preferences_path();
     match onboarding::load(&onboarding_path) {
         Ok(preferences) if is_staged_project(&project_path) => {
             if let Some(progress) = preferences.active_tutorial.as_ref() {
@@ -27863,9 +27919,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ));
             }
         }
-        Ok(preferences) if startup_scratch.is_some() => {
+        Ok(preferences) if show_startup_chooser => {
             state.help_panel = Some(welcome_panel(preferences.active_tutorial.is_some()));
-            state.message = "Start screen · choose New Project, Open Project, Recent Projects, Import, or a tutorial".into();
+            state.message =
+                "Start screen · choose Resume, New, Open, Recent, Import, or a tutorial".into();
         }
         Ok(preferences) if !preferences.welcome_seen || preferences.active_tutorial.is_some() => {
             state.help_panel = Some(welcome_panel(preferences.active_tutorial.is_some()));
@@ -27929,6 +27986,18 @@ fn restore(t: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<(), io::Err
     )?;
     t.show_cursor()
 }
+
+/// Invalidate Ratatui's diff buffers and clear the fullscreen view without
+/// asking the terminal emulator for its physical cursor position. Some SSH
+/// clients and busy terminals omit or delay CPR replies; screen transitions
+/// and resizes must remain independent of that optional terminal query.
+fn clear_terminal_for_redraw(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<(), io::Error> {
+    let size = terminal.size()?;
+    terminal.resize(Rect::new(0, 0, size.width, size.height))
+}
+
 fn run(
     t: &mut Terminal<CrosstermBackend<io::Stdout>>,
     s: &mut AppState,
@@ -27971,7 +28040,7 @@ fn run(
                         // Clear the physical terminal as well as Ratatui's diff buffers when
                         // changing screens. This prevents stale pane contents on terminals
                         // that miss or defer partial cell updates.
-                        t.clear()?;
+                        clear_terminal_for_redraw(t)?;
                     }
                     if s.active_challenge.as_ref().is_some_and(|challenge| {
                         s.count_words_for_project(&s.editor.join("\n")) >= challenge.target_words
@@ -28020,7 +28089,7 @@ fn run(
                 }
                 Event::Resize(_, _) => {
                     s.pause_challenge_inactivity();
-                    t.clear()?;
+                    clear_terminal_for_redraw(t)?;
                 }
                 Event::Mouse(mouse) => {
                     let save_view = matches!(
@@ -29599,11 +29668,19 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     let mut spans = Vec::new();
                     push_coalesced_editor_span(&mut spans, prefix, Style::default());
                     let mut byte_offset = line_start_byte;
+                    let mut display_column = 0usize;
+                    let tab_width = s.editor_preferences.indent_width.clamp(1, 8);
                     for (col, ch) in line.graphemes(true).enumerate() {
-                        let shown = if s.editor_preferences.show_formatting_marks && ch == "\t" {
-                            "→"
+                        let tab_cells =
+                            (ch == "\t").then(|| tab_width - display_column % tab_width);
+                        let shown = if let Some(cells) = tab_cells {
+                            if s.editor_preferences.show_formatting_marks {
+                                format!("→{}", " ".repeat(cells.saturating_sub(1)))
+                            } else {
+                                " ".repeat(cells)
+                            }
                         } else {
-                            ch
+                            ch.to_owned()
                         };
                         let coordinate_selection = selection.is_some_and(|((sr, sc), (er, ec))| {
                             (row > sr || (row == sr && col >= sc))
@@ -29666,7 +29743,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                         if !s.reference_focused && row == view_cursor.0 && col == view_cursor.1 {
                             style = style.add_modifier(Modifier::REVERSED);
                         }
-                        push_coalesced_editor_span(&mut spans, shown, style);
+                        push_coalesced_editor_span(&mut spans, &shown, style);
+                        display_column += tab_cells.unwrap_or_else(|| UnicodeWidthStr::width(ch));
                         byte_offset += ch.len() as u64;
                     }
                     if !s.reference_focused
@@ -31262,12 +31340,14 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
 fn is_welcome_choice(line: &str) -> bool {
     [
         "New Project",
+        "Resume Last Project",
         "Open Project",
         "Recent Projects",
         "Import Scrivener Project",
         "Guided Tour",
         "Quick Start",
         "Skip",
+        "Don't show this again",
         "Resume Tutorial",
     ]
     .iter()
@@ -38219,6 +38299,27 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                         .cloned()
                         .unwrap_or_default();
                     match selected.split('·').next().unwrap_or_default().trim() {
+                        "Resume Last Project" => {
+                            s.mark_welcome_seen(false)?;
+                            s.help_panel = None;
+                            let last = s
+                                .recent_projects_path
+                                .as_deref()
+                                .map(load_recent_projects)
+                                .transpose()?
+                                .unwrap_or_default()
+                                .into_iter()
+                                .find(|path| {
+                                    path.join("project.toml").is_file()
+                                        && path.join("story.db").is_file()
+                                });
+                            if let Some(path) = last {
+                                s.switch_to_project(path, "Resumed the last project".into())?;
+                            } else {
+                                s.message = "There is no recent project to resume · choose Open Project or New Project".into();
+                                s.help_panel = Some(welcome_panel(false));
+                            }
+                        }
                         "New Project" => {
                             s.mark_welcome_seen(false)?;
                             s.help_panel = None;
@@ -38248,6 +38349,7 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                                 "Tutorial skipped · Help remains available from the Help menu"
                                     .into();
                         }
+                        "Don't show this again" => s.dismiss_startup_chooser_and_resume()?,
                         "Resume Tutorial" => s.resume_tutorial()?,
                         _ => {}
                     }
@@ -57444,6 +57546,18 @@ mod tests {
             panel
                 .lines
                 .iter()
+                .any(|line| line.starts_with("Resume Last Project"))
+        );
+        assert!(
+            panel
+                .lines
+                .iter()
+                .any(|line| line.starts_with("Don't show this again"))
+        );
+        assert!(
+            panel
+                .lines
+                .iter()
                 .any(|line| line.starts_with("Resume Tutorial"))
         );
         assert!(
@@ -57477,6 +57591,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         for choice in [
+            "Resume Last Project",
             "New Project",
             "Open Project",
             "Recent Projects",
@@ -57486,6 +57601,8 @@ mod tests {
         ] {
             assert!(rendered.contains(choice), "missing {choice}: {rendered}");
         }
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.help_panel.as_ref().unwrap().scroll, 1);
         assert!(state.file_browser.is_none());
 
         handle(
@@ -60002,6 +60119,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
         let mut state = AppState::new(app, default_bindings());
+        state.tutorial_preferences_path = directory.path().join("preferences/tutorial-state.json");
 
         state
             .dispatch_registered_command_id("help.show-welcome")
@@ -60009,6 +60127,11 @@ mod tests {
         assert_eq!(
             state.help_panel.as_ref().unwrap().title,
             "Welcome to Writer's IDE"
+        );
+        assert!(
+            onboarding::load(&state.tutorial_preferences_path)
+                .unwrap()
+                .startup_chooser_enabled()
         );
 
         state.help_panel = None;

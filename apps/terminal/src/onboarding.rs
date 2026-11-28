@@ -9,14 +9,37 @@ use std::{collections::BTreeSet, fs, io, path::Path};
 
 pub const PREFERENCES_VERSION: u16 = 1;
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Preferences {
     pub version: u16,
     pub welcome_seen: bool,
+    /// `None` preserves the legacy behaviour: users who had already dismissed
+    /// the welcome screen continue straight into their last project. New users
+    /// see the chooser until they explicitly opt out.
+    pub show_startup_chooser: Option<bool>,
     pub tutorial_dismissed: bool,
     pub tutorial_completed: bool,
     pub active_tutorial: Option<TutorialProgress>,
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Self {
+            version: PREFERENCES_VERSION,
+            welcome_seen: false,
+            show_startup_chooser: None,
+            tutorial_dismissed: false,
+            tutorial_completed: false,
+            active_tutorial: None,
+        }
+    }
+}
+
+impl Preferences {
+    pub fn startup_chooser_enabled(&self) -> bool {
+        self.show_startup_chooser.unwrap_or(!self.welcome_seen)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -119,6 +142,7 @@ mod tests {
         let path = directory.path().join("tutorial-state.json");
         let mut preferences = load(&path).unwrap();
         assert!(!preferences.welcome_seen);
+        assert!(preferences.startup_chooser_enabled());
         assert_eq!(preferences.version, PREFERENCES_VERSION);
         preferences.welcome_seen = true;
         preferences.active_tutorial = Some(TutorialProgress {
@@ -131,6 +155,24 @@ mod tests {
         });
         store(&path, &preferences).unwrap();
         assert_eq!(load(&path).unwrap(), preferences);
+    }
+
+    #[test]
+    fn legacy_welcome_state_and_explicit_startup_choice_are_persistent() {
+        let legacy: Preferences =
+            serde_json::from_str(r#"{"version":1,"welcome_seen":true}"#).unwrap();
+        assert!(!legacy.startup_chooser_enabled());
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("tutorial-state.json");
+        let mut preferences = legacy;
+        preferences.show_startup_chooser = Some(true);
+        store(&path, &preferences).unwrap();
+        assert!(load(&path).unwrap().startup_chooser_enabled());
+
+        preferences.show_startup_chooser = Some(false);
+        store(&path, &preferences).unwrap();
+        assert!(!load(&path).unwrap().startup_chooser_enabled());
     }
 
     #[test]
@@ -149,6 +191,7 @@ mod tests {
         let mut preferences = Preferences {
             version: PREFERENCES_VERSION,
             welcome_seen: true,
+            show_startup_chooser: None,
             tutorial_dismissed: false,
             tutorial_completed: false,
             active_tutorial: Some(TutorialProgress {

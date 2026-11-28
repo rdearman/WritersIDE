@@ -151,6 +151,121 @@ fn lock_pty_test() -> std::sync::MutexGuard<'static, ()> {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn first_run_startup_chooser_can_be_persistently_disabled_and_auto_resume_last_project() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Last Author Project");
+    let app = WriterApp::create_project(&project, "Last Author Project").unwrap();
+    drop(app);
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    for mode in ["startup-chooser", "startup-auto-resume"] {
+        let result = Command::new("python3")
+            .arg(&harness)
+            .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+            .arg("-")
+            .arg(root.path())
+            .arg(mode)
+            .env("WIDE_PTY_RECENT_PROJECT", &project)
+            .output()
+            .expect("run the startup chooser lifecycle through the production PTY");
+        assert!(
+            result.status.success(),
+            "startup workflow {mode} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn literal_tab_indentation_is_visible_in_rendered_terminal_with_formatting_marks_off_and_on() {
+    let _guard = lock_pty_test();
+    use std::fs;
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Tabbed Manuscript");
+    let mut app = WriterApp::create_project(&project, "Tabbed Manuscript").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Indented Passage", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "\tINDENTED-PROSE remains indented.")
+        .unwrap();
+    drop(app);
+    let settings = project.join(".writers-ide/editor-preferences.toml");
+    fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+
+    for (mode, marks) in [("rendered-tabs-off", false), ("rendered-tabs-on", true)] {
+        fs::write(
+            &settings,
+            format!(
+                "[editor]\nindentation = \"tabs\"\nindent_width = 4\nshow_formatting_marks = {marks}\n"
+            ),
+        )
+        .unwrap();
+        let result = Command::new("python3")
+            .arg(&harness)
+            .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+            .arg(&project)
+            .arg(root.path())
+            .arg(mode)
+            .output()
+            .expect("inspect tab indentation in the actual terminal rendering");
+        assert!(
+            result.status.success(),
+            "rendered tab workflow {mode} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    assert_eq!(
+        WriterApp::open_project(&project)
+            .unwrap()
+            .load_scene_text(scene)
+            .unwrap()
+            .0,
+        "\tINDENTED-PROSE remains indented."
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn delayed_and_missing_cursor_reports_do_not_terminate_on_workspace_resize() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Cursor Report Project");
+    let app = WriterApp::create_project(&project, "Cursor Report Project").unwrap();
+    drop(app);
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    for mode in ["cursor-timeout-delayed", "cursor-timeout-missing"] {
+        let result = Command::new("python3")
+            .arg(&harness)
+            .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+            .arg(&project)
+            .arg(root.path())
+            .arg(mode)
+            .output()
+            .expect("simulate delayed or missing cursor-position reports through a Linux PTY");
+        assert!(
+            result.status.success(),
+            "cursor-report workflow {mode} failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn named_snapshot_compare_and_selective_restore_work_through_the_production_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

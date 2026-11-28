@@ -85,6 +85,8 @@ def terminal_snapshot(data, rows, columns):
             column = 0
         elif character == "\n":
             row = min(rows - 1, row + 1)
+        elif character == "\t":
+            column = min(columns - 1, ((column // 8) + 1) * 8)
         elif character == "\b":
             column = max(0, column - 1)
         elif character >= " " and character != "\x7f" and row < rows and column < columns:
@@ -209,6 +211,12 @@ def main():
     outline_view = modes == ["outline-view"]
     search_outline_restore = modes == ["search-outline-restore"]
     editor_viewport = modes == ["editor-viewport"]
+    rendered_tabs_off = modes == ["rendered-tabs-off"]
+    rendered_tabs_on = modes == ["rendered-tabs-on"]
+    startup_chooser = modes == ["startup-chooser"]
+    startup_auto_resume = modes == ["startup-auto-resume"]
+    cursor_timeout_delayed = modes == ["cursor-timeout-delayed"]
+    cursor_timeout_missing = modes == ["cursor-timeout-missing"]
     chapter_removal = modes in (
         ["chapter-removal"],
         ["chapter-removal-target"],
@@ -248,7 +256,7 @@ def main():
                 '{"version":1,"welcome_seen":true,"tutorial_dismissed":true,'
                 '"tutorial_completed":false,"active_tutorial":null}'
             )
-    if recent_projects:
+    if recent_projects or startup_chooser or startup_auto_resume:
         recent_path = os.environ.get("WIDE_PTY_RECENT_PROJECT")
         if not recent_path:
             raise AssertionError("recent-projects PTY requires a target project path")
@@ -287,11 +295,15 @@ def main():
     set_size(master, 24, 80)
     output = bytearray()
     cursor_query_offset = 0
+    delayed_cursor_replies = []
 
     def read_for(seconds):
         nonlocal cursor_query_offset
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
+            if delayed_cursor_replies and delayed_cursor_replies[0] <= time.monotonic():
+                delayed_cursor_replies.pop(0)
+                os.write(master, b"\x1b[1;1R")
             ready, _, _ = select.select(
                 [master], [], [], max(0, deadline - time.monotonic())
             )
@@ -309,7 +321,10 @@ def main():
                 cursor_query_offset = query + 4
                 # Some terminal libraries ask the terminal to report its
                 # cursor location. A real emulator replies to this request.
-                os.write(master, b"\x1b[1;1R")
+                if cursor_timeout_delayed:
+                    delayed_cursor_replies.append(time.monotonic() + 2.3)
+                elif not cursor_timeout_missing:
+                    os.write(master, b"\x1b[1;1R")
 
     def wait_for(marker, start=0, timeout=5.0):
         deadline = time.monotonic() + timeout
@@ -676,6 +691,102 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit after saving the scrolled edit")
             print("PTY editor viewport passed: cursor-following, resize and saved insertion work in a long manuscript.")
+            return
+        if rendered_tabs_off or rendered_tabs_on:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")
+            if not wait_for_workspace_title("Editor", timeout=5.0):
+                raise AssertionError("tab-rendering fixture did not open in the manuscript editor")
+            rows = terminal_snapshot(output, 24, 80)
+            manuscript_row = next((row for row in rows if "INDENTED-PROSE" in row), None)
+            if manuscript_row is None:
+                raise AssertionError("literal-tab manuscript line was absent from rendered terminal output: " + repr(rows))
+            marker = manuscript_row.find(">")
+            text_position = manuscript_row.index("INDENTED-PROSE")
+            visual_indent = text_position - marker - 2
+            if visual_indent != 4:
+                raise AssertionError(f"tab indentation rendered as {visual_indent} columns, expected 4: {manuscript_row!r}")
+            arrow_position = manuscript_row.find("→")
+            if rendered_tabs_on and arrow_position < 0:
+                raise AssertionError("Reveal Codes enabled but the tab mark was not rendered")
+            if rendered_tabs_off and arrow_position >= 0:
+                raise AssertionError("Reveal Codes disabled but a tab mark leaked into rendered prose")
+            if arrow_position >= 0 and manuscript_row.index("INDENTED-PROSE") - arrow_position != 4:
+                raise AssertionError("Reveal Codes changed the tab's rendered display columns")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after rendered-tab verification")
+            print("PTY rendered tab check passed: literal tabs occupy four stable display columns with formatting marks off/on.")
+            return
+        if startup_chooser:
+            if not wait_for_screen_fragments((b"Welcome to Writer's IDE", b"Resume Last Project", b"New Project", b"Don't show this again"), timeout=5.0):
+                raise AssertionError("new-user startup chooser did not present the project actions")
+            for _ in range(8):
+                os.write(master, b"\x1b[B")
+                read_for(0.03)
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Startup chooser disabled",), timeout=5.0):
+                raise AssertionError("the persistent startup opt-out did not resume the last project")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit after startup chooser preference was saved")
+            print("PTY startup chooser passed: first-run choices are visible and opting out resumes the last project.")
+            return
+        if startup_auto_resume:
+            read_for(0.4)
+            rows = terminal_snapshot(output, 24, 80)
+            if any("Welcome to Writer's IDE" in row for row in rows):
+                raise AssertionError("the persisted chooser opt-out was not honoured on the next launch")
+            if not any("Outline" in row for row in rows):
+                raise AssertionError("auto-resume did not open the recent project workspace: " + repr(rows))
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit after auto-resuming the previous project")
+            print("PTY auto-resume passed: a persisted opt-out opens the last project without the chooser.")
+            return
+        if cursor_timeout_delayed or cursor_timeout_missing:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")
+            if not wait_for_screen_fragments((b"Included", b"No scenes yet"), timeout=5.0):
+                raise AssertionError("cursor-timeout fixture did not reach the normal authoring workspace: " + repr(terminal_snapshot(output, 24, 80)))
+            query_start = len(output)
+            set_size(master, 30, 100)
+            read_for(2.6 if cursor_timeout_delayed else 2.2)
+            finished_pid, _ = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != 0:
+                raise AssertionError("terminal resize caused WIDE to exit while handling cursor-report behavior")
+            if b"\x1b[6n" in output[query_start:]:
+                raise AssertionError("screen transition issued a cursor-position query that can time out")
+            if not any("Included" in row for row in terminal_snapshot(output, 30, 100)):
+                raise AssertionError("authoring workspace did not remain visible after terminal resize")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit after cursor-report regression verification")
+            print("PTY cursor-report check passed: delayed/missing terminal replies cannot block or terminate screen resize.")
             return
         if backup_archive:
             start = len(output)
@@ -1373,8 +1484,8 @@ def main():
                 (b"Welcome to Writer's IDE", b"Guided Tour", b"Quick Start"), timeout=10.0
             ):
                 raise AssertionError("first-run welcome did not present the tutorial choices")
-            # New Project, Open Project, Recent Projects, Import, Guided Tour.
-            os.write(master, b"\x1b[B" * 4 + b"\r")
+            # Resume Last Project, New, Open, Recent, Import, Guided Tour.
+            os.write(master, b"\x1b[B" * 5 + b"\r")
             if not wait_for_screen_fragments(
                 (b"Tutorial", b"1/6", b"Press Ctrl+/ to open the menu"), timeout=10.0
             ):

@@ -2975,12 +2975,31 @@ unchanged. The existing production PTY custom-correction regression also
 passed. Targeted terminal Clippy with warnings denied and formatting passed.
 Human UAT remains open.
 
-The complete terminal package suite passed after these authoring changes:
-384 unit tests, 3 end-to-end author workflows, and 51 production PTY tests
-passed; 1 private arrow-making import PTY test was skipped because its local
-fixture path was not configured. The package was run offline. Formatting,
-terminal Clippy with warnings denied, and `git diff --check` passed at the
-custom-status checkpoint.
+### UAT 47 corrections — 28 November 2026
+
+Restored the first-run Welcome chooser for users with an explicit project
+launch, while explicit launch still opens the requested project underneath.
+Users can persistently disable the chooser and resume the last valid recent
+project; Help can restore it. The editor now visibly expands literal tabs to
+the configured tab stops in both formatting-mark states without changing
+saved manuscript text. Resize redraws no longer request a terminal cursor
+position, avoiding CPR timeouts; delayed and missing CPR replies were exercised
+through the production PTY.
+
+Verification: `cargo fmt --all -- --check`,
+`cargo clippy --offline --workspace --all-targets -- -D warnings`,
+`git diff --check`, and `cargo test --offline --workspace -- --test-threads=1`
+passed. The full run included 390 terminal unit tests, 3 author workflow tests,
+and 62 PTY tests; the protected private-corpus PTY remained skipped because its
+opt-in fixture path was not configured. The non-serial PTY suite had one
+transient same-chapter navigation failure under contention; it passed both in
+isolation and in the serial full run. Human acceptance is pending.
+
+### Alpha UAT 47 checkpoint notes — superseded 28 November 2026
+
+The implementation and verification state above supersede the earlier
+checkpoint totals in this section. No Alpha UAT 47 bundle is being replaced;
+the next frozen bundle will contain these tested changes.
 
 ### Frozen Alpha UAT 43 — 28 November 2026
 
