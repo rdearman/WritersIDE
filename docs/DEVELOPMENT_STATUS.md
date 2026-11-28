@@ -2821,9 +2821,9 @@ outline conversion and bulk insertion, custom status assignment, spelling
 suggestions, selected-text thesaurus replacement, save/reopen and publishing.
 The release binary was launched in an 80×24 PTY, displayed the bundled sample
 workspace and exited cleanly. `sha256sum -c SHA256SUMS` passed for the binary,
-launcher, manifest, checklist and disposable sample projects. Alpha UAT 42
-remains frozen at `dac9c35`; Alpha UAT 41 was removed so only UAT 42 and UAT 43
-remain. Human acceptance remains pending.
+launcher, manifest, checklist and disposable sample projects. At generation,
+UAT 42 and UAT 43 were retained; UAT 42 was later removed when UAT 44 was
+packaged, leaving only UAT 43 and UAT 44. Human acceptance remains pending.
 
 Workspace verification: formatting and workspace Clippy with warnings denied
 passed. The first offline workspace test run was blocked by the sandbox's
@@ -2851,3 +2851,20 @@ same-document occurrences, corrected the second, saved/reopened, and verified
 the ignored prose and a different scene were unchanged. The focused state test,
 PTY, terminal Clippy, formatting and diff checks passed. Human UAT remains
 open.
+
+### Frozen Alpha UAT 44 — 28 November 2026
+
+Alpha UAT 44 is at `test-builds/alpha-uat-44-e92f21e/`, frozen from
+`e92f21ebf1f5ddeef5a7ed99f6aa04b133dace61`. Launch from the repository root:
+
+```sh
+cd test-builds/alpha-uat-44-e92f21e
+./run.sh "The Glassmaker's Compass"
+```
+
+The checklist includes the new Ignore Once proofreading action. The bundled
+release binary launched the synthetic sample in an 80×24 PTY and exited
+cleanly; its checksum manifest passed. Only Alpha UAT 43 and 44 are retained.
+The Ignore Once state and production PTY tests passed, but a complete workspace
+test run has not yet passed cleanly in aggregate; see the verification note
+above. Human acceptance remains pending.
