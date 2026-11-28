@@ -2764,7 +2764,7 @@ fn command_registry() -> Vec<CommandSpec> {
             "Choose a planning field for the selected scene",
             "Edit",
             "scene-field",
-            true,
+            false,
         ),
         legacy_command(
             "search.find-panel",
@@ -18785,10 +18785,6 @@ impl AppState {
             None => self.message = "Select an outline item to rename".into(),
         }
         Ok(())
-    }
-
-    fn start_scene_synopsis(&mut self) {
-        self.start_scene_planning_edit('Y', "synopsis");
     }
 
     fn open_scene_planning_field_picker(&mut self) {
@@ -37249,7 +37245,7 @@ fn begin_command_arguments(
         return s.start_scene_move();
     }
     if command.id == "scene.field" {
-        s.start_scene_synopsis();
+        s.open_scene_planning_field_picker();
         return Ok(());
     }
     s.prompt_for_registered_command(command)
@@ -50698,6 +50694,34 @@ mod tests {
             .filter_map(|(id, _, _)| *id)
             .collect::<Vec<_>>();
         assert_eq!(visible_order, scene_card_ids(&state));
+    }
+
+    #[test]
+    fn scene_planning_editor_is_reachable_from_search_all_commands_without_arguments() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.workspace = Workspace::Outline;
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| *row == OutlineRow::Scene(scene))
+            .unwrap();
+        state.open_command_palette(false);
+        state.command_palette.as_mut().unwrap().query = "Edit Scene Planning".into();
+        state.command_palette.as_mut().unwrap().selected = 0;
+        handle_command_palette_key(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(
+            state.help_panel.as_ref().map(|panel| panel.title.as_str()),
+            Some("Edit Scene Planning Field")
+        );
+        assert!(state.mode.is_none());
     }
 
     #[test]

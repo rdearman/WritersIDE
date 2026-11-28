@@ -6,12 +6,14 @@ The unified Outline's selected-item pane now shows a selected scene's current
 status, publication inclusion, actual/planned word counts, synopsis, purpose,
 goal and outcome. Outline → **Edit Scene Planning…** presents a keyboard
 selector for those four planning fields and opens an editor labelled with the
-selected scene and field; no scene UUID or command syntax is needed. Metadata
-updates remain transactional and are verified after closing and reopening.
+selected scene and field; it is available from the Outline menu and Search All
+Commands, with no scene UUID or command syntax. Metadata updates remain
+transactional and are verified after closing and reopening.
 
 Verification after this change: formatting, the outline presentation test,
 the production PTY metadata-edit/save/reopen workflow, and warnings-denied
-workspace Clippy passed. The immediately preceding full offline workspace run
+workspace Clippy passed. Search All Commands dispatch and the chooser path are
+also covered by a focused unit regression. The immediately preceding full offline workspace run
 passed with 388 terminal unit tests, 3 end-to-end author workflows and 58
 production PTY tests; one protected private-corpus PTY was skipped because its
 local fixture path was unset. The workspace test run preceded this metadata
