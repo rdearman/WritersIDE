@@ -3011,10 +3011,14 @@ full interactive workspace instead of returning “that view cannot be opened in
 a manuscript window yet”. It carries the referenced scene selection into the
 outline when possible. A scene reference in a multi-pane layout can be promoted
 to an editable scene editor in that focused pane, preserving its pane identity
-and layout. Focused terminal state tests passed; production PTY coverage for
-these new transitions and full per-pane independent view state remain
-outstanding. This is partial progress on U47-08/09/11, not completion of the
-pane acceptance criteria.
+and layout. State tests and the full workspace test suite passed after this
+change: 392 terminal unit tests, 3 author-workflow tests, and 63 production PTY
+tests passed (one protected-corpus PTY test skipped because
+`WIDE_PRIVATE_ARROWMAKING_PROJECT` was unset); all other workspace and doc tests
+passed. Workspace Clippy with warnings denied and formatting checks passed.
+The new transitions still lack a dedicated PTY scenario, and full per-pane
+independent view state remains outstanding. This is partial progress on
+U47-08/09/11, not completion of the pane acceptance criteria.
 
 ### UAT 47 corrections — 28 November 2026
 
