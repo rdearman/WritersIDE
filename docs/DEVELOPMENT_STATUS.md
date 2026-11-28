@@ -2804,3 +2804,23 @@ passed; 1 private arrow-making import PTY test was skipped because its local
 fixture path was not configured. The package was run offline. Formatting,
 terminal Clippy with warnings denied, and `git diff --check` passed at the
 custom-status checkpoint.
+
+### Frozen Alpha UAT 43 — 28 November 2026
+
+The current authoring fixes are packaged at
+`test-builds/alpha-uat-43-c2bc4d0/`, frozen from
+`c2bc4d05aa388b7867795bbc0a943d1b94b9ad0f`. Launch from the repository root:
+
+```sh
+cd test-builds/alpha-uat-43-c2bc4d0
+./run.sh "The Glassmaker's Compass"
+```
+
+`UAT-CHECKLIST.md` covers cross-document and external-file clipboard use,
+outline conversion and bulk insertion, custom status assignment, spelling
+suggestions, selected-text thesaurus replacement, save/reopen and publishing.
+The release binary was launched in an 80×24 PTY, displayed the bundled sample
+workspace and exited cleanly. `sha256sum -c SHA256SUMS` passed for the binary,
+launcher, manifest, checklist and disposable sample projects. Alpha UAT 42
+remains frozen at `dac9c35`; Alpha UAT 41 was removed so only UAT 42 and UAT 43
+remain. Human acceptance remains pending.
