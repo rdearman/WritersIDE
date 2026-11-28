@@ -190,7 +190,8 @@ def main():
     find_replace_focus = modes == ["find-replace-focus"]
     review_thesaurus = modes == ["review-thesaurus"]
     review_menu = modes in (["review-menu"], ["review-thesaurus"])
-    review_spellcheck_current = modes == ["spellcheck-current"]
+    review_spellcheck_suggestions = modes == ["spellcheck-suggestions"]
+    review_spellcheck_current = modes in (["spellcheck-current"], ["spellcheck-suggestions"])
     review_proofread = modes == ["review-proofread"]
     removed_scenes = modes == ["removed-scenes"]
     outline_view = modes == ["outline-view"]
@@ -1224,7 +1225,8 @@ def main():
             read_for(0.2)
             select_visible_menu_item("Spell Check")
             os.write(master, b"\r")
-            if not wait_for_screen_fragments((b"Spell Check", b"Arrival", b"en-GB", b"Baad", b"line 41, column 1"), menu_start, timeout=5.0):
+            expected_location = b"line 1, column 1" if review_spellcheck_suggestions else b"line 41, column 1"
+            if not wait_for_screen_fragments((b"Spell Check", b"Arrival", b"en-GB", b"Baad", expected_location), menu_start, timeout=5.0):
                 raise AssertionError(
                     "Spell Check did not show results for the open document; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
@@ -1232,12 +1234,20 @@ def main():
             screen = "\n".join(terminal_snapshot(output, 24, 80))
             if "Wrng" in screen:
                 raise AssertionError("Spell Check included a different scene instead of the current document")
-            os.write(master, b"r")  # enter an author-chosen correction
-            if not wait_for_screen_fragments((b"Replace", b"Baad"), timeout=3.0):
-                raise AssertionError("custom spelling correction dialogue was not shown")
-            os.write(master, b"Bad\r")
-            if not wait_for_screen_fragments((b"Changed 'Baad' to 'Bad'", b"Undo available"), timeout=3.0):
-                raise AssertionError("custom spelling correction was not applied")
+            if review_spellcheck_suggestions:
+                os.write(master, b"s")
+                if not wait_for_screen_fragments((b"Spelling Suggestions", b"bad", b"bead"), timeout=3.0):
+                    raise AssertionError("suggestion selector did not display multiple spelling candidates")
+                os.write(master, b"\x1b[B\r")  # choose and apply the second suggestion
+                if not wait_for_screen_fragments((b"Changed 'Baad' to 'bead'", b"Undo available"), timeout=3.0):
+                    raise AssertionError("selected non-first spelling suggestion was not applied")
+            else:
+                os.write(master, b"r")  # enter an author-chosen correction
+                if not wait_for_screen_fragments((b"Replace", b"Baad"), timeout=3.0):
+                    raise AssertionError("custom spelling correction dialogue was not shown")
+                os.write(master, b"Bad\r")
+                if not wait_for_screen_fragments((b"Changed 'Baad' to 'Bad'", b"Undo available"), timeout=3.0):
+                    raise AssertionError("custom spelling correction was not applied")
             os.write(master, b"\x13")  # save
             if not wait_for_screen_fragments((b"Saved at",), timeout=3.0):
                 raise AssertionError("corrected manuscript text was not saved")
@@ -1250,7 +1260,7 @@ def main():
                 finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after current-document Spell Check")
-            print("PTY Spell Check passed: Review checks only the open document and leaves its prose unchanged.")
+            print("PTY Spell Check passed: selected correction was applied, saved and kept within the open document.")
             return
 
         if review_proofread:

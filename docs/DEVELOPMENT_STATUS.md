@@ -2790,7 +2790,8 @@ Spell Check now offers `S` to open an author-facing suggestion selector. Up/Down
 chooses among local Aspell candidates, Enter applies the selected correction,
 and Esc cancels. The chosen replacement follows the existing source/range
 validation, undo and save path; `C` remains the quick accept-first action and
-`R` remains custom replacement. A focused persistence test selected a
-non-first suggestion and reopened the project; the existing production PTY
-custom-correction regression passed. Targeted terminal Clippy with warnings
-denied and formatting passed. Human UAT remains open.
+`R` remains custom replacement. A production Linux PTY selected a non-first
+suggestion, saved it, reopened the project and verified another document stayed
+unchanged. The existing production PTY custom-correction regression also
+passed. Targeted terminal Clippy with warnings denied and formatting passed.
+Human UAT remains open.
