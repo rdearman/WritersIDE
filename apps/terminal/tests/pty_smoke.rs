@@ -2157,6 +2157,56 @@ fn split_panes_keep_independent_scroll_positions_through_the_real_view_menu() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn last_scene_cards_pane_can_return_to_interactive_outline_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Last Scene Cards Pane");
+    let mut app = WriterApp::create_project(&project, "Last Scene Cards Pane").unwrap();
+    let chapter = app.create_chapter(None, "Chapter Six", 0).unwrap();
+    let scene = app.create_scene(chapter, "Harbour", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "PANE-LINE-00\nThe harbour was quiet.")
+        .unwrap();
+    drop(app);
+
+    if Command::new("python3").arg("--version").output().is_err() {
+        eprintln!("skipping Linux PTY pane-recovery workflow: python3 is unavailable");
+        return;
+    }
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path().join("isolated-home"))
+        .arg("last-scene-card-pane")
+        .output()
+        .expect("run the Linux PTY last-pane recovery workflow");
+    assert!(
+        result.status.success(),
+        "PTY last-pane recovery failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "PANE-LINE-00\nThe harbour was quiet."
+    );
+    assert!(
+        reopened
+            .list_structural_nodes()
+            .unwrap()
+            .iter()
+            .any(|node| node.title == "Chapter Six")
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn window_prefix_received_during_startup_does_not_raise_sigquit() {
     let _guard = lock_pty_test();
     use std::process::Command;

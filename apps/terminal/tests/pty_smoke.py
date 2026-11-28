@@ -209,6 +209,7 @@ def main():
     review_proofread = modes == ["review-proofread"]
     removed_scenes = modes == ["removed-scenes"]
     outline_view = modes == ["outline-view"]
+    last_scene_card_pane = modes == ["last-scene-card-pane"]
     search_outline_restore = modes == ["search-outline-restore"]
     editor_viewport = modes == ["editor-viewport"]
     rendered_tabs_off = modes == ["rendered-tabs-off"]
@@ -848,7 +849,10 @@ def main():
                 raise AssertionError("the test manuscript did not open in the writing workspace")
 
             snapshot_start = len(output)
-            os.write(master, b"\x10snapshot Before revision test\r")
+            os.write(master, b"\x10")  # wait for the palette before sending its query
+            if not wait_for_screen_fragments((b"Command Palette",), snapshot_start, timeout=2.0):
+                raise AssertionError("the command palette did not open before the snapshot query")
+            os.write(master, b"snapshot Before revision test\r")
             if not wait_for_screen_fragments((b"Snapshot created:",), snapshot_start, timeout=4.0):
                 raise AssertionError(
                     "the author-facing command palette did not confirm the named snapshot; screen: "
@@ -1738,6 +1742,94 @@ def main():
                 raise AssertionError("application did not exit after the heading rename")
             print("PTY heading rename passed: Outline menu saved a prefilled section or chapter heading.")
             return
+        if last_scene_card_pane:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")
+            if not wait_for_screen_fragments((b"PANE-LINE-00",), timeout=5.0):
+                raise AssertionError("opening scene was not visible before pane recovery test")
+
+            start = len(output)
+            os.write(master, b"\x1b[21~")  # F10, then View menu
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 4)
+            if not wait_for_screen_fragments((b"Split Side by Side",), start, timeout=2.0):
+                raise AssertionError("single-pane View menu did not offer Split Side by Side")
+            select_visible_menu_item("Split Side by Side")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Split side by side",), start, timeout=3.0):
+                raise AssertionError("View menu did not create the second pane")
+
+            start = len(output)
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 4)
+            if not wait_for_screen_fragments((b"Show Scene Cards",), start, timeout=2.0):
+                raise AssertionError("focused pane could not choose Scene Cards")
+            select_visible_menu_item("Show Scene Cards")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Scene Cards", b"Harbour"), start, timeout=3.0):
+                raise AssertionError("scene-card view did not appear in the focused pane")
+
+            # Keep only the Scene Cards pane, reproducing U47-11. The remaining
+            # view must offer a named route back to the interactive outline.
+            start = len(output)
+            os.write(master, b"\x1c")  # Ctrl+Backslash is the prefix alone.
+            if not wait_for_screen_fragments((b"Window prefix",), start, timeout=2.0):
+                raise AssertionError("window-management prefix did not activate before pane 1")
+            os.write(master, b"1")  # independent second event, never a literal plus
+            if not wait_for_screen_fragments((b"Focused pane 1",), start, timeout=2.0):
+                raise AssertionError("Ctrl+Backslash then 1 did not focus pane 1")
+            start = len(output)
+            os.write(master, b"\x1c")
+            if not wait_for_screen_fragments((b"Window prefix",), start, timeout=2.0):
+                raise AssertionError("window-management prefix did not activate before close")
+            os.write(master, b"x")
+            if not wait_for_screen_fragments((b"Window closed",), start, timeout=3.0):
+                raise AssertionError("could not close pane 1 and leave Scene Cards open")
+
+            start = len(output)
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            os.write(master, b"\x1b[C" * 4)
+            if not wait_for_screen_fragments((b"Switch View",), start, timeout=2.0):
+                raise AssertionError("lone Scene Cards pane did not offer Switch View")
+            select_visible_menu_item("Switch View…")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Switch View >",), start, timeout=2.0):
+                raise AssertionError(
+                    "Switch View did not open the view selector; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"Outline\r")
+            if not wait_for_workspace_title("Outline", timeout=3.0):
+                raise AssertionError(
+                    "lone Scene Cards pane could not return to full Outline; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            outline_menu = open_outline_menu()
+            if not wait_for_screen_fragments((b"New Chapter",), outline_menu, timeout=2.0):
+                raise AssertionError("recovered Outline was not an interactive manuscript outliner")
+            os.write(master, b"\x1b")
+            read_for(0.3)
+            if any("Outline · actions" in row for row in terminal_snapshot(output, 24, 80)):
+                os.write(master, b"\x1b")
+                read_for(0.3)
+            os.write(master, b"\x11")
+            read_for(0.3)
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError(
+                    "application did not exit after recovering its only Scene Cards pane; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            print("PTY U47-11 recovery passed: the last Scene Cards pane switches back to the interactive Outline.")
+            return
+
         if outline_view:
             os.write(master, b"\x1b")  # dismiss first-run welcome
             read_for(0.25)

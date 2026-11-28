@@ -3016,9 +3016,16 @@ change: 392 terminal unit tests, 3 author-workflow tests, and 63 production PTY
 tests passed (one protected-corpus PTY test skipped because
 `WIDE_PRIVATE_ARROWMAKING_PROJECT` was unset); all other workspace and doc tests
 passed. Workspace Clippy with warnings denied and formatting checks passed.
-The new transitions still lack a dedicated PTY scenario, and full per-pane
-independent view state remains outstanding. This is partial progress on
-U47-08/09/11, not completion of the pane acceptance criteria.
+A production PTY regression now follows the U47-11 path: split from View,
+switch the second pane to Scene Cards, close the first pane, return through
+Switch View to the full Outline, and verify the Outline menu is active. The
+focused test passes. The first 65-test PTY rerun had one intermittent failure
+in the existing snapshot scenario because its harness sent the palette query
+before confirming that the palette had opened; the harness now waits for the
+palette and both that test and the new pane recovery test pass individually.
+The full 65-test PTY rerun is pending. Full per-pane independent view state
+remains outstanding. This is partial progress on U47-08/09/11, not completion
+of the pane acceptance criteria.
 
 ### UAT 47 corrections — 28 November 2026
 
