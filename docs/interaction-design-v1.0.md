@@ -58,6 +58,8 @@ KEY-04: One typed command registry and dispatch path for menu, palette, shortcut
 
 KEY-05: Traditional terminal baseline, optional enhanced keyboard protocols. Audit Ctrl+I/Tab, Ctrl+M/Enter, Ctrl+H/Backspace, Alt/Escape sequences, modifier/function-key limitations, Ctrl+S flow control, SSH/tmux interception. Every essential action has a reliable fallback. Mouse optional with full keyboard parity.
 
+KEY-09 (issue #62 navigation-history contract): Navigate exposes Return to Previous Position and Return to Next Position as paired history actions. They restore the manuscript document and cursor position left by the opposite action. An empty history boundary reports a concise, non-fatal message and preserves focus, cursor and unsaved text. History movement requires a clean editor buffer; the author must save before switching documents, and a missing or ambiguous passage leaves the current document unchanged.
+
 ## 6. Menus (MENU) — supersedes rejected cascading proposal
 
 MENU-01: Persistent conventional root menus File, Edit, Insert, Format, Navigate, View, Tools, Help. Add dynamic context-specific root menus based on focused pane: Outline, Scenes, Timeline, Characters, Research, Diagnostics and equivalent relevant views. Focus, not mere pane visibility, determines context. Preserve originating context while menu is open.

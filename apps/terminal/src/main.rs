@@ -398,6 +398,7 @@ struct AppState {
     history: Vec<Workspace>,
     history_index: usize,
     location_history: Vec<EditorBookmark>,
+    forward_location_history: Vec<EditorBookmark>,
     width: usize,
     editor_viewport_width: usize,
     editor_viewport_height: usize,
@@ -1237,6 +1238,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "view.reading",
         "scene.open",
         "search.return-position",
+        "search.next-position",
     ],
     &[
         "view.cards",
@@ -1758,6 +1760,12 @@ struct EditorBookmark {
     scene_id: SceneId,
     offset: usize,
     quote: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResolvedEditorBookmark {
+    scene_id: SceneId,
+    cursor: (usize, usize),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -2817,9 +2825,17 @@ fn command_registry() -> Vec<CommandSpec> {
         legacy_command(
             "search.return-position",
             "Return to Previous Position",
-            "Return to the editor location before the last symbol jump",
+            "Return to the editor location before the last manuscript jump",
             "Navigate",
             "return-position",
+            false,
+        ),
+        legacy_command(
+            "search.next-position",
+            "Return to Next Position",
+            "Return to the manuscript location left by Return to Previous Position",
+            "Navigate",
+            "next-position",
             false,
         ),
         legacy_command(
@@ -8510,6 +8526,7 @@ impl AppState {
             history: vec![Workspace::Dashboard],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 80,
             editor_viewport_width: 78,
             editor_viewport_height: 18,
@@ -12930,36 +12947,37 @@ impl AppState {
         if self.dirty {
             return;
         }
-        let Some(scene_id) = self.editing_scene else {
+        let Some(bookmark) = self.editor_bookmark_at_cursor() else {
             return;
         };
+        self.location_history.push(bookmark);
+        self.forward_location_history.clear();
+    }
+    fn editor_bookmark_at_cursor(&self) -> Option<EditorBookmark> {
+        let scene_id = self.editing_scene?;
         let offset = editor_position_byte(&self.editor, self.cursor.0, self.cursor.1);
         let text = self.editor.join("\n");
         let line_end = text[offset..]
             .find('\n')
             .map_or(text.len(), |position| offset + position);
-        let quote = text[offset..line_end].to_owned();
-        self.location_history.push(EditorBookmark {
+        Some(EditorBookmark {
             scene_id,
             offset,
-            quote,
-        });
+            quote: text[offset..line_end].to_owned(),
+        })
     }
-    fn return_to_previous_location(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let Some(location) = self.location_history.last().cloned() else {
-            self.message = "No previous manuscript position".into();
-            return Ok(());
-        };
-        if self.dirty {
-            self.message =
-                "Save the current manuscript before returning to the previous position".into();
-            return Ok(());
-        }
+    fn resolve_editor_bookmark(
+        &mut self,
+        location: &EditorBookmark,
+        direction: &str,
+    ) -> Result<Option<ResolvedEditorBookmark>, Box<dyn std::error::Error>> {
         let (text, _) = self.app.load_scene_text(location.scene_id)?;
         let offset = if location.quote.is_empty() {
             if location.offset > text.len() || !text.is_char_boundary(location.offset) {
-                self.message = "Previous position no longer exists in the source scene".into();
-                return Ok(());
+                self.message = format!(
+                    "{direction} position no longer exists in the source scene; content was left unchanged"
+                );
+                return Ok(None);
             }
             Some(location.offset)
         } else {
@@ -12972,25 +12990,70 @@ impl AppState {
                     occurrences.next().is_none().then_some(first)
                 })
                 .or_else(|| {
-                    self.message =
-                        "Previous passage is missing or ambiguous; source was left unchanged"
-                            .into();
+                    self.message = format!(
+                        "{direction} passage is missing or ambiguous; source was left unchanged"
+                    );
                     None
                 })
         };
         let Some(offset) = offset else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(cursor) = editor_position_from_byte(&text, offset) else {
-            self.message =
-                "Previous position is not a valid editor boundary; source was left unchanged"
-                    .into();
+            self.message = format!(
+                "{direction} position is not a valid editor boundary; source was left unchanged"
+            );
+            return Ok(None);
+        };
+        Ok(Some(ResolvedEditorBookmark {
+            scene_id: location.scene_id,
+            cursor,
+        }))
+    }
+    fn return_to_previous_location(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(location) = self.location_history.last().cloned() else {
+            self.message = "No previous manuscript position".into();
             return Ok(());
         };
-        self.open_scene(location.scene_id)?;
-        self.cursor = cursor;
+        if self.dirty {
+            self.message =
+                "Save the current manuscript before returning to the previous position".into();
+            return Ok(());
+        }
+        let Some(resolved) = self.resolve_editor_bookmark(&location, "Previous")? else {
+            return Ok(());
+        };
+        let current = self.editor_bookmark_at_cursor();
+        self.open_scene(resolved.scene_id)?;
+        self.cursor = resolved.cursor;
         self.location_history.pop();
+        if let Some(current) = current {
+            self.forward_location_history.push(current);
+        }
         self.message = "Returned to the previous manuscript position".into();
+        Ok(())
+    }
+    fn return_to_next_location(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(location) = self.forward_location_history.last().cloned() else {
+            self.message = "No next manuscript position".into();
+            return Ok(());
+        };
+        if self.dirty {
+            self.message =
+                "Save the current manuscript before returning to the next position".into();
+            return Ok(());
+        }
+        let Some(resolved) = self.resolve_editor_bookmark(&location, "Next")? else {
+            return Ok(());
+        };
+        let current = self.editor_bookmark_at_cursor();
+        self.open_scene(resolved.scene_id)?;
+        self.cursor = resolved.cursor;
+        self.forward_location_history.pop();
+        if let Some(current) = current {
+            self.location_history.push(current);
+        }
+        self.message = "Returned to the next manuscript position".into();
         Ok(())
     }
     fn step_replace_preview_match(&mut self, forward: bool) {
@@ -25203,6 +25266,8 @@ impl AppState {
             );
         } else if cmd == "return-position" {
             self.return_to_previous_location()?;
+        } else if cmd == "next-position" {
+            self.return_to_next_location()?;
         } else if cmd == "replace-next" {
             self.replace_next_in_current_scene()?;
         } else if let Some(rest) = cmd.strip_prefix("find ") {
@@ -47095,6 +47160,7 @@ mod tests {
             history: vec![Workspace::Editor],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -49539,6 +49605,51 @@ mod tests {
     }
 
     #[test]
+    fn previous_and_next_manuscript_positions_form_a_safe_bidirectional_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+        let first = app.create_scene(chapter, "The Station", 0).unwrap();
+        let second = app.create_scene(chapter, "The Market", 1).unwrap();
+        for (scene, text) in [
+            (first, "Thomas waits beside the station clock."),
+            (second, "A unique lantern-marker glows above the market."),
+        ] {
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), text).unwrap();
+        }
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(first).unwrap();
+        state.cursor = (0, 5);
+
+        state.return_to_next_location().unwrap();
+        assert_eq!(state.message, "No next manuscript position");
+        assert_eq!(state.editing_scene, Some(first));
+        assert_eq!(state.cursor, (0, 5));
+
+        state
+            .run_named_text_search("lantern-marker", "all")
+            .unwrap();
+        assert_eq!(state.editing_scene, Some(second));
+        assert_eq!(state.location_history.len(), 1);
+        state.find_panel = None;
+        state.return_to_previous_location().unwrap();
+        assert_eq!(state.editing_scene, Some(first));
+        assert_eq!(state.cursor, (0, 5));
+        assert_eq!(state.forward_location_history.len(), 1);
+
+        state.return_to_next_location().unwrap();
+        assert_eq!(state.editing_scene, Some(second));
+        assert_eq!(state.forward_location_history.len(), 0);
+        assert_eq!(state.location_history.len(), 1);
+
+        state.return_to_previous_location().unwrap();
+        assert_eq!(state.editing_scene, Some(first));
+        assert!(state.forward_location_history.len() == 1);
+        assert_eq!(state.location_history.len(), 0);
+    }
+
+    #[test]
     fn refs_search_reports_raw_text_matches_without_claiming_presence() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -51106,6 +51217,7 @@ mod tests {
             history: vec![Workspace::Editor],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -51281,6 +51393,7 @@ mod tests {
             history: vec![Workspace::Editor],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -51564,6 +51677,7 @@ mod tests {
             history: vec![Workspace::Editor],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -51743,6 +51857,7 @@ mod tests {
             history: vec![Workspace::Outline],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -52072,6 +52187,7 @@ mod tests {
             history: vec![Workspace::Dashboard],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -52251,6 +52367,7 @@ mod tests {
             history: vec![Workspace::Outline],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -54125,6 +54242,7 @@ mod tests {
             history: vec![Workspace::Revisions],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 100,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -54521,6 +54639,7 @@ mod tests {
             history: vec![Workspace::Reading],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -56164,6 +56283,7 @@ mod tests {
             history: vec![Workspace::Search],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -56354,6 +56474,7 @@ mod tests {
             history: vec![Workspace::Search],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),
@@ -56596,6 +56717,7 @@ mod tests {
             history: vec![Workspace::Outline],
             history_index: 0,
             location_history: Vec::new(),
+            forward_location_history: Vec::new(),
             width: 80,
             editor_focus_mode: false,
             horizontal_split_ratio: default_split_ratio(),

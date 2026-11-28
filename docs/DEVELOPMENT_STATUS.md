@@ -1,5 +1,23 @@
 # Writer's IDE Development Status
 
+## Bidirectional manuscript position history — 28 November 2026
+
+Navigate now provides paired **Return to Previous Position** and **Return to
+Next Position** actions. Each restores the document and cursor left by the
+opposite action. New jumps clear forward history; a missing or ambiguous
+passage leaves the current content unchanged. Dirty buffers require an explicit
+save before a history move. Empty boundaries remain non-fatal and preserve
+unsaved text. The production PTY journey verifies search across two scenes,
+previous/next round trips through menu and shortcut paths, empty-boundary
+feedback, save and reopen.
+
+Verification: formatting, warnings-denied workspace Clippy, all workspace unit
+and integration suites, and the 57-case terminal PTY suite. The workspace run
+showed two transient PTY failures (chapter creation and empty previous history);
+both passed individually, and a complete serial PTY rerun passed (56 passed,
+one protected private-corpus test intentionally ignored). The private fixture
+was not enabled. Human UAT for #62 remains open.
+
 ## Previous Position boundary coverage — 28 November 2026
 
 Added a production Linux PTY journey for populated navigation history: search

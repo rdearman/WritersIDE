@@ -3232,6 +3232,28 @@ def main():
             if not wait_for_screen_fragments((b"Thomas waits beside the station clock.",), timeout=2.0):
                 raise AssertionError("the previous scene was not restored visibly")
 
+            next_menu_start = len(output)
+            os.write(master, b"\x1b[21~")  # Navigate through the normal menu path.
+            read_for(0.2)
+            for _ in range(10):
+                if wait_for_screen_fragments((b"Return to Next Position",), next_menu_start, timeout=0.2):
+                    break
+                os.write(master, b"\x1b[C")
+                read_for(0.1)
+            else:
+                raise AssertionError("Navigate menu did not expose Return to Next Position")
+            select_visible_menu_item("Return to Next Position")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Returned to the next manuscript position",), timeout=3.0):
+                raise AssertionError("Next Position did not return to the location left behind")
+            if not wait_for_screen_fragments((b"A unique lantern-marker glows above the market.",), timeout=2.0):
+                raise AssertionError("Next Position did not restore the second scene")
+            os.write(master, b"\x10return-position\r")
+            if not wait_for_screen_fragments((b"Returned to the previous manuscript position",), timeout=3.0):
+                raise AssertionError("Previous Position did not work after Next Position")
+            if not wait_for_screen_fragments((b"Thomas waits beside the station clock.",), timeout=2.0):
+                raise AssertionError("Previous Position did not restore the first scene again")
+
             # The history entry is consumed once. A second attempt at the
             # boundary must remain non-fatal and preserve an in-memory edit.
             os.write(master, b"UNSAVED-PRESERVED")

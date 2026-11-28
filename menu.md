@@ -89,6 +89,7 @@ When the Series Books workspace is active, File also offers **Remove Selected Bo
 - Reference
 - Open Scene
 - Return to Previous Position
+- Return to Next Position
 - Search All Commands…
 
 ## View
