@@ -2707,3 +2707,20 @@ reopened the project and verified their names, order and chapter placement.
 Storage scene-batch tests, the focused terminal test, formatting and targeted
 Clippy with warnings denied passed. Human UAT remains pending. No new Alpha
 build has been generated; Alpha UAT 42 remains frozen at `dac9c35`.
+
+### Project manuscript status choices — 28 November 2026
+
+Schema migration 54 adds ordered status choices to each project with
+author-facing default labels. The Outline menu now provides a status picker for
+the selected scene. Tools > Manuscript Statuses lets authors rename,
+enable/disable and reorder the project's choices; existing scene status codes
+remain stable, including imported and archived states. At least one choice must
+remain enabled, and changes are saved transactionally.
+
+Verification passed for project-local status persistence and validation, the
+production PTY status-selection workflow (including reopen), the production
+PTY status-configuration workflow (rename/disable/reopen), formatting and
+targeted Clippy with warnings denied. Authors can rename the seven supported
+drafting stages to create a project-specific progression, but the current model
+does not create an unlimited number of distinct status stages. Human UAT
+remains pending; Alpha UAT 42 remains frozen.

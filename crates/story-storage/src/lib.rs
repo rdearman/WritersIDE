@@ -70,6 +70,7 @@ const MIGRATION_51: &str = include_str!("../migrations/0051_multiple_section_bod
 const MIGRATION_52: &str = include_str!("../migrations/0052_content_unit_inclusion.sql");
 const MIGRATION_53: &str =
     include_str!("../migrations/0053_structural_kind_conversion_constraints.sql");
+const MIGRATION_54: &str = include_str!("../migrations/0054_project_scene_statuses.sql");
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -1494,6 +1495,7 @@ impl ProjectStore {
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_51}\nINSERT INTO schema_migrations(version,applied_at) VALUES(51,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_52}\nINSERT INTO schema_migrations(version,applied_at) VALUES(52,'{}');\nCOMMIT;", now()))?;
         conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_53}\nINSERT INTO schema_migrations(version,applied_at) VALUES(53,'{}');\nCOMMIT;", now()))?;
+        conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_54}\nINSERT INTO schema_migrations(version,applied_at) VALUES(54,'{}');\nCOMMIT;", now()))?;
         let now = now();
         conn.execute("INSERT INTO project(singleton,id,title,author,genre,synopsis,target_words,story_epoch_label,story_calendar_id,created_at,updated_at,book_type,template_id,language_code,word_count_policy) VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?9,?10,?11,?12,?13)",params![cfg.id.to_string(),cfg.title,cfg.author,cfg.genre,cfg.synopsis,cfg.target_words,cfg.story_epoch_label,cfg.story_calendar_id,now,cfg.book_type.as_str(),cfg.template_id,project.language_code,project.word_count_policy.as_str()])?;
         Ok(Self {
@@ -1542,7 +1544,7 @@ impl ProjectStore {
             .optional()?
             .unwrap_or(0);
         let migrated = version == 1;
-        if version > 53 {
+        if version > 54 {
             return Err(StorageError::UnsupportedSchema(version));
         }
         if version < 1 {
@@ -1755,6 +1757,10 @@ impl ProjectStore {
         }
         if current_version == 52 {
             conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_53}\nINSERT INTO schema_migrations(version,applied_at) VALUES(53,'{}');\nCOMMIT;", now()))?;
+            current_version = 53;
+        }
+        if current_version == 53 {
+            conn.execute_batch(&format!("BEGIN IMMEDIATE;\n{MIGRATION_54}\nINSERT INTO schema_migrations(version,applied_at) VALUES(54,'{}');\nCOMMIT;", now()))?;
         }
         let dbid: String = conn
             .query_row("SELECT id FROM project LIMIT 1", [], |r| r.get(0))
@@ -3706,6 +3712,88 @@ impl ProjectStore {
             })
             .collect()
     }
+    pub fn list_manuscript_statuses(&self) -> Result<Vec<story_core::ManuscriptStatusDefinition>> {
+        let mut statement = self.conn.prepare(
+            "SELECT status_code,label,position,enabled FROM project_scene_status ORDER BY position",
+        )?;
+        let records = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, u32>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        records
+            .into_iter()
+            .map(|(code, label, position, enabled)| {
+                let status = parse_status(&code);
+                if status.as_str() != code
+                    || matches!(status, SceneStatus::Imported | SceneStatus::Archived)
+                {
+                    return Err(StorageError::Config(format!(
+                        "invalid project manuscript status code {code}"
+                    )));
+                }
+                Ok(story_core::ManuscriptStatusDefinition {
+                    status,
+                    label,
+                    position,
+                    enabled,
+                })
+            })
+            .collect()
+    }
+
+    pub fn update_manuscript_statuses(
+        &mut self,
+        definitions: &[story_core::ManuscriptStatusDefinition],
+    ) -> Result<()> {
+        let current = self.list_manuscript_statuses()?;
+        if definitions.len() != current.len()
+            || definitions.iter().any(|definition| {
+                definition.label.trim().is_empty()
+                    || definition.label.chars().count() > 40
+                    || matches!(
+                        definition.status,
+                        SceneStatus::Imported | SceneStatus::Archived
+                    )
+            })
+            || definitions
+                .iter()
+                .map(|item| item.status.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                != current.len()
+            || definitions
+                .iter()
+                .any(|item| !current.iter().any(|old| old.status == item.status))
+            || definitions.iter().filter(|item| item.enabled).count() == 0
+            || definitions
+                .iter()
+                .enumerate()
+                .any(|(position, item)| item.position as usize != position)
+        {
+            return Err(StorageError::Invalid(
+                "status definitions must retain every supported status, unique order, non-empty labels and at least one enabled choice".into(),
+            ));
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute("UPDATE project_scene_status SET position=position+1000", [])?;
+        for definition in definitions {
+            tx.execute(
+                "UPDATE project_scene_status SET label=?2,position=?3,enabled=?4 WHERE status_code=?1",
+                params![definition.status.as_str(), definition.label.trim(), definition.position, definition.enabled],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     pub fn scene_is_included(&self, id: SceneId) -> Result<bool> {
         let exists: bool = self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM scene WHERE id=?1)",
@@ -12372,6 +12460,37 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
     #[test]
+    fn manuscript_status_definitions_are_project_local_ordered_and_validated() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let mut statuses = store.list_manuscript_statuses().unwrap();
+        assert_eq!(statuses.len(), 7);
+        assert_eq!(statuses[0].label, "Not Started");
+        statuses.swap(0, 1);
+        for (position, definition) in statuses.iter_mut().enumerate() {
+            definition.position = position as u32;
+        }
+        statuses[0].label = "Planned".into();
+        statuses[1].enabled = false;
+        store.update_manuscript_statuses(&statuses).unwrap();
+        assert_eq!(store.list_manuscript_statuses().unwrap(), statuses);
+
+        let mut invalid = statuses.clone();
+        invalid[0].status = invalid[1].status;
+        assert!(store.update_manuscript_statuses(&invalid).is_err());
+        let mut disabled = statuses.clone();
+        for status in &mut disabled {
+            status.enabled = false;
+        }
+        assert!(store.update_manuscript_statuses(&disabled).is_err());
+        drop(store);
+
+        let reopened = ProjectStore::open(&project).unwrap();
+        assert_eq!(reopened.list_manuscript_statuses().unwrap(), statuses);
+    }
+
+    #[test]
     fn story_interval_boundaries_migrate_persist_and_reject_invalid_sql_values() {
         let directory = tempdir().unwrap();
         let project = directory.path().join("Book");
@@ -12441,7 +12560,7 @@ mod tests {
         let project = directory.path().join("Book");
         let store = ProjectStore::create(&project, "Book").unwrap();
         store.conn.execute_batch(
-            "DROP INDEX IF EXISTS content_unit_one_section_body_per_node; CREATE UNIQUE INDEX content_unit_one_body_per_node ON content_unit(parent_node_id,kind) WHERE kind IN('section_body','chapter_body'); DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE content_unit_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DELETE FROM schema_migrations WHERE version>=40;",
+            "DROP INDEX IF EXISTS content_unit_one_section_body_per_node; CREATE UNIQUE INDEX content_unit_one_body_per_node ON content_unit(parent_node_id,kind) WHERE kind IN('section_body','chapter_body'); DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE content_unit_exclusion; DROP TABLE unplaced_scene_order; DROP TABLE diagnostic_suppression; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DROP TABLE project_scene_status; DELETE FROM schema_migrations WHERE version>=40;",
        ).unwrap();
         drop(store);
 
@@ -12467,7 +12586,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 53);
+        assert_eq!(version, 54);
     }
     #[test]
     fn event_character_and_location_relationships_are_typed_atomic_and_persistent() {
@@ -12526,7 +12645,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(schema_version, 53);
+        assert_eq!(schema_version, 54);
     }
     #[test]
     fn writing_challenges_are_validated_persisted_and_completed_once() {
@@ -14658,7 +14777,7 @@ mod tests {
                 [],
                 |row| row.get::<_, i64>(0),
             )
-            .map(|version| assert_eq!(version, 53))
+            .map(|version| assert_eq!(version, 54))
             .unwrap();
     }
 
@@ -15069,7 +15188,7 @@ mod tests {
         let conn = Connection::open(project.join("story.db")).unwrap();
         conn.execute_batch("DROP TRIGGER structural_node_kind_conversion_guard; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE scene_exclusion; DROP TABLE content_unit_exclusion; DROP TRIGGER reading_document_language_insert; DROP TRIGGER reading_document_language_update; ALTER TABLE reading_document DROP COLUMN language_code; DROP TRIGGER location_parent_insert; DROP TRIGGER location_parent_update; DROP TRIGGER project_search_location_profile_update; ALTER TABLE location DROP COLUMN description; ALTER TABLE location DROP COLUMN parent_id; DROP TRIGGER story_event_dependency_no_cycle; DROP TABLE story_event_dependency; DROP TRIGGER character_absence_conflicts_with_presence; DROP TRIGGER character_presence_conflicts_with_absence; DROP TRIGGER character_presence_update_conflicts_with_absence; DROP TABLE scene_character_absence; DROP TABLE writing_goal_snapshot; DROP TABLE writing_goal_event; DROP TABLE writing_goal; DROP TABLE saved_query_expression")
             .unwrap();
-        conn.execute_batch("DROP TABLE diagnostic_suppression; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>4;").unwrap();
+        conn.execute_batch("DROP TABLE diagnostic_suppression; DROP TABLE writing_session; DROP TABLE saved_query_assertion; DROP TABLE writing_challenge; DROP TRIGGER planning_board_connector_scope_insert; DROP TRIGGER planning_board_entity_insert; DROP TRIGGER planning_board_entity_update; DROP TABLE planning_board_connector; DROP TABLE planning_board_item; DROP TABLE planning_board; DROP TRIGGER scratchpad_scene_delete; DROP TRIGGER scratchpad_character_delete; DROP TRIGGER scratchpad_location_delete; DROP TRIGGER scratchpad_object_delete; DROP TRIGGER scratchpad_plotline_delete; DROP TRIGGER scratchpad_research_delete; DROP TABLE assembly_item; DROP TABLE manuscript_assembly; DROP TABLE personal_comment; DROP TABLE scratchpad_note; DROP TABLE detected_mention_candidate; DROP TABLE detected_mention; DROP TABLE story_object; DROP TRIGGER structural_node_kind_not_content_unit; DROP TRIGGER scene_update_id_not_content_unit; DROP TRIGGER content_unit_kind_insert; DROP TRIGGER content_unit_kind_update; DROP TRIGGER content_unit_search_insert; DROP TRIGGER content_unit_search_update; DROP TRIGGER content_unit_search_delete; DROP TRIGGER content_unit_search_text_insert; DROP TRIGGER content_unit_search_text_update; DROP TRIGGER scene_id_not_content_unit; DROP TABLE content_unit_write_conflict; DROP TABLE content_unit_write_journal; DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; DROP TABLE content_unit_search_content; DROP TABLE content_unit; ALTER TABLE project DROP COLUMN template_id; ALTER TABLE project DROP COLUMN book_type; DROP TRIGGER story_link_inclusion_documents_insert; DROP TRIGGER story_link_inclusion_documents_update; DROP TRIGGER project_search_custom_field_insert; DROP TRIGGER project_search_custom_field_update; DROP TRIGGER project_search_custom_field_delete; DROP TRIGGER project_search_content_insert; DROP TRIGGER project_search_content_update; DROP TRIGGER project_search_content_delete; DROP TRIGGER project_search_scene_insert; DROP TRIGGER project_search_scene_update; DROP TRIGGER project_search_scene_delete; DROP TRIGGER project_search_scene_text_insert; DROP TRIGGER project_search_scene_text_update; DROP TRIGGER project_search_scene_text_delete; DROP TRIGGER project_search_character_insert; DROP TRIGGER project_search_character_update; DROP TRIGGER project_search_character_delete; DROP TRIGGER project_search_character_profile_update; DROP TRIGGER project_search_character_alias_insert; DROP TRIGGER project_search_character_alias_delete; DROP TRIGGER project_search_location_insert; DROP TRIGGER project_search_location_update; DROP TRIGGER project_search_location_delete; DROP TRIGGER project_search_plotline_insert; DROP TRIGGER project_search_plotline_update; DROP TRIGGER project_search_plotline_delete; DROP TRIGGER project_search_event_insert; DROP TRIGGER project_search_event_update; DROP TRIGGER project_search_event_delete; DROP TRIGGER project_search_research_insert; DROP TRIGGER project_search_research_update; DROP TRIGGER project_search_research_delete; DROP TRIGGER project_search_issue_insert; DROP TRIGGER project_search_issue_update; DROP TRIGGER project_search_issue_delete; DROP TRIGGER project_search_reading_insert; DROP TRIGGER project_search_reading_update; DROP TRIGGER project_search_reading_delete; DROP TRIGGER project_search_knowledge_insert; DROP TRIGGER project_search_knowledge_update; DROP TRIGGER project_search_knowledge_delete; DROP TRIGGER approved_knowledge_source_insert; DROP TRIGGER approved_knowledge_source_update; DROP TABLE character_alias; ALTER TABLE character DROP COLUMN status; ALTER TABLE character DROP COLUMN external_conflict; ALTER TABLE character DROP COLUMN internal_conflict; ALTER TABLE character DROP COLUMN secrets; ALTER TABLE character DROP COLUMN motivations; ALTER TABLE character DROP COLUMN goals; ALTER TABLE character DROP COLUMN background; ALTER TABLE character DROP COLUMN description; ALTER TABLE character DROP COLUMN preferred_name; DROP TABLE approved_knowledge_claim; DROP TABLE project_search_fts; DROP TABLE project_search_content; ALTER TABLE project DROP COLUMN language_code; ALTER TABLE project DROP COLUMN word_count_policy; DROP TABLE passage_language_tag; ALTER TABLE scene DROP COLUMN word_count_policy; ALTER TABLE scene DROP COLUMN language_code; DROP TABLE location_incompatibility_rule; DROP TABLE story_event_character; DROP TABLE story_event_location; DROP TABLE story_event_interval_boundary; DROP TABLE scene_interval_boundary; DROP TABLE unplaced_scene_order; DROP TABLE project_scene_status; DELETE FROM schema_migrations WHERE version>4;").unwrap();
         drop(conn);
         let st = ProjectStore::open(&project).unwrap();
         assert_eq!(st.search_scenes("obsidian").unwrap(), vec![scene]);
@@ -15079,7 +15198,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(version, 53);
+        assert_eq!(version, 54);
         let hits = st.search_project("obsidian", 10).unwrap();
         assert_eq!(hits[0].entity_id, scene.to_string());
     }
@@ -15171,7 +15290,7 @@ mod tests {
              DROP TABLE scene_interval_boundary;
              DROP TABLE diagnostic_suppression;
              DROP TABLE unplaced_scene_order;
-             DELETE FROM schema_migrations WHERE version>=9;",
+             DROP TABLE project_scene_status; DELETE FROM schema_migrations WHERE version>=9;",
         )
         .unwrap();
         drop(conn);
@@ -17194,7 +17313,7 @@ mod tests {
         let connection = Connection::open(project.join("story.db")).unwrap();
         connection
             .execute_batch(
-                "CREATE UNIQUE INDEX content_unit_one_section_body_per_node ON content_unit(parent_node_id) WHERE kind='section_body'; DROP TABLE content_unit_exclusion; DELETE FROM schema_migrations WHERE version>=51;",
+                "CREATE UNIQUE INDEX content_unit_one_section_body_per_node ON content_unit(parent_node_id) WHERE kind='section_body'; DROP TABLE content_unit_exclusion; DROP TABLE project_scene_status; DELETE FROM schema_migrations WHERE version>=51;",
             )
             .unwrap();
         drop(connection);
@@ -17227,7 +17346,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 53);
+        assert_eq!(version, 54);
     }
 
     #[test]
@@ -17761,7 +17880,7 @@ mod tests {
             .unwrap();
         connection
             .execute_batch(
-                "DROP INDEX IF EXISTS content_unit_one_section_body_per_node; CREATE UNIQUE INDEX content_unit_one_body_per_node ON content_unit(parent_node_id,kind) WHERE kind IN('section_body','chapter_body'); DROP TABLE content_unit_exclusion; DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE unplaced_scene_order; DELETE FROM schema_migrations WHERE version>=44;",
+                "DROP INDEX IF EXISTS content_unit_one_section_body_per_node; CREATE UNIQUE INDEX content_unit_one_body_per_node ON content_unit(parent_node_id,kind) WHERE kind IN('section_body','chapter_body'); DROP TABLE content_unit_exclusion; DROP TABLE structural_removal_content_unit; DROP TABLE structural_removal_scene; DROP TABLE structural_removal_node; DROP TABLE structural_removal; DROP TRIGGER scene_restore_requires_active_chapter; DROP TRIGGER content_unit_restore_requires_active_parent; DROP TRIGGER structural_node_archive_requires_empty; DROP TRIGGER structural_node_cannot_parent_archived; DROP TRIGGER structural_node_cannot_use_archived_parent_insert; DROP TRIGGER structural_node_restore_requires_active_parent; DROP TRIGGER content_unit_cannot_use_archived_parent; DROP TRIGGER content_unit_cannot_move_to_archived_parent; DROP TRIGGER scene_cannot_place_in_archived_chapter; DROP TRIGGER scene_cannot_move_to_archived_chapter; DROP INDEX structural_node_archived_order; ALTER TABLE structural_node DROP COLUMN archived; ALTER TABLE scene DROP COLUMN status_before_archive; DROP INDEX reading_document_archive_title; ALTER TABLE reading_document DROP COLUMN archived; DROP TABLE unplaced_scene_order; DROP TABLE project_scene_status; DELETE FROM schema_migrations WHERE version>=44;",
             )
             .unwrap();
         drop(connection);
@@ -17777,6 +17896,6 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 53);
+        assert_eq!(version, 54);
     }
 }

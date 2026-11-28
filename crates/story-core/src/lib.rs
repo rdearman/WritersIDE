@@ -1792,6 +1792,15 @@ impl SceneStatus {
         }
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ManuscriptStatusDefinition {
+    pub status: SceneStatus,
+    pub label: String,
+    pub position: u32,
+    pub enabled: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Project {
     pub id: ProjectId,

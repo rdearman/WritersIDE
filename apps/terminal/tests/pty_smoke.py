@@ -162,6 +162,8 @@ def main():
     authoring_audit = modes == ["authoring-audit"]
     cross_document_clipboard = modes == ["cross-document-clipboard"]
     bulk_outline_insert = modes == ["bulk-outline-insert"]
+    scene_status_picker = modes == ["scene-status-picker"]
+    manuscript_status_settings = modes == ["manuscript-status-settings"]
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
     scrivener_import = modes == ["scrivener-import"]
@@ -218,6 +220,8 @@ def main():
         or no_function_authoring
         or cross_document_clipboard
         or bulk_outline_insert
+        or scene_status_picker
+        or manuscript_status_settings
     ):
         # Keep this workflow focused on project lifecycle rather than allowing
         # first-run onboarding to consume editing keys.
@@ -2406,6 +2410,61 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("the application did not exit cleanly after bulk outline insertion")
             print("PTY bulk outline insertion passed: numbered chapters and scenes were created through the production Outline menu.")
+            return
+
+        if scene_status_picker:
+            show_outline_tree_presentation()
+            os.write(master, b"\x1b[B\x1b[B")  # select the scene under the chapter
+            if not wait_for_screen_fragments((b"Opening",), timeout=2.0):
+                raise AssertionError("the test scene was not visible in the manuscript outline")
+            menu_start = open_named_menu("Outline")
+            select_visible_menu_item("Set Scene Status…")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Status", b"Not Started", b"First Draft"), menu_start, timeout=3.0):
+                raise AssertionError("Set Scene Status did not open the author-facing status chooser")
+            os.write(master, b"\x1b[B" * 3 + b"\r")
+            if not wait_for_screen_fragments((b"status set to First Draft",), menu_start, timeout=3.0):
+                raise AssertionError("the status chooser did not apply the selected manuscript status")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("the application did not exit cleanly after status selection")
+            print("PTY manuscript status passed: selected a valid status through the Edit menu and persisted it.")
+            return
+
+        if manuscript_status_settings:
+            menu_start = open_named_menu("Tools")
+            select_visible_menu_item("Manuscript Statuses…")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Manuscript Status Choices", b"[x] Not Started", b"R rename"),
+                menu_start,
+                timeout=3.0,
+            ):
+                raise AssertionError("Tools > Manuscript Statuses did not show project status choices")
+            os.write(master, b"r" + b"\x7f" * len("Not Started") + b"Planning")
+            if not wait_for_screen_fragments((b"[x] Planning",), menu_start, timeout=2.0):
+                raise AssertionError("status label could not be edited in the configuration dialogue")
+            os.write(master, b"\r")  # finish label edit
+            os.write(master, b" ")  # disable the selected status for future assignments
+            os.write(master, b"\r")  # save project-local status choices
+            if not wait_for_screen_fragments((b"status choices saved to this project",), menu_start, timeout=3.0):
+                raise AssertionError("status configuration did not report a successful project save")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("the application did not exit cleanly after status configuration")
+            print("PTY manuscript status configuration passed: renamed, disabled and saved a project status.")
             return
 
         if chapter_creation:

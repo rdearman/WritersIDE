@@ -127,6 +127,81 @@ fn bulk_outline_insertion_uses_the_production_menu_and_persists_through_reopen()
 
 #[cfg(target_os = "linux")]
 #[test]
+fn scene_status_is_selected_from_the_project_choices_through_the_production_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+    use story_core::SceneStatus;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Status Workflow Project");
+    let mut app = WriterApp::create_project(&project, "Status Workflow").unwrap();
+    let section = app.create_section("Part One", 0).unwrap();
+    let chapter = app.create_chapter(Some(section), "Chapter One", 0).unwrap();
+    let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("scene-status-picker")
+        .output()
+        .expect("select a manuscript status through the Linux PTY");
+    assert!(
+        result.status.success(),
+        "scene status PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.get_scene(scene).unwrap().scene.status,
+        SceneStatus::Drafting
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn manuscript_status_choices_are_configurable_through_the_production_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+    use story_core::SceneStatus;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Status Settings Project");
+    let app = WriterApp::create_project(&project, "Status Settings").unwrap();
+    drop(app);
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("manuscript-status-settings")
+        .output()
+        .expect("configure project manuscript statuses through the Linux PTY");
+    assert!(
+        result.status.success(),
+        "manuscript status settings PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let reopened = WriterApp::open_project(&project).unwrap();
+    let statuses = reopened.list_manuscript_statuses().unwrap();
+    let planned = statuses
+        .iter()
+        .find(|item| item.status == SceneStatus::Idea)
+        .unwrap();
+    assert_eq!(planned.label, "Planning");
+    assert!(!planned.enabled);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn whole_document_snapshot_restore_requires_confirmation_in_the_production_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

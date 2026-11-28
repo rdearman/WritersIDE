@@ -329,6 +329,21 @@ struct BulkNodeInsertDialog {
     focus: usize,
 }
 
+#[derive(Clone, Debug)]
+struct SceneStatusPicker {
+    scene: SceneId,
+    title: String,
+    choices: Vec<story_core::ManuscriptStatusDefinition>,
+    selected: usize,
+}
+
+#[derive(Clone, Debug)]
+struct ManuscriptStatusSettings {
+    definitions: Vec<story_core::ManuscriptStatusDefinition>,
+    selected: usize,
+    editing_label: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BulkItemKind {
     Section,
@@ -415,6 +430,8 @@ struct AppState {
     pending_structural_node_removal: Option<StructuralNodeRemovalDialog>,
     structural_conversion: Option<StructuralConversionDialog>,
     bulk_node_insert: Option<BulkNodeInsertDialog>,
+    scene_status_picker: Option<SceneStatusPicker>,
+    manuscript_status_settings: Option<ManuscriptStatusSettings>,
     function_bindings: Vec<(u8, Workspace)>,
     command_bindings: CommandBindings,
     context_command_bindings: Vec<ContextCommandBinding>,
@@ -1265,6 +1282,7 @@ const MENU_COMMON_COMMANDS: [&[&str]; 10] = [
         "research.removed-references",
         "research.restore-reference",
         "settings.keybinding-manager",
+        "project.manuscript-statuses",
         "edit.preferences",
         "edit.text-expansion",
         "edit.text-expansion-user",
@@ -1961,6 +1979,8 @@ enum CommandAction {
     RestoreSelectedStructuralNode,
     ConvertSelectedStructuralNode,
     InsertMultipleStructuralNodes,
+    ChooseSelectedSceneStatus,
+    ConfigureManuscriptStatuses,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2682,14 +2702,36 @@ fn command_registry() -> Vec<CommandSpec> {
             "rename",
             true,
         ),
-        legacy_command(
-            "scene.status",
-            "Set Scene Status",
-            "Change a scene's drafting status",
-            "Edit",
-            "scene-status",
-            true,
-        ),
+        CommandSpec {
+            id: "scene.status",
+            label: "Set Scene Status…",
+            description: "Choose a project manuscript status for the selected scene",
+            category: "Edit",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["scene status", "draft status"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ChooseSelectedSceneStatus,
+            task_group: "Outline",
+            menu_priority: 19,
+            advanced: false,
+        },
+        CommandSpec {
+            id: "project.manuscript-statuses",
+            label: "Manuscript Statuses…",
+            description: "Rename, reorder or disable project drafting-status choices",
+            category: "Tools",
+            default_shortcuts: &[],
+            mnemonic: None,
+            palette_aliases: &["configure manuscript statuses", "draft status settings"],
+            palette_prefix: None,
+            takes_arguments: false,
+            action: CommandAction::ConfigureManuscriptStatuses,
+            task_group: "Project Settings",
+            menu_priority: 28,
+            advanced: false,
+        },
         legacy_command(
             "scene.field",
             "Edit Scene Planning Field",
@@ -5428,8 +5470,11 @@ fn registered_global_command_for_key(state: &AppState, key: KeyEvent) -> Option<
         || state.snippet_preview.is_some()
         || state.snippet_chooser.is_some()
         || state.special_character_picker.is_some();
-    let modal_is_open =
-        modal_is_open || state.structural_conversion.is_some() || state.bulk_node_insert.is_some();
+    let modal_is_open = modal_is_open
+        || state.structural_conversion.is_some()
+        || state.bulk_node_insert.is_some()
+        || state.scene_status_picker.is_some()
+        || state.manuscript_status_settings.is_some();
     let modal_is_open = modal_is_open || tutorial_modal_open;
     if let Some(help) = command_for_effective_shortcut(state, key)
         .filter(|command| command.action == CommandAction::Help)
@@ -8542,6 +8587,8 @@ impl AppState {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -15063,6 +15110,65 @@ impl AppState {
         Ok(())
     }
 
+    fn open_scene_status_picker(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(scene) = selected_scene_for_workspace(self) else {
+            self.message = "Select a scene in the manuscript Outline first".into();
+            return Ok(());
+        };
+        let record = self.app.get_scene(scene)?;
+        let mut choices = self.app.list_manuscript_statuses()?;
+        choices.retain(|definition| definition.enabled || definition.status == record.scene.status);
+        let selected = choices
+            .iter()
+            .position(|definition| definition.status == record.scene.status)
+            .unwrap_or(0);
+        self.scene_status_picker = Some(SceneStatusPicker {
+            scene,
+            title: record.scene.title,
+            choices,
+            selected,
+        });
+        Ok(())
+    }
+
+    fn finish_scene_status_picker(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(picker) = self.scene_status_picker.as_ref() else {
+            return Ok(());
+        };
+        let Some(choice) = picker.choices.get(picker.selected).cloned() else {
+            self.message = "No manuscript statuses are available".into();
+            return Ok(());
+        };
+        let scene = picker.scene;
+        let title = picker.title.clone();
+        let mut record = self.app.get_scene(scene)?;
+        record.scene.status = choice.status;
+        self.app.update_scene_metadata(&record.scene)?;
+        self.scene_status_picker = None;
+        self.refresh()?;
+        self.message = format!("‘{title}’ status set to {}", choice.label);
+        Ok(())
+    }
+
+    fn open_manuscript_status_settings(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.manuscript_status_settings = Some(ManuscriptStatusSettings {
+            definitions: self.app.list_manuscript_statuses()?,
+            selected: 0,
+            editing_label: false,
+        });
+        Ok(())
+    }
+
+    fn save_manuscript_status_settings(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(settings) = self.manuscript_status_settings.as_ref() else {
+            return Ok(());
+        };
+        self.app.update_manuscript_statuses(&settings.definitions)?;
+        self.manuscript_status_settings = None;
+        self.message = "Manuscript status choices saved to this project".into();
+        Ok(())
+    }
+
     fn finish_bulk_node_insert(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let Some(dialog) = self.bulk_node_insert.clone() else {
             return Ok(());
@@ -17267,6 +17373,9 @@ impl AppState {
                 None
             };
         }
+        if spec.id == "scene.status" && selected_scene_for_workspace(self).is_none() {
+            return Some("Select a scene in the manuscript Outline first");
+        }
         if spec.id == "scene.restore" {
             return if self.workspace != Workspace::Cards || !self.removed_scenes_list {
                 Some("Show Removed Scenes first")
@@ -18625,6 +18734,8 @@ impl AppState {
                 self.open_structural_conversion_dialog()?
             }
             CommandAction::InsertMultipleStructuralNodes => self.open_bulk_node_insert()?,
+            CommandAction::ChooseSelectedSceneStatus => self.open_scene_status_picker()?,
+            CommandAction::ConfigureManuscriptStatuses => self.open_manuscript_status_settings()?,
             CommandAction::MoveOutlineUp => self.move_selected_outline_entry(false)?,
             CommandAction::MoveOutlineDown => self.move_selected_outline_entry(true)?,
             CommandAction::PromoteOutlineItem => self.move_selected_outline_depth(false)?,
@@ -29917,6 +30028,12 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.bulk_node_insert.is_some() {
         draw_bulk_node_insert_overlay(f, s);
     }
+    if s.scene_status_picker.is_some() {
+        draw_scene_status_picker_overlay(f, s);
+    }
+    if s.manuscript_status_settings.is_some() {
+        draw_manuscript_status_settings_overlay(f, s);
+    }
     if s.command_palette.is_some() {
         draw_command_palette_overlay(f, s);
     }
@@ -30071,6 +30188,102 @@ fn draw_bulk_node_insert_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         Paragraph::new("Tab fields · ↑/↓ or Space changes type · Enter inserts · Esc cancels"),
         chunks[5],
     );
+}
+
+fn draw_scene_status_picker_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(picker) = &s.scene_status_picker else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).min(58);
+    let height = (picker.choices.len() as u16 + 5).min(area.height.saturating_sub(2));
+    if width < 28 || height < 6 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(format!(" Status · {} ", picker.title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let mut lines = picker
+        .choices
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| {
+            let selected = index == picker.selected;
+            let style = if selected {
+                Style::default().fg(Color::White).bg(Color::Blue)
+            } else {
+                Style::default()
+            };
+            Line::from(Span::styled(
+                format!("{} {}", if selected { "▸" } else { " " }, definition.label),
+                style,
+            ))
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from("↑/↓ choose · Enter set · Esc cancel"));
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_manuscript_status_settings_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(settings) = &s.manuscript_status_settings else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).min(68);
+    let height = (settings.definitions.len() as u16 + 5).min(area.height.saturating_sub(2));
+    if width < 34 || height < 7 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Manuscript Status Choices ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let mut lines = settings
+        .definitions
+        .iter()
+        .enumerate()
+        .map(|(index, definition)| {
+            let selected = index == settings.selected;
+            let enabled = if definition.enabled { "[x]" } else { "[ ]" };
+            let label = if selected && settings.editing_label {
+                format!("{enabled} {}▏", definition.label)
+            } else {
+                format!("{enabled} {}", definition.label)
+            };
+            Line::from(Span::styled(
+                format!("{} {label}", if selected { "▸" } else { " " }),
+                if selected {
+                    Style::default().fg(Color::White).bg(Color::Blue)
+                } else {
+                    Style::default()
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    lines.push(Line::from(
+        "↑/↓ select · Space enable · R rename · ←/→ reorder",
+    ));
+    lines.push(Line::from("Enter save · Esc cancel"));
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 fn context_help_panel(state: &AppState) -> HelpPanel {
@@ -36443,6 +36656,103 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     let k = normalize_standard_terminal_key(s, k);
     if s.window_prefix_active {
         handle_window_prefix_key(s, k)?;
+        return Ok(false);
+    }
+    if let Some(settings) = s.manuscript_status_settings.as_mut() {
+        if settings.editing_label {
+            match k.code {
+                KeyCode::Esc => settings.editing_label = false,
+                KeyCode::Enter => settings.editing_label = false,
+                KeyCode::Backspace => {
+                    settings.definitions[settings.selected].label.pop();
+                }
+                KeyCode::Char(character)
+                    if !k.modifiers.contains(KeyModifiers::CONTROL)
+                        && !k.modifiers.contains(KeyModifiers::ALT)
+                        && settings.definitions[settings.selected]
+                            .label
+                            .chars()
+                            .count()
+                            < 40 =>
+                {
+                    settings.definitions[settings.selected]
+                        .label
+                        .push(character);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
+        match k.code {
+            KeyCode::Esc => {
+                s.manuscript_status_settings = None;
+                s.message = "Manuscript status changes cancelled".into();
+            }
+            KeyCode::Up => {
+                settings.selected = settings.selected.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                settings.selected =
+                    (settings.selected + 1).min(settings.definitions.len().saturating_sub(1));
+            }
+            KeyCode::Left | KeyCode::Right => {
+                let current = settings.selected;
+                let target = if k.code == KeyCode::Left {
+                    current.saturating_sub(1)
+                } else {
+                    (current + 1).min(settings.definitions.len().saturating_sub(1))
+                };
+                settings.definitions.swap(current, target);
+                settings.selected = target;
+                for (position, definition) in settings.definitions.iter_mut().enumerate() {
+                    definition.position = position as u32;
+                }
+            }
+            KeyCode::Char(' ') => {
+                let enabled_count = settings
+                    .definitions
+                    .iter()
+                    .filter(|item| item.enabled)
+                    .count();
+                let item = &mut settings.definitions[settings.selected];
+                if item.enabled && enabled_count == 1 {
+                    s.message = "At least one manuscript status must remain available".into();
+                } else {
+                    item.enabled = !item.enabled;
+                }
+            }
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                settings.editing_label = true;
+            }
+            KeyCode::Enter => {
+                if let Err(error) = s.save_manuscript_status_settings() {
+                    s.message = format!("Status choices were not saved: {error}");
+                }
+            }
+            _ => {}
+        }
+        return Ok(false);
+    }
+    if s.scene_status_picker.is_some() {
+        match k.code {
+            KeyCode::Esc => {
+                s.scene_status_picker = None;
+                s.message = "Scene status unchanged".into();
+            }
+            KeyCode::Up | KeyCode::Down => {
+                if let Some(picker) = s.scene_status_picker.as_mut()
+                    && !picker.choices.is_empty()
+                {
+                    picker.selected = if k.code == KeyCode::Up {
+                        (picker.selected + picker.choices.len() - 1) % picker.choices.len()
+                    } else {
+                        (picker.selected + 1) % picker.choices.len()
+                    };
+                }
+            }
+            KeyCode::Enter | KeyCode::Char(' ') => s.finish_scene_status_picker()?,
+            _ => {}
+        }
         return Ok(false);
     }
     if s.bulk_node_insert.is_some() {
@@ -45881,6 +46191,8 @@ mod tests {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -49843,6 +50155,8 @@ mod tests {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -50015,6 +50329,8 @@ mod tests {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -50295,6 +50611,8 @@ mod tests {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -50471,6 +50789,8 @@ mod tests {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -50797,6 +51117,8 @@ mod tests {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -50973,6 +51295,8 @@ mod tests {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -52826,6 +53150,8 @@ mod tests {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -53219,6 +53545,8 @@ mod tests {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -54859,6 +55187,8 @@ mod tests {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -55046,6 +55376,8 @@ mod tests {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,
@@ -55285,6 +55617,8 @@ mod tests {
             special_character_picker: None,
             structural_conversion: None,
             bulk_node_insert: None,
+            scene_status_picker: None,
+            manuscript_status_settings: None,
             pending_replace: None,
             replace_preview_target: 0,
             replace_preview_match: 0,

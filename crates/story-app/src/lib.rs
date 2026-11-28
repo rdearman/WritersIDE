@@ -2042,6 +2042,15 @@ impl WriterApp {
     pub fn list_scenes(&self, include_archived: bool) -> Result<Vec<SceneRecord>> {
         Ok(self.store.list_scenes(include_archived)?)
     }
+    pub fn list_manuscript_statuses(&self) -> Result<Vec<story_core::ManuscriptStatusDefinition>> {
+        Ok(self.store.list_manuscript_statuses()?)
+    }
+    pub fn update_manuscript_statuses(
+        &mut self,
+        definitions: &[story_core::ManuscriptStatusDefinition],
+    ) -> Result<()> {
+        Ok(self.store.update_manuscript_statuses(definitions)?)
+    }
     pub fn scene_is_included(&self, id: SceneId) -> Result<bool> {
         Ok(self.store.scene_is_included(id)?)
     }
