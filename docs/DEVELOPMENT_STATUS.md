@@ -2884,3 +2884,14 @@ a word, exits, reopens the project and confirms the word is no longer flagged
 passed. Terminal Clippy with warnings denied, formatting and diff checks passed.
 The full workspace suite was not rerun for this increment; human UAT remains
 pending.
+
+### Workspace verification and spelling-test correction — 28 November 2026
+
+`cargo test --workspace --offline` passed after correcting a stale PTY
+expectation in the non-first spelling suggestion test (the test's fixture
+contains `Baad word.`, not a second occurrence). Results: 386 terminal unit
+tests, 3 end-to-end author workflows, 52 PTY tests passed, 1 protected
+private-corpus PTY test skipped because its local fixture path was not set; all
+other workspace and doc tests passed. Workspace Clippy with warnings denied,
+formatting and `git diff --check` passed. The skip is not reported as a pass.
+Human UAT remains pending.

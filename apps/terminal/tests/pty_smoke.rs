@@ -2018,10 +2018,7 @@ fn spell_check_can_choose_a_nonfirst_suggestion_through_the_production_pty() {
         String::from_utf8_lossy(&result.stderr)
     );
     let reopened = WriterApp::open_project(&project).unwrap();
-    assert_eq!(
-        reopened.load_scene_text(first).unwrap().0,
-        "bead word. Baad again."
-    );
+    assert_eq!(reopened.load_scene_text(first).unwrap().0, "bead word.");
     assert_eq!(reopened.load_scene_text(second).unwrap().0, "Wrng word.");
 }
 
