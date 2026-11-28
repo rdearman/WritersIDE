@@ -38353,6 +38353,20 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     );
                 }
                 KeyCode::Enter if !chapters.is_empty() => {
+                    if let (Some(scene), Some(chapter)) =
+                        (s.scene_move_target, chapters.get(s.selected))
+                        && s.app.get_scene(scene)?.chapter_id == Some(chapter.id)
+                    {
+                        let scene_title = s.app.get_scene(scene)?.scene.title;
+                        s.scene_move_target = None;
+                        s.mode = None;
+                        s.prompt.clear();
+                        s.message = format!(
+                            "‘{scene_title}’ is already in ‘{}’ · use Move Earlier/Later to reorder",
+                            chapter.title
+                        );
+                        return Ok(false);
+                    }
                     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
                         let scene = s.scene_move_target.ok_or("no scene selected for moving")?;
                         let chapter = chapters

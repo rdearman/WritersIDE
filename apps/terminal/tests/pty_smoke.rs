@@ -86,6 +86,63 @@ fn outline_item_conversion_preserves_identity_through_the_production_pty() {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn choosing_a_scenes_current_chapter_does_not_fail_or_change_order_in_the_production_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Same Chapter Move Project");
+    let mut app = WriterApp::create_project(&project, "Same Chapter Move").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let first = app.create_scene(chapter, "First", 0).unwrap();
+    let second = app.create_scene(chapter, "Second", 1).unwrap();
+    for (scene, text) in [
+        (first, "First prose stays."),
+        (second, "Second prose stays."),
+    ] {
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), text).unwrap();
+    }
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("same-chapter-move")
+        .output()
+        .expect("check same-chapter destination in the production Linux PTY");
+    assert!(
+        result.status.success(),
+        "same-chapter movement PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    let scenes = reopened.list_scenes(false).unwrap();
+    assert_eq!(
+        scenes
+            .iter()
+            .map(|record| record.scene.id)
+            .collect::<Vec<_>>(),
+        [first, second]
+    );
+    assert_eq!(
+        reopened.load_scene_text(first).unwrap().0,
+        "First prose stays."
+    );
+    assert_eq!(
+        reopened.load_scene_text(second).unwrap().0,
+        "Second prose stays."
+    );
+}
+
+#[cfg(target_os = "linux")]
 fn lock_pty_test() -> std::sync::MutexGuard<'static, ()> {
     PTY_TEST_LOCK
         .lock()

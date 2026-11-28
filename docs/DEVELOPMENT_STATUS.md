@@ -33,6 +33,14 @@ restored, opens the selected scene and verifies its manuscript text. This
 replaces the test's previous manual Navigate → Manuscript route and prevents
 assuming the editor was the origin when it was not.
 
+The Outline → Move Scene to Chapter chooser now handles selecting the scene's
+current chapter as a clear no-op, with guidance to use Move Earlier/Later.
+Previously the UI included the moving scene in the destination count and sent
+an out-of-range position to storage. A production PTY regression selects a
+scene, chooses its current chapter, confirms the visible guidance, exits and
+reopens to verify sibling order and both scene texts are unchanged. The focused
+workflow passes.
+
 ## Confirm revision-hunk restoration before applying — 27 November 2026
 
 Revision history previously restored a highlighted hunk immediately when the

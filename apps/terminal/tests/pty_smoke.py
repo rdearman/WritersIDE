@@ -189,6 +189,7 @@ def main():
     date_time_unavailable = modes == ["date-time-unavailable"]
     find_replace_focus = modes == ["find-replace-focus"]
     delete_sentence = modes == ["delete-sentence"]
+    same_chapter_move = modes == ["same-chapter-move"]
     convert_outline_item = modes == ["convert-outline-item"]
     review_thesaurus = modes == ["review-thesaurus"]
     review_menu = modes in (["review-menu"], ["review-thesaurus"])
@@ -2198,6 +2199,56 @@ def main():
             if restored[6][termios.VQUIT] != b"\x1c":
                 raise AssertionError("application shutdown did not restore the terminal VQUIT byte")
             print("PTY window-prefix workflow passed: raw-mode ASCII 0x1C, directions, pane numbers, help/cancel, split/close/maximise, F6/menu fallback, independent scrolling, and termios restoration.")
+            return
+
+        if same_chapter_move:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")
+            if wait_for_workspace_title("Editor", timeout=0.2):
+                os.write(master, b"\x1b[21~")
+                read_for(0.2)
+                os.write(master, b"\x1b[C" * 3)  # Navigate
+                select_visible_menu_item("Outline")
+                os.write(master, b"\r")
+                if not wait_for_workspace_title("Outline", timeout=3.0):
+                    raise AssertionError("Navigate > Outline did not open the manuscript hierarchy")
+            else:
+                show_outline_tree_presentation()
+            if not move_outline_selection_until(lambda row: "Second" in row, "down"):
+                raise AssertionError("the scene for the same-chapter move check was not selectable")
+            action_start = open_outline_menu()
+            select_visible_menu_item("Move Scene to Chapter…")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Move", b"Opening"), action_start, timeout=3.0):
+                raise AssertionError(
+                    "Move Scene to Chapter did not show its selected destination; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            read_for(0.25)
+            os.write(master, b"\r")  # default destination is the scene's current chapter
+            if not wait_for_screen_fragments((b"already in",), action_start, timeout=3.0):
+                raise AssertionError(
+                    "same-chapter selection did not explain that order was unchanged; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            screen = "\n".join(terminal_snapshot(output, 24, 80))
+            if "position beyond sibling count" in screen:
+                raise AssertionError("the internal sibling-position error leaked into the author interface")
+            if "First" not in screen or "Second" not in screen:
+                raise AssertionError("same-chapter move hid an existing scene; screen: " + repr(screen))
+            os.write(master, b"\x13")
+            if not wait_for_screen_fragments((b"Saved at",), timeout=3.0):
+                raise AssertionError("same-chapter move workflow did not save normally")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after same-chapter selection")
+            print("PTY Move Scene to Chapter passed: same-chapter choice is a clear no-op, without losing order.")
             return
 
         if convert_outline_item:
