@@ -2794,6 +2794,215 @@ impl ProjectStore {
         self.create_scene_record(None, title)
     }
 
+    /// Create several scenes with one database transaction and stable empty
+    /// manuscript files. Existing chapter order is shifted as a safe two-phase
+    /// renumbering; unplaced scenes append to the unplaced sequence.
+    pub fn create_scenes_batch(
+        &mut self,
+        placement: Option<(NodeId, u32)>,
+        titles: &[String],
+    ) -> Result<Vec<SceneId>> {
+        if titles.is_empty() {
+            return Err(StorageError::Invalid(
+                "enter at least one scene title".into(),
+            ));
+        }
+        if titles.iter().any(|title| title.trim().is_empty()) {
+            return Err(StorageError::Invalid("scene titles cannot be empty".into()));
+        }
+        if let Some((chapter, _)) = placement {
+            let kind: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT kind FROM structural_node WHERE id=?1 AND archived=0",
+                    [chapter.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if kind.as_deref() != Some("chapter") {
+                return Err(StorageError::Invalid(
+                    "scene destination must be an active chapter".into(),
+                ));
+            }
+        }
+
+        let ids = titles.iter().map(|_| SceneId::new()).collect::<Vec<_>>();
+        let mut prepared_paths = Vec::with_capacity(ids.len());
+        for id in &ids {
+            let relative = format!("manuscript/{id}.md");
+            let path = self.safe_path(Path::new(&relative))?;
+            if path.exists() {
+                return Err(StorageError::Invalid(
+                    "a generated scene file already exists; no scenes were inserted".into(),
+                ));
+            }
+            prepared_paths.push((relative, path));
+        }
+        let mut written_paths = Vec::new();
+        for (_, path) in &prepared_paths {
+            if let Err(error) = atomic_write(path, b"") {
+                let _ = fs::remove_file(path);
+                for written in &written_paths {
+                    let _ = fs::remove_file(written);
+                }
+                return Err(error);
+            }
+            written_paths.push(path.clone());
+        }
+
+        let result = (|| -> Result<()> {
+            let tx = self
+                .conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let existing = if let Some((chapter, position)) = placement {
+                let scenes = query_scene_ids(&tx, &chapter.to_string())?;
+                if position as usize > scenes.len() {
+                    return Err(StorageError::Invalid(
+                        "scene insertion position is beyond the chapter contents".into(),
+                    ));
+                }
+                let maximum: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(position),0) FROM scene_placement",
+                    [],
+                    |row| row.get(0),
+                )?;
+                let offset = maximum
+                    .checked_mul(3)
+                    .and_then(|value| value.checked_add(scenes.len() as i64))
+                    .and_then(|value| value.checked_add(titles.len() as i64))
+                    .and_then(|value| value.checked_add(100))
+                    .ok_or_else(|| {
+                        StorageError::Invalid("scene position space exhausted".into())
+                    })?;
+                for scene in &scenes {
+                    tx.execute(
+                        "UPDATE scene_placement SET position=position+?2 WHERE scene_id=?1",
+                        params![scene, offset],
+                    )?;
+                }
+                for (index, scene) in scenes.iter().enumerate() {
+                    let position = (index as i64)
+                        + if index >= position as usize {
+                            titles.len() as i64
+                        } else {
+                            0
+                        };
+                    tx.execute(
+                        "UPDATE scene_placement SET position=?2 WHERE scene_id=?1",
+                        params![scene, position],
+                    )?;
+                }
+                Some((chapter, position))
+            } else {
+                None
+            };
+            let defaults: Vec<CustomDefaultRow> = {
+                let mut query = tx.prepare("SELECT id,field_type,default_text,default_integer,default_decimal,default_boolean,reference_kind FROM custom_field_definition WHERE default_text IS NOT NULL OR default_integer IS NOT NULL OR default_decimal IS NOT NULL OR default_boolean IS NOT NULL")?;
+                query
+                    .query_map([], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<_, _>>()?
+            };
+            let hash = hash_bytes(b"");
+            for (index, ((id, (relative, _)), title)) in
+                ids.iter().zip(&prepared_paths).zip(titles).enumerate()
+            {
+                let timestamp = now();
+                tx.execute(
+                    "INSERT INTO scene(id,title,created_at,updated_at) VALUES(?1,?2,?3,?3)",
+                    params![id.to_string(), title.trim(), timestamp],
+                )?;
+                if let Some((chapter, position)) = existing {
+                    tx.execute(
+                        "INSERT INTO scene_placement(scene_id,chapter_id,position) VALUES(?1,?2,?3)",
+                        params![id.to_string(), chapter.to_string(), i64::from(position) + index as i64],
+                    )?;
+                } else {
+                    let position: i64 = tx.query_row(
+                        "SELECT COALESCE(MAX(position)+1,0) FROM unplaced_scene_order",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    tx.execute(
+                        "INSERT INTO unplaced_scene_order(scene_id,position) VALUES(?1,?2)",
+                        params![id.to_string(), position],
+                    )?;
+                }
+                tx.execute(
+                    "INSERT INTO scene_content(scene_id,relative_path,sha256,byte_length) VALUES(?1,?2,?3,0)",
+                    params![id.to_string(), relative, hash],
+                )?;
+                for (field_id, field_type, text, integer, decimal, boolean, reference_kind) in
+                    &defaults
+                {
+                    match field_type.as_str() {
+                        "text" | "long_text" | "enum" | "datetime" => {
+                            tx.execute("INSERT INTO custom_field_value(scene_id,field_id,text_value) VALUES(?1,?2,?3)", params![id.to_string(), field_id, text])?;
+                        }
+                        "integer" => {
+                            tx.execute("INSERT INTO custom_field_value(scene_id,field_id,integer_value) VALUES(?1,?2,?3)", params![id.to_string(), field_id, integer])?;
+                        }
+                        "decimal" => {
+                            tx.execute("INSERT INTO custom_field_value(scene_id,field_id,decimal_value) VALUES(?1,?2,?3)", params![id.to_string(), field_id, decimal])?;
+                        }
+                        "boolean" => {
+                            tx.execute("INSERT INTO custom_field_value(scene_id,field_id,boolean_value) VALUES(?1,?2,?3)", params![id.to_string(), field_id, boolean])?;
+                        }
+                        "entity_ref" => {
+                            let target = text.as_ref().ok_or_else(|| {
+                                StorageError::Invalid(
+                                    "entity reference default must be text ID".into(),
+                                )
+                            })?;
+                            let target_kind = reference_kind.as_deref().ok_or_else(|| {
+                                StorageError::Invalid(
+                                    "entity reference field lacks target kind".into(),
+                                )
+                            })?;
+                            validate_entity_ref(&tx, Some(target_kind), target)?;
+                            tx.execute("INSERT INTO custom_field_value(scene_id,field_id,entity_ref) VALUES(?1,?2,?3)", params![id.to_string(), field_id, target])?;
+                            insert_ref(
+                                &tx,
+                                *id,
+                                FieldId(
+                                    Uuid::parse_str(field_id).map_err(|error| {
+                                        StorageError::Invalid(error.to_string())
+                                    })?,
+                                ),
+                                0,
+                                target_kind,
+                                target,
+                            )?;
+                        }
+                        _ => {
+                            return Err(StorageError::Invalid(
+                                "unsupported custom field default type".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            for path in &written_paths {
+                let _ = fs::remove_file(path);
+            }
+            return Err(error);
+        }
+        Ok(ids)
+    }
+
     pub fn reorder_unplaced_scene(&mut self, id: SceneId, position: u32) -> Result<()> {
         let tx = self
             .conn
@@ -13137,6 +13346,101 @@ mod tests {
         assert_eq!(reopened_nodes.len(), 3);
         assert_eq!(reopened_nodes[1].id, second[0]);
         assert_eq!(reopened_nodes[2].position, 2);
+    }
+
+    #[test]
+    fn scene_batch_insertion_is_atomic_ordered_and_creates_manuscript_files() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let before = store.create_scene(chapter, 0, "Before").unwrap();
+        let after = store.create_scene(chapter, 1, "After").unwrap();
+        let inserted = store
+            .create_scenes_batch(Some((chapter, 1)), &["Middle A".into(), "Middle B".into()])
+            .unwrap();
+        assert_eq!(
+            store
+                .list_scenes(false)
+                .unwrap()
+                .into_iter()
+                .map(|record| record.scene.title)
+                .collect::<Vec<_>>(),
+            ["Before", "Middle A", "Middle B", "After"]
+        );
+        assert_eq!(store.get_scene(before).unwrap().position, Some(0));
+        assert_eq!(store.get_scene(inserted[0]).unwrap().position, Some(1));
+        assert_eq!(store.get_scene(inserted[1]).unwrap().position, Some(2));
+        assert_eq!(store.get_scene(after).unwrap().position, Some(3));
+        for scene in &inserted {
+            assert!(
+                project
+                    .join("manuscript")
+                    .join(format!("{scene}.md"))
+                    .is_file()
+            );
+        }
+        assert!(
+            store
+                .create_scenes_batch(Some((chapter, 100)), &["Invalid".into()])
+                .is_err()
+        );
+        assert!(
+            store
+                .create_scenes_batch(None, &["Valid".into(), " ".into()])
+                .is_err()
+        );
+        assert_eq!(store.list_scenes(false).unwrap().len(), 4);
+
+        drop(store);
+        let reopened = ProjectStore::open(&project).unwrap();
+        assert_eq!(reopened.list_scenes(false).unwrap().len(), 4);
+        assert_eq!(
+            reopened.get_scene(inserted[0]).unwrap().scene.title,
+            "Middle A"
+        );
+    }
+
+    #[test]
+    fn scene_batch_failure_removes_prepared_files_and_unplaced_batches_persist() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Book");
+        let mut store = ProjectStore::create(&project, "Book").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        assert!(
+            store
+                .create_scenes_batch(Some((chapter, 3)), &["Invalid".into()])
+                .is_err()
+        );
+        assert_eq!(store.list_scenes(false).unwrap().len(), 0);
+        let manuscript_files = fs::read_dir(project.join("manuscript")).unwrap().count();
+        assert_eq!(
+            manuscript_files, 0,
+            "failed batches clean up prepared files"
+        );
+
+        let ids = store
+            .create_scenes_batch(None, &["Draft 1".into(), "Draft 2".into()])
+            .unwrap();
+        assert!(
+            ids.iter()
+                .all(|id| store.get_scene(*id).unwrap().chapter_id.is_none())
+        );
+        drop(store);
+        let reopened = ProjectStore::open(&project).unwrap();
+        assert_eq!(reopened.list_scenes(false).unwrap().len(), 2);
+        for id in ids {
+            assert!(
+                project
+                    .join("manuscript")
+                    .join(format!("{id}.md"))
+                    .is_file()
+            );
+        }
     }
 
     #[test]

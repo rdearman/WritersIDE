@@ -1801,6 +1801,13 @@ impl WriterApp {
     pub fn create_unplaced_scene(&mut self, title: &str) -> Result<SceneId> {
         Ok(self.store.create_unplaced_scene(title)?)
     }
+    pub fn create_scenes_batch(
+        &mut self,
+        placement: Option<(NodeId, u32)>,
+        titles: &[String],
+    ) -> Result<Vec<SceneId>> {
+        Ok(self.store.create_scenes_batch(placement, titles)?)
+    }
     pub fn reorder_unplaced_scene(&mut self, scene: SceneId, position: u32) -> Result<()> {
         Ok(self.store.reorder_unplaced_scene(scene, position)?)
     }

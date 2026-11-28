@@ -161,6 +161,7 @@ def main():
     backup_archive = modes == ["backup-archive"]
     authoring_audit = modes == ["authoring-audit"]
     cross_document_clipboard = modes == ["cross-document-clipboard"]
+    bulk_outline_insert = modes == ["bulk-outline-insert"]
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
     scrivener_import = modes == ["scrivener-import"]
@@ -216,6 +217,7 @@ def main():
         or pty_wrapper is not None
         or no_function_authoring
         or cross_document_clipboard
+        or bulk_outline_insert
     ):
         # Keep this workflow focused on project lifecycle rather than allowing
         # first-run onboarding to consume editing keys.
@@ -467,6 +469,8 @@ def main():
         raise AssertionError(
             "Outline menu was not reachable from the manuscript outliner; screen: "
             + repr(terminal_snapshot(output, 24, 80))
+            + "\nrecent terminal output: "
+            + repr(ANSI_CONTROL.sub(b"", output[-1600:]))
         )
 
     def open_named_menu(name):
@@ -2358,6 +2362,50 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit after the Find and Replace focus test")
             print("PTY Find and Replace focus passed: empty fields show a caret, replacement-first entry works, and Esc preserves prose.")
+            return
+
+        if bulk_outline_insert:
+            show_outline_tree_presentation()
+            menu_start = open_outline_menu()
+            select_visible_menu_item("Insert Multiple Items…")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                ("Insert Multiple Outline Items".encode("utf-8"), b"Quantity: 5", b"Name pattern: Chapter {n}"),
+                menu_start,
+                timeout=3.0,
+            ):
+                raise AssertionError(
+                    "Outline > Insert Multiple Items did not show the author-facing defaults; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Inserted 5 chapter items",), menu_start, timeout=4.0):
+                raise AssertionError(
+                    "bulk chapter insertion did not report completion; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            scene_start = len(output)
+            menu_start = open_outline_menu()
+            select_visible_menu_item("Insert Multiple Items…")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(("Insert Multiple Outline Items".encode("utf-8"),), menu_start, timeout=3.0):
+                raise AssertionError("the bulk insertion dialogue did not reopen for scene insertion")
+            os.write(master, b"\x1b[B\x1b[B")  # Chapter → Section → Scene.
+            if not wait_for_screen_fragments((b"Item type: Scene",), menu_start, timeout=2.0):
+                raise AssertionError("the bulk insertion dialogue did not offer Scene as an item type")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Inserted 5 scenes",), scene_start, timeout=4.0):
+                raise AssertionError("bulk scene insertion did not report completion")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("the application did not exit cleanly after bulk outline insertion")
+            print("PTY bulk outline insertion passed: numbered chapters and scenes were created through the production Outline menu.")
             return
 
         if chapter_creation:

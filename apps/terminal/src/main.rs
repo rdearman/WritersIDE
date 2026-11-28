@@ -179,10 +179,44 @@ fn structural_kind_label(kind: story_core::NodeKind) -> &'static str {
 
 fn bulk_node_location(
     state: &AppState,
-    _kind: story_core::NodeKind,
+    kind: BulkItemKind,
 ) -> Result<(Option<story_core::NodeId>, u32), Box<dyn std::error::Error>> {
     let nodes = state.app.list_structural_nodes()?;
-    let selected_node = match outline_rows(state).get(state.selected) {
+    let selected_row = outline_rows(state).get(state.selected).cloned();
+    if kind == BulkItemKind::Scene {
+        let scenes = state.app.list_scenes(false)?;
+        return match selected_row {
+            Some(OutlineRow::Scene(id)) => {
+                let scene = state.app.get_scene(id)?;
+                if let Some(chapter) = scene.chapter_id {
+                    Ok((Some(chapter), scene.position.unwrap_or(0).saturating_add(1)))
+                } else {
+                    Ok((
+                        None,
+                        scenes
+                            .iter()
+                            .filter(|item| item.chapter_id.is_none())
+                            .count() as u32,
+                    ))
+                }
+            }
+            Some(OutlineRow::Chapter { id, .. }) => Ok((
+                Some(id),
+                scenes
+                    .iter()
+                    .filter(|item| item.chapter_id == Some(id))
+                    .count() as u32,
+            )),
+            _ => Ok((
+                None,
+                scenes
+                    .iter()
+                    .filter(|item| item.chapter_id.is_none())
+                    .count() as u32,
+            )),
+        };
+    }
+    let selected_node = match selected_row.as_ref() {
         Some(OutlineRow::Section { id, .. } | OutlineRow::Chapter { id, .. }) => Some(*id),
         Some(OutlineRow::ContentUnit(id)) => state.app.get_content_unit(*id)?.parent_id,
         Some(OutlineRow::Scene(id)) => state.app.get_scene(*id)?.chapter_id,
@@ -286,13 +320,38 @@ struct StructuralConversionDialog {
 
 #[derive(Clone, Debug)]
 struct BulkNodeInsertDialog {
-    kind: story_core::NodeKind,
+    kind: BulkItemKind,
     parent: Option<story_core::NodeId>,
     position: u32,
     count: String,
     first_number: String,
     pattern: String,
     focus: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BulkItemKind {
+    Section,
+    Chapter,
+    Scene,
+}
+
+impl BulkItemKind {
+    fn next(self) -> Self {
+        match self {
+            Self::Chapter => Self::Section,
+            Self::Section => Self::Scene,
+            Self::Scene => Self::Chapter,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Section => "Section",
+            Self::Chapter => "Chapter",
+            Self::Scene => "Scene",
+        }
+    }
 }
 
 struct AppState {
@@ -14990,7 +15049,7 @@ impl AppState {
             self.message = "Open Outline to insert multiple items".into();
             return Ok(());
         }
-        let kind = story_core::NodeKind::Chapter;
+        let kind = BulkItemKind::Chapter;
         let (parent, position) = bulk_node_location(self, kind)?;
         self.bulk_node_insert = Some(BulkNodeInsertDialog {
             kind,
@@ -14998,7 +15057,7 @@ impl AppState {
             position,
             count: "5".into(),
             first_number: "1".into(),
-            pattern: "Chapter {n}".into(),
+            pattern: format!("{} {{n}}", kind.label()),
             focus: 0,
         });
         Ok(())
@@ -15042,9 +15101,42 @@ impl AppState {
             };
             titles.push(title);
         }
+        if dialog.kind == BulkItemKind::Scene {
+            match self.app.create_scenes_batch(
+                dialog.parent.map(|chapter| (chapter, dialog.position)),
+                &titles,
+            ) {
+                Ok(ids) => {
+                    self.bulk_node_insert = None;
+                    self.refresh()?;
+                    self.selected = outline_rows(self)
+                        .iter()
+                        .position(|row| matches!(row, OutlineRow::Scene(id) if *id == ids[0]))
+                        .unwrap_or(0);
+                    self.message = format!(
+                        "Inserted {} scenes · first scene selected{}",
+                        ids.len(),
+                        if dialog.parent.is_some() {
+                            " in the selected chapter"
+                        } else {
+                            " · unplaced"
+                        }
+                    );
+                }
+                Err(error) => {
+                    self.message = format!("Scenes were not inserted · outline unchanged: {error}");
+                }
+            }
+            return Ok(());
+        }
+        let structural_kind = match dialog.kind {
+            BulkItemKind::Section => story_core::NodeKind::Section,
+            BulkItemKind::Chapter => story_core::NodeKind::Chapter,
+            BulkItemKind::Scene => unreachable!(),
+        };
         match self.app.create_structural_nodes_batch(
             dialog.parent,
-            dialog.kind,
+            structural_kind,
             &titles,
             dialog.position,
         ) {
@@ -15059,7 +15151,7 @@ impl AppState {
                 self.message = format!(
                     "Inserted {} {} items · first item selected",
                     ids.len(),
-                    structural_kind_label(dialog.kind).to_ascii_lowercase()
+                    dialog.kind.label().to_ascii_lowercase()
                 );
             }
             Err(error) => {
@@ -29958,7 +30050,7 @@ fn draw_bulk_node_insert_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         ])
         .split(inner);
     let labels = [
-        format!("Item type: {}", structural_kind_label(dialog.kind)),
+        format!("Item type: {}", dialog.kind.label()),
         format!("Quantity: {}", dialog.count),
         format!("Name pattern: {}", dialog.pattern),
         format!("Starting number: {}", dialog.first_number),
@@ -36375,18 +36467,13 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                     .as_ref()
                     .is_some_and(|dialog| dialog.focus == 0) =>
             {
-                let next_kind =
-                    if s.bulk_node_insert.as_ref().unwrap().kind == story_core::NodeKind::Chapter {
-                        story_core::NodeKind::Section
-                    } else {
-                        story_core::NodeKind::Chapter
-                    };
+                let next_kind = s.bulk_node_insert.as_ref().unwrap().kind.next();
                 let (parent, position) = bulk_node_location(s, next_kind)?;
                 if let Some(dialog) = s.bulk_node_insert.as_mut() {
                     dialog.kind = next_kind;
                     dialog.parent = parent;
                     dialog.position = position;
-                    dialog.pattern = format!("{} {{n}}", structural_kind_label(next_kind));
+                    dialog.pattern = format!("{} {{n}}", next_kind.label());
                 }
             }
             KeyCode::Backspace => {
@@ -40220,7 +40307,7 @@ mod tests {
         state.open_bulk_node_insert().unwrap();
         handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
         let dialog = state.bulk_node_insert.as_mut().unwrap();
-        assert_eq!(dialog.kind, story_core::NodeKind::Section);
+        assert_eq!(dialog.kind, BulkItemKind::Section);
         dialog.count = "2".into();
         dialog.first_number = "7".into();
         dialog.pattern = "Interlude {n}".into();
@@ -40242,6 +40329,37 @@ mod tests {
                 .map(|node| node.title.as_str())
                 .collect::<Vec<_>>(),
             ["Interlude 7", "Interlude 8"]
+        );
+        state.selected = outline_rows(&state)
+            .iter()
+            .position(|row| matches!(row, OutlineRow::Chapter { id, .. } if *id == chapters[0].id))
+            .unwrap();
+        state.open_bulk_node_insert().unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        let dialog = state.bulk_node_insert.as_mut().unwrap();
+        assert_eq!(dialog.kind, BulkItemKind::Scene);
+        dialog.count = "2".into();
+        dialog.first_number = "10".into();
+        dialog.pattern = "Scene {n}".into();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        let scenes = state
+            .app
+            .list_scenes(false)
+            .unwrap()
+            .into_iter()
+            .filter(|scene| scene.chapter_id == Some(chapters[0].id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            scenes
+                .iter()
+                .map(|scene| scene.scene.title.as_str())
+                .collect::<Vec<_>>(),
+            ["Scene 10", "Scene 11"]
         );
     }
 

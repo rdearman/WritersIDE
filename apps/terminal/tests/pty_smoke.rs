@@ -59,6 +59,74 @@ fn named_snapshot_compare_and_selective_restore_work_through_the_production_pty(
 
 #[cfg(target_os = "linux")]
 #[test]
+fn bulk_outline_insertion_uses_the_production_menu_and_persists_through_reopen() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Bulk Outline Project");
+    let mut app = WriterApp::create_project(&project, "Bulk Outline").unwrap();
+    let section = app.create_section("Part One", 0).unwrap();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("bulk-outline-insert")
+        .output()
+        .expect("run bulk chapter insertion through the production Linux PTY");
+    assert!(
+        result.status.success(),
+        "bulk outline insertion PTY failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    let chapters = reopened
+        .list_structural_nodes()
+        .unwrap()
+        .into_iter()
+        .filter(|node| node.parent_id == Some(section) && node.kind == "chapter")
+        .collect::<Vec<_>>();
+    assert_eq!(chapters.len(), 5);
+    assert_eq!(
+        chapters
+            .iter()
+            .map(|chapter| chapter.title.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Chapter 1",
+            "Chapter 2",
+            "Chapter 3",
+            "Chapter 4",
+            "Chapter 5"
+        ]
+    );
+    assert!(chapters.iter().all(|chapter| chapter.kind == "chapter"));
+    let scenes = reopened.list_scenes(false).unwrap();
+    assert_eq!(scenes.len(), 5);
+    assert!(
+        scenes
+            .iter()
+            .all(|scene| scene.chapter_id == Some(chapters[0].id))
+    );
+    assert_eq!(
+        scenes
+            .iter()
+            .map(|scene| scene.scene.title.as_str())
+            .collect::<Vec<_>>(),
+        ["Scene 1", "Scene 2", "Scene 3", "Scene 4", "Scene 5"]
+    );
+    assert_eq!(reopened.get_project().unwrap().title, "Bulk Outline");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn whole_document_snapshot_restore_requires_confirmation_in_the_production_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

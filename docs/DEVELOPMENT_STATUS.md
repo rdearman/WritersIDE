@@ -2692,15 +2692,18 @@ Conversion has automated verification but has not had human UAT.
 ### Bulk outline insertion checkpoint — 27 November 2026
 
 The Outline menu now has **Insert Multiple Items…** for numbered chapter and
-section runs. Its visible dialogue accepts item type, quantity (1–100), a
-`{n}` naming pattern and starting number. The insertion location follows the
-selected section/chapter; the whole batch is one database transaction with
-safe sibling-position compaction. Invalid quantity, parent or title data leaves
-the outline unchanged. Scene creation continues to use the existing rapid
-Insert action and is not yet included in this batch dialogue.
+section runs, and can create a numbered run of scenes in the selected chapter
+or as unplaced scenes. Its visible dialogue accepts item type, quantity
+(1–100), a `{n}` naming pattern and starting number. Structural and scene
+batches are transactional; sibling positions are compacted safely, manuscript
+files are staged and cleaned on failure, and invalid input leaves the outline
+unchanged.
 
 Focused verification passed for transactional storage insertion/persistence
 and the terminal dialogue, rendering, sequential chapter names, nested section
-names and invalid-count rollback. Targeted Clippy with warnings denied and
-formatting passed. This increment still needs a production PTY check and human
-UAT; no new Alpha build has been generated.
+names, scene type selection and invalid-count rollback. A production 80×24 PTY
+test used the Outline menu to create five chapters and five scenes, exited,
+reopened the project and verified their names, order and chapter placement.
+Storage scene-batch tests, the focused terminal test, formatting and targeted
+Clippy with warnings denied passed. Human UAT remains pending. No new Alpha
+build has been generated; Alpha UAT 42 remains frozen at `dac9c35`.
