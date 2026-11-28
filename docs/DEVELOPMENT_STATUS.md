@@ -2895,3 +2895,20 @@ private-corpus PTY test skipped because its local fixture path was not set; all
 other workspace and doc tests passed. Workspace Clippy with warnings denied,
 formatting and `git diff --check` passed. The skip is not reported as a pass.
 Human UAT remains pending.
+
+### Frozen Alpha UAT 45 — 28 November 2026
+
+Alpha UAT 45 is at `test-builds/alpha-uat-45-0017fcc/`, frozen from
+`0017fcc9c0517df62fc9bfaccb32f68876a7d6ff`. Launch from the repository root:
+
+```sh
+cd test-builds/alpha-uat-45-0017fcc
+./run.sh "The Glassmaker's Compass"
+```
+
+The bundle includes isolated preferences and disposable synthetic fiction and
+non-fiction projects. It adds the project dictionary workflow to the Alpha 44
+proofreading actions. The release executable passed the production PTY fiction
+creation/write/save/exit smoke workflow, and all bundle checksums verified.
+Alpha 43 was removed after Alpha 45 passed, leaving only numbered Alpha 44 and
+45 bundles. Human acceptance remains pending.
