@@ -165,6 +165,7 @@ def main():
     bulk_outline_insert = modes == ["bulk-outline-insert"]
     scene_status_picker = modes == ["scene-status-picker"]
     manuscript_status_settings = modes == ["manuscript-status-settings"]
+    scene_planning_fields = modes == ["scene-planning-fields"]
     reference_removal = modes == ["reference-removal"]
     compile_docx = modes == ["compile-docx"]
     scrivener_import = modes == ["scrivener-import"]
@@ -235,6 +236,7 @@ def main():
         or bulk_outline_insert
         or scene_status_picker
         or manuscript_status_settings
+        or scene_planning_fields
         or search_outline_restore
     ):
         # Keep this workflow focused on project lifecycle rather than allowing
@@ -2677,6 +2679,40 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("the application did not exit cleanly after bulk outline insertion")
             print("PTY bulk outline insertion passed: numbered chapters and scenes were created through the production Outline menu.")
+            return
+
+        if scene_planning_fields:
+            show_outline_tree_presentation()
+            os.write(master, b"\x1b[B\x1b[B")  # select the scene under the chapter
+            if not wait_for_screen_fragments((b"Opening",), timeout=2.0):
+                raise AssertionError("the scene for planning-field editing was not visible")
+            menu_start = open_named_menu("Outline")
+            select_visible_menu_item("Edit Scene Planning…")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Edit Scene Planning", b"Synopsis", b"Purpose", b"Goal", b"Outcome"),
+                menu_start,
+                timeout=3.0,
+            ):
+                raise AssertionError("the scene planning field chooser did not open")
+            os.write(master, b"\x1b[B\x1b[B\r")  # Goal
+            if not wait_for_screen_fragments((b"Edit goal for",), menu_start, timeout=3.0):
+                raise AssertionError("choosing Goal did not open its author-facing editor")
+            os.write(master, b"Escape at the observatory\r")
+            if not wait_for_screen_fragments((b"Scene goal saved",), menu_start, timeout=3.0):
+                raise AssertionError("the selected scene goal was not saved")
+            # Planning metadata is stored transactionally by the application
+            # service; closing and reopening below verifies durable persistence.
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after planning metadata edit")
+            print("PTY scene planning metadata passed: selected Goal in the outline, edited without identifiers, and saved.")
             return
 
         if scene_status_picker:

@@ -1,5 +1,24 @@
 # Writer's IDE Development Status
 
+## Outline scene metadata inspector — 28 November 2026
+
+The unified Outline's selected-item pane now shows a selected scene's current
+status, publication inclusion, actual/planned word counts, synopsis, purpose,
+goal and outcome. Outline → **Edit Scene Planning…** presents a keyboard
+selector for those four planning fields and opens an editor labelled with the
+selected scene and field; no scene UUID or command syntax is needed. Metadata
+updates remain transactional and are verified after closing and reopening.
+
+Verification after this change: formatting, the outline presentation test,
+the production PTY metadata-edit/save/reopen workflow, and warnings-denied
+workspace Clippy passed. The immediately preceding full offline workspace run
+passed with 388 terminal unit tests, 3 end-to-end author workflows and 58
+production PTY tests; one protected private-corpus PTY was skipped because its
+local fixture path was unset. The workspace test run preceded this metadata
+change, so only the focused tests above verify the new interaction. Human UAT
+remains required; #68's broader typed metadata inspector and editing coverage
+are still incomplete.
+
 ## Staged project recovery after SSH hangup — 28 November 2026
 
 Added a production Linux PTY test that types a draft into a staged project,

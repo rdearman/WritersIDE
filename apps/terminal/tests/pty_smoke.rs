@@ -269,6 +269,43 @@ fn bulk_outline_insertion_uses_the_production_menu_and_persists_through_reopen()
 
 #[cfg(target_os = "linux")]
 #[test]
+fn scene_planning_field_is_selected_and_saved_from_the_production_outline_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Planning Field Project");
+    let mut app = WriterApp::create_project(&project, "Planning Field").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("scene-planning-fields")
+        .output()
+        .expect("edit a scene planning field through the Linux PTY");
+    assert!(
+        result.status.success(),
+        "scene planning field PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    let record = reopened.get_scene(scene).unwrap();
+    assert_eq!(record.scene.goal, "Escape at the observatory");
+    assert!(record.scene.synopsis.is_empty());
+    assert!(record.scene.purpose.is_empty());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn scene_status_is_selected_from_the_project_choices_through_the_production_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

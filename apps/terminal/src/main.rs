@@ -2760,8 +2760,8 @@ fn command_registry() -> Vec<CommandSpec> {
         },
         legacy_command(
             "scene.field",
-            "Edit Scene Planning Field",
-            "Edit a scene synopsis or purpose field",
+            "Edit Scene Planning…",
+            "Choose a planning field for the selected scene",
             "Edit",
             "scene-field",
             true,
@@ -17474,7 +17474,7 @@ impl AppState {
                             spec.takes_arguments = false;
                         }
                         "scene.field" => {
-                            spec.label = "Edit Scene Synopsis";
+                            spec.label = "Edit Scene Planning…";
                             spec.takes_arguments = false;
                         }
                         "scene.move" => {
@@ -18642,7 +18642,7 @@ impl AppState {
             return Ok(());
         }
         if command_id == "scene.field" && arguments.is_none() {
-            self.start_scene_synopsis();
+            self.open_scene_planning_field_picker();
             return Ok(());
         }
         if command_id == "outline.move-up" && self.workspace == Workspace::Cards {
@@ -18788,14 +18788,52 @@ impl AppState {
     }
 
     fn start_scene_synopsis(&mut self) {
+        self.start_scene_planning_edit('Y', "synopsis");
+    }
+
+    fn open_scene_planning_field_picker(&mut self) {
         if selected_scene_for_workspace(self).is_none() {
-            self.message = "Select a scene in the Outline before editing its synopsis".into();
+            self.message =
+                "Select a scene in the Outline before editing its planning fields".into();
             return;
         }
-        self.mode = Some('Y');
-        self.prompt.clear();
-        self.message =
-            "Edit selected scene synopsis · enter text · Enter saves · Esc cancels".into();
+        self.help_panel = Some(HelpPanel {
+            title: "Edit Scene Planning Field".into(),
+            lines: vec![
+                "Synopsis".into(),
+                "Purpose".into(),
+                "Goal".into(),
+                "Outcome".into(),
+            ],
+            scroll: 0,
+        });
+        self.message = "Choose a planning field · ↑/↓ select · Enter edit · Esc cancel".into();
+    }
+
+    fn start_scene_planning_edit(&mut self, mode: char, field: &str) {
+        let Some(scene_id) = selected_scene_for_workspace(self) else {
+            self.message =
+                "Select a scene in the Outline before editing its planning fields".into();
+            return;
+        };
+        let Ok(record) = self.app.get_scene(scene_id) else {
+            self.message =
+                "The selected scene could not be loaded · no planning field changed".into();
+            return;
+        };
+        self.mode = Some(mode);
+        self.prompt = match field {
+            "synopsis" => record.scene.synopsis,
+            "purpose" => record.scene.purpose,
+            "goal" => record.scene.goal,
+            "outcome" => record.scene.outcome,
+            _ => String::new(),
+        };
+        self.message = format!(
+            "Edit {} for ‘{}’ · Enter saves · Esc cancels",
+            field.to_ascii_lowercase(),
+            record.scene.title
+        );
     }
 
     fn record_recent_command(&mut self, command_id: &str) {
@@ -19605,7 +19643,7 @@ impl AppState {
             self.message = format!("Renamed document to ‘{}’", cmd.trim());
             return Ok(());
         }
-        if matches!(mode, Some('T' | 'Y')) {
+        if matches!(mode, Some('T' | 'Y' | 'A' | 'B' | 'C')) {
             let Some(scene_id) = selected_scene_for_workspace(self) else {
                 self.message = "Select a scene in the Outline first · no scene was changed".into();
                 return Ok(());
@@ -19617,10 +19655,22 @@ impl AppState {
             }
             let result = (|| -> Result<(), Box<dyn std::error::Error>> {
                 let mut scene = self.app.get_scene(scene_id)?.scene;
+                let planning_field = match mode {
+                    Some('A') => "purpose",
+                    Some('B') => "goal",
+                    Some('C') => "outcome",
+                    _ => "synopsis",
+                };
                 if mode == Some('T') {
                     scene.title = cmd.clone();
                 } else {
-                    scene.synopsis = cmd.clone();
+                    match planning_field {
+                        "synopsis" => scene.synopsis = cmd.clone(),
+                        "purpose" => scene.purpose = cmd.clone(),
+                        "goal" => scene.goal = cmd.clone(),
+                        "outcome" => scene.outcome = cmd.clone(),
+                        _ => unreachable!(),
+                    }
                 }
                 self.app.update_scene_metadata(&scene)?;
                 self.refresh()?;
@@ -19628,7 +19678,7 @@ impl AppState {
                 self.message = if mode == Some('T') {
                     format!("Renamed scene to “{cmd}”")
                 } else {
-                    "Scene synopsis saved".into()
+                    format!("Scene {planning_field} saved")
                 };
                 Ok(())
             })();
@@ -28247,6 +28297,57 @@ fn detail_panel_title(state: &AppState) -> &'static str {
     }
 }
 
+fn selected_outline_detail(state: &AppState) -> String {
+    let rows = outline_rows(state);
+    let Some(row) = rows.get(state.selected) else {
+        return "No outline item selected".into();
+    };
+    let OutlineRow::Scene(id) = row else {
+        return format!(
+            "{}\n\nEnter opens this item in the manuscript. Use the Outline menu to edit or organise it.",
+            workspace_items(state)
+                .get(state.selected)
+                .map(String::as_str)
+                .unwrap_or("Selected outline item")
+        );
+    };
+    let Ok(record) = state.app.get_scene(*id) else {
+        return "The selected scene is no longer available".into();
+    };
+    let words = state
+        .scenes
+        .iter()
+        .find(|(scene, _, _, _)| scene == id)
+        .map(|(_, _, _, words)| *words)
+        .unwrap_or_default();
+    let included = state.app.scene_is_included(*id).unwrap_or(false);
+    let statuses = state.app.list_manuscript_statuses().unwrap_or_default();
+    let target_words = record
+        .scene
+        .target_words
+        .map(|target| target.to_string())
+        .unwrap_or_else(|| "—".into());
+    let value = |text: &str| {
+        if text.trim().is_empty() {
+            "—".to_owned()
+        } else {
+            text.to_owned()
+        }
+    };
+    format!(
+        "Scene: {}\nStatus: {}\nPublication: {}\nWords: {} / {} planned\n\nSynopsis: {}\n\nPurpose: {}\n\nGoal: {}\n\nOutcome: {}\n\nEnter opens prose · Outline > Edit Scene Planning… edits these fields",
+        record.scene.title,
+        manuscript_status_label(record.scene.status, &statuses),
+        if included { "Included" } else { "Excluded" },
+        words,
+        target_words,
+        value(&record.scene.synopsis),
+        value(&record.scene.purpose),
+        value(&record.scene.goal),
+        value(&record.scene.outcome),
+    )
+}
+
 fn scrivener_import_detail(
     wizard: &ScrivenerImportWizard,
     selected: usize,
@@ -30015,12 +30116,9 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             } else if s.workspace == Workspace::Dashboard && s.scenes.is_empty() {
                 "Welcome to Writer's IDE\n\nSelect Start Writing to create a chapter and first scene, then start drafting. Select Open or Import to continue an existing manuscript. Offline Help is available with ? .".into()
             } else if s.workspace == Workspace::Outline {
-                let row = workspace_items(s)
-                    .get(s.selected)
-                    .cloned()
-                    .unwrap_or_else(|| "No outline row selected".into());
                 format!(
-                    "{row}\n\nEnter opens this item in the manuscript. Space expands/collapses headings or includes/excludes the selected scene or prose document."
+                    "{}\n\nSpace expands/collapses headings or includes/excludes the selected item.",
+                    selected_outline_detail(s)
                 )
             } else if s.workspace == Workspace::Research && s.proposal_review_active {
                 format!(
@@ -30959,6 +31057,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
     let area = f.area();
     let tutorial = panel.title.starts_with("Tutorial ·");
     let scrivener_layout_chooser = panel.title == "Choose Scrivener Layout";
+    let scene_planning_field_chooser = panel.title == "Edit Scene Planning Field";
     let width = if tutorial {
         area.width.saturating_sub(2).clamp(1, 78)
     } else {
@@ -31024,7 +31123,7 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
                 }
             })
             .collect::<Text>()
-    } else if scrivener_layout_chooser {
+    } else if scrivener_layout_chooser || scene_planning_field_chooser {
         panel
             .lines
             .iter()
@@ -31059,6 +31158,8 @@ fn draw_help_overlay(f: &mut ratatui::Frame<'_>, state: &AppState) {
                     format!(" {} ", panel.title)
                 } else if scrivener_layout_chooser {
                     " Choose Scrivener Layout · ↑/↓ select · Enter continue · Esc cancel ".into()
+                } else if scene_planning_field_chooser {
+                    " Edit Scene Planning · ↑/↓ select · Enter edit · Esc cancel ".into()
                 } else {
                     format!(" {} · Esc closes ", panel.title)
                 })
@@ -37955,6 +38056,42 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     }
     if s.help_panel.is_some() && !tutorial_has_focus {
         let panel_title = s.help_panel.as_ref().map(|panel| panel.title.as_str());
+        if panel_title == Some("Edit Scene Planning Field") {
+            match k.code {
+                KeyCode::Esc => {
+                    s.help_panel = None;
+                    s.message = "Planning field edit cancelled · scene metadata unchanged".into();
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    if let Some(panel) = s.help_panel.as_mut() {
+                        let count = panel.lines.len();
+                        panel.scroll = if k.code == KeyCode::Up {
+                            (panel.scroll + count - 1) % count
+                        } else {
+                            (panel.scroll + 1) % count
+                        };
+                    }
+                }
+                KeyCode::Enter => {
+                    let selected = s
+                        .help_panel
+                        .as_ref()
+                        .and_then(|panel| panel.lines.get(panel.scroll))
+                        .map(String::as_str)
+                        .unwrap_or("Synopsis");
+                    let (mode, field) = match selected {
+                        "Purpose" => ('A', "purpose"),
+                        "Goal" => ('B', "goal"),
+                        "Outcome" => ('C', "outcome"),
+                        _ => ('Y', "synopsis"),
+                    };
+                    s.help_panel = None;
+                    s.start_scene_planning_edit(mode, field);
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
         if panel_title == Some("Welcome to Writer's IDE") {
             match k.code {
                 KeyCode::Esc => {
@@ -40365,6 +40502,12 @@ mod tests {
         let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
         let first = app.create_scene(chapter, "First", 0).unwrap();
         let second = app.create_scene(chapter, "Second", 1).unwrap();
+        let mut second_record = app.get_scene(second).unwrap().scene;
+        second_record.synopsis = "Mara finds the station empty".into();
+        second_record.purpose = "Introduce the missing informant".into();
+        second_record.goal = "Find the coded message".into();
+        second_record.outcome = "A clue points to the harbour".into();
+        app.update_scene_metadata(&second_record).unwrap();
         let mut state = AppState::new(app, default_bindings());
         state.refresh().unwrap();
         state.workspace = Workspace::Outline;
@@ -40398,12 +40541,25 @@ mod tests {
             .iter()
             .position(|row| *row == OutlineRow::Scene(second))
             .unwrap();
+        let metadata_detail = selected_outline_detail(&state);
+        for value in [
+            "Mara finds the station empty",
+            "Introduce the missing informant",
+            "Find the coded message",
+            "A clue points to the harbour",
+            "Publication: Included",
+        ] {
+            assert!(
+                metadata_detail.contains(value),
+                "missing {value}: {metadata_detail}"
+            );
+        }
         let entries = state.menu_visible_entries();
         for label in [
             "New Scene",
             "Write Selected Scene",
             "Rename Selected Scene",
-            "Edit Scene Synopsis",
+            "Edit Scene Planning…",
             "Move Selected Item Earlier",
             "Move Selected Item Later",
             "Move Scene to Chapter…",
@@ -40492,6 +40648,15 @@ mod tests {
         state
             .handle_menu_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
+        assert_eq!(
+            state.help_panel.as_ref().map(|panel| panel.title.as_str()),
+            Some("Edit Scene Planning Field")
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
         assert_eq!(state.mode, Some('Y'));
         state.prompt = "Mara reaches the station".into();
         state.command().unwrap();
