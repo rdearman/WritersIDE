@@ -173,7 +173,9 @@ fn manuscript_status_choices_are_configurable_through_the_production_pty() {
 
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("Status Settings Project");
-    let app = WriterApp::create_project(&project, "Status Settings").unwrap();
+    let mut app = WriterApp::create_project(&project, "Status Settings").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
     drop(app);
     let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
     let result = Command::new("python3")
@@ -198,6 +200,18 @@ fn manuscript_status_choices_are_configurable_through_the_production_pty() {
         .unwrap();
     assert_eq!(planned.label, "Planning");
     assert!(!planned.enabled);
+    assert_eq!(
+        statuses
+            .iter()
+            .find(|item| item.status == SceneStatus::Custom(1))
+            .unwrap()
+            .label,
+        "Third Draft"
+    );
+    assert_eq!(
+        reopened.get_scene(scene).unwrap().scene.status,
+        SceneStatus::Custom(1)
+    );
 }
 
 #[cfg(target_os = "linux")]

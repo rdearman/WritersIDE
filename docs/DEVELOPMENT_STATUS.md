@@ -2726,6 +2726,8 @@ status labels instead of internal custom IDs. The storage suite passed (102
 tests), the production status-configuration PTY and focused label-rendering
 test passed, and targeted Clippy with warnings denied passed.
 Human UAT remains pending; Alpha UAT 42 remains frozen.
+The production PTY also assigns “Third Draft” through Outline > Set Scene
+Status, then reopens the project and verifies the assignment persisted.
 
 ### Author-facing argument prompt correction — 28 November 2026
 

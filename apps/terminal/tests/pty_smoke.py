@@ -2459,6 +2459,10 @@ def main():
             return
 
         if manuscript_status_settings:
+            show_outline_tree_presentation()
+            os.write(master, b"\x1b[B\x1b[B")  # select the scene under the chapter
+            if not wait_for_screen_fragments((b"Arrival",), timeout=2.0):
+                raise AssertionError("the scene for custom status assignment was not visible")
             menu_start = open_named_menu("Tools")
             select_visible_menu_item("Manuscript Statuses…")
             os.write(master, b"\r")
@@ -2479,6 +2483,20 @@ def main():
             os.write(master, b"\r")  # save project-local status choices
             if not wait_for_screen_fragments((b"status choices saved to this project",), menu_start, timeout=3.0):
                 raise AssertionError("status configuration did not report a successful project save")
+            outline_start = open_outline_menu()
+            select_visible_menu_item("Set Scene Status…")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(("Status · Arrival".encode(), b"Third Draft"), outline_start, timeout=3.0):
+                raise AssertionError(
+                    "the scene status chooser did not show the custom project status; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            for _ in range(7):
+                os.write(master, b"\x1b[B")
+                read_for(0.22)
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"status set to Third Draft", b"Third Draft"), outline_start, timeout=3.0):
+                raise AssertionError("the author could not assign the custom status from the scene picker")
             os.write(master, b"\x11")
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0
