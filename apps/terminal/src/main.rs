@@ -387,6 +387,7 @@ struct AppState {
     dirty: bool,
     mode: Option<char>,
     prompt: String,
+    hidden_command_prefix_len: Option<usize>,
     message: String,
     help_panel: Option<HelpPanel>,
     tutorial_preferences_path: PathBuf,
@@ -8474,6 +8475,7 @@ impl AppState {
             dirty: false,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message,
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),
@@ -18089,13 +18091,8 @@ impl AppState {
                             self.prompt_for_registered_command(spec)?;
                             return Ok(());
                         }
-                        let prefix = spec
-                            .palette_prefix
-                            .ok_or("menu command has no command-palette route")?;
                         self.menu = None;
-                        self.mode = Some(':');
-                        self.prompt = format!("{prefix} ");
-                        self.message = spec.description.into();
+                        self.prompt_for_registered_command(spec)?;
                         return Ok(());
                     }
                     self.menu = None;
@@ -18157,13 +18154,8 @@ impl AppState {
                             self.prompt_for_registered_command(spec)?;
                             return Ok(());
                         }
-                        let prefix = spec
-                            .palette_prefix
-                            .ok_or("menu command has no command-palette route")?;
                         self.menu = None;
-                        self.mode = Some(':');
-                        self.prompt = format!("{prefix} ");
-                        self.message = spec.description.into();
+                        self.prompt_for_registered_command(spec)?;
                         return Ok(());
                     }
                     self.menu = None;
@@ -18965,6 +18957,7 @@ impl AppState {
         &mut self,
         command: CommandSpec,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        self.hidden_command_prefix_len = None;
         match command.action {
             CommandAction::CreateSection => {
                 self.mode = Some('P');
@@ -18991,13 +18984,18 @@ impl AppState {
             .ok_or("argument command has no command-palette invocation")?;
         self.mode = Some(':');
         self.prompt = format!("{prefix} ");
-        self.message = format!("Arguments for {}", command.label);
+        self.hidden_command_prefix_len = Some(self.prompt.len());
+        self.message = format!(
+            "{} · enter the requested details · Enter runs · Esc cancels",
+            command.description
+        );
         Ok(())
     }
     fn command(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let cmd = self.prompt.trim().to_owned();
         self.prompt.clear();
         let mode = self.mode.take();
+        self.hidden_command_prefix_len = None;
         if matches!(mode, Some('L' | 'l')) {
             let result = if cmd.is_empty() {
                 Err("Enter a layout name, or press Esc to cancel".into())
@@ -29695,8 +29693,12 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                     Constraint::Length(1),
                 ])
                 .split(inner);
+            let prompt_text = s
+                .hidden_command_prefix_len
+                .and_then(|prefix_len| s.prompt.get(prefix_len..))
+                .unwrap_or(&s.prompt);
             f.render_widget(
-                Paragraph::new(format!(" {mode} {}_", s.prompt)),
+                Paragraph::new(format!(" {mode} {prompt_text}_")),
                 sections[0],
             );
             f.render_widget(
@@ -36421,13 +36423,6 @@ fn step_find_query_history(
     Ok(())
 }
 
-fn command_palette_alias(command: &CommandSpec) -> &str {
-    command
-        .palette_prefix
-        .or_else(|| command.palette_aliases.first().copied())
-        .unwrap_or(command.id)
-}
-
 fn begin_command_arguments(
     s: &mut AppState,
     command: CommandSpec,
@@ -36453,12 +36448,15 @@ fn begin_command_arguments(
         s.command_palette = None;
         return s.prompt_for_registered_command(command);
     }
-    let prefix = command_palette_alias(&command);
     s.command_palette = None;
-    s.mode = Some(':');
-    s.prompt = format!("{prefix} ");
-    s.message = format!("Arguments for {} · Enter runs · Esc cancels", command.label);
-    Ok(())
+    if command.id == "scene.move" {
+        return s.start_scene_move();
+    }
+    if command.id == "scene.field" {
+        s.start_scene_synopsis();
+        return Ok(());
+    }
+    s.prompt_for_registered_command(command)
 }
 
 fn invoke_palette_command(
@@ -38061,10 +38059,13 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             KeyCode::Esc => {
                 s.mode = None;
                 s.prompt.clear();
+                s.hidden_command_prefix_len = None;
             }
             KeyCode::Enter => s.command()?,
             KeyCode::Backspace => {
-                s.prompt.pop();
+                if s.prompt.len() > s.hidden_command_prefix_len.unwrap_or(0) {
+                    s.prompt.pop();
+                }
             }
             KeyCode::Char(c) if k.modifiers.is_empty() || k.modifiers == KeyModifiers::SHIFT => {
                 s.prompt.push(c)
@@ -46089,6 +46090,7 @@ mod tests {
             dirty: true,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message: String::new(),
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),
@@ -48803,6 +48805,48 @@ mod tests {
     }
 
     #[test]
+    fn registered_argument_prompt_hides_internal_command_name() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        let command = command_by_id("search.query-assert-save").unwrap();
+        state.prompt_for_registered_command(command).unwrap();
+        assert_eq!(state.mode, Some(':'));
+        assert!(state.hidden_command_prefix_len.is_some());
+        assert!(state.prompt.starts_with("query-assert-save "));
+
+        let render = |state: &mut AppState| {
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            terminal.draw(|frame| draw(frame, state)).unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>()
+        };
+        let initial = render(&mut state);
+        assert!(!initial.contains("query-assert-save"), "{initial}");
+        assert!(initial.contains("Persist count assertions"), "{initial}");
+
+        for character in "ideas exactly:1".chars() {
+            handle(
+                &mut state,
+                KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE),
+            )
+            .unwrap();
+        }
+        let entered = render(&mut state);
+        assert!(entered.contains("ideas exactly:1"), "{entered}");
+        assert!(!entered.contains("query-assert-save"), "{entered}");
+        handle(&mut state, KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.mode, None);
+        assert_eq!(state.hidden_command_prefix_len, None);
+    }
+
+    #[test]
     fn terminal_find_and_replace_use_each_scenes_locale() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
@@ -50053,6 +50097,7 @@ mod tests {
             dirty: false,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message: String::new(),
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),
@@ -50227,6 +50272,7 @@ mod tests {
             dirty: false,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message: String::new(),
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),
@@ -50509,6 +50555,7 @@ mod tests {
             dirty: false,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message: String::new(),
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),
@@ -50687,6 +50734,7 @@ mod tests {
             dirty: false,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message: String::new(),
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),
@@ -51015,6 +51063,7 @@ mod tests {
             dirty: false,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message: String::new(),
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),
@@ -51193,6 +51242,7 @@ mod tests {
             dirty: false,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message: String::new(),
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),
@@ -53048,6 +53098,7 @@ mod tests {
             dirty: false,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message: String::new(),
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),
@@ -53443,6 +53494,7 @@ mod tests {
             dirty: false,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message: String::new(),
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),
@@ -55085,6 +55137,7 @@ mod tests {
             dirty: false,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message: String::new(),
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),
@@ -55274,6 +55327,7 @@ mod tests {
             dirty: false,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message: String::new(),
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),
@@ -55515,6 +55569,7 @@ mod tests {
             dirty: false,
             mode: None,
             prompt: String::new(),
+            hidden_command_prefix_len: None,
             message: String::new(),
             help_panel: None,
             tutorial_preferences_path: user_tutorial_preferences_path(),

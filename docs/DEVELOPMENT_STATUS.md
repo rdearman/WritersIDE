@@ -2724,3 +2724,20 @@ targeted Clippy with warnings denied. Authors can rename the seven supported
 drafting stages to create a project-specific progression, but the current model
 does not create an unlimited number of distinct status stages. Human UAT
 remains pending; Alpha UAT 42 remains frozen.
+
+### Author-facing argument prompt correction — 28 November 2026
+
+Registered commands that need free-form arguments now keep the internal
+dispatch prefix out of the visible input line. The screen presents the
+command's author-facing description and only displays the details the author
+types. Backspace cannot erase the hidden dispatch prefix; Enter still routes
+the same arguments through the existing command dispatcher, and Esc cancels.
+Scene move and planning-field palette actions route to their existing
+selection workflows instead of requesting command syntax.
+
+Verification passed with a rendered terminal regression test asserting the
+internal command name is absent while user input remains visible, the scene
+status production PTY regression, formatting and terminal Clippy with warnings
+denied. This does not replace dedicated forms for every advanced command;
+advanced command-palette operations remain available, while broader dialog
+work is still outstanding.
