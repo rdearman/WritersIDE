@@ -3026,8 +3026,15 @@ palette and both that test and the new pane recovery test pass individually.
 The full 65-test PTY rerun found a second timing issue in the new scenario's
 menu-navigation helper: it advanced faster than the terminal poll interval and
 could overshoot Outline. The helper now waits at least 220 ms per menu step;
-the pane-recovery scenario passed three consecutive focused PTY runs. The full
-65-test PTY rerun is pending. Full per-pane independent view state remains
+the pane-recovery scenario passed three consecutive focused PTY runs. The next
+full PTY run exposed two additional harness races: the production authoring
+journey sent all four story-link form fields in one burst, and the dictionary
+workflow sent its action immediately after asynchronous spelling results
+appeared. The harness now waits for each visible form step and for a settled
+result pane. Focused runs passed, followed by the complete serial production
+PTY suite: 64 passed, 0 failed, 1 protected-corpus test ignored because its
+private fixture variable was unset. Formatting and terminal Clippy with
+warnings denied passed. Full per-pane independent view state remains
 outstanding. This is partial progress on U47-08/09/11, not completion of the
 pane acceptance criteria.
 

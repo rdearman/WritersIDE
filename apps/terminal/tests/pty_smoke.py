@@ -1412,8 +1412,21 @@ def main():
                 if "Baad · line" in "\n".join(terminal_snapshot(output, 24, 80)):
                     raise AssertionError("project dictionary word remained in spell-check results after reopening")
             elif review_spellcheck_dictionary_add:
+                # Wait through a complete render/poll cycle after the result
+                # row appears.  Spell Check may finish its provider request
+                # just before the view has processed a key, and sending `d`
+                # earlier can deliver it to the editor behind the view.
+                read_for(0.3)
+                if not wait_for_screen_fragments(
+                    (b"Spell Check", b"Arrival", b"Baad", b"line 1, column 1"),
+                    timeout=1.0,
+                ):
+                    raise AssertionError(
+                        "Spell Check result pane was not stable before dictionary action; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
                 os.write(master, b"d")
-                if not wait_for_screen_fragments((b"to this project's dictionary", b"Manuscript unchanged"), timeout=3.0):
+                if not wait_for_screen_fragments((b"to this project's dictionary", b"Manuscript unchanged"), timeout=5.0):
                     raise AssertionError("Add to Project Dictionary did not confirm the update; screen: " + repr(terminal_snapshot(output, 24, 80)))
                 if "Baad · line" in "\n".join(terminal_snapshot(output, 24, 80)):
                     raise AssertionError("adding a word did not remove its current spelling findings")
@@ -3133,7 +3146,59 @@ def main():
 
             link_start = open_named_menu("Insert")
             select_visible_menu_item("Create Story Link")
-            os.write(master, b"\rOpening\rDiscovery\rrelated\r\r")
+            # The highlighted row can be rendered in the same PTY read that
+            # processes the final navigation event. Let the menu state settle
+            # before confirming, particularly under the full-suite load.
+            read_for(0.22)
+            if not wait_for_screen_fragments(
+                ("▸ Create Story Link".encode("utf-8"),), link_start, timeout=1.0
+            ):
+                raise AssertionError("Create Story Link lost menu selection before confirmation")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments((b"Create Story Relationship",), link_start, timeout=3.0):
+                raise AssertionError(
+                    "Create Story Link selection did not open its dialogue; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+
+            def enter_story_link_filter(value, next_step):
+                # The searchable selectors and four-step relationship form
+                # are a modal workflow.  Send one action at a time and wait
+                # for the next visible field so slow PTY polling cannot merge
+                # several Enter events or leave later text in the wrong
+                # selector.
+                if not wait_for_screen_fragments(
+                    (f"Step {next_step - 1} of 4".encode(),),
+                    link_start,
+                    timeout=3.0,
+                ):
+                    raise AssertionError(
+                        f"story relationship form did not reach step {next_step - 1}; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+                for character in value:
+                    os.write(master, character.encode("utf-8"))
+                    read_for(0.04)
+                os.write(master, b"\r")
+                if not wait_for_screen_fragments(
+                    (f"Step {next_step} of 4".encode(),),
+                    link_start,
+                    timeout=3.0,
+                ):
+                    raise AssertionError(
+                        f"story relationship form did not advance to step {next_step}; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
+
+            if not wait_for_screen_fragments((b"Step 1 of 4",), link_start, timeout=3.0):
+                raise AssertionError(
+                    "Create Story Link did not open its selection dialogue; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            enter_story_link_filter("Opening", 2)
+            enter_story_link_filter("Discovery", 3)
+            enter_story_link_filter("related", 4)
+            os.write(master, b"\r")  # optional label may remain blank
             if not wait_for_screen_fragments((b"Created related relationship", b"Scene", b"Opening", b"Discovery"), link_start, timeout=5.0):
                 raise AssertionError("searchable story-link selection did not create a named link; screen: " + repr(terminal_snapshot(output, 24, 80)))
             type_start = len(output)
