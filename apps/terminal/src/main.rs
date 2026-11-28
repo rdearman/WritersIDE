@@ -13758,6 +13758,62 @@ impl AppState {
         pane.scroll = review.selected;
         true
     }
+    fn add_selected_spelling_word_to_project_dictionary(
+        &mut self,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let Some(review) = self
+            .active_reference_pane()
+            .and_then(|pane| pane.spelling.as_ref())
+        else {
+            return Ok(false);
+        };
+        let Some(word) = review
+            .occurrences
+            .get(review.selected)
+            .map(|occurrence| occurrence.word.clone())
+        else {
+            return Ok(false);
+        };
+        let language = review.language.clone();
+        let added =
+            add_word_to_project_spelling_dictionary(self.app.project_root(), &language, &word)?;
+        let Some(pane) = self.active_reference_pane_mut() else {
+            return Ok(false);
+        };
+        let Some(review) = &mut pane.spelling else {
+            return Ok(false);
+        };
+        review
+            .occurrences
+            .retain(|occurrence| !occurrence.word.eq_ignore_ascii_case(&word));
+        review.selected = review
+            .selected
+            .min(review.occurrences.len().saturating_sub(1));
+        review.suggestions.clear();
+        review.selected_suggestion = 0;
+        review.choosing_suggestion = false;
+        review.jumped_to_source = false;
+        pane.content = if added {
+            format!(
+                "Added ‘{word}’ to this project's dictionary. Manuscript unchanged.\n\n{}",
+                spelling_review_text(&review.occurrences)
+            )
+        } else {
+            spelling_review_text(&review.occurrences)
+        };
+        pane.scroll = review.selected;
+        Ok(added)
+    }
+    fn set_spelling_review_notice(&mut self, notice: &str) {
+        let Some(pane) = self.active_reference_pane_mut() else {
+            return;
+        };
+        let Some(review) = &pane.spelling else {
+            return;
+        };
+        pane.content = format!("{notice}\n\n{}", spelling_review_text(&review.occurrences));
+        pane.scroll = 0;
+    }
     fn jump_to_selected_spelling_occurrence(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let Some(pane) = self.active_reference_pane() else {
             return Ok(());
@@ -18274,11 +18330,13 @@ impl AppState {
                         let aspell = std::env::var_os("WIDE_ASPELL")
                             .map(std::path::PathBuf::from)
                             .unwrap_or_else(|| "aspell".into());
+                        let allowed =
+                            load_project_spelling_dictionary(self.app.project_root(), &language)?;
                         let findings = spellcheck_text_with_engine(
                             &text,
                             &title,
                             &language,
-                            &std::collections::BTreeSet::new(),
+                            &allowed,
                             aspell.to_string_lossy().as_ref(),
                             story_document::SpellcheckEngine::Aspell,
                         )?;
@@ -30274,7 +30332,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 && let Some(review) = pane.spelling.as_ref()
             {
                 format!(
-                    "Spell {} · Enter jump · S choose · C fix · R replace · I ignore once · Esc back",
+                    "Spell {} · Enter jump · S sugg · C fix · I ignore once · D add word · Esc",
                     review.occurrences.len(),
                 )
             } else if s.reference_focused
@@ -31240,6 +31298,97 @@ fn spellcheck_terminal_project_with_engine(
         }
     }
     Ok(findings)
+}
+
+fn project_spelling_dictionary_path(
+    project_root: &Path,
+    language: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    if language.is_empty()
+        || !language
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("invalid spelling dictionary language tag".into());
+    }
+    let root = project_root.canonicalize()?;
+    let metadata_dir = root.join(".writers-ide");
+    let dictionaries_dir = metadata_dir.join("dictionaries");
+    for directory in [&metadata_dir, &dictionaries_dir] {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err("project dictionary directory must not be a symlink".into());
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err("project dictionary path is not a directory".into());
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(dictionaries_dir.join(format!("{language}.txt")))
+}
+
+fn load_project_spelling_dictionary(
+    project_root: &Path,
+    language: &str,
+) -> Result<BTreeSet<String>, Box<dyn std::error::Error>> {
+    let path = project_spelling_dictionary_path(project_root, language)?;
+    if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+        return Err("project dictionary file must not be a symlink".into());
+    }
+    match fs::read_to_string(path) {
+        Ok(source) => Ok(story_document::parse_personal_dictionary(&source)?
+            .into_iter()
+            .map(|word| word.to_lowercase())
+            .collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(BTreeSet::new()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn add_word_to_project_spelling_dictionary(
+    project_root: &Path,
+    language: &str,
+    word: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    if word.is_empty()
+        || word.chars().any(|character| {
+            character.is_whitespace() || character.is_control() || matches!(character, '/' | '\\')
+        })
+    {
+        return Err("select a single word to add to the project dictionary".into());
+    }
+    let path = project_spelling_dictionary_path(project_root, language)?;
+    let words = load_project_spelling_dictionary(project_root, language)?;
+    if words.iter().any(|known| known.eq_ignore_ascii_case(word)) {
+        return Ok(false);
+    }
+    let directory = path
+        .parent()
+        .ok_or("project dictionary has no parent directory")?;
+    fs::create_dir_all(directory)?;
+    let existing = match fs::read_to_string(&path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(existing.as_bytes())?;
+    if !existing.is_empty() && !existing.ends_with('\n') {
+        temporary.write_all(b"\n")?;
+    }
+    temporary.write_all(word.as_bytes())?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&path)?;
+    if let Ok(directory_handle) = fs::File::open(directory) {
+        directory_handle.sync_all()?;
+    }
+    Ok(true)
 }
 
 fn spellcheck_text_with_engine(
@@ -38891,6 +39040,31 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 }
                 return Ok(false);
             }
+            KeyCode::Char('d' | 'D') => {
+                match s.add_selected_spelling_word_to_project_dictionary() {
+                    Ok(true) => {
+                        let remaining = s
+                            .active_reference_pane()
+                            .and_then(|pane| pane.spelling.as_ref())
+                            .map(|review| review.occurrences.len())
+                            .unwrap_or_default();
+                        s.message = format!(
+                            "Word added to this project's dictionary · {remaining} unrelated occurrence(s) remain · prose unchanged"
+                        );
+                    }
+                    Ok(false) => {
+                        let notice = "Word is already in this project's dictionary, or no spelling result is selected. Manuscript unchanged.";
+                        s.set_spelling_review_notice(notice);
+                        s.message = notice.into();
+                    }
+                    Err(error) => {
+                        let notice = format!("Could not update project dictionary: {error}");
+                        s.set_spelling_review_notice(&notice);
+                        s.message = notice;
+                    }
+                }
+                return Ok(false);
+            }
             _ => {}
         }
     }
@@ -45855,6 +46029,29 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             source_text,
             "ignoring a result must never change manuscript prose"
+        );
+    }
+
+    #[test]
+    fn project_spelling_dictionary_is_language_scoped_and_preserves_entries() {
+        let root = tempfile::tempdir().unwrap();
+        let app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let project_root = app.project_root().to_path_buf();
+
+        assert!(add_word_to_project_spelling_dictionary(&project_root, "en-GB", "Baad").unwrap());
+        assert!(!add_word_to_project_spelling_dictionary(&project_root, "en-GB", "baad").unwrap());
+        assert!(add_word_to_project_spelling_dictionary(&project_root, "fr-FR", "Baad").unwrap());
+        assert_eq!(
+            load_project_spelling_dictionary(&project_root, "en-GB").unwrap(),
+            BTreeSet::from(["baad".to_owned()])
+        );
+        assert_eq!(
+            fs::read_to_string(project_root.join(".writers-ide/dictionaries/en-GB.txt")).unwrap(),
+            "Baad\n"
+        );
+        assert!(load_project_spelling_dictionary(&project_root, "../../outside").is_err());
+        assert!(
+            add_word_to_project_spelling_dictionary(&project_root, "en-GB", "two words").is_err()
         );
     }
 

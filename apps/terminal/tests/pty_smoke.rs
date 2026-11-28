@@ -2027,6 +2027,63 @@ fn spell_check_can_choose_a_nonfirst_suggestion_through_the_production_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn project_dictionary_addition_persists_and_suppresses_findings_in_the_production_pty() {
+    let _guard = lock_pty_test();
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Project Dictionary Workflow");
+    let mut app = WriterApp::create_project(&project, "Project Dictionary Workflow").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "Baad word. Baad again.")
+        .unwrap();
+    drop(app);
+
+    let mock_aspell = root.path().join("aspell-mock");
+    std::fs::write(
+        &mock_aspell,
+        "#!/bin/sh\ntext=$(cat)\ncase \"$*\" in *pipe*) echo '& Baad 4 1: bad, bead, band, bat';; *) case \"$text\" in *Baad*) echo Baad;; esac;; esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&mock_aspell, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    for mode in ["spellcheck-dictionary-add", "spellcheck-dictionary-recheck"] {
+        if mode == "spellcheck-dictionary-recheck" {
+            let _ = std::fs::remove_file(project.join(".writers-ide/session.json"));
+        }
+        let result = Command::new("python3")
+            .arg(&harness)
+            .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+            .arg(&project)
+            .arg(root.path())
+            .arg(mode)
+            .env("WIDE_ASPELL", &mock_aspell)
+            .output()
+            .expect("run project dictionary workflow through production PTY");
+        assert!(
+            result.status.success(),
+            "{mode} PTY failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+    let dictionary =
+        std::fs::read_to_string(project.join(".writers-ide/dictionaries/en-GB.txt")).unwrap();
+    assert_eq!(dictionary, "Baad\n");
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "Baad word. Baad again.",
+        "dictionary management never rewrites manuscript prose"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn grammar_review_can_correct_and_reopen_a_scene_through_the_production_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

@@ -2868,3 +2868,19 @@ cleanly; its checksum manifest passed. Only Alpha UAT 43 and 44 are retained.
 The Ignore Once state and production PTY tests passed, but a complete workspace
 test run has not yet passed cleanly in aggregate; see the verification note
 above. Human acceptance remains pending.
+
+### Project spelling dictionary — 28 November 2026
+
+The current-document Spell Check results pane now accepts `D` to add the
+selected word to a language-specific project dictionary at
+`.writers-ide/dictionaries/<language>.txt`. Matching results disappear from
+the current review, and the pane confirms the change without altering prose.
+Later Spell Check runs load the saved list. Dictionary writes use a synced
+same-directory temporary file and atomic replacement; invalid language tags,
+multiword entries and symlinked dictionary paths are rejected.
+
+Focused state tests, the spelling correction PTY and a production PTY that adds
+a word, exits, reopens the project and confirms the word is no longer flagged
+passed. Terminal Clippy with warnings denied, formatting and diff checks passed.
+The full workspace suite was not rerun for this increment; human UAT remains
+pending.

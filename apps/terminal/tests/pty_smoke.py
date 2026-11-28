@@ -191,7 +191,14 @@ def main():
     review_thesaurus = modes == ["review-thesaurus"]
     review_menu = modes in (["review-menu"], ["review-thesaurus"])
     review_spellcheck_suggestions = modes == ["spellcheck-suggestions"]
-    review_spellcheck_current = modes in (["spellcheck-current"], ["spellcheck-suggestions"])
+    review_spellcheck_dictionary_add = modes == ["spellcheck-dictionary-add"]
+    review_spellcheck_dictionary_recheck = modes == ["spellcheck-dictionary-recheck"]
+    review_spellcheck_current = modes in (
+        ["spellcheck-current"],
+        ["spellcheck-suggestions"],
+        ["spellcheck-dictionary-add"],
+        ["spellcheck-dictionary-recheck"],
+    )
     review_proofread = modes == ["review-proofread"]
     removed_scenes = modes == ["removed-scenes"]
     outline_view = modes == ["outline-view"]
@@ -1214,8 +1221,8 @@ def main():
                 if not move_outline_selection_until(lambda row: "Arrival" in row, "down"):
                     raise AssertionError("the Arrival scene was not selectable")
                 os.write(master, b"\r")
-            elif not wait_for_workspace_title("Editor", timeout=0.5):
-                raise AssertionError("project did not open in an authoring workspace")
+            elif not wait_for_workspace_title("Editor", timeout=3.0):
+                raise AssertionError("project did not open in an authoring workspace; screen: " + repr(terminal_snapshot(output, 24, 80)))
             if not wait_for_workspace_title("Editor", timeout=3.0):
                 raise AssertionError("the Arrival document did not open")
             menu_start = len(output)
@@ -1225,8 +1232,16 @@ def main():
             read_for(0.2)
             select_visible_menu_item("Spell Check")
             os.write(master, b"\r")
-            expected_location = b"line 1, column 1" if review_spellcheck_suggestions else b"line 41, column 1"
-            if not wait_for_screen_fragments((b"Spell Check", b"Arrival", b"en-GB", b"Baad", expected_location), menu_start, timeout=5.0):
+            if review_spellcheck_dictionary_recheck:
+                expected = (b"Spell Check", b"Arrival", b"en-GB", b"Spell 0")
+            else:
+                expected_location = (
+                    b"line 1, column 1"
+                    if review_spellcheck_suggestions or review_spellcheck_dictionary_add
+                    else b"line 41, column 1"
+                )
+                expected = (b"Spell Check", b"Arrival", b"en-GB", b"Baad", expected_location)
+            if not wait_for_screen_fragments(expected, menu_start, timeout=5.0):
                 raise AssertionError(
                     "Spell Check did not show results for the open document; screen: "
                     + repr(terminal_snapshot(output, 24, 80))
@@ -1234,7 +1249,16 @@ def main():
             screen = "\n".join(terminal_snapshot(output, 24, 80))
             if "Wrng" in screen:
                 raise AssertionError("Spell Check included a different scene instead of the current document")
-            if review_spellcheck_suggestions:
+            if review_spellcheck_dictionary_recheck:
+                if "Baad · line" in "\n".join(terminal_snapshot(output, 24, 80)):
+                    raise AssertionError("project dictionary word remained in spell-check results after reopening")
+            elif review_spellcheck_dictionary_add:
+                os.write(master, b"d")
+                if not wait_for_screen_fragments((b"to this project's dictionary", b"Manuscript unchanged"), timeout=3.0):
+                    raise AssertionError("Add to Project Dictionary did not confirm the update; screen: " + repr(terminal_snapshot(output, 24, 80)))
+                if "Baad · line" in "\n".join(terminal_snapshot(output, 24, 80)):
+                    raise AssertionError("adding a word did not remove its current spelling findings")
+            elif review_spellcheck_suggestions:
                 os.write(master, b"s")
                 if not wait_for_screen_fragments((b"Spelling Suggestions", b"bad", b"bead"), timeout=3.0):
                     raise AssertionError("suggestion selector did not display multiple spelling candidates")
@@ -1257,9 +1281,10 @@ def main():
                 os.write(master, b"Bad\r")
                 if not wait_for_screen_fragments((b"Changed 'Baad' to 'Bad'", b"Undo available"), timeout=3.0):
                     raise AssertionError("custom spelling correction was not applied")
-            os.write(master, b"\x13")  # save
-            if not wait_for_screen_fragments((b"Saved at",), timeout=3.0):
-                raise AssertionError("corrected manuscript text was not saved")
+            if not (review_spellcheck_dictionary_add or review_spellcheck_dictionary_recheck):
+                os.write(master, b"\x13")  # save
+                if not wait_for_screen_fragments((b"Saved at",), timeout=3.0):
+                    raise AssertionError("corrected manuscript text was not saved")
             os.write(master, b"\x11")
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0
