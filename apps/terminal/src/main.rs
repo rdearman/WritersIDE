@@ -702,6 +702,9 @@ struct SpellCheckReview {
     occurrences: Vec<SpellCheckOccurrence>,
     selected: usize,
     jumped_to_source: bool,
+    suggestions: Vec<String>,
+    selected_suggestion: usize,
+    choosing_suggestion: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -13720,6 +13723,9 @@ impl AppState {
             return true;
         }
         review.jumped_to_source = false;
+        review.choosing_suggestion = false;
+        review.suggestions.clear();
+        review.selected_suggestion = 0;
         review.selected = if forward {
             (review.selected + 1) % review.occurrences.len()
         } else {
@@ -13824,6 +13830,41 @@ impl AppState {
         };
         self.apply_selected_spelling_replacement(replacement)
     }
+
+    fn open_spelling_suggestions(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some((word, language)) = self
+            .active_reference_pane()
+            .and_then(|pane| pane.spelling.as_ref())
+            .and_then(|review| {
+                review
+                    .occurrences
+                    .get(review.selected)
+                    .map(|occurrence| (occurrence.word.clone(), review.language.clone()))
+            })
+        else {
+            self.message = "No spelling occurrence is selected".into();
+            return Ok(());
+        };
+        let executable = std::env::var_os("WIDE_ASPELL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "aspell".into());
+        let suggestions =
+            spelling_suggestions(&word, &language, executable.to_string_lossy().as_ref())?;
+        if suggestions.is_empty() {
+            self.message = format!("No spelling suggestions for ‘{word}’");
+            return Ok(());
+        }
+        if let Some(review) = self
+            .active_reference_pane_mut()
+            .and_then(|pane| pane.spelling.as_mut())
+        {
+            review.suggestions = suggestions;
+            review.selected_suggestion = 0;
+            review.choosing_suggestion = true;
+        }
+        Ok(())
+    }
+
     fn apply_selected_spelling_replacement(
         &mut self,
         replacement: &str,
@@ -18216,6 +18257,9 @@ impl AppState {
                                 occurrences,
                                 selected: 0,
                                 jumped_to_source: false,
+                                suggestions: Vec::new(),
+                                selected_suggestion: 0,
+                                choosing_suggestion: false,
                             });
                         }
                         self.reference_focused = true;
@@ -30172,7 +30216,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 && let Some(review) = pane.spelling.as_ref()
             {
                 format!(
-                    "Spell Check · {} occurrence(s) · Enter jump · C suggest · R custom correction · Esc manuscript",
+                    "Spell Check · {} occurrence(s) · Enter jump · S choose suggestion · C accept first · R custom · Esc manuscript",
                     review.occurrences.len()
                 )
             } else if s.reference_focused
@@ -30258,6 +30302,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
     if s.scene_status_picker.is_some() {
         draw_scene_status_picker_overlay(f, s);
     }
+    draw_spelling_suggestions_overlay(f, s);
     if s.manuscript_status_settings.is_some() {
         draw_manuscript_status_settings_overlay(f, s);
     }
@@ -30459,6 +30504,56 @@ fn draw_scene_status_picker_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
         .collect::<Vec<_>>();
     lines.push(Line::from("↑/↓ choose · Enter set · Esc cancel"));
     f.render_widget(Paragraph::new(lines), inner);
+}
+
+fn draw_spelling_suggestions_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
+    let Some(review) = s
+        .active_reference_pane()
+        .and_then(|pane| pane.spelling.as_ref())
+        .filter(|review| review.choosing_suggestion)
+    else {
+        return;
+    };
+    let area = f.area();
+    let width = area.width.saturating_sub(4).min(64);
+    let height = (review.suggestions.len() as u16 + 4).min(area.height.saturating_sub(2));
+    if width < 30 || height < 5 {
+        return;
+    }
+    let popup = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .title(" Spelling Suggestions ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    f.render_widget(block, popup);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+    let items = review
+        .suggestions
+        .iter()
+        .map(|suggestion| ListItem::new(suggestion.as_str()))
+        .collect::<Vec<_>>();
+    f.render_stateful_widget(
+        List::new(items)
+            .highlight_symbol("▸ ")
+            .highlight_style(Style::default().bg(Color::Blue).fg(Color::White)),
+        rows[0],
+        &mut ListState::default()
+            .with_selected((!review.suggestions.is_empty()).then_some(review.selected_suggestion)),
+    );
+    f.render_widget(
+        Paragraph::new("↑/↓ choose · Enter apply · Esc cancel"),
+        rows[1],
+    );
 }
 
 fn draw_manuscript_status_settings_overlay(f: &mut ratatui::Frame<'_>, s: &AppState) {
@@ -38627,6 +38722,55 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         && s.active_reference_pane()
             .is_some_and(|pane| pane.spelling.is_some())
     {
+        let choosing_suggestion = s
+            .active_reference_pane()
+            .and_then(|pane| pane.spelling.as_ref())
+            .is_some_and(|review| review.choosing_suggestion);
+        if choosing_suggestion {
+            match k.code {
+                KeyCode::Esc => {
+                    if let Some(review) = s
+                        .active_reference_pane_mut()
+                        .and_then(|pane| pane.spelling.as_mut())
+                    {
+                        review.choosing_suggestion = false;
+                    }
+                    s.message = "Spelling correction cancelled · manuscript unchanged".into();
+                }
+                KeyCode::Up | KeyCode::Down => {
+                    if let Some(review) = s
+                        .active_reference_pane_mut()
+                        .and_then(|pane| pane.spelling.as_mut())
+                        && !review.suggestions.is_empty()
+                    {
+                        review.selected_suggestion = if k.code == KeyCode::Up {
+                            (review.selected_suggestion + review.suggestions.len() - 1)
+                                % review.suggestions.len()
+                        } else {
+                            (review.selected_suggestion + 1) % review.suggestions.len()
+                        };
+                    }
+                }
+                KeyCode::Enter => {
+                    let replacement = s
+                        .active_reference_pane()
+                        .and_then(|pane| pane.spelling.as_ref())
+                        .and_then(|review| review.suggestions.get(review.selected_suggestion))
+                        .cloned();
+                    if let Some(review) = s
+                        .active_reference_pane_mut()
+                        .and_then(|pane| pane.spelling.as_mut())
+                    {
+                        review.choosing_suggestion = false;
+                    }
+                    if let Some(replacement) = replacement {
+                        s.apply_selected_spelling_replacement(&replacement)?;
+                    }
+                }
+                _ => {}
+            }
+            return Ok(false);
+        }
         match k.code {
             KeyCode::Up | KeyCode::Down => {
                 s.select_spelling_occurrence(k.code == KeyCode::Down);
@@ -38646,6 +38790,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
             KeyCode::Char('c' | 'C') => {
                 s.correct_selected_spelling_occurrence()?;
+                return Ok(false);
+            }
+            KeyCode::Char('s' | 'S') => {
+                s.open_spelling_suggestions()?;
                 return Ok(false);
             }
             KeyCode::Char('r' | 'R') => {
@@ -45494,6 +45642,67 @@ mod tests {
             state.app.git_history(10).unwrap()[0]
                 .subject
                 .contains("Before restoring scene Opening")
+        );
+    }
+
+    #[test]
+    fn spelling_suggestion_dialogue_applies_the_selected_candidate_and_saves() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Baad weather ahead.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.open_reference_buffer(
+            "spellcheck:current".into(),
+            Some(scene),
+            "Spell Check · Opening · en-GB".into(),
+            "Baad · line 1, column 1".into(),
+        );
+        state.active_reference_pane_mut().unwrap().spelling = Some(SpellCheckReview {
+            scene_id: Some(scene),
+            content_unit_id: None,
+            language: "en-GB".into(),
+            source_text: "Baad weather ahead.".into(),
+            occurrences: vec![SpellCheckOccurrence {
+                word: "Baad".into(),
+                byte_range: 0..4,
+                line: 1,
+                column: 1,
+            }],
+            selected: 0,
+            jumped_to_source: false,
+            suggestions: vec!["Bad".into(), "Bade".into()],
+            selected_suggestion: 0,
+            choosing_suggestion: true,
+        });
+        state.reference_focused = true;
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        assert_eq!(
+            state
+                .active_reference_pane()
+                .unwrap()
+                .spelling
+                .as_ref()
+                .unwrap()
+                .selected_suggestion,
+            1
+        );
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "Bade weather ahead.");
+        state.save().unwrap();
+        drop(state);
+        let reopened = WriterApp::open_project(root.path().join("Book")).unwrap();
+        assert_eq!(
+            reopened.load_scene_text(scene).unwrap().0,
+            "Bade weather ahead."
         );
     }
 
