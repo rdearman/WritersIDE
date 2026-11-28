@@ -3089,3 +3089,19 @@ proofreading actions. The release executable passed the production PTY fiction
 creation/write/save/exit smoke workflow, and all bundle checksums verified.
 Alpha 43 was removed after Alpha 45 passed, leaving only numbered Alpha 44 and
 45 bundles. Human acceptance remains pending.
+
+### Outline custom metadata visibility — 28 November 2026
+
+The unified outline's selected-scene detail pane now shows typed custom field
+values alongside core planning metadata. Unset and empty values remain distinct;
+booleans are readable labels and entity references resolve to display names
+rather than UUIDs. The scene detail layout was compacted so metadata is visible
+in a standard 80×24 terminal. Storage persistence, outline rendering, selector
+navigation and production PTY checks passed. This is read/display support only;
+editing custom values and configuring metadata columns remain outstanding for
+#68. `cargo clippy --offline --workspace --all-targets -- -D warnings`,
+formatting, diff checks, and the focused storage, state, and production PTY tests
+passed. `cargo test --offline --workspace` passed through the importer and then
+stopped at the Ollama localhost test because this sandbox denied binding its
+loopback test socket; this is an environment failure, not a code test failure.
+Human UAT remains open.

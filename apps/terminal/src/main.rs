@@ -28323,15 +28323,31 @@ fn selected_outline_detail(state: &AppState) -> String {
         .target_words
         .map(|target| target.to_string())
         .unwrap_or_else(|| "—".into());
+    let custom_fields = state
+        .app
+        .scene_custom_field_values(*id)
+        .map(|fields| {
+            fields
+                .into_iter()
+                .map(|(definition, value)| {
+                    format!(
+                        "{}: {}",
+                        definition.name,
+                        custom_field_display_value(state, &definition, value)
+                    )
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|error| vec![format!("Custom metadata unavailable: {error}")]);
     let value = |text: &str| {
         if text.trim().is_empty() {
             "—".to_owned()
         } else {
-            text.to_owned()
+            text.split_whitespace().collect::<Vec<_>>().join(" ")
         }
     };
     format!(
-        "Scene: {}\nStatus: {}\nPublication: {}\nWords: {} / {} planned\n\nSynopsis: {}\n\nPurpose: {}\n\nGoal: {}\n\nOutcome: {}\n\nEnter opens prose · Outline > Edit Scene Planning… edits these fields",
+        "Scene: {}\nStatus: {} · {}\nWords: {} / {} planned\nSynopsis: {}\nPurpose: {}\nGoal: {}\nOutcome: {}\nCustom metadata: {}\nEnter opens prose · Outline > Edit Scene Planning… edits core planning fields",
         record.scene.title,
         manuscript_status_label(record.scene.status, &statuses),
         if included { "Included" } else { "Excluded" },
@@ -28341,7 +28357,85 @@ fn selected_outline_detail(state: &AppState) -> String {
         value(&record.scene.purpose),
         value(&record.scene.goal),
         value(&record.scene.outcome),
+        if custom_fields.is_empty() {
+            "—".into()
+        } else {
+            custom_fields.join(" · ")
+        },
     )
+}
+
+fn custom_field_display_value(
+    state: &AppState,
+    definition: &story_core::CustomFieldDefinition,
+    value: Option<story_core::FieldValue>,
+) -> String {
+    use story_core::FieldValue;
+
+    let Some(value) = value else {
+        return "(not set)".into();
+    };
+    match value {
+        FieldValue::Text(value) => {
+            if value.is_empty() {
+                "(empty)".into()
+            } else {
+                value
+            }
+        }
+        FieldValue::Integer(value) => value.to_string(),
+        FieldValue::Decimal(value) | FieldValue::DateTime(value) | FieldValue::Enum(value) => value,
+        FieldValue::Boolean(value) => if value { "Yes" } else { "No" }.into(),
+        FieldValue::EntityRef(id) => custom_entity_display_name(
+            state,
+            definition.reference_kind.as_deref().unwrap_or_default(),
+            &id,
+        ),
+        FieldValue::EntityRefs(ids) => {
+            let kind = definition.reference_kind.as_deref().unwrap_or_default();
+            ids.iter()
+                .map(|id| custom_entity_display_name(state, kind, id))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+    .to_owned()
+}
+
+fn custom_entity_display_name(state: &AppState, kind: &str, id: &str) -> String {
+    match kind {
+        "character" => state
+            .app
+            .list_characters()
+            .ok()
+            .and_then(|items| items.into_iter().find(|item| item.id.to_string() == id))
+            .map(|item| item.name),
+        "location" => state
+            .app
+            .list_locations()
+            .ok()
+            .and_then(|items| items.into_iter().find(|item| item.id.to_string() == id))
+            .map(|item| item.name),
+        "plotline" => state
+            .app
+            .list_plotlines()
+            .ok()
+            .and_then(|items| items.into_iter().find(|item| item.id.to_string() == id))
+            .map(|item| item.name),
+        "event" => state
+            .app
+            .list_events()
+            .ok()
+            .and_then(|items| items.into_iter().find(|item| item.id.to_string() == id))
+            .map(|item| item.title),
+        "scene" => id
+            .parse::<uuid::Uuid>()
+            .ok()
+            .and_then(|uuid| state.app.get_scene(SceneId(uuid)).ok())
+            .map(|record| record.scene.title),
+        _ => None,
+    }
+    .unwrap_or_else(|| "Linked record unavailable".into())
 }
 
 fn scrivener_import_detail(
@@ -40504,6 +40598,23 @@ mod tests {
         second_record.goal = "Find the coded message".into();
         second_record.outcome = "A clue points to the harbour".into();
         app.update_scene_metadata(&second_record).unwrap();
+        let custom_field = story_core::FieldId::new();
+        app.define_custom_field(&story_core::CustomFieldDefinition {
+            id: custom_field,
+            name: "Emotional beat".into(),
+            field_type: story_core::FieldType::Text,
+            required: false,
+            default_value: None,
+            enum_values: Vec::new(),
+            reference_kind: None,
+        })
+        .unwrap();
+        app.set_custom_field(
+            second,
+            custom_field,
+            &story_core::FieldValue::Text("Make the reunion joyful".into()),
+        )
+        .unwrap();
         let mut state = AppState::new(app, default_bindings());
         state.refresh().unwrap();
         state.workspace = Workspace::Outline;
@@ -40543,7 +40654,8 @@ mod tests {
             "Introduce the missing informant",
             "Find the coded message",
             "A clue points to the harbour",
-            "Publication: Included",
+            "Included",
+            "Emotional beat: Make the reunion joyful",
         ] {
             assert!(
                 metadata_detail.contains(value),
@@ -40648,17 +40760,19 @@ mod tests {
             state.help_panel.as_ref().map(|panel| panel.title.as_str()),
             Some("Edit Scene Planning Field")
         );
+        handle(&mut state, KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)).unwrap();
+        assert_eq!(state.help_panel.as_ref().unwrap().scroll, 1);
         handle(
             &mut state,
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
         )
         .unwrap();
-        assert_eq!(state.mode, Some('Y'));
-        state.prompt = "Mara reaches the station".into();
+        assert_eq!(state.mode, Some('A'));
+        state.prompt = "Keep the opening chapter focused".into();
         state.command().unwrap();
         assert_eq!(
-            state.app.get_scene(second).unwrap().scene.synopsis,
-            "Mara reaches the station"
+            state.app.get_scene(second).unwrap().scene.purpose,
+            "Keep the opening chapter focused"
         );
         state.command_bindings.push((
             KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),

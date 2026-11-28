@@ -5859,6 +5859,12 @@ impl WriterApp {
     pub fn list_custom_field_definitions(&self) -> Result<Vec<CustomFieldDefinition>> {
         Ok(self.store.list_custom_field_definitions()?)
     }
+    pub fn scene_custom_field_values(
+        &self,
+        scene: SceneId,
+    ) -> Result<Vec<(CustomFieldDefinition, Option<FieldValue>)>> {
+        Ok(self.store.scene_custom_field_values(scene)?)
+    }
     pub fn set_custom_field(
         &mut self,
         scene: SceneId,

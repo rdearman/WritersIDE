@@ -467,6 +467,14 @@ pub struct ProjectStore {
     conn: Connection,
 }
 
+type CustomFieldStorageColumns = (
+    Option<String>,
+    Option<i64>,
+    Option<String>,
+    Option<bool>,
+    Option<String>,
+);
+
 #[derive(Clone, Debug)]
 pub struct GitRestoreFile {
     pub relative_path: String,
@@ -10687,6 +10695,79 @@ impl ProjectStore {
             )
             .collect()
     }
+    /// Return every project-defined scene field with an explicit `None` for
+    /// unset values. Empty text, zero, false and empty reference lists remain
+    /// distinct from an unset field.
+    pub fn scene_custom_field_values(
+        &self,
+        scene: SceneId,
+    ) -> Result<Vec<(CustomFieldDefinition, Option<FieldValue>)>> {
+        self.get_scene(scene)?;
+        self.list_custom_field_definitions()?
+            .into_iter()
+            .map(|definition| {
+                let row: Option<CustomFieldStorageColumns> = self
+                    .conn
+                    .query_row(
+                        "SELECT text_value,integer_value,decimal_value,boolean_value,entity_ref
+                         FROM custom_field_value WHERE scene_id=?1 AND field_id=?2",
+                        params![scene.to_string(), definition.id.to_string()],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let value = match (definition.field_type, row) {
+                    (_, None) => None,
+                    (FieldType::Text | FieldType::LongText, Some((Some(value), ..))) => {
+                        Some(FieldValue::Text(value))
+                    }
+                    (FieldType::Integer, Some((_, Some(value), ..))) => {
+                        Some(FieldValue::Integer(value))
+                    }
+                    (FieldType::Decimal, Some((_, _, Some(value), ..))) => {
+                        Some(FieldValue::Decimal(value))
+                    }
+                    (FieldType::Boolean, Some((_, _, _, Some(value), _))) => {
+                        Some(FieldValue::Boolean(value))
+                    }
+                    (FieldType::DateTime, Some((Some(value), ..))) => {
+                        Some(FieldValue::DateTime(value))
+                    }
+                    (FieldType::Enum, Some((Some(value), ..))) => Some(FieldValue::Enum(value)),
+                    (FieldType::EntityRef, Some((_, _, _, _, Some(value)))) => {
+                        Some(FieldValue::EntityRef(value))
+                    }
+                    (FieldType::EntityRefs, Some(_)) => {
+                        let mut statement = self.conn.prepare(
+                            "SELECT target_id FROM custom_field_entity_ref
+                             WHERE scene_id=?1 AND field_id=?2 ORDER BY ordinal",
+                        )?;
+                        let references = statement
+                            .query_map(
+                                params![scene.to_string(), definition.id.to_string()],
+                                |row| row.get::<_, String>(0),
+                            )?
+                            .collect::<std::result::Result<Vec<_>, _>>()?;
+                        Some(FieldValue::EntityRefs(references))
+                    }
+                    _ => {
+                        return Err(StorageError::Invalid(format!(
+                            "stored value for custom field ‘{}’ does not match its declared type",
+                            definition.name
+                        )));
+                    }
+                };
+                Ok((definition, value))
+            })
+            .collect()
+    }
     pub fn set_custom_field(
         &mut self,
         scene: SceneId,
@@ -14270,6 +14351,59 @@ mod tests {
         drop(st);
         let reopened = ProjectStore::open(d.path().join("N")).unwrap();
         assert_eq!(reopened.get_query_assertions(query.id).unwrap(), assertions);
+    }
+
+    #[test]
+    fn scene_custom_field_values_distinguish_unset_empty_zero_and_false_after_reopen() {
+        let directory = tempdir().unwrap();
+        let project = directory.path().join("Custom Metadata");
+        let mut store = ProjectStore::create(&project, "Custom Metadata").unwrap();
+        let chapter = store
+            .create_node(None, NodeKind::Chapter, "Chapter", 0)
+            .unwrap();
+        let scene = store.create_scene(chapter, 0, "Scene").unwrap();
+        let fields = [
+            ("Unset", FieldType::LongText),
+            ("Empty text", FieldType::Text),
+            ("Integer", FieldType::Integer),
+            ("Boolean", FieldType::Boolean),
+        ];
+        let mut ids = std::collections::BTreeMap::new();
+        for (name, field_type) in fields {
+            let id = FieldId::new();
+            ids.insert(name, id);
+            store
+                .define_custom_field(&CustomFieldDefinition {
+                    id,
+                    name: name.into(),
+                    field_type,
+                    required: false,
+                    default_value: None,
+                    enum_values: Vec::new(),
+                    reference_kind: None,
+                })
+                .unwrap();
+        }
+        for (name, value) in [
+            ("Empty text", FieldValue::Text(String::new())),
+            ("Integer", FieldValue::Integer(0)),
+            ("Boolean", FieldValue::Boolean(false)),
+        ] {
+            store.set_custom_field(scene, ids[name], &value).unwrap();
+        }
+        drop(store);
+
+        let reopened = ProjectStore::open(&project).unwrap();
+        let values = reopened
+            .scene_custom_field_values(scene)
+            .unwrap()
+            .into_iter()
+            .map(|(definition, value)| (definition.name, value))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(values["Unset"], None);
+        assert_eq!(values["Empty text"], Some(FieldValue::Text(String::new())));
+        assert_eq!(values["Integer"], Some(FieldValue::Integer(0)));
+        assert_eq!(values["Boolean"], Some(FieldValue::Boolean(false)));
     }
 
     #[test]

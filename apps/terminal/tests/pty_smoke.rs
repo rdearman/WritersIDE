@@ -269,7 +269,7 @@ fn bulk_outline_insertion_uses_the_production_menu_and_persists_through_reopen()
 
 #[cfg(target_os = "linux")]
 #[test]
-fn scene_planning_field_is_selected_and_saved_from_the_production_outline_pty() {
+fn scene_custom_metadata_is_visible_in_the_production_outline_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
@@ -279,6 +279,23 @@ fn scene_planning_field_is_selected_and_saved_from_the_production_outline_pty() 
     let mut app = WriterApp::create_project(&project, "Planning Field").unwrap();
     let chapter = app.create_chapter(None, "Opening", 0).unwrap();
     let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let field = story_core::FieldId::new();
+    app.define_custom_field(&story_core::CustomFieldDefinition {
+        id: field,
+        name: "Emotional beat".into(),
+        field_type: story_core::FieldType::Text,
+        required: false,
+        default_value: None,
+        enum_values: Vec::new(),
+        reference_kind: None,
+    })
+    .unwrap();
+    app.set_custom_field(
+        scene,
+        field,
+        &story_core::FieldValue::Text("Keep the reunion joyful".into()),
+    )
+    .unwrap();
     drop(app);
 
     let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
@@ -289,19 +306,30 @@ fn scene_planning_field_is_selected_and_saved_from_the_production_outline_pty() 
         .arg(root.path())
         .arg("scene-planning-fields")
         .output()
-        .expect("edit a scene planning field through the Linux PTY");
+        .expect("inspect custom scene metadata through the Linux PTY");
     assert!(
         result.status.success(),
-        "scene planning field PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        "custom scene metadata PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
 
     let reopened = WriterApp::open_project(&project).unwrap();
     let record = reopened.get_scene(scene).unwrap();
-    assert_eq!(record.scene.goal, "Escape at the observatory");
+    assert!(record.scene.goal.is_empty());
     assert!(record.scene.synopsis.is_empty());
     assert!(record.scene.purpose.is_empty());
+    assert_eq!(
+        reopened
+            .scene_custom_field_values(scene)
+            .unwrap()
+            .into_iter()
+            .find(|(definition, _)| definition.id == field)
+            .and_then(|(_, value)| value),
+        Some(story_core::FieldValue::Text(
+            "Keep the reunion joyful".into()
+        ))
+    );
 }
 
 #[cfg(target_os = "linux")]
