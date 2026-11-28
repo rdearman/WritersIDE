@@ -2975,6 +2975,29 @@ unchanged. The existing production PTY custom-correction regression also
 passed. Targeted terminal Clippy with warnings denied and formatting passed.
 Human UAT remains open.
 
+### UAT 47 startup, rendered tabs, mouse input and pane findings — 28 November 2026
+
+The startup chooser, rendered tab-stop indentation and cursor-report timeout
+handling were committed and verified in `ae7bc19`. UAT 47 follow-up comments
+identify a P0 multi-view pane limitation (#77 U47-08/09/11), a potential saved
+mouse-report contamination defect (U47-10), and additional P1 issues covering
+contextual help, scene selection, read-only text copying, and discoverable View
+menu actions. These author findings remain open for human retest.
+
+Commit `7e64da9` limits terminal mouse capture to Planning Boards. A production
+Linux PTY injected an SGR mouse report while a manuscript was open, saved and
+reopened the project, and confirmed the prose was unchanged. Terminal Clippy,
+formatting and this focused PTY test passed. This is a tested mitigation; the
+author's screenshots do not independently establish the original byte source,
+and unsupported/fragmented report injection still needs coverage.
+
+The main split-window implementation still treats pane 1 as the only full
+workspace and secondary panes as reference buffers. Split and Switch View are
+also restricted to Editor context. Therefore the U47-08/09/11 requirement for
+independent, fully interactive views in any pane is not complete. It remains the
+next P0 implementation task; no Alpha UAT bundle has been made from these
+changes yet.
+
 ### UAT 47 corrections — 28 November 2026
 
 Restored the first-run Welcome chooser for users with an explicit project
