@@ -1,5 +1,34 @@
 # Writer's IDE Development Status
 
+## Alpha UAT 46 candidate — 28 November 2026
+
+Frozen at `bfc28d0110cfd30f2ea5a1abf54520bd85710d16`. The isolated Linux
+x86_64 bundle is `test-builds/alpha-uat-46-bfc28d0/`; launch it from the
+repository root with:
+
+```sh
+cd test-builds/alpha-uat-46-bfc28d0
+./run.sh "The Glassmaker's Compass"
+```
+
+Use `./run.sh "Chapter-Based Sample"` for the non-fiction sample. The bundle
+contains isolated preferences and disposable synthetic projects. Its
+`SHA256SUMS` passed verification after the release executable smoke launch.
+Release compilation passed with
+`cargo build --workspace --release --offline`; full workspace tests passed
+(386 terminal unit tests, 3 author-workflow tests and 55 PTY tests; one
+protected private-corpus PTY is intentionally ignored without its configured
+local path). The production application launched under a PTY and exited
+cleanly. The six-point retest checklist is in the bundle's
+`UAT-CHECKLIST.md`. Human acceptance is pending; this is not a claim of
+publication fidelity or general authoring readiness.
+
+The latest verified corrective increments cover safe sentence deletion,
+outline node conversion, Enter-based replace confirmation, Escape navigation
+from the Reference Library, and safe handling when Move Scene to Chapter is
+given its current chapter. Commits: `6f92b0d`, `5005478`, `b17d855`,
+`ebb364b`, `bfc28d0`.
+
 ## Safe sentence deletion through the production terminal — 28 November 2026
 
 Added a Linux PTY regression for the reported multi-line Delete Sentence hazard.
