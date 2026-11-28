@@ -508,10 +508,13 @@ def main():
         os.write(master, b"\x1b[21~")  # F10 remains covered as a compatibility path.
         read_for(0.2)
         for _ in range(12):
-            if wait_for_screen_fragments(("Outline · actions".encode("utf-8"),), start, timeout=0.1):
+            if wait_for_screen_fragments(("Outline · actions".encode("utf-8"),), start, timeout=0.2):
                 return start
             os.write(master, b"\x1b[C")
-            read_for(0.05)
+            # Wait through the app's 200 ms poll/render interval before
+            # advancing again; otherwise a slow terminal can queue enough
+            # Right events to wrap past Outline into another menu.
+            read_for(0.22)
         raise AssertionError(
             "Outline menu was not reachable from the manuscript outliner; screen: "
             + repr(terminal_snapshot(output, 24, 80))
@@ -526,10 +529,10 @@ def main():
             return start
         marker = f"{name} · actions".encode("utf-8")
         for _ in range(12):
-            if wait_for_screen_fragments((marker,), start, timeout=0.1):
+            if wait_for_screen_fragments((marker,), start, timeout=0.2):
                 return start
             os.write(master, b"\x1b[C")
-            read_for(0.05)
+            read_for(0.22)
         raise AssertionError(
             f"{name} menu was not reachable from the current workspace; screen: "
             + repr(terminal_snapshot(output, 24, 80))

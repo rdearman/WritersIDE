@@ -3023,9 +3023,13 @@ focused test passes. The first 65-test PTY rerun had one intermittent failure
 in the existing snapshot scenario because its harness sent the palette query
 before confirming that the palette had opened; the harness now waits for the
 palette and both that test and the new pane recovery test pass individually.
-The full 65-test PTY rerun is pending. Full per-pane independent view state
-remains outstanding. This is partial progress on U47-08/09/11, not completion
-of the pane acceptance criteria.
+The full 65-test PTY rerun found a second timing issue in the new scenario's
+menu-navigation helper: it advanced faster than the terminal poll interval and
+could overshoot Outline. The helper now waits at least 220 ms per menu step;
+the pane-recovery scenario passed three consecutive focused PTY runs. The full
+65-test PTY rerun is pending. Full per-pane independent view state remains
+outstanding. This is partial progress on U47-08/09/11, not completion of the
+pane acceptance criteria.
 
 ### UAT 47 corrections — 28 November 2026
 
