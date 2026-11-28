@@ -10,6 +10,14 @@ text. The production PTY test passes. This verifies the safe fallback for
 unpunctuated multiline text; it does not establish broader editor usability or
 human acceptance of sentence-selection semantics.
 
+The same checkpoint adds a production PTY regression for Outline → Convert
+Selected Section or Chapter. It selects an actual section in the rendered
+outline, chooses Chapter in the conversion dialogue, confirms the visible
+change, closes the application and reopens the project. The assertion verifies
+that the converted node retained its stable ID, title and sibling position.
+Both new focused PTY workflows pass; full-workspace verification is pending for
+this test-only increment.
+
 ## Confirm revision-hunk restoration before applying — 27 November 2026
 
 Revision history previously restored a highlighted hunk immediately when the

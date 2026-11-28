@@ -45,6 +45,47 @@ fn delete_sentence_removes_only_the_current_unpunctuated_line_through_the_produc
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn outline_item_conversion_preserves_identity_through_the_production_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Outline Conversion Project");
+    let mut app = WriterApp::create_project(&project, "Outline Conversion").unwrap();
+    let section = app.create_section("Part One", 0).unwrap();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("convert-outline-item")
+        .output()
+        .expect("convert a structural item through the production Linux PTY");
+    assert!(
+        result.status.success(),
+        "outline conversion PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    let converted = reopened
+        .list_structural_nodes()
+        .unwrap()
+        .into_iter()
+        .find(|node| node.id == section)
+        .expect("the converted outline node retains its original identity");
+    assert_eq!(converted.kind, "chapter");
+    assert_eq!(converted.title, "Part One");
+    assert_eq!(converted.position, 0);
+}
+
+#[cfg(target_os = "linux")]
 fn lock_pty_test() -> std::sync::MutexGuard<'static, ()> {
     PTY_TEST_LOCK
         .lock()

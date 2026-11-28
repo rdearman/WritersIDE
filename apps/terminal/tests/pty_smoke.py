@@ -189,6 +189,7 @@ def main():
     date_time_unavailable = modes == ["date-time-unavailable"]
     find_replace_focus = modes == ["find-replace-focus"]
     delete_sentence = modes == ["delete-sentence"]
+    convert_outline_item = modes == ["convert-outline-item"]
     review_thesaurus = modes == ["review-thesaurus"]
     review_menu = modes in (["review-menu"], ["review-thesaurus"])
     review_spellcheck_suggestions = modes == ["spellcheck-suggestions"]
@@ -2197,6 +2198,41 @@ def main():
             if restored[6][termios.VQUIT] != b"\x1c":
                 raise AssertionError("application shutdown did not restore the terminal VQUIT byte")
             print("PTY window-prefix workflow passed: raw-mode ASCII 0x1C, directions, pane numbers, help/cancel, split/close/maximise, F6/menu fallback, independent scrolling, and termios restoration.")
+            return
+
+        if convert_outline_item:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")
+            show_outline_tree_presentation()
+            if not move_outline_selection_until(lambda row: "Part One" in row, "down"):
+                raise AssertionError("the section to convert was not selectable")
+            start = open_outline_menu()
+            select_visible_menu_item("Convert Selected Section or Chapter…")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Convert Outline Item", b"Part One", b"Chapter"), timeout=3.0
+            ):
+                raise AssertionError("conversion dialogue did not identify the selected item and destination")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"converted to Chapter",), start, timeout=3.0
+            ):
+                # The status message may be replaced by the following render;
+                # the persisted structure is asserted by the Rust caller.
+                read_for(0.3)
+            screen = "\n".join(terminal_snapshot(output, 24, 80))
+            if "Part One" not in screen or "Chapter" not in screen:
+                raise AssertionError("converted chapter was not visible in the outline; screen: " + repr(screen))
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after outline conversion")
+            print("PTY outline conversion passed: selected section became a chapter and persisted.")
             return
 
         if delete_sentence:
