@@ -1952,7 +1952,7 @@ fn spell_check_from_review_can_correct_and_reopen_the_open_document() {
     let reopened = WriterApp::open_project(&project).unwrap();
     assert_eq!(
         reopened.load_scene_text(first).unwrap().0,
-        long_text.replace("Baad word.", "bad word.")
+        long_text.replace("Baad word.", "Bad word.")
     );
     assert_eq!(reopened.load_scene_text(second).unwrap().0, "Wrng word.");
 }

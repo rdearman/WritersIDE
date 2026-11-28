@@ -1232,9 +1232,12 @@ def main():
             screen = "\n".join(terminal_snapshot(output, 24, 80))
             if "Wrng" in screen:
                 raise AssertionError("Spell Check included a different scene instead of the current document")
-            os.write(master, b"c")  # explicitly accept the selected occurrence's first suggestion
-            if not wait_for_screen_fragments((b"Changed 'Baad' to 'bad'", b"Undo available"), timeout=3.0):
-                raise AssertionError("spelling correction did not apply the selected suggestion")
+            os.write(master, b"r")  # enter an author-chosen correction
+            if not wait_for_screen_fragments((b"Replace", b"Baad"), timeout=3.0):
+                raise AssertionError("custom spelling correction dialogue was not shown")
+            os.write(master, b"Bad\r")
+            if not wait_for_screen_fragments((b"Changed 'Baad' to 'Bad'", b"Undo available"), timeout=3.0):
+                raise AssertionError("custom spelling correction was not applied")
             os.write(master, b"\x13")  # save
             if not wait_for_screen_fragments((b"Saved at",), timeout=3.0):
                 raise AssertionError("corrected manuscript text was not saved")

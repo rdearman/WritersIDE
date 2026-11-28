@@ -13807,12 +13807,7 @@ impl AppState {
             self.message = "No spelling occurrence is selected".into();
             return Ok(());
         };
-        let (source_text, scene_id, content_unit_id, language) = (
-            review.source_text.clone(),
-            review.scene_id,
-            review.content_unit_id,
-            review.language.clone(),
-        );
+        let language = review.language.clone();
         let executable = std::env::var_os("WIDE_ASPELL")
             .map(std::path::PathBuf::from)
             .unwrap_or_else(|| "aspell".into());
@@ -13825,6 +13820,29 @@ impl AppState {
             self.message = format!("No spelling suggestions for '{}'", occurrence.word);
             return Ok(());
         };
+        self.apply_selected_spelling_replacement(replacement)
+    }
+    fn apply_selected_spelling_replacement(
+        &mut self,
+        replacement: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(review) = self
+            .active_reference_pane()
+            .and_then(|pane| pane.spelling.as_ref())
+        else {
+            return Ok(());
+        };
+        let Some(occurrence) = review.occurrences.get(review.selected).cloned() else {
+            self.message = "No spelling occurrence is selected".into();
+            return Ok(());
+        };
+        if replacement.trim().is_empty() {
+            self.message = "Correction cancelled · replacement cannot be empty".into();
+            return Ok(());
+        }
+        let source_text = review.source_text.clone();
+        let scene_id = review.scene_id;
+        let content_unit_id = review.content_unit_id;
         if self.dirty
             && ((scene_id.is_some() && self.editing_scene != scene_id)
                 || (content_unit_id.is_some() && self.editing_content_unit != content_unit_id))
@@ -19153,6 +19171,9 @@ impl AppState {
                 Err(error) => format!("Window layout was not changed: {error}"),
             };
             return Ok(());
+        }
+        if mode == Some('Z') {
+            return self.apply_selected_spelling_replacement(&cmd);
         }
         if mode == Some('H') {
             if cmd.is_empty() {
@@ -30127,7 +30148,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 && let Some(review) = pane.spelling.as_ref()
             {
                 format!(
-                    "Spell Check · {} occurrence(s) · Enter jump · C correct · Esc manuscript",
+                    "Spell Check · {} occurrence(s) · Enter jump · C suggest · R custom correction · Esc manuscript",
                     review.occurrences.len()
                 )
             } else if s.reference_focused
@@ -38531,6 +38552,19 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
             KeyCode::Char('c' | 'C') => {
                 s.correct_selected_spelling_occurrence()?;
+                return Ok(false);
+            }
+            KeyCode::Char('r' | 'R') => {
+                let word = s
+                    .active_reference_pane()
+                    .and_then(|pane| pane.spelling.as_ref())
+                    .and_then(|review| review.occurrences.get(review.selected))
+                    .map(|occurrence| occurrence.word.clone());
+                if let Some(word) = word {
+                    s.mode = Some('Z');
+                    s.prompt.clear();
+                    s.message = format!("Replace ‘{word}’ with… · Enter applies · Esc cancels");
+                }
                 return Ok(false);
             }
             _ => {}

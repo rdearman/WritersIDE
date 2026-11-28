@@ -2752,10 +2752,12 @@ It does not silently change prose; the author explicitly accepts the action
 and can undo it before saving.
 
 The production Linux PTY regression checks the current-document result,
-applies the suggested correction, saves, and verifies the persisted text after
-reopening while confirming another scene remains unchanged. Focused PTY,
-formatting and terminal Clippy checks passed. Custom replacement and selecting
-among multiple suggestions remain outstanding.
+applies a custom correction, saves, and verifies the persisted text after
+reopening while confirming another scene remains unchanged. Press `C` accepts
+Aspell's first suggestion; `R` opens a custom replacement prompt. Both edits
+are undoable. Choosing among multiple Aspell suggestions remains outstanding.
+Focused PTY, formatting and terminal Clippy checks passed for the suggestion
+path; the custom path is covered by the production PTY regression.
 
 ### Selected-text thesaurus — 28 November 2026
 
