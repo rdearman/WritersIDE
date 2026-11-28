@@ -2998,6 +2998,24 @@ independent, fully interactive views in any pane is not complete. It remains the
 next P0 implementation task; no Alpha UAT bundle has been made from these
 changes yet.
 
+### Approved pane/menu invariants and recovery from a lone reference pane — 28 November 2026
+
+The author approved explicit interaction-design clarifications: every
+registered author-facing view must retain full functionality in split panes;
+read-only projections are supplementary and cannot substitute for a selected
+view; named menu actions remain available and shortcuts only supplement them.
+These are now normative in `interaction-design-v1.0.md`.
+
+The focused-pane view dispatcher now lets a lone reference pane return to the
+full interactive workspace instead of returning “that view cannot be opened in
+a manuscript window yet”. It carries the referenced scene selection into the
+outline when possible. A scene reference in a multi-pane layout can be promoted
+to an editable scene editor in that focused pane, preserving its pane identity
+and layout. Focused terminal state tests passed; production PTY coverage for
+these new transitions and full per-pane independent view state remain
+outstanding. This is partial progress on U47-08/09/11, not completion of the
+pane acceptance criteria.
+
 ### UAT 47 corrections — 28 November 2026
 
 Restored the first-run Welcome chooser for users with an explicit project

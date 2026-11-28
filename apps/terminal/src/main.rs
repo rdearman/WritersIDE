@@ -18978,12 +18978,61 @@ impl AppState {
         &mut self,
         workspace: Workspace,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let focused_reference = self
-            .pane_layout
-            .as_ref()
-            .is_some_and(|layout| layout.focused() != 1);
+        let focused_layout = self.pane_layout.as_ref();
+        let focused_reference = focused_layout.is_some_and(|layout| layout.focused() != 1);
         if !focused_reference {
             self.switch(workspace);
+            return Ok(());
+        }
+        // A surviving reference pane must never become a dead end. When it is
+        // the only pane, promote the requested view into the normal interactive
+        // workspace instead of trying to open a static reference rendering.
+        if focused_layout.is_some_and(|layout| layout.pane_count() == 1) {
+            let scene = self.active_reference_pane().and_then(|pane| pane.scene_id);
+            self.pane_layout = None;
+            self.reference_panes.clear();
+            self.active_reference = 0;
+            self.reference_focused = false;
+            if let Some(scene) = scene {
+                self.selected = self
+                    .scenes
+                    .iter()
+                    .position(|row| row.0 == scene)
+                    .unwrap_or(self.selected);
+            }
+            self.switch(workspace);
+            if workspace == Workspace::Outline
+                && let Some(scene) = scene
+            {
+                self.selected = outline_rows(self)
+                    .iter()
+                    .position(|row| *row == OutlineRow::Scene(scene))
+                    .unwrap_or(self.selected);
+            }
+            self.message = format!("{} opened in the full workspace", workspace.title());
+            return Ok(());
+        }
+        if workspace == Workspace::Editor {
+            let scene = self
+                .active_reference_pane()
+                .and_then(|pane| pane.scene_id)
+                .or_else(|| selected_scene_for_workspace(self));
+            let Some(scene) = scene else {
+                return Err("select a manuscript scene before opening the editor".into());
+            };
+            if self.dirty && self.editing_scene != Some(scene) {
+                return Err("save the current manuscript before opening another scene".into());
+            }
+            let row = self.app.get_scene(scene)?;
+            let title = row.scene.title.clone();
+            if let Some(pane) = self.active_reference_pane_mut() {
+                pane.source_key = format!("scene:{scene}");
+                pane.scene_id = Some(scene);
+                pane.title = title.clone();
+            }
+            self.open_scene(scene)?;
+            self.reference_focused = true;
+            self.message = format!("{title} opened for editing in the focused pane");
             return Ok(());
         }
         let (source, title, content) = match workspace {
@@ -49497,6 +49546,96 @@ mod tests {
             reopened.app.load_scene_text(scene).unwrap().0,
             "The manuscript remains intact."
         );
+    }
+
+    #[test]
+    fn last_reference_pane_can_return_to_the_interactive_outline() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Book"), "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter Six", 0).unwrap();
+        let scene = app.create_scene(chapter, "Scene One", 0).unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+        state.open_scene(scene).unwrap();
+        state.pane_bounds = pane_layout::PaneRect {
+            x: 0,
+            y: 1,
+            width: 160,
+            height: 50,
+        };
+        state
+            .split_focused_window(pane_layout::Orientation::Vertical)
+            .unwrap();
+        let pane_id = state.active_reference_pane().unwrap().layout_id.unwrap();
+        let pane = state.active_reference_pane_mut().unwrap();
+        pane.source_key = format!("scene-card:{scene}");
+        pane.scene_id = Some(scene);
+        pane.title = "Scene One · Card".into();
+        pane.content = "Scene One card details".into();
+        pane.shared_scene = false;
+        let layout = state.pane_layout.as_mut().unwrap();
+        layout.only_focused();
+        layout.focus(pane_id).unwrap();
+        state.sync_focused_window(pane_id);
+        state.workspace = Workspace::Cards;
+
+        state
+            .switch_view_in_focused_window(Workspace::Outline)
+            .unwrap();
+
+        assert_eq!(state.workspace, Workspace::Outline);
+        assert!(state.pane_layout.is_none());
+        assert!(state.reference_panes.is_empty());
+        assert!(!state.reference_focused);
+        assert_eq!(selected_scene_for_workspace(&state), Some(scene));
+        assert!(
+            workspace_items(&state)
+                .iter()
+                .any(|row| row.contains("Chapter Six"))
+        );
+    }
+
+    #[test]
+    fn focused_scene_reference_can_become_an_editable_scene_pane() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(directory.path().join("Book"), "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let first = app.create_scene(chapter, "Scene One", 0).unwrap();
+        let second = app.create_scene(chapter, "Scene Two", 1).unwrap();
+        let (_, hash) = app.load_scene_text(second).unwrap();
+        app.save_scene_text(second, Some(&hash), "Second scene prose.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(first).unwrap();
+        state.pane_bounds = pane_layout::PaneRect {
+            x: 0,
+            y: 1,
+            width: 160,
+            height: 50,
+        };
+        state
+            .split_focused_window(pane_layout::Orientation::Vertical)
+            .unwrap();
+        let pane_id = state.active_reference_pane().unwrap().layout_id.unwrap();
+        {
+            let pane = state.active_reference_pane_mut().unwrap();
+            pane.source_key = format!("scene:{second}");
+            pane.scene_id = Some(second);
+            pane.title = "Scene Two".into();
+            pane.content = "Second scene prose.".into();
+            pane.shared_scene = false;
+        }
+
+        state
+            .switch_view_in_focused_window(Workspace::Editor)
+            .unwrap();
+
+        assert_eq!(state.workspace, Workspace::Editor);
+        assert_eq!(state.editing_scene, Some(second));
+        assert!(state.reference_focused);
+        assert!(state.active_reference_shares_open_scene());
+        assert_eq!(state.editor.join("\n"), "Second scene prose.");
+        assert_eq!(state.pane_layout.as_ref().unwrap().focused(), pane_id);
     }
 
     #[test]
