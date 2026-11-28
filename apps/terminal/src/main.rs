@@ -691,6 +691,8 @@ struct ThesaurusReview {
     selected_range: Option<std::ops::Range<usize>>,
     selected_word: String,
     replacement: Option<String>,
+    synonyms: Vec<String>,
+    selected_synonym: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -13972,6 +13974,31 @@ impl AppState {
         self.message = format!("Replaced selected text with ‘{replacement}’ · Undo available");
         Ok(())
     }
+
+    fn cycle_thesaurus_synonym(&mut self, forward: bool) {
+        let Some(review) = self
+            .active_reference_pane_mut()
+            .and_then(|pane| pane.thesaurus.as_mut())
+        else {
+            return;
+        };
+        if review.synonyms.is_empty() {
+            self.message = "No thesaurus alternatives are available".into();
+            return;
+        }
+        review.selected_synonym = if forward {
+            (review.selected_synonym + 1) % review.synonyms.len()
+        } else {
+            (review.selected_synonym + review.synonyms.len() - 1) % review.synonyms.len()
+        };
+        review.replacement = review.synonyms.get(review.selected_synonym).cloned();
+        self.message = format!(
+            "Thesaurus replacement {}/{}: {} · R replaces selected text",
+            review.selected_synonym + 1,
+            review.synonyms.len(),
+            review.replacement.as_deref().unwrap_or_default()
+        );
+    }
     fn refresh_proofreading_pane(&mut self) {
         let Some(pane) = self.active_reference_pane_mut() else {
             return;
@@ -24322,6 +24349,7 @@ impl AppState {
                 .then_some(selected_range)
                 .flatten();
             let mut first_suggestion = None;
+            let mut synonyms = Vec::new();
             let mut body = format!(
                 "Thesaurus — {word}\nTerm: {word}\nLanguage: {language}\nSource: {}\n\n",
                 dictionary_path.display()
@@ -24338,6 +24366,9 @@ impl AppState {
                             body.push_str("  • ");
                             body.push_str(synonym);
                             body.push('\n');
+                            if !synonyms.contains(synonym) {
+                                synonyms.push(synonym.clone());
+                            }
                             if first_suggestion.is_none() {
                                 first_suggestion = Some(synonym.clone());
                             }
@@ -24357,6 +24388,8 @@ impl AppState {
                         selected_range,
                         selected_word,
                         replacement: first_suggestion,
+                        synonyms,
+                        selected_synonym: 0,
                     });
                 }
                 self.reference_focused = true;
@@ -30207,7 +30240,10 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 && let Some(review) = pane.thesaurus.as_ref()
             {
                 if review.selected_range.is_some() && review.replacement.is_some() {
-                    "Thesaurus · R replace selection · Esc manuscript".into()
+                    format!(
+                        "Thesaurus · [/] choose from {} · R replace selection · Esc manuscript",
+                        review.synonyms.len()
+                    )
                 } else {
                     "Thesaurus · Esc manuscript".into()
                 }
@@ -38712,6 +38748,15 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
         && s.reference_focused
         && s.active_reference_pane()
             .is_some_and(|pane| pane.thesaurus.is_some())
+        && matches!(k.code, KeyCode::Char('[' | ']'))
+    {
+        s.cycle_thesaurus_synonym(k.code == KeyCode::Char(']'));
+        return Ok(false);
+    }
+    if s.workspace == Workspace::Editor
+        && s.reference_focused
+        && s.active_reference_pane()
+            .is_some_and(|pane| pane.thesaurus.is_some())
         && matches!(k.code, KeyCode::Char('r' | 'R'))
     {
         s.replace_thesaurus_selection()?;
@@ -45795,6 +45840,49 @@ mod tests {
             explicit
         );
         assert!(thesaurus_data_path_from("fr-FR", None, &[]).is_none());
+    }
+
+    #[test]
+    fn thesaurus_cycles_to_an_author_chosen_synonym_before_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "colour.").unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        state.open_reference_buffer(
+            "thesaurus:colour".into(),
+            None,
+            "Thesaurus · colour".into(),
+            "hue · pigment".into(),
+        );
+        state.active_reference_pane_mut().unwrap().thesaurus = Some(ThesaurusReview {
+            source_text: "colour.".into(),
+            selected_range: Some(0..6),
+            selected_word: "colour".into(),
+            replacement: Some("hue".into()),
+            synonyms: vec!["hue".into(), "pigment".into()],
+            selected_synonym: 0,
+        });
+        state.reference_focused = true;
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert!(state.message.contains("replacement 2/2: pigment"));
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+        )
+        .unwrap();
+        assert_eq!(state.editor.join("\n"), "pigment.");
+        state.save().unwrap();
+        drop(state);
+        let reopened = WriterApp::open_project(root.path().join("Book")).unwrap();
+        assert_eq!(reopened.load_scene_text(scene).unwrap().0, "pigment.");
     }
 
     #[test]

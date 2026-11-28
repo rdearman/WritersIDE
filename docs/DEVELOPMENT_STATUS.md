@@ -2757,20 +2757,20 @@ The production Linux PTY regression checks the current-document result,
 applies a custom correction, saves, and verifies the persisted text after
 reopening while confirming another scene remains unchanged. Press `C` accepts
 Aspell's first suggestion; `R` opens a custom replacement prompt. Both edits
-are undoable. Choosing among multiple Aspell suggestions remains outstanding.
-Focused PTY, formatting and terminal Clippy checks passed for the suggestion
-path; the custom path is covered by the production PTY regression.
+are undoable. The subsequent selectable-suggestions checkpoint below
+supersedes that limitation. Production PTY, formatting and terminal Clippy
+checks passed.
 
 ### Selected-text thesaurus — 28 November 2026
 
 Review > Thesaurus now uses an active manuscript selection automatically and
-opens local results in a second pane. `R` replaces the original selection with
-the first available local synonym; the edit is undoable and remains in the
-normal save flow. Without a selection, the existing word-entry and standalone
-results workflow remains available. A production PTY regression selects
-“colour”, looks up the local dictionary, applies “hue”, saves and verifies the
-reopened manuscript. Focused PTY and formatting passed; final Clippy check is
-pending.
+opens local results in a second pane. `[` and `]` choose among the displayed
+synonyms; `R` applies the current choice to the original selection. The edit is
+undoable and remains in the normal save flow. Without a selection, the existing
+word-entry and standalone results workflow remains available. A production PTY
+regression selects “colour”, looks up the local dictionary, applies “hue”,
+saves and verifies reopening; a focused test cycles to and applies a non-first
+synonym. Formatting and terminal Clippy passed. Human UAT remains open.
 
 ### 28 November terminal regression checkpoint
 
