@@ -38804,6 +38804,23 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     }
     if s.workspace == Workspace::Reading {
         match k.code {
+            KeyCode::Esc if s.reading_document.is_some() => {
+                s.reading_document = None;
+                s.reading_text.clear();
+                s.reading_offset = 0;
+                s.reading_selection_start = None;
+                s.scroll = 0;
+                s.reading_focus = false;
+                s.message = "Reference closed · Reference Library".into();
+            }
+            KeyCode::Esc if s.history_index > 0 => {
+                s.history_index -= 1;
+                s.workspace = s.history[s.history_index];
+                s.message = format!("Returned to {}", s.workspace.title());
+            }
+            KeyCode::Esc => {
+                s.message = "Reference Library · no previous workspace".into();
+            }
             KeyCode::Char('h') => s.reading_focus = false,
             KeyCode::Char('l') => s.reading_focus = true,
             KeyCode::Up | KeyCode::Char('k') if s.reading_focus => {

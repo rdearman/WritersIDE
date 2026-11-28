@@ -25,6 +25,14 @@ accidental function-key-only workflow. The focused test passes. The complete
 terminal binary unit suite also passes (386/386); the workspace integration
 suite was not conclusively completed in this run.
 
+Reference Library navigation now has a two-step Escape route: Escape closes an
+open reference back to its library list, then Escape returns to the actual
+originating workspace. The production PTY test navigates from the manuscript
+outline into a reference, closes both levels with Escape, verifies Outline is
+restored, opens the selected scene and verifies its manuscript text. This
+replaces the test's previous manual Navigate → Manuscript route and prevents
+assuming the editor was the origin when it was not.
+
 ## Confirm revision-hunk restoration before applying — 27 November 2026
 
 Revision history previously restored a highlighted hunk immediately when the

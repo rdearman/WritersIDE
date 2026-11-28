@@ -3578,17 +3578,28 @@ def main():
         read_for(0.4)
         assert_visible_sentence(output, 24, 80, "Reference only stays clear.", "Reference at 80x24")
 
-        os.write(master, b"\x1b[21~")  # F10
-        read_for(0.2)
-        os.write(master, b"\x1b[C" * 3)  # Navigate
-        read_for(0.2)
-        select_visible_menu_item("Manuscript")
-        os.write(master, b"\r")
+        close_reference_start = len(output)
+        os.write(master, b"\x1b")  # close the selected reference, return to its library
+        if not wait_for_screen_fragments(
+            (b"Reference Library",), close_reference_start, timeout=3.0
+        ):
+            raise AssertionError("Esc did not close the current reference to its library")
+        read_for(0.3)
+        screen = terminal_snapshot(output, 24, 80)
+        if any("Reference only stays clear." in row for row in screen):
+            raise AssertionError("closed reference text remained visible in the library; screen: " + repr(screen))
+        os.write(master, b"\x1b")  # return to the manuscript workspace which opened the library
         if not wait_for_workspace_title("Editor", timeout=3.0):
-            raise AssertionError(
-                "Navigate > Manuscript did not restore the editor; screen: "
-                + repr(terminal_snapshot(output, 24, 80))
-            )
+            if not wait_for_workspace_title("Outline", timeout=3.0):
+                raise AssertionError(
+                    "Esc from the Reference Library did not restore its originating workspace; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            if not move_outline_selection_until(lambda row: "Arrival" in row, "down"):
+                raise AssertionError("the originating outline did not retain a selectable manuscript scene")
+            os.write(master, b"\r")
+            if not wait_for_workspace_title("Editor", timeout=3.0):
+                raise AssertionError("Enter did not open the selected scene after returning to Outline")
         if not wait_for_screen_fragments((b"The opening paragraph remains readable.",), timeout=3.0):
             raise AssertionError("manuscript prose was not rendered after returning from Reference Library")
         assert_sample_prose_visible(output, 24, 80, "screen after returning from Reference Library")
