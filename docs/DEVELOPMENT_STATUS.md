@@ -2756,3 +2756,14 @@ applies the suggested correction, saves, and verifies the persisted text after
 reopening while confirming another scene remains unchanged. Focused PTY,
 formatting and terminal Clippy checks passed. Custom replacement and selecting
 among multiple suggestions remain outstanding.
+
+### Selected-text thesaurus — 28 November 2026
+
+Review > Thesaurus now uses an active manuscript selection automatically and
+opens local results in a second pane. `R` replaces the original selection with
+the first available local synonym; the edit is undoable and remains in the
+normal save flow. Without a selection, the existing word-entry and standalone
+results workflow remains available. A production PTY regression selects
+“colour”, looks up the local dictionary, applies “hue”, saves and verifies the
+reopened manuscript. Focused PTY and formatting passed; final Clippy check is
+pending.

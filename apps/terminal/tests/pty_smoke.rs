@@ -2005,14 +2005,20 @@ fn grammar_review_can_correct_and_reopen_a_scene_through_the_production_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn offline_thesaurus_runs_from_the_review_menu_in_a_real_pty() {
+fn selected_text_thesaurus_can_replace_and_reopen_manuscript_text_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;
     use story_app::WriterApp;
 
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("Thesaurus Project");
-    WriterApp::create_project(&project, "Thesaurus Project").unwrap();
+    let mut app = WriterApp::create_project(&project, "Thesaurus Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, source_hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&source_hash), "colour appears.")
+        .unwrap();
+    drop(app);
     let dictionary = root.path().join("test-mythes.dat");
     std::fs::write(&dictionary, "UTF-8\n1\ncolour|1\n(noun)|hue|pigment\n").unwrap();
 
@@ -2036,6 +2042,8 @@ fn offline_thesaurus_runs_from_the_review_menu_in_a_real_pty() {
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(reopened.load_scene_text(scene).unwrap().0, "hue appears.");
 }
 
 #[cfg(target_os = "linux")]

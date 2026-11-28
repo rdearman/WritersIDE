@@ -1141,6 +1141,17 @@ def main():
         if review_menu:
             os.write(master, b"\x1b")  # dismiss the visible first-run welcome
             read_for(0.25)
+            if review_thesaurus:
+                if wait_for_workspace_title("Outline", timeout=1.0):
+                    if not move_outline_selection_until(lambda row: "Arrival" in row, "down"):
+                        raise AssertionError("the thesaurus test scene was not selectable")
+                    os.write(master, b"\r")
+                if not wait_for_workspace_title("Editor", timeout=3.0):
+                    raise AssertionError("the thesaurus test manuscript did not open")
+                # Select the leading word "colour" using ordinary editor
+                # selection input before invoking the Review command.
+                os.write(master, b"\x1b[1;2C" * 6)
+                read_for(0.2)
             menu_start = len(output)
             os.write(master, b"\x1b[21~")  # F10
             read_for(0.2)
@@ -1159,14 +1170,17 @@ def main():
             select_visible_menu_item("Thesaurus" if review_thesaurus else "Spell Check")
             os.write(master, b"\r")
             if review_thesaurus:
-                if not wait_for_screen_fragments((b"thesaurus ",), menu_start, timeout=2.0):
-                    raise AssertionError("Review > Thesaurus did not open its word prompt")
-                os.write(master, b"colour\r")
-                if not wait_for_screen_fragments((b"Thesaurus", b"hue", b"pigment"), menu_start, timeout=5.0):
+                if not wait_for_screen_fragments((b"Thesaurus", b"colour", b"hue", b"pigment"), menu_start, timeout=5.0):
                     raise AssertionError(
-                        "offline thesaurus results did not appear in the reference pane; screen: "
+                        "selected-text lookup did not show offline results alongside the manuscript; screen: "
                         + repr(terminal_snapshot(output, 24, 80))
                     )
+                os.write(master, b"r")  # explicitly replace with the first thesaurus suggestion
+                if not wait_for_screen_fragments((b"Replaced selected text with", b"hue"), menu_start, timeout=3.0):
+                    raise AssertionError("thesaurus replacement did not update the manuscript selection")
+                os.write(master, b"\x13")
+                if not wait_for_screen_fragments((b"Saved at",), timeout=3.0):
+                    raise AssertionError("thesaurus replacement was not saved")
                 os.write(master, b"\x11")
                 quit_deadline = time.monotonic() + 5.0
                 finished_pid = 0

@@ -680,6 +680,15 @@ struct ReferencePane {
     selection_anchor: Option<usize>,
     proofreading: Option<ProofreadingReview>,
     spelling: Option<SpellCheckReview>,
+    thesaurus: Option<ThesaurusReview>,
+}
+
+#[derive(Clone, Debug)]
+struct ThesaurusReview {
+    source_text: String,
+    selected_range: Option<std::ops::Range<usize>>,
+    selected_word: String,
+    replacement: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -9865,6 +9874,7 @@ impl AppState {
                     selection_anchor: None,
                     proofreading: None,
                     spelling: None,
+                    thesaurus: None,
                 });
             } else {
                 stale_reference = true;
@@ -13515,6 +13525,7 @@ impl AppState {
                 selection_anchor: None,
                 proofreading: None,
                 spelling: None,
+                thesaurus: None,
             }
         } else {
             let pane = self
@@ -13858,6 +13869,48 @@ impl AppState {
         );
         Ok(())
     }
+    fn replace_thesaurus_selection(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(review) = self
+            .active_reference_pane()
+            .and_then(|pane| pane.thesaurus.as_ref())
+        else {
+            return Ok(());
+        };
+        let (source, range, word, replacement) = (
+            review.source_text.clone(),
+            review.selected_range.clone(),
+            review.selected_word.clone(),
+            review.replacement.clone(),
+        );
+        let Some(range) = range else {
+            self.message = "Select a manuscript word before replacement".into();
+            return Ok(());
+        };
+        let Some(replacement) = replacement else {
+            self.message = "No thesaurus suggestion is available for replacement".into();
+            return Ok(());
+        };
+        let current = self.editor.join("\n");
+        if current != source || current.get(range.clone()) != Some(word.as_str()) {
+            self.message = "Manuscript selection changed · run Thesaurus again".into();
+            return Ok(());
+        }
+        let mut updated = current.clone();
+        updated.replace_range(range.clone(), &replacement);
+        self.push_undo();
+        self.editor = updated.lines().map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        self.cursor = editor_position_from_byte(&updated, range.start + replacement.len())
+            .unwrap_or(self.cursor);
+        self.editor_selection = None;
+        self.dirty = true;
+        self.update_narrowed_passage(&current);
+        self.focus_main_editor();
+        self.message = format!("Replaced selected text with ‘{replacement}’ · Undo available");
+        Ok(())
+    }
     fn refresh_proofreading_pane(&mut self) {
         let Some(pane) = self.active_reference_pane_mut() else {
             return;
@@ -14118,6 +14171,7 @@ impl AppState {
                     selection_anchor: None,
                     proofreading: None,
                     spelling: None,
+                    thesaurus: None,
                 };
                 self.active_reference = index;
                 self.sync_focused_window(focused);
@@ -14155,6 +14209,7 @@ impl AppState {
                 selection_anchor: None,
                 proofreading: None,
                 spelling: None,
+                thesaurus: None,
             };
             self.active_reference = index;
         } else {
@@ -14171,6 +14226,7 @@ impl AppState {
                 selection_anchor: None,
                 proofreading: None,
                 spelling: None,
+                thesaurus: None,
             });
             self.active_reference = self.reference_panes.len() - 1;
         }
@@ -18152,6 +18208,11 @@ impl AppState {
                         return Ok(());
                     }
                     if spec.takes_arguments {
+                        if spec.id == "analysis.thesaurus" && self.selected_text().is_some() {
+                            self.menu = None;
+                            self.dispatch_registered_command_id(spec.id)?;
+                            return Ok(());
+                        }
                         if spec.category == "Series"
                             || matches!(spec.id, "link.create" | "link.delete")
                         {
@@ -18326,7 +18387,13 @@ impl AppState {
             self.message = format!("{} unavailable: {reason}", command.label);
             return Ok(());
         }
-        if command.takes_arguments && arguments.is_none() {
+        if command_id == "analysis.thesaurus" && arguments.is_none() {
+            if let Some(selection) = self.selected_text().filter(|text| !text.trim().is_empty()) {
+                self.execute_legacy_palette_command(&format!("thesaurus {}", selection.trim()))?;
+            } else {
+                self.prompt_for_registered_command(command)?;
+            }
+        } else if command.takes_arguments && arguments.is_none() {
             self.prompt_for_registered_command(command)?;
         } else if command.action == CommandAction::LegacyPalette {
             self.dispatch_registered_with_args(
@@ -24172,6 +24239,20 @@ impl AppState {
             let bytes = fs::read(&dictionary_path)?;
             let thesaurus = story_analysis::OfflineThesaurus::parse_mythes_bytes(&bytes)?;
             let senses = thesaurus.lookup(word);
+            let source_text = self.editor.join("\n");
+            let selected_range = self.selection_bounds().map(|(start, end)| {
+                editor_position_byte(&self.editor, start.0, start.1)
+                    ..editor_position_byte(&self.editor, end.0, end.1)
+            });
+            let selected_word = selected_range
+                .as_ref()
+                .and_then(|range| source_text.get(range.clone()))
+                .unwrap_or_default()
+                .to_owned();
+            let selected_range = (selected_word.trim() == word)
+                .then_some(selected_range)
+                .flatten();
+            let mut first_suggestion = None;
             let mut body = format!(
                 "Thesaurus — {word}\nTerm: {word}\nLanguage: {language}\nSource: {}\n\n",
                 dictionary_path.display()
@@ -24188,19 +24269,34 @@ impl AppState {
                             body.push_str("  • ");
                             body.push_str(synonym);
                             body.push('\n');
+                            if first_suggestion.is_none() {
+                                first_suggestion = Some(synonym.clone());
+                            }
                         }
                         body.push('\n');
                     }
                 }
                 _ => body.push_str("No thesaurus entry was found for this term.\n"),
             }
-            // Show the read-only result in the integrated reference workspace,
-            // including when the author launched the command from the welcome
-            // screen or outline where no manuscript pane exists yet.
-            self.workspace = Workspace::Reading;
-            self.reading_document = None;
-            self.reading_text = body;
-            self.scroll = 0;
+            if selected_range.is_some() && self.workspace == Workspace::Editor {
+                self.ensure_manual_pane_layout()?;
+                let source_key = format!("thesaurus:{}", word.to_lowercase());
+                self.open_reference_buffer(source_key, None, format!("Thesaurus · {word}"), body);
+                if let Some(pane) = self.active_reference_pane_mut() {
+                    pane.thesaurus = Some(ThesaurusReview {
+                        source_text,
+                        selected_range,
+                        selected_word,
+                        replacement: first_suggestion,
+                    });
+                }
+                self.reference_focused = true;
+            } else {
+                self.workspace = Workspace::Reading;
+                self.reading_document = None;
+                self.reading_text = body;
+                self.scroll = 0;
+            }
             self.message = if fallback_note.is_some() {
                 "Offline thesaurus opened using an available English variant; results are suggestions only".into()
             } else {
@@ -30018,6 +30114,15 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
             };
             let menu_hint = display_shortcut_label(effective_shortcut_label(s, "menu.main", "F10"));
             let actions = if s.reference_focused
+                && let Some(pane) = s.active_reference_pane()
+                && let Some(review) = pane.thesaurus.as_ref()
+            {
+                if review.selected_range.is_some() && review.replacement.is_some() {
+                    "Thesaurus · R replace selection · Esc manuscript".into()
+                } else {
+                    "Thesaurus · Esc manuscript".into()
+                }
+            } else if s.reference_focused
                 && let Some(pane) = s.active_reference_pane()
                 && let Some(review) = pane.spelling.as_ref()
             {
@@ -38391,6 +38496,15 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
     if s.workspace == Workspace::Editor && s.reference_focused && k.code == KeyCode::Esc {
         s.focus_main_editor();
         s.message = "Manuscript editor focused".into();
+        return Ok(false);
+    }
+    if s.workspace == Workspace::Editor
+        && s.reference_focused
+        && s.active_reference_pane()
+            .is_some_and(|pane| pane.thesaurus.is_some())
+        && matches!(k.code, KeyCode::Char('r' | 'R'))
+    {
+        s.replace_thesaurus_selection()?;
         return Ok(false);
     }
     if s.workspace == Workspace::Editor
@@ -60013,6 +60127,7 @@ mod tests {
             selection_anchor: None,
             proofreading: None,
             spelling: None,
+            thesaurus: None,
         });
         layout.focus(reference_id).unwrap();
         state.reference_focused = true;
@@ -60085,6 +60200,7 @@ mod tests {
             selection_anchor: None,
             proofreading: None,
             spelling: None,
+            thesaurus: None,
         });
         state.pane_layout = Some(saved);
         state.save_named_window_layout("Research").unwrap();
