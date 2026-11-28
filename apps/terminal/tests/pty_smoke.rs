@@ -960,6 +960,52 @@ fn staged_working_project_recovers_after_an_abrupt_pty_exit() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn staged_working_project_recovers_autosaved_text_after_sighup() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("isolated-home");
+    let staged = home.join("data/writers-ide/staging").join("working-novel");
+    std::fs::create_dir_all(&staged).unwrap();
+    let mut app = WriterApp::create_project(&staged, "Working Novel").unwrap();
+    let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+    let scene = app.create_scene(chapter, "Recovery Opening", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "Recovery checkpoint.")
+        .unwrap();
+    std::fs::create_dir_all(staged.join(".writers-ide")).unwrap();
+    std::fs::write(
+        staged.join(".writers-ide/staging.json"),
+        serde_json::json!({"version": 1, "created_at": 1}).to_string(),
+    )
+    .unwrap();
+    drop(app);
+
+    let harness =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_staging_recovery.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&home)
+        .arg("hangup")
+        .output()
+        .expect("run staged-work SIGHUP recovery through Linux PTY");
+    assert!(
+        result.status.success(),
+        "SIGHUP recovery PTY failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(
+        !staged.exists(),
+        "the explicit discard after recovery should remove only the staged project"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 #[ignore = "requires WIDE_PRIVATE_ARROWMAKING_PROJECT to point at the protected local corpus"]
 fn protected_arrowmaking_project_imports_through_the_production_pty_without_source_changes() {
     let _guard = lock_pty_test();

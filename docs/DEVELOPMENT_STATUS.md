@@ -1,5 +1,15 @@
 # Writer's IDE Development Status
 
+## Staged project recovery after SSH hangup — 28 November 2026
+
+Added a production Linux PTY test that types a draft into a staged project,
+waits through the two-second idle autosave, delivers `SIGHUP`, restarts WIDE,
+and verifies both the earlier prose and the autosaved draft are present before
+explicitly discarding the test project. The existing abrupt-`SIGKILL` recovery
+test remains intact. The focused SIGHUP PTY passes. This validates staged
+project journal recovery on a terminal hangup; rolling whole-project backups,
+retention and close/exit backup policy in #70 remain outstanding.
+
 ## Search results no longer hide manuscript items — 28 November 2026
 
 Fixed a shared-state defect where returning from a narrowed quick-search view

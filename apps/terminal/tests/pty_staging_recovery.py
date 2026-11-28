@@ -69,21 +69,52 @@ def finish(pid, master):
 
 
 def main():
-    binary, home = sys.argv[1:]
+    binary, home, *modes = sys.argv[1:]
+    simulate_hangup = modes == ["hangup"]
     os.makedirs(os.path.join(home, "tmp"), exist_ok=True)
     pid, master = spawn(binary, home)
     wait_for(master, b"checkpoint.")
-    os.kill(pid, signal.SIGKILL)
-    os.waitpid(pid, 0)
-    os.close(master)
+    if simulate_hangup:
+        os.write(master, b"SIGHUP draft.")
+        wait_for(master, b"SIGHUP draft.")
+        # Autosave is scheduled after two seconds idle; allow one complete
+        # application poll/save cycle before simulating the lost SSH session.
+        time.sleep(3)
+        os.kill(pid, signal.SIGHUP)
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done == pid:
+                break
+            time.sleep(0.05)
+        else:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+            os.close(master)
+            raise AssertionError("application did not terminate after the simulated SSH hangup")
+        os.close(master)
+        if not os.WIFSIGNALED(status) or os.WTERMSIG(status) != signal.SIGHUP:
+            raise AssertionError(f"PTY process did not receive SIGHUP: wait status {status}")
+    else:
+        os.kill(pid, signal.SIGKILL)
+        os.waitpid(pid, 0)
+        os.close(master)
 
     pid, master = spawn(binary, home)
-    wait_for(master, b"checkpoint.")
+    if simulate_hangup:
+        recovered = wait_for(master, b"SIGHUP draft.")
+        if b"checkpoint." not in recovered:
+            raise AssertionError("recovery did not retain both the prior and autosaved manuscript text")
+    else:
+        wait_for(master, b"checkpoint.")
     os.write(master, b"\x11")
     wait_for(master, b"Save Project and Quit")
     os.write(master, b"d")
     finish(pid, master)
-    print("PTY staging recovery passed: edit → abrupt termination → automatic project recovery → explicit discard.")
+    if simulate_hangup:
+        print("PTY SIGHUP recovery passed: typed draft → autosave → terminal hangup → recovered draft → explicit discard.")
+    else:
+        print("PTY staging recovery passed: edit → abrupt termination → automatic project recovery → explicit discard.")
 
 
 if __name__ == "__main__":
