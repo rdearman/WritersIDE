@@ -1,5 +1,23 @@
 # Writer's IDE Development Status
 
+## Search results no longer hide manuscript items — 28 November 2026
+
+Fixed a shared-state defect where returning from a narrowed quick-search view
+could leave the manuscript outline or scene cards backed by only the matching
+scene subset. Search state is no longer saved as intentional outline narrowing;
+leaving Search for either outliner reloads all scenes while retaining the
+matched scene selection. Reopening Search also restores selection by stable
+scene identity rather than a stale list index.
+
+Regression coverage includes a unit test and a production Linux PTY journey:
+search one of 12 scenes, switch through Scene Cards back to the Outline, verify
+the selected result and chapter count, navigate to the last scene, then close
+and reopen to verify all scene identities, order and text. Verification passed:
+formatting, warnings-denied workspace Clippy, and the complete terminal package
+suite (388 unit tests, 3 author workflows, 57 PTY tests passed; one protected
+private-corpus PTY was skipped because its local path was not configured). This
+is a code fix, not human UAT.
+
 ## Alpha UAT 47 candidate — 28 November 2026
 
 Frozen from code commit `b746778` at

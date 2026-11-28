@@ -1409,6 +1409,67 @@ fn view_menu_switches_between_unified_outline_presentations_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn returning_from_search_restores_all_outline_items_in_a_real_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Search Outline PTY");
+    let mut app = WriterApp::create_project(&project, "Search Outline PTY").unwrap();
+    let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+    let scenes = (0..12)
+        .map(|index| {
+            let scene = app
+                .create_scene(chapter, &format!("Scene {:02}", index + 1), index)
+                .unwrap();
+            let text = if index == 4 {
+                "The needle appears in this scene."
+            } else {
+                "This scene contains ordinary manuscript prose."
+            };
+            let (_, hash) = app.load_scene_text(scene).unwrap();
+            app.save_scene_text(scene, Some(&hash), text).unwrap();
+            scene
+        })
+        .collect::<Vec<_>>();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("search-outline-restore")
+        .output()
+        .expect("run the search-to-outline Linux PTY workflow");
+    assert!(
+        result.status.success(),
+        "search-to-outline PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(reopened.list_scenes(false).unwrap().len(), 12);
+    assert_eq!(
+        reopened.load_scene_text(scenes[4]).unwrap().0,
+        "The needle appears in this scene."
+    );
+    assert_eq!(
+        scenes
+            .iter()
+            .map(|scene| reopened.get_scene(*scene).unwrap().scene.title)
+            .collect::<Vec<_>>(),
+        (1..=12)
+            .map(|number| format!("Scene {number:02}"))
+            .collect::<Vec<_>>()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn removed_scenes_empty_state_returns_to_cards_in_a_real_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;

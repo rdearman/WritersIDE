@@ -206,6 +206,7 @@ def main():
     review_proofread = modes == ["review-proofread"]
     removed_scenes = modes == ["removed-scenes"]
     outline_view = modes == ["outline-view"]
+    search_outline_restore = modes == ["search-outline-restore"]
     editor_viewport = modes == ["editor-viewport"]
     chapter_removal = modes in (
         ["chapter-removal"],
@@ -234,6 +235,7 @@ def main():
         or bulk_outline_insert
         or scene_status_picker
         or manuscript_status_settings
+        or search_outline_restore
     ):
         # Keep this workflow focused on project lifecycle rather than allowing
         # first-run onboarding to consume editing keys.
@@ -1621,6 +1623,83 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit cleanly after switching outline presentations; visible tail: " + repr(ANSI_CONTROL.sub(b"", output[-1200:])))
             print("PTY unified-outline workflow passed: View menu switches between tree and scene-card presentations.")
+            return
+
+        if search_outline_restore:
+            for _ in range(3):
+                if wait_for_workspace_title("Outline", timeout=0.2):
+                    break
+                os.write(master, b"\x1b")
+                read_for(0.2)
+            if not wait_for_workspace_title("Outline", timeout=1.0):
+                raise AssertionError("could not focus the manuscript outline before searching")
+            os.write(master, b"/needle\r")  # quick search narrows the result view
+            if not wait_for_screen_fragments((b"1 search result",), timeout=5.0):
+                raise AssertionError(
+                    "quick search did not display its single matching result; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")
+            read_for(0.2)
+            for _ in range(10):
+                if wait_for_screen_fragments((b"Show Scene Cards",), menu_start, timeout=0.1):
+                    break
+                os.write(master, b"\x1b[C")
+                read_for(0.2)
+            else:
+                raise AssertionError(
+                    "View menu did not expose Scene Cards from search results; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            select_visible_menu_item("Show Scene Cards")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(("Included · 12".encode("utf-8"),), timeout=5.0):
+                raise AssertionError(
+                    "View > Show Scene Cards did not leave the search results; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            menu_start = len(output)
+            os.write(master, b"\x1b[21~")
+            if not wait_for_screen_fragments((b"Show Outline Tree",), menu_start, timeout=1.0):
+                for _ in range(8):
+                    os.write(master, b"\x1b[C")
+                    read_for(0.15)
+                    if wait_for_screen_fragments((b"Show Outline Tree",), menu_start, timeout=0.1):
+                        break
+                else:
+                    raise AssertionError("View menu did not offer the outline tree from Scene Cards")
+            select_visible_menu_item("Show Outline Tree")
+            os.write(master, b"\r")
+            if not wait_for_workspace_title("Outline", timeout=5.0):
+                raise AssertionError(
+                    "the application did not return to the manuscript outline; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            rows = terminal_snapshot(output, 24, 80)
+            visible = "".join(rows)
+            if "12 scene(s)" not in visible or "Scene 05" not in visible:
+                raise AssertionError(f"outline count or selected search result was lost; screen: {rows!r}")
+            if "▸   [ ] Scene 05" not in visible:
+                raise AssertionError("the matching scene was not retained as the outline selection")
+            for _ in range(7):
+                os.write(master, b"\x1b[B")
+                read_for(0.12)
+            if not wait_for_screen_fragments(("▸   [ ] Scene 12".encode("utf-8"),), timeout=2.0):
+                raise AssertionError(
+                    "the last manuscript item was not reachable after returning from search; screen: "
+                    + repr(terminal_snapshot(output, 24, 80))
+                )
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after restoring the outline")
+            print("PTY search-to-outline passed: search retained its match, restored all manuscript items and closed cleanly.")
             return
 
         if outline_enter:

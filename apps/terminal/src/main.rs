@@ -9402,10 +9402,18 @@ impl AppState {
         let parent = path.parent().ok_or("session file has no parent")?;
         fs::create_dir_all(parent)?;
         let all_scenes = self.app.list_scenes(false)?;
-        let narrowed_chapter =
-            infer_narrowed_chapter(&self.scenes, &all_scenes).map(|chapter| chapter.to_string());
-        let narrowed_node =
-            infer_narrowed_node(&self.scenes, &all_scenes, &self.app)?.map(|node| node.to_string());
+        // Search results share the cached scene list used by the manuscript
+        // outline. A search subset is transient navigation state, not an
+        // instruction to reopen the project with its outline narrowed.
+        let narrowed_chapter = (self.workspace != Workspace::Search)
+            .then(|| infer_narrowed_chapter(&self.scenes, &all_scenes))
+            .flatten()
+            .map(|chapter| chapter.to_string());
+        let narrowed_node = if self.workspace == Workspace::Search {
+            None
+        } else {
+            infer_narrowed_node(&self.scenes, &all_scenes, &self.app)?.map(|node| node.to_string())
+        };
         let snapshot = SessionSnapshot {
             workspace: self.workspace.title().to_owned(),
             selected_scene: self.active_scene().map(|id| id.to_string()),
@@ -9999,7 +10007,7 @@ impl AppState {
             .copied()
             .find(|workspace| workspace.title().eq_ignore_ascii_case(&snapshot.workspace))
             .unwrap_or(Workspace::Dashboard);
-        if self.workspace == Workspace::Outline {
+        if matches!(self.workspace, Workspace::Outline | Workspace::Search) {
             let rows = outline_rows(self);
             if let Some(scene) = snapshot
                 .selected_scene
@@ -10007,10 +10015,20 @@ impl AppState {
                 .and_then(|value| value.parse::<uuid::Uuid>().ok())
                 .map(SceneId)
             {
-                self.selected = rows
-                    .iter()
-                    .position(|row| *row == OutlineRow::Scene(scene))
-                    .unwrap_or_else(|| snapshot.selected.min(rows.len().saturating_sub(1)));
+                if self.workspace == Workspace::Outline {
+                    self.selected = rows
+                        .iter()
+                        .position(|row| *row == OutlineRow::Scene(scene))
+                        .unwrap_or_else(|| snapshot.selected.min(rows.len().saturating_sub(1)));
+                } else {
+                    self.selected = self
+                        .scenes
+                        .iter()
+                        .position(|row| row.0 == scene)
+                        .unwrap_or_else(|| {
+                            snapshot.selected.min(self.scenes.len().saturating_sub(1))
+                        });
+                }
             } else {
                 self.selected = snapshot.selected.min(rows.len().saturating_sub(1));
             }
@@ -16496,6 +16514,36 @@ impl AppState {
     fn switch(&mut self, w: Workspace) {
         if self.workspace != w {
             let previous = self.workspace;
+            // Search temporarily replaces the scene cache with its results.
+            // Restore the complete manuscript list before building outline
+            // rows, while retaining the selected result as the return target.
+            let search_selection = (previous == Workspace::Search && is_manuscript_outliner(w))
+                .then(|| selected_scene_for_workspace(self))
+                .flatten();
+            if previous == Workspace::Search && is_manuscript_outliner(w) {
+                match self.app.list_scenes(false) {
+                    Ok(scenes) => {
+                        self.scenes = scenes
+                            .into_iter()
+                            .map(|record| {
+                                (
+                                    record.scene.id,
+                                    record.scene.title,
+                                    record.scene.status,
+                                    record.actual_words,
+                                )
+                            })
+                            .collect();
+                        self.selected = search_selection
+                            .and_then(|id| self.scenes.iter().position(|scene| scene.0 == id))
+                            .unwrap_or(0);
+                    }
+                    Err(error) => {
+                        self.message =
+                            format!("Could not restore the full manuscript outline: {error}");
+                    }
+                }
+            }
             let outline_selection = (previous == Workspace::Outline)
                 .then(|| outline_rows(self).get(self.selected).cloned())
                 .flatten();
@@ -47547,6 +47595,43 @@ mod tests {
         assert!(!reopened.scenes.iter().any(|scene| scene.0 == first_scene));
         assert_eq!(reopened.horizontal_split_ratio, 60);
         assert_eq!(reopened.vertical_split_ratio, 40);
+    }
+
+    #[test]
+    fn search_subset_does_not_hide_outline_items_or_persist_as_narrowing() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Search"), "Search").unwrap();
+        let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
+        let expected = (0..12)
+            .map(|index| {
+                app.create_scene(chapter, &format!("Scene {:02}", index + 1), index)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut state = AppState::new(app, default_bindings());
+        state.refresh().unwrap();
+
+        state.scenes = vec![state.scenes[4].clone()];
+        state.selected = 0;
+        state.workspace = Workspace::Search;
+        state.save_session().unwrap();
+
+        let mut reopened = AppState::new(
+            WriterApp::open_project(state.app.project_root()).unwrap(),
+            default_bindings(),
+        );
+        reopened.restore_session().unwrap();
+        reopened.switch(Workspace::Outline);
+
+        let outline_scenes = outline_rows(&reopened)
+            .into_iter()
+            .filter_map(|row| match row {
+                OutlineRow::Scene(id) => Some(id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outline_scenes, expected);
+        assert_eq!(reopened.active_scene(), Some(expected[4]));
     }
 
     #[test]
