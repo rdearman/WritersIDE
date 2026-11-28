@@ -686,6 +686,7 @@ struct ReferencePane {
 struct SpellCheckReview {
     scene_id: Option<SceneId>,
     content_unit_id: Option<story_core::ContentUnitId>,
+    language: String,
     source_text: String,
     occurrences: Vec<SpellCheckOccurrence>,
     selected: usize,
@@ -13784,6 +13785,79 @@ impl AppState {
         );
         Ok(())
     }
+    fn correct_selected_spelling_occurrence(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(review) = self
+            .active_reference_pane()
+            .and_then(|pane| pane.spelling.as_ref())
+        else {
+            return Ok(());
+        };
+        let Some(occurrence) = review.occurrences.get(review.selected).cloned() else {
+            self.message = "No spelling occurrence is selected".into();
+            return Ok(());
+        };
+        let (source_text, scene_id, content_unit_id, language) = (
+            review.source_text.clone(),
+            review.scene_id,
+            review.content_unit_id,
+            review.language.clone(),
+        );
+        let executable = std::env::var_os("WIDE_ASPELL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| "aspell".into());
+        let suggestions = spelling_suggestions(
+            &occurrence.word,
+            &language,
+            executable.to_string_lossy().as_ref(),
+        )?;
+        let Some(replacement) = suggestions.first() else {
+            self.message = format!("No spelling suggestions for '{}'", occurrence.word);
+            return Ok(());
+        };
+        if self.dirty
+            && ((scene_id.is_some() && self.editing_scene != scene_id)
+                || (content_unit_id.is_some() && self.editing_content_unit != content_unit_id))
+        {
+            self.message =
+                "Save the current document before correcting this spelling result".into();
+            return Ok(());
+        }
+        if let Some(scene) = scene_id {
+            if self.editing_scene != Some(scene) {
+                self.open_scene(scene)?;
+            }
+        } else if let Some(content) = content_unit_id
+            && self.editing_content_unit != Some(content)
+        {
+            self.open_content_unit(content)?;
+        }
+        let current = self.editor.join("\n");
+        if current != source_text
+            || current.get(occurrence.byte_range.clone()) != Some(occurrence.word.as_str())
+        {
+            self.message = "Spelling result is stale · run Spell Check again".into();
+            return Ok(());
+        }
+        let mut corrected = current.clone();
+        corrected.replace_range(occurrence.byte_range.clone(), replacement);
+        self.push_undo();
+        self.editor = corrected.lines().map(str::to_owned).collect();
+        if self.editor.is_empty() {
+            self.editor.push(String::new());
+        }
+        self.cursor =
+            editor_position_from_byte(&corrected, occurrence.byte_range.start + replacement.len())
+                .unwrap_or(self.cursor);
+        self.editor_selection = None;
+        self.dirty = true;
+        self.update_narrowed_passage(&current);
+        self.focus_main_editor();
+        self.message = format!(
+            "Changed '{}' to '{}' · Undo available · save to keep the correction",
+            occurrence.word, replacement
+        );
+        Ok(())
+    }
     fn refresh_proofreading_pane(&mut self) {
         let Some(pane) = self.active_reference_pane_mut() else {
             return;
@@ -18059,6 +18133,7 @@ impl AppState {
                             pane.spelling = Some(SpellCheckReview {
                                 scene_id,
                                 content_unit_id,
+                                language,
                                 source_text: text,
                                 occurrences,
                                 selected: 0,
@@ -29947,7 +30022,7 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 && let Some(review) = pane.spelling.as_ref()
             {
                 format!(
-                    "Spell Check · {} occurrence(s) · Enter jump · Esc manuscript",
+                    "Spell Check · {} occurrence(s) · Enter jump · C correct · Esc manuscript",
                     review.occurrences.len()
                 )
             } else if s.reference_focused
@@ -30907,6 +30982,49 @@ fn spellcheck_text_with_engine(
         title: title.to_owned(),
         candidates,
     }))
+}
+
+fn spelling_suggestions(
+    word: &str,
+    language: &str,
+    executable: &str,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut child = Command::new(executable)
+        .arg(format!("--lang={language}"))
+        .arg("pipe")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .ok_or("spell checker stdin unavailable")?
+        .write_all(format!("^{word}\n").as_bytes())?;
+    let output = child.wait_with_output()?;
+    if !output.status.success() {
+        return Err(format!(
+            "Aspell could not suggest a correction: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .into());
+    }
+    let response = String::from_utf8(output.stdout)?;
+    let Some((_, list)) = response
+        .lines()
+        .find(|line| line.starts_with('&'))
+        .and_then(|line| line.split_once(':'))
+    else {
+        return Ok(Vec::new());
+    };
+    Ok(list
+        .split(", ")
+        .map(str::trim)
+        .filter(|candidate| !candidate.is_empty())
+        .take(10)
+        .map(str::to_owned)
+        .collect())
 }
 
 fn spelling_occurrences(
@@ -38295,6 +38413,10 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
             }
             KeyCode::Enter => {
                 s.jump_to_selected_spelling_occurrence()?;
+                return Ok(false);
+            }
+            KeyCode::Char('c' | 'C') => {
+                s.correct_selected_spelling_occurrence()?;
                 return Ok(false);
             }
             _ => {}

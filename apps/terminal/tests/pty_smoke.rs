@@ -1901,7 +1901,7 @@ fn review_menu_exposes_spellcheck_and_grammar_actions_in_a_real_pty() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn spell_check_from_review_defaults_to_the_open_document_and_preserves_prose() {
+fn spell_check_from_review_can_correct_and_reopen_the_open_document() {
     let _guard = lock_pty_test();
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
@@ -1928,7 +1928,7 @@ fn spell_check_from_review_defaults_to_the_open_document_and_preserves_prose() {
     let mock_aspell = root.path().join("aspell-mock");
     std::fs::write(
         &mock_aspell,
-        "#!/bin/sh\ntext=$(cat)\ncase \"$text\" in *Baad*) echo Baad;; esac\ncase \"$text\" in *Wrng*) echo Wrng;; esac\n",
+        "#!/bin/sh\ntext=$(cat)\ncase \"$*\" in *pipe*) case \"$text\" in *Baad*) echo '& Baad 4 1: bad, bead, band, bat';; esac;; *) case \"$text\" in *Baad*) echo Baad;; esac; case \"$text\" in *Wrng*) echo Wrng;; esac;; esac\n",
     )
     .unwrap();
     std::fs::set_permissions(&mock_aspell, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1950,7 +1950,10 @@ fn spell_check_from_review_defaults_to_the_open_document_and_preserves_prose() {
         String::from_utf8_lossy(&result.stderr)
     );
     let reopened = WriterApp::open_project(&project).unwrap();
-    assert_eq!(reopened.load_scene_text(first).unwrap().0, long_text);
+    assert_eq!(
+        reopened.load_scene_text(first).unwrap().0,
+        long_text.replace("Baad word.", "bad word.")
+    );
     assert_eq!(reopened.load_scene_text(second).unwrap().0, "Wrng word.");
 }
 

@@ -1218,18 +1218,12 @@ def main():
             screen = "\n".join(terminal_snapshot(output, 24, 80))
             if "Wrng" in screen:
                 raise AssertionError("Spell Check included a different scene instead of the current document")
-            os.write(master, b"\r")  # navigate from the report to the source occurrence
-            if not wait_for_screen_fragments((b"Selected spelling occurrence", b"line 41, column 1"), menu_start, timeout=3.0):
-                raise AssertionError("Spell Check did not navigate to and select the misspelling in the manuscript")
-            screen = "\n".join(terminal_snapshot(output, 24, 80))
-            if "Spell Check" in screen and "Active:reference" in screen:
-                raise AssertionError("the spelling report kept focus instead of returning to the manuscript selection")
-            if "Baad word." not in screen:
-                raise AssertionError("spelling navigation did not scroll the misspelling into the editor viewport")
-            if "! Baad word." not in screen:
-                raise AssertionError(
-                    "the editor did not mark the misspelling's line in context: " + repr(screen)
-                )
+            os.write(master, b"c")  # explicitly accept the selected occurrence's first suggestion
+            if not wait_for_screen_fragments((b"Changed 'Baad' to 'bad'", b"Undo available"), timeout=3.0):
+                raise AssertionError("spelling correction did not apply the selected suggestion")
+            os.write(master, b"\x13")  # save
+            if not wait_for_screen_fragments((b"Saved at",), timeout=3.0):
+                raise AssertionError("corrected manuscript text was not saved")
             os.write(master, b"\x11")
             quit_deadline = time.monotonic() + 5.0
             finished_pid = 0

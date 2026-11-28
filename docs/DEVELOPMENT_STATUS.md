@@ -2741,3 +2741,18 @@ status production PTY regression, formatting and terminal Clippy with warnings
 denied. This does not replace dedicated forms for every advanced command;
 advanced command-palette operations remain available, while broader dialog
 work is still outstanding.
+
+### Interactive spelling correction — 28 November 2026
+
+Spell Check results can now correct the selected occurrence with `C`, using
+the first suggestion from the configured Aspell language. The correction
+validates the reviewed source and exact occurrence before replacing text,
+adds the change to the editor undo stack, and returns focus to the manuscript.
+It does not silently change prose; the author explicitly accepts the action
+and can undo it before saving.
+
+The production Linux PTY regression checks the current-document result,
+applies the suggested correction, saves, and verifies the persisted text after
+reopening while confirming another scene remains unchanged. Focused PTY,
+formatting and terminal Clippy checks passed. Custom replacement and selecting
+among multiple suggestions remain outstanding.
