@@ -1,6 +1,50 @@
 static PTY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(target_os = "linux")]
+#[test]
+fn delete_sentence_removes_only_the_current_unpunctuated_line_through_the_production_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Sentence Deletion Project");
+    let mut app = WriterApp::create_project(&project, "Sentence Deletion").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(
+        scene,
+        Some(&hash),
+        "First thought\nSecond thought\nThird thought\nFourth thought",
+    )
+    .unwrap();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("delete-sentence")
+        .output()
+        .expect("run sentence deletion through the production Linux PTY");
+    assert!(
+        result.status.success(),
+        "sentence deletion PTY workflow failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "First thought\nSecond thought\nFourth thought"
+    );
+}
+
+#[cfg(target_os = "linux")]
 fn lock_pty_test() -> std::sync::MutexGuard<'static, ()> {
     PTY_TEST_LOCK
         .lock()

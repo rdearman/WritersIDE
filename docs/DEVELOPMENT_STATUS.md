@@ -1,5 +1,15 @@
 # Writer's IDE Development Status
 
+## Safe sentence deletion through the production terminal — 28 November 2026
+
+Added a Linux PTY regression for the reported multi-line Delete Sentence hazard.
+The test creates a four-line unpunctuated passage, selects Edit → Delete
+Sentence through the visible application menu, confirms only the caret's line
+is removed, saves, exits and reopens the project to verify exact persisted
+text. The production PTY test passes. This verifies the safe fallback for
+unpunctuated multiline text; it does not establish broader editor usability or
+human acceptance of sentence-selection semantics.
+
 ## Confirm revision-hunk restoration before applying — 27 November 2026
 
 Revision history previously restored a highlighted hunk immediately when the

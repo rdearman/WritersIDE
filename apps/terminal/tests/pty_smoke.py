@@ -188,6 +188,7 @@ def main():
     date_time_insertion = modes == ["date-time-insertion"]
     date_time_unavailable = modes == ["date-time-unavailable"]
     find_replace_focus = modes == ["find-replace-focus"]
+    delete_sentence = modes == ["delete-sentence"]
     review_thesaurus = modes == ["review-thesaurus"]
     review_menu = modes in (["review-menu"], ["review-thesaurus"])
     review_spellcheck_suggestions = modes == ["spellcheck-suggestions"]
@@ -2196,6 +2197,50 @@ def main():
             if restored[6][termios.VQUIT] != b"\x1c":
                 raise AssertionError("application shutdown did not restore the terminal VQUIT byte")
             print("PTY window-prefix workflow passed: raw-mode ASCII 0x1C, directions, pane numbers, help/cancel, split/close/maximise, F6/menu fallback, independent scrolling, and termios restoration.")
+            return
+
+        if delete_sentence:
+            if wait_for_screen_fragments((b"Welcome to Writer's IDE",), timeout=1.0):
+                os.write(master, b"\x1b")
+            if wait_for_workspace_title("Outline", timeout=3.0):
+                if not move_outline_selection_until(lambda row: "Opening" in row, "down"):
+                    raise AssertionError("the opening scene was not selectable")
+                os.write(master, b"\r")
+            elif not wait_for_workspace_title("Editor", timeout=3.0):
+                raise AssertionError("project did not open in a manuscript workspace")
+            if not wait_for_workspace_title("Editor", timeout=3.0):
+                raise AssertionError("the opening scene did not open in the editor")
+            os.write(master, b"\x1b[B\x1b[B")  # caret on the third physical line
+            read_for(0.25)
+            action_start = len(output)
+            os.write(master, b"\x1b[21~")  # F10
+            read_for(0.15)
+            os.write(master, b"\x1b[C")  # Edit menu
+            select_visible_menu_item("Delete Sentence")
+            os.write(master, b"\r")
+            if not wait_for_screen_fragments(
+                (b"Unpunctuated line deleted as sentence",), action_start, timeout=3.0
+            ):
+                raise AssertionError("Delete Sentence did not use the safe unpunctuated-line action")
+            screen = "\n".join(terminal_snapshot(output, 24, 80))
+            for expected in ("First thought", "Second thought", "Fourth thought"):
+                if expected not in screen:
+                    raise AssertionError(f"Delete Sentence lost neighboring text {expected!r}; screen: {screen!r}")
+            if "Third thought" in screen:
+                raise AssertionError("Delete Sentence left the selected third line in the editor")
+            os.write(master, b"\x13")
+            if not wait_for_screen_fragments((b"Saved at",), timeout=3.0):
+                raise AssertionError("sentence deletion was not saved")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("application did not exit cleanly after sentence deletion")
+            print("PTY Delete Sentence passed: one line removed from a four-line unpunctuated passage.")
             return
 
         if edit_menu:
