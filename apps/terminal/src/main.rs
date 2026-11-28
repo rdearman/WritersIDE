@@ -50718,7 +50718,7 @@ mod tests {
     }
 
     #[test]
-    fn bottom_replace_panel_requires_enter_preview_then_f5_apply() {
+    fn bottom_replace_panel_previews_then_applies_with_enter() {
         let directory = tempfile::tempdir().unwrap();
         let mut app = WriterApp::create_project(directory.path().join("Novel"), "Novel").unwrap();
         let chapter = app.create_chapter(None, "Chapter", 0).unwrap();
@@ -50759,7 +50759,11 @@ mod tests {
             state.app.load_scene_text(scene).unwrap().0,
             "A CAT catalog waits."
         );
-        handle(&mut state, KeyEvent::new(KeyCode::F(5), KeyModifiers::NONE)).unwrap();
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .unwrap();
         assert_eq!(
             state.app.load_scene_text(scene).unwrap().0,
             "A fox catalog waits."

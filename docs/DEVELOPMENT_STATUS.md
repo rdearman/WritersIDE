@@ -18,6 +18,13 @@ that the converted node retained its stable ID, title and sibling position.
 Both new focused PTY workflows pass; full-workspace verification is pending for
 this test-only increment.
 
+The replace-preview confirmation test previously used F5 for applying the
+preview, despite Enter already being the supported ordinary confirmation key.
+It now explicitly previews and applies with Enter, guarding against an
+accidental function-key-only workflow. The focused test passes. The complete
+terminal binary unit suite also passes (386/386); the workspace integration
+suite was not conclusively completed in this run.
+
 ## Confirm revision-hunk restoration before applying — 27 November 2026
 
 Revision history previously restored a highlighted hunk immediately when the
