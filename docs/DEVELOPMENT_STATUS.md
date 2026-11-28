@@ -2797,3 +2797,10 @@ suggestion, saved it, reopened the project and verified another document stayed
 unchanged. The existing production PTY custom-correction regression also
 passed. Targeted terminal Clippy with warnings denied and formatting passed.
 Human UAT remains open.
+
+The complete terminal package suite passed after these authoring changes:
+384 unit tests, 3 end-to-end author workflows, and 51 production PTY tests
+passed; 1 private arrow-making import PTY test was skipped because its local
+fixture path was not configured. The package was run offline. Formatting,
+terminal Clippy with warnings denied, and `git diff --check` passed at the
+custom-status checkpoint.
