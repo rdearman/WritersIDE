@@ -217,6 +217,7 @@ def main():
     startup_auto_resume = modes == ["startup-auto-resume"]
     cursor_timeout_delayed = modes == ["cursor-timeout-delayed"]
     cursor_timeout_missing = modes == ["cursor-timeout-missing"]
+    mouse_input_isolation = modes == ["mouse-input-isolation"]
     chapter_removal = modes in (
         ["chapter-removal"],
         ["chapter-removal-target"],
@@ -246,6 +247,7 @@ def main():
         or manuscript_status_settings
         or scene_planning_fields
         or search_outline_restore
+        or mouse_input_isolation
     ):
         # Keep this workflow focused on project lifecycle rather than allowing
         # first-run onboarding to consume editing keys.
@@ -787,6 +789,29 @@ def main():
             if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
                 raise AssertionError("application did not exit after cursor-report regression verification")
             print("PTY cursor-report check passed: delayed/missing terminal replies cannot block or terminate screen resize.")
+            return
+
+        if mouse_input_isolation:
+            if not wait_for_screen_fragments((b"Editor", b"Arrival", b"Preserve this prose."), timeout=5.0):
+                raise AssertionError("the manuscript editor did not open before mouse-input isolation")
+            if b"?1000h" in output or b"?1006h" in output:
+                raise AssertionError("mouse reporting was enabled in the ordinary manuscript editor")
+            # Inject the SGR mouse report bytes a terminal sends for a click.
+            os.write(master, b"\x1b[<0;12;9M")
+            read_for(0.3)
+            os.write(master, b"\x13")
+            if not wait_for_screen_fragments((b"Saved at",), timeout=3.0):
+                raise AssertionError("mouse-report isolation workflow did not save normally")
+            os.write(master, b"\x11")
+            quit_deadline = time.monotonic() + 5.0
+            finished_pid = 0
+            status = 0
+            while finished_pid == 0 and time.monotonic() < quit_deadline:
+                read_for(0.1)
+                finished_pid, status = os.waitpid(child_pid, os.WNOHANG)
+            if finished_pid != child_pid or not os.WIFEXITED(status) or os.WEXITSTATUS(status) != 0:
+                raise AssertionError("mouse-report isolation workflow did not exit cleanly")
+            print("PTY mouse-input isolation passed: ordinary editor mode does not enable terminal mouse reporting and an SGR report does not contaminate prose.")
             return
         if backup_archive:
             start = len(output)

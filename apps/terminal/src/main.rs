@@ -27967,7 +27967,6 @@ fn setup() -> Result<Terminal<CrosstermBackend<io::Stdout>>, io::Error> {
     execute!(
         out,
         EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture,
         crossterm::event::EnableBracketedPaste,
         crossterm::event::PushKeyboardEnhancementFlags(
             crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -28004,7 +28003,17 @@ fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut autosave_deadline: Option<Instant> = None;
     let mut auto_snapshot_check = Instant::now();
+    let mut mouse_capture_enabled = false;
     loop {
+        let needs_mouse_capture = s.workspace == Workspace::PlanningBoards;
+        if needs_mouse_capture != mouse_capture_enabled {
+            if needs_mouse_capture {
+                execute!(t.backend_mut(), crossterm::event::EnableMouseCapture)?;
+            } else {
+                execute!(t.backend_mut(), crossterm::event::DisableMouseCapture)?;
+            }
+            mouse_capture_enabled = needs_mouse_capture;
+        }
         s.poll_background_grammar()?;
         if auto_snapshot_check.elapsed() >= Duration::from_secs(10) {
             auto_snapshot_check = Instant::now();

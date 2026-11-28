@@ -266,6 +266,47 @@ fn delayed_and_missing_cursor_reports_do_not_terminate_on_workspace_resize() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn sgr_mouse_reports_do_not_contaminate_manuscript_text_through_the_production_pty() {
+    let _guard = lock_pty_test();
+    use std::process::Command;
+    use story_app::WriterApp;
+
+    let root = tempfile::tempdir().unwrap();
+    let project = root.path().join("Mouse Input Project");
+    let mut app = WriterApp::create_project(&project, "Mouse Input Project").unwrap();
+    let chapter = app.create_chapter(None, "Opening", 0).unwrap();
+    let scene = app.create_scene(chapter, "Arrival", 0).unwrap();
+    let (_, hash) = app.load_scene_text(scene).unwrap();
+    app.save_scene_text(scene, Some(&hash), "Preserve this prose.")
+        .unwrap();
+    drop(app);
+
+    let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pty_smoke.py");
+    let result = Command::new("python3")
+        .arg(harness)
+        .arg(env!("CARGO_BIN_EXE_writers-ide-terminal"))
+        .arg(&project)
+        .arg(root.path())
+        .arg("mouse-input-isolation")
+        .output()
+        .expect("inject a terminal SGR mouse report through a production PTY");
+    assert!(
+        result.status.success(),
+        "mouse input isolation PTY failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    let reopened = WriterApp::open_project(&project).unwrap();
+    assert_eq!(
+        reopened.load_scene_text(scene).unwrap().0,
+        "Preserve this prose.",
+        "mouse-report control bytes must not enter the saved manuscript"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn named_snapshot_compare_and_selective_restore_work_through_the_production_pty() {
     let _guard = lock_pty_test();
     use std::process::Command;
