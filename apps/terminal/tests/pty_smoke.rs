@@ -1930,7 +1930,7 @@ fn spell_check_from_review_can_correct_and_reopen_the_open_document() {
     let (_, hash) = app.load_scene_text(first).unwrap();
     let long_text = (1..=40)
         .map(|line| format!("A correctly spelled line {line}."))
-        .chain(std::iter::once("Baad word.".to_owned()))
+        .chain(std::iter::once("Baad word. Baad again.".to_owned()))
         .collect::<Vec<_>>()
         .join("\n");
     app.save_scene_text(first, Some(&hash), &long_text).unwrap();
@@ -1966,7 +1966,7 @@ fn spell_check_from_review_can_correct_and_reopen_the_open_document() {
     let reopened = WriterApp::open_project(&project).unwrap();
     assert_eq!(
         reopened.load_scene_text(first).unwrap().0,
-        long_text.replace("Baad word.", "Bad word.")
+        long_text.replace("Baad word. Baad again.", "Baad word. Bad again.")
     );
     assert_eq!(reopened.load_scene_text(second).unwrap().0, "Wrng word.");
 }
@@ -2018,7 +2018,10 @@ fn spell_check_can_choose_a_nonfirst_suggestion_through_the_production_pty() {
         String::from_utf8_lossy(&result.stderr)
     );
     let reopened = WriterApp::open_project(&project).unwrap();
-    assert_eq!(reopened.load_scene_text(first).unwrap().0, "bead word.");
+    assert_eq!(
+        reopened.load_scene_text(first).unwrap().0,
+        "bead word. Baad again."
+    );
     assert_eq!(reopened.load_scene_text(second).unwrap().0, "Wrng word.");
 }
 

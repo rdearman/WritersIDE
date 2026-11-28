@@ -13736,6 +13736,28 @@ impl AppState {
         pane.scroll = review.selected;
         true
     }
+    fn ignore_selected_spelling_occurrence(&mut self) -> bool {
+        let Some(pane) = self.active_reference_pane_mut() else {
+            return false;
+        };
+        let Some(review) = &mut pane.spelling else {
+            return false;
+        };
+        if review.occurrences.is_empty() {
+            return false;
+        }
+        review.occurrences.remove(review.selected);
+        review.selected = review
+            .selected
+            .min(review.occurrences.len().saturating_sub(1));
+        review.suggestions.clear();
+        review.selected_suggestion = 0;
+        review.choosing_suggestion = false;
+        review.jumped_to_source = false;
+        pane.content = spelling_review_text(&review.occurrences);
+        pane.scroll = review.selected;
+        true
+    }
     fn jump_to_selected_spelling_occurrence(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let Some(pane) = self.active_reference_pane() else {
             return Ok(());
@@ -30252,8 +30274,8 @@ fn draw(f: &mut ratatui::Frame<'_>, s: &mut AppState) {
                 && let Some(review) = pane.spelling.as_ref()
             {
                 format!(
-                    "Spell Check · {} occurrence(s) · Enter jump · S choose suggestion · C accept first · R custom · Esc manuscript",
-                    review.occurrences.len()
+                    "Spell {} · Enter jump · S choose · C fix · R replace · I ignore once · Esc back",
+                    review.occurrences.len(),
                 )
             } else if s.reference_focused
                 && let Some(pane) = s.active_reference_pane()
@@ -38854,6 +38876,21 @@ fn handle(s: &mut AppState, k: KeyEvent) -> Result<bool, Box<dyn std::error::Err
                 }
                 return Ok(false);
             }
+            KeyCode::Char('i' | 'I') => {
+                if s.ignore_selected_spelling_occurrence() {
+                    let remaining = s
+                        .active_reference_pane()
+                        .and_then(|pane| pane.spelling.as_ref())
+                        .map(|review| review.occurrences.len())
+                        .unwrap_or_default();
+                    s.message = format!(
+                        "Spelling occurrence ignored for this review · {remaining} remaining · manuscript unchanged"
+                    );
+                } else {
+                    s.message = "No spelling occurrence to ignore · manuscript unchanged".into();
+                }
+                return Ok(false);
+            }
             _ => {}
         }
     }
@@ -45748,6 +45785,76 @@ mod tests {
         assert_eq!(
             reopened.load_scene_text(scene).unwrap().0,
             "Bade weather ahead."
+        );
+    }
+
+    #[test]
+    fn spelling_ignore_once_removes_only_the_selected_review_occurrence() {
+        let root = tempfile::tempdir().unwrap();
+        let mut app = WriterApp::create_project(root.path().join("Book"), "Book").unwrap();
+        let chapter = app.create_chapter(None, "Chapter One", 0).unwrap();
+        let scene = app.create_scene(chapter, "Opening", 0).unwrap();
+        let (_, hash) = app.load_scene_text(scene).unwrap();
+        app.save_scene_text(scene, Some(&hash), "Baad weather. Baad forecast.")
+            .unwrap();
+        let mut state = AppState::new(app, default_bindings());
+        state.open_scene(scene).unwrap();
+        let source_text = "Baad weather. Baad forecast.";
+        let candidates = BTreeMap::from([("baad".to_owned(), 2)]);
+        let occurrences = spelling_occurrences(source_text, &candidates);
+        state.open_reference_buffer(
+            "spellcheck:current".into(),
+            Some(scene),
+            "Spell Check · Opening · en-GB".into(),
+            spelling_review_text(&occurrences),
+        );
+        state.active_reference_pane_mut().unwrap().spelling = Some(SpellCheckReview {
+            scene_id: Some(scene),
+            content_unit_id: None,
+            language: "en-GB".into(),
+            source_text: source_text.into(),
+            occurrences,
+            selected: 0,
+            jumped_to_source: false,
+            suggestions: Vec::new(),
+            selected_suggestion: 0,
+            choosing_suggestion: false,
+        });
+        state.reference_focused = true;
+
+        handle(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+        )
+        .unwrap();
+
+        let pane = state.active_reference_pane().unwrap();
+        let review = pane.spelling.as_ref().unwrap();
+        assert_eq!(review.occurrences.len(), 1);
+        assert_eq!(review.selected, 0);
+        assert_eq!(review.occurrences[0].word, "Baad");
+        assert!(review.occurrences[0].byte_range.start > 0);
+        assert_eq!(
+            pane.content,
+            spelling_review_text(&review.occurrences),
+            "the visible result list follows the remaining spelling findings"
+        );
+        assert!(state.message.contains("ignored for this review"));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("I ignore once"), "{rendered}");
+        assert_eq!(
+            state.app.load_scene_text(scene).unwrap().0,
+            source_text,
+            "ignoring a result must never change manuscript prose"
         );
     }
 

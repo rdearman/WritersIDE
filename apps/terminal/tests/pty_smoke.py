@@ -1242,6 +1242,15 @@ def main():
                 if not wait_for_screen_fragments((b"Changed 'Baad' to 'bead'", b"Undo available"), timeout=3.0):
                     raise AssertionError("selected non-first spelling suggestion was not applied")
             else:
+                os.write(master, b"i")  # ignore only this occurrence in the current review
+                if not wait_for_screen_fragments(
+                    (b"Spell 1", b"line 41, column 12"),
+                    timeout=3.0,
+                ):
+                    raise AssertionError(
+                        "Ignore Once did not remove only the selected spelling result; screen: "
+                        + repr(terminal_snapshot(output, 24, 80))
+                    )
                 os.write(master, b"r")  # enter an author-chosen correction
                 if not wait_for_screen_fragments((b"Replace", b"Baad"), timeout=3.0):
                     raise AssertionError("custom spelling correction dialogue was not shown")

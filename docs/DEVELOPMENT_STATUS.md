@@ -2840,3 +2840,14 @@ workspace, title-dialogue dismissal and the new chapter's selected state
 instead of accepting stale prompt text. Its focused production PTY passed
 twice after that change. The complete workspace suite has not yet been rerun
 after the test-harness correction.
+
+### Spell Check Ignore Once — 28 November 2026
+
+The Spell Check results pane now accepts `I` to dismiss only the selected
+occurrence from the current review; it does not change manuscript text or add a
+persistent dictionary entry. The visible result count and list update, and the
+80×24 footer exposes the shortcut. A production PTY ignored the first of two
+same-document occurrences, corrected the second, saved/reopened, and verified
+the ignored prose and a different scene were unchanged. The focused state test,
+PTY, terminal Clippy, formatting and diff checks passed. Human UAT remains
+open.
